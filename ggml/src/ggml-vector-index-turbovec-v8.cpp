@@ -193,33 +193,22 @@ Geo index_geo(const ggml_vec_index & idx) {
     return geo;
 }
 
-std::vector<size_t> live_slots(const ggml_vec_index & idx) {
-    std::vector<size_t> live;
-    live.reserve(active_count(idx));
-    for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
-        if (slot_is_active(idx, slot)) {
-            live.push_back(slot);
-        }
-    }
-    return live;
-}
-
-// Serializes an index as a file whose row r is slot rows[r] (upstream
-// `SyncSource`). Snapshots list the live slots in order; a synced file keeps
-// the row order its earlier commits gave it.
+// Serializes an index as a file whose row r is slot r (upstream
+// `SyncSource`). A TurboVec 1.x index swap-removes, so its slots are dense
+// and already in upstream's row order.
 class Source {
 public:
-    Source(const ggml_vec_index & idx, const std::vector<size_t> & rows) :
-        idx(idx), rows(rows), geo(index_geo(idx)),
+    explicit Source(const ggml_vec_index & idx) :
+        idx(idx), geo(index_geo(idx)),
         packed_bytes(turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim))),
         seq(geo.row_bytes()) {}
 
     const Geo & geometry() const { return geo; }
-    size_t n() const { return rows.size(); }
+    size_t n() const { return idx.slot_to_id.size(); }
 
     // One row's sequential codes, scale and id: a tail row or a redo op.
     void append_row(size_t r, std::vector<uint8_t> & out) const {
-        const size_t slot = rows[r];
+        const size_t slot = r;
         const uint8_t * codes = seq_row(slot);
         out.insert(out.end(), codes, codes + geo.row_bytes());
         push_f32(out, idx.turbovec_scale[slot]);
@@ -303,7 +292,7 @@ public:
             if (r >= n()) {
                 break;
             }
-            const size_t slot = rows[r];
+            const size_t slot = r;
             const uint8_t * codes = seq_row(slot);
             for (size_t g = 0; g < row_bytes; ++g) {
                 out[g * kBlock + lane] = codes[g];
@@ -322,7 +311,6 @@ private:
     }
 
     const ggml_vec_index & idx;
-    const std::vector<size_t> & rows;
     Geo geo;
     size_t packed_bytes;
     mutable std::vector<uint8_t> seq;
@@ -349,8 +337,7 @@ void build_image(const Source & src, uint64_t nonce, TurboVecV8Image & image) {
 // add/remove history holds them in. Falls back to slot order if the
 // tracked order was lost.
 void turbovec_v8_build_image(const ggml_vec_index & idx, TurboVecV8Image & image) {
-    const std::vector<size_t> rows = live_slots(idx);
-    build_image(Source(idx, rows), 0, image);
+    build_image(Source(idx), 0, image);
 }
 
 size_t turbovec_v8_image_size(const TurboVecV8Image & image) {
@@ -388,6 +375,8 @@ struct ParsedHeader {
     uint32_t delta_crc = 0;
     // Bytes of the slot the header occupies.
     size_t used = 0;
+    // The header's own CRC, which tells two commits of one generation apart.
+    uint32_t crc = 0;
 };
 
 // Parses the header in `bytes` (slot `slot`, at file offset `at`, at most
@@ -481,6 +470,7 @@ bool parse_header(
     }
     out.tail_at = at + 16;
     out.used = p + 4;
+    out.crc = get_u32_le(bytes + p);
     return true;
 }
 
@@ -539,7 +529,11 @@ bool delta_verified_in(const std::vector<uint8_t> & raw, const Geo & geo, const 
 uint64_t turbovec_v8_declared_size(std::istream & f, uint64_t file_size) {
     // The image size follows from the geometry and the row count, so a
     // padded or sparse file never costs more memory than its image
-    // (upstream io_v7 `declared_len`, #487). Returns 0 when undecidable.
+    // (upstream io_v7 `declared_len`, #487). Only a header whose CRC holds
+    // may declare the row count. A file whose geometry is invalid yields
+    // just the fixed superblock prefix, enough for the loader to name its
+    // error, never the whole file.
+    const uint64_t probe = std::min<uint64_t>(file_size, 24);
     auto read_at = [&](uint64_t offset, uint8_t * out, size_t size) {
         if (offset > file_size || file_size - offset < size) {
             return false;
@@ -551,7 +545,7 @@ uint64_t turbovec_v8_declared_size(std::istream & f, uint64_t file_size) {
     };
     uint8_t head[24];
     if (!read_at(0, head, sizeof(head)) || !turbovec_v8_magic(head, sizeof(head))) {
-        return 0;
+        return probe;
     }
     Geo geo;
     const bool v8 = std::memcmp(head, kV8Magic, 4) == 0;
@@ -560,34 +554,42 @@ uint64_t turbovec_v8_declared_size(std::istream & f, uint64_t file_size) {
     geo.kind = head[6];
     geo.layout = v8 ? head[7] : kLayoutSeq;
     if (geo.bits < 2 || geo.bits > 4 || geo.kind > 1 || geo.layout > kLayoutPlanes) {
-        return 0;
+        return probe;
     }
     geo.dim = get_u32_le(head + geo.sb_fixed() - 16);
     if (geo.dim == 0 || geo.dim % 8 != 0 || geo.dim > static_cast<size_t>(kTurboVecMaxDim)) {
-        return 0;
+        return probe;
     }
     uint8_t n_calib_bytes[4];
     if (!read_at(geo.sb_fixed() + (2 * geo.n_levels() - 1) * 4, n_calib_bytes, 4)) {
-        return 0;
+        return probe;
     }
     geo.n_calib = get_u32_le(n_calib_bytes);
     if (geo.n_calib != 0 && geo.n_calib != geo.dim) {
-        return 0;
+        return probe;
     }
+    // The superblock and both header slots: bounded by the geometry.
+    const uint64_t fixed = std::min<uint64_t>(file_size, geo.unit_at(0));
+    if (file_size > std::numeric_limits<size_t>::max()) {
+        return fixed;
+    }
+    const size_t file_len = static_cast<size_t>(file_size);
     uint64_t n = 0;
+    std::vector<uint8_t> buf;
     for (size_t slot = 0; slot < 2; ++slot) {
-        uint8_t count[8];
-        if (!read_at(geo.hdr_at(slot) + 8, count, sizeof(count))) {
-            return 0;
+        const size_t at = geo.hdr_at(slot);
+        if (at >= file_len) {
+            continue;
         }
-        n = std::max(n, get_u64_le(count));
+        buf.resize(std::min(geo.hdr_len(), file_len - at));
+        ParsedHeader h;
+        if (read_at(at, buf.data(), buf.size()) &&
+            parse_header(buf.data(), buf.size(), at, geo, slot, file_len, h)) {
+            n = std::max<uint64_t>(n, h.n);
+        }
     }
-    const uint64_t blocks = n / kBlock;
-    const uint64_t unit_len = geo.unit_len();
-    if (blocks > (UINT64_MAX - geo.unit_at(0)) / unit_len) {
-        return 0;
-    }
-    return std::min<uint64_t>(file_size, geo.unit_at(0) + blocks * unit_len);
+    // parse_header already bounds the row count's units by the file.
+    return std::min<uint64_t>(file_size, geo.unit_at(0) + n / kBlock * geo.unit_len());
 }
 
 ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error, TurboVecV8LoadInfo * info) {
@@ -845,20 +847,28 @@ void turbovec_sync_unbind(ggml_vec_index & idx) noexcept {
     b.path.clear();
     b.pending.clear();
     b.fresh.clear();
+    b.rewrite = false;
+    b.attempt_nonce = 0;
+    b.attempt_gen = 0;
 }
 
 namespace {
 
+// Callers build `path` and `pending` first, so a commit that already landed
+// is never followed by a failed allocation that leaves the binding stale.
 void bind_rows(
         ggml_vec_index & idx,
-        const char * path,
+        std::string path,
         uint64_t gen,
         uint64_t nonce,
-        const std::vector<size_t> & pending) {
+        std::unordered_set<size_t> pending) noexcept {
     TurboVecSyncBinding & b = idx.turbovec_sync;
-    b.pending = std::unordered_set<size_t>(pending.begin(), pending.end());
+    b.pending = std::move(pending);
     b.fresh.clear();
-    b.path = path;
+    b.path = std::move(path);
+    b.rewrite = false;
+    b.attempt_nonce = 0;
+    b.attempt_gen = 0;
     b.gen = gen;
     b.n_synced = idx.slot_to_id.size();
     b.nonce = nonce;
@@ -923,7 +933,9 @@ int cursor_state(
     // nobody's sync destination: rewrite it.
     const uint64_t nonce = get_u64_le(head.data() + sb_fixed - 12);
     if (nonce != b.nonce) {
-        state = nonce == 0 ? CursorState::replaced : CursorState::foreign;
+        // Our own full write, which failed after its rename, owns the file.
+        const bool ours = b.attempt_nonce != 0 && nonce == b.attempt_nonce;
+        state = nonce == 0 || ours ? CursorState::replaced : CursorState::foreign;
         return GGML_VEC_INDEX_OK;
     }
     if (!v8 || head[7] != kLayoutSeq) {
@@ -1025,7 +1037,10 @@ int cursor_state(
             return true;
         });
         if (verified) {
-            state = h.gen == b.gen ? CursorState::intact : CursorState::foreign;
+            // A newer commit is another writer's unless it is the one our
+            // last, failed sync wrote, which nobody has built on.
+            const bool ours = b.attempt_gen != 0 && h.gen == b.attempt_gen && h.crc == b.attempt_crc;
+            state = h.gen == b.gen ? CursorState::intact : ours ? CursorState::replaced : CursorState::foreign;
             return GGML_VEC_INDEX_OK;
         }
     }
@@ -1142,7 +1157,7 @@ void turbovec_sync_bind_loaded(ggml_vec_index & idx, const char * path, const Tu
         turbovec_sync_unbind(idx);
         return;
     }
-    bind_rows(idx, path, info.gen, info.nonce, info.pending);
+    bind_rows(idx, path, info.gen, info.nonce, std::unordered_set<size_t>(info.pending.begin(), info.pending.end()));
 }
 
 void turbovec_sync_note_remove(ggml_vec_index & idx, size_t slot) noexcept {
@@ -1163,7 +1178,8 @@ void turbovec_sync_note_remove(ggml_vec_index & idx, size_t slot) noexcept {
             }
         }
     } catch (...) {
-        turbovec_sync_unbind(idx);
+        // Keep the binding: a rewrite still checks the file's generation.
+        b.rewrite = true;
     }
 }
 
@@ -1182,7 +1198,7 @@ int turbovec_v8_sync(ggml_vec_index & idx, const char * path) {
         // that declares another calibration length (a stored identity pair,
         // which loading drops) would take them at the wrong offsets:
         // rewrite it instead.
-        if (state == CursorState::intact && file_n_calib != idx.turbovec_tqplus_shift.size()) {
+        if (state == CursorState::intact && (file_n_calib != idx.turbovec_tqplus_shift.size() || b.rewrite)) {
             state = CursorState::replaced;
         }
     }
@@ -1193,37 +1209,48 @@ int turbovec_v8_sync(ggml_vec_index & idx, const char * path) {
     }
 
     if (state == CursorState::intact && b.calib_gen == idx.turbovec_calib_gen) {
-        const std::vector<size_t> rows = live_slots(idx);
-        const Source src(idx, rows);
+        const Source src(idx);
         std::vector<TurboVecWriteBatch> batches;
         uint64_t new_gen = 0;
         std::vector<size_t> carried;
         if (plan_incremental(src, b, stale_used, batches, new_gen, carried)) {
+            std::unordered_set<size_t> pending(carried.begin(), carried.end());
+            // The commit header is the last write; it ends with its CRC.
+            const std::vector<uint8_t> & header = batches.back().back().second;
+            b.attempt_gen = new_gen;
+            b.attempt_crc = get_u32_le(header.data() + header.size() - 4);
             const int rc = turbovec_v8_apply_batches(path, batches);
             if (rc != GGML_VEC_INDEX_OK) {
-                // Bytes may have landed; only a full rewrite is safe next.
-                turbovec_sync_unbind(idx);
+                // Bytes may have landed. The binding stays, so the next
+                // sync still refuses a file another writer advanced, and
+                // rewrites if this commit landed.
                 return rc;
             }
             b.gen = new_gen;
-            b.n_synced = rows.size();
-            b.pending = std::unordered_set<size_t>(carried.begin(), carried.end());
+            b.n_synced = src.n();
+            b.pending = std::move(pending);
             b.fresh.clear();
+            b.attempt_gen = 0;
             return GGML_VEC_INDEX_OK;
         }
     }
 
     // A full write claims the file with a fresh nonce.
-    const std::vector<size_t> rows = live_slots(idx);
     const uint64_t nonce = new_file_nonce();
+    std::string bound_path(path);
+    std::unordered_set<size_t> no_pending;
     TurboVecV8Image image;
-    build_image(Source(idx, rows), nonce, image);
+    build_image(Source(idx), nonce, image);
+    if (bound) {
+        b.attempt_nonce = nonce;
+    }
     const int rc = turbovec_v8_write_file(path, image);
     if (rc != GGML_VEC_INDEX_OK && rc != GGML_VEC_INDEX_E_NOT_DURABLE) {
-        turbovec_sync_unbind(idx);
+        // A full write commits by rename and every failure before it leaves
+        // the file untouched, so the binding still describes it.
         return rc;
     }
-    bind_rows(idx, path, 0, nonce, {});
+    bind_rows(idx, std::move(bound_path), 0, nonce, std::move(no_pending));
     return rc;
 }
 
@@ -1247,8 +1274,7 @@ int turbovec_sync_plan_for_test(
     }
     uint64_t new_gen = 0;
     std::vector<size_t> carried;
-    const std::vector<size_t> rows = live_slots(*idx);
-    return plan_incremental(Source(*idx, rows), b, stale_used, batches, new_gen, carried) ?
+    return plan_incremental(Source(*idx), b, stale_used, batches, new_gen, carried) ?
         GGML_VEC_INDEX_OK : GGML_VEC_INDEX_E_INVALID_ARG;
 }
 #endif
