@@ -99,17 +99,17 @@ xdna_head * xdna_head_create(xdna_kernel_pool *  pool,
     // frequent tokens, the ones the distribution's mass sits on. Measured
     // (KLD against the Q6_K head on the CPU, 0.0049): every row 4-bit 0.0165;
     // the first 16K exact 0.0072, 32K 0.0061, 64K 0.0052.
-    // GGML_XDNA_HEAD_EXACT_ROWS, rounded down to a pass of the pool; 0 for all
-    // 4-bit. strtoll stops at the first non-digit like atoll and saturates on
-    // an out-of-range value.
+    // GGML_XDNA_HEAD_EXACT_ROWS, rounded down to a pass of the pool; 0, or a
+    // negative value, for all 4-bit. strtoll stops at the first non-digit like
+    // atoll and saturates on an out-of-range value.
     static const int64_t exact_env = [] {
         const char * e = getenv("GGML_XDNA_HEAD_EXACT_ROWS");
         return e ? (int64_t) strtoll(e, nullptr, 10) : (int64_t) 65536;
     }();
     const xdna_gemv_geom g8 =
         xdna_gemv_variant(w->type, K, std::max<int64_t>(exact_env, 1), false, XDNA_GEMV_SPLIT_FUSED, true);
-    int64_t R = w->type == GGML_TYPE_Q4_K || !g8.valid() ? 0 : std::min(exact_env, N);
-    R         = g8.valid() ? R / g8.chunk() * g8.chunk() : 0;
+    const int64_t R =
+        w->type == GGML_TYPE_Q4_K || !g8.valid() ? 0 : xdna_head_exact_rows(exact_env, N, g8.chunk());
 
     xdna_head * h = new xdna_head;
     h->n_real     = (int) N;

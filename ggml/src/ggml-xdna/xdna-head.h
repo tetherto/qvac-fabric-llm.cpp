@@ -2,6 +2,9 @@
 
 #include <xrt/xrt_kernel.h>
 
+#include <algorithm>
+#include <cstdint>
+
 // The decode's vocabulary projection (lm_head: Qwen3.5 ties it to
 // token_embd, Q6_K [1024 x 248320]) on the fused layer design's pool (the
 // layers' hardware context: another xclbin costs ~2.5 ms each way). The array
@@ -26,6 +29,12 @@ xdna_head * xdna_head_create(struct xdna_kernel_pool *  pool,
                              const float *              gamma = nullptr,
                              float                      eps   = 0.0f);
 void        xdna_head_free(xdna_head * h);
+
+// The leading rows of an n-row head kept exact: `requested` clamped to [0, n],
+// rounded down to whole chunks of the exact part.
+static inline int64_t xdna_head_exact_rows(int64_t requested, int64_t n, int64_t chunk) {
+    return chunk > 0 ? std::clamp<int64_t>(requested, 0, n) / chunk * chunk : 0;
+}
 
 // logits = W x for one row x of the weight's K.
 bool xdna_head_run(xdna_head * h, const float * x, float * logits);
