@@ -195,6 +195,129 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+// evict-first loads and stores; plain ones on HIP, which has no __ldcs/__stcs
+static __device__ __forceinline__ float4 gdn_load_stream(const float4 * p) {
+#ifdef GGML_USE_HIP
+    return *p;
+#else
+    return __ldcs(p);
+#endif // GGML_USE_HIP
+}
+
+static __device__ __forceinline__ void gdn_store_stream(float4 * p, const float4 x) {
+#ifdef GGML_USE_HIP
+    *p = x;
+#else
+    __stcs(p, x);
+#endif // GGML_USE_HIP
+}
+
+// decode (one token per seq, scalar gate): a block of 4 warps owns 128/LPC columns of one (seq, head) state.
+// LPC = S_v/16 lanes share a column and each holds 16 of its rows as 4 float4, so the state is read and written
+// with coalesced 16-byte accesses and a column sum reduces over LPC lanes only. The state is streamed (evict
+// first): it is not reused within the step. ~226 GB/s on the GB10, vs ~209 for the token-loop kernel
+template <int S_v>
+__global__ void __launch_bounds__(128) gated_delta_net_decode_cuda(
+        const float * q, const float * k, const float * v, const float * g, const float * beta,
+        const float * curr_state, float * dst, float * state, const int64_t H,
+        const int64_t sq1, const int64_t sq3, const int64_t sv1, const int64_t sv3, const int64_t sb1, const int64_t sb3,
+        const uint3 neqk1_magic, const uint3 rq3_magic, const float scale) {
+    constexpr int LPC = S_v / 16; // lanes per column
+    constexpr int NG  = 4;        // float4 granules per lane
+
+    const int      lane = threadIdx.x % WARP_SIZE;
+    const int      sub  = lane % LPC;
+    const int      col  = blockIdx.x * (128 / LPC) + threadIdx.x / LPC;
+    const uint32_t h    = blockIdx.y;
+    const uint32_t seq  = blockIdx.z;
+    const uint32_t iq1  = fastmodulo(h, neqk1_magic);
+    const uint32_t iq3  = fastdiv(seq, rq3_magic);
+
+    const int64_t  s_off = ((int64_t) seq * H + h) * S_v * S_v + (int64_t) col * S_v;
+    const float4 * s_in  = (const float4 *) (curr_state + s_off);
+    float4 *       s_out = (float4 *) (state + s_off);
+    const float4 * q4    = (const float4 *) (q + iq3 * sq3 + iq1 * sq1);
+    const float4 * k4    = (const float4 *) (k + iq3 * sq3 + iq1 * sq1);
+
+    ggml_cuda_pdl_sync();
+
+    float4 st[NG];
+    float4 kk[NG];
+    float4 qq[NG];
+#pragma unroll
+    for (int j = 0; j < NG; ++j) {
+        st[j] = gdn_load_stream(s_in + j * LPC + sub);
+        kk[j] = k4[j * LPC + sub];
+        qq[j] = q4[j * LPC + sub];
+    }
+
+    const int64_t gb   = seq * sb3 + h * sb1;
+    const float   gate = expf(g[gb]);
+    const float   bv   = beta[gb];
+    const float   vv   = v[seq * sv3 + h * sv1 + col];
+
+    // kv = (S^T @ k)[col] on the state before the decay
+    float kv = 0.0f;
+#pragma unroll
+    for (int j = 0; j < NG; ++j) {
+        kv += st[j].x * kk[j].x + st[j].y * kk[j].y + st[j].z * kk[j].z + st[j].w * kk[j].w;
+    }
+#pragma unroll
+    for (int m = 1; m < LPC; m *= 2) {
+        kv += __shfl_xor_sync(0xffffffff, kv, m, WARP_SIZE);
+    }
+
+    const float delta = (vv - gate * kv) * bv;
+
+    float o = 0.0f;
+#pragma unroll
+    for (int j = 0; j < NG; ++j) {
+        st[j].x = gate * st[j].x + kk[j].x * delta;
+        st[j].y = gate * st[j].y + kk[j].y * delta;
+        st[j].z = gate * st[j].z + kk[j].z * delta;
+        st[j].w = gate * st[j].w + kk[j].w * delta;
+        o += st[j].x * qq[j].x + st[j].y * qq[j].y + st[j].z * qq[j].z + st[j].w * qq[j].w;
+        gdn_store_stream(s_out + j * LPC + sub, st[j]);
+    }
+#pragma unroll
+    for (int m = 1; m < LPC; m *= 2) {
+        o += __shfl_xor_sync(0xffffffff, o, m, WARP_SIZE);
+    }
+
+    if (sub == 0) {
+        dst[((int64_t) seq * H + h) * S_v + col] = o * scale;
+    }
+}
+
+// one token per seq with a scalar gate and 16-byte aligned rows; returns false if the decode kernel does not apply
+static bool launch_gated_delta_net_decode(
+        const float * q_d, const float * k_d, const float * v_d, const float * g_d, const float * b_d,
+        const float * s_d, float * dst_d, float * state_d, int64_t S_v, int64_t H, int64_t n_seqs,
+        int64_t sq1, int64_t sq3, int64_t sv1, int64_t sv3, int64_t sb1, int64_t sb3,
+        int64_t neqk1, int64_t rq3, float scale, cudaStream_t stream) {
+    if ((S_v != 64 && S_v != 128) || WARP_SIZE != 32 || n_seqs > 65535) {
+        return false;
+    }
+    const uintptr_t align = (uintptr_t) q_d | (uintptr_t) k_d | (uintptr_t) s_d | (uintptr_t) state_d;
+    if ((align & 15) != 0 || (sq1 | sq3) % 4 != 0) {
+        return false;
+    }
+
+    // 128 / (S_v/16) columns per block
+    const dim3 grid(S_v * S_v / 2048, H, n_seqs);
+    const ggml_cuda_kernel_launch_params params = ggml_cuda_kernel_launch_params(grid, dim3(128, 1, 1), 0, stream);
+    const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+    const uint3 rq3_magic   = init_fastdiv_values(rq3);
+    if (S_v == 128) {
+        ggml_cuda_kernel_launch(gated_delta_net_decode_cuda<128>, params, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            H, sq1, sq3, sv1, sv3, sb1, sb3, neqk1_magic, rq3_magic, scale);
+    } else {
+        ggml_cuda_kernel_launch(gated_delta_net_decode_cuda<64>, params, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            H, sq1, sq3, sv1, sv3, sb1, sb3, neqk1_magic, rq3_magic, scale);
+    }
+    return true;
+}
+
 template <bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -377,6 +500,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
         if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
             return;
         }
+    }
+    // one token: the snapshots (keep_rs) reduce to slot 0, the final state
+    if (!kda && n_tokens == 1 &&
+            launch_gated_delta_net_decode(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_seqs,
+                sq1, sq3, sv1, sv3, sb1, sb3, neqk1, rq3, scale, stream)) {
+        return;
     }
     if (kda) {
         if (keep_rs) {
