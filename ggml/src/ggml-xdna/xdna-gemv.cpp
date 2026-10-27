@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -804,7 +805,6 @@ bool xdna_gemv_pack_weights(const xdna_gemv_geom &             geom,
     const int    nsup      = geom.n_sup();
 
     dst.assign(geom.weight_bytes(), 0);
-    std::vector<uint8_t> row(row_b);
 
     // A ggml weight is N rows of K, so one column of the GEMV is one ggml row:
     // repack it into the canonical group form, then scatter its codes and
@@ -833,17 +833,18 @@ bool xdna_gemv_pack_weights(const xdna_gemv_geom &             geom,
         }
     }
 
-    for (int n = 0; n < geom.N; n++) {
+    // Packs destination column n through the scratch row; false when its row cannot be repacked.
+    const auto pack_column = [&](int n, uint8_t * row) {
         const int src_col = colmap ? colmap[n] : n;
         if (src_col < 0 || src_col >= (int) owner.size()) {
-            continue;  // padding column: zero weights decode to a zero output
+            return true;  // padding column: zero weights decode to a zero output
         }
         {
             const struct ggml_tensor * w      = owner[(size_t) src_col];
             const int64_t              r0     = ownrow[(size_t) src_col];
             const size_t               src_rb = ggml_row_size(w->type, K);
             if (!xdna_wfmt_repack_row_as(w->type, geom.fmt, (const uint8_t *) w->data + (size_t) r0 * src_rb, K,
-                                         row.data())) {
+                                         row)) {
                 return false;
             }
             const int oc   = n / geom.chunk();
@@ -859,7 +860,7 @@ bool xdna_gemv_pack_weights(const xdna_gemv_geom &             geom,
                 uint8_t * tile = dst.data() + (((size_t) (c * geom.n_out() + oc) * NT + t) * rows + r) * tb;
                 for (int gg = 0; gg < gpt; gg++) {
                     const int       gidx = t * gpt + gg;
-                    const uint8_t * rec  = row.data() + (size_t) (gidx / sbg) * sb_b;
+                    const uint8_t * rec  = row + (size_t) (gidx / sbg) * sb_b;
                     const int       gi   = gidx % sbg;
                     const uint8_t * src  = rec + (size_t) gi * code_b;
                     uint8_t *       blk  = tile + (size_t) (j * gpt + gg) * bb;
@@ -891,8 +892,34 @@ bool xdna_gemv_pack_weights(const xdna_gemv_geom &             geom,
                 }
             }
         }
+        return true;
+    };
+
+    // A core's n_core columns: two 4-bit lanes share a byte only inside one core.
+    const auto pack_unit = [&](int u, uint8_t * row) {
+        for (int n = u * n_core; n < (u + 1) * n_core; n++) {
+            if (!pack_column(n, row)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // The units own disjoint tiles, so they pack in parallel, a scratch row per thread.
+    const int            n_threads = xdna_host_threads();
+    std::vector<uint8_t> scratch((size_t) n_threads * row_b);
+    bool                 ok = true;
+#ifdef GGML_USE_OPENMP
+#    pragma omp parallel for num_threads(n_threads) schedule(dynamic, 1) reduction(&& : ok)
+#endif
+    for (int u = 0; u < geom.N / n_core; u++) {
+        try {
+            ok = ok && pack_unit(u, scratch.data() + (size_t) xdna_omp_thread() * row_b);
+        } catch (const std::exception &) {
+            ok = false;
+        }
     }
-    return true;
+    return ok;
 }
 
 // --- runner -----------------------------------------------------------------
