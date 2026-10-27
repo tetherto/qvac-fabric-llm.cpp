@@ -6650,6 +6650,36 @@ void check_turbovec_1x_sparse_load() {
     std::filesystem::remove(path);
 }
 
+// A stale handle whose next sync would switch the file to the planes
+// layout still checks the file's commits first, so it cannot rewrite over
+// another writer's commit.
+void check_turbovec_1x_stale_layout_change() {
+    constexpr int dim = 32;
+    // Upstream switches to the planes layout at 32768 rows.
+    constexpr size_t n = 32768;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-layout.tvim").string();
+    std::filesystem::remove(path);
+    auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+    CHECK(ggml_vec_index_add(tv, rows.data(), static_cast<int>(n - 1), ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+    auto * other = ggml_vec_index_load(path.c_str());
+    CHECK(other != nullptr);
+    CHECK(ggml_vec_index_remove(other, ids[0]) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_sync(other, path.c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(other);
+    CHECK(ggml_vec_index_add(tv, rows.data() + (n - 1) * dim, 1, ids.data() + n - 1) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_IO);
+    auto * reloaded = ggml_vec_index_load(path.c_str());
+    CHECK(reloaded != nullptr);
+    CHECK(ggml_vec_index_len(reloaded) == static_cast<int>(n - 2));
+    CHECK(ggml_vec_index_contains(reloaded, ids[0]) == 0);
+    ggml_vec_index_free(reloaded);
+    ggml_vec_index_free(tv);
+    std::filesystem::remove(path);
+}
+
 void check_turbovec_1x() {
     for (const Tv1xIndexCase & c : kTv1xIndexCases) {
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
@@ -6673,6 +6703,7 @@ void check_turbovec_1x() {
     }
     check_turbovec_1x_sync_api();
     check_turbovec_1x_sparse_load();
+    check_turbovec_1x_stale_layout_change();
     check_turbovec_1x_history_snapshots();
     check_turbovec_1x_threads();
     check_vector_index_introspection();

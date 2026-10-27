@@ -1010,11 +1010,9 @@ int cursor_state(
         return GGML_VEC_INDEX_OK;
     }
     // Our own file in a form this index no longer writes (a v7 file, or a
-    // layout it has since grown into): rewrite it whole.
-    if (!v8 || head[7] != b_layout) {
-        state = CursorState::replaced;
-        return GGML_VEC_INDEX_OK;
-    }
+    // layout it has since grown into) is rewritten whole, but only once its
+    // commits show that no other writer has advanced it.
+    const bool reform = !v8 || head[7] != b_layout;
     if (file_size > std::numeric_limits<size_t>::max()) {
         return GGML_VEC_INDEX_E_IO;
     }
@@ -1024,12 +1022,13 @@ int cursor_state(
     // and reading the file through it would miss another writer's newer
     // commits and treat the file as ours to rewrite.
     Geo geo;
+    geo.version = v8 ? 8 : 7;
     geo.kind = head[6];
     geo.bits = head[5];
-    geo.layout = head[7];
+    geo.layout = v8 ? head[7] : kLayoutSeq;
     geo.dim = get_u32_le(head.data() + sb_fixed - 16);
     if (geo.kind != kKindIdMap || geo.bits < 2 || geo.bits > 4 || geo.dim == 0 || geo.dim % 8 != 0 ||
-        geo.dim > static_cast<size_t>(kTurboVecMaxDim)) {
+        geo.dim > static_cast<size_t>(kTurboVecMaxDim) || geo.layout > kLayoutPlanes) {
         state = CursorState::replaced;
         return GGML_VEC_INDEX_OK;
     }
@@ -1089,8 +1088,9 @@ int cursor_state(
     });
     // The binding's own commit, still newest, was verified when the binding
     // was made; it needs no delta re-read.
+    const CursorState ours_now = reform ? CursorState::replaced : CursorState::intact;
     if (!candidates.empty() && candidates.front().gen == b.gen) {
-        state = CursorState::intact;
+        state = ours_now;
         return GGML_VEC_INDEX_OK;
     }
     for (const ParsedHeader & h : candidates) {
@@ -1114,7 +1114,7 @@ int cursor_state(
             // A newer commit is another writer's unless it is the one our
             // last, failed sync wrote, which nobody has built on.
             const bool ours = b.attempt_gen != 0 && h.gen == b.attempt_gen && h.crc == b.attempt_crc;
-            state = h.gen == b.gen ? CursorState::intact : ours ? CursorState::replaced : CursorState::foreign;
+            state = h.gen == b.gen ? ours_now : ours ? CursorState::replaced : CursorState::foreign;
             return GGML_VEC_INDEX_OK;
         }
     }
