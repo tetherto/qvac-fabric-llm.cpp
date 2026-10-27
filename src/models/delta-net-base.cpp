@@ -562,6 +562,87 @@ ggml_tensor * llm_build_delta_net_base::build_conv_deferred(
     return out;
 }
 
+ggml_tensor * llm_build_delta_net_base::build_recurrent_ragged(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        qkv_mixed,
+        ggml_tensor *        conv_kernel,
+        ggml_tensor *        g,
+        ggml_tensor *        b,
+        int64_t              head_k_dim,
+        int64_t              num_k_heads,
+        int64_t              head_v_dim,
+        int64_t              num_v_heads,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+
+    GGML_ASSERT(ubatch.is_ragged() && inp->seq_off != nullptr && inp->rec_idx == nullptr);
+    GGML_ASSERT(head_k_dim == head_v_dim);
+
+    const int64_t n_seqs   = ubatch.n_seqs;
+    const int64_t n_tokens = ubatch.n_tokens;
+    const int64_t C        = qkv_mixed->ne[0];
+    const int64_t d_conv   = conv_kernel->ne[0];
+    const auto    kv_head  = mctx_cur->get_head();
+
+    ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+    ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+
+    // conv: in place, the conv op reads the states before the new ones are copied back
+    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs, nullptr, true);
+    conv_states = ggml_reshape_3d(ctx0, conv_states, d_conv - 1, C, n_seqs);
+    cb(conv_states, "conv_states", il);
+
+    qkv_mixed = ggml_reshape_2d(ctx0, qkv_mixed, C, n_tokens);
+
+    ggml_tensor * conv_out = ggml_ssm_conv_ragged(ctx0, qkv_mixed, conv_states, conv_kernel, inp->seq_off, true);
+    cb(conv_out, "conv_ragged", il);
+
+    const size_t row_conv = ggml_row_size(conv_out->type, C);
+
+    ggml_tensor * conv_new = ggml_view_2d(ctx0, conv_out, (d_conv - 1)*C, n_seqs,
+            ggml_row_size(conv_out->type, (d_conv - 1)*C), n_tokens*row_conv);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_new,
+            ggml_view_2d(ctx0, conv_states_all, (d_conv - 1)*C, n_seqs, conv_states_all->nb[1], kv_head*conv_states_all->nb[1])));
+
+    ggml_tensor * q = ggml_view_3d(ctx0, conv_out, head_k_dim, num_k_heads, n_tokens,
+            ggml_row_size(conv_out->type, head_k_dim), row_conv, 0);
+    ggml_tensor * k = ggml_view_3d(ctx0, conv_out, head_k_dim, num_k_heads, n_tokens,
+            ggml_row_size(conv_out->type, head_k_dim), row_conv, ggml_row_size(conv_out->type, head_k_dim*num_k_heads));
+    ggml_tensor * v = ggml_view_3d(ctx0, conv_out, head_v_dim, num_v_heads, n_tokens,
+            ggml_row_size(conv_out->type, head_v_dim), row_conv, ggml_row_size(conv_out->type, 2*head_k_dim*num_k_heads));
+
+    q = build_gdn_l2_norm(ctx0, q, hparams.f_norm_rms_eps);
+    k = build_gdn_l2_norm(ctx0, k, hparams.f_norm_rms_eps);
+    cb(q, "q_conv_predelta", il);
+    cb(k, "k_conv_predelta", il);
+    cb(v, "v_conv_predelta", il);
+
+    g = ggml_reshape_3d(ctx0, g, 1, num_v_heads, n_tokens);
+    b = ggml_reshape_3d(ctx0, b, 1, num_v_heads, n_tokens);
+
+    ggml_tensor * state = build_rs_ssm(inp, ssm_states_all, n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    cb(state, "state_predelta", il);
+
+    ggml_tensor * gdn_out = ggml_gated_delta_net_ragged(ctx0, q, k, v, g, b, state, inp->seq_off);
+    cb(gdn_out, "gdn_ragged_out", il);
+
+    const int64_t D = head_v_dim*head_v_dim*num_v_heads;
+
+    ggml_tensor * new_state = ggml_view_2d(ctx0, gdn_out, D, n_seqs,
+            ggml_row_size(gdn_out->type, D), ggml_row_size(gdn_out->type, head_v_dim*num_v_heads*n_tokens));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state,
+            ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1], kv_head*ssm_states_all->nb[1])));
+
+    ggml_tensor * output = ggml_view_4d(ctx0, gdn_out, head_v_dim, num_v_heads, n_tokens, 1,
+            ggml_row_size(gdn_out->type, head_v_dim),
+            ggml_row_size(gdn_out->type, head_v_dim*num_v_heads),
+            ggml_row_size(gdn_out->type, head_v_dim*num_v_heads*n_tokens), 0);
+    cb(output, "attn_output", il);
+
+    return output;
+}
+
 ggml_tensor * llm_build_delta_net_base::build_rs_ssm(
         llm_graph_input_rs * inp,
         ggml_tensor *        ssm_states_all,

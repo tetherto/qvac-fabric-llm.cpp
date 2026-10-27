@@ -249,8 +249,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
-    const int64_t n_seqs       = ubatch.n_seqs;
-    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+    // a ragged ubatch keeps all its tokens in one sequence dimension
+    const int64_t n_seqs       = ubatch.is_ragged() ? 1 : ubatch.n_seqs;
+    const int64_t n_seq_tokens = ubatch.is_ragged() ? ubatch.n_tokens : ubatch.n_seq_tokens;
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
@@ -360,16 +361,18 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         int                  il) {
     const auto * mctx_cur = inp->mctx;
 
+    // a ragged ubatch keeps all its tokens in one sequence dimension (see build_recurrent_ragged)
+    const bool    ragged       = ubatch.is_ragged();
     const int64_t d_inner      = hparams.ssm_d_inner;
-    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t n_seqs       = ragged ? 1 : ubatch.n_seqs;
     const int64_t head_k_dim   = hparams.ssm_d_state;
     const int64_t num_k_heads  = hparams.ssm_n_group;
     const int64_t num_v_heads  = hparams.ssm_dt_rank;
     const int64_t head_v_dim   = d_inner / num_v_heads;
-    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+    const int64_t n_seq_tokens = ragged ? ubatch.n_tokens : ubatch.n_seq_tokens;
 
-    GGML_ASSERT(n_seqs != 0);
-    GGML_ASSERT(ubatch.equal_seqs());
+    GGML_ASSERT(ubatch.n_seqs != 0);
+    GGML_ASSERT(ubatch.equal_seqs() || ragged);
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
     // Input projections
@@ -415,6 +418,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // with the deferred commit the conv states live in conv input histories, and the conv op also
     // applies the q/k l2 norms
     const bool deferred = inp->rec_idx != nullptr;
+
+    if (ragged) {
+        GGML_ASSERT(!deferred);
+        ggml_tensor * output = build_recurrent_ragged(inp, qkv_mixed, conv_kernel, gate, beta,
+                head_k_dim, num_k_heads, head_v_dim, num_v_heads, il);
+
+        ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+        ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+        ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
+        cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+        cb(cur, "linear_attn_out", il);
+        return cur;
+    }
 
     ggml_tensor * conv_qkv_mix;
 
