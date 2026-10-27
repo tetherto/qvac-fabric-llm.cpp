@@ -3422,6 +3422,9 @@ int ggml_vec_index_sync(ggml_vec_index_t * idx, const char * path) {
     if (idx == nullptr || path == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
+    // A failed sync keeps the binding: dropping it would let the retry
+    // rewrite a file another writer has since committed to. The sync itself
+    // records any commit it may have landed.
     try {
         std::unique_lock<std::shared_mutex> lock(idx->mutex);
         if (!is_turbovec(*idx) || idx->turbovec_legacy || idx->delta_log_bound) {
@@ -3430,10 +3433,8 @@ int ggml_vec_index_sync(ggml_vec_index_t * idx, const char * path) {
         test_maybe_throw_bad_alloc();
         return turbovec_v8_sync(*idx, path);
     } catch (const std::bad_alloc &) {
-        turbovec_sync_unbind(*idx);
         return GGML_VEC_INDEX_E_OOM;
     } catch (...) {
-        turbovec_sync_unbind(*idx);
         return GGML_VEC_INDEX_E_INTERNAL;
     }
 }
@@ -3831,10 +3832,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
             if (file_size <= 0) {
                 return load_fail(GGML_VEC_INDEX_E_IO);
             }
-            uint64_t want = turbovec_v8_declared_size(f, static_cast<uint64_t>(file_size));
-            if (want == 0) {
-                want = static_cast<uint64_t>(file_size);
-            }
+            const uint64_t want = turbovec_v8_declared_size(f, static_cast<uint64_t>(file_size));
             if (want > std::numeric_limits<size_t>::max()) {
                 return load_fail(GGML_VEC_INDEX_E_IO);
             }
