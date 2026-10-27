@@ -48,6 +48,8 @@ constexpr int          O_OBJ   = R * DH;       // f32 a core's O object
 constexpr int          KV_RING = 3;            // K/V descriptors in flight a stream
 constexpr float        SCALE   = 0.0625f;
 
+constexpr int64_t FA_HOST_PAIRS = 512 * 512;  // (token, key) pairs a call up to which the host runs it
+
 int kv_col(int s) {
     return 4 * (s / 2) + s % 2;
 }
@@ -313,10 +315,12 @@ bool xdna_attn_mm_supported(const ggml_tensor * node) {
     if (n_tokens < PASS || n_kv < n_tokens) {
         return false;
     }
-    // Everything else runs here: the prefill belongs on the array. Below ~1M
-    // (token, key) pairs the host would be quicker (it takes ~11 ns a pair,
-    // the array ~3 plus a few ms a call - the layouts and the stream), which
-    // is the call's own cost to bring down.
+    // Up to FA_HOST_PAIRS the host is quicker at no more energy a token (pp512 on
+    // the 0.8B: 2047 against 1853 t/s, 14.1 against 14.2 mJ); past it the array
+    // wins, by more the longer the context (pp512 at depth 16384: 1202 against 945).
+    if (n_tokens * n_kv <= FA_HOST_PAIRS) {
+        return false;
+    }
     float params[3] = { 0.0f, 0.0f, 0.0f };
     std::memcpy(params, node->op_params, sizeof(params));
     if (params[0] != SCALE || params[1] != 0.0f || params[2] != 0.0f) {
