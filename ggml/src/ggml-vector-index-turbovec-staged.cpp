@@ -439,7 +439,91 @@ uint64_t load_word(const uint8_t * bytes, size_t n) {
     return get_u64_le(w);
 }
 
+#if GGML_VEC_INDEX_USE_NEON
+// Upstream low_dot_neon: the bit counts a byte at a time, each plane's
+// difference (-8..8) weighted into two i8 accumulators, so the result is
+// the scalar loop's integer.
+int64_t low_dot_neon(const uint8_t * masks, const uint8_t * row, size_t row_len) {
+    static_assert(kLowBits == 6, "the byte accumulators hold three bits' worth each");
+    int32x4_t acc_lo = vdupq_n_s32(0);
+    int32x4_t acc_hi = vdupq_n_s32(0);
+    for (size_t c = 0; c * kLowChunk < row_len; ++c) {
+        const size_t chunk_len = std::min(kLowChunk, row_len - c * kLowChunk);
+        const uint8_t * group = masks + c * 2 * kLowBits * kLowChunk;
+        const uint8_t * chunk = row + c * kLowChunk;
+        for (size_t j = 0; j < chunk_len; j += 16) {
+            uint8x16_t l;
+            if (chunk_len - j >= 16) {
+                l = vld1q_u8(chunk + j);
+            } else {
+                uint8_t t[16] = {};
+                std::memcpy(t, chunk + j, chunk_len - j);
+                l = vld1q_u8(t);
+            }
+            int8x16_t lo = vdupq_n_s8(0);
+            int8x16_t hi = vdupq_n_s8(0);
+            for (int b = 0; b < kLowBits; ++b) {
+                const uint8x16_t pos = vcntq_u8(vandq_u8(l, vld1q_u8(group + static_cast<size_t>(b) * kLowChunk + j)));
+                const uint8x16_t neg =
+                    vcntq_u8(vandq_u8(l, vld1q_u8(group + static_cast<size_t>(kLowBits + b) * kLowChunk + j)));
+                const int8x16_t d = vreinterpretq_s8_u8(vsubq_u8(pos, neg));
+                if (b < 3) {
+                    lo = vaddq_s8(lo, vshlq_s8(d, vdupq_n_s8(static_cast<int8_t>(b))));
+                } else {
+                    hi = vaddq_s8(hi, vshlq_s8(d, vdupq_n_s8(static_cast<int8_t>(b - 3))));
+                }
+            }
+            acc_lo = vpadalq_s16(acc_lo, vpaddlq_s8(lo));
+            acc_hi = vpadalq_s16(acc_hi, vpaddlq_s8(hi));
+        }
+    }
+    return vaddlvq_s32(acc_lo) + 8 * vaddlvq_s32(acc_hi);
+}
+
+// Upstream exact4_sum_neon: one row's 4-bit permute-dot integer sum from
+// its planes, the sign plane read from the lane-blocked sign region
+// (aarch64's layout), so the row's exact score needs no block scan.
+int32_t exact4_sum_blocked(const int8_t * w, const int8_t * levels, const uint8_t * sign_block,
+        const uint8_t * low_row, size_t nsg, size_t lane) {
+    // spread8[b]: byte i is bit i of b.
+    static const std::array<uint64_t, 256> spread8 = [] {
+        std::array<uint64_t, 256> t{};
+        for (size_t b = 0; b < 256; ++b) {
+            for (int i = 0; i < 8; ++i) {
+                t[b] |= static_cast<uint64_t>((b >> i) & 1u) << (8 * i);
+            }
+        }
+        return t;
+    }();
+    auto codes_of = [&](size_t g) {
+        return (spread8[sign_block[g * kBlock + lane]] << 3) | (spread8[low_row[2 * nsg + g]] << 2) |
+            (spread8[low_row[nsg + g]] << 1) | spread8[low_row[g]];
+    };
+    const int8x16_t level_table = vld1q_s8(levels);
+    int32x4_t acc = vdupq_n_s32(0);
+    size_t c = 0;
+    for (; c + 2 <= nsg; c += 2) {
+        const uint64_t codes[2] = { codes_of(c), codes_of(c + 1) };
+        const int8x16_t lv = vqtbl1q_s8(level_table, vreinterpretq_u8_u64(vld1q_u64(codes)));
+        const int8x16_t wv = vld1q_s8(w + c * 8);
+        acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(lv), vget_low_s8(wv)));
+        acc = vpadalq_s16(acc, vmull_high_s8(lv, wv));
+    }
+    int32_t sum = vaddvq_s32(acc);
+    for (; c < nsg; ++c) {
+        const uint64_t codes = codes_of(c);
+        for (int b = 0; b < 8; ++b) {
+            sum += static_cast<int32_t>(w[c * 8 + static_cast<size_t>(b)]) * levels[(codes >> (8 * b)) & 15];
+        }
+    }
+    return sum;
+}
+#endif
+
 int64_t low_dot(const LowPlanes & planes, const uint8_t * row) {
+#if GGML_VEC_INDEX_USE_NEON
+    return low_dot_neon(reinterpret_cast<const uint8_t *>(planes.masks.data()), row, planes.row_len);
+#endif
 #if defined(GGML_VEC_INDEX_HAVE_VPOPCNT_KERNEL)
     // Upstream's VPOPCNTDQ form, counting the same bits.
     static const bool has_vpopcnt = [] {
@@ -914,9 +998,11 @@ bool turbovec_staged_search(
     float exact_bias = 0.0f;
     TurboVecPermuteDot pd;
     const bool permute_dot = turbovec_uses_permute_dot(idx);
-    // Upstream x86 rescores a 4-bit shortlist from the planes themselves
-    // (`exact4_sum`), its sign plane read from the vector-major region.
-    const bool exact4 = permute_dot && turbovec_sign_layout(idx) == kTurboVecLayoutVm;
+    // Upstream rescores a 4-bit shortlist from the planes themselves
+    // (`exact4_sum`), its sign plane read from the vector-major region on
+    // x86 and from the lane-blocked one on aarch64.
+    const bool vm_sign = turbovec_sign_layout(idx) == kTurboVecLayoutVm;
+    const bool exact4 = permute_dot && (vm_sign || arm_rules);
     std::vector<int8_t> exact4_w;
     bool exact_built = false;
     auto build_exact = [&]() {
@@ -949,9 +1035,15 @@ bool turbovec_staged_search(
     // One candidate's exact 4-bit score from the planes: the permute-dot
     // integer sum and its epilogue, the full scan's score bit for bit.
     auto exact4_score = [&](size_t v) {
-        const int32_t sum = turbovec_exact4_sum(exact4_w.data(), pd.levels, pd.zero,
-            idx.turbovec_sign_blocked.data() + (v / kBlock) * nsg * kBlock, idx.turbovec_data.data() + v * row_bytes,
-            nsg, v % kBlock);
+        const uint8_t * sign_block = idx.turbovec_sign_blocked.data() + (v / kBlock) * nsg * kBlock;
+        const uint8_t * low_row = idx.turbovec_data.data() + v * row_bytes;
+#if GGML_VEC_INDEX_USE_NEON
+        const int32_t sum = vm_sign ?
+            turbovec_exact4_sum(exact4_w.data(), pd.levels, pd.zero, sign_block, low_row, nsg, v % kBlock) :
+            exact4_sum_blocked(exact4_w.data(), pd.levels, sign_block, low_row, nsg, v % kBlock);
+#else
+        const int32_t sum = turbovec_exact4_sum(exact4_w.data(), pd.levels, pd.zero, sign_block, low_row, nsg, v % kBlock);
+#endif
         return std::fma(static_cast<float>(sum), pd.scale, pd.bias) * vscales[v];
     };
     auto plain_score = [&](size_t v, float s) {
