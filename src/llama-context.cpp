@@ -511,7 +511,8 @@ llama_context::llama_context(
         llama_memory_params params_mem = {
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
+            // training reads K/V of the current ubatch directly, so the SWA cache must not be padded beyond n_ctx
+            /*.swa_full  =*/ params.swa_full || cparams.training_ctx,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
             /*.no_alloc  =*/ model.no_alloc(),
