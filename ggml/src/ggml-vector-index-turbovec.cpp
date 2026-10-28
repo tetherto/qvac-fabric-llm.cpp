@@ -29,9 +29,6 @@ constexpr int kTurboVecDimMultiple = 8;
 constexpr int kTurboVecScoreBlock = 32;
 // 32-row blocks per parallel task of the cache repacks.
 constexpr size_t kTurboVecBlocksPerTask = 64;
-#if GGML_VEC_INDEX_USE_NEON
-constexpr int kTurboVecFlushEvery = 256;
-#endif
 constexpr uint64_t kTurboVecRotationSeed = 42;
 constexpr int kTurboVecHadamardRounds = 2;
 // rand_core 0.6 `seed_from_u64(42)`, frozen by upstream turbovec 1.x

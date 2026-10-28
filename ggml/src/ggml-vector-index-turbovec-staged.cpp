@@ -80,6 +80,9 @@ struct SignLut {
     std::vector<uint8_t> split;
     float scale = 1.0f;
     float bias = 0.0f;
+    // Entries capped at kSignLutCapSingle, so eight lookups fit a byte and
+    // the scan widens once per four groups (upstream score_sign_block_neon).
+    bool deferred = false;
 };
 
 // Per-query nibble tables over a sign plane (upstream build_sign_lut): the
@@ -118,6 +121,7 @@ SignLut build_sign_lut(const float * q, float m, int dim, bool single_query) {
     // lookups in u8, so its entries are capped at 31.
 #if GGML_VEC_INDEX_USE_NEON
     const float max_lut = single_query ? kSignLutCapSingle : 127.0f;
+    out.deferred = single_query;
 #else
     (void) single_query;
     const float max_lut = 127.0f;
@@ -148,9 +152,186 @@ void split_sign_lut(const ggml_vec_index & idx, SignLut & lut) {
     }
 }
 
+#if GGML_VEC_INDEX_USE_NEON
+// score_turbovec_lut_block for a block of the sign region under deferred
+// tables (upstream score_lut_block_neon<DEFER = true>): four byte groups,
+// eight lookups of at most 31, are summed in u8 and widened once instead
+// of once per group. Each flush's u16 sums are the same integers as the
+// per-group kernel's, so the scores match it bit for bit.
+void score_sign_block_deferred(const uint8_t * lut, float lut_scale, float lut_bias, const uint8_t * blocked_codes,
+        const float * vector_scales, size_t block, size_t n, size_t n_groups, float * out) {
+    const size_t base = block * kBlock;
+    const size_t valid = std::min(kBlock, n - base);
+    const uint8_t * codes = blocked_codes + block * n_groups * kBlock;
+    const uint8x16_t nib = vdupq_n_u8(0x0f);
+    const float32x4_t scale_v = vdupq_n_f32(lut_scale);
+    float32x4_t facc[8];
+    for (float32x4_t & f : facc) {
+        f = vdupq_n_f32(lut_bias);
+    }
+    const size_t flush = static_cast<size_t>(kTurboVecFlushEvery);
+    for (size_t g_begin = 0; g_begin < n_groups; g_begin += flush) {
+        const size_t g_end = std::min(g_begin + flush, n_groups);
+        uint16x8_t acc[4] = { vdupq_n_u16(0), vdupq_n_u16(0), vdupq_n_u16(0), vdupq_n_u16(0) };
+        size_t g = g_begin;
+        for (; g + 3 < g_end; g += 4) {
+            const uint8_t * lp = lut + g * 32;
+            const uint8_t * cp = codes + g * kBlock;
+            uint8x16_t t0 = vdupq_n_u8(0);
+            uint8x16_t t1 = vdupq_n_u8(0);
+            for (size_t j = 0; j < 4; ++j) {
+                const uint8x16_t lut_hi = vld1q_u8(lp + j * 32);
+                const uint8x16_t lut_lo = vld1q_u8(lp + j * 32 + 16);
+                const uint8x16_t c0 = vld1q_u8(cp + j * kBlock);
+                const uint8x16_t c1 = vld1q_u8(cp + j * kBlock + 16);
+                t0 = vaddq_u8(t0, vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c0, nib)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c0, 4))));
+                t1 = vaddq_u8(t1, vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c1, nib)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c1, 4))));
+            }
+            acc[0] = vaddw_u8(acc[0], vget_low_u8(t0));
+            acc[1] = vaddw_high_u8(acc[1], t0);
+            acc[2] = vaddw_u8(acc[2], vget_low_u8(t1));
+            acc[3] = vaddw_high_u8(acc[3], t1);
+        }
+        for (; g < g_end; ++g) {
+            const uint8_t * lp = lut + g * 32;
+            const uint8_t * cp = codes + g * kBlock;
+            const uint8x16_t lut_hi = vld1q_u8(lp);
+            const uint8x16_t lut_lo = vld1q_u8(lp + 16);
+            const uint8x16_t c0 = vld1q_u8(cp);
+            const uint8x16_t c1 = vld1q_u8(cp + 16);
+            const uint8x16_t s0 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c0, nib)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c0, 4)));
+            const uint8x16_t s1 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c1, nib)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c1, 4)));
+            acc[0] = vaddw_u8(acc[0], vget_low_u8(s0));
+            acc[1] = vaddw_high_u8(acc[1], s0);
+            acc[2] = vaddw_u8(acc[2], vget_low_u8(s1));
+            acc[3] = vaddw_high_u8(acc[3], s1);
+        }
+        for (int i = 0; i < 4; ++i) {
+            const float32x4_t lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(acc[i])));
+            const float32x4_t hi = vcvtq_f32_u32(vmovl_high_u16(acc[i]));
+            facc[i * 2] = vfmaq_f32(facc[i * 2], scale_v, lo);
+            facc[i * 2 + 1] = vfmaq_f32(facc[i * 2 + 1], scale_v, hi);
+        }
+    }
+    if (valid == kBlock) {
+        for (int i = 0; i < 8; ++i) {
+            vst1q_f32(out + i * 4, vmulq_f32(facc[i], vld1q_f32(vector_scales + base + static_cast<size_t>(i) * 4)));
+        }
+        return;
+    }
+    float decoded[kBlock];
+    for (int i = 0; i < 8; ++i) {
+        vst1q_f32(decoded + i * 4, facc[i]);
+    }
+    for (size_t lane = 0; lane < kBlock; ++lane) {
+        out[lane] = lane < valid ? decoded[lane] * vector_scales[base + lane] : -std::numeric_limits<float>::infinity();
+    }
+}
+
+// Candidates one ranking batch gathers (upstream RANK_BATCH).
+constexpr size_t kRankBatch = 32;
+
+// Sixteen 16-byte rows to sixteen columns (upstream transpose16_neon):
+// out[j] holds byte j of each row, in row order.
+void transpose16(const uint8x16_t r[16], uint8x16_t out[16]) {
+    uint8x16_t a[8];
+    uint8x16_t b[8];
+    for (size_t i = 0; i < 8; ++i) {
+        a[i] = vzip1q_u8(r[2 * i], r[2 * i + 1]);
+        b[i] = vzip2q_u8(r[2 * i], r[2 * i + 1]);
+    }
+    uint8x16_t q[4][4];
+    for (size_t i = 0; i < 4; ++i) {
+        const uint16x8_t a0 = vreinterpretq_u16_u8(a[2 * i]);
+        const uint16x8_t a1 = vreinterpretq_u16_u8(a[2 * i + 1]);
+        const uint16x8_t b0 = vreinterpretq_u16_u8(b[2 * i]);
+        const uint16x8_t b1 = vreinterpretq_u16_u8(b[2 * i + 1]);
+        q[0][i] = vreinterpretq_u8_u16(vzip1q_u16(a0, a1));
+        q[1][i] = vreinterpretq_u8_u16(vzip2q_u16(a0, a1));
+        q[2][i] = vreinterpretq_u8_u16(vzip1q_u16(b0, b1));
+        q[3][i] = vreinterpretq_u8_u16(vzip2q_u16(b0, b1));
+    }
+    for (size_t c = 0; c < 4; ++c) {
+        // q[c][i]: columns 4c..4c+4 of rows 4i..4i+4.
+        uint8x16_t o[2][2];
+        for (size_t i = 0; i < 2; ++i) {
+            const uint32x4_t x0 = vreinterpretq_u32_u8(q[c][2 * i]);
+            const uint32x4_t x1 = vreinterpretq_u32_u8(q[c][2 * i + 1]);
+            o[0][i] = vreinterpretq_u8_u32(vzip1q_u32(x0, x1));
+            o[1][i] = vreinterpretq_u8_u32(vzip2q_u32(x0, x1));
+        }
+        for (size_t h = 0; h < 2; ++h) {
+            // o[h][i]: columns 4c+2h, 4c+2h+1 of rows 8i..8i+8.
+            const uint64x2_t y0 = vreinterpretq_u64_u8(o[h][0]);
+            const uint64x2_t y1 = vreinterpretq_u64_u8(o[h][1]);
+            out[4 * c + 2 * h] = vreinterpretq_u8_u64(vzip1q_u64(y0, y1));
+            out[4 * c + 2 * h + 1] = vreinterpretq_u8_u64(vzip2q_u64(y0, y1));
+        }
+    }
+}
+
+// For up to kRankBatch rows of nsg bytes, the sum over byte positions of
+// the two nibble lookups in the sign tables t: the sign scan's arithmetic,
+// on rows gathered from anywhere (upstream table_sums_neon). Sixteen rows
+// are transposed so one position's lookups serve them all.
+void table_sums(const uint8_t * t, const uint8_t * const * rows, size_t n_rows, size_t nsg, uint32_t * out) {
+    const uint8x16_t zero = vdupq_n_u8(0);
+    const uint8x16_t nib = vdupq_n_u8(0x0f);
+    uint32x4_t acc32[8];
+    for (uint32x4_t & a : acc32) {
+        a = vdupq_n_u32(0);
+    }
+    uint16x8_t acc16[4] = { vdupq_n_u16(0), vdupq_n_u16(0), vdupq_n_u16(0), vdupq_n_u16(0) };
+    for (size_t c = 0; c < nsg;) {
+        const size_t width = std::min<size_t>(nsg - c, 16);
+        uint8x16_t r[2][16];
+        for (size_t i = 0; i < 2 * 16; ++i) {
+            if (i >= n_rows) {
+                r[i / 16][i % 16] = zero;
+            } else if (width == 16) {
+                r[i / 16][i % 16] = vld1q_u8(rows[i] + c);
+            } else {
+                uint8_t tmp[16] = {};
+                std::memcpy(tmp, rows[i] + c, width);
+                r[i / 16][i % 16] = vld1q_u8(tmp);
+            }
+        }
+        uint8x16_t cols[2][16];
+        transpose16(r[0], cols[0]);
+        transpose16(r[1], cols[1]);
+        for (size_t j = 0; j < width; ++j) {
+            const uint8_t * tp = t + (c + j) * 32;
+            const uint8x16_t thi = vld1q_u8(tp);
+            const uint8x16_t tlo = vld1q_u8(tp + 16);
+            for (size_t h = 0; h < 2; ++h) {
+                const uint8x16_t x = cols[h][j];
+                // Each entry is at most 127, so the pair fits a byte.
+                const uint8x16_t sum = vaddq_u8(vqtbl1q_u8(thi, vshrq_n_u8(x, 4)), vqtbl1q_u8(tlo, vandq_u8(x, nib)));
+                acc16[2 * h] = vaddw_u8(acc16[2 * h], vget_low_u8(sum));
+                acc16[2 * h + 1] = vaddw_high_u8(acc16[2 * h + 1], sum);
+            }
+        }
+        c += 16;
+        // 16 positions add at most 16 * 254 to a u16 lane: widen every 256
+        // positions, and at the end.
+        if (c % 256 == 0 || c >= nsg) {
+            for (size_t k = 0; k < 4; ++k) {
+                acc32[2 * k] = vaddw_u16(acc32[2 * k], vget_low_u16(acc16[k]));
+                acc32[2 * k + 1] = vaddw_high_u16(acc32[2 * k + 1], acc16[k]);
+                acc16[k] = vdupq_n_u16(0);
+            }
+        }
+    }
+    for (size_t k = 0; k < 8; ++k) {
+        vst1q_u32(out + 4 * k, acc32[k]);
+    }
+}
+#endif
+
 // One block of sign scores, with the kernel upstream scans the sign region
 // with on this index's host: the `vpermb` scan over a vector-major region
-// (x86), the nibble LUT scan otherwise.
+// (x86), the deferred nibble LUT scan for a lone query on aarch64, the
+// nibble LUT scan otherwise.
 void score_sign_block(const ggml_vec_index & idx, const SignLut & lut, const uint8_t * sign, size_t block, size_t n,
         float * out) {
     const float * vscales = idx.turbovec_scale.data();
@@ -159,6 +340,13 @@ void score_sign_block(const ggml_vec_index & idx, const SignLut & lut, const uin
             lut.bias, sign, vscales, block, n, 2, idx.dim / 2, out);
         return;
     }
+#if GGML_VEC_INDEX_USE_NEON
+    if (lut.deferred) {
+        score_sign_block_deferred(
+            lut.values.data(), lut.scale, lut.bias, sign, vscales, block, n, static_cast<size_t>(idx.dim) / 8, out);
+        return;
+    }
+#endif
     score_turbovec_lut_block(lut.values.data(), lut.scale, lut.bias, sign, vscales, block, n, 2, idx.dim / 2, out);
 }
 
@@ -933,57 +1121,86 @@ bool turbovec_staged_search(
         const float b_over_m[3] = { stats.beta[0] / m, stats.beta[1] / m, stats.beta[2] / m };
         const float a1_over_m = stats.alpha1 / m;
         const float b1_over_m = stats.beta1 / m;
-        auto plane_term = [&](size_t v, size_t plane) -> float {
-            const uint8_t * low = idx.turbovec_data.data() + v * row_bytes + plane * nsg;
+        // m * sum(+-q) over one low plane for the candidates in [begin, end),
+        // at most kRankBatch of them (upstream plane_terms): the sign tables
+        // over their rows, undone to m * sum(+-q), or the bit masks counted.
+        auto plane_terms = [&](size_t begin, size_t end, size_t plane, float * out) {
             if (table_rank) {
-                // The sign tables over a low plane row (upstream table_sums),
-                // undone to m * sum(+-q).
-                uint32_t sum = 0;
-                for (size_t g = 0; g < nsg; ++g) {
-                    sum += static_cast<uint32_t>(rank_lut.values[g * 32 + (low[g] >> 4)]) +
-                        rank_lut.values[g * 32 + 16 + (low[g] & 0x0f)];
+#if GGML_VEC_INDEX_USE_NEON
+                const uint8_t * rows[kRankBatch];
+                for (size_t i = begin; i < end; ++i) {
+                    rows[i - begin] = idx.turbovec_data.data() + list[i].slot * row_bytes + plane * nsg;
                 }
+                uint32_t sums[kRankBatch];
+                table_sums(rank_lut.values.data(), rows, end - begin, nsg, sums);
                 const float b = rank_lut.bias - bias_corr;
-                return rank_lut.scale * static_cast<float>(sum) + b;
+                for (size_t i = begin; i < end; ++i) {
+                    out[i - begin] = rank_lut.scale * static_cast<float>(sums[i - begin]) + b;
+                }
+#endif
+                return;
             }
-            return low_planes.unit * static_cast<float>(2 * low_dot(low_planes, low) - low_planes.sum_w);
+            for (size_t i = begin; i < end; ++i) {
+                const uint8_t * low = idx.turbovec_data.data() + list[i].slot * row_bytes + plane * nsg;
+                out[i - begin] = low_planes.unit * static_cast<float>(2 * low_dot(low_planes, low) - low_planes.sum_w);
+            }
+        };
+        // Runs fn(begin, end) over the list in batches of kRankBatch; a split
+        // query spreads the batches over threads.
+        auto for_each_batch = [&](auto && fn) {
+            auto run = [&](size_t from, size_t to) {
+                for (size_t b = from; b < to; b += kRankBatch) {
+                    fn(b, std::min(to, b + kRankBatch));
+                }
+            };
+            const size_t count = list.size();
+            if (!split) {
+                run(0, count);
+                return;
+            }
+            parallel_for((count + kRankPerTask - 1) / kRankPerTask, n_threads, [&](size_t task, size_t) {
+                run(task * kRankPerTask, std::min(count, (task + 1) * kRankPerTask));
+            });
         };
         const size_t top_plane = n_low - 1;
         std::vector<float> tops(list.size());
-        for_each_candidate(list.size(), [&](size_t i) {
-            Candidate & c = list[i];
-            const float l = plane_term(c.slot, top_plane);
-            tops[i] = l;
-            const float vscale = vscales[c.slot];
-            if (vscale == 0.0f) {
-                c.score = 0.0f;
-            } else {
-                const float m_s = c.score / vscale - bias_corr;
-                c.score = vscale * (a1_over_m * m_s + b1_over_m * l + bias_corr);
+        for_each_batch([&](size_t begin, size_t end) {
+            plane_terms(begin, end, top_plane, tops.data() + begin);
+            for (size_t i = begin; i < end; ++i) {
+                Candidate & c = list[i];
+                const float vscale = vscales[c.slot];
+                if (vscale == 0.0f) {
+                    c.score = 0.0f;
+                } else {
+                    const float m_s = c.score / vscale - bias_corr;
+                    c.score = vscale * (a1_over_m * m_s + b1_over_m * tops[i] + bias_corr);
+                }
             }
         });
         if (n_low > 1) {
             // keep_best's choice follows the strict (score, slot) order, so
             // it does not depend on the order the shortlist arrived in.
             keep_best(list, mid_len(k_sz), &tops);
-            for_each_candidate(list.size(), [&](size_t i) {
-                Candidate & c = list[i];
-                const float vscale = vscales[c.slot];
-                if (vscale == 0.0f) {
-                    c.score = 0.0f;
-                    return;
-                }
-                float l[3] = {};
+            for_each_batch([&](size_t begin, size_t end) {
+                float l[3][kRankBatch];
                 for (size_t j = 0; j + 1 < n_low; ++j) {
-                    l[j] = plane_term(c.slot, j);
+                    plane_terms(begin, end, j, l[j]);
                 }
-                l[n_low - 1] = tops[i];
-                const float m_s = ((c.score / vscale - bias_corr) - b1_over_m * l[n_low - 1]) / a1_over_m;
-                float est = a_over_m * m_s;
-                for (size_t j = 0; j < n_low; ++j) {
-                    est += b_over_m[j] * l[j];
+                for (size_t i = begin; i < end; ++i) {
+                    Candidate & c = list[i];
+                    const float vscale = vscales[c.slot];
+                    if (vscale == 0.0f) {
+                        c.score = 0.0f;
+                        continue;
+                    }
+                    l[n_low - 1][i - begin] = tops[i];
+                    const float m_s = ((c.score / vscale - bias_corr) - b1_over_m * tops[i]) / a1_over_m;
+                    float est = a_over_m * m_s;
+                    for (size_t j = 0; j < n_low; ++j) {
+                        est += b_over_m[j] * l[j][i - begin];
+                    }
+                    c.score = vscale * (est + bias_corr);
                 }
-                c.score = vscale * (est + bias_corr);
             });
         }
         keep_best(list, t_len);
