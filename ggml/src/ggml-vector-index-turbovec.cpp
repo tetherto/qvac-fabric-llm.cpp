@@ -1409,6 +1409,47 @@ static void build_turbovec_query_lut(
 
     for (int g = 0; g < n_byte_groups; ++g) {
         const int dim_start = g * codes_per_byte;
+        if (bits == 2) {
+            // Upstream H67/H109: a 2-bit sub-table's entry (a, b) is
+            // q[d] * c[a] + q[d + 1] * c[b], so it is 4 + 4 products and 16
+            // adds, summed as (0 + p_a) + p_b like the loop below, so every
+            // entry is the same bit pattern; f32 addition is monotone in
+            // each operand, so the extremes are the sums of the addends'.
+            // The bias takes the two halves' minima as one sum, as below.
+            float sub_mins[2];
+            for (int half = 0; half < 2; ++half) {
+                const size_t d = static_cast<size_t>(dim_start + half * 2);
+                float pa[4];
+                float pb[4];
+                for (int c = 0; c < 4; ++c) {
+                    pa[c] = 0.0f + turbovec_lut_product(rotated_query[d], centroids[c]);
+                    pb[c] = turbovec_lut_product(rotated_query[d + 1], centroids[c]);
+                }
+                float * entries = float_vals.data() + static_cast<size_t>(g) * 32 + static_cast<size_t>(half) * 16;
+                for (int a = 0; a < 4; ++a) {
+                    for (int b = 0; b < 4; ++b) {
+                        entries[a * 4 + b] = pa[a] + pb[b];
+                    }
+                }
+                float a_min = pa[0];
+                float a_max = pa[0];
+                float b_min = pb[0];
+                float b_max = pb[0];
+                for (int c = 1; c < 4; ++c) {
+                    a_min = std::min(a_min, pa[c]);
+                    a_max = std::max(a_max, pa[c]);
+                    b_min = std::min(b_min, pb[c]);
+                    b_max = std::max(b_max, pb[c]);
+                }
+                const float sub_min = a_min + b_min;
+                const float sub_max = a_max + b_max;
+                mins[static_cast<size_t>(g) * 2 + static_cast<size_t>(half)] = sub_min;
+                sub_mins[half] = sub_min;
+                max_span = std::max(max_span, sub_max - sub_min);
+            }
+            out_bias += sub_mins[0] + sub_mins[1];
+            continue;
+        }
         float lo_min = FLT_MAX;
         float lo_max = -FLT_MAX;
         for (uint16_t nibble = 0; nibble < 16; ++nibble) {
