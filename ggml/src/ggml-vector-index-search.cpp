@@ -1463,6 +1463,19 @@ static int ggml_vec_index_search_impl(
                 n_q,
                 dim);
         }
+        // A staged (planes) search over several queries scans the sign
+        // region four queries at a time; it declines a filtered search and
+        // a batch too small for the threads, which run query by query.
+        if (is_turbovec(*idx) && idx->turbovec_planes && idx->turbovec_staged_enabled && allowed_ptr == nullptr &&
+            active_count(*idx) == idx->slot_to_id.size() && n_q > 1) {
+            std::vector<std::vector<ScoreId>> heaps;
+            if (turbovec_staged_search_batch(*idx, rotated_turbovec_queries.data(), n_q, k, idx->n_threads, heaps)) {
+                for (size_t q = 0; q < n_q_sz; ++q) {
+                    write_topk_heap(*idx, k, out_scores + q * k_sz, out_ids + q * k_sz, heaps[q]);
+                }
+                return GGML_VEC_INDEX_OK;
+            }
+        }
         // Queries covered by the fused TurboVec batch kernels, as upstream
         // chunks them.
         struct Batch {
