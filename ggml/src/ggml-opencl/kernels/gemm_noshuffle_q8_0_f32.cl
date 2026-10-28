@@ -7,6 +7,8 @@
 #define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
 #endif
 
+#define QK8_0 32
+
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
 #endif
@@ -23,7 +25,6 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
         ulong offsetd
 ) {
 
-    int m_4 = m >> 2;
     int n_4 = n >> 2;
 
     int gy   = get_global_id(0);
@@ -31,66 +32,73 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
     int gx_2 = gx << 2;
     dst  = (global float *)((global char*)dst  + offsetd);
 
-
-    half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    float8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     half8 B;
-    half4 deq;
 
     __global const uint* wptr = src0_q + gx_2;
     __global const half* sptr = src0_d + gx_2;
 
-      for (int i = 0; i < k; i += 4) {
-        uint4 pack4 = vload4(0, wptr + (i / 4) * m);
-        half4 scale = vload4(0, sptr + (i / 32) * m);
+    for (int ib = 0; ib < k; ib += QK8_0) {
+        half4 scale = vload4(0, sptr + (ib / QK8_0) * m);
+        half8 b0 = 0, b1 = 0, b2 = 0, b3 = 0;
 
-        char4 p0 = as_char4(pack4.s0);
-        char4 p1 = as_char4(pack4.s1);
-        char4 p2 = as_char4(pack4.s2);
-        char4 p3 = as_char4(pack4.s3);
+        for (int i = ib; i < ib + QK8_0; i += 4) {
+            uint4 pack4 = vload4(0, wptr + (i / 4) * m);
 
-        // ------------------- j = 0 (k = i+0) -------------------
-        B.s0123 = read_imageh(src1, gy * 2 + (i + 0) * n_4);
-        B.s4567 = read_imageh(src1, gy * 2 + (i + 0) * n_4 + 1);
+            char4 p0 = as_char4(pack4.s0);
+            char4 p1 = as_char4(pack4.s1);
+            char4 p2 = as_char4(pack4.s2);
+            char4 p3 = as_char4(pack4.s3);
 
-        half4 wj0 = convert_half4((char4)(p0.s0, p1.s0, p2.s0, p3.s0)) * scale;
+            // ------------------- j = 0 (k = i+0) -------------------
+            B.s0123 = read_imageh(src1, gy * 2 + (i + 0) * n_4);
+            B.s4567 = read_imageh(src1, gy * 2 + (i + 0) * n_4 + 1);
 
-        c0 += B * wj0.s0;
-        c1 += B * wj0.s1;
-        c2 += B * wj0.s2;
-        c3 += B * wj0.s3;
+            half4 wj0 = convert_half4((char4)(p0.s0, p1.s0, p2.s0, p3.s0)) * scale;
 
-        // ------------------- j = 1 (k = i+1) -------------------
-        B.s0123 = read_imageh(src1, gy * 2 + (i + 1) * n_4);
-        B.s4567 = read_imageh(src1, gy * 2 + (i + 1) * n_4 + 1);
+            b0 += B * wj0.s0;
+            b1 += B * wj0.s1;
+            b2 += B * wj0.s2;
+            b3 += B * wj0.s3;
 
-        half4 wj1 = convert_half4((char4)(p0.s1, p1.s1, p2.s1, p3.s1)) * scale;
+            // ------------------- j = 1 (k = i+1) -------------------
+            B.s0123 = read_imageh(src1, gy * 2 + (i + 1) * n_4);
+            B.s4567 = read_imageh(src1, gy * 2 + (i + 1) * n_4 + 1);
 
-        c0 += B * wj1.s0;
-        c1 += B * wj1.s1;
-        c2 += B * wj1.s2;
-        c3 += B * wj1.s3;
+            half4 wj1 = convert_half4((char4)(p0.s1, p1.s1, p2.s1, p3.s1)) * scale;
 
-        // ------------------- j = 2 (k = i+2) -------------------
-        B.s0123 = read_imageh(src1, gy * 2 + (i + 2) * n_4);
-        B.s4567 = read_imageh(src1, gy * 2 + (i + 2) * n_4 + 1);
+            b0 += B * wj1.s0;
+            b1 += B * wj1.s1;
+            b2 += B * wj1.s2;
+            b3 += B * wj1.s3;
 
-        half4 wj2 = convert_half4((char4)(p0.s2, p1.s2, p2.s2, p3.s2)) * scale;
+            // ------------------- j = 2 (k = i+2) -------------------
+            B.s0123 = read_imageh(src1, gy * 2 + (i + 2) * n_4);
+            B.s4567 = read_imageh(src1, gy * 2 + (i + 2) * n_4 + 1);
 
-        c0 += B * wj2.s0;
-        c1 += B * wj2.s1;
-        c2 += B * wj2.s2;
-        c3 += B * wj2.s3;
+            half4 wj2 = convert_half4((char4)(p0.s2, p1.s2, p2.s2, p3.s2)) * scale;
 
-        // ------------------- j = 3 (k = i+3) -------------------
-        B.s0123 = read_imageh(src1, gy * 2 + (i + 3) * n_4);
-        B.s4567 = read_imageh(src1, gy * 2 + (i + 3) * n_4 + 1);
+            b0 += B * wj2.s0;
+            b1 += B * wj2.s1;
+            b2 += B * wj2.s2;
+            b3 += B * wj2.s3;
 
-        half4 wj3 = convert_half4((char4)(p0.s3, p1.s3, p2.s3, p3.s3)) * scale;
+            // ------------------- j = 3 (k = i+3) -------------------
+            B.s0123 = read_imageh(src1, gy * 2 + (i + 3) * n_4);
+            B.s4567 = read_imageh(src1, gy * 2 + (i + 3) * n_4 + 1);
 
-        c0 += B * wj3.s0;
-        c1 += B * wj3.s1;
-        c2 += B * wj3.s2;
-        c3 += B * wj3.s3;
+            half4 wj3 = convert_half4((char4)(p0.s3, p1.s3, p2.s3, p3.s3)) * scale;
+
+            b0 += B * wj3.s0;
+            b1 += B * wj3.s1;
+            b2 += B * wj3.s2;
+            b3 += B * wj3.s3;
+        }
+
+        c0 += convert_float8(b0);
+        c1 += convert_float8(b1);
+        c2 += convert_float8(b2);
+        c3 += convert_float8(b3);
     }
 
     int idx = (gy << 3) * m + (gx << 2);
