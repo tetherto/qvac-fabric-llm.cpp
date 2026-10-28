@@ -649,9 +649,10 @@ struct ggml_webgpu_flash_attn_vec_pipeline_key_hash {
 struct ggml_webgpu_flash_attn_pipeline_key {
     ggml_webgpu_flash_attn_common_pipeline_key common;
     bool                                       use_sg_matrix;
+    bool                                       prec_f32;
 
     bool operator==(const ggml_webgpu_flash_attn_pipeline_key & other) const {
-        return common == other.common && use_sg_matrix == other.use_sg_matrix;
+        return common == other.common && use_sg_matrix == other.use_sg_matrix && prec_f32 == other.prec_f32;
     }
 };
 
@@ -660,6 +661,7 @@ struct ggml_webgpu_flash_attn_pipeline_key_hash {
         size_t seed = 0;
         ggml_webgpu_flash_attn_hash_common_pipeline_key(seed, key.common);
         ggml_webgpu_hash_combine(seed, key.use_sg_matrix);
+        ggml_webgpu_hash_combine(seed, key.prec_f32);
         return seed;
     }
 };
@@ -947,15 +949,25 @@ inline uint32_t ggml_webgpu_flash_attn_get_vec_kv_tile(size_t   wg_mem_limit_byt
     return kv_tile;
 }
 
+inline bool ggml_webgpu_flash_attn_prec_f32(const ggml_tensor * dst) {
+    return ggml_flash_attn_ext_get_prec(dst) == GGML_PREC_F32;
+}
+
 inline bool ggml_webgpu_flash_attn_can_use_subgroup_matrix_path(bool                supports_subgroup_matrix,
                                                                 uint32_t            sg_mat_k,
                                                                 uint32_t            sg_mat_n,
                                                                 const ggml_tensor * Q,
-                                                                const ggml_tensor * V) {
-    return supports_subgroup_matrix && Q->ne[0] % sg_mat_k == 0 && V->ne[0] % sg_mat_n == 0;
+                                                                const ggml_tensor * V,
+                                                                const ggml_tensor * dst) {
+    return supports_subgroup_matrix && !ggml_webgpu_flash_attn_prec_f32(dst) && Q->ne[0] % sg_mat_k == 0 &&
+           V->ne[0] % sg_mat_n == 0;
 }
 
 /** Matrix Multiplication **/
+
+inline bool ggml_webgpu_mul_mat_prec_f32(const ggml_tensor * dst) {
+    return dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32;
+}
 
 struct ggml_webgpu_mul_mat_vec_pipeline_key {
     ggml_type src0_type;
@@ -964,10 +976,12 @@ struct ggml_webgpu_mul_mat_vec_pipeline_key {
     uint32_t  num_cols;
     bool      use_mmvq;
     bool      src_overlap;
+    bool      prec_f32;
 
     bool operator==(const ggml_webgpu_mul_mat_vec_pipeline_key & other) const {
         return src0_type == other.src0_type && src1_type == other.src1_type && vectorized == other.vectorized &&
-               num_cols == other.num_cols && use_mmvq == other.use_mmvq && src_overlap == other.src_overlap;
+               num_cols == other.num_cols && use_mmvq == other.use_mmvq && src_overlap == other.src_overlap &&
+               prec_f32 == other.prec_f32;
     }
 };
 
@@ -980,6 +994,7 @@ struct ggml_webgpu_mul_mat_vec_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.num_cols);
         ggml_webgpu_hash_combine(seed, key.use_mmvq);
         ggml_webgpu_hash_combine(seed, key.src_overlap);
+        ggml_webgpu_hash_combine(seed, key.prec_f32);
         return seed;
     }
 };
@@ -1011,10 +1026,12 @@ struct ggml_webgpu_mul_mat_pipeline_key {
     int       vectorized;
     int       use_subgroup_matrix;
     bool      src_overlap;
+    bool      prec_f32;
 
     bool operator==(const ggml_webgpu_mul_mat_pipeline_key & other) const {
         return src0_type == other.src0_type && src1_type == other.src1_type && vectorized == other.vectorized &&
-               use_subgroup_matrix == other.use_subgroup_matrix && src_overlap == other.src_overlap;
+               use_subgroup_matrix == other.use_subgroup_matrix && src_overlap == other.src_overlap &&
+               prec_f32 == other.prec_f32;
     }
 };
 
@@ -1026,6 +1043,7 @@ struct ggml_webgpu_mul_mat_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.vectorized);
         ggml_webgpu_hash_combine(seed, key.use_subgroup_matrix);
         ggml_webgpu_hash_combine(seed, key.src_overlap);
+        ggml_webgpu_hash_combine(seed, key.prec_f32);
         return seed;
     }
 };
@@ -1189,8 +1207,12 @@ struct ggml_webgpu_soft_max_pipeline_key_hash {
 
 inline bool ggml_webgpu_can_use_mmvq(const ggml_tensor * src0,
                                      const ggml_tensor * src1,
+                                     const ggml_tensor * dst,
                                      bool                supports_dot_product,
                                      const std::string & vendor) {
+    if (ggml_webgpu_mul_mat_prec_f32(dst)) {
+        return false;
+    }
     if (src1->ne[1] <= 4) {
         bool supports_dp4a = vendor == "amd" || vendor == "intel" || vendor == "nvidia";
         if (supports_dp4a && supports_dot_product) {
@@ -2016,8 +2038,10 @@ class ggml_webgpu_shader_lib {
                              0;
         key.num_cols   = context.dst->ne[1];
         key.use_mmvq =
-            ggml_webgpu_can_use_mmvq(context.src0, context.src1, context.supports_dot_product, context.vendor);
+            ggml_webgpu_can_use_mmvq(context.src0, context.src1, context.dst, context.supports_dot_product,
+                                     context.vendor);
         key.src_overlap = src_overlap;
+        key.prec_f32    = ggml_webgpu_mul_mat_prec_f32(context.dst) && context.src1->type == GGML_TYPE_F16;
 
         auto it = mul_mat_vec_pipelines.find(key);
         if (it != mul_mat_vec_pipelines.end()) {
@@ -2144,6 +2168,11 @@ class ggml_webgpu_shader_lib {
             defines.push_back("Q8_1_T");
         }
 
+        if (key.prec_f32) {
+            defines.push_back("PREC_F32");
+            variant += "_prec_f32";
+        }
+
         if (key.src_overlap) {
             defines.push_back("SRC_OVERLAP");
             variant += "_src_overlap";
@@ -2178,7 +2207,8 @@ class ggml_webgpu_shader_lib {
                                    (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
                                       1 :
                                       0;
-        key.use_subgroup_matrix = context.supports_subgroup_matrix;
+        key.prec_f32            = ggml_webgpu_mul_mat_prec_f32(context.dst);
+        key.use_subgroup_matrix = context.supports_subgroup_matrix && !key.prec_f32;
         key.src_overlap         = src_overlap;
 
         auto it = mul_mat_fast_pipelines.find(key);
@@ -2309,6 +2339,14 @@ class ggml_webgpu_shader_lib {
         if (key.src_overlap) {
             defines.push_back("SRC_OVERLAP");
             variant += "_src_overlap";
+        }
+
+        if (key.prec_f32 && context.src1->type == GGML_TYPE_F32) {
+            defines.push_back("SRC1_SHMEM_F32");
+            if (context.src0->type == GGML_TYPE_F32) {
+                defines.push_back("SRC0_SHMEM_TYPE=f32");
+            }
+            variant += "_prec_f32";
         }
 
         if (!key.use_subgroup_matrix) {
@@ -2921,7 +2959,8 @@ class ggml_webgpu_shader_lib {
 
     webgpu_pipeline get_flash_attn_pipeline(const ggml_webgpu_shader_lib_context & context, bool kv_overlap) {
         const bool can_use_subgroup_matrix = ggml_webgpu_flash_attn_can_use_subgroup_matrix_path(
-            context.supports_subgroup_matrix, context.sg_mat_k, context.sg_mat_n, context.src0, context.src2);
+            context.supports_subgroup_matrix, context.sg_mat_k, context.sg_mat_n, context.src0, context.src2,
+            context.dst);
         ggml_webgpu_flash_attn_decisions decisions = {};
         decisions.use_sg_matrix                    = can_use_subgroup_matrix;
         decisions.q_tile = decisions.use_sg_matrix ? context.sg_mat_m : GGML_WEBGPU_FLASH_ATTN_TILE_Q_TILE;
@@ -2932,6 +2971,7 @@ class ggml_webgpu_shader_lib {
         key.common.k_direct &= decisions.use_sg_matrix && key.common.k_type == GGML_TYPE_F16;
         key.common.v_direct &= decisions.use_sg_matrix && key.common.v_type == GGML_TYPE_F16;
         key.use_sg_matrix = decisions.use_sg_matrix;
+        key.prec_f32      = ggml_webgpu_flash_attn_prec_f32(context.dst);
 
         uint32_t max_kv_tile = ggml_webgpu_flash_attn_max_kv_tile(
             context.wg_mem_limit_bytes, decisions.q_tile, decisions.use_sg_matrix ? context.sg_mat_n : 1u,
@@ -2980,6 +3020,10 @@ class ggml_webgpu_shader_lib {
         const char *             shader_src = nullptr;
         if (!key.use_sg_matrix) {
             shader_src = wgsl_flash_attn_tile;
+            if (key.prec_f32) {
+                defines.push_back("PREC_F32");
+                variant += "_prec_f32";
+            }
             defines.push_back("MIN_SUBGROUP_SIZE=" + std::to_string(context.min_subgroup_size) + "u");
             defines.push_back("MAX_SUBGROUP_SIZE=" + std::to_string(context.max_subgroup_size) + "u");
             variant += "_tile_sg" + std::to_string(context.min_subgroup_size) + "_" +

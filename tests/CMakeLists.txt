@@ -426,6 +426,8 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 if (GGML_WEBGPU AND NOT EMSCRIPTEN)
+    llama_build_and_test(test-webgpu-mul-mat-prec-f32.cpp)
+    set_tests_properties(test-webgpu-mul-mat-prec-f32 PROPERTIES SKIP_RETURN_CODE 77)
     llama_build(test-webgpu-registry.cpp)
     if (GGML_BACKEND_DL)
         target_compile_definitions(test-webgpu-registry PRIVATE TEST_WEBGPU_DL)
