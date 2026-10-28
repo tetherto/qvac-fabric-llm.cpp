@@ -54,7 +54,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
     int gx = get_global_id(1);
     int gx_2 = gx << 2;
 
-    half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    float8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     half8 B;
     half4 dequantized_weights;
 
@@ -84,6 +84,8 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
         half4 scale = convert_half4(convert_float4(d)  * convert_float4((uchar4)(sv0, sv1, sv2, sv3)));
         half4 mval  = convert_half4(convert_float4(dm) * convert_float4((uchar4)(mn0, mn1, mn2, mn3)));
 
+        half8 b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+
         for (int l = 0; l < 32; l += 4) {
             int ki = i + l;
             ushort4 bits4 = vload4(0, weight_ptr + (ki/4) * m);
@@ -95,10 +97,10 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
             dequantized_weights.s1 = (bits4.s1 & 0x000F) * scale.s1 - mval.s1;
             dequantized_weights.s2 = (bits4.s2 & 0x000F) * scale.s2 - mval.s2;
             dequantized_weights.s3 = (bits4.s3 & 0x000F) * scale.s3 - mval.s3;
-            c0 += B * dequantized_weights.s0;
-            c1 += B * dequantized_weights.s1;
-            c2 += B * dequantized_weights.s2;
-            c3 += B * dequantized_weights.s3;
+            b0 += B * dequantized_weights.s0;
+            b1 += B * dequantized_weights.s1;
+            b2 += B * dequantized_weights.s2;
+            b3 += B * dequantized_weights.s3;
 
             // j=1
             B.s0123 = read_imageh(src1, gy*2   + (ki+1) * n_4);
@@ -107,10 +109,10 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
             dequantized_weights.s1 = ((bits4.s1 & 0x00F0) >> 4) * scale.s1 - mval.s1;
             dequantized_weights.s2 = ((bits4.s2 & 0x00F0) >> 4) * scale.s2 - mval.s2;
             dequantized_weights.s3 = ((bits4.s3 & 0x00F0) >> 4) * scale.s3 - mval.s3;
-            c0 += B * dequantized_weights.s0;
-            c1 += B * dequantized_weights.s1;
-            c2 += B * dequantized_weights.s2;
-            c3 += B * dequantized_weights.s3;
+            b0 += B * dequantized_weights.s0;
+            b1 += B * dequantized_weights.s1;
+            b2 += B * dequantized_weights.s2;
+            b3 += B * dequantized_weights.s3;
 
             // j=2
             B.s0123 = read_imageh(src1, gy*2   + (ki+2) * n_4);
@@ -119,10 +121,10 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
             dequantized_weights.s1 = ((bits4.s1 & 0x0F00) >> 8) * scale.s1 - mval.s1;
             dequantized_weights.s2 = ((bits4.s2 & 0x0F00) >> 8) * scale.s2 - mval.s2;
             dequantized_weights.s3 = ((bits4.s3 & 0x0F00) >> 8) * scale.s3 - mval.s3;
-            c0 += B * dequantized_weights.s0;
-            c1 += B * dequantized_weights.s1;
-            c2 += B * dequantized_weights.s2;
-            c3 += B * dequantized_weights.s3;
+            b0 += B * dequantized_weights.s0;
+            b1 += B * dequantized_weights.s1;
+            b2 += B * dequantized_weights.s2;
+            b3 += B * dequantized_weights.s3;
 
             // j=3
             B.s0123 = read_imageh(src1, gy*2   + (ki+3) * n_4);
@@ -131,11 +133,16 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
             dequantized_weights.s1 = ((bits4.s1 & 0xF000) >> 12) * scale.s1 - mval.s1;
             dequantized_weights.s2 = ((bits4.s2 & 0xF000) >> 12) * scale.s2 - mval.s2;
             dequantized_weights.s3 = ((bits4.s3 & 0xF000) >> 12) * scale.s3 - mval.s3;
-            c0 += B * dequantized_weights.s0;
-            c1 += B * dequantized_weights.s1;
-            c2 += B * dequantized_weights.s2;
-            c3 += B * dequantized_weights.s3;
+            b0 += B * dequantized_weights.s0;
+            b1 += B * dequantized_weights.s1;
+            b2 += B * dequantized_weights.s2;
+            b3 += B * dequantized_weights.s3;
         }
+
+        c0 += convert_float8(b0);
+        c1 += convert_float8(b1);
+        c2 += convert_float8(b2);
+        c3 += convert_float8(b3);
     }
 
     int idx = (gy<<3)*m + (gx<<2);

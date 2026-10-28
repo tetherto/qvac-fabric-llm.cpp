@@ -29,7 +29,7 @@ kernel void kernel_gemm_noshuffle_q1_0_f32(
     int gx_2 = gx << 2;
     dst  = (global float *)((global char*)dst  + offsetd);
 
-    half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    float8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     half8 B;
 
     global const uint* wptr = src0_q + gx_2;
@@ -40,6 +40,9 @@ kernel void kernel_gemm_noshuffle_q1_0_f32(
         uint4 pack4 = vload4(0, wptr + (i / 32)  * m); // 4 rows, 32 K-values each
         half4 scale = vload4(0, sptr + (i / 128) * m); // 4 rows, one scale per 128
 
+        half8 b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+
+        #pragma unroll
         for (int j = 0; j < 32; ++j) {
             B.s0123 = read_imageh(src1, gy * 2 + (i + j) * n_4);
             B.s4567 = read_imageh(src1, gy * 2 + (i + j) * n_4 + 1);
@@ -51,11 +54,16 @@ kernel void kernel_gemm_noshuffle_q1_0_f32(
                 2.0h * (half)((pack4.s2 >> j) & 1u) - 1.0h,
                 2.0h * (half)((pack4.s3 >> j) & 1u) - 1.0h) * scale;
 
-            c0 += B * wj.s0;
-            c1 += B * wj.s1;
-            c2 += B * wj.s2;
-            c3 += B * wj.s3;
+            b0 += B * wj.s0;
+            b1 += B * wj.s1;
+            b2 += B * wj.s2;
+            b3 += B * wj.s3;
         }
+
+        c0 += convert_float8(b0);
+        c1 += convert_float8(b1);
+        c2 += convert_float8(b2);
+        c3 += convert_float8(b3);
     }
 
     int idx = (gy << 3) * m + (gx << 2);
