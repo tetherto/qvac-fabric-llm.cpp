@@ -717,3 +717,8 @@ if (GGML_OPENCL)
     llama_build_and_test(test-opencl-mul-mat-sum-range.cpp)
     set_tests_properties(test-opencl-mul-mat-sum-range PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+if (GGML_METAL)
+    llama_build_and_test(test-metal-glu-alias.cpp)
+    set_tests_properties(test-metal-glu-alias PROPERTIES SKIP_RETURN_CODE 77)
+endif()

@@ -1104,6 +1104,12 @@ static bool ggml_metal_fusion_mul_mv_glu_swiglu_ok(const ggml_tensor * glu) {
            glu->type == GGML_TYPE_F32 && ggml_get_op_params_i32(glu, 1) == 0;
 }
 
+static bool ggml_metal_fusion_mul_mv_glu_overlaps(const ggml_tensor * glu, const ggml_tensor * mm) {
+    return ggml_metal_fusion_overlap(glu, mm->src[0]) ||
+           ggml_metal_fusion_overlap(glu, mm->src[1]) ||
+           (mm->op == GGML_OP_MUL_MAT_ID && ggml_metal_fusion_overlap(glu, mm->src[2]));
+}
+
 // split weights: MUL_MAT(_ID) x2 + GLU, with the two matmuls in either order
 static bool ggml_metal_fusion_check_mul_mv_glu(
         const ggml_metal_fusion      * fusion,
@@ -1139,6 +1145,11 @@ static bool ggml_metal_fusion_check_mul_mv_glu(
     }
 
     if (!ggml_metal_fusion_mul_mv_glu_decode_ok(up, mode) || !ggml_metal_fusion_mul_mv_glu_decode_ok(gate, mode)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL &&
+        (ggml_metal_fusion_mul_mv_glu_overlaps(glu, up) || ggml_metal_fusion_mul_mv_glu_overlaps(glu, gate))) {
         return false;
     }
 
@@ -1196,6 +1207,10 @@ static bool ggml_metal_fusion_check_mul_mv_glu_stacked(
     }
 
     if (!ggml_metal_fusion_mul_mv_glu_decode_ok(gate_up, mode)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL && ggml_metal_fusion_mul_mv_glu_overlaps(glu, gate_up)) {
         return false;
     }
 
