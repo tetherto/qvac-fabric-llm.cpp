@@ -2332,13 +2332,13 @@ class ggml_webgpu_shader_lib {
         ggml_webgpu_mul_mat_pipeline_key key = {};
         key.src0_type                        = context.src0->type;
         key.src1_type                        = context.src1->type;
-        key.vectorized          = (ggml_webgpu_mul_mat_can_vectorize(context.src0, context.src1) &&
-                                   ggml_webgpu_mul_mat_vec4_rows(context.dst)) ?
-                                      1 :
-                                      0;
-        key.prec_f32            = ggml_webgpu_mul_mat_f32_arithmetic(context.dst);
-        key.use_subgroup_matrix = context.supports_subgroup_matrix && !key.prec_f32;
-        key.src_overlap         = src_overlap;
+        key.vectorized                       = (ggml_webgpu_mul_mat_can_vectorize(context.src0, context.src1) &&
+                                                ggml_webgpu_mul_mat_vec4_rows(context.dst)) ?
+                                                   1 :
+                                                   0;
+        key.prec_f32                         = ggml_webgpu_mul_mat_f32_arithmetic(context.dst);
+        key.use_subgroup_matrix              = context.supports_subgroup_matrix && !key.prec_f32;
+        key.src_overlap                      = src_overlap;
 
         auto it = mul_mat_fast_pipelines.find(key);
         if (it != mul_mat_fast_pipelines.end()) {
