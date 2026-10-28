@@ -8,6 +8,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "mtmd.h"
+#include "mtmd-helper.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -64,6 +65,15 @@ inline mtmd_helper_logger g_logger;
 #define LOG_INF(...) g_logger.log(GGML_LOG_LEVEL_INFO,  __VA_ARGS__)
 #define LOG_WRN(...) g_logger.log(GGML_LOG_LEVEL_WARN,  __VA_ARGS__)
 #define LOG_ERR(...) g_logger.log(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
+
+//
+// media decoding
+//
+
+// mtmd_helper_bitmap_init_from_buf() with the model's audio sample rate passed in (< 0: no audio encoder), so that test-mtmd-impl can run the decoders without loading a model
+mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf_impl(const mtmd_context * ctx, int audio_sample_rate,
+                                                                 const unsigned char * buf, size_t len, bool placeholder,
+                                                                 mtmd_helper_init_opt opt);
 
 //
 // embd batch

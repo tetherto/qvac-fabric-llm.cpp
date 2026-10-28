@@ -335,8 +335,9 @@ static bool is_audio_file(const char * buf, size_t len) {
     return is_wav || is_mp3 || is_flac;
 }
 
-// returns true if the buffer is a valid audio file
-static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int target_sampler_rate, std::vector<float> & pcmf32_mono) {
+// decodes the buffer into mono f32 at target_sampler_rate
+// max_frames bounds the decoded length, 0 means no limit
+static mtmd_helper_bitmap_status decode_audio_from_buf(const unsigned char * buf_in, size_t len, int target_sampler_rate, uint64_t max_frames, std::vector<float> & pcmf32_mono) {
     ma_result result;
     const int channels = 1;
     ma_decoder_config decoder_config = ma_decoder_config_init(ma_format_f32, channels, target_sampler_rate);
@@ -344,7 +345,7 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
 
     result = ma_decoder_init_memory(buf_in, len, &decoder_config, &decoder);
     if (result != MA_SUCCESS) {
-        return false;
+        return MTMD_HELPER_BITMAP_FAILED;
     }
 
     ma_uint64 frame_count;
@@ -352,14 +353,21 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
     result = ma_decoder_get_length_in_pcm_frames(&decoder, &frame_count);
     if (result != MA_SUCCESS) {
         ma_decoder_uninit(&decoder);
-        return false;
+        return MTMD_HELPER_BITMAP_FAILED;
+    }
+
+    // the length comes from the file (a WAV data chunk scaled by its declared sample rate, an MP3 Xing frame, ...), and the buffer below is sized by it, so check it before allocating
+    if (max_frames > 0 && frame_count > max_frames) {
+        LOG_ERR("%s: audio has %" PRIu64 " samples, over the limit of %" PRIu64 "\n", __func__, (uint64_t) frame_count, max_frames);
+        ma_decoder_uninit(&decoder);
+        return MTMD_HELPER_BITMAP_AUDIO_TOO_LONG;
     }
 
     pcmf32_mono.resize(frame_count);
     result = ma_decoder_read_pcm_frames(&decoder, pcmf32_mono.data(), frame_count, &frames_read);
     if (result != MA_SUCCESS) {
         ma_decoder_uninit(&decoder);
-        return false;
+        return MTMD_HELPER_BITMAP_FAILED;
     }
 
 #ifdef MTMD_AUDIO_DEBUG
@@ -372,7 +380,7 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
 #endif
 
     ma_decoder_uninit(&decoder);
-    return true;
+    return MTMD_HELPER_BITMAP_OK;
 }
 
 } // namespace audio_helpers
@@ -384,17 +392,24 @@ static bool is_webp_file(const unsigned char * buf, size_t len) {
 
 #ifdef MTMD_VIDEO
 static mtmd_bitmap * decode_webp_with_ffmpeg(const mtmd_context * mctx, const unsigned char * buf, size_t len, bool placeholder,
-                                             const mtmd_helper_video_init_params & params);
+                                             const mtmd_helper_video_init_params & params, mtmd_helper_bitmap_status & status);
+static mtmd_helper_video * video_init_from_buf(const mtmd_context * mctx, const unsigned char * buf, size_t len,
+                                               const mtmd_helper_video_init_params & params, mtmd_helper_bitmap_status & status);
 static void mtmd_helper_video_set_id(mtmd_helper_video * vctx, const std::string & id);
 #endif
 
 mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(const mtmd_context * ctx, const unsigned char * buf, size_t len, bool placeholder,
                                                             mtmd_helper_init_opt opt) {
+    const int audio_sample_rate = ctx ? mtmd_get_audio_sample_rate(ctx) : -1;
+    return mtmd_helper_bitmap_init_from_buf_impl(ctx, audio_sample_rate, buf, len, placeholder, opt);
+}
+
+mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf_impl(const mtmd_context * ctx, int audio_sample_rate,
+                                                                 const unsigned char * buf, size_t len, bool placeholder,
+                                                                 mtmd_helper_init_opt opt) {
     // calculate the hash if needed
     std::string id;
     mtmd_bitmap * result = nullptr;
-
-    GGML_UNUSED(opt); // only used by video code paths
 
     if (!placeholder) {
         // use sha256 to prevent cache poisoning
@@ -403,53 +418,75 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(const mtmd_context *
 
     if (audio_helpers::is_audio_file((const char *)buf, len)) {
         std::vector<float> pcmf32;
-        const int sample_rate = mtmd_get_audio_sample_rate(ctx);
-        if (sample_rate < 0) {
+        if (audio_sample_rate < 0) {
             LOG_ERR("This model does not support audio input\n");
-            return {nullptr, nullptr};
+            return {nullptr, nullptr, MTMD_HELPER_BITMAP_FAILED};
         }
-        if (!audio_helpers::decode_audio_from_buf(buf, len, sample_rate, pcmf32)) {
+        const auto status = audio_helpers::decode_audio_from_buf(buf, len, audio_sample_rate, opt.max_audio_frames, pcmf32);
+        if (status == MTMD_HELPER_BITMAP_FAILED) {
             LOG_ERR("Unable to read WAV audio file from buffer\n");
-            return {nullptr, nullptr};
+        }
+        if (status != MTMD_HELPER_BITMAP_OK) {
+            return {nullptr, nullptr, status};
         }
         result = mtmd_bitmap_init_from_audio(pcmf32.size(), placeholder ? nullptr : pcmf32.data());
         mtmd_bitmap_set_id(result, id.empty() ? nullptr : id.c_str());
-        return {result, nullptr};
+        return {result, nullptr, MTMD_HELPER_BITMAP_OK};
     }
 
     // otherwise, we assume it's an image
     if (!result) {
         int nx, ny, nc;
-        auto * data = stbi_load_from_memory(buf, len, &nx, &ny, &nc, 3);
+        // stb allocates and decodes whatever size the header claims, so with a limit, read the size first; an image that stb cannot size is not decoded here
+        bool stb_can_load = true;
+        if (opt.max_image_pixels > 0) {
+            stb_can_load = stbi_info_from_memory(buf, len, &nx, &ny, &nc) != 0;
+            // stbi_info reports a top-down BMP's height as negative, which stbi_load flips
+            const auto abs_dim = [](int v) { return v < 0 ? (uint64_t) -(int64_t) v : (uint64_t) v; };
+            if (stb_can_load && abs_dim(nx) * abs_dim(ny) > opt.max_image_pixels) {
+                LOG_ERR("%s: image is %" PRIu64 "x%" PRIu64 ", over the limit of %" PRIu64 " pixels\n",
+                        __func__, abs_dim(nx), abs_dim(ny), opt.max_image_pixels);
+                return {nullptr, nullptr, MTMD_HELPER_BITMAP_IMAGE_TOO_LARGE};
+            }
+        }
+        auto * data = stb_can_load ? stbi_load_from_memory(buf, len, &nx, &ny, &nc, 3) : nullptr;
         if (data) {
             result = mtmd_bitmap_init(nx, ny, placeholder ? nullptr : data);
             mtmd_bitmap_set_id(result, id.empty() ? nullptr : id.c_str());
             stbi_image_free(data);
-            return {result, nullptr};
+            return {result, nullptr, MTMD_HELPER_BITMAP_OK};
         }
         // otherwise, fallthrough to video decoding (if supported)
     }
 
 #ifdef MTMD_VIDEO
+    // max_image_pixels also bounds the frames that ffmpeg decodes
+    mtmd_helper_video_init_params video_params = opt.video_params;
+    if (opt.max_image_pixels > 0 && (video_params.max_frame_pixels == 0 || opt.max_image_pixels < video_params.max_frame_pixels)) {
+        video_params.max_frame_pixels = opt.max_image_pixels;
+    }
+
     // stb_image does not support webp; decode it with ffmpeg as a single frame
     if (!result && is_webp_file(buf, len)) {
-        result = decode_webp_with_ffmpeg(ctx, buf, len, placeholder, opt.video_params);
+        auto status = MTMD_HELPER_BITMAP_FAILED;
+        result = decode_webp_with_ffmpeg(ctx, buf, len, placeholder, video_params, status);
         if (!result) {
             LOG_ERR("%s: failed to decode webp buffer\n", __func__);
-            return {nullptr, nullptr};
+            return {nullptr, nullptr, status};
         }
         mtmd_bitmap_set_id(result, id.empty() ? nullptr : id.c_str());
-        return {result, nullptr};
+        return {result, nullptr, MTMD_HELPER_BITMAP_OK};
     }
 #endif
 
     // last try: load as video
 #ifdef MTMD_VIDEO
     if (!result) {
-        auto video_ctx = mtmd_helper_video_init_from_buf(ctx, buf, len, opt.video_params);
+        auto status = MTMD_HELPER_BITMAP_FAILED;
+        auto video_ctx = video_init_from_buf(ctx, buf, len, video_params, status);
         if (!video_ctx) {
             LOG_ERR("%s: failed to decode buffer as either image/audio/video\n", __func__);
-            return {nullptr, nullptr};
+            return {nullptr, nullptr, status};
         }
         mtmd_helper_video_set_id(video_ctx, id); // propagate the hash to the frames
         result = mtmd_bitmap_init_lazy(ctx,
@@ -462,17 +499,18 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(const mtmd_context *
                 *out_text = text; // heap-allocated by read_next; freed automatically by mtmd
                 return ret;
             });
-         return {result, video_ctx};
+         return {result, video_ctx, MTMD_HELPER_BITMAP_OK};
     }
 #else
+    GGML_UNUSED(ctx);
     if (!result) {
         LOG_ERR("%s: failed to decode buffer as either image or audio (video support not compiled in)\n", __func__);
-        return {nullptr, nullptr};
+        return {nullptr, nullptr, MTMD_HELPER_BITMAP_FAILED};
     }
 #endif
 
     // should not reach here
-    return {nullptr, nullptr};
+    return {nullptr, nullptr, MTMD_HELPER_BITMAP_FAILED};
 }
 
 mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_file(const mtmd_context * ctx, const char * fname, bool placeholder,
@@ -481,13 +519,13 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_file(const mtmd_context 
     int wlen = MultiByteToWideChar(CP_UTF8, 0, fname, -1, NULL, 0);
     if (!wlen) {
         LOG_ERR("Unable to convert filename to UTF-16: %s\n", fname);
-        return {nullptr, nullptr};
+        return {nullptr, nullptr, MTMD_HELPER_BITMAP_FAILED};
     }
     std::vector<wchar_t> wfname(wlen);
     wlen = MultiByteToWideChar(CP_UTF8, 0, fname, -1, wfname.data(), wlen);
     if (!wlen) {
         LOG_ERR("Unable to convert filename to UTF-16: %s\n", fname);
-        return {nullptr, nullptr};
+        return {nullptr, nullptr, MTMD_HELPER_BITMAP_FAILED};
     }
     FILE * f = _wfopen(wfname.data(), L"rb");
 #else
@@ -495,7 +533,7 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_file(const mtmd_context 
 #endif
     if (!f) {
         LOG_ERR("Unable to open file %s: %s\n", fname, strerror(errno));
-        return {nullptr, nullptr};
+        return {nullptr, nullptr, MTMD_HELPER_BITMAP_FAILED};
     }
 
     std::vector<unsigned char> buf;
@@ -506,7 +544,7 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_file(const mtmd_context 
     if (file_size < 0) {
         LOG_ERR("Failed to get file size of %s\n", fname);
         fclose(f);
-        return {nullptr, nullptr};
+        return {nullptr, nullptr, MTMD_HELPER_BITMAP_FAILED};
     }
     buf.resize(file_size);
 
@@ -514,7 +552,7 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_file(const mtmd_context 
     fclose(f);
     if (n_read != (size_t)file_size) {
         LOG_ERR("Failed to read entire file %s", fname);
-        return {nullptr, nullptr};
+        return {nullptr, nullptr, MTMD_HELPER_BITMAP_FAILED};
     }
 
     return mtmd_helper_bitmap_init_from_buf(ctx, buf.data(), buf.size(), placeholder, opt);
@@ -544,6 +582,8 @@ struct mtmd_helper_video {
     float fps_target = 0.0f;
     mtmd_helper_video_info info = {};
     std::string id; // hash of the input video
+    uint64_t max_pixels = 0;     // per frame, from mtmd_helper_video_init_params.max_frame_pixels; 0 means no limit
+    bool     too_large  = false; // set by probe() when a frame is over max_pixels
 
     // RAII wrapper for managing subprocess
     struct subprocess_handle {
@@ -691,6 +731,13 @@ struct mtmd_helper_video {
             return false;
         }
 
+        // checked before frame_buf is sized from the probed dimensions
+        if (max_pixels > 0 && (uint64_t) width * height > max_pixels) {
+            LOG_ERR("%s: frames are %ux%u, over the limit of %" PRIu64 " pixels\n", __func__, width, height, max_pixels);
+            too_large = true;
+            return false;
+        }
+
         if (duration < 0.0f && n_frames_orig > 0) {
             duration = (float)n_frames_orig / orig_fps;
         }
@@ -737,6 +784,10 @@ struct mtmd_helper_video {
             cmd.push_back("-ss");
             cmd.push_back(seek_buf);
         }
+
+        // decode the stream that probe() sized (and checked against max_pixels), not the one ffmpeg would pick
+        cmd.push_back("-map");
+        cmd.push_back("0:v:0");
 
         if (fps_target > 0.0f) {
             snprintf(fps_buf, sizeof(fps_buf), "fps=%.6f", fps_target);
@@ -878,12 +929,15 @@ mtmd_helper_video_init_params mtmd_helper_video_init_params_default() {
         /* fps_target             */ 4.0f,
         /* ffmpeg_bin_dir         */ nullptr,
         /* timestamp_interval_ms  */ 5000,
+        /* max_frame_pixels       */ 0,
     };
 }
 
 mtmd_helper_init_opt mtmd_helper_init_opt_default() {
     return {
-        /* video_params */ mtmd_helper_video_init_params_default(),
+        /* video_params     */ mtmd_helper_video_init_params_default(),
+        /* max_audio_frames */ 0,
+        /* max_image_pixels */ 0,
     };
 }
 
@@ -913,16 +967,22 @@ static void mtmd_helper_video_set_id(mtmd_helper_video * vctx, const std::string
 }
 
 static mtmd_bitmap * decode_webp_with_ffmpeg(const mtmd_context * mctx, const unsigned char * buf, size_t len, bool placeholder,
-                                             const mtmd_helper_video_init_params & params) {
+                                             const mtmd_helper_video_init_params & params, mtmd_helper_bitmap_status & status) {
+    status = MTMD_HELPER_BITMAP_FAILED;
     mtmd_helper_video vctx;
     vctx.mctx        = mctx;
     vctx.input_buf.assign(buf, buf + len);
     vctx.ffmpeg_bin  = video_resolve_bin(params.ffmpeg_bin_dir, "ffmpeg");
     vctx.ffprobe_bin = video_resolve_bin(params.ffmpeg_bin_dir, "ffprobe");
+    vctx.max_pixels  = params.max_frame_pixels;
     if (!vctx.probe(0.0f)) {
+        if (vctx.too_large) {
+            status = MTMD_HELPER_BITMAP_IMAGE_TOO_LARGE;
+        }
         return nullptr;
     }
     if (placeholder) {
+        status = MTMD_HELPER_BITMAP_OK;
         return mtmd_bitmap_init(vctx.info.width, vctx.info.height, nullptr);
     }
     // still image: the fps filter would output no frame, so disable it
@@ -933,8 +993,41 @@ static mtmd_bitmap * decode_webp_with_ffmpeg(const mtmd_context * mctx, const un
     mtmd_bitmap * frame = vctx.read_next_frame();
     if (frame) {
         mtmd_bitmap_set_mergeable(frame, false);
+        status = MTMD_HELPER_BITMAP_OK;
     }
     return frame;
+}
+
+static mtmd_helper_video * video_init_from_buf(const mtmd_context * mctx, const unsigned char * buf, size_t len,
+                                               const mtmd_helper_video_init_params & params, mtmd_helper_bitmap_status & status) {
+    status = MTMD_HELPER_BITMAP_FAILED;
+    auto * ctx = new mtmd_helper_video();
+
+    ctx->mctx                  = mctx;
+    ctx->input_buf.assign(buf, buf + len);
+    ctx->ffmpeg_bin            = video_resolve_bin(params.ffmpeg_bin_dir, "ffmpeg");
+    ctx->ffprobe_bin           = video_resolve_bin(params.ffmpeg_bin_dir, "ffprobe");
+    ctx->timestamp_interval_ms = params.timestamp_interval_ms;
+    ctx->max_pixels            = params.max_frame_pixels;
+
+    if (!ctx->probe(params.fps_target)) {
+        if (ctx->too_large) {
+            status = MTMD_HELPER_BITMAP_IMAGE_TOO_LARGE;
+        } else {
+            LOG_ERR("%s: ffprobe failed on buffer (is ffprobe in PATH?)\n", __func__);
+        }
+        delete ctx;
+        return nullptr;
+    }
+
+    if (!ctx->start_ffmpeg(0.0f)) {
+        LOG_ERR("%s: failed to start ffmpeg on buffer (is ffmpeg in PATH?)\n", __func__);
+        delete ctx;
+        return nullptr;
+    }
+
+    status = MTMD_HELPER_BITMAP_OK;
+    return ctx;
 }
 #endif
 
@@ -950,9 +1043,12 @@ mtmd_helper_video * mtmd_helper_video_init(
     ctx->ffmpeg_bin           = video_resolve_bin(params.ffmpeg_bin_dir, "ffmpeg");
     ctx->ffprobe_bin          = video_resolve_bin(params.ffmpeg_bin_dir, "ffprobe");
     ctx->timestamp_interval_ms = params.timestamp_interval_ms;
+    ctx->max_pixels            = params.max_frame_pixels;
 
     if (!ctx->probe(params.fps_target)) {
-        LOG_ERR("%s: ffprobe failed for '%s' (is ffprobe in PATH?)\n", __func__, path);
+        if (!ctx->too_large) {
+            LOG_ERR("%s: ffprobe failed for '%s' (is ffprobe in PATH?)\n", __func__, path);
+        }
         delete ctx;
         return nullptr;
     }
@@ -978,27 +1074,8 @@ mtmd_helper_video * mtmd_helper_video_init_from_buf(
         const unsigned char * buf, size_t len,
         mtmd_helper_video_init_params params) {
 #ifdef MTMD_VIDEO
-    auto * ctx = new mtmd_helper_video();
-
-    ctx->mctx                  = mctx;
-    ctx->input_buf.assign(buf, buf + len);
-    ctx->ffmpeg_bin            = video_resolve_bin(params.ffmpeg_bin_dir, "ffmpeg");
-    ctx->ffprobe_bin           = video_resolve_bin(params.ffmpeg_bin_dir, "ffprobe");
-    ctx->timestamp_interval_ms = params.timestamp_interval_ms;
-
-    if (!ctx->probe(params.fps_target)) {
-        LOG_ERR("%s: ffprobe failed on buffer (is ffprobe in PATH?)\n", __func__);
-        delete ctx;
-        return nullptr;
-    }
-
-    if (!ctx->start_ffmpeg(0.0f)) {
-        LOG_ERR("%s: failed to start ffmpeg on buffer (is ffmpeg in PATH?)\n", __func__);
-        delete ctx;
-        return nullptr;
-    }
-
-    return ctx;
+    auto status = MTMD_HELPER_BITMAP_FAILED;
+    return video_init_from_buf(mctx, buf, len, params, status);
 #else
     GGML_UNUSED(mctx);
     GGML_UNUSED(buf);
