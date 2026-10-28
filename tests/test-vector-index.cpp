@@ -10,6 +10,7 @@
 #include <array>
 #include <cassert>
 #include <atomic>
+#include <bitset>
 #include <cfloat>
 #include <chrono>
 #include <cfenv>
@@ -179,6 +180,7 @@ void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
+int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * unit, std::vector<uint64_t> * masks);
 int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
@@ -5882,6 +5884,45 @@ void check_turbovec_1x_permute_dot_kernels() {
 #endif
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+// The staged ranking's low-plane weights: a query so small that its weight
+// reciprocal overflows still gets upstream's saturated weights (the top
+// weight for every nonzero coordinate, unit 0), with no floating-point flag.
+void check_turbovec_1x_low_planes_tiny() {
+    constexpr int dim = 32;
+    constexpr int32_t top = 63;
+    for (const float scale : { 1.0f, 1e-38f }) {
+        std::vector<float> q(dim);
+        int32_t want_sum = 0;
+        int nonzero = 0;
+        for (int i = 0; i < dim; ++i) {
+            const float mag = static_cast<float>(2 + i % 4);
+            q[i] = i % 5 == 0 ? 0.0f : (i % 3 == 0 ? -mag : mag) * scale;
+            if (q[i] != 0.0f) {
+                ++nonzero;
+                // At scale 1, q_max is 5: weights trunc(mag * 63 / 5 + 0.5).
+                const int32_t w = scale == 1.0f ? static_cast<int32_t>(mag * (63.0f / 5.0f) + 0.5f) : top;
+                want_sum += q[i] < 0.0f ? -w : w;
+            }
+        }
+        float unit = -1.0f;
+        std::vector<uint64_t> masks;
+        std::feclearexcept(FE_ALL_EXCEPT);
+        const int32_t sum_w = turbovec_low_planes_for_test(q.data(), dim, 1.5f, &unit, &masks);
+        CHECK(std::fetestexcept(FE_OVERFLOW | FE_INVALID) == 0);
+        CHECK(sum_w == want_sum);
+        if (scale == 1.0f) {
+            CHECK(unit == 1.5f / (63.0f / 5.0f));
+        } else {
+            CHECK(unit == 0.0f);
+            int bits = 0;
+            for (const uint64_t word : masks) {
+                bits += static_cast<int>(std::bitset<64>(word).count());
+            }
+            CHECK(bits == 6 * nonzero);
+        }
+    }
+}
+
 // Staged search (upstream planes search): returned scores are the full
 // scan's for the same ids, and on aarch64 the results are upstream's.
 void check_turbovec_1x_staged() {
@@ -6767,6 +6808,7 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_failed_sync_keeps_binding();
             check_turbovec_1x_reordered_and_stale_commits();
             check_turbovec_1x_permute_dot_kernels();
+            check_turbovec_1x_low_planes_tiny();
             check_turbovec_1x_staged();
             check_turbovec_1x_staged_maintenance();
             check_turbovec_1x_single_code_copy();
