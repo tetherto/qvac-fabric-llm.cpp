@@ -191,6 +191,7 @@ llama_context::llama_context(
     cparams.no_perf                 = params.no_perf;
     cparams.training                = params.training;
     cparams.warmup                  = false;
+    cparams.reserve_indexer_gather  = false;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
@@ -840,10 +841,19 @@ void llama_context::sched_reserve() {
         n_nodes_tg  = ggml_graph_n_nodes(gf);
     }
 
+    if (model.hparams.indexer_gather_max_tokens > 0) {
+        const uint32_t n_gather_tokens = std::min(n_tokens, model.hparams.indexer_gather_max_tokens);
+        // A non-unified reserve context holds all n_seqs streams, so its ubatch must span all of them.
+        const uint32_t n_gather_seqs   = cparams.kv_unified ? std::min(n_seqs, n_gather_tokens) : n_seqs;
+        reserve_gather_ubatch(n_gather_tokens, n_gather_seqs, mctx.get());
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
+        //       recurrent states between the state cells of a ubatch add n_rs - n_seqs rows that no reserve holds,
+        //       so a stored plan grows once for each new count of these rows
         ggml_cgraph * gf = nullptr;
         switch (model.arch) {
             case LLM_ARCH_KIMI_LINEAR:
@@ -2678,8 +2688,18 @@ static void ubatch_prepare_reserve(
     }
 }
 
+// The gather path takes ubatches of up to n_tokens tokens at any cache length, with tensors that grow with the token and sequence count.
+// Its graph of the most tokens and sequences covers all of them, but a full-length cache can choose another path, so force the gather path.
+void llama_context::reserve_gather_ubatch(uint32_t n_tokens, uint32_t n_seqs, const llama_memory_context_i * mctx) {
+    const uint32_t n_outputs = std::min(n_tokens, cparams.n_outputs_max);
+    if (graph_reserve(n_tokens, n_seqs, n_outputs, mctx, model.hparams.no_alloc, nullptr, /*gather_path =*/ true) == nullptr) {
+        throw std::runtime_error("failed to allocate compute gather buffers");
+    }
+}
+
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+        bool gather_path) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -2711,7 +2731,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    gparams.cparams.reserve_indexer_gather = gather_path;
 
     res->reset();
 
