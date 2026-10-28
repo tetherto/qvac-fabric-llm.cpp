@@ -7,6 +7,49 @@
 #define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
 #endif
 
+inline bool tile_finite(float8 c0, float8 c1, float8 c2, float8 c3) {
+    return all(isfinite(c0)) && all(isfinite(c1)) && all(isfinite(c2)) && all(isfinite(c3));
+}
+
+inline float4 dequantize_rows(
+        global const uint * wptr,
+        global const half * sptr,
+        int m,
+        int kk
+) {
+    uint4 pack4 = vload4(0, wptr + (kk / 32) * m);
+    float4 scale = convert_float4(vload4(0, sptr + (kk / 128) * m));
+    float4 sign = convert_float4((pack4 >> (uint) (kk % 32)) & (uint) 1) * 2.0f - 1.0f;
+    return sign * scale;
+}
+
+inline void accumulate_tile_fp32(
+        read_only image1d_buffer_t src1,
+        global const uint * wptr,
+        global const half * sptr,
+        int m,
+        int n_4,
+        int k,
+        int gy,
+        float8 * c0,
+        float8 * c1,
+        float8 * c2,
+        float8 * c3
+) {
+    *c0 = 0; *c1 = 0; *c2 = 0; *c3 = 0;
+    for (int kk = 0; kk < k; ++kk) {
+        half8 B;
+        B.s0123 = read_imageh(src1, gy * 2 + kk * n_4);
+        B.s4567 = read_imageh(src1, gy * 2 + kk * n_4 + 1);
+        float8 activations = convert_float8(B);
+        float4 weights = dequantize_rows(wptr, sptr, m, kk);
+        *c0 += activations * weights.s0;
+        *c1 += activations * weights.s1;
+        *c2 += activations * weights.s2;
+        *c3 += activations * weights.s3;
+    }
+}
+
 // each work-item computes a 4 (rows of A / m) x 8 (cols of B / n) output tile.
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
@@ -64,6 +107,10 @@ kernel void kernel_gemm_noshuffle_q1_0_f32(
         c1 += convert_float8(b1);
         c2 += convert_float8(b2);
         c3 += convert_float8(b3);
+    }
+
+    if (!tile_finite(c0, c1, c2, c3)) {
+        accumulate_tile_fp32(src1, wptr, sptr, m, n_4, k, gy, &c0, &c1, &c2, &c3);
     }
 
     int idx = (gy << 3) * m + (gx << 2);

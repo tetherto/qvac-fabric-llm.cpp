@@ -26,6 +26,77 @@ inline void get_scale_min_k4(
     }
 }
 
+inline bool tile_finite(float8 c0, float8 c1, float8 c2, float8 c3) {
+    return all(isfinite(c0)) && all(isfinite(c1)) && all(isfinite(c2)) && all(isfinite(c3));
+}
+
+inline float4 dequantize_rows(
+        global const ushort * weight_ptr,
+        global const uchar * qh_ptr,
+        global const uchar * src0_s,
+        global const half * d_ptr,
+        global const half * dm_ptr,
+        int gx_2,
+        int num_blocks_K,
+        uchar mask_d6,
+        uchar mask_d4,
+        uchar mask_hi2,
+        int m,
+        int kk
+) {
+    int sb_idx  = kk / QK_K;
+    int sub_idx = (kk / 32) % 8;
+    int row_stride = num_blocks_K * K_SCALE_SIZE;
+    global const uchar * sc = src0_s + gx_2 * row_stride + sb_idx * K_SCALE_SIZE;
+    uchar sv0, mn0, sv1, mn1, sv2, mn2, sv3, mn3;
+    get_scale_min_k4(sub_idx, sc + 0 * row_stride, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+    get_scale_min_k4(sub_idx, sc + 1 * row_stride, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+    get_scale_min_k4(sub_idx, sc + 2 * row_stride, &sv2, &mn2, mask_d6, mask_d4, mask_hi2);
+    get_scale_min_k4(sub_idx, sc + 3 * row_stride, &sv3, &mn3, mask_d6, mask_d4, mask_hi2);
+    float4 scale = convert_float4(vload4(0, d_ptr  + sb_idx * m)) * convert_float4((uchar4)(sv0, sv1, sv2, sv3));
+    float4 mval  = convert_float4(vload4(0, dm_ptr + sb_idx * m)) * convert_float4((uchar4)(mn0, mn1, mn2, mn3));
+    ushort4 bits4 = vload4(0, weight_ptr + (kk/4)*m);
+    uchar4  qh    = vload4(0, qh_ptr + (kk/8)*m);
+    ushort4 nibble = (bits4 >> (ushort) (4 * (kk % 4))) & (ushort) 0xF;
+    ushort4 high = convert_ushort4((qh >> (uchar) (kk % 8)) & (uchar) 1);
+    return convert_float4(nibble | (high << (ushort) 4)) * scale - mval;
+}
+
+inline void accumulate_tile_fp32(
+        read_only image1d_buffer_t src1,
+        global const ushort * weight_ptr,
+        global const uchar * qh_ptr,
+        global const uchar * src0_s,
+        global const half * d_ptr,
+        global const half * dm_ptr,
+        int gx_2,
+        int num_blocks_K,
+        uchar mask_d6,
+        uchar mask_d4,
+        uchar mask_hi2,
+        int m,
+        int n_4,
+        int k,
+        int gy,
+        float8 * c0,
+        float8 * c1,
+        float8 * c2,
+        float8 * c3
+) {
+    *c0 = 0; *c1 = 0; *c2 = 0; *c3 = 0;
+    for (int kk = 0; kk < k; ++kk) {
+        half8 B;
+        B.s0123 = read_imageh(src1, gy * 2 + kk * n_4);
+        B.s4567 = read_imageh(src1, gy * 2 + kk * n_4 + 1);
+        float8 activations = convert_float8(B);
+        float4 weights = dequantize_rows(weight_ptr, qh_ptr, src0_s, d_ptr, dm_ptr, gx_2, num_blocks_K, mask_d6, mask_d4, mask_hi2, m, kk);
+        *c0 += activations * weights.s0;
+        *c1 += activations * weights.s1;
+        *c2 += activations * weights.s2;
+        *c3 += activations * weights.s3;
+    }
+}
+
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
 #endif
@@ -145,6 +216,10 @@ kernel void kernel_gemm_noshuffle_q5_k_f32(
         c1 += convert_float8(b1);
         c2 += convert_float8(b2);
         c3 += convert_float8(b3);
+    }
+
+    if (!tile_finite(c0, c1, c2, c3)) {
+        accumulate_tile_fp32(src1, weight_ptr, qh_ptr, src0_s, d_ptr, dm_ptr, gx_2, num_blocks_K, mask_d6, mask_d4, mask_hi2, m, n_4, k, gy, &c0, &c1, &c2, &c3);
     }
 
     int idx = (gy<<3)*m + (gx<<2);

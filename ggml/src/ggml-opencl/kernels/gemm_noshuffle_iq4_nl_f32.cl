@@ -30,6 +30,50 @@ constant uint iq4nl_packed[8] = {
 // Packed dequant: 1 uint constant load (8-way divergence) + shift + as_half
 #define IQ4_NL_DEQUANT(nibble) as_half((ushort)(iq4nl_packed[(nibble) >> 1] >> (((nibble) & 1u) << 4)))
 
+inline bool tile_finite(float8 c0, float8 c1, float8 c2, float8 c3) {
+    return all(isfinite(c0)) && all(isfinite(c1)) && all(isfinite(c2)) && all(isfinite(c3));
+}
+
+inline float4 dequantize_rows(
+        global const ushort * weight_ptr,
+        global const half * scale_ptr,
+        int m,
+        int kk
+) {
+    ushort4 bits4 = vload4(0, weight_ptr + (kk/4)*m);
+    float4 scale = convert_float4(vload4(0, scale_ptr + (kk/QK4_NL)*m));
+    ushort4 nibble = (bits4 >> (ushort) (4 * (kk % 4))) & (ushort) 0xF;
+    half4 values = (half4)(IQ4_NL_DEQUANT(nibble.s0), IQ4_NL_DEQUANT(nibble.s1), IQ4_NL_DEQUANT(nibble.s2), IQ4_NL_DEQUANT(nibble.s3));
+    return convert_float4(values) * scale;
+}
+
+inline void accumulate_tile_fp32(
+        read_only image1d_buffer_t src1,
+        global const ushort * weight_ptr,
+        global const half * scale_ptr,
+        int m,
+        int n_4,
+        int k,
+        int gy,
+        float8 * c0,
+        float8 * c1,
+        float8 * c2,
+        float8 * c3
+) {
+    *c0 = 0; *c1 = 0; *c2 = 0; *c3 = 0;
+    for (int kk = 0; kk < k; ++kk) {
+        half8 B;
+        B.s0123 = read_imageh(src1, gy * 2 + kk * n_4);
+        B.s4567 = read_imageh(src1, gy * 2 + kk * n_4 + 1);
+        float8 activations = convert_float8(B);
+        float4 weights = dequantize_rows(weight_ptr, scale_ptr, m, kk);
+        *c0 += activations * weights.s0;
+        *c1 += activations * weights.s1;
+        *c2 += activations * weights.s2;
+        *c3 += activations * weights.s3;
+    }
+}
+
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
 #endif
@@ -121,6 +165,10 @@ kernel void kernel_gemm_noshuffle_iq4_nl_f32(
         c1 += convert_float8(b1);
         c2 += convert_float8(b2);
         c3 += convert_float8(b3);
+    }
+
+    if (!tile_finite(c0, c1, c2, c3)) {
+        accumulate_tile_fp32(src1, weight_ptr, scale_ptr, m, n_4, k, gy, &c0, &c1, &c2, &c3);
     }
 
     int idx = (gy<<3)*m + (gx<<2);

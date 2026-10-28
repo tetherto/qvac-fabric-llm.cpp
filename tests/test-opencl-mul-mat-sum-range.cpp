@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -18,6 +19,11 @@ static const float WEIGHT_MAX     = 1.0f;
 static const float ACTIVATION_MAX = 1000.0f;
 static const float FP16_MAX       = 65504.0f;
 static const double MAX_NMSE      = 5e-4;
+
+static const float   CANCELLING_WEIGHT   = 2.0f;
+static const float   CANCELLING_NEGATIVE = -500.0f;
+static const float   CANCELLING_POSITIVE = 1500.0f;
+static const int64_t CANCELLING_RUN      = 32;
 
 static const size_t CONTEXT_BYTES = 16 * 1024 * 1024;
 
@@ -39,6 +45,12 @@ struct graph_inputs {
     ggml_type            weight_type;
     std::vector<uint8_t> weights;
     std::vector<float>   activations;
+};
+
+struct batch_result {
+    float  reference_max;
+    bool   finite;
+    double error;
 };
 
 static uint32_t next_random(uint32_t & state) {
@@ -70,6 +82,27 @@ static graph_inputs make_inputs(ggml_type type, int64_t n, uint32_t seed) {
     inputs.weight_type = type;
     inputs.weights     = quantize(type, fill_uniform((size_t) (K * M), WEIGHT_MAX, state));
     inputs.activations = fill_uniform((size_t) (K * n), ACTIVATION_MAX, state);
+    return inputs;
+}
+
+static void fill_cancelling_column(float * column) {
+    std::fill_n(column, CANCELLING_RUN, CANCELLING_NEGATIVE);
+    std::fill_n(column + CANCELLING_RUN, CANCELLING_RUN, CANCELLING_POSITIVE);
+}
+
+static std::vector<float> fill_cancelling_columns(int64_t n) {
+    std::vector<float> values((size_t) (K * n), 0.0f);
+    for (int64_t column = 0; column < n; ++column) {
+        fill_cancelling_column(values.data() + column * K);
+    }
+    return values;
+}
+
+static graph_inputs make_cancelling_inputs(ggml_type type, int64_t n) {
+    graph_inputs inputs;
+    inputs.weight_type = type;
+    inputs.weights     = quantize(type, std::vector<float>((size_t) (K * M), CANCELLING_WEIGHT));
+    inputs.activations = fill_cancelling_columns(n);
     return inputs;
 }
 
@@ -137,26 +170,37 @@ static ggml_backend_dev_t find_opencl_device() {
     return nullptr;
 }
 
-static bool check_batch(ggml_backend_t cpu, ggml_backend_t opencl, ggml_type type, int64_t n, uint32_t seed) {
-    const graph_inputs inputs = make_inputs(type, n, seed);
+static batch_result compare_backends(ggml_backend_t cpu, ggml_backend_t opencl, const graph_inputs & inputs, int64_t n) {
     const std::vector<float> reference = run_mul_mat(cpu, inputs, n);
     const std::vector<float> actual    = run_mul_mat(opencl, inputs, n);
+    return { max_abs(reference), all_finite(actual), nmse(reference, actual) };
+}
 
-    const float  reference_max = max_abs(reference);
-    const bool   finite        = all_finite(actual);
-    const double error         = nmse(reference, actual);
-    const bool   ok = reference_max > FP16_MAX && finite && error < MAX_NMSE;
-
-    std::printf("%s %-6s n=%3lld reference_max=%.0f finite=%d nmse=%.3e\n",
-                ok ? "ok  " : "FAIL", ggml_type_name(type), (long long) n, reference_max, finite ? 1 : 0, error);
+static bool report_batch(const char * kind, ggml_type type, int64_t n, const batch_result & result, bool ok) {
+    std::printf("%s %-6s %-6s n=%3lld reference_max=%.0f finite=%d nmse=%.3e\n",
+                ok ? "ok  " : "FAIL", kind, ggml_type_name(type), (long long) n,
+                result.reference_max, result.finite ? 1 : 0, result.error);
     return ok;
+}
+
+static bool check_sum_range_batch(ggml_backend_t cpu, ggml_backend_t opencl, ggml_type type, int64_t n, uint32_t seed) {
+    const batch_result result = compare_backends(cpu, opencl, make_inputs(type, n, seed), n);
+    const bool ok = result.reference_max > FP16_MAX && result.finite && result.error < MAX_NMSE;
+    return report_batch("range", type, n, result, ok);
+}
+
+static bool check_cancelling_batch(ggml_backend_t cpu, ggml_backend_t opencl, ggml_type type, int64_t n) {
+    const batch_result result = compare_backends(cpu, opencl, make_cancelling_inputs(type, n), n);
+    const bool ok = result.finite && result.error < MAX_NMSE;
+    return report_batch("cancel", type, n, result, ok);
 }
 
 static int count_type_failures(ggml_backend_t cpu, ggml_backend_t opencl, ggml_type type, uint32_t & seed) {
     int failures = 0;
     for (int64_t n : BATCHES) {
         seed += SEED_STRIDE;
-        failures += check_batch(cpu, opencl, type, n, seed) ? 0 : 1;
+        failures += check_sum_range_batch(cpu, opencl, type, n, seed) ? 0 : 1;
+        failures += check_cancelling_batch(cpu, opencl, type, n) ? 0 : 1;
     }
     return failures;
 }
