@@ -733,7 +733,7 @@ void search_one(
         TurboVecPermuteDot permute_dot;
         const bool use_permute_dot = turbovec_uses_permute_dot(idx);
         if (use_permute_dot) {
-            build_turbovec_permute_dot(score_query, idx.dim, permute_dot);
+            build_turbovec_permute_dot(score_query, idx.dim, permute_dot, turbovec_layout(idx) == kTurboVecLayoutVm8);
             permute_dot.bias = tqplus_bias;
         }
 
@@ -899,7 +899,8 @@ void search_turbovec_query_batch(
         if (pd_batched) {
             // The permute-dot kernels carry the TQ+ correction in their bias.
             if (bits == 4) {
-                build_turbovec_permute_dot(score_queries[query], idx.dim, scratch.permute_dots[query]);
+                build_turbovec_permute_dot(
+                    score_queries[query], idx.dim, scratch.permute_dots[query], turbovec_layout(idx) == kTurboVecLayoutVm8);
             } else {
                 build_turbovec_permute_dot_2bit(score_queries[query], idx.dim, scratch.permute_dots[query]);
             }

@@ -661,6 +661,7 @@ void turbovec_force_planes_for_test(int mode, size_t min_vectors);
 size_t parallel_pool_threads_for_test(void);
 void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums);
 int parallel_pool_selftest_for_test(int n_threads);
+int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * unit, std::vector<uint64_t> * masks);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
     uint64_t * codes_hash,
@@ -768,7 +769,8 @@ struct TurboVecPermuteDot {
     float scale = 1.0f;
     float bias = 0.0f;
 };
-void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot & out);
+// vm8 builds the lone-query vm8 weights, which only a vm8-layout index reads.
+void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot & out, bool vm8);
 // The 2-bit SMMLA operand set of a 2-bit vm8 index (upstream
 // `build_permute_dot_2bit`).
 void build_turbovec_permute_dot_2bit(const float * query, int dim, TurboVecPermuteDot & out);

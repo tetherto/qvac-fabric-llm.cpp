@@ -182,20 +182,30 @@ LowPlanes build_low_planes(const float * q, float m, int dim) {
     for (int i = 0; i < dim; ++i) {
         q_max = std::max(q_max, std::fabs(q[i]));
     }
-    const float inv = q_max > 0.0f && std::isfinite(q_max) ? top / q_max : 0.0f;
+    // For a tiny query top / q_max rounds to infinity. Upstream's Rust casts
+    // saturate there (infinity to the top weight, the NaN of a zero
+    // coordinate to 0) and unit becomes m / inf = 0; a C++ cast of either is
+    // undefined, so that case is spelled out. The double quotient is exact
+    // enough to tell, and raises no floating-point flag.
+    const bool valid = q_max > 0.0f && std::isfinite(q_max);
+    const bool overflow = valid && static_cast<double>(top) / q_max >= 0x1.fffffep127 + 0x1p103;
+    const float inv = valid && !overflow ? top / q_max : 0.0f;
     bool built = false;
 #if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL)
     // Upstream's AVX-512 build (sixteen coordinates a step), where dim
-    // allows it; the same weights as the loop below.
+    // allows it; the same weights as the loop below. Its conversions are
+    // not saturating, so an overflowing query takes the loop.
     const VecIndexCpuFeatures & features = vec_index_cpu_features();
-    if (dim % 16 == 0 && features.avx512bw && features.avx2 && g_low_kernels_enabled.load(std::memory_order_relaxed)) {
+    if (!overflow && dim % 16 == 0 && features.avx512bw && features.avx2 &&
+        g_low_kernels_enabled.load(std::memory_order_relaxed)) {
         out.sum_w = ggml_vec_index_detail::turbovec_build_low_masks_avx512(
             q, static_cast<size_t>(dim), inv, static_cast<uint32_t>(top), masks.data());
         built = true;
     }
 #endif
     for (int i = 0; i < dim && !built; ++i) {
-        const uint32_t w = std::min(static_cast<uint32_t>(std::fabs(q[i]) * inv + 0.5f), static_cast<uint32_t>(top));
+        const uint32_t w = overflow ? (q[i] != 0.0f ? static_cast<uint32_t>(top) : 0u) :
+            std::min(static_cast<uint32_t>(std::fabs(q[i]) * inv + 0.5f), static_cast<uint32_t>(top));
         if (w == 0) {
             continue;
         }
@@ -709,7 +719,7 @@ bool turbovec_staged_search(
     bool exact_built = false;
     auto build_exact = [&]() {
         if (permute_dot) {
-            build_turbovec_permute_dot(query, dim, pd);
+            build_turbovec_permute_dot(query, dim, pd, turbovec_layout(idx) == kTurboVecLayoutVm8);
             pd.bias = bias_corr;
             if (exact4) {
                 // Position 8c + b is dim 8c + 7 - b, zero-padded to 64s.
@@ -1097,6 +1107,13 @@ int turbovec_low_kernel_parity_for_test(int kernel) {
     (void) kernel;
     return -1;
 #endif
+}
+
+int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * unit, std::vector<uint64_t> * masks) {
+    const LowPlanes planes = build_low_planes(q, m, dim);
+    *unit = planes.unit;
+    *masks = planes.masks;
+    return planes.sum_w;
 }
 
 void turbovec_force_planes_for_test(int mode, size_t min_vectors) {
