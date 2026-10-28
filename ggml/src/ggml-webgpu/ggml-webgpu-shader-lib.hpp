@@ -965,6 +965,20 @@ inline bool ggml_webgpu_flash_attn_can_use_subgroup_matrix_path(bool            
 
 /** Matrix Multiplication **/
 
+inline constexpr uint32_t GGML_WEBGPU_MUL_MAT_VEC_WIDTH = 4u;
+
+inline bool ggml_webgpu_mul_mat_vec4_rows(const ggml_tensor * tensor) {
+    const size_t vec_bytes = GGML_WEBGPU_MUL_MAT_VEC_WIDTH * ggml_type_size(tensor->type);
+    return tensor->ne[0] % GGML_WEBGPU_MUL_MAT_VEC_WIDTH == 0 && tensor->nb[1] % vec_bytes == 0 &&
+           tensor->nb[2] % vec_bytes == 0 && tensor->nb[3] % vec_bytes == 0 &&
+           ggml_webgpu_flash_attn_tensor_offset(tensor) % vec_bytes == 0;
+}
+
+inline bool ggml_webgpu_mul_mat_can_vectorize(const ggml_tensor * src0, const ggml_tensor * src1) {
+    return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) && ggml_webgpu_mul_mat_vec4_rows(src0) &&
+           ggml_webgpu_mul_mat_vec4_rows(src1);
+}
+
 inline bool ggml_webgpu_mul_mat_prec_f32(const ggml_tensor * dst) {
     return dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32;
 }
@@ -2032,10 +2046,7 @@ class ggml_webgpu_shader_lib {
         ggml_webgpu_mul_mat_vec_pipeline_key key = {};
         key.src0_type                            = context.src0->type;
         key.src1_type                            = context.src1->type;
-        key.vectorized = (context.src0->ne[0] % 4 == 0 &&
-                          (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
-                             1 :
-                             0;
+        key.vectorized = ggml_webgpu_mul_mat_can_vectorize(context.src0, context.src1) ? 1 : 0;
         key.num_cols   = context.dst->ne[1];
         key.use_mmvq =
             ggml_webgpu_can_use_mmvq(context.src0, context.src1, context.dst, context.supports_dot_product,
@@ -2203,8 +2214,8 @@ class ggml_webgpu_shader_lib {
         ggml_webgpu_mul_mat_pipeline_key key = {};
         key.src0_type                        = context.src0->type;
         key.src1_type                        = context.src1->type;
-        key.vectorized          = (context.src0->ne[0] % 4 == 0 && context.dst->ne[0] % 4 == 0 &&
-                                   (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
+        key.vectorized          = (ggml_webgpu_mul_mat_can_vectorize(context.src0, context.src1) &&
+                                   ggml_webgpu_mul_mat_vec4_rows(context.dst)) ?
                                       1 :
                                       0;
         key.prec_f32            = ggml_webgpu_mul_mat_prec_f32(context.dst);

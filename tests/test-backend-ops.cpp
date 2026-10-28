@@ -14072,9 +14072,19 @@ static void add_speech_htp_cases(std::vector<std::unique_ptr<test_case>> & cases
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+static void add_mul_mat_strided_vec4_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t n : {1, 8}) {
+            cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 64, n, 4, {1, 1}, {1, 1}, {0, 1, 2, 3}, 10));
+            cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 64, n, 8, {2, 1}, {1, 1}, {0, 1, 2, 3}, 10));
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_speech_htp_cases(test_cases);
+    add_mul_mat_strided_vec4_cases(test_cases);
     std::default_random_engine rng(0);
 
     // unary ops
