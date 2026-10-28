@@ -3,6 +3,18 @@
 #include <cstdlib>
 #include <exception>
 
+static thread_local ggml_log_level g_log_min_level = GGML_LOG_LEVEL_NONE;
+
+ggml_log_level ggml_log_get_thread_min_level(void) {
+    return g_log_min_level;
+}
+
+ggml_log_level ggml_log_set_thread_min_level(ggml_log_level level) {
+    const auto previous = g_log_min_level;
+    g_log_min_level = level;
+    return previous;
+}
+
 static std::terminate_handler previous_terminate_handler;
 
 GGML_NORETURN static void ggml_uncaught_exception() {
