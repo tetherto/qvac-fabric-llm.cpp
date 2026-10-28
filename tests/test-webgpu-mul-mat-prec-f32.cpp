@@ -12,11 +12,12 @@ static const char * const WEBGPU_REGISTRY_NAME = "WebGPU";
 
 static const int64_t M = 96;
 
-static const float  UNIT_MAX          = 1.0f;
+static const float  UNIT_MAX           = 1.0f;
 static const float  F32_ACTIVATION_MAX = 1.0e5f;
 static const float  F16_OPERAND_MAX    = 256.0f;
 static const float  FP16_MAX           = 65504.0f;
-static const double MAX_NMSE       = 1e-9;
+static const float  ANY_REFERENCE_MAX  = 0.0f;
+static const double MAX_NMSE           = 1e-9;
 
 static const size_t CONTEXT_BYTES = 16 * 1024 * 1024;
 
@@ -29,16 +30,19 @@ static const uint32_t BASE_SEED      = 0x5EED;
 static const uint32_t SEED_STRIDE    = 101;
 
 struct graph_inputs {
-    std::vector<ggml_fp16_t> weights_f16;
-    std::vector<float>       activations;
+    std::vector<float> weights;
+    std::vector<float> activations;
 };
 
 struct mul_mat_shape {
     int64_t   k;
     int64_t   n;
+    ggml_type weight_type;
     ggml_type activation_type;
     float     weight_max;
     float     activation_max;
+    ggml_prec prec;
+    float     min_reference_max;
 };
 
 static uint32_t next_random(uint32_t & state) {
@@ -72,30 +76,32 @@ static std::vector<float> round_to_f16(const std::vector<float> & values) {
     return rounded;
 }
 
+static std::vector<float> fill_operand(size_t count, float max_value, ggml_type type, uint32_t & state) {
+    const std::vector<float> values = fill_uniform(count, max_value, state);
+    return type == GGML_TYPE_F16 ? round_to_f16(values) : values;
+}
+
 static graph_inputs make_inputs(const mul_mat_shape & shape, uint32_t seed) {
     uint32_t     state = seed;
     graph_inputs inputs;
-    inputs.weights_f16 = to_f16(fill_uniform((size_t) (shape.k * M), shape.weight_max, state));
-    inputs.activations = fill_uniform((size_t) (shape.k * shape.n), shape.activation_max, state);
-    if (shape.activation_type == GGML_TYPE_F16) {
-        inputs.activations = round_to_f16(inputs.activations);
-    }
+    inputs.weights     = fill_operand((size_t) (shape.k * M), shape.weight_max, shape.weight_type, state);
+    inputs.activations = fill_operand((size_t) (shape.k * shape.n), shape.activation_max, shape.activation_type, state);
     return inputs;
 }
 
-static void set_activations(ggml_tensor * activations, const std::vector<float> & values) {
-    if (activations->type == GGML_TYPE_F16) {
+static void set_values(ggml_tensor * tensor, const std::vector<float> & values) {
+    if (tensor->type == GGML_TYPE_F16) {
         const std::vector<ggml_fp16_t> converted = to_f16(values);
-        ggml_backend_tensor_set(activations, converted.data(), 0, converted.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(tensor, converted.data(), 0, converted.size() * sizeof(ggml_fp16_t));
         return;
     }
-    ggml_backend_tensor_set(activations, values.data(), 0, values.size() * sizeof(float));
+    ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
 }
 
 static double dot_row(const graph_inputs & inputs, const mul_mat_shape & shape, int64_t row, int64_t col) {
     double sum = 0.0;
     for (int64_t i = 0; i < shape.k; ++i) {
-        const double weight     = ggml_fp16_to_fp32(inputs.weights_f16[row * shape.k + i]);
+        const double weight     = inputs.weights[row * shape.k + i];
         const double activation = inputs.activations[col * shape.k + i];
         sum += weight * activation;
     }
@@ -125,10 +131,10 @@ static std::vector<float> run_mul_mat(ggml_backend_t        backend,
     ggml_init_params params = { CONTEXT_BYTES, nullptr, true };
     ggml_context *   ctx    = ggml_init(params);
 
-    ggml_tensor * weights     = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, shape.k, M);
+    ggml_tensor * weights     = ggml_new_tensor_2d(ctx, shape.weight_type, shape.k, M);
     ggml_tensor * activations = ggml_new_tensor_2d(ctx, shape.activation_type, shape.k, shape.n);
     ggml_tensor * out         = ggml_mul_mat(ctx, weights, activations);
-    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+    ggml_mul_mat_set_prec(out, shape.prec);
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
@@ -136,8 +142,8 @@ static std::vector<float> run_mul_mat(ggml_backend_t        backend,
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     GGML_ASSERT(buffer != nullptr);
 
-    ggml_backend_tensor_set(weights, inputs.weights_f16.data(), 0, inputs.weights_f16.size() * sizeof(ggml_fp16_t));
-    set_activations(activations, inputs.activations);
+    set_values(weights, inputs.weights);
+    set_values(activations, inputs.activations);
     GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
 
     std::vector<float> result(ggml_nelements(out));
@@ -194,26 +200,31 @@ static bool check_shape(ggml_backend_t webgpu, const mul_mat_shape & shape, uint
     const float  reference_max = max_abs(reference);
     const bool   finite        = all_finite(actual);
     const double error         = nmse(reference, actual);
-    const bool   ok            = reference_max > FP16_MAX && finite && error < MAX_NMSE;
+    const bool   ok            = reference_max > shape.min_reference_max && finite && error < MAX_NMSE;
 
-    std::printf("%s %s k=%3lld n=%3lld reference_max=%.0f finite=%d nmse=%.3e\n", ok ? "ok  " : "FAIL",
-                ggml_type_name(shape.activation_type), (long long) shape.k, (long long) shape.n, reference_max,
-                finite ? 1 : 0, error);
+    std::printf("%s %s x %s prec=%s k=%3lld n=%3lld reference_max=%.0f finite=%d nmse=%.3e\n", ok ? "ok  " : "FAIL",
+                ggml_type_name(shape.weight_type), ggml_type_name(shape.activation_type),
+                shape.prec == GGML_PREC_F32 ? "f32" : "default", (long long) shape.k, (long long) shape.n,
+                reference_max, finite ? 1 : 0, error);
     return ok;
 }
 
 static int count_failures(ggml_backend_t webgpu) {
     const mul_mat_shape shapes[] = {
-        { 512, 1, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX },
-        { 512, 4, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX },
-        { 512, 5, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX },
-        { 512, 63, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX },
-        { 512, 129, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX },
-        { 513, 1, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX },
-        { 513, 63, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX },
-        { 512, 1, GGML_TYPE_F16, F16_OPERAND_MAX, F16_OPERAND_MAX },
-        { 512, 4, GGML_TYPE_F16, F16_OPERAND_MAX, F16_OPERAND_MAX },
-        { 512, 63, GGML_TYPE_F16, F16_OPERAND_MAX, F16_OPERAND_MAX },
+        { 512, 1, GGML_TYPE_F16, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX, GGML_PREC_F32, FP16_MAX },
+        { 512, 4, GGML_TYPE_F16, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX, GGML_PREC_F32, FP16_MAX },
+        { 512, 5, GGML_TYPE_F16, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX, GGML_PREC_F32, FP16_MAX },
+        { 512, 63, GGML_TYPE_F16, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX, GGML_PREC_F32, FP16_MAX },
+        { 512, 129, GGML_TYPE_F16, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX, GGML_PREC_F32, FP16_MAX },
+        { 513, 1, GGML_TYPE_F16, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX, GGML_PREC_F32, FP16_MAX },
+        { 513, 63, GGML_TYPE_F16, GGML_TYPE_F32, UNIT_MAX, F32_ACTIVATION_MAX, GGML_PREC_F32, FP16_MAX },
+        { 512, 1, GGML_TYPE_F16, GGML_TYPE_F16, F16_OPERAND_MAX, F16_OPERAND_MAX, GGML_PREC_F32, FP16_MAX },
+        { 512, 4, GGML_TYPE_F16, GGML_TYPE_F16, F16_OPERAND_MAX, F16_OPERAND_MAX, GGML_PREC_F32, FP16_MAX },
+        { 512, 63, GGML_TYPE_F16, GGML_TYPE_F16, F16_OPERAND_MAX, F16_OPERAND_MAX, GGML_PREC_F32, FP16_MAX },
+        { 512, 1, GGML_TYPE_F32, GGML_TYPE_F32, UNIT_MAX, UNIT_MAX, GGML_PREC_DEFAULT, ANY_REFERENCE_MAX },
+        { 512, 63, GGML_TYPE_F32, GGML_TYPE_F32, UNIT_MAX, UNIT_MAX, GGML_PREC_DEFAULT, ANY_REFERENCE_MAX },
+        { 513, 63, GGML_TYPE_F32, GGML_TYPE_F32, UNIT_MAX, UNIT_MAX, GGML_PREC_DEFAULT, ANY_REFERENCE_MAX },
+        { 512, 129, GGML_TYPE_F32, GGML_TYPE_F32, UNIT_MAX, UNIT_MAX, GGML_PREC_DEFAULT, ANY_REFERENCE_MAX },
     };
     uint32_t seed     = BASE_SEED;
     int      failures = 0;
