@@ -1551,17 +1551,37 @@ bool turbovec_staged_search_batch(
         int k,
         int n_threads,
         std::vector<std::vector<ScoreId>> & heaps) {
-#if GGML_VEC_INDEX_USE_NEON
-    // Upstream's aarch64 batch: the sign region scanned four queries at a
-    // time with the fused LUT kernel (one code load and nibble split for
-    // all four), a seeded collector per query. x86 batches its sign scan
-    // with the `vpermb` kernel, not ported here.
-    constexpr int kQuad = 4;
-    // The 4-query kernel reads the lane-blocked sign region, aarch64's.
-    if (!is_turbovec(idx) || idx.turbovec_legacy || !idx.turbovec_staged_enabled || idx.turbovec_x86 ||
-        turbovec_sign_layout(idx) == kTurboVecLayoutVm || n_q < kQuad) {
+    if (!is_turbovec(idx) || idx.turbovec_legacy || !idx.turbovec_staged_enabled) {
         return false;
     }
+    // Upstream scans a batch's sign region several queries at a time, a
+    // seeded collector per query: under its aarch64 rules four with the
+    // fused LUT kernel over the lane-blocked region (one code load and
+    // nibble split for all four), under its x86 rules six with the
+    // `vpermb` kernel over the vector-major region (search.rs VNNI_BATCH,
+    // where that kernel's cost per query is lowest; the tail takes its own
+    // width, a lone one two blocks a call).
+    constexpr int kQuad = 4;
+    constexpr int kVnniBatch = 6;
+    constexpr int kBatchMax = 6;
+    static_assert(kQuad <= kBatchMax && kVnniBatch <= kBatchMax, "the per-task arrays hold a batch");
+    const bool vm_sign = turbovec_sign_layout(idx) == kTurboVecLayoutVm;
+#if GGML_VEC_INDEX_USE_NEON
+    const bool quad_scan = !idx.turbovec_x86 && !vm_sign;
+#else
+    // The aarch64 rules without their NEON kernel (forced in a test on an
+    // x86 host) run query by query.
+    const bool quad_scan = false;
+#endif
+    if (!quad_scan && !vm_sign) {
+        return false;
+    }
+    // The quad kernel wants four queries; the `vpermb` scan has a form for
+    // every width, so any batch takes it.
+    if (n_q < (quad_scan ? kQuad : 2)) {
+        return false;
+    }
+    const size_t width = static_cast<size_t>(quad_scan ? kQuad : kVnniBatch);
     TurboVecPlanesStats stats;
     const std::vector<float> * centre = nullptr;
     if (!planes_ready(idx, stats, centre)) {
@@ -1578,16 +1598,18 @@ bool turbovec_staged_search_batch(
         return false;
     }
     n_threads = std::max(1, n_threads);
-    const size_t n_tasks = (static_cast<size_t>(n_q) + kQuad - 1) / kQuad;
+    const size_t n_tasks = (static_cast<size_t>(n_q) + width - 1) / width;
     if (n_threads > 1 && n_tasks < static_cast<size_t>(n_threads)) {
-        // Fewer quads than threads would leave threads idle; query by query
-        // each query splits its blocks instead. (Upstream tiles the block
-        // axis as well.)
+        // Fewer batches than threads would leave threads idle; query by
+        // query each query splits its blocks instead. (Upstream tiles the
+        // block axis as well.)
         return false;
     }
     const float m = stats.m;
     const float * vscales = idx.turbovec_scale.data();
     const bool calibrated = !idx.turbovec_tqplus_shift.empty();
+    // Both kernels implement the collector (upstream planes_buffered_supported
+    // holds for either), so a large enough index seeds every query.
     const bool seeded = 2 * s_len < n && n / kBlock >= kSeedMinBlocks;
     const size_t n_q_sz = static_cast<size_t>(n_q);
 
@@ -1619,18 +1641,20 @@ bool turbovec_staged_search_batch(
         turbovec_staged_search(idx, score_queries.data() + q * dim_sz, biases[q], k, nullptr, o, heaps[q]);
     };
 
-    // The scan, a quad per task; a short tail scans query by query with
-    // the same tables so its queries count toward the batch's short ones.
+    // The scan, a batch per task. A quad path's short tail scans query by
+    // query with the same tables so its queries count toward the batch's
+    // short ones; the `vpermb` kernel takes a tail at its own width.
     std::vector<uint8_t> seed_short(n_q_sz, 0);
     parallel_for(n_tasks, n_threads, [&](size_t task, size_t) {
         count_batch_scan();
-        const size_t q0 = task * kQuad;
-        const size_t n_in = std::min<size_t>(kQuad, n_q_sz - q0);
-        SignLut luts[kQuad];
-        const uint8_t * lut_ptrs[kQuad] = {};
-        float lut_scales[kQuad] = {};
-        float lut_biases[kQuad] = {};
-        Collector cols[kQuad];
+        const size_t q0 = task * width;
+        const size_t n_in = std::min(width, n_q_sz - q0);
+        SignLut luts[kBatchMax];
+        const uint8_t * lut_ptrs[kBatchMax] = {};
+        const uint8_t * split_ptrs[kBatchMax] = {};
+        float lut_scales[kBatchMax] = {};
+        float lut_biases[kBatchMax] = {};
+        Collector cols[kBatchMax];
         std::vector<float> q_sign(dim_sz);
         for (size_t i = 0; i < n_in; ++i) {
             const size_t q = q0 + i;
@@ -1643,27 +1667,54 @@ bool turbovec_staged_search_batch(
             }
             luts[i] = build_sign_lut(q_sign.data(), m, dim, false);
             luts[i].bias += biases[q];
+            split_sign_lut(idx, luts[i]);
             lut_ptrs[i] = luts[i].values.data();
+            split_ptrs[i] = luts[i].split.empty() ? nullptr : luts[i].split.data();
             lut_scales[i] = luts[i].scale;
             lut_biases[i] = luts[i].bias;
             const float seed = seeded ? sample_seed(idx, luts[i], s_len, bits) : -std::numeric_limits<float>::infinity();
             cols[i].start(s_len, seed, 2 * s_len, nullptr);
         }
-        float block_scores[kQuad][kBlock];
-        float * const outs[kQuad] = { block_scores[0], block_scores[1], block_scores[2], block_scores[3] };
-        for (size_t block = 0; block < n_blocks; ++block) {
-            const size_t count = std::min(kBlock, n - block * kBlock);
-            if (n_in == kQuad) {
-                score_turbovec_lut_block_4(
-                    lut_ptrs, lut_scales, lut_biases, idx.turbovec_sign_blocked.data(), vscales, block, n, 2, dim / 2,
-                    outs);
-            } else {
+        if (quad_scan) {
+#if GGML_VEC_INDEX_USE_NEON
+            float block_scores[kQuad][kBlock];
+            float * const outs[kQuad] = { block_scores[0], block_scores[1], block_scores[2], block_scores[3] };
+            for (size_t block = 0; block < n_blocks; ++block) {
+                const size_t count = std::min(kBlock, n - block * kBlock);
+                if (n_in == kQuad) {
+                    score_turbovec_lut_block_4(
+                        lut_ptrs, lut_scales, lut_biases, idx.turbovec_sign_blocked.data(), vscales, block, n, 2,
+                        dim / 2, outs);
+                } else {
+                    for (size_t i = 0; i < n_in; ++i) {
+                        score_sign_block(idx, luts[i], idx.turbovec_sign_blocked.data(), block, n, block_scores[i]);
+                    }
+                }
                 for (size_t i = 0; i < n_in; ++i) {
-                    score_sign_block(idx, luts[i], idx.turbovec_sign_blocked.data(), block, n, block_scores[i]);
+                    cols[i].add_block(block_scores[i], block, count, nullptr);
                 }
             }
+#endif
+        } else {
+            // Blocks per `vpermb` call: enough that a lone tail query's
+            // kernel walks its block pairs and the per-call setup is shared.
+            constexpr size_t kVnniGroup = 8;
+            std::vector<float> scores(n_in * kVnniGroup * kBlock);
+            float * outs[kBatchMax] = {};
             for (size_t i = 0; i < n_in; ++i) {
-                cols[i].add_block(block_scores[i], block, count, nullptr);
+                outs[i] = scores.data() + i * kVnniGroup * kBlock;
+            }
+            for (size_t block = 0; block < n_blocks; block += kVnniGroup) {
+                const size_t n_group = std::min(kVnniGroup, n_blocks - block);
+                score_turbovec_lut_blocks_vnni(
+                    lut_ptrs, split_ptrs, lut_scales, lut_biases, static_cast<int>(n_in), idx.turbovec_sign_blocked.data(),
+                    vscales, block, n_group, n, 2, dim / 2, outs);
+                for (size_t b = 0; b < n_group; ++b) {
+                    const size_t count = std::min(kBlock, n - (block + b) * kBlock);
+                    for (size_t i = 0; i < n_in; ++i) {
+                        cols[i].add_block(outs[i] + b * kBlock, block + b, count, nullptr);
+                    }
+                }
             }
         }
         for (size_t i = 0; i < n_in; ++i) {
@@ -1683,9 +1734,9 @@ bool turbovec_staged_search_batch(
     });
 
     // Upstream rescans a batch's short queries unseeded: one alone through
-    // the single-query scan and its narrower tables, several with the batch
-    // tables. The lone scan does both: seeded again, it comes back short
-    // again and rescans itself unseeded.
+    // the single-query scan and, under the aarch64 rules, its narrower
+    // tables, several with the batch tables. The lone scan does both:
+    // seeded again, it comes back short again and rescans itself unseeded.
     std::vector<size_t> short_queries;
     for (size_t q = 0; q < n_q_sz; ++q) {
         if (seed_short[q] != 0) {
@@ -1695,15 +1746,6 @@ bool turbovec_staged_search_batch(
     const bool lone_short = short_queries.size() == 1;
     parallel_for(short_queries.size(), n_threads, [&](size_t i, size_t) { run_query(short_queries[i], nullptr, lone_short); });
     return true;
-#else
-    (void) idx;
-    (void) rotated_queries;
-    (void) n_q;
-    (void) k;
-    (void) n_threads;
-    (void) heaps;
-    return false;
-#endif
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS

@@ -1505,8 +1505,8 @@ static int ggml_vec_index_search_impl(
                 dim);
         }
         // A staged (planes) search over several queries scans the sign
-        // region four queries at a time; it declines a filtered search and
-        // a batch too small for the threads, which run query by query.
+        // region several queries at a time; it declines a filtered search
+        // and a batch too small for the threads, which run query by query.
         if (is_turbovec(*idx) && idx->turbovec_planes && idx->turbovec_staged_enabled && allowed_ptr == nullptr &&
             active_count(*idx) == idx->slot_to_id.size() && n_q > 1) {
             std::vector<std::vector<ScoreId>> heaps;
