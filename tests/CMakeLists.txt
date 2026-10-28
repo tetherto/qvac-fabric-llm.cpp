@@ -535,6 +535,13 @@ llama_build_and_test(test-copy-tbq-subgroups.cpp)
 # mtmd, so it is intentionally outside the LLAMA_MTMD block below.
 llama_build_and_test(test-opencl-fa-chunking.cpp)
 
+# QVAC-26299: PNG zlib decode in vendor/stb/stb_image.h stays bounded by the
+# IHDR size (decompression bomb) and still decodes valid and Adam7 PNGs. Pure
+# CPU, compiles its own stb copy with tracking allocators, so it does not need
+# mtmd and sits outside the LLAMA_MTMD block below.
+llama_build_and_test(test-stb-png-decode-bound.cpp)
+target_include_directories(test-stb-png-decode-bound PRIVATE ${PROJECT_SOURCE_DIR}/vendor)
+
 # Readback of views of OpenCL Q1_0 / PQ2_0 weights, which the backend stores converted. Self-skipping like the above.
 llama_build_and_test(test-opencl-quant-views.cpp)
 
