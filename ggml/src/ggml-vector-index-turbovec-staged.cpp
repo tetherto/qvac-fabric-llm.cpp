@@ -8,7 +8,7 @@
 // path (search.rs `search` with a `PlanesRef`, `rerank_legacy`, `Refine`).
 // Upstream's seeded collectors only speed the shortlist up, except that the
 // one query of a batch whose seed runs short is rescanned with single-query
-// tables; the port computes the seed to reproduce that. Upstream's in-scan
+// tables; the port seeds the same way and reports that query. Upstream's in-scan
 // refinement on a thread pool, which can return other rows than its
 // single-threaded path, is not reproduced: a lone query here splits the
 // shortlist scan, the ranking and the rescore across threads and still
@@ -990,11 +990,12 @@ bool turbovec_staged_search(
         }
     } else {
         // Upstream seeds an unmasked scan's collector with the r-th best
-        // score of a 48-block sample and rescans a query that comes back
-        // with fewer than s_len rows above it. The rows kept are the same
-        // either way; only which query is short matters, to the caller.
-        const bool seeded = kSeedSupported && arm_rules && opts.seed_short != nullptr && allowed_mask == nullptr &&
-            2 * s_len < n_allowed && n / kBlock >= kSeedMinBlocks;
+        // score of a 48-block sample, so it admits a few hundred rows in
+        // all instead of ratcheting a top s_len, and rescans a query that
+        // comes back with fewer than s_len rows above the seed. With s_len
+        // rows above it the rows kept are exactly the unseeded top s_len.
+        const bool seeded = kSeedSupported && arm_rules && allowed_mask == nullptr && 2 * s_len < n_allowed &&
+            n / kBlock >= kSeedMinBlocks;
         float seed = -std::numeric_limits<float>::infinity();
         if (seeded) {
             seed = sample_seed(idx, sign_lut, s_len, bits);
@@ -1008,8 +1009,10 @@ bool turbovec_staged_search(
         auto scan = [&](size_t block_begin, size_t block_end, std::vector<ScoreId> & top, size_t & above_seed) {
             // A short range never needs the full 2 * s_len.
             top.reserve(std::min(2 * s_len, (block_end - block_begin) * kBlock + 1));
-            bool cut = false;
-            double threshold = 0.0;
+            // A seed is the threshold until the first cut-back raises it.
+            const bool seed_active = seed > -std::numeric_limits<float>::infinity();
+            bool cut = seed_active;
+            double threshold = seed_active ? static_cast<double>(seed) : 0.0;
             auto cut_back = [&]() {
                 std::nth_element(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(s_len - 1), top.end(), score_id_better);
                 top.resize(s_len);
@@ -1043,7 +1046,7 @@ bool turbovec_staged_search(
                 for (size_t i = 0; i < 8; ++i) {
                     v[i] = vld1q_f32(block_scores + i * 4);
                 }
-                if (seeded) {
+                if (seed_active) {
                     const float32x4_t seed_v = vdupq_n_f32(seed);
                     uint32x4_t above = vdupq_n_u32(0);
                     for (const float32x4_t & x : v) {
@@ -1089,7 +1092,7 @@ bool turbovec_staged_search(
                     continue;
                 }
 #else
-                if (seeded) {
+                if (seed_active) {
                     for (size_t lane = 0; lane < count; ++lane) {
                         above_seed += block_scores[lane] > seed ? 1 : 0;
                     }
@@ -1115,45 +1118,61 @@ bool turbovec_staged_search(
             }
         };
         std::vector<ScoreId> top;
-        size_t above_seed = 0;
-        if (split) {
-            const size_t n_ranges = static_cast<size_t>(n_threads) * kRangesPerThread;
-            const size_t per_range = (n_blocks + n_ranges - 1) / n_ranges;
-            std::vector<std::vector<ScoreId>> range_tops(n_ranges);
-            std::vector<size_t> range_above(n_ranges, 0);
-            // Two more tasks build the query's later tables meanwhile.
-            parallel_for(n_ranges + 2, n_threads, [&](size_t range, size_t) {
-                if (range == n_ranges) {
-                    build_low();
-                    return;
+        bool seed_short = false;
+        // A seeded scan that comes back short runs once more unseeded; the
+        // later tables are built on the first pass only.
+        for (int pass = 0; pass < 2; ++pass) {
+            size_t above_seed = 0;
+            top.clear();
+            floor_score.store(-std::numeric_limits<double>::infinity(), std::memory_order_relaxed);
+            if (split) {
+                const size_t n_ranges = static_cast<size_t>(n_threads) * kRangesPerThread;
+                const size_t per_range = (n_blocks + n_ranges - 1) / n_ranges;
+                std::vector<std::vector<ScoreId>> range_tops(n_ranges);
+                std::vector<size_t> range_above(n_ranges, 0);
+                // Two more tasks build the query's later tables meanwhile.
+                parallel_for(n_ranges + 2, n_threads, [&](size_t range, size_t) {
+                    if (range == n_ranges) {
+                        if (pass == 0) {
+                            build_low();
+                        }
+                        return;
+                    }
+                    if (range == n_ranges + 1) {
+                        if (pass == 0) {
+                            build_exact();
+                        }
+                        return;
+                    }
+                    const size_t begin = range * per_range;
+                    const size_t end = std::min(n_blocks, begin + per_range);
+                    if (begin < end) {
+                        scan(begin, end, range_tops[range], range_above[range]);
+                    }
+                });
+                // A row below the final floor is below some range's s_len rows.
+                const double floor = floor_score.load(std::memory_order_relaxed);
+                size_t total = 0;
+                for (size_t range = 0; range < n_ranges; ++range) {
+                    above_seed += range_above[range];
+                    total += range_tops[range].size();
                 }
-                if (range == n_ranges + 1) {
-                    build_exact();
-                    return;
-                }
-                const size_t begin = range * per_range;
-                const size_t end = std::min(n_blocks, begin + per_range);
-                if (begin < end) {
-                    scan(begin, end, range_tops[range], range_above[range]);
-                }
-            });
-            // A row below the final floor is below some range's s_len rows.
-            const double floor = floor_score.load(std::memory_order_relaxed);
-            size_t total = 0;
-            for (size_t range = 0; range < n_ranges; ++range) {
-                above_seed += range_above[range];
-                total += range_tops[range].size();
-            }
-            top.reserve(total);
-            for (const std::vector<ScoreId> & range_top : range_tops) {
-                for (const ScoreId & c : range_top) {
-                    if (c.score >= floor) {
-                        top.push_back(c);
+                top.reserve(total);
+                for (const std::vector<ScoreId> & range_top : range_tops) {
+                    for (const ScoreId & c : range_top) {
+                        if (c.score >= floor) {
+                            top.push_back(c);
+                        }
                     }
                 }
+            } else {
+                scan(0, n_blocks, top, above_seed);
             }
-        } else {
-            scan(0, n_blocks, top, above_seed);
+            if (!seeded || seed == -std::numeric_limits<float>::infinity() || above_seed >= s_len) {
+                break;
+            }
+            seed_short = true;
+            seed = -std::numeric_limits<float>::infinity();
         }
         if (top.size() > s_len) {
             std::nth_element(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(s_len - 1), top.end(), score_id_better);
@@ -1164,8 +1183,8 @@ bool turbovec_staged_search(
             const size_t v = static_cast<size_t>(c.id);
             list.push_back({ v, plain_score(v, static_cast<float>(c.score)) });
         }
-        if (seeded) {
-            *opts.seed_short = above_seed < s_len;
+        if (seeded && opts.seed_short != nullptr) {
+            *opts.seed_short = seed_short;
         }
     }
     // Runs fn(i) for every candidate i in [0, count): each candidate's
