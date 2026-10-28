@@ -15,17 +15,23 @@
 #if Q6K_GEMM_COLS == 8
 #define Q6K_GEMM_NAME         kernel_gemm_noshuffle_q6_K_f32
 #define Q6K_GEMM_HALF_T       half8
+#define Q6K_GEMM_FLOAT_T      float8
+#define Q6K_GEMM_TO_FLOAT     convert_float8
 #define Q6K_GEMM_COLS_LOG2    3
 #define Q6K_GEMM_LOAD_B(r)    B.s0123 = read_imageh(src1, gy*2 + (r)*n_4 + 0); \
                               B.s4567 = read_imageh(src1, gy*2 + (r)*n_4 + 1);
 #elif Q6K_GEMM_COLS == 4
 #define Q6K_GEMM_NAME         kernel_gemm_noshuffle_q6_K_f32_n4
 #define Q6K_GEMM_HALF_T       half4
+#define Q6K_GEMM_FLOAT_T      float4
+#define Q6K_GEMM_TO_FLOAT     convert_float4
 #define Q6K_GEMM_COLS_LOG2    2
 #define Q6K_GEMM_LOAD_B(r)    B = read_imageh(src1, gy + (r)*n_4);
 #else
 #error "Q6K_GEMM_COLS must be 4 or 8"
 #endif
+
+#define K_PER_SCALE_PAIR 32
 
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
@@ -54,7 +60,7 @@ kernel void Q6K_GEMM_NAME(
     int gx = get_global_id(1); // m
     int gx_2 = gx << 2;
 
-    Q6K_GEMM_HALF_T c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    Q6K_GEMM_FLOAT_T c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     Q6K_GEMM_HALF_T B;
     half4 dequantized_weights;
 
@@ -63,61 +69,69 @@ kernel void Q6K_GEMM_NAME(
     global const ushort * ptr_s  = src0_s  + gx_2;
     global const half   * ptr_d  = src0_d  + gx_2;
 
-    for (int i = 0; i < k; i += 4) {
-        // load 4x elements (ushort) of ql on M, each ushort contains 4 weights
-        // 4x ushort correspons to 4 rows on M
-        ushort4 bits4 = vload4(0, ptr_ql + (i/4)*m); // ql packed in 4s in ushort
-        uchar4  bits2 = vload4(0, ptr_qh + (i/4)*m); // qh packed in 4s in uchar
-
+    for (int ib = 0; ib < k; ib += K_PER_SCALE_PAIR) {
         // load 4 consecutive scales
-        char8 scale_s_8 = as_char8(vload4(0, ptr_s + (i/16/2)*m)); // 1 char scale every 16 elements, packed in 2s
-        char4   scale_s = ((i/16) % 2) == 0 ? scale_s_8.s0246 : scale_s_8.s1357; // transposed as ushort, 2 blocks
-        half4   scale_d = vload4(0, ptr_d + (i/256)*m);  // 1 half scale every 256 elements
+        char8 scale_s_8 = as_char8(vload4(0, ptr_s + (ib/K_PER_SCALE_PAIR)*m)); // 1 char scale every 16 elements, packed in 2s
+        half4   scale_d = vload4(0, ptr_d + (ib/256)*m);  // 1 half scale every 256 elements
+        Q6K_GEMM_HALF_T b0 = 0, b1 = 0, b2 = 0, b3 = 0;
 
-        // j=0
-        // load the Q6K_GEMM_COLS activations of this work item's columns
-        Q6K_GEMM_LOAD_B(i + 0)
-        dequantized_weights.s0 = (convert_half((bits4.s0 & 0x000F) | ((bits2.s0 & 0x03) << 4)) - 32.f) * scale_s.s0 * scale_d.s0;
-        dequantized_weights.s1 = (convert_half((bits4.s1 & 0x000F) | ((bits2.s1 & 0x03) << 4)) - 32.f) * scale_s.s1 * scale_d.s1;
-        dequantized_weights.s2 = (convert_half((bits4.s2 & 0x000F) | ((bits2.s2 & 0x03) << 4)) - 32.f) * scale_s.s2 * scale_d.s2;
-        dequantized_weights.s3 = (convert_half((bits4.s3 & 0x000F) | ((bits2.s3 & 0x03) << 4)) - 32.f) * scale_s.s3 * scale_d.s3;
-        c0 += B * dequantized_weights.s0;
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+        for (int i = ib; i < ib + K_PER_SCALE_PAIR; i += 4) {
+            // load 4x elements (ushort) of ql on M, each ushort contains 4 weights
+            // 4x ushort correspons to 4 rows on M
+            ushort4 bits4 = vload4(0, ptr_ql + (i/4)*m); // ql packed in 4s in ushort
+            uchar4  bits2 = vload4(0, ptr_qh + (i/4)*m); // qh packed in 4s in uchar
 
-        // j=1
-        Q6K_GEMM_LOAD_B(i + 1)
-        dequantized_weights.s0 = (convert_half((((bits4.s0 & 0x00F0) >> 4) | ((bits2.s0 & 0x0C) << 2))) - 32.f) * scale_s.s0 * scale_d.s0;
-        dequantized_weights.s1 = (convert_half((((bits4.s1 & 0x00F0) >> 4) | ((bits2.s1 & 0x0C) << 2))) - 32.f) * scale_s.s1 * scale_d.s1;
-        dequantized_weights.s2 = (convert_half((((bits4.s2 & 0x00F0) >> 4) | ((bits2.s2 & 0x0C) << 2))) - 32.f) * scale_s.s2 * scale_d.s2;
-        dequantized_weights.s3 = (convert_half((((bits4.s3 & 0x00F0) >> 4) | ((bits2.s3 & 0x0C) << 2))) - 32.f) * scale_s.s3 * scale_d.s3;
-        c0 += B * dequantized_weights.s0;
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+            char4   scale_s = ((i/16) % 2) == 0 ? scale_s_8.s0246 : scale_s_8.s1357; // transposed as ushort, 2 blocks
 
-        // j=2
-        Q6K_GEMM_LOAD_B(i + 2)
-        dequantized_weights.s0 = (convert_half((((bits4.s0 & 0x0F00) >> 8) | (bits2.s0 & 0x30))) - 32.f) * scale_s.s0 * scale_d.s0;
-        dequantized_weights.s1 = (convert_half((((bits4.s1 & 0x0F00) >> 8) | (bits2.s1 & 0x30))) - 32.f) * scale_s.s1 * scale_d.s1;
-        dequantized_weights.s2 = (convert_half((((bits4.s2 & 0x0F00) >> 8) | (bits2.s2 & 0x30))) - 32.f) * scale_s.s2 * scale_d.s2;
-        dequantized_weights.s3 = (convert_half((((bits4.s3 & 0x0F00) >> 8) | (bits2.s3 & 0x30))) - 32.f) * scale_s.s3 * scale_d.s3;
-        c0 += B * dequantized_weights.s0;
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+            // j=0
+            Q6K_GEMM_LOAD_B(i + 0)
+            dequantized_weights.s0 = (convert_half((bits4.s0 & 0x000F) | ((bits2.s0 & 0x03) << 4)) - 32.f) * scale_s.s0 * scale_d.s0;
+            dequantized_weights.s1 = (convert_half((bits4.s1 & 0x000F) | ((bits2.s1 & 0x03) << 4)) - 32.f) * scale_s.s1 * scale_d.s1;
+            dequantized_weights.s2 = (convert_half((bits4.s2 & 0x000F) | ((bits2.s2 & 0x03) << 4)) - 32.f) * scale_s.s2 * scale_d.s2;
+            dequantized_weights.s3 = (convert_half((bits4.s3 & 0x000F) | ((bits2.s3 & 0x03) << 4)) - 32.f) * scale_s.s3 * scale_d.s3;
+            b0 += B * dequantized_weights.s0;
+            b1 += B * dequantized_weights.s1;
+            b2 += B * dequantized_weights.s2;
+            b3 += B * dequantized_weights.s3;
 
-        // j=3
-        Q6K_GEMM_LOAD_B(i + 3)
-        dequantized_weights.s0 = (convert_half((((bits4.s0 & mask_f000) >> 12) | ((bits2.s0 & mask_c0) >> 2))) - 32.f) * scale_s.s0 * scale_d.s0;
-        dequantized_weights.s1 = (convert_half((((bits4.s1 & mask_f000) >> 12) | ((bits2.s1 & mask_c0) >> 2))) - 32.f) * scale_s.s1 * scale_d.s1;
-        dequantized_weights.s2 = (convert_half((((bits4.s2 & mask_f000) >> 12) | ((bits2.s2 & mask_c0) >> 2))) - 32.f) * scale_s.s2 * scale_d.s2;
-        dequantized_weights.s3 = (convert_half((((bits4.s3 & mask_f000) >> 12) | ((bits2.s3 & mask_c0) >> 2))) - 32.f) * scale_s.s3 * scale_d.s3;
-        c0 += B * dequantized_weights.s0;
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+            // j=1
+            Q6K_GEMM_LOAD_B(i + 1)
+            dequantized_weights.s0 = (convert_half((((bits4.s0 & 0x00F0) >> 4) | ((bits2.s0 & 0x0C) << 2))) - 32.f) * scale_s.s0 * scale_d.s0;
+            dequantized_weights.s1 = (convert_half((((bits4.s1 & 0x00F0) >> 4) | ((bits2.s1 & 0x0C) << 2))) - 32.f) * scale_s.s1 * scale_d.s1;
+            dequantized_weights.s2 = (convert_half((((bits4.s2 & 0x00F0) >> 4) | ((bits2.s2 & 0x0C) << 2))) - 32.f) * scale_s.s2 * scale_d.s2;
+            dequantized_weights.s3 = (convert_half((((bits4.s3 & 0x00F0) >> 4) | ((bits2.s3 & 0x0C) << 2))) - 32.f) * scale_s.s3 * scale_d.s3;
+            b0 += B * dequantized_weights.s0;
+            b1 += B * dequantized_weights.s1;
+            b2 += B * dequantized_weights.s2;
+            b3 += B * dequantized_weights.s3;
+
+            // j=2
+            Q6K_GEMM_LOAD_B(i + 2)
+            dequantized_weights.s0 = (convert_half((((bits4.s0 & 0x0F00) >> 8) | (bits2.s0 & 0x30))) - 32.f) * scale_s.s0 * scale_d.s0;
+            dequantized_weights.s1 = (convert_half((((bits4.s1 & 0x0F00) >> 8) | (bits2.s1 & 0x30))) - 32.f) * scale_s.s1 * scale_d.s1;
+            dequantized_weights.s2 = (convert_half((((bits4.s2 & 0x0F00) >> 8) | (bits2.s2 & 0x30))) - 32.f) * scale_s.s2 * scale_d.s2;
+            dequantized_weights.s3 = (convert_half((((bits4.s3 & 0x0F00) >> 8) | (bits2.s3 & 0x30))) - 32.f) * scale_s.s3 * scale_d.s3;
+            b0 += B * dequantized_weights.s0;
+            b1 += B * dequantized_weights.s1;
+            b2 += B * dequantized_weights.s2;
+            b3 += B * dequantized_weights.s3;
+
+            // j=3
+            Q6K_GEMM_LOAD_B(i + 3)
+            dequantized_weights.s0 = (convert_half((((bits4.s0 & mask_f000) >> 12) | ((bits2.s0 & mask_c0) >> 2))) - 32.f) * scale_s.s0 * scale_d.s0;
+            dequantized_weights.s1 = (convert_half((((bits4.s1 & mask_f000) >> 12) | ((bits2.s1 & mask_c0) >> 2))) - 32.f) * scale_s.s1 * scale_d.s1;
+            dequantized_weights.s2 = (convert_half((((bits4.s2 & mask_f000) >> 12) | ((bits2.s2 & mask_c0) >> 2))) - 32.f) * scale_s.s2 * scale_d.s2;
+            dequantized_weights.s3 = (convert_half((((bits4.s3 & mask_f000) >> 12) | ((bits2.s3 & mask_c0) >> 2))) - 32.f) * scale_s.s3 * scale_d.s3;
+            b0 += B * dequantized_weights.s0;
+            b1 += B * dequantized_weights.s1;
+            b2 += B * dequantized_weights.s2;
+            b3 += B * dequantized_weights.s3;
+        }
+
+        c0 += Q6K_GEMM_TO_FLOAT(b0);
+        c1 += Q6K_GEMM_TO_FLOAT(b1);
+        c2 += Q6K_GEMM_TO_FLOAT(b2);
+        c3 += Q6K_GEMM_TO_FLOAT(b3);
     }
 
     int idx = (gy<<Q6K_GEMM_COLS_LOG2)*m + (gx<<2);

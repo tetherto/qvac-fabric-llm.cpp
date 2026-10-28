@@ -7,6 +7,8 @@
 #define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
 #endif
 
+#define QK4_1 32
+
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
 #endif
@@ -25,14 +27,13 @@ kernel void kernel_gemm_noshuffle_q4_1_f32(
 ) {
     dst = (global float *)((global char *)dst + offsetd);
 
-    int m_4 = m >> 2;
     int n_4 = n >> 2;
 
     int gy = get_global_id(0);
     int gx = get_global_id(1);
     int gx_2 = gx << 2;
 
-    half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    float8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     half8 B;
     half4 dequantized_weights;
 
@@ -40,60 +41,68 @@ kernel void kernel_gemm_noshuffle_q4_1_f32(
     global const half*   scale_ptr  = src0_d + gx_2;
     global const half*   min_ptr    = src0_m + gx_2;
 
-    for(int i = 0; i < k; i += 4) {
-        B.s0123 = read_imageh(src1, gy*2 + (i)*(n_4));
-        B.s4567 = read_imageh(src1, gy*2 + (i)*(n_4)+1);
+    for (int ib = 0; ib < k; ib += QK4_1) {
+        half4 scale = vload4(0, scale_ptr + (ib/QK4_1)*(m));
+        half4 minv  = vload4(0,   min_ptr + (ib/QK4_1)*(m));
+        half8 b0 = 0, b1 = 0, b2 = 0, b3 = 0;
 
-        ushort4 bits4 = vload4(0, weight_ptr + (i/4)*(m));
+        for (int i = ib; i < ib + QK4_1; i += 4) {
+            B.s0123 = read_imageh(src1, gy*2 + (i)*(n_4));
+            B.s4567 = read_imageh(src1, gy*2 + (i)*(n_4)+1);
 
-        half4 scale = vload4(0, scale_ptr + (i/32)*(m));
-        half4 minv  = vload4(0,   min_ptr + (i/32)*(m));
+            ushort4 bits4 = vload4(0, weight_ptr + (i/4)*(m));
 
-        // j=0
-        dequantized_weights.s0 = (bits4.s0 & (0x000F)) * scale.s0 + minv.s0;
-        dequantized_weights.s1 = (bits4.s1 & (0x000F)) * scale.s1 + minv.s1;
-        dequantized_weights.s2 = (bits4.s2 & (0x000F)) * scale.s2 + minv.s2;
-        dequantized_weights.s3 = (bits4.s3 & (0x000F)) * scale.s3 + minv.s3;
-        c0 += B * dequantized_weights.s0;
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+            // j=0
+            dequantized_weights.s0 = (bits4.s0 & (0x000F)) * scale.s0 + minv.s0;
+            dequantized_weights.s1 = (bits4.s1 & (0x000F)) * scale.s1 + minv.s1;
+            dequantized_weights.s2 = (bits4.s2 & (0x000F)) * scale.s2 + minv.s2;
+            dequantized_weights.s3 = (bits4.s3 & (0x000F)) * scale.s3 + minv.s3;
+            b0 += B * dequantized_weights.s0;
+            b1 += B * dequantized_weights.s1;
+            b2 += B * dequantized_weights.s2;
+            b3 += B * dequantized_weights.s3;
 
-        // j=1
-        B.s0123 = read_imageh(src1, gy*2 + (i+1)*(n_4));
-        B.s4567 = read_imageh(src1, gy*2 + (i+1)*(n_4)+1);
-        dequantized_weights.s0 = ((bits4.s0 & (0x00F0)) >> 4) * scale.s0 + minv.s0;
-        dequantized_weights.s1 = ((bits4.s1 & (0x00F0)) >> 4) * scale.s1 + minv.s1;
-        dequantized_weights.s2 = ((bits4.s2 & (0x00F0)) >> 4) * scale.s2 + minv.s2;
-        dequantized_weights.s3 = ((bits4.s3 & (0x00F0)) >> 4) * scale.s3 + minv.s3;
-        c0 += B * dequantized_weights.s0;
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+            // j=1
+            B.s0123 = read_imageh(src1, gy*2 + (i+1)*(n_4));
+            B.s4567 = read_imageh(src1, gy*2 + (i+1)*(n_4)+1);
+            dequantized_weights.s0 = ((bits4.s0 & (0x00F0)) >> 4) * scale.s0 + minv.s0;
+            dequantized_weights.s1 = ((bits4.s1 & (0x00F0)) >> 4) * scale.s1 + minv.s1;
+            dequantized_weights.s2 = ((bits4.s2 & (0x00F0)) >> 4) * scale.s2 + minv.s2;
+            dequantized_weights.s3 = ((bits4.s3 & (0x00F0)) >> 4) * scale.s3 + minv.s3;
+            b0 += B * dequantized_weights.s0;
+            b1 += B * dequantized_weights.s1;
+            b2 += B * dequantized_weights.s2;
+            b3 += B * dequantized_weights.s3;
 
-        // j=2
-        B.s0123 = read_imageh(src1, gy*2 + (i+2)*(n_4));
-        B.s4567 = read_imageh(src1, gy*2 + (i+2)*(n_4)+1);
-        dequantized_weights.s0 = ((bits4.s0 & (0x0F00)) >> 8) * scale.s0 + minv.s0;
-        dequantized_weights.s1 = ((bits4.s1 & (0x0F00)) >> 8) * scale.s1 + minv.s1;
-        dequantized_weights.s2 = ((bits4.s2 & (0x0F00)) >> 8) * scale.s2 + minv.s2;
-        dequantized_weights.s3 = ((bits4.s3 & (0x0F00)) >> 8) * scale.s3 + minv.s3;
-        c0 += B * dequantized_weights.s0;
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+            // j=2
+            B.s0123 = read_imageh(src1, gy*2 + (i+2)*(n_4));
+            B.s4567 = read_imageh(src1, gy*2 + (i+2)*(n_4)+1);
+            dequantized_weights.s0 = ((bits4.s0 & (0x0F00)) >> 8) * scale.s0 + minv.s0;
+            dequantized_weights.s1 = ((bits4.s1 & (0x0F00)) >> 8) * scale.s1 + minv.s1;
+            dequantized_weights.s2 = ((bits4.s2 & (0x0F00)) >> 8) * scale.s2 + minv.s2;
+            dequantized_weights.s3 = ((bits4.s3 & (0x0F00)) >> 8) * scale.s3 + minv.s3;
+            b0 += B * dequantized_weights.s0;
+            b1 += B * dequantized_weights.s1;
+            b2 += B * dequantized_weights.s2;
+            b3 += B * dequantized_weights.s3;
 
-        // j=3
-        B.s0123 = read_imageh(src1, gy*2 + (i+3)*(n_4));
-        B.s4567 = read_imageh(src1, gy*2 + (i+3)*(n_4)+1);
-        dequantized_weights.s0 = ((bits4.s0 & (0xF000)) >> 12) * scale.s0 + minv.s0;
-        dequantized_weights.s1 = ((bits4.s1 & (0xF000)) >> 12) * scale.s1 + minv.s1;
-        dequantized_weights.s2 = ((bits4.s2 & (0xF000)) >> 12) * scale.s2 + minv.s2;
-        dequantized_weights.s3 = ((bits4.s3 & (0xF000)) >> 12) * scale.s3 + minv.s3;
-        c0 += B * dequantized_weights.s0;
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+            // j=3
+            B.s0123 = read_imageh(src1, gy*2 + (i+3)*(n_4));
+            B.s4567 = read_imageh(src1, gy*2 + (i+3)*(n_4)+1);
+            dequantized_weights.s0 = ((bits4.s0 & (0xF000)) >> 12) * scale.s0 + minv.s0;
+            dequantized_weights.s1 = ((bits4.s1 & (0xF000)) >> 12) * scale.s1 + minv.s1;
+            dequantized_weights.s2 = ((bits4.s2 & (0xF000)) >> 12) * scale.s2 + minv.s2;
+            dequantized_weights.s3 = ((bits4.s3 & (0xF000)) >> 12) * scale.s3 + minv.s3;
+            b0 += B * dequantized_weights.s0;
+            b1 += B * dequantized_weights.s1;
+            b2 += B * dequantized_weights.s2;
+            b3 += B * dequantized_weights.s3;
+        }
+
+        c0 += convert_float8(b0);
+        c1 += convert_float8(b1);
+        c2 += convert_float8(b2);
+        c3 += convert_float8(b3);
     }
 
     int idx = (gy<<3)*m + (gx<<2);
