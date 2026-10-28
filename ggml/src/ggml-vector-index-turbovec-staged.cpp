@@ -6,9 +6,9 @@
 // the full scan's own arithmetic, so returned scores are exact while the
 // candidate set is approximate. This follows upstream's single-threaded
 // path (search.rs `search` with a `PlanesRef`, `rerank_legacy`, `Refine`).
-// Upstream's seeded collectors only speed the shortlist up, except that the
-// one query of a batch whose seed runs short is rescanned with single-query
-// tables; the port seeds the same way and reports that query. Upstream's in-scan
+// Upstream's seeded collectors only speed the shortlist up, except that on
+// aarch64 the one query of a batch whose seed runs short is rescanned with
+// single-query tables; the port seeds the same way and reports that query. Upstream's in-scan
 // refinement on a thread pool, which can return other rows than its
 // single-threaded path, is not reproduced: a lone query here splits the
 // shortlist scan, the ranking and the rescore across threads and still
@@ -657,15 +657,30 @@ void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last)
 namespace {
 
 // Upstream seeds its buffered collectors for an index of at least 1024 full
-// blocks (pack.rs planes_sample). What a seed changes is which query of a
-// batch is rescanned with single-query tables, and only aarch64's differ
-// (their entries are capped at 31), so the port computes it there alone.
-#if GGML_VEC_INDEX_USE_NEON
-constexpr bool kSeedSupported = true;
-#else
-constexpr bool kSeedSupported = false;
-#endif
+// blocks (pack.rs planes_sample) wherever the kernel that scans the sign
+// tables implements the collector (search.rs planes_buffered_supported):
+// always under its aarch64 rules, under its x86 rules when the tables carry
+// `vpermb` split tables, so over a vector-major sign region. A seed changes
+// how the shortlist is collected, not which rows it holds (see Collector),
+// except that on aarch64 the one query of a batch whose seed runs short is
+// rescanned with single-query tables.
 constexpr size_t kSeedMinBlocks = 1024;
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// Queries whose seed left them short, and batch scans run, for a test that
+// must know the path it checks was taken.
+std::atomic<int64_t> g_seed_short_count{ 0 };
+std::atomic<int64_t> g_batch_scan_count{ 0 };
+#endif
+void count_seed_short() {
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+    g_seed_short_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+void count_batch_scan() {
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+    g_batch_scan_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
 
 // Upstream's collector seed (search.rs sample_seeds over pack.rs
 // planes_sample): the r-th best sign score among 48 blocks taken at a
@@ -1252,7 +1267,7 @@ bool turbovec_staged_search(
         // all instead of ratcheting a top s_len, and rescans a query that
         // comes back with fewer than s_len rows above the seed. With s_len
         // rows above it the rows kept are exactly the unseeded top s_len.
-        const bool seeded = kSeedSupported && arm_rules && allowed_mask == nullptr && 2 * s_len < n_allowed &&
+        const bool seeded = (arm_rules || vm_sign) && allowed_mask == nullptr && 2 * s_len < n_allowed &&
             n / kBlock >= kSeedMinBlocks;
         float seed = -std::numeric_limits<float>::infinity();
         if (seeded) {
@@ -1331,6 +1346,7 @@ bool turbovec_staged_search(
                 break;
             }
             seed_short = true;
+            count_seed_short();
             seed = -std::numeric_limits<float>::infinity();
         }
         if (top.size() > s_len) {
@@ -1342,7 +1358,11 @@ bool turbovec_staged_search(
             const size_t v = static_cast<size_t>(c.id);
             list.push_back({ v, plain_score(v, static_cast<float>(c.score)) });
         }
-        if (seeded && opts.seed_short != nullptr) {
+        // Reported so a batch's lone short query is rescanned with
+        // single-query tables; those differ only under the aarch64 rules
+        // (upstream search.rs `search`: `deferred = aarch64 && short_q.len()
+        // == 1`), so under the x86 rules the unseeded pass above is final.
+        if (seeded && arm_rules && opts.seed_short != nullptr) {
             *opts.seed_short = seed_short;
         }
     }
@@ -1568,7 +1588,7 @@ bool turbovec_staged_search_batch(
     const float m = stats.m;
     const float * vscales = idx.turbovec_scale.data();
     const bool calibrated = !idx.turbovec_tqplus_shift.empty();
-    const bool seeded = kSeedSupported && 2 * s_len < n && n / kBlock >= kSeedMinBlocks;
+    const bool seeded = 2 * s_len < n && n / kBlock >= kSeedMinBlocks;
     const size_t n_q_sz = static_cast<size_t>(n_q);
 
     // Each query's calibrated query and TQ+ bias, as search_one computes
@@ -1603,6 +1623,7 @@ bool turbovec_staged_search_batch(
     // the same tables so its queries count toward the batch's short ones.
     std::vector<uint8_t> seed_short(n_q_sz, 0);
     parallel_for(n_tasks, n_threads, [&](size_t task, size_t) {
+        count_batch_scan();
         const size_t q0 = task * kQuad;
         const size_t n_in = std::min<size_t>(kQuad, n_q_sz - q0);
         SignLut luts[kQuad];
@@ -1649,6 +1670,7 @@ bool turbovec_staged_search_batch(
             const size_t q = q0 + i;
             if (seeded && cols[i].above_seed < s_len) {
                 seed_short[q] = 1;
+                count_seed_short();
                 continue;
             }
             std::vector<ScoreId> & top = cols[i].top;
@@ -1754,5 +1776,13 @@ int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * 
 void turbovec_force_planes_for_test(int mode, size_t min_vectors) {
     g_planes_override.store(mode, std::memory_order_relaxed);
     g_planes_min_vectors.store(min_vectors == 0 ? kTurboVecPlanesMinVectors : min_vectors, std::memory_order_relaxed);
+}
+
+int64_t turbovec_seed_short_count_for_test() {
+    return g_seed_short_count.load(std::memory_order_relaxed);
+}
+
+int64_t turbovec_batch_scan_count_for_test() {
+    return g_batch_scan_count.load(std::memory_order_relaxed);
 }
 #endif
