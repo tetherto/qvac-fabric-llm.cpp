@@ -983,6 +983,11 @@ inline bool ggml_webgpu_mul_mat_prec_f32(const ggml_tensor * dst) {
     return dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32;
 }
 
+inline bool ggml_webgpu_mul_mat_f32_arithmetic(const ggml_tensor * dst) {
+    return ggml_webgpu_mul_mat_prec_f32(dst) ||
+           (dst->src[0]->type == GGML_TYPE_F32 && dst->src[1]->type == GGML_TYPE_F32);
+}
+
 struct ggml_webgpu_mul_mat_vec_pipeline_key {
     ggml_type src0_type;
     ggml_type src1_type;
@@ -2218,7 +2223,7 @@ class ggml_webgpu_shader_lib {
                                    ggml_webgpu_mul_mat_vec4_rows(context.dst)) ?
                                       1 :
                                       0;
-        key.prec_f32            = ggml_webgpu_mul_mat_prec_f32(context.dst);
+        key.prec_f32            = ggml_webgpu_mul_mat_f32_arithmetic(context.dst);
         key.use_subgroup_matrix = context.supports_subgroup_matrix && !key.prec_f32;
         key.src_overlap         = src_overlap;
 
