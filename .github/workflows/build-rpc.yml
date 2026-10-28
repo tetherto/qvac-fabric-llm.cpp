@@ -115,7 +115,9 @@ jobs:
           ready=0
           for attempt in $(seq 1 50); do
             kill -0 ${rpc_server_0} ${rpc_server_1}
-            if bin/llama-bench -rpc ${GGML_RPC_TEST_ENDPOINTS} --list-devices > /dev/null 2>&1; then
+            # llama-bench skips the servers it cannot reach and still exits 0, so check that both are listed
+            devices="$(bin/llama-bench -rpc ${GGML_RPC_TEST_ENDPOINTS} --list-devices 2>/dev/null || true)"
+            if grep -qF ': 127.0.0.1:50052 (' <<< "${devices}" && grep -qF ': 127.0.0.1:50053 (' <<< "${devices}"; then
               ready=1
               break
             fi
@@ -169,7 +171,9 @@ jobs:
           ready=0
           for attempt in $(seq 1 50); do
             kill -0 ${rpc_server_0} ${rpc_server_1}
-            if bin/llama-bench -rpc ${GGML_RPC_TEST_ENDPOINTS} --list-devices > /dev/null 2>&1; then
+            # llama-bench skips the servers it cannot reach and still exits 0, so check that both are listed
+            devices="$(bin/llama-bench -rpc ${GGML_RPC_TEST_ENDPOINTS} --list-devices 2>/dev/null || true)"
+            if grep -qF ': 127.0.0.1:50052 (' <<< "${devices}" && grep -qF ': 127.0.0.1:50053 (' <<< "${devices}"; then
               ready=1
               break
             fi
