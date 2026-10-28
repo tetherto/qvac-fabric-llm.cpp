@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,11 @@ static const float ACTIVATION_MAX = 1000.0f;
 static const float FP16_MAX       = 65504.0f;
 static const double MAX_NMSE      = 5e-4;
 
+static const float   CANCELLING_WEIGHT   = 2.0f;
+static const float   CANCELLING_NEGATIVE = -500.0f;
+static const float   CANCELLING_POSITIVE = 1500.0f;
+static const int64_t CANCELLING_RUN      = 32;
+
 static const size_t CONTEXT_BYTES = 16 * 1024 * 1024;
 
 static const uint32_t LCG_MULTIPLIER  = 1664525u;
@@ -29,9 +35,22 @@ static const float    RANDOM_RANGE    = (float) 0x1000000;
 static const uint32_t BASE_SEED       = 0x5EED;
 static const uint32_t SEED_STRIDE     = 101;
 
+static const ggml_type WEIGHT_TYPES[] = {
+    GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+    GGML_TYPE_Q1_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL,
+};
+static const int64_t BATCHES[] = { 1, 8, 63, 64, 750 };
+
 struct graph_inputs {
-    std::vector<uint8_t> weights_q8_0;
+    ggml_type            weight_type;
+    std::vector<uint8_t> weights;
     std::vector<float>   activations;
+};
+
+struct batch_result {
+    float  reference_max;
+    bool   finite;
+    double error;
 };
 
 static uint32_t next_random(uint32_t & state) {
@@ -51,17 +70,39 @@ static std::vector<float> fill_uniform(size_t count, float max_value, uint32_t &
     return values;
 }
 
-static std::vector<uint8_t> quantize_q8_0(const std::vector<float> & values) {
-    std::vector<uint8_t> quantized(ggml_row_size(GGML_TYPE_Q8_0, K) * M);
-    ggml_quantize_chunk(GGML_TYPE_Q8_0, values.data(), quantized.data(), 0, M, K, nullptr);
+static std::vector<uint8_t> quantize(ggml_type type, const std::vector<float> & values) {
+    std::vector<uint8_t> quantized(ggml_row_size(type, K) * M);
+    ggml_quantize_chunk(type, values.data(), quantized.data(), 0, M, K, nullptr);
     return quantized;
 }
 
-static graph_inputs make_inputs(int64_t n, uint32_t seed) {
+static graph_inputs make_inputs(ggml_type type, int64_t n, uint32_t seed) {
     uint32_t state = seed;
     graph_inputs inputs;
-    inputs.weights_q8_0 = quantize_q8_0(fill_uniform((size_t) (K * M), WEIGHT_MAX, state));
-    inputs.activations  = fill_uniform((size_t) (K * n), ACTIVATION_MAX, state);
+    inputs.weight_type = type;
+    inputs.weights     = quantize(type, fill_uniform((size_t) (K * M), WEIGHT_MAX, state));
+    inputs.activations = fill_uniform((size_t) (K * n), ACTIVATION_MAX, state);
+    return inputs;
+}
+
+static void fill_cancelling_column(float * column) {
+    std::fill_n(column, CANCELLING_RUN, CANCELLING_NEGATIVE);
+    std::fill_n(column + CANCELLING_RUN, CANCELLING_RUN, CANCELLING_POSITIVE);
+}
+
+static std::vector<float> fill_cancelling_columns(int64_t n) {
+    std::vector<float> values((size_t) (K * n), 0.0f);
+    for (int64_t column = 0; column < n; ++column) {
+        fill_cancelling_column(values.data() + column * K);
+    }
+    return values;
+}
+
+static graph_inputs make_cancelling_inputs(ggml_type type, int64_t n) {
+    graph_inputs inputs;
+    inputs.weight_type = type;
+    inputs.weights     = quantize(type, std::vector<float>((size_t) (K * M), CANCELLING_WEIGHT));
+    inputs.activations = fill_cancelling_columns(n);
     return inputs;
 }
 
@@ -69,7 +110,7 @@ static std::vector<float> run_mul_mat(ggml_backend_t backend, const graph_inputs
     ggml_init_params params = { CONTEXT_BYTES, nullptr, true };
     ggml_context * ctx = ggml_init(params);
 
-    ggml_tensor * weights     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, M);
+    ggml_tensor * weights     = ggml_new_tensor_2d(ctx, inputs.weight_type, K, M);
     ggml_tensor * activations = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n);
     ggml_tensor * out         = ggml_mul_mat(ctx, weights, activations);
 
@@ -79,7 +120,7 @@ static std::vector<float> run_mul_mat(ggml_backend_t backend, const graph_inputs
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     GGML_ASSERT(buffer != nullptr);
 
-    ggml_backend_tensor_set(weights, inputs.weights_q8_0.data(), 0, inputs.weights_q8_0.size());
+    ggml_backend_tensor_set(weights, inputs.weights.data(), 0, inputs.weights.size());
     ggml_backend_tensor_set(activations, inputs.activations.data(), 0, inputs.activations.size() * sizeof(float));
     GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
 
@@ -129,28 +170,46 @@ static ggml_backend_dev_t find_opencl_device() {
     return nullptr;
 }
 
-static bool check_batch(ggml_backend_t cpu, ggml_backend_t opencl, int64_t n, uint32_t seed) {
-    const graph_inputs inputs = make_inputs(n, seed);
+static batch_result compare_backends(ggml_backend_t cpu, ggml_backend_t opencl, const graph_inputs & inputs, int64_t n) {
     const std::vector<float> reference = run_mul_mat(cpu, inputs, n);
     const std::vector<float> actual    = run_mul_mat(opencl, inputs, n);
+    return { max_abs(reference), all_finite(actual), nmse(reference, actual) };
+}
 
-    const float  reference_max = max_abs(reference);
-    const bool   finite        = all_finite(actual);
-    const double error         = nmse(reference, actual);
-    const bool   ok = reference_max > FP16_MAX && finite && error < MAX_NMSE;
-
-    std::printf("%s n=%3lld reference_max=%.0f finite=%d nmse=%.3e\n",
-                ok ? "ok  " : "FAIL", (long long) n, reference_max, finite ? 1 : 0, error);
+static bool report_batch(const char * kind, ggml_type type, int64_t n, const batch_result & result, bool ok) {
+    std::printf("%s %-6s %-6s n=%3lld reference_max=%.0f finite=%d nmse=%.3e\n",
+                ok ? "ok  " : "FAIL", kind, ggml_type_name(type), (long long) n,
+                result.reference_max, result.finite ? 1 : 0, result.error);
     return ok;
 }
 
+static bool check_sum_range_batch(ggml_backend_t cpu, ggml_backend_t opencl, ggml_type type, int64_t n, uint32_t seed) {
+    const batch_result result = compare_backends(cpu, opencl, make_inputs(type, n, seed), n);
+    const bool ok = result.reference_max > FP16_MAX && result.finite && result.error < MAX_NMSE;
+    return report_batch("range", type, n, result, ok);
+}
+
+static bool check_cancelling_batch(ggml_backend_t cpu, ggml_backend_t opencl, ggml_type type, int64_t n) {
+    const batch_result result = compare_backends(cpu, opencl, make_cancelling_inputs(type, n), n);
+    const bool ok = result.finite && result.error < MAX_NMSE;
+    return report_batch("cancel", type, n, result, ok);
+}
+
+static int count_type_failures(ggml_backend_t cpu, ggml_backend_t opencl, ggml_type type, uint32_t & seed) {
+    int failures = 0;
+    for (int64_t n : BATCHES) {
+        seed += SEED_STRIDE;
+        failures += check_sum_range_batch(cpu, opencl, type, n, seed) ? 0 : 1;
+        failures += check_cancelling_batch(cpu, opencl, type, n) ? 0 : 1;
+    }
+    return failures;
+}
+
 static int count_failures(ggml_backend_t cpu, ggml_backend_t opencl) {
-    const int64_t batches[] = { 1, 8, 63, 64, 750 };
     uint32_t seed = BASE_SEED;
     int failures = 0;
-    for (int64_t n : batches) {
-        seed += SEED_STRIDE;
-        failures += check_batch(cpu, opencl, n, seed) ? 0 : 1;
+    for (ggml_type type : WEIGHT_TYPES) {
+        failures += count_type_failures(cpu, opencl, type, seed);
     }
     return failures;
 }
