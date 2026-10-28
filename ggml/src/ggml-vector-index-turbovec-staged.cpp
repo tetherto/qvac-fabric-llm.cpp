@@ -896,6 +896,176 @@ void keep_best(std::vector<Candidate> & cands, size_t keep, std::vector<float> *
 
 }  // namespace
 
+namespace {
+
+// The planes cache's statistics and centre, computed on first use. False
+// without a valid cache: the caller's full scan (and its per-row fallback)
+// answers then.
+bool planes_ready(const ggml_vec_index & idx, TurboVecPlanesStats & stats, const std::vector<float> *& centre) {
+    const int bits = idx.turbovec_bits;
+    const size_t n = idx.slot_to_id.size();
+    const size_t nsg = static_cast<size_t>(idx.dim) / 8;
+    std::lock_guard<std::mutex> lock(idx.turbovec_planes_mutex);
+    const size_t n_blocks = (n + kBlock - 1) / kBlock;
+    const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / bits);
+    if (!idx.turbovec_planes || idx.turbovec_sign_blocked.size() != n_blocks * nsg * kBlock ||
+        idx.turbovec_blocked_n_blocks != n_blocks ||
+        idx.turbovec_blocked_data.size() != n_blocks * n_byte_groups * kBlock) {
+        return false;
+    }
+    if (!idx.turbovec_stats_ready) {
+        idx.turbovec_stats = compute_stats(idx);
+        idx.turbovec_stats_ready = true;
+    }
+    stats = idx.turbovec_stats;
+    centre = nullptr;
+    if (!idx.turbovec_tqplus_shift.empty()) {
+        if (!idx.turbovec_centre_ready) {
+            idx.turbovec_centre = compute_centre(idx, stats.m);
+            idx.turbovec_centre_ready = true;
+        }
+        centre = &idx.turbovec_centre;
+    }
+    return true;
+}
+
+// Collects one query's rows above a threshold from its sign scores
+// (upstream's buffered collector): rows are appended, and at twice s_len
+// the buffer is cut back to its best s_len, whose worst score becomes the
+// threshold. A seed is the threshold until the first cut-back. Whenever at
+// least s_len rows score above the seed, the rows kept are exactly the top
+// s_len under the strict (score, slot) order, whatever order they came in.
+struct Collector {
+    std::vector<ScoreId> top;
+    size_t s_len = 0;
+    float seed = -std::numeric_limits<float>::infinity();
+    bool seed_active = false;
+    bool cut = false;
+    double threshold = 0.0;
+    // Rows that scored above the seed, to tell a short query.
+    size_t above_seed = 0;
+    // For one range of a split query: the best s_len-th score any range has
+    // kept so far. Every row of the shortlist scores at least that, so a
+    // range may drop a row that scores strictly less (a tie may still win
+    // on its slot). Null for a lone range.
+    std::atomic<double> * floor_score = nullptr;
+
+    void start(size_t s_len_, float seed_, size_t reserve, std::atomic<double> * floor) {
+        top.clear();
+        top.reserve(reserve);
+        s_len = s_len_;
+        seed = seed_;
+        seed_active = seed > -std::numeric_limits<float>::infinity();
+        cut = seed_active;
+        threshold = seed_active ? static_cast<double>(seed) : 0.0;
+        above_seed = 0;
+        floor_score = floor;
+    }
+
+    void cut_back() {
+        std::nth_element(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(s_len - 1), top.end(), score_id_better);
+        top.resize(s_len);
+        cut = true;
+        threshold = top.back().score;
+        if (floor_score != nullptr) {
+            double seen = floor_score->load(std::memory_order_relaxed);
+            while (threshold > seen && !floor_score->compare_exchange_weak(seen, threshold, std::memory_order_relaxed)) {
+            }
+        }
+    }
+
+    // One scored block: lanes [0, count) are rows block * kBlock + lane,
+    // the rest -inf padding. Rows arrive in slot order, so once s_len rows
+    // are kept a row scoring no better than the worst of them cannot enter.
+    void add_block(const float * block_scores, size_t block, size_t count, const uint8_t * allowed_mask) {
+        const double floor = floor_score != nullptr ? floor_score->load(std::memory_order_relaxed) :
+                                                      -std::numeric_limits<double>::infinity();
+#if GGML_VEC_INDEX_USE_NEON
+        // Upstream neon_block_topk_update: a block whose best lane cannot
+        // enter is skipped whole, and under a threshold only the lanes above
+        // it are visited, taken as a mask so the walk does not branch on
+        // every lane. Padding lanes are -inf, so they never count or enter.
+        float32x4_t v[8];
+        for (size_t i = 0; i < 8; ++i) {
+            v[i] = vld1q_f32(block_scores + i * 4);
+        }
+        if (seed_active) {
+            const float32x4_t seed_v = vdupq_n_f32(seed);
+            uint32x4_t above = vdupq_n_u32(0);
+            for (const float32x4_t & x : v) {
+                above = vsubq_u32(above, vcgtq_f32(x, seed_v));
+            }
+            above_seed += vaddvq_u32(above);
+        }
+        const float32x4_t m0 = vmaxq_f32(vmaxq_f32(v[0], v[1]), vmaxq_f32(v[2], v[3]));
+        const float32x4_t m1 = vmaxq_f32(vmaxq_f32(v[4], v[5]), vmaxq_f32(v[6], v[7]));
+        const double block_max = static_cast<double>(vmaxvq_f32(vmaxq_f32(m0, m1)));
+        if ((cut && block_max <= threshold) || block_max < floor) {
+            return;
+        }
+        if (cut) {
+            const float32x4_t thr = vdupq_n_f32(static_cast<float>(threshold));
+            for (size_t half = 0; half < 2; ++half) {
+                const uint16x4_t c0 = vmovn_u32(vcgtq_f32(v[half * 4], thr));
+                const uint16x4_t c1 = vmovn_u32(vcgtq_f32(v[half * 4 + 1], thr));
+                const uint16x4_t c2 = vmovn_u32(vcgtq_f32(v[half * 4 + 2], thr));
+                const uint16x4_t c3 = vmovn_u32(vcgtq_f32(v[half * 4 + 3], thr));
+                const uint8x16_t b = vcombine_u8(vmovn_u16(vcombine_u16(c0, c1)), vmovn_u16(vcombine_u16(c2, c3)));
+                // Four bits a lane (the narrowing-shift idiom).
+                uint64_t bits = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(b), 4)), 0) &
+                    0x1111111111111111ull;
+                while (bits != 0) {
+                    const size_t lane = half * 16 + static_cast<size_t>(ctz64(bits)) / 4;
+                    bits &= bits - 1;
+                    const double score = static_cast<double>(block_scores[lane]);
+                    if (lane >= count || score < floor) {
+                        continue;
+                    }
+                    const size_t v_slot = block * kBlock + lane;
+                    if (allowed_mask != nullptr && allowed_mask[v_slot] == 0) {
+                        continue;
+                    }
+                    top.push_back({ score, static_cast<uint64_t>(v_slot) });
+                }
+            }
+            if (top.size() >= 2 * s_len) {
+                cut_back();
+            }
+            return;
+        }
+#else
+        if (seed_active) {
+            for (size_t lane = 0; lane < count; ++lane) {
+                above_seed += block_scores[lane] > seed ? 1 : 0;
+            }
+        }
+#endif
+        for (size_t lane = 0; lane < count; ++lane) {
+            const double score = static_cast<double>(block_scores[lane]);
+            if ((cut && score <= threshold) || score < floor) {
+                continue;
+            }
+            const size_t v = block * kBlock + lane;
+            if (allowed_mask != nullptr && allowed_mask[v] == 0) {
+                continue;
+            }
+            top.push_back({ score, static_cast<uint64_t>(v) });
+        }
+        if (top.size() >= 2 * s_len) {
+            cut_back();
+        }
+    }
+
+    // A range of a split query hands back at most s_len rows.
+    void finish() {
+        if (floor_score != nullptr && top.size() > s_len) {
+            cut_back();
+        }
+    }
+};
+
+}  // namespace
+
 bool turbovec_staged_search(
         const ggml_vec_index & idx,
         const float * query,
@@ -922,29 +1092,8 @@ bool turbovec_staged_search(
 
     TurboVecPlanesStats stats;
     const std::vector<float> * centre = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(idx.turbovec_planes_mutex);
-        // The exact rescore reads the blocked cache; without a valid one
-        // the caller's full scan (and its per-row fallback) answers.
-        const size_t n_blocks = (n + kBlock - 1) / kBlock;
-        const size_t n_byte_groups = static_cast<size_t>(dim) / static_cast<size_t>(8 / bits);
-        if (!idx.turbovec_planes || idx.turbovec_sign_blocked.size() != n_blocks * nsg * kBlock ||
-            idx.turbovec_blocked_n_blocks != n_blocks ||
-            idx.turbovec_blocked_data.size() != n_blocks * n_byte_groups * kBlock) {
-            return false;
-        }
-        if (!idx.turbovec_stats_ready) {
-            idx.turbovec_stats = compute_stats(idx);
-            idx.turbovec_stats_ready = true;
-        }
-        stats = idx.turbovec_stats;
-        if (calibrated) {
-            if (!idx.turbovec_centre_ready) {
-                idx.turbovec_centre = compute_centre(idx, stats.m);
-                idx.turbovec_centre_ready = true;
-            }
-            centre = &idx.turbovec_centre;
-        }
+    if (!planes_ready(idx, stats, centre)) {
+        return false;
     }
     const float m = stats.m;
 
@@ -1079,10 +1228,19 @@ bool turbovec_staged_search(
     const int n_threads = std::max(1, opts.n_threads);
     const bool split = n_threads > 1 && n_scan_blocks >= kTurboVecParallelMinBlocks;
     std::vector<Candidate> list;
-    if (s_len >= n_allowed || !split) {
+    if (opts.shortlist != nullptr) {
+        // The caller scanned the sign region for this query.
+        build_low();
+        list.reserve(opts.shortlist->size());
+        for (const ScoreId & c : *opts.shortlist) {
+            const size_t v = static_cast<size_t>(c.id);
+            list.push_back({ v, plain_score(v, static_cast<float>(c.score)) });
+        }
+    } else if (s_len >= n_allowed || !split) {
         build_low();
     }
-    if (s_len >= n_allowed) {
+    if (opts.shortlist != nullptr) {
+    } else if (s_len >= n_allowed) {
         for (size_t v = 0; v < n; ++v) {
             if (allowed_mask == nullptr || allowed_mask[v] != 0) {
                 list.push_back({ v, 0.0f });
@@ -1100,122 +1258,21 @@ bool turbovec_staged_search(
         if (seeded) {
             seed = sample_seed(idx, sign_lut, s_len, bits);
         }
-        // The best s_len-th score any range has kept so far: every row of
-        // the shortlist scores at least that, so a range may drop a row that
-        // scores strictly less (a tie may still win on its slot).
+        // Shared by the ranges of a split query (see Collector).
         std::atomic<double> floor_score{ -std::numeric_limits<double>::infinity() };
-        // Collects a range's rows in a buffer cut back to its best s_len
-        // whenever it doubles; the s_len-th best kept is the cut-off.
-        auto scan = [&](size_t block_begin, size_t block_end, std::vector<ScoreId> & top, size_t & above_seed) {
+        auto scan = [&](size_t block_begin, size_t block_end, Collector & col) {
             // A short range never needs the full 2 * s_len.
-            top.reserve(std::min(2 * s_len, (block_end - block_begin) * kBlock + 1));
-            // A seed is the threshold until the first cut-back raises it.
-            const bool seed_active = seed > -std::numeric_limits<float>::infinity();
-            bool cut = seed_active;
-            double threshold = seed_active ? static_cast<double>(seed) : 0.0;
-            auto cut_back = [&]() {
-                std::nth_element(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(s_len - 1), top.end(), score_id_better);
-                top.resize(s_len);
-                cut = true;
-                threshold = top.back().score;
-                if (split) {
-                    double seen = floor_score.load(std::memory_order_relaxed);
-                    while (threshold > seen &&
-                           !floor_score.compare_exchange_weak(seen, threshold, std::memory_order_relaxed)) {
-                    }
-                }
-            };
+            col.start(s_len, seed, std::min(2 * s_len, (block_end - block_begin) * kBlock + 1),
+                split ? &floor_score : nullptr);
             float block_scores[kBlock];
             for (size_t block = block_begin; block < block_end; ++block) {
                 if (!scan_blocks.empty() && scan_blocks[block] == 0) {
                     continue;
                 }
                 score_sign_block(idx, sign_lut, idx.turbovec_sign_blocked.data(), block, n, block_scores);
-                const size_t count = std::min(kBlock, n - block * kBlock);
-                // Rows arrive in slot order, so once s_len rows are kept a
-                // row scoring no better than the worst of them cannot enter.
-                const double floor = split ? floor_score.load(std::memory_order_relaxed) :
-                                             -std::numeric_limits<double>::infinity();
-#if GGML_VEC_INDEX_USE_NEON
-                // Upstream neon_block_topk_update: a block whose best lane
-                // cannot enter is skipped whole, and under a threshold only
-                // the lanes above it are visited, taken as a mask so the walk
-                // does not branch on every lane. Padding lanes are -inf, so
-                // they never count or enter.
-                float32x4_t v[8];
-                for (size_t i = 0; i < 8; ++i) {
-                    v[i] = vld1q_f32(block_scores + i * 4);
-                }
-                if (seed_active) {
-                    const float32x4_t seed_v = vdupq_n_f32(seed);
-                    uint32x4_t above = vdupq_n_u32(0);
-                    for (const float32x4_t & x : v) {
-                        above = vsubq_u32(above, vcgtq_f32(x, seed_v));
-                    }
-                    above_seed += vaddvq_u32(above);
-                }
-                const float32x4_t m0 = vmaxq_f32(vmaxq_f32(v[0], v[1]), vmaxq_f32(v[2], v[3]));
-                const float32x4_t m1 = vmaxq_f32(vmaxq_f32(v[4], v[5]), vmaxq_f32(v[6], v[7]));
-                const double block_max = static_cast<double>(vmaxvq_f32(vmaxq_f32(m0, m1)));
-                if ((cut && block_max <= threshold) || block_max < floor) {
-                    continue;
-                }
-                if (cut) {
-                    const float32x4_t thr = vdupq_n_f32(static_cast<float>(threshold));
-                    for (size_t half = 0; half < 2; ++half) {
-                        const uint16x4_t c0 = vmovn_u32(vcgtq_f32(v[half * 4], thr));
-                        const uint16x4_t c1 = vmovn_u32(vcgtq_f32(v[half * 4 + 1], thr));
-                        const uint16x4_t c2 = vmovn_u32(vcgtq_f32(v[half * 4 + 2], thr));
-                        const uint16x4_t c3 = vmovn_u32(vcgtq_f32(v[half * 4 + 3], thr));
-                        const uint8x16_t b = vcombine_u8(
-                            vmovn_u16(vcombine_u16(c0, c1)), vmovn_u16(vcombine_u16(c2, c3)));
-                        // Four bits a lane (the narrowing-shift idiom).
-                        uint64_t bits = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(b), 4)), 0) &
-                            0x1111111111111111ull;
-                        while (bits != 0) {
-                            const size_t lane = half * 16 + static_cast<size_t>(ctz64(bits)) / 4;
-                            bits &= bits - 1;
-                            const double score = static_cast<double>(block_scores[lane]);
-                            if (lane >= count || score < floor) {
-                                continue;
-                            }
-                            const size_t v_slot = block * kBlock + lane;
-                            if (allowed_mask != nullptr && allowed_mask[v_slot] == 0) {
-                                continue;
-                            }
-                            top.push_back({ score, static_cast<uint64_t>(v_slot) });
-                        }
-                    }
-                    if (top.size() >= 2 * s_len) {
-                        cut_back();
-                    }
-                    continue;
-                }
-#else
-                if (seed_active) {
-                    for (size_t lane = 0; lane < count; ++lane) {
-                        above_seed += block_scores[lane] > seed ? 1 : 0;
-                    }
-                }
-#endif
-                for (size_t lane = 0; lane < count; ++lane) {
-                    const double score = static_cast<double>(block_scores[lane]);
-                    if ((cut && score <= threshold) || score < floor) {
-                        continue;
-                    }
-                    const size_t v = block * kBlock + lane;
-                    if (allowed_mask != nullptr && allowed_mask[v] == 0) {
-                        continue;
-                    }
-                    top.push_back({ score, static_cast<uint64_t>(v) });
-                }
-                if (top.size() >= 2 * s_len) {
-                    cut_back();
-                }
+                col.add_block(block_scores, block, std::min(kBlock, n - block * kBlock), allowed_mask);
             }
-            if (split && top.size() > s_len) {
-                cut_back();
-            }
+            col.finish();
         };
         std::vector<ScoreId> top;
         bool seed_short = false;
@@ -1228,8 +1285,7 @@ bool turbovec_staged_search(
             if (split) {
                 const size_t n_ranges = static_cast<size_t>(n_threads) * kRangesPerThread;
                 const size_t per_range = (n_blocks + n_ranges - 1) / n_ranges;
-                std::vector<std::vector<ScoreId>> range_tops(n_ranges);
-                std::vector<size_t> range_above(n_ranges, 0);
+                std::vector<Collector> ranges(n_ranges);
                 // Two more tasks build the query's later tables meanwhile.
                 parallel_for(n_ranges + 2, n_threads, [&](size_t range, size_t) {
                     if (range == n_ranges) {
@@ -1247,26 +1303,29 @@ bool turbovec_staged_search(
                     const size_t begin = range * per_range;
                     const size_t end = std::min(n_blocks, begin + per_range);
                     if (begin < end) {
-                        scan(begin, end, range_tops[range], range_above[range]);
+                        scan(begin, end, ranges[range]);
                     }
                 });
                 // A row below the final floor is below some range's s_len rows.
                 const double floor = floor_score.load(std::memory_order_relaxed);
                 size_t total = 0;
-                for (size_t range = 0; range < n_ranges; ++range) {
-                    above_seed += range_above[range];
-                    total += range_tops[range].size();
+                for (const Collector & range : ranges) {
+                    above_seed += range.above_seed;
+                    total += range.top.size();
                 }
                 top.reserve(total);
-                for (const std::vector<ScoreId> & range_top : range_tops) {
-                    for (const ScoreId & c : range_top) {
+                for (const Collector & range : ranges) {
+                    for (const ScoreId & c : range.top) {
                         if (c.score >= floor) {
                             top.push_back(c);
                         }
                     }
                 }
             } else {
-                scan(0, n_blocks, top, above_seed);
+                Collector col;
+                scan(0, n_blocks, col);
+                top.swap(col.top);
+                above_seed = col.above_seed;
             }
             if (!seeded || seed == -std::numeric_limits<float>::infinity() || above_seed >= s_len) {
                 break;
@@ -1463,6 +1522,164 @@ bool turbovec_staged_search(
         update_topk_heap(heap, k, { exact[i], topk_key(idx, list[i].slot) });
     }
     return true;
+}
+
+bool turbovec_staged_search_batch(
+        const ggml_vec_index & idx,
+        const float * rotated_queries,
+        int n_q,
+        int k,
+        int n_threads,
+        std::vector<std::vector<ScoreId>> & heaps) {
+#if GGML_VEC_INDEX_USE_NEON
+    // Upstream's aarch64 batch: the sign region scanned four queries at a
+    // time with the fused LUT kernel (one code load and nibble split for
+    // all four), a seeded collector per query. x86 batches its sign scan
+    // with the `vpermb` kernel, not ported here.
+    constexpr int kQuad = 4;
+    if (!is_turbovec(idx) || idx.turbovec_legacy || !idx.turbovec_staged_enabled || idx.turbovec_x86 || n_q < kQuad) {
+        return false;
+    }
+    TurboVecPlanesStats stats;
+    const std::vector<float> * centre = nullptr;
+    if (!planes_ready(idx, stats, centre)) {
+        return false;
+    }
+    const int bits = idx.turbovec_bits;
+    const int dim = idx.dim;
+    const size_t dim_sz = static_cast<size_t>(dim);
+    const size_t n = idx.slot_to_id.size();
+    const size_t n_blocks = (n + kBlock - 1) / kBlock;
+    const size_t s_len = shortlist_len(static_cast<size_t>(k), bits);
+    if (s_len >= n) {
+        // Every row is rescored; nothing to shortlist.
+        return false;
+    }
+    n_threads = std::max(1, n_threads);
+    const size_t n_tasks = (static_cast<size_t>(n_q) + kQuad - 1) / kQuad;
+    if (n_threads > 1 && n_tasks < static_cast<size_t>(n_threads)) {
+        // Fewer quads than threads would leave threads idle; query by query
+        // each query splits its blocks instead. (Upstream tiles the block
+        // axis as well.)
+        return false;
+    }
+    const float m = stats.m;
+    const float * vscales = idx.turbovec_scale.data();
+    const bool calibrated = !idx.turbovec_tqplus_shift.empty();
+    const bool seeded = kSeedSupported && 2 * s_len < n && n / kBlock >= kSeedMinBlocks;
+    const size_t n_q_sz = static_cast<size_t>(n_q);
+
+    // Each query's calibrated query and TQ+ bias, as search_one computes
+    // them, and its sign-stage query pulled toward the centre.
+    std::vector<float> score_queries(n_q_sz * dim_sz);
+    std::vector<float> biases(n_q_sz, 0.0f);
+    for (size_t q = 0; q < n_q_sz; ++q) {
+        const float * rq = rotated_queries + q * dim_sz;
+        float * sq = score_queries.data() + q * dim_sz;
+        if (calibrated) {
+            double bias_correction = 0.0;
+            for (size_t d = 0; d < dim_sz; ++d) {
+                sq[d] = rq[d] / idx.turbovec_tqplus_scale[d];
+                bias_correction -= static_cast<double>(rq[d]) * static_cast<double>(idx.turbovec_tqplus_shift[d]);
+            }
+            biases[q] = static_cast<float>(bias_correction);
+        } else {
+            std::copy(rq, rq + dim_sz, sq);
+        }
+    }
+    heaps.assign(n_q_sz, {});
+    auto run_query = [&](size_t q, const std::vector<ScoreId> * shortlist, bool sign_single) {
+        TurboVecStagedOpts o;
+        o.single_query = false;
+        o.sign_single = sign_single;
+        o.n_threads = 1;
+        o.shortlist = shortlist;
+        turbovec_staged_search(idx, score_queries.data() + q * dim_sz, biases[q], k, nullptr, o, heaps[q]);
+    };
+
+    // The scan, a quad per task; a short tail scans query by query with
+    // the same tables so its queries count toward the batch's short ones.
+    std::vector<uint8_t> seed_short(n_q_sz, 0);
+    parallel_for(n_tasks, n_threads, [&](size_t task, size_t) {
+        const size_t q0 = task * kQuad;
+        const size_t n_in = std::min<size_t>(kQuad, n_q_sz - q0);
+        SignLut luts[kQuad];
+        const uint8_t * lut_ptrs[kQuad] = {};
+        float lut_scales[kQuad] = {};
+        float lut_biases[kQuad] = {};
+        Collector cols[kQuad];
+        std::vector<float> q_sign(dim_sz);
+        for (size_t i = 0; i < n_in; ++i) {
+            const size_t q = q0 + i;
+            const float * sq = score_queries.data() + q * dim_sz;
+            for (size_t d = 0; d < dim_sz; ++d) {
+                q_sign[d] = sq[d];
+                if (calibrated) {
+                    q_sign[d] += kSignCentre * idx.turbovec_tqplus_shift[d] / idx.turbovec_tqplus_scale[d];
+                }
+            }
+            luts[i] = build_sign_lut(q_sign.data(), m, dim, false);
+            luts[i].bias += biases[q];
+            lut_ptrs[i] = luts[i].values.data();
+            lut_scales[i] = luts[i].scale;
+            lut_biases[i] = luts[i].bias;
+            const float seed = seeded ? sample_seed(idx, luts[i], s_len, bits) : -std::numeric_limits<float>::infinity();
+            cols[i].start(s_len, seed, 2 * s_len, nullptr);
+        }
+        float block_scores[kQuad][kBlock];
+        float * const outs[kQuad] = { block_scores[0], block_scores[1], block_scores[2], block_scores[3] };
+        for (size_t block = 0; block < n_blocks; ++block) {
+            const size_t count = std::min(kBlock, n - block * kBlock);
+            if (n_in == kQuad) {
+                score_turbovec_lut_block_4(
+                    lut_ptrs, lut_scales, lut_biases, idx.turbovec_sign_blocked.data(), vscales, block, n, 2, dim / 2,
+                    outs);
+            } else {
+                for (size_t i = 0; i < n_in; ++i) {
+                    score_sign_block(idx, luts[i], idx.turbovec_sign_blocked.data(), block, n, block_scores[i]);
+                }
+            }
+            for (size_t i = 0; i < n_in; ++i) {
+                cols[i].add_block(block_scores[i], block, count, nullptr);
+            }
+        }
+        for (size_t i = 0; i < n_in; ++i) {
+            const size_t q = q0 + i;
+            if (seeded && cols[i].above_seed < s_len) {
+                seed_short[q] = 1;
+                continue;
+            }
+            std::vector<ScoreId> & top = cols[i].top;
+            if (top.size() > s_len) {
+                std::nth_element(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(s_len - 1), top.end(), score_id_better);
+                top.resize(s_len);
+            }
+            run_query(q, &top, false);
+        }
+    });
+
+    // Upstream rescans a batch's short queries unseeded: one alone through
+    // the single-query scan and its narrower tables, several with the batch
+    // tables. The lone scan does both: seeded again, it comes back short
+    // again and rescans itself unseeded.
+    std::vector<size_t> short_queries;
+    for (size_t q = 0; q < n_q_sz; ++q) {
+        if (seed_short[q] != 0) {
+            short_queries.push_back(q);
+        }
+    }
+    const bool lone_short = short_queries.size() == 1;
+    parallel_for(short_queries.size(), n_threads, [&](size_t i, size_t) { run_query(short_queries[i], nullptr, lone_short); });
+    return true;
+#else
+    (void) idx;
+    (void) rotated_queries;
+    (void) n_q;
+    (void) k;
+    (void) n_threads;
+    (void) heaps;
+    return false;
+#endif
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
