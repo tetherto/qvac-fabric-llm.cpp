@@ -1537,7 +1537,9 @@ bool turbovec_staged_search_batch(
     // all four), a seeded collector per query. x86 batches its sign scan
     // with the `vpermb` kernel, not ported here.
     constexpr int kQuad = 4;
-    if (!is_turbovec(idx) || idx.turbovec_legacy || !idx.turbovec_staged_enabled || idx.turbovec_x86 || n_q < kQuad) {
+    // The 4-query kernel reads the lane-blocked sign region, aarch64's.
+    if (!is_turbovec(idx) || idx.turbovec_legacy || !idx.turbovec_staged_enabled || idx.turbovec_x86 ||
+        turbovec_sign_layout(idx) == kTurboVecLayoutVm || n_q < kQuad) {
         return false;
     }
     TurboVecPlanesStats stats;

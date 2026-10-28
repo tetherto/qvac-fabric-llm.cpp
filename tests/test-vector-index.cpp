@@ -6655,6 +6655,24 @@ void check_turbovec_1x_staged(int x86_rules) {
                     CHECK(scores[i] == c.scores[i]);
                 }
             }
+            // The same three queries and two more, a batch the fused
+            // four-query sign scan takes (on one or two threads; more
+            // threads than quads run query by query): query 0 is still
+            // the batch's only short query, so its results do not change.
+            std::vector<float> five(queries);
+            const std::vector<float> fillers = tv1x_rows(kTv1xStagedShortNoiseSeed + 1, 2, dim);
+            five.insert(five.end(), fillers.begin(), fillers.end());
+            std::vector<float> five_scores(static_cast<size_t>(5 * short_k));
+            std::vector<uint64_t> five_out(five_scores.size());
+            for (const int threads : { 1, 2, 4, 8 }) {
+                ggml_vec_index_set_threads(tv, threads);
+                CHECK(ggml_vec_index_search(tv, five.data(), 5, short_k, five_scores.data(), five_out.data()) ==
+                      GGML_VEC_INDEX_OK);
+                for (size_t i = 0; i < out.size(); ++i) {
+                    CHECK(five_out[i] == c.ids[i]);
+                    CHECK(five_scores[i] == c.scores[i]);
+                }
+            }
             ggml_vec_index_free(tv);
         }
     }
