@@ -134,7 +134,7 @@ static std::vector<float> run_mul_mat(ggml_backend_t        backend,
     ggml_tensor * weights     = ggml_new_tensor_2d(ctx, shape.weight_type, shape.k, M);
     ggml_tensor * activations = ggml_new_tensor_2d(ctx, shape.activation_type, shape.k, shape.n);
     ggml_tensor * out         = ggml_mul_mat(ctx, weights, activations);
-    ggml_mul_mat_set_prec(out, shape.prec);
+    GGML_ASSERT(ggml_prec_set_acc(out, shape.prec));
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
