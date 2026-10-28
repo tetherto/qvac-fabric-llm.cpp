@@ -909,7 +909,23 @@ struct TurboVecStagedOpts {
     // Threads the one query may split its blocks over (a batch already
     // splits across queries and passes 1). The results do not depend on it.
     int n_threads = 1;
+    // The query's shortlist, when the caller scanned the sign region for it
+    // (a batch): sign scores under the centred tables, by slot. The call
+    // then ranks and rescores it and skips the scan.
+    const std::vector<ScoreId> * shortlist = nullptr;
 };
+// The staged search for a batch of queries (rotated, uncalibrated): the sign
+// region is scanned four queries at a time, then each query is ranked and
+// rescored as turbovec_staged_search does. Fills heaps[q] like search_one
+// would. False when the batch is better served query by query (filtered,
+// too few queries for the threads, no planes cache, not aarch64).
+bool turbovec_staged_search_batch(
+    const ggml_vec_index & idx,
+    const float * rotated_queries,
+    int n_q,
+    int k,
+    int n_threads,
+    std::vector<std::vector<ScoreId>> & heaps);
 bool turbovec_staged_search(
     const ggml_vec_index & idx,
     const float * query,
