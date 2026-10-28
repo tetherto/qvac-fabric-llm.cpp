@@ -235,6 +235,11 @@ inline constexpr int kMaxThreads = 256;
 // them across threads (upstream turbovec's block-parallel threshold).
 inline constexpr size_t kTurboVecParallelMinBlocks = 1024;
 
+// Byte groups a NEON LUT scan sums in u16 before widening into its float
+// accumulators. Every kernel that must match score_turbovec_lut_block bit for
+// bit flushes at the same points, so it is shared here.
+inline constexpr int kTurboVecFlushEvery = 256;
+
 // One parallel_for task: ctx is the caller's functor.
 using ParallelTaskFn = void (*)(void * ctx, size_t task, size_t worker);
 
