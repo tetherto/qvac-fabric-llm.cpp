@@ -251,9 +251,6 @@ void score_sign_block_deferred(const uint8_t * lut, float lut_scale, float lut_b
     }
 }
 
-// Candidates one ranking batch gathers (upstream RANK_BATCH).
-constexpr size_t kRankBatch = 32;
-
 // Sixteen 16-byte rows to sixteen columns (upstream transpose16_neon):
 // out[j] holds byte j of each row, in row order.
 void transpose16(const uint8x16_t r[16], uint8x16_t out[16]) {
@@ -822,6 +819,8 @@ TurboVecPlanesStats compute_stats(const ggml_vec_index & idx) {
 // and rescore stages: enough to amortize the hand-off.
 constexpr size_t kCentreRowsPerTask = 4096;
 constexpr size_t kRankPerTask = 64;
+// Candidates one ranking batch gathers (upstream RANK_BATCH).
+constexpr size_t kRankBatch = 32;
 // Shortlist ranges per thread of a split scan: each range fills a shortlist
 // of its own before it can prune, so fewer ranges than the full scan's.
 constexpr size_t kRangesPerThread = 2;
