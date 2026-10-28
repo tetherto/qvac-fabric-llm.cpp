@@ -715,7 +715,9 @@ endif()
 
 if (GGML_OPENCL)
     llama_build_and_test(test-opencl-mul-mat-sum-range.cpp)
-    set_tests_properties(test-opencl-mul-mat-sum-range PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(test-opencl-mul-mat-sum-range PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "GGML_OPENCL_KQUANT_MC_GEMV=0;GGML_OPENCL_Q6K_GEMM_COK=0")
 endif()
 
 if (GGML_METAL)
