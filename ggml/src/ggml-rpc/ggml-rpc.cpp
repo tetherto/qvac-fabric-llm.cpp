@@ -2173,12 +2173,13 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
         return false;
     }
     // Discard all cached graphs to avoid use-after-free in graph_recompute,
-    // since their nodes may hold pointers to the buffer being freed. The client
-    // will have to re-serialize its graphs from now on.
+    // since their nodes may hold pointers to the buffer being freed. Erase
+    // them rather than keep empty entries: the client forgets its uids at the
+    // same point (ggml_backend_rpc_buffer_free_buffer), and both sides must
+    // count the same graphs towards GRAPH_CACHE_MAX, or this side clears its
+    // cache first and is then asked to recompute a graph it no longer has.
     for (auto & cache : stored_graphs) {
-        for (auto & entry : cache) {
-            entry.second.graph = nullptr;
-        }
+        cache.clear();
     }
     forget_extras(buffer);
     ggml_backend_buffer_free(buffer);
