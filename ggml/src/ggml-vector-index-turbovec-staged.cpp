@@ -57,6 +57,15 @@ inline int popcount64(uint64_t x) {
 #endif
 }
 
+// Hint that the cache line at p is about to be read.
+inline void prefetch_read(const void * p) {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(p, 0, 3);
+#else
+    (void) p;
+#endif
+}
+
 // Trailing zero bits of a non-zero word.
 inline int ctz64(uint64_t x) {
 #if defined(__GNUC__) || defined(__clang__)
@@ -1307,6 +1316,15 @@ bool turbovec_staged_search(
         // at most kRankBatch of them (upstream plane_terms): the sign tables
         // over their rows, undone to m * sum(+-q), or the bit masks counted.
         auto plane_terms = [&](size_t begin, size_t end, size_t plane, float * out) {
+            // The rows are scattered over the index, so a batch's lines are
+            // asked for together before any row is read (upstream
+            // prefetch_low); one miss at a time cost more than the count.
+            for (size_t i = begin; i < end; ++i) {
+                const uint8_t * low = idx.turbovec_data.data() + list[i].slot * row_bytes + plane * nsg;
+                for (size_t off = 0; off < nsg; off += 64) {
+                    prefetch_read(low + off);
+                }
+            }
             if (table_rank) {
 #if GGML_VEC_INDEX_USE_NEON
                 const uint8_t * rows[kRankBatch];
