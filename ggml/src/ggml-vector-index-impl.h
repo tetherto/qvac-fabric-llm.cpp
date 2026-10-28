@@ -663,6 +663,10 @@ void turbovec_force_vm8_2bit_for_test(int mode);
 // small indexes included, so a test reaches the batch kernels.
 void turbovec_force_batches_for_test(int enabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
+// Staged searches so far whose sampled seed left the shortlist short, and
+// staged batch scan tasks run so far.
+int64_t turbovec_seed_short_count_for_test(void);
+int64_t turbovec_batch_scan_count_for_test(void);
 size_t parallel_pool_threads_for_test(void);
 void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums);
 int parallel_pool_selftest_for_test(int n_threads);
@@ -904,7 +908,9 @@ struct TurboVecStagedOpts {
     // rescan of the one query in a batch whose sampled seed ran short).
     bool sign_single = false;
     // Set to whether upstream's sampled seed would have left this query's
-    // shortlist short; false when upstream does not seed.
+    // shortlist short and its rescan alone would read other tables (the
+    // aarch64 rules); false when upstream does not seed or rescans with
+    // the same tables (the x86 rules).
     bool * seed_short = nullptr;
     // Threads the one query may split its blocks over (a batch already
     // splits across queries and passes 1). The results do not depend on it.
@@ -915,10 +921,13 @@ struct TurboVecStagedOpts {
     const std::vector<ScoreId> * shortlist = nullptr;
 };
 // The staged search for a batch of queries (rotated, uncalibrated): the sign
-// region is scanned four queries at a time, then each query is ranked and
-// rescored as turbovec_staged_search does. Fills heaps[q] like search_one
-// would. False when the batch is better served query by query (filtered,
-// too few queries for the threads, no planes cache, not aarch64).
+// region is scanned several queries at a time (four with the fused LUT
+// kernel over a lane-blocked region, six with the `vpermb` kernel over a
+// vector-major one), then each query is ranked and rescored as
+// turbovec_staged_search does. Fills heaps[q] like search_one would. False
+// when the batch is better served query by query (filtered, too few
+// queries for the threads, no planes cache, no batch kernel for the sign
+// region's layout on this build).
 bool turbovec_staged_search_batch(
     const ggml_vec_index & idx,
     const float * rotated_queries,

@@ -1505,8 +1505,8 @@ static int ggml_vec_index_search_impl(
                 dim);
         }
         // A staged (planes) search over several queries scans the sign
-        // region four queries at a time; it declines a filtered search and
-        // a batch too small for the threads, which run query by query.
+        // region several queries at a time; it declines a filtered search
+        // and a batch too small for the threads, which run query by query.
         if (is_turbovec(*idx) && idx->turbovec_planes && idx->turbovec_staged_enabled && allowed_ptr == nullptr &&
             active_count(*idx) == idx->slot_to_id.size() && n_q > 1) {
             std::vector<std::vector<ScoreId>> heaps;
@@ -1675,11 +1675,13 @@ static int ggml_vec_index_search_impl(
                 seed_short[q] = query_short ? 1 : 0;
             }
         });
-        // Upstream rescans a batch's short queries unseeded; a lone short
-        // query goes through the single-query scan and its narrower sign
-        // tables, which can change its shortlist. Several short queries
-        // keep the batch tables, as their first pass here already did.
-        // The rescan runs alone, so it may split its blocks.
+        // Upstream rescans a batch's short queries unseeded; under the
+        // aarch64 rules a lone short query goes through the single-query
+        // scan and its narrower sign tables, which can change its
+        // shortlist. Several short queries keep the batch tables, as their
+        // first pass here already did, and so does the x86 rules' lone one
+        // (the staged search then reports no short query). The rescan runs
+        // alone, so it may split its blocks.
         if (std::count(seed_short.begin(), seed_short.end(), uint8_t{ 1 }) == 1) {
             const size_t q = static_cast<size_t>(std::find(seed_short.begin(), seed_short.end(), uint8_t{ 1 }) - seed_short.begin());
             Scratch & sc = scratch[0];

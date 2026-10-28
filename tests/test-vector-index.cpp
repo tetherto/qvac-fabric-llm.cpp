@@ -214,6 +214,8 @@ void turbovec_force_batches_for_test(int enabled);
 int turbovec_layout_for_test(const ggml_vec_index_t * idx);
 bool turbovec_planes_for(int bits, int dim);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
+int64_t turbovec_seed_short_count_for_test(void);
+int64_t turbovec_batch_scan_count_for_test(void);
 size_t parallel_pool_threads_for_test(void);
 void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums);
 int parallel_pool_selftest_for_test(int n_threads);
@@ -6565,6 +6567,9 @@ void check_turbovec_1x_staged(int x86_rules) {
             CHECK(reloaded != nullptr);
             CHECK(tv1x_snapshot_bytes(reloaded, "ggml-vector-index-tv1x-staged-2.tvim") == image);
             ggml_vec_index_free(reloaded);
+            // The three queries one at a time, per filter.
+            std::vector<float> lone_scores[2];
+            std::vector<uint64_t> lone_ids[2];
             for (const int nq : { 1, 3 }) {
                 for (const int filtered : { 0, 1 }) {
                     auto search = [&](std::vector<float> & scores, std::vector<uint64_t> & out) {
@@ -6581,6 +6586,7 @@ void check_turbovec_1x_staged(int x86_rules) {
                     };
                     std::vector<float> staged_scores;
                     std::vector<uint64_t> staged_ids;
+                    const int64_t batches_before = turbovec_batch_scan_count_for_test();
                     search(staged_scores, staged_ids);
                     // Every returned score is the full scan's for that id.
                     CHECK(ggml_vec_index_turbovec_set_staged(tv, 0) == GGML_VEC_INDEX_OK);
@@ -6599,6 +6605,18 @@ void check_turbovec_1x_staged(int x86_rules) {
                         }
                     }
                     CHECK(shared * 10 >= staged_ids.size() * 8);
+                    if (nq == 1) {
+                        lone_scores[filtered] = staged_scores;
+                        lone_ids[filtered] = staged_ids;
+                    } else if (x86_rules != 0) {
+                        // Under the x86 rules a batch and its queries one
+                        // at a time scan with the same tables, so the batch
+                        // (the `vpermb` sign scan when unfiltered) returns
+                        // exactly the lone results.
+                        CHECK(filtered != 0 || turbovec_batch_scan_count_for_test() > batches_before);
+                        CHECK(staged_ids == lone_ids[filtered]);
+                        CHECK(staged_scores == lone_scores[filtered]);
+                    }
 #if defined(__aarch64__) || defined(_M_ARM64)
                     if (x86_rules != 0) {
                         continue;
@@ -6620,10 +6638,15 @@ void check_turbovec_1x_staged(int x86_rules) {
             ggml_vec_index_free(tv);
         }
     }
-#if defined(__aarch64__) || defined(_M_ARM64)
-    // A batch in which only query 0's sampled seed runs short: upstream
-    // rescans it with the single-query sign tables, and so does the port.
-    if (x86_rules == 0) {
+    // A batch in which only query 0's sampled seed runs short. Under the
+    // aarch64 rules upstream rescans it with the single-query sign tables,
+    // and so does the port (recorded on aarch64, so checked there alone);
+    // under the x86 rules the rescan reads the batch's own tables, so the
+    // batch returns exactly what its queries return one at a time.
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (x86_rules != 0)
+#endif
+    {
         const int short_k = kTv1xStagedShortK;
         std::vector<float> short_db = db;
         const std::vector<float> noise = tv1x_rows(kTv1xStagedShortNoiseSeed, 48 * 32, dim);
@@ -6643,22 +6666,38 @@ void check_turbovec_1x_staged(int x86_rules) {
                 CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
             }
             CHECK(ggml_vec_index_add(tv, short_db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
-            std::vector<float> scores(static_cast<size_t>(3 * short_k));
+            std::vector<float> want_scores(static_cast<size_t>(3 * short_k));
+            std::vector<uint64_t> want_ids(want_scores.size());
+            if (x86_rules != 0) {
+                // The lone searches: query 0's seed must run short here too,
+                // or the batches below would prove nothing.
+                const int64_t short_before = turbovec_seed_short_count_for_test();
+                for (int q = 0; q < 3; ++q) {
+                    CHECK(ggml_vec_index_search(tv, queries.data() + static_cast<size_t>(q) * dim, 1, short_k,
+                              want_scores.data() + static_cast<size_t>(q * short_k),
+                              want_ids.data() + static_cast<size_t>(q * short_k)) == GGML_VEC_INDEX_OK);
+                }
+                CHECK(turbovec_seed_short_count_for_test() > short_before);
+            } else {
+                std::copy(c.scores, c.scores + want_scores.size(), want_scores.begin());
+                std::copy(c.ids, c.ids + want_ids.size(), want_ids.begin());
+            }
+            std::vector<float> scores(want_scores.size());
             std::vector<uint64_t> out(scores.size());
             // The rescan of the short query splits its blocks above one thread.
             for (const int threads : { 1, 2, 4, 8 }) {
                 ggml_vec_index_set_threads(tv, threads);
+                const int64_t short_before = turbovec_seed_short_count_for_test();
                 CHECK(ggml_vec_index_search(tv, queries.data(), 3, short_k, scores.data(), out.data()) ==
                       GGML_VEC_INDEX_OK);
-                for (size_t i = 0; i < out.size(); ++i) {
-                    CHECK(out[i] == c.ids[i]);
-                    CHECK(scores[i] == c.scores[i]);
-                }
+                CHECK(turbovec_seed_short_count_for_test() > short_before);
+                CHECK(out == want_ids);
+                CHECK(scores == want_scores);
             }
-            // The same three queries and two more, a batch the fused
-            // four-query sign scan takes (on one or two threads; more
-            // threads than quads run query by query): query 0 is still
-            // the batch's only short query, so its results do not change.
+            // The same three queries and two more, a batch the fused sign
+            // scan takes (on one or two threads; more threads than batch
+            // tasks run query by query): query 0 is still the batch's only
+            // short query, so its results do not change.
             std::vector<float> five(queries);
             const std::vector<float> fillers = tv1x_rows(kTv1xStagedShortNoiseSeed + 1, 2, dim);
             five.insert(five.end(), fillers.begin(), fillers.end());
@@ -6666,17 +6705,18 @@ void check_turbovec_1x_staged(int x86_rules) {
             std::vector<uint64_t> five_out(five_scores.size());
             for (const int threads : { 1, 2, 4, 8 }) {
                 ggml_vec_index_set_threads(tv, threads);
+                const int64_t short_before = turbovec_seed_short_count_for_test();
                 CHECK(ggml_vec_index_search(tv, five.data(), 5, short_k, five_scores.data(), five_out.data()) ==
                       GGML_VEC_INDEX_OK);
+                CHECK(turbovec_seed_short_count_for_test() > short_before);
                 for (size_t i = 0; i < out.size(); ++i) {
-                    CHECK(five_out[i] == c.ids[i]);
-                    CHECK(five_scores[i] == c.scores[i]);
+                    CHECK(five_out[i] == want_ids[i]);
+                    CHECK(five_scores[i] == want_scores[i]);
                 }
             }
             ggml_vec_index_free(tv);
         }
     }
-#endif
     turbovec_force_vector_major_for_test(-1);
     turbovec_force_planes_for_test(-1, 0);
     turbovec_force_x86_rules_for_test(0);
@@ -6779,11 +6819,15 @@ void check_turbovec_1x_vpermb() {
 // Every search returns the same ids and score bits at any thread count:
 // lone queries (which split their blocks), batches (split across queries),
 // wide and narrow filters, staged and full scans, and k large enough for
-// the ranking to split too.
-void check_turbovec_1x_thread_invariance() {
+// the ranking to split too. Under the x86 rules the staged batch is the
+// `vpermb` scan six queries at a time: seven queries make a full batch and
+// a lone tail, and at one or two threads the batch runs, at more it does
+// not, so the batch is also checked against the queries one at a time.
+void check_turbovec_1x_thread_invariance(int x86_rules) {
+    turbovec_force_x86_rules_for_test(x86_rules);
     constexpr int dim = 64;
     constexpr int n = 40000;
-    constexpr int nq = 5;
+    const int nq = x86_rules != 0 ? 7 : 5;
     const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
     const std::vector<uint64_t> ids = tv1x_ids(n);
     const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, nq, dim);
@@ -6834,7 +6878,20 @@ void check_turbovec_1x_thread_invariance() {
             };
             std::vector<float> ref_scores;
             std::vector<uint64_t> ref_ids;
+            const int64_t batches_before = turbovec_batch_scan_count_for_test();
             run(1, ref_scores, ref_ids);
+            // One thread takes the staged batch, a full task and a tail at
+            // either k; the reference must come from it. Under the aarch64
+            // rules that needs the NEON quad kernel, so on an x86 host those
+            // rules run query by query and only the equality below holds.
+#if defined(__aarch64__) || defined(_M_ARM64)
+            const bool batch_expected = true;
+#else
+            const bool batch_expected = x86_rules != 0;
+#endif
+            if (batch_expected) {
+                CHECK(turbovec_batch_scan_count_for_test() >= batches_before + 4);
+            }
             for (const int threads : { 2, 8, 3 }) {
                 std::vector<float> scores;
                 std::vector<uint64_t> out;
@@ -6848,6 +6905,7 @@ void check_turbovec_1x_thread_invariance() {
     }
     turbovec_force_vector_major_for_test(-1);
     turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_x86_rules_for_test(0);
 }
 
 // The pool behind every multi-threaded call: tasks run once each, nested
@@ -7852,7 +7910,8 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_staged(1);
             check_turbovec_1x_vpermb();
             check_turbovec_1x_low_planes_tiny();
-            check_turbovec_1x_thread_invariance();
+            check_turbovec_1x_thread_invariance(0);
+            check_turbovec_1x_thread_invariance(1);
             check_vector_index_pool();
             check_turbovec_1x_concurrent_search();
             check_turbovec_1x_staged_maintenance(0);
