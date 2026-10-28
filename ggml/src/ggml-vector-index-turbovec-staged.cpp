@@ -57,6 +57,20 @@ inline int popcount64(uint64_t x) {
 #endif
 }
 
+// Trailing zero bits of a non-zero word.
+inline int ctz64(uint64_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(x);
+#else
+    int n = 0;
+    while ((x & 1u) == 0) {
+        x >>= 1;
+        ++n;
+    }
+    return n;
+#endif
+}
+
 // Shortlist, middle and rescore lengths for a top-k request (upstream
 // planes_shortlist_len, planes_mid_len, planes_rescore_len).
 size_t shortlist_len(size_t k, int bits) {
@@ -1015,15 +1029,72 @@ bool turbovec_staged_search(
                 }
                 score_sign_block(idx, sign_lut, idx.turbovec_sign_blocked.data(), block, n, block_scores);
                 const size_t count = std::min(kBlock, n - block * kBlock);
+                // Rows arrive in slot order, so once s_len rows are kept a
+                // row scoring no better than the worst of them cannot enter.
+                const double floor = split ? floor_score.load(std::memory_order_relaxed) :
+                                             -std::numeric_limits<double>::infinity();
+#if GGML_VEC_INDEX_USE_NEON
+                // Upstream neon_block_topk_update: a block whose best lane
+                // cannot enter is skipped whole, and under a threshold only
+                // the lanes above it are visited, taken as a mask so the walk
+                // does not branch on every lane. Padding lanes are -inf, so
+                // they never count or enter.
+                float32x4_t v[8];
+                for (size_t i = 0; i < 8; ++i) {
+                    v[i] = vld1q_f32(block_scores + i * 4);
+                }
+                if (seeded) {
+                    const float32x4_t seed_v = vdupq_n_f32(seed);
+                    uint32x4_t above = vdupq_n_u32(0);
+                    for (const float32x4_t & x : v) {
+                        above = vsubq_u32(above, vcgtq_f32(x, seed_v));
+                    }
+                    above_seed += vaddvq_u32(above);
+                }
+                const float32x4_t m0 = vmaxq_f32(vmaxq_f32(v[0], v[1]), vmaxq_f32(v[2], v[3]));
+                const float32x4_t m1 = vmaxq_f32(vmaxq_f32(v[4], v[5]), vmaxq_f32(v[6], v[7]));
+                const double block_max = static_cast<double>(vmaxvq_f32(vmaxq_f32(m0, m1)));
+                if ((cut && block_max <= threshold) || block_max < floor) {
+                    continue;
+                }
+                if (cut) {
+                    const float32x4_t thr = vdupq_n_f32(static_cast<float>(threshold));
+                    for (size_t half = 0; half < 2; ++half) {
+                        const uint16x4_t c0 = vmovn_u32(vcgtq_f32(v[half * 4], thr));
+                        const uint16x4_t c1 = vmovn_u32(vcgtq_f32(v[half * 4 + 1], thr));
+                        const uint16x4_t c2 = vmovn_u32(vcgtq_f32(v[half * 4 + 2], thr));
+                        const uint16x4_t c3 = vmovn_u32(vcgtq_f32(v[half * 4 + 3], thr));
+                        const uint8x16_t b = vcombine_u8(
+                            vmovn_u16(vcombine_u16(c0, c1)), vmovn_u16(vcombine_u16(c2, c3)));
+                        // Four bits a lane (the narrowing-shift idiom).
+                        uint64_t bits = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(b), 4)), 0) &
+                            0x1111111111111111ull;
+                        while (bits != 0) {
+                            const size_t lane = half * 16 + static_cast<size_t>(ctz64(bits)) / 4;
+                            bits &= bits - 1;
+                            const double score = static_cast<double>(block_scores[lane]);
+                            if (lane >= count || score < floor) {
+                                continue;
+                            }
+                            const size_t v_slot = block * kBlock + lane;
+                            if (allowed_mask != nullptr && allowed_mask[v_slot] == 0) {
+                                continue;
+                            }
+                            top.push_back({ score, static_cast<uint64_t>(v_slot) });
+                        }
+                    }
+                    if (top.size() >= 2 * s_len) {
+                        cut_back();
+                    }
+                    continue;
+                }
+#else
                 if (seeded) {
                     for (size_t lane = 0; lane < count; ++lane) {
                         above_seed += block_scores[lane] > seed ? 1 : 0;
                     }
                 }
-                // Rows arrive in slot order, so once s_len rows are kept a
-                // row scoring no better than the worst of them cannot enter.
-                const double floor = split ? floor_score.load(std::memory_order_relaxed) :
-                                             -std::numeric_limits<double>::infinity();
+#endif
                 for (size_t lane = 0; lane < count; ++lane) {
                     const double score = static_cast<double>(block_scores[lane]);
                     if ((cut && score <= threshold) || score < floor) {
