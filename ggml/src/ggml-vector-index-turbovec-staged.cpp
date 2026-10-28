@@ -635,7 +635,7 @@ bool turbovec_staged_search(
     bool exact_built = false;
     auto build_exact = [&]() {
         if (permute_dot) {
-            build_turbovec_permute_dot(query, dim, pd);
+            build_turbovec_permute_dot(query, dim, pd, turbovec_layout(idx) == kTurboVecLayoutVm8);
             pd.bias = bias_corr;
         } else {
             build_turbovec_lut(bits, false, query, dim, exact_lut, exact_scale, exact_bias);

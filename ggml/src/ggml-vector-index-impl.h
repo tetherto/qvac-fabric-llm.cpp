@@ -706,7 +706,8 @@ struct TurboVecPermuteDot {
     float scale = 1.0f;
     float bias = 0.0f;
 };
-void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot & out);
+// vm8 builds the lone-query vm8 weights, which only a vm8-layout index reads.
+void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot & out, bool vm8);
 // The 2-bit SMMLA operand set of a 2-bit vm8 index (upstream
 // `build_permute_dot_2bit`).
 void build_turbovec_permute_dot_2bit(const float * query, int dim, TurboVecPermuteDot & out);
