@@ -1690,7 +1690,7 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
 
     // use MMVQ path for mat-vec
     bool use_mmvq = ggml_webgpu_can_use_mmvq(
-        src0, src1, src1->ne[1], ctx->global_ctx->capabilities.supports_dot_product, ctx->global_ctx->vendor);
+        src0, src1, dst, src1->ne[1], ctx->global_ctx->capabilities.supports_dot_product, ctx->global_ctx->vendor);
 
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
 
@@ -4425,7 +4425,7 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
                 // mmvq batch and the size stays monotonic in the batch length
                 const int64_t n_rows   = std::min<int64_t>(src1->ne[1], GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS);
                 const bool    use_mmvq = ggml_webgpu_can_use_mmvq(
-                    src0, src1, n_rows, ctx->webgpu_global_ctx->capabilities.supports_dot_product,
+                    src0, src1, tensor, n_rows, ctx->webgpu_global_ctx->capabilities.supports_dot_product,
                     ctx->webgpu_global_ctx->vendor);
                 if (use_mmvq) {
                     const size_t q8_src1_size = src1->ne[3] * src1->ne[2] * n_rows *
@@ -4986,8 +4986,10 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                 const size_t storage_offset_alignment = capabilities.limits.minStorageBufferOffsetAlignment;
 
                 // subgroup matrix path requirements
-                const bool use_subgroup_matrix = ggml_webgpu_flash_attn_can_use_subgroup_matrix_path(
-                    capabilities.supports_subgroup_matrix, capabilities.sg_mat_k, capabilities.sg_mat_n, src0, src2);
+                const bool use_subgroup_matrix =
+                    ggml_webgpu_flash_attn_can_use_subgroup_matrix_path(capabilities.supports_subgroup_matrix,
+                                                                        capabilities.sg_mat_k, capabilities.sg_mat_n,
+                                                                        src0, src2, op);
 
                 // tile path requirements
                 const bool float_vec4_aligned =
