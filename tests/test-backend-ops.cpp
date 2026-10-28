@@ -14081,8 +14081,27 @@ static void add_mul_mat_strided_vec4_cases(std::vector<std::unique_ptr<test_case
     }
 }
 
+static void add_single_query_softmax_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (perf) {
+        for (int64_t cols : {1024, 4096, 8192}) {
+            cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {cols, 1, 16, 1}, true, false, GGML_TYPE_F32,
+                                                 {1, 1}, 0.125f, 0.0f));
+        }
+        return;
+    }
+    for (int64_t cols : {1024, 1100, 4096}) {
+        for (int64_t heads : {14, 16, 32}) {
+            for (bool mask : {false, true}) {
+                cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {cols, 1, heads, 1}, mask, false, GGML_TYPE_F32,
+                                                     {1, 1}, 0.125f, 0.0f));
+            }
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_single_query_softmax_tests(test_cases, false);
     add_speech_htp_cases(test_cases);
     add_mul_mat_strided_vec4_cases(test_cases);
     std::default_random_engine rng(0);
@@ -17548,6 +17567,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_single_query_softmax_tests(test_cases, true);
     // bandwidth comparison at Bonsai-2 shapes
     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_TQ2_0}) {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 1, 5120, {1, 1}, {1, 1}));
