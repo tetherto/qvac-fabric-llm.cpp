@@ -580,6 +580,33 @@ void score_turbovec_query_blocks(
 
 
 
+// Whether none of a full block's 32 scores can enter a heap whose worst
+// score is floor: all finite and the best strictly below floor.
+bool block_cannot_enter(const float * scores, double floor) {
+#if GGML_VEC_INDEX_USE_NEON
+    float32x4_t hi = vld1q_f32(scores);
+    float32x4_t lo = hi;
+    for (size_t i = 4; i < 32; i += 4) {
+        const float32x4_t v = vld1q_f32(scores + i);
+        hi = vmaxq_f32(hi, v);
+        lo = vminq_f32(lo, v);
+    }
+    // vmaxq/vminq propagate NaN, which fails both tests.
+    const float best = vmaxvq_f32(hi);
+    const float worst = vminvq_f32(lo);
+    return std::isfinite(best) && std::isfinite(worst) && static_cast<double>(best) < floor;
+#else
+    float best = scores[0];
+    for (size_t i = 0; i < 32; ++i) {
+        if (!std::isfinite(scores[i])) {
+            return false;
+        }
+        best = std::max(best, scores[i]);
+    }
+    return static_cast<double>(best) < floor;
+#endif
+}
+
 // Scores blocks [block_begin, block_end) straight into the top-k heap,
 // skipping tombstones, blocks with no allowed slot and disallowed slots.
 void score_turbovec_block_range(
@@ -617,6 +644,15 @@ void score_turbovec_block_range(
             }
             const size_t base_slot = block * 32;
             const size_t count = std::min(static_cast<size_t>(32), n_slots - base_slot);
+            // Upstream neon_block_topk_update's whole-block prune: once the
+            // heap is full, a block whose best score is strictly below the
+            // heap's worst adds nothing (a tie could still win on its id).
+            // Only a full block whose scores are all finite, since a
+            // non-finite lane is rescored per row below.
+            if (count == 32 && heap.size() == static_cast<size_t>(k) &&
+                block_cannot_enter(block_scores.data() + b * 32, heap.front().score)) {
+                continue;
+            }
             for (size_t lane = 0; lane < count; ++lane) {
                 const size_t slot = base_slot + lane;
                 if (!slot_is_active(idx, slot) || (allowed_mask != nullptr && allowed_mask[slot] == 0)) {
@@ -1011,6 +1047,11 @@ void search_turbovec_query_batch(
             const size_t base_slot = block * 32;
             const size_t count = std::min(static_cast<size_t>(32), n_slots - base_slot);
             for (int query = 0; query < n; ++query) {
+                // The lone scan's whole-block prune, per query.
+                if (count == 32 && heaps[query].size() == static_cast<size_t>(k) &&
+                    block_cannot_enter(block_scores[query].data() + b * 32, heaps[query].front().score)) {
+                    continue;
+                }
                 for (size_t lane = 0; lane < count; ++lane) {
                     const size_t slot = base_slot + lane;
                     if (allowed_mask != nullptr && allowed_mask[slot] == 0) {
