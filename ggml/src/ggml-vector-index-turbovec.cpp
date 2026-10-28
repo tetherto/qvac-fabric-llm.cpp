@@ -2222,7 +2222,7 @@ static float turbovec_query_weights(const float * query, int dim, std::vector<in
     return qs;
 }
 
-void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot & out) {
+void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot & out, bool vm8) {
     // Upstream search.rs `build_permute_dot`: the codebook and the query
     // each rounded to int8 under one scale (round is half away from zero).
     const TurboVecCodebook & codebook = turbovec_codebook(4, dim, false);
@@ -2243,7 +2243,7 @@ void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot
     // eight even (high-nibble) dims twice, then the eight odd ones twice.
     const size_t n_byte_groups = static_cast<size_t>(dim) / 2;
     out.vm8_weights.clear();
-    if (n_byte_groups % 8 == 0) {
+    if (vm8 && n_byte_groups % 8 == 0) {
         out.vm8_weights.resize(n_byte_groups * 4);
         for (size_t oct = 0; oct < n_byte_groups / 8; ++oct) {
             int8_t * a = out.vm8_weights.data() + oct * 32;
