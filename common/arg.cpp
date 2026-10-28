@@ -9,6 +9,7 @@
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "llama.h"
+#include "llama-coreml.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -33,6 +34,8 @@
 #include <vector>
 
 #define LLAMA_MAX_URL_LENGTH 2084 // Maximum URL Length in Chrome: 2083
+
+static_assert(LLAMA_COREML_DEFAULT_INFLIGHT == 1, "update common_params::coreml_max_inflight");
 
 using json = common_json;
 using namespace common_arg_utils;
