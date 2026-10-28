@@ -921,10 +921,13 @@ struct TurboVecStagedOpts {
     const std::vector<ScoreId> * shortlist = nullptr;
 };
 // The staged search for a batch of queries (rotated, uncalibrated): the sign
-// region is scanned four queries at a time, then each query is ranked and
-// rescored as turbovec_staged_search does. Fills heaps[q] like search_one
-// would. False when the batch is better served query by query (filtered,
-// too few queries for the threads, no planes cache, not aarch64).
+// region is scanned several queries at a time (four with the fused LUT
+// kernel over a lane-blocked region, six with the `vpermb` kernel over a
+// vector-major one), then each query is ranked and rescored as
+// turbovec_staged_search does. Fills heaps[q] like search_one would. False
+// when the batch is better served query by query (filtered, too few
+// queries for the threads, no planes cache, no batch kernel for the sign
+// region's layout on this build).
 bool turbovec_staged_search_batch(
     const ggml_vec_index & idx,
     const float * rotated_queries,

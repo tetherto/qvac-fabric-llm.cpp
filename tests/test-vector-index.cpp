@@ -6586,6 +6586,7 @@ void check_turbovec_1x_staged(int x86_rules) {
                     };
                     std::vector<float> staged_scores;
                     std::vector<uint64_t> staged_ids;
+                    const int64_t batches_before = turbovec_batch_scan_count_for_test();
                     search(staged_scores, staged_ids);
                     // Every returned score is the full scan's for that id.
                     CHECK(ggml_vec_index_turbovec_set_staged(tv, 0) == GGML_VEC_INDEX_OK);
@@ -6612,6 +6613,7 @@ void check_turbovec_1x_staged(int x86_rules) {
                         // at a time scan with the same tables, so the batch
                         // (the `vpermb` sign scan when unfiltered) returns
                         // exactly the lone results.
+                        CHECK(filtered != 0 || turbovec_batch_scan_count_for_test() > batches_before);
                         CHECK(staged_ids == lone_ids[filtered]);
                         CHECK(staged_scores == lone_scores[filtered]);
                     }
@@ -6817,11 +6819,15 @@ void check_turbovec_1x_vpermb() {
 // Every search returns the same ids and score bits at any thread count:
 // lone queries (which split their blocks), batches (split across queries),
 // wide and narrow filters, staged and full scans, and k large enough for
-// the ranking to split too.
-void check_turbovec_1x_thread_invariance() {
+// the ranking to split too. Under the x86 rules the staged batch is the
+// `vpermb` scan six queries at a time: seven queries make a full batch and
+// a lone tail, and at one or two threads the batch runs, at more it does
+// not, so the batch is also checked against the queries one at a time.
+void check_turbovec_1x_thread_invariance(int x86_rules) {
+    turbovec_force_x86_rules_for_test(x86_rules);
     constexpr int dim = 64;
     constexpr int n = 40000;
-    constexpr int nq = 5;
+    const int nq = x86_rules != 0 ? 7 : 5;
     const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
     const std::vector<uint64_t> ids = tv1x_ids(n);
     const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, nq, dim);
@@ -6872,7 +6878,11 @@ void check_turbovec_1x_thread_invariance() {
             };
             std::vector<float> ref_scores;
             std::vector<uint64_t> ref_ids;
+            const int64_t batches_before = turbovec_batch_scan_count_for_test();
             run(1, ref_scores, ref_ids);
+            // One thread takes the staged batch, a full task and a tail at
+            // either k; the reference must come from it.
+            CHECK(turbovec_batch_scan_count_for_test() >= batches_before + 4);
             for (const int threads : { 2, 8, 3 }) {
                 std::vector<float> scores;
                 std::vector<uint64_t> out;
@@ -6886,6 +6896,7 @@ void check_turbovec_1x_thread_invariance() {
     }
     turbovec_force_vector_major_for_test(-1);
     turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_x86_rules_for_test(0);
 }
 
 // The pool behind every multi-threaded call: tasks run once each, nested
@@ -7890,7 +7901,8 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_staged(1);
             check_turbovec_1x_vpermb();
             check_turbovec_1x_low_planes_tiny();
-            check_turbovec_1x_thread_invariance();
+            check_turbovec_1x_thread_invariance(0);
+            check_turbovec_1x_thread_invariance(1);
             check_vector_index_pool();
             check_turbovec_1x_concurrent_search();
             check_turbovec_1x_staged_maintenance(0);
