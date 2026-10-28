@@ -6,6 +6,7 @@
 #include "mtmd-helper.h"
 #include "chat.h"
 #include "base64.hpp"
+#include "http.h"
 
 #include "server-common.h"
 
@@ -26,12 +27,108 @@
 #endif
 #include <windows.h>
 #include <io.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #else
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #endif
+
+// SSRF Protection: Check if an IP address is private/internal
+// Covers RFC 1918 (private), RFC 3927 (link-local), RFC 4193 (ULA), loopback
+static bool is_private_ip(const std::string & ip) {
+    // IPv4 loopback
+    if (ip.rfind("127.", 0) == 0) return true;
+    // IPv4 link-local (RFC 3927)
+    if (ip.rfind("169.254.", 0) == 0) return true;
+    // IPv4 private ranges (RFC 1918)
+    if (ip.rfind("10.", 0) == 0) return true;
+    if (ip.rfind("172.", 0) == 0) {
+        // 172.16.0.0/12 = 172.16.0.0 - 172.31.255.255
+        size_t pos1 = ip.find('.', 4);
+        if (pos1 != std::string::npos) {
+            std::string second = ip.substr(4, pos1 - 4);
+            try {
+                int octet = std::stoi(second);
+                if (octet >= 16 && octet <= 31) return true;
+            } catch (...) {}
+        }
+    }
+    if (ip.rfind("192.168.", 0) == 0) return true;
+    // IPv4 broadcast
+    if (ip == "255.255.255.255") return true;
+    // IPv4 zero network
+    if (ip.rfind("0.", 0) == 0) return true;
+    
+    // IPv6 loopback
+    if (ip == "::1" || ip == "0:0:0:0:0:0:0:1") return true;
+    // IPv6 link-local (fe80::/10)
+    if (ip.rfind("fe80:", 0) == 0 || ip.rfind("fe90:", 0) == 0 || 
+        ip.rfind("fea0:", 0) == 0 || ip.rfind("feb0:", 0) == 0) return true;
+    // IPv6 unique local (fc00::/7)
+    if (ip.rfind("fc", 0) == 0 || ip.rfind("fd", 0) == 0) return true;
+    // IPv6 unspecified
+    if (ip == "::" || ip == "0:0:0:0:0:0:0:0") return true;
+    
+    return false;
+}
+
+// SSRF Protection: Resolve hostname and check if any IP is private
+static bool is_host_private(const std::string & host) {
+    // Try to parse as IP first
+    struct sockaddr_in sa4;
+    struct sockaddr_in6 sa6;
+    if (inet_pton(AF_INET, host.c_str(), &(sa4.sin_addr)) == 1) {
+        char buf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(sa4.sin_addr), buf, INET_ADDRSTRLEN);
+        return is_private_ip(buf);
+    }
+    if (inet_pton(AF_INET6, host.c_str(), &(sa6.sin6_addr)) == 1) {
+        char buf[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, &(sa6.sin6_addr), buf, INET6_ADDRSTRLEN);
+        return is_private_ip(buf);
+    }
+    
+    // Resolve hostname
+    struct addrinfo hints = {}, *res = nullptr;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    int ret = getaddrinfo(host.c_str(), nullptr, &hints, &res);
+    if (ret != 0) {
+        // If resolution fails, fail-open for availability (DNS issues shouldn't break legitimate requests)
+        // Could be fail-closed for stricter security
+        return false;
+    }
+    
+    bool private_found = false;
+    for (struct addrinfo *rp = res; rp != nullptr; rp = rp->ai_next) {
+        if (rp->ai_family == AF_INET) {
+            struct sockaddr_in *ipv4 = (struct sockaddr_in *)rp->ai_addr;
+            char buf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(ipv4->sin_addr), buf, INET_ADDRSTRLEN);
+            if (is_private_ip(buf)) {
+                private_found = true;
+                break;
+            }
+        } else if (rp->ai_family == AF_INET6) {
+            struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)rp->ai_addr;
+            char buf[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, &(ipv6->sin6_addr), buf, INET6_ADDRSTRLEN);
+            if (is_private_ip(buf)) {
+                private_found = true;
+                break;
+            }
+        }
+    }
+    freeaddrinfo(res);
+    return private_found;
+}
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -1086,6 +1183,19 @@ static void handle_media(
     }
 
     if (string_starts_with(url, "http")) {
+        // SSRF Protection: Validate URL host against private IP ranges
+        common_http_url url_parts;
+        try {
+            url_parts = common_http_parse_url(url);
+        } catch (const std::exception & e) {
+            throw std::runtime_error("Invalid URL format: " + std::string(e.what()));
+        }
+        
+        if (is_host_private(url_parts.host)) {
+            SRV_WRN("SSRF blocked: attempt to access private IP/host '%s'\n", url_parts.host.c_str());
+            throw std::runtime_error("Access to private/internal addresses is not allowed");
+        }
+        
         // download remote image
         // TODO @ngxson : maybe make these params configurable
         common_remote_params params;
