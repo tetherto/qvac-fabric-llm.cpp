@@ -39,7 +39,7 @@ static const ggml_type WEIGHT_TYPES[] = {
     GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
     GGML_TYPE_Q1_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL,
 };
-static const int64_t BATCHES[] = { 1, 8, 63, 64, 750 };
+static const int64_t BATCHES[] = { 1, 4, 8, 63, 64, 750 };
 
 struct graph_inputs {
     ggml_type            weight_type;
