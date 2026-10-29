@@ -1646,7 +1646,7 @@ bool turbovec_staged_search(
             }
             if (table_rank) {
 #if GGML_VEC_INDEX_USE_NEON
-                const uint8_t * rows[kRankBatch];
+                const uint8_t * rows[kRankBatch] = {};
                 for (size_t i = begin; i < end; ++i) {
                     rows[i - begin] = idx.turbovec_data.data() + list[i].slot * row_bytes + plane * nsg;
                 }
