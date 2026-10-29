@@ -3236,6 +3236,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
 
     // Size the host-fallback pool for this chunk (xdna_glue_threads).
     xdna_glue_set_n_tokens(cgraph);
+    g_xdna_chunk_threads.store(xdna_glue_n_threads(g_glue_n_seq_tokens >= 32, false), std::memory_order_relaxed);
     // the prefill GEMM's activation layouts belong to the graph that laid them
     // out, so every graph starts a new one, whatever its token count
     xdna_pgemm_graph_begin();
