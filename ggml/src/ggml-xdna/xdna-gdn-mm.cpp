@@ -228,7 +228,7 @@ bool xdna_gdn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     // K, Q and the exponents, so those are worked out once. Each object is
     // built in local memory and copied into the BO whole.
     uint16_t * xh = (uint16_t *) bo_x->data;
-#pragma omp parallel for num_threads(xdna_host_threads())
+#pragma omp parallel for num_threads(xdna_chunk_threads())
     for (int job = 0; job < COLS * 2 * nx; job++) {
         const int            col = job / (2 * nx), p = (job / nx) % 2, ob = job % nx;
         const int            hd = 2 * col + p;
@@ -330,7 +330,7 @@ bool xdna_gdn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         const float * oh    = (const float *) bo_o->data;
         float *       attn  = (float *) node->data;
         float *       s_out = attn + (size_t) S * H * n_tok;
-#pragma omp parallel for num_threads(xdna_host_threads())
+#pragma omp parallel for num_threads(xdna_chunk_threads())
         for (int job = 0; job < COLS * 4; job++) {
             const int col = job / 4, i = job % 4;
             const int hd = 2 * col + i / 2, half = i % 2;
@@ -400,7 +400,7 @@ bool xdna_gdn_mm_materialize(const ggml_tensor * node) {
     float *       attn  = (float *) node->data;
     const int     n_tok = g_gm.kept_tok, nch = (n_tok + C - 1) / C;
     const size_t  o_col = g_gm.kept_col;
-#pragma omp parallel for num_threads(xdna_host_threads())
+#pragma omp parallel for num_threads(xdna_chunk_threads())
     for (int job = 0; job < COLS * 4; job++) {
         const int col = job / 4, i = job % 4;
         const int hd = 2 * col + i / 2, half = i % 2;
@@ -487,7 +487,7 @@ bool xdna_gdn_mm_prepare(xdna_kernel_pool * pool, const ggml_tensor * node, cons
     }
     // a job is one head's chunk: its 16 tokens' conv, SiLU and (Q, K) norms,
     // into the head's two cores' objects in bf16 8 x 8 tiles
-#pragma omp parallel for collapse(2) num_threads(xdna_host_threads())
+#pragma omp parallel for collapse(2) num_threads(xdna_chunk_threads())
     for (int hd = 0; hd < H; hd++) {
         for (int c = 0; c < nch; c++) {
             alignas(64) uint16_t kq[2 * C * DK];
