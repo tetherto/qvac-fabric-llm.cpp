@@ -3256,6 +3256,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     if (xdna_wants_host_decode(ctx, cgraph)) {
         return xdna_host_decode_run(ctx, cgraph);
     }
+    xdna_prof::section_timer plan_st("graph: plan");
 
     // Per-op NPU kernels are suppressed while the fused layer path is active
     // (default when the fused xclbins are present): the fused run owns the
@@ -3962,6 +3963,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
         }
     }
 
+    plan_st.stop();
     std::vector<struct ggml_tensor *> glue_batch;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];

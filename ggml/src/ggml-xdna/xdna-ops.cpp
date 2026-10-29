@@ -809,6 +809,7 @@ bool xdna_ops_finalize(xdna_ops * ops) {
     if (ops->pending.empty()) {
         return true;
     }
+    xdna_prof::section_timer st("prefill: gemm finalize");
 
     // Wait all runs first so all kernels of the layer complete together.
     for (auto & op : ops->pending) {
@@ -1330,6 +1331,7 @@ bool xdna_ops_compute(xdna_ops * ops, struct ggml_tensor * node) {
                     xdna_prof::section_timer st("prefill: pgemm");
                     return xdna_pgemm_run(ops->pool, node);
                 }
+                xdna_prof::section_timer st("prefill: gemm submit");
                 return xdna_int8_eligible(ops, node) ? gemm_compute_i8(ops, node) : gemm_compute(ops, node);
             }
         case GGML_OP_GATED_DELTA_NET:
