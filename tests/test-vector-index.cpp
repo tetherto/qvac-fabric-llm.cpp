@@ -4689,6 +4689,10 @@ bool tv1x_vpermb_index(const ggml_vec_index_t * idx, int bits) {
 bool tv1x_vpermb_host() {
 #if defined(_M_X64) && defined(_MSC_VER)
     int regs[4] = {};
+    __cpuidex(regs, 0, 0);
+    if (regs[0] < 7) {
+        return false;
+    }
     __cpuidex(regs, 1, 0);
     // _xgetbv faults unless the OS enabled XSAVE.
     if ((static_cast<unsigned>(regs[2]) & (1u << 27)) == 0) {
@@ -5847,7 +5851,7 @@ void check_turbovec_1x_sync_contracts() {
         ggml_vec_index_free(a);
     }
 #ifndef _WIN32
-    // A sync that fails partway drops the binding; the next one rewrites.
+    // A sync that fails before writing keeps the binding; the retry succeeds.
     if (::geteuid() != 0) {
         std::filesystem::remove(path);
         auto * tv = ggml_vec_index_create_turbovec(dim, 2);
@@ -6697,8 +6701,9 @@ void check_turbovec_1x_staged(int x86_rules) {
                 CHECK(scores == want_scores);
             }
             // The same three queries and two more, a batch the fused sign
-            // scan takes (on one or two threads; more threads than batch
-            // tasks run query by query): query 0 is still the batch's only
+            // scan takes (on one thread under the x86 rules, whose width of
+            // six makes it one task; more threads than batch tasks run query
+            // by query): query 0 is still the batch's only
             // short query, so its results do not change.
             std::vector<float> five(queries);
             const std::vector<float> fillers = tv1x_rows(kTv1xStagedShortNoiseSeed + 1, 2, dim);

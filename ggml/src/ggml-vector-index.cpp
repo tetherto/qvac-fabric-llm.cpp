@@ -51,6 +51,9 @@ bool is_quantized(const ggml_vec_index & idx) {
     return is_q4(idx) || is_q8(idx) || is_turbovec(idx);
 }
 
+// The v2/v3 storage kind. 3-bit TurboVec has none: 3-bit indexes are 1.x
+// only, never written as v3, and the state hashes that also read this still
+// tell them apart through bit_width.
 uint8_t storage_kind(const ggml_vec_index & idx) {
     return is_turbovec_q2(idx) ? kStorageTurboVecQ2 :
         is_turbovec_q4(idx) ? kStorageTurboVecQ4 :

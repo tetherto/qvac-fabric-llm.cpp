@@ -897,7 +897,7 @@ static float turbovec_norm_sq_with(TurboVecSimd simd, const float * row, int dim
 #if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
         case TurboVecSimd::avx2:
         case TurboVecSimd::avx512:
-            return ggml_vec_index_detail::turbovec_norm_sq_avx(row, dim);
+            return ggml_vec_index_detail::turbovec_norm_sq_avx2(row, dim);
 #endif
         default:
             break;
@@ -2990,7 +2990,11 @@ void score_turbovec_permute_dot_batch_block(
             permute_dot_block_sums_sdot_4(batch.pds + q, block, n_byte_groups, sums + q);
         }
         done = true;
-    } else if (batch.bits == 4 && turbovec_cpu_dot_product()) {
+    } else if (batch.bits == 4 && turbovec_cpu_dot_product() &&
+               (batch.layout != kTurboVecLayoutVm8 || std::all_of(batch.pds, batch.pds + n, [](const TurboVecPermuteDot * pd) {
+                    return !pd->vm8_weights.empty();
+                }))) {
+        // A vm8 query needs its vm8 weights, as the single-query path checks.
         for (int q = 0; q < n; ++q) {
             if (batch.layout == kTurboVecLayoutVm8) {
                 permute_dot_block_sums_sdot_vm8_single(*batch.pds[q], block, n_byte_groups, sums[q]);
@@ -4879,102 +4883,6 @@ void reencode_turbovec_rows(
     });
     out_codes.swap(next_codes);
     out_scales.swap(next_scales);
-}
-
-void quantize_turbovec_q2_row(const float * src, uint8_t * dst, float * scales, int dim) {
-    std::vector<float> shift;
-    std::vector<float> scale;
-    quantize_turbovec_batch(src, 1, 2, dst, scales, dim, shift, scale);
-}
-
-void decode_turbovec_q2_row(const uint8_t * codes, const float * scales, float * dst, int dim) {
-    decode_turbovec_q2_row_calibrated(codes, scales, nullptr, nullptr, dst, dim);
-}
-
-void decode_turbovec_q2_row_calibrated(
-        const uint8_t * codes,
-        const float * scales,
-        const float * tqplus_shift,
-        const float * tqplus_scale,
-        float * dst,
-        int dim) {
-    decode_turbovec_row_calibrated(2, true, codes, scales, tqplus_shift, tqplus_scale, dst, dim);
-}
-
-float dot_turbovec_q2_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim) {
-    std::vector<uint8_t> lut;
-    float lut_scale = 1.0f;
-    float lut_bias = 0.0f;
-    build_turbovec_q2_lut(rotated_query, dim, lut, lut_scale, lut_bias);
-    return dot_turbovec_q2_lut_row(lut.data(), lut_scale, lut_bias, codes, scales, dim);
-}
-
-float dot_turbovec_q2_row(const float * query, const uint8_t * codes, const float * scales, int dim) {
-    std::vector<float> rotated(static_cast<size_t>(dim));
-    rotate_turbovec_query(true, query, rotated.data(), dim);
-    return dot_turbovec_q2_rotated_row(rotated.data(), codes, scales, dim);
-}
-
-void quantize_turbovec_q4_row(const float * src, uint8_t * dst, float * scales, int dim) {
-    std::vector<float> shift;
-    std::vector<float> scale;
-    quantize_turbovec_batch(src, 1, 4, dst, scales, dim, shift, scale);
-}
-
-void build_turbovec_q2_lut(const float * rotated_query, int dim, std::vector<uint8_t> & lut, float & scale, float & bias) {
-    build_turbovec_lut(2, true, rotated_query, dim, lut, scale, bias);
-}
-
-float dot_turbovec_q2_lut_row(
-        const uint8_t * lut,
-        float lut_scale,
-        float lut_bias,
-        const uint8_t * codes,
-        const float * scales,
-        int dim) {
-    return dot_turbovec_lut_row(lut, lut_scale, lut_bias, codes, scales, 2, dim);
-}
-
-void decode_turbovec_q4_row(const uint8_t * codes, const float * scales, float * dst, int dim) {
-    decode_turbovec_q4_row_calibrated(codes, scales, nullptr, nullptr, dst, dim);
-}
-
-void decode_turbovec_q4_row_calibrated(
-        const uint8_t * codes,
-        const float * scales,
-        const float * tqplus_shift,
-        const float * tqplus_scale,
-        float * dst,
-        int dim) {
-    decode_turbovec_row_calibrated(4, true, codes, scales, tqplus_shift, tqplus_scale, dst, dim);
-}
-
-void build_turbovec_q4_lut(const float * rotated_query, int dim, std::vector<uint8_t> & lut, float & scale, float & bias) {
-    build_turbovec_lut(4, true, rotated_query, dim, lut, scale, bias);
-}
-
-float dot_turbovec_q4_lut_row(
-        const uint8_t * lut,
-        float lut_scale,
-        float lut_bias,
-        const uint8_t * codes,
-        const float * scales,
-        int dim) {
-    return dot_turbovec_lut_row(lut, lut_scale, lut_bias, codes, scales, 4, dim);
-}
-
-float dot_turbovec_q4_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim) {
-    std::vector<uint8_t> lut;
-    float lut_scale = 1.0f;
-    float lut_bias = 0.0f;
-    build_turbovec_q4_lut(rotated_query, dim, lut, lut_scale, lut_bias);
-    return dot_turbovec_q4_lut_row(lut.data(), lut_scale, lut_bias, codes, scales, dim);
-}
-
-float dot_turbovec_q4_row(const float * query, const uint8_t * codes, const float * scales, int dim) {
-    std::vector<float> rotated(static_cast<size_t>(dim));
-    rotate_turbovec_query(true, query, rotated.data(), dim);
-    return dot_turbovec_q4_rotated_row(rotated.data(), codes, scales, dim);
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS

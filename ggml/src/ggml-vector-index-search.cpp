@@ -33,6 +33,8 @@
 // Upstream turbovec scores 4-bit codes with its permute-dot kernels on
 // hosts that run them (turbovec_cpu_vector_major) and with the nibble LUT
 // elsewhere; the two round differently, so this follows the same split.
+// This is the single-query choice: 2-bit vm8 batches also use permute-dot,
+// see turbovec_pd_batched.
 bool turbovec_uses_permute_dot(const ggml_vec_index_t & idx) {
     // Decided with the blocked layout when the index was created; on x86
     // the 2- and 3-bit vector-major layouts take the `vpermb` scan instead.

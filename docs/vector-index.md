@@ -138,8 +138,8 @@ differently, so scores, and occasionally which ids sit at the edge of a
 top-k, depend on the host exactly as upstream's do.
 `TURBOVEC_NO_VECTOR_MAJOR` (or the older `TURBOVEC_NO_VNNI`) set to anything
 but `0`, read once per process, keeps the lookup tables for new indexes, and
-`TURBOVEC_NO_GFNI` keeps the x86 permute-dot kernel off its GFNI form (the
-same sums), as upstream's do.
+`TURBOVEC_NO_GFNI`, set to any value (`0` included), keeps the x86
+permute-dot kernel off its GFNI form (the same sums), as upstream's do.
 
 On aarch64 with the int8 matrix-multiply extension (i8mm) as well, a 4-bit
 index whose dimension is a multiple of 16 takes upstream's wider `vm8`

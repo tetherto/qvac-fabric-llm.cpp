@@ -9,7 +9,6 @@
 #include "ggml-vector-index-x86.h"
 #include "ggml-vector-index-turbovec-pd-x86.h"
 
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -232,19 +231,22 @@ void turbovec_vnni_lut_sums(
     for (size_t b = 0; b < n_blocks; ++b) {
         const uint8_t * block = blocks + b * block_bytes;
         int32_t * out = sums + b * static_cast<size_t>(nq) * kBlock;
-        switch (nq) {
-            case 2: vnni_lut_sums_nq<2, false>(split_luts, block, n_byte_groups, 0, out); break;
-            case 3: vnni_lut_sums_nq<3, false>(split_luts, block, n_byte_groups, 0, out); break;
-            case 4: vnni_lut_sums_nq<4, false>(split_luts, block, n_byte_groups, 0, out); break;
-            case 5: vnni_lut_sums_nq<5, false>(split_luts, block, n_byte_groups, 0, out); break;
-            case 6: vnni_lut_sums_nq<6, false>(split_luts, block, n_byte_groups, 0, out); break;
-            case 7: vnni_lut_sums_nq<7, false>(split_luts, block, n_byte_groups, 0, out); break;
-            default:
-                // Callers batch at most 8 (the scan's width is 6); more would
-                // leave the extra queries' sums unwritten, as upstream would.
-                assert(nq <= 8);
-                vnni_lut_sums_nq<8, false>(split_luts, block, n_byte_groups, 0, out);
-                break;
+        // Callers batch at most 6; a wider batch runs in groups of 8, so
+        // every query's sums are written.
+        for (int q0 = 0; q0 < nq; q0 += 8) {
+            const uint8_t * const * luts = split_luts + q0;
+            int32_t * group_out = out + static_cast<size_t>(q0) * kBlock;
+            // No std::min: this object pulls in no <algorithm> inline function.
+            switch (nq - q0 < 8 ? nq - q0 : 8) {
+                case 1: vnni_lut_sums_nq<1, false>(luts, block, n_byte_groups, 0, group_out); break;
+                case 2: vnni_lut_sums_nq<2, false>(luts, block, n_byte_groups, 0, group_out); break;
+                case 3: vnni_lut_sums_nq<3, false>(luts, block, n_byte_groups, 0, group_out); break;
+                case 4: vnni_lut_sums_nq<4, false>(luts, block, n_byte_groups, 0, group_out); break;
+                case 5: vnni_lut_sums_nq<5, false>(luts, block, n_byte_groups, 0, group_out); break;
+                case 6: vnni_lut_sums_nq<6, false>(luts, block, n_byte_groups, 0, group_out); break;
+                case 7: vnni_lut_sums_nq<7, false>(luts, block, n_byte_groups, 0, group_out); break;
+                default: vnni_lut_sums_nq<8, false>(luts, block, n_byte_groups, 0, group_out); break;
+            }
         }
     }
 }

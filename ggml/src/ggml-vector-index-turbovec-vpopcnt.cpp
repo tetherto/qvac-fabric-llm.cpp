@@ -13,8 +13,8 @@
 namespace ggml_vec_index_detail {
 
 // sum_b 2^b * (popcount(row & pos[b]) - popcount(row & neg[b])) over a low
-// row of `row_len` bytes; `masks` holds, per 64 row bytes, pos[0..6] then
-// neg[0..6], 64 bytes each. A masked load reads only a short tail's live
+// row of `row_len` bytes; `masks` holds, per 64 row bytes, pos[0..5] then
+// neg[0..5], 64 bytes each. A masked load reads only a short tail's live
 // bytes.
 int64_t turbovec_low_dot_avx512(const uint8_t * masks, const uint8_t * row, size_t row_len) {
     constexpr size_t kLowBits = 6;

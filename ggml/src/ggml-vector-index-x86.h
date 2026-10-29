@@ -16,7 +16,7 @@ namespace ggml_vec_index_detail {
 void turbovec_wht_block_avx2(float * blk, int block, float inv_sqrt_block);
 void turbovec_permute_gather_avx2(
     int mode, const float * src, const uint32_t * perm, const float * signs, float inv, float * dst, size_t n);
-float turbovec_norm_sq_avx(const float * row, int dim);
+float turbovec_norm_sq_avx2(const float * row, int dim);
 double turbovec_quantize_row_avx2(
     const float * rotated,
     const float * shift,
