@@ -1302,7 +1302,7 @@ bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
             // Depthwise conv1d offloaded to the conv kernel when present.
             return xdna_conv_prefill_supported(op);
         case GGML_OP_FLASH_ATTN_EXT:
-            // The six full-attention prefill layers, on the mmul
+            // Prefill attention of 2 KV heads of 256, on the mmul
             // (kernels/attn_mm.py).
             return xdna_attn_mm_supported(op);
         default:
