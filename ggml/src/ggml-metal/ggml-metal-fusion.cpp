@@ -1746,6 +1746,18 @@ void ggml_metal_fusion_add_alloc_deps(
                 continue;
             }
             if (ggml_metal_fusion_match_raw_pattern(gf, i, fusion.ops_all)) {
+                if (fusion.id == GGML_METAL_FUSION_RMS_NORM_MUL_MV) {
+                    const ggml_tensor * nodes[GGML_METAL_FUSION_MAX];
+                    int idxs[GGML_METAL_FUSION_MAX];
+                    for (int j = 0; j < (int) fusion.ops.size(); ++j) {
+                        nodes[j] = gf->nodes[i + j];
+                        idxs[j] = i + j;
+                    }
+                    // An unrelated matmul can move before the norm and end its input lifetime too early.
+                    if (!fusion.check(&fusion, nodes, gf, idxs, 0, GGML_METAL_FUSION_STRUCTURAL)) {
+                        continue;
+                    }
+                }
                 best = &fusion;
                 best_raw = (int) fusion.ops_all.size();
             }
