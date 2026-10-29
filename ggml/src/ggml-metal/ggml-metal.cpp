@@ -547,10 +547,87 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
     return ggml_metal_cpy_tensor_async(ctx_src, ctx_dst, src, dst);
 }
 
-static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+#ifdef GGML_METAL_FFN_EXPERIMENT
+static ggml_custom2_op_t custom2_tag = nullptr;
+static ggml_metal_custom2_execute custom2_execute = nullptr;
+
+void ggml_backend_metal_set_custom2(ggml_custom2_op_t tag, ggml_metal_custom2_execute execute) {
+    custom2_tag = tag;
+    custom2_execute = execute;
+}
+
+bool ggml_backend_metal_tensor_is_shared(const ggml_tensor * tensor) {
+    auto * buffer = tensor->buffer;
+    return buffer && ggml_backend_buffer_is_metal(buffer) && ggml_metal_buffer_is_shared((ggml_metal_buffer_t) buffer->context);
+}
+
+static bool ggml_backend_metal_custom2_matches(const ggml_tensor * tensor) {
+    if (!custom2_tag || !custom2_execute || tensor->op != GGML_OP_MAP_CUSTOM2) { return false; }
+    ggml_map_custom2_op_params params;
+    memcpy(&params, tensor->op_params, sizeof(params));
+    return params.fun == custom2_tag;
+}
+#endif
+
+static enum ggml_status ggml_backend_metal_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
+#ifdef GGML_METAL_FFN_EXPERIMENT
+    static bool layout_dumped = false;
+    if (!layout_dumped && getenv("FFN_COREML_TRACE_DECODE") && cgraph->n_nodes > 1000) {
+        layout_dumped = true;
+        fprintf(stderr, "decode_layout nodes=%d\n", cgraph->n_nodes);
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            auto * node = cgraph->nodes[i];
+            for (int j = -1; j < GGML_MAX_SRC; ++j) {
+                auto * tensor = j < 0 ? node : node->src[j];
+                if (!tensor) { continue; }
+                auto * buffer = tensor->buffer ? tensor->buffer : tensor->view_src ? tensor->view_src->buffer : nullptr;
+                const auto base = buffer ? (uintptr_t) ggml_backend_buffer_get_base(buffer) : 0;
+                fprintf(stderr, "layout node=%d src=%d name=%s op=%s type=%s buffer=%p offset=%zu ne=%lld,%lld,%lld,%lld nb=%zu,%zu,%zu,%zu\n",
+                        i, j, tensor->name, ggml_op_name(tensor->op), ggml_type_name(tensor->type), (void *) buffer, (size_t) ((uintptr_t) tensor->data - base),
+                        (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3], tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3]);
+            }
+        }
+    }
+    int first = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (!ggml_backend_metal_custom2_matches(node)) { continue; }
+        if (first < i) {
+            auto before = ggml_graph_view(cgraph, first, i);
+            const auto status = ggml_metal_graph_compute(ctx, &before);
+            if (status != GGML_STATUS_SUCCESS) { return status; }
+        }
+        ggml_map_custom2_op_params params;
+        memcpy(&params, node->op_params, sizeof(params));
+        if (!custom2_execute(backend, node, params.userdata)) { return GGML_STATUS_FAILED; }
+        first = i + 1;
+    }
+    if (first != 0) {
+        auto after = ggml_graph_view(cgraph, first, cgraph->n_nodes);
+        return ggml_metal_graph_compute(ctx, &after);
+    }
+#endif
     return ggml_metal_graph_compute(ctx, cgraph);
+}
+
+static int ggml_backend_metal_default_n_cb(void);
+
+static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+#ifdef GGML_METAL_FFN_EXPERIMENT
+    if (getenv("FFN_COREML_SINGLE_ENCODER")) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (!ggml_backend_metal_custom2_matches(cgraph->nodes[i])) { continue; }
+            auto * ctx = (ggml_metal_t) backend->context;
+            ggml_metal_set_n_cb(ctx, 0);
+            const auto status = ggml_backend_metal_graph_compute_impl(backend, cgraph);
+            ggml_metal_set_n_cb(ctx, ggml_backend_metal_default_n_cb());
+            return status;
+        }
+    }
+#endif
+    return ggml_backend_metal_graph_compute_impl(backend, cgraph);
 }
 
 static void ggml_backend_metal_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -769,6 +846,10 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
 }
 
 static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+#ifdef GGML_METAL_FFN_EXPERIMENT
+    if (ggml_backend_metal_custom2_matches(op)) { return true; }
+#endif
+
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
     if (op->op == GGML_OP_GATED_DELTA_NET_DEFERRED && !ggml_backend_dev_supports_inplace_src(dev, op->src[6])) {

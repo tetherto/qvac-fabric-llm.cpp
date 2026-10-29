@@ -56,6 +56,13 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
+#ifdef GGML_METAL_FFN_EXPERIMENT
+typedef bool (*ggml_metal_custom2_execute)(ggml_backend_t backend, struct ggml_tensor * tensor, void * userdata);
+GGML_BACKEND_API void ggml_backend_metal_set_custom2(ggml_custom2_op_t tag, ggml_metal_custom2_execute execute);
+GGML_BACKEND_API bool ggml_backend_metal_tensor_is_shared(const struct ggml_tensor * tensor);
+#endif
+
+
 #ifdef __cplusplus
 }
 #endif

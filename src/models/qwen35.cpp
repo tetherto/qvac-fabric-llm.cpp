@@ -1,6 +1,18 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#ifdef LLAMA_FFN_COREML_EXPERIMENT
+#include "ffn-coreml-hook.h"
+
+static llama_ffn_coreml_builder qwen35_coreml_builder = nullptr;
+static void * qwen35_coreml_userdata = nullptr;
+
+void llama_ffn_coreml_set_builder(llama_ffn_coreml_builder builder, void * userdata) {
+    qwen35_coreml_builder = builder;
+    qwen35_coreml_userdata = userdata;
+}
+#endif
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -191,12 +203,15 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
-        // Dense FFN layer - without residual connection
-        cur = build_layer_ffn(attn_post_norm, il);
-        cb(cur, "ffn_out", il);
-
-        // Residual connection for FFN - add to the tensor from before post_attention_layernorm
-        cur = ggml_add(ctx0, cur, ffn_residual);
+#ifdef LLAMA_FFN_COREML_EXPERIMENT
+        ggml_tensor * offloaded = qwen35_coreml_builder ? qwen35_coreml_builder(ctx0, attn_post_norm, ffn_residual, il, qwen35_coreml_userdata) : nullptr;
+        if (offloaded) { cur = offloaded; } else
+#endif
+        {
+            cur = build_layer_ffn(attn_post_norm, il);
+            cb(cur, "ffn_out", il);
+            cur = ggml_add(ctx0, cur, ffn_residual);
+        }
         cb(cur, "post_ffn", il);
 
         cur = build_cvec(cur, il);
