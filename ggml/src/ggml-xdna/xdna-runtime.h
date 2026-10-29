@@ -50,6 +50,10 @@ bool xdna_insts_stream_ok(const char * name, const uint32_t * insts, size_t n_wo
 // directly; every stream is checked again by xdna_kernel_bind_insts.
 bool xdna_insts_read_file(const char * path, std::vector<uint32_t> & words);
 
+// A kernel of the same xclbin as `proto` with no stream bound yet, to keep one
+// more stream ready without loading the xclbin again. Returns nullptr on failure.
+xdna_kernel * xdna_kernel_clone(const xdna_kernel * proto);
+
 // Bind an in-memory instruction stream (TXN words) to a loaded kernel. `dev`
 // must be the same handle used for the data buffers.
 bool xdna_kernel_bind_insts(xdna_device * dev, xdna_kernel * kern, const uint32_t * insts, size_t n_words);
