@@ -243,21 +243,27 @@ inline constexpr int kTurboVecFlushEvery = 256;
 // std::round (half away from zero) without the libm call it is on x86's
 // baseline, where it costs the table builds a call per entry (upstream
 // round_half_away_f32, H65). aarch64 keeps std::round: it is one frinta
-// and vectorises, where the form below does not. Below 2^23 the integer
-// conversion is the exact truncation and the fraction is exact in f32; at
-// or above it, and for NaN, a float is already its own rounding. Only the
-// sign of a zero result can differ from std::round, which the callers'
-// max(0, ..) erases.
+// and vectorises. Below 2^23 the integer conversion is the exact
+// truncation and the fraction is exact in f32; at or above it, and for
+// NaN, a float is already its own rounding. Written as two selects rather
+// than an early return so the table builds' loops vectorise with SSE2
+// (cvttps2dq, cmpps, and the comparisons added as integers): an early
+// return kept them scalar, at about 2 ns an entry on x86 for the 4096
+// sign-table entries and 8192 exact-table entries at dim 1024. Checked
+// against the earlier form and std::round over every float: only the sign
+// of a zero result can differ from std::round, which the callers' max(0,
+// ..) or integer cast erases. The cast's operand is zeroed where it would
+// be out of range, so it is always defined.
 inline float round_half_away_f32(float x) {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return std::round(x);
 #else
-    if (!(std::fabs(x) < 8388608.0f)) {
-        return x;
-    }
-    const float t = static_cast<float>(static_cast<int32_t>(x));
-    const float f = x - t;
-    return t + static_cast<float>(static_cast<int>(f >= 0.5f) - static_cast<int>(f <= -0.5f));
+    const bool small = std::fabs(x) < 8388608.0f;
+    const float c = small ? x : 0.0f;
+    const float t = static_cast<float>(static_cast<int32_t>(c));
+    const float f = c - t;
+    const float r = t + static_cast<float>(static_cast<int>(f >= 0.5f) - static_cast<int>(f <= -0.5f));
+    return small ? r : x;
 #endif
 }
 
