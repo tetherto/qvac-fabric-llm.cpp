@@ -38,7 +38,8 @@ bailingmoe3         ,1   ,any     ,UNARY+MUL                   ,      1
 beam                ,0   ,any     ,MUL+ADD                     ,      6
 beam                ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      1
 beam                ,0   ,decode  ,MUL_MAT_ID+MUL_MAT_ID+GLU   ,      3
-beam                ,0   ,any     ,RMS_NORM+MUL                ,     25
+beam                ,0   ,any     ,RMS_NORM+MUL                ,     21
+beam                ,0   ,any     ,RMS_NORM+MUL+ROPE           ,      4
 bloom               ,0   ,any     ,NORM+MUL+ADD                ,      6
 chatglm             ,0   ,any     ,RMS_NORM+MUL                ,      5
 codeshell           ,0   ,any     ,NORM+MUL+ADD                ,      5
@@ -220,8 +221,9 @@ kimi-linear         ,0   ,any     ,UNARY+MUL                   ,      1
 kolibri1            ,0   ,any     ,MUL+ADD                     ,      4
 kolibri1            ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
 kolibri1            ,0   ,decode  ,MUL_MAT_ID+MUL_MAT_ID+GLU   ,      2
-kolibri1            ,0   ,any     ,RMS_NORM+MUL                ,     10
+kolibri1            ,0   ,any     ,RMS_NORM+MUL                ,      8
 kolibri1            ,0   ,any     ,RMS_NORM+MUL+ADD            ,      3
+kolibri1            ,0   ,any     ,RMS_NORM+MUL+ROPE           ,      2
 laguna              ,0   ,any     ,ADD+ADD                     ,      1
 laguna              ,0   ,any     ,MUL+ADD                     ,      2
 laguna              ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
@@ -258,8 +260,9 @@ maincoder           ,0   ,any     ,RMS_NORM+MUL                ,      9
 maion-coder         ,0   ,any     ,MUL+ADD                     ,      4
 maion-coder         ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
 maion-coder         ,0   ,decode  ,MUL_MAT_ID+MUL_MAT_ID+GLU   ,      2
-maion-coder         ,0   ,any     ,RMS_NORM+MUL                ,     17
+maion-coder         ,0   ,any     ,RMS_NORM+MUL                ,     13
 maion-coder         ,0   ,any     ,RMS_NORM+MUL+ADD            ,      8
+maion-coder         ,0   ,any     ,RMS_NORM+MUL+ROPE           ,      4
 maion-coder         ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
 mamba               ,0   ,any     ,RMS_NORM+MUL                ,      3
 mamba2              ,0   ,any     ,RMS_NORM+MUL                ,      5
@@ -311,7 +314,8 @@ muse-glimmer        ,0   ,any     ,UNARY+MUL                   ,      2
 muse-spark          ,0   ,any     ,MUL+ADD                     ,      4
 muse-spark          ,0   ,decode  ,MUL_MAT_ID+MUL              ,      2
 muse-spark          ,0   ,decode  ,MUL_MAT_ID+MUL_MAT_ID+GLU   ,      2
-muse-spark          ,0   ,any     ,RMS_NORM+MUL                ,     14
+muse-spark          ,0   ,any     ,RMS_NORM+MUL                ,     12
+muse-spark          ,0   ,any     ,RMS_NORM+MUL+ROPE           ,      2
 muse-spark          ,0   ,any     ,UNARY+MUL                   ,      2
 nanbeige            ,0   ,any     ,RMS_NORM+MUL                ,      5
 nemotron            ,0   ,any     ,NORM+MUL+ADD                ,      5
