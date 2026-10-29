@@ -243,17 +243,12 @@ run_backend_ops_speech_case() {
   note_timeout_if_triggered "$rc" "$timeout_seconds" "$log"
   sed $'s/\033\[[0-9;]*m//g' "$log" > "$clean_log"
   if [ "$rc" -eq 0 ]; then
-    if ! grep -q 'Backend HTP0: OK' "$clean_log" ||
-       grep -Eq 'suite=speech_htp,.*: not supported' "$clean_log"; then
+    # qvac-b11739: the Hexagon speech kernels (QVAC-26706) are deferred until they are ported onto
+    # the rewritten upstream backend, so unsupported speech cases are allowed and no per-op pass is
+    # required. Restore the strict gate together with that port.
+    if ! grep -q 'Backend HTP0: OK' "$clean_log"; then
       rc=1
     fi
-    local op
-    for op in DEPTHWISE_CONV_1D COL2IM_1D CONV_2D_DW IM2COL MUL_MAT TIMESTEP_EMBEDDING GELU_ERF GET_ROWS CPY FLASH_ATTN_EXT; do
-      if ! grep -Eq "^[[:space:]]*$op\\(suite=speech_htp,.*\\): OK$" "$clean_log"; then
-        rc=1
-        echo "No $op speech case passed on HTP0" >> "$log"
-      fi
-    done
   fi
   if [ "$rc" -eq 0 ]; then
     xml_case_pass "tests.test_backend_ops_posix" "test_backend_ops_speech_htp0"
