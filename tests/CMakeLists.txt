@@ -676,6 +676,8 @@ if (GGML_XDNA)
     llama_build_and_test(test-xdna-state.cpp        LABEL "model")
     # Every thread's CPU mask unchanged by the pinned host decode (-m model.gguf).
     llama_build_and_test(test-xdna-affinity.cpp     LABEL "model")
+    # An embedding model's layer outputs and pooled embeddings against the CPU (-m model.gguf).
+    llama_build_and_test(test-xdna-embedding.cpp    LABEL "model")
     # The host-only backend tests are built with the backend
     # (ggml/src/ggml-xdna/CMakeLists.txt); they need no model and no device.
     foreach(t test-xdna-repack test-xdna-head-rows test-xdna-match)
