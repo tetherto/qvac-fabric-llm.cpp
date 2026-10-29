@@ -22,6 +22,12 @@ bool xdna_pgemm_supported(const struct ggml_tensor * op);
 // share an input belong to the previous one.
 void xdna_pgemm_graph_begin(void);
 
+// The bytes a prefill GEMM writes into `op`'s output: its rows rounded up to
+// the array's 128-row blocks, which the host buffer type reports as the
+// tensor's allocation size so the array can write the output in place;
+// 0 when `op` does not go that way.
+size_t xdna_pgemm_out_bytes(const struct ggml_tensor * op);
+
 // Drop the packed weights. They are keyed by a tensor's data pointer, which
 // does not survive the model that owned it.
 void xdna_pgemm_release(void);
