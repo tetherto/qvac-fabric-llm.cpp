@@ -265,6 +265,51 @@ static bool test_output_in_place(ggml_backend_t npu, ggml_backend_t cpu, int64_t
     return passed;
 }
 
+// One Q4_K weight applied to `count` activations of M tokens, each product in a node of its own
+static norm_graph build_repeated(ggml_backend_t be, int64_t K, int64_t N, int64_t M, int count) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * p     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, N);
+    g.inputs            = { p };
+    g.gf                = ggml_new_graph(g.ctx);
+    for (int i = 0; i < count; i++) {
+        ggml_tensor * a = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+        g.inputs.push_back(a);
+        ggml_tensor * out = ggml_mul_mat(g.ctx, p, a);
+        ggml_build_forward_expand(g.gf, out);
+        g.checked.push_back(out);
+    }
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
+// The streams of the same call are kept; a repeat of its shape with another
+// activation and another output place, in one graph and in the next pass,
+// has to land in its own node
+static bool test_repeated_projection(ggml_backend_t npu, ggml_backend_t cpu, int64_t M, int count, double tol) {
+    const int64_t K = 1024, N = 1024;
+    norm_graph    want_g = build_repeated(cpu, K, N, M, count);
+    norm_graph    got_g  = build_repeated(npu, K, N, M, count);
+    std::vector<std::vector<float>> want, got;
+    bool ok = run(want_g, cpu, want);
+    double worst = 0;
+    for (int pass = 0; ok && pass < 2; pass++) {
+        ok = run(got_g, npu, got);
+        for (int i = 0; ok && i < count; i++) {
+            worst = std::max(worst, nmse(want[i], got[i]));
+        }
+    }
+    const bool passed = ok && worst < tol;
+    std::printf("MUL_MAT x%d of one weight, M %-4lld two passes, worst nmse %.3g %s\n", count, (long long) M, worst,
+                passed ? "ok" : "FAIL");
+    ggml_backend_buffer_free(want_g.buf);
+    ggml_backend_buffer_free(got_g.buf);
+    ggml_free(want_g.ctx);
+    ggml_free(got_g.ctx);
+    return passed;
+}
+
 // x (K x M) through a gate and an up projection of F rows, joined by `op`
 static norm_graph build_ffn(ggml_backend_t be, ggml_glu_op op, bool glu_is_output, int64_t K, int64_t F, int64_t M,
                             float scale) {
@@ -608,6 +653,7 @@ int main(void) {
     for (int64_t M : { 100, 129, 300 }) {
         passed = test_output_in_place(npu, cpu, M, tol) && passed;
     }
+    passed = test_repeated_projection(npu, cpu, 200, 3, tol) && passed;
 
     const std::vector<std::vector<int64_t>> groups = { { 1024, 512, 512 }, { 2048, 512, 512 }, { 1024, 640 } };
     for (const std::vector<int64_t> & ns : groups) {

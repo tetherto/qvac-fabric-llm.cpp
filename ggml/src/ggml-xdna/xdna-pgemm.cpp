@@ -205,9 +205,19 @@ template <class Row> bool lay_slab(const a_geom & ag, xdna_buffer * bo, int sl, 
     return xdna_buffer_sync_to_device_range(bo, ag.slab_bytes(sl), ag.base(sl));
 }
 
+// A kernel bound to an instruction stream, kept for the calls that build the same
+struct seq_entry {
+    xdna_kernel * kern = nullptr;
+    uint64_t      used = 0;
+};
+
 struct runner {
     std::mutex                                                      mtx;
+    // the artifact's kernel, which the streams' are cloned from
     xdna_kernel *                                                   kern = nullptr;
+    // the streams of earlier calls (seq_key), least recently used first out
+    std::map<std::string, seq_entry>                                seqs;
+    uint64_t                                                        seq_tick = 0;
     // the weights' data pointers, a nullptr after them for a GLU's gate and
     // up: either a plain weight, a GLU's pair, or projections side by side
     std::map<std::vector<const void *>, weights> w;
@@ -288,9 +298,6 @@ xdna_bd linear_bd(uint32_t words) {
     return bd;
 }
 
-// Where a call's C goes: a row-major (rows x ldc) f32 target, argument 2 at
-// byte offset `off`, and per column the chunks whose columns lie inside it
-// (the rest of a column's chunks go to the sink, argument 3).
 // One projection's share of a call that writes several: its `nobj` objects of
 // 512 columns from the call's object `obj0` on go to `cols` columns of a
 // row-major (rows x ldc) f32 target at byte `off` of argument 2.
@@ -302,6 +309,10 @@ struct c_seg {
     uint32_t off  = 0;
 };
 
+// Where a call's C goes: a row-major (rows x ldc) f32 target, argument 2 at
+// byte offset `off`, and per column the chunks whose columns lie inside it
+// (the rest of a column's chunks go to the sink, argument 3). seq_key names
+// every member.
 struct c_dest {
     uint32_t ldc      = 0;   // floats a row
     uint32_t off      = 0;   // bytes into argument 2
@@ -592,6 +603,88 @@ std::vector<uint32_t> build_seq(const xdna_gemv_geom & g,
     return xdna_seq_build(&seq);
 }
 
+// What build_seq reads, as a key: the weights' geometry and plan rather than
+// the weights, so every layer of a shape, and every pass, builds the stream once.
+std::string seq_key(const weights * ws, int nmb, const c_dest & cd, uint32_t h_off, uint32_t a_off) {
+    static_assert(sizeof(c_seg) == 5 * sizeof(int), "c_seg is keyed by its bytes");
+    std::string  key;
+    auto         put = [&key](const auto & v) { key.append((const char *) &v, sizeof(v)); };
+    const size_t nsg = cd.segs.size();
+    put(ws->geom.K);
+    put(ws->geom.n_out());
+    put(ws->geom.n_tiles());
+    put(ws->geom.tile_bytes());
+    put(ws->geom.col_weight_bytes());
+    put(ws->plan.G);
+    put(ws->plan.ng);
+    put(ws->plan.nslots);
+    put(nmb);
+    put(h_off);
+    put(a_off);
+    put(cd.ldc);
+    put(cd.off);
+    put(cd.objs);
+    put(cd.valid);
+    put(cd.fused);
+    put(cd.half);
+    put(cd.a_blk);
+    put(cd.nreal);
+    put(nsg);
+    key.append((const char *) cd.segs.data(), nsg * sizeof(c_seg));
+    return key;
+}
+
+// Streams kept; the least recently used go past this
+constexpr size_t SEQ_KEPT = 128;
+
+void evict_oldest_seq() {
+    auto oldest = g_pg.seqs.begin();
+    for (auto it = g_pg.seqs.begin(); it != g_pg.seqs.end(); ++it) {
+        if (it->second.used < oldest->second.used) {
+            oldest = it;
+        }
+    }
+    xdna_kernel_free(oldest->second.kern);
+    g_pg.seqs.erase(oldest);
+}
+
+// Between calls, when no run holds a kernel
+void trim_seqs() {
+    while (g_pg.seqs.size() > SEQ_KEPT) {
+        evict_oldest_seq();
+    }
+}
+
+// The kernel bound to the call's stream, the stream built the first time only
+xdna_kernel * seq_kernel(xdna_kernel_pool * pool,
+                         const weights *    ws,
+                         int                nmb,
+                         const c_dest &     cd,
+                         uint32_t           h_off,
+                         uint32_t           a_off) {
+    const std::string key = seq_key(ws, nmb, cd, h_off, a_off);
+    auto              it  = g_pg.seqs.find(key);
+    if (it != g_pg.seqs.end()) {
+        it->second.used = ++g_pg.seq_tick;
+        return it->second.kern;
+    }
+    if (!g_pg.kern) {
+        g_pg.kern = xdna_kernel_find(pool->device, STEM);
+    }
+    xdna_kernel * kern = xdna_kernel_clone(g_pg.kern);
+    if (!kern) {
+        return nullptr;
+    }
+    const std::vector<uint32_t> insts = build_seq(ws->geom, ws->plan, nmb, cd, h_off, a_off);
+    // xdna-runtime names the stream and the reason
+    if (!xdna_kernel_bind_insts(pool->device, kern, insts.data(), insts.size())) {
+        xdna_kernel_free(kern);
+        return nullptr;
+    }
+    g_pg.seqs[key] = { kern, ++g_pg.seq_tick };
+    return kern;
+}
+
 // The weight in the array's column order (kernels/pgemm.py): core (c, r)'s
 // 64 columns of chunk ch are two parts h of 32, and part h is output columns
 // (2 ch + h) * 512 + (c * 2 + r) * 32 - so a column's C objects follow each
@@ -728,6 +821,14 @@ void xdna_pgemm_release(void) {
         kv.second.bo = nullptr;
     }
     g_pg.w.clear();
+    for (auto & kv : g_pg.seqs) {
+        xdna_kernel_free(kv.second.kern);
+    }
+    g_pg.seqs.clear();
+    if (g_pg.kern) {
+        xdna_kernel_free(g_pg.kern);
+        g_pg.kern = nullptr;
+    }
 }
 
 namespace {
@@ -983,10 +1084,7 @@ bool pgemm_call(xdna_kernel_pool *  pool,
         bo_c[i] = xdna_kernel_pool_acquire_buffer(pool, c_bytes);
         ok      = bo_c[i] != nullptr;
     }
-    if (ok && !g_pg.kern) {
-        g_pg.kern = xdna_kernel_find(pool->device, STEM);
-        ok        = g_pg.kern != nullptr;
-    }
+    trim_seqs();
     buf_st.stop();
     if (ok && direct && !fuse) {
         // no dirty line of dst may land over what the array writes
@@ -1005,15 +1103,12 @@ bool pgemm_call(xdna_kernel_pool *  pool,
             cs.nreal      = std::min(nmb, (M - sl * slab * MBLK + MBLK - 1) / MBLK);
             cs.half[0]    = (uint32_t) fg.half(sl, 0);
             cs.half[1]    = (uint32_t) fg.half(sl, 1);
-            // the stream names this slab's place in dst, so it is bound per
-            // slab; a started run keeps the instruction buffer it was given
-            xdna_prof::section_timer      stream_st("prefill: pgemm: stream");
-            const std::vector<uint32_t> insts =
-                build_seq(g, ws->plan, nmb, cs, (uint32_t) (sl * 2 * HDR_BYTES), (uint32_t) ag.base(sl));
-            const bool bound = xdna_kernel_bind_insts(pool->device, g_pg.kern, insts.data(), insts.size());
+            // the stream names this slab's place in dst, so a kernel is bound
+            // to it per slab
+            xdna_prof::section_timer stream_st("prefill: pgemm: stream");
+            xdna_kernel * kern = seq_kernel(pool, ws, nmb, cs, (uint32_t) (sl * 2 * HDR_BYTES), (uint32_t) ag.base(sl));
             stream_st.stop();
-            if (!bound) {
-                // xdna-runtime names the stream and the reason
+            if (!kern) {
                 if (sl > 0) {
                     (void) xdna_run_wait(runs[(sl - 1) % 2]);
                 }
@@ -1032,7 +1127,7 @@ bool pgemm_call(xdna_kernel_pool *  pool,
             }
             xdna_buffer *            args[4] = { ws->bo, al->bo, direct ? dst_bo : bo_c[sl % 2], sink };
             xdna_prof::section_timer start_st("prefill: pgemm: start");
-            runs[sl % 2] = xdna_kernel_run_start(g_pg.kern, args, 4);
+            runs[sl % 2] = xdna_kernel_run_start(kern, args, 4);
         }
         if (sl > 0) {
             const int                p = sl - 1;
