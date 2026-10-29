@@ -1,6 +1,8 @@
 #include "xdna-attn-mm.h"
 
 #include "ggml-impl.h"
+#include "xdna-attn-mask.h"
+#include "xdna-host-attn.h"
 #include "xdna-match.h"
 #include "xdna-norm.h"
 #include "xdna-prof.h"
@@ -45,6 +47,8 @@
 
 namespace {
 
+using namespace xdna_attn_mask;
+
 constexpr const char * STEM    = "attn_mm_c8";
 constexpr int          COLS    = 8;
 constexpr int          KVH     = 2;            // KV heads
@@ -63,11 +67,16 @@ constexpr int          KV_RING = 3;            // K/V descriptors in flight a st
 // A call pays two hardware-context switches, one into the design and one back
 // to the projections around it (~2.5 ms each: probes/attn_probe.cpp --proj 4
 // measures 5.0 ms a layer), and its own time is ~0.3 ns a visible (query, key,
-// head) against ~1.0 ns on the host. They meet at about 8M of them: Qwen3.5's
-// pp512 on the 0.8B at depth 256 .. 1024 (2.6M .. 5.2M) is 14% .. 5% slower on
-// the array, at depth 2048 (9.4M) 3% quicker, at 4096 8%.
-constexpr int64_t FA_MIN_PAIR_HEADS = 8 << 20;
-constexpr int64_t FA_MIN_TOKENS     = 64;  // below it a call's fixed cost is the whole of it
+// head). The host takes ~0.36 ns with the backend's kernel (xdna-host-attn.cpp):
+// Qwen3.5's pp512 on the 0.8B is 9% .. 17% quicker there at a depth of 2048 ..
+// 8192 (9M .. 35M of them a call), level within the run-to-run noise at 12288
+// .. 16384 (51M .. 68M) and 6% .. 14% slower from 20480 (85M). Where the kernel
+// cannot take the node (GGML_XDNA_HOST_FA=0, a CPU without AVX-512, a shape it
+// does not do) ggml-cpu's op takes ~1.0 ns: there the array was 14% .. 5%
+// slower at a depth of 256 .. 1024 (2.6M .. 5.2M) and 3% quicker at 2048 (9.4M).
+constexpr int64_t FA_MIN_PAIR_HEADS_HOST_KERNEL = 64 << 20;
+constexpr int64_t FA_MIN_PAIR_HEADS_CPU_OP      = 8 << 20;
+constexpr int64_t FA_MIN_TOKENS                 = 64;  // below it a call's fixed cost is the whole of it
 
 // How the rows of a pair are laid out: the query heads of a KV head group
 // share its K/V, and a pair holds all of them at pp positions each.
@@ -149,51 +158,6 @@ struct mask_rows {
     int64_t              visible = 0;  // (row, key) pairs seen
 };
 
-// On the f16 bits: a visible key is 0.0 (0x0000 or 0x8000), a hidden one below
-// -1e30, which in f16 is only -inf (0xFC00). Converting each value to f32 cost
-// pp4096 18% (1604 -> 1309 t/s): the whole mask, every attention layer of
-// every ubatch, twice a node.
-constexpr uint16_t MASK_HIDDEN = 0xFC00;
-
-constexpr uint64_t MASK_HIDDEN_X4 = 0xFC00FC00FC00FC00ull;  // four hidden keys
-
-bool four_hidden(const uint16_t * p) {
-    uint64_t w;
-    std::memcpy(&w, p, sizeof(w));
-    return w == MASK_HIDDEN_X4;
-}
-
-int64_t first_not_hidden(const uint16_t * row, int64_t n) {
-    int64_t j = 0;
-    while (j + 4 <= n && four_hidden(row + j)) {
-        j += 4;
-    }
-    while (j < n && row[j] == MASK_HIDDEN) {
-        j++;
-    }
-    return j;
-}
-
-int64_t last_not_hidden(const uint16_t * row, int64_t n) {
-    int64_t j = n - 1;
-    while (j >= 3 && four_hidden(row + j - 3)) {
-        j -= 4;
-    }
-    while (j >= 0 && row[j] == MASK_HIDDEN) {
-        j--;
-    }
-    return j;
-}
-
-// True when the keys lo .. hi of the row are all visible.
-bool all_visible(const uint16_t * row, int64_t lo, int64_t hi) {
-    uint16_t bad = 0;
-    for (int64_t j = lo; j <= hi; j++) {
-        bad |= row[j] & 0x7FFF;
-    }
-    return bad == 0;
-}
-
 // Row t of the mask: the keys it sees, or false.
 bool scan_row(const uint16_t * row, int64_t n_cols, int64_t n_kv, int32_t * lo, int32_t * hi) {
     const int64_t first = first_not_hidden(row, n_cols);
@@ -236,7 +200,8 @@ bool scan_mask(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens, mask_rows 
 // it each time was 12 whole-mask passes an ubatch on the 0.8B, n_tokens x n_kv
 // values each - 8% of a 16k prompt's prefill energy. The answer is kept for
 // the graph (xdna_attn_mm_graph_begin starts a new one: a new ubatch rewrites
-// the mask in place).
+// the mask in place). Only a graph input is read: a computed mask holds nothing
+// to scan before the graph runs, so its attention goes to the host.
 struct mask_memo {
     static constexpr int SLOTS = 4;
     struct slot {
@@ -253,7 +218,7 @@ struct mask_memo {
 } g_mask;
 
 std::shared_ptr<const mask_rows> mask_of(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
-    if (!m || !m->data) {
+    if (!m || !m->data || !xdna_attn_mask::is_graph_input(m)) {
         return nullptr;
     }
     std::lock_guard<std::mutex> lock(g_mask.mtx);
@@ -468,9 +433,9 @@ bool shapes_supported(const ggml_tensor * node, geometry * geo, int64_t * n_toke
 
 }  // namespace
 
-// GGML_XDNA_FA_MM: 0 the host, 1 the array from FA_MIN_PAIR_HEADS visible
-// (query, key, head) triples a call, 2 the array whatever the size (tests,
-// bisection).
+// GGML_XDNA_FA_MM: 0 the host, 1 the array from FA_MIN_PAIR_HEADS_* visible
+// (query, key, head) triples a call (the bound of the host route that would run
+// the node), 2 the array whatever the size (tests, bisection).
 bool xdna_attn_mm_supported(const ggml_tensor * node) {
     const int mode = xdna_env_int("GGML_XDNA_FA_MM", 1);
     if (!node || node->op != GGML_OP_FLASH_ATTN_EXT || mode == 0 || !artifact_present()) {
@@ -482,8 +447,9 @@ bool xdna_attn_mm_supported(const ggml_tensor * node) {
         return false;
     }
     const int64_t n_head = (int64_t) geo.hg * KVH;
+    const int64_t bound  = xdna_host_attn_supported(node) ? FA_MIN_PAIR_HEADS_HOST_KERNEL : FA_MIN_PAIR_HEADS_CPU_OP;
     // the most it can see, before the mask is scanned
-    if (mode != 2 && n_tokens * n_kv * n_head < FA_MIN_PAIR_HEADS) {
+    if (mode != 2 && n_tokens * n_kv * n_head < bound) {
         return false;
     }
     float params[3] = { 0.0f, 0.0f, 0.0f };
@@ -492,7 +458,7 @@ bool xdna_attn_mm_supported(const ggml_tensor * node) {
         return false;  // the scale is in the host's Q; no ALiBi, no softcap
     }
     const std::shared_ptr<const mask_rows> mr = mask_of(node->src[3], n_kv, n_tokens);
-    return mr && (mode == 2 || mr->visible * n_head >= FA_MIN_PAIR_HEADS);
+    return mr && (mode == 2 || mr->visible * n_head >= bound);
 }
 
 namespace {
