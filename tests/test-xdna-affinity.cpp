@@ -4,9 +4,10 @@
 //
 // The decode of a model wider than the fused layers runs on host threads pinned
 // one a core (GGML_XDNA_HOST_DECODE_PIN), borrowing the caller's OpenMP team.
-// The prompt, then 8 greedy tokens: a sampler thread has to see a thread pinned
-// to one CPU while they decode, and after each decode every thread in
-// /proc/self/task has to have the mask the main thread had at start. Skips
+// The prompt, then 8 greedy tokens: a sampler thread has to see, while they
+// decode, threads pinned one to each core of the start mask and to no other CPU,
+// and after each decode every thread in /proc/self/task has to have the mask the
+// main thread had at start. Skips
 // (exit 0) without a model or an XDNA device, for a model the fused layers
 // cover, with the pin or the host decode switched off, or with OpenMP binding.
 #include "llama.h"
@@ -19,6 +20,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -74,6 +77,26 @@ static std::vector<cpu_set_t> thread_masks(void) {
     return masks;
 }
 
+// The first CPU of each core in `m`, as the backend picks them (thread_siblings_list).
+static std::set<int> core_cpus(const cpu_set_t & m) {
+    std::set<int> firsts;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (!CPU_ISSET(cpu, &m)) {
+            continue;
+        }
+        const std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list";
+        FILE *            f    = std::fopen(path.c_str(), "r");
+        int               first = -1;
+        if (f && std::fscanf(f, "%d", &first) == 1 && CPU_ISSET(first, &m)) {
+            firsts.insert(first);
+        }
+        if (f) {
+            std::fclose(f);
+        }
+    }
+    return firsts;
+}
+
 static int count_off(const std::vector<cpu_set_t> & masks, const cpu_set_t & want) {
     int off = 0;
     for (const cpu_set_t & m : masks) {
@@ -82,19 +105,26 @@ static int count_off(const std::vector<cpu_set_t> & masks, const cpu_set_t & wan
     return off;
 }
 
-static bool any_pinned(const std::vector<cpu_set_t> & masks) {
+// The CPUs of the threads pinned to exactly one.
+static void add_pinned(const std::vector<cpu_set_t> & masks, std::set<int> & cpus) {
     for (const cpu_set_t & m : masks) {
-        if (CPU_COUNT(&m) == 1) {
-            return true;
+        if (CPU_COUNT(&m) != 1) {
+            continue;
+        }
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+            if (CPU_ISSET(cpu, &m)) {
+                cpus.insert(cpu);
+            }
         }
     }
-    return false;
 }
 
-static void sample_until(const std::atomic<bool> & stop, std::atomic<bool> & pinned) {
+static void sample_until(const std::atomic<bool> & stop, std::set<int> & pinned, std::mutex & mu) {
     while (!stop.load()) {
-        if (any_pinned(thread_masks())) {
-            pinned = true;
+        const std::vector<cpu_set_t> masks = thread_masks();
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            add_pinned(masks, pinned);
         }
         std::this_thread::sleep_for(SAMPLE_PERIOD);
     }
@@ -129,14 +159,17 @@ static int run(llama_model * model, const cpu_set_t & start) {
         return 1;
     }
     std::atomic<bool> stop{ false };
-    std::atomic<bool> pinned{ false };
-    std::thread       sampler(sample_until, std::cref(stop), std::ref(pinned));
+    std::set<int>     pinned;
+    std::mutex        mu;
+    std::thread       sampler(sample_until, std::cref(stop), std::ref(pinned), std::ref(mu));
     const int         off = decode_and_check(ctx, llama_vocab_n_tokens(v), start);
     stop                  = true;
     sampler.join();
     llama_free(ctx);
-    std::printf("pinned thread seen while decoding: %s, threads off the start mask: %d\n", pinned ? "yes" : "no", off);
-    return pinned && off == 0 ? 0 : 1;
+    const std::set<int> want = core_cpus(start);
+    std::printf("CPUs pinned while decoding: %zu (one a core of the start mask: %zu), threads off the start mask: %d\n",
+                pinned.size(), want.size(), off);
+    return !want.empty() && pinned == want && off == 0 ? 0 : 1;
 }
 
 int main(int argc, char ** argv) {

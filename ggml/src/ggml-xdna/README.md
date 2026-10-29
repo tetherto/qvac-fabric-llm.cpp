@@ -51,13 +51,13 @@ cannot be handed a recurrent layer at all, and one warning names the width when
 it happens. Its prefill keeps the array as far as the kernels take its shapes.
 Its decode (one token a sequence) runs whole on the host instead, because the
 decode GEMV streams weights at ~31 GB/s, less than the host's cores draw.
-`GGML_XDNA_HOST_DECODE_THREADS` (8) threads compute it, pinned one a core and
-filling one L3 domain before the next, so the other domain idles. Spreading
-them over both domains decodes faster but costs more energy a token. Against
-the array's per-op decode on a Ryzen AI MAX+ 395, the 4B Q4_K_M goes from 8.9
-to 17.6 t/s at 2.5 instead of 3.0 J a token, the 9B Q4_K_M from 6.0 to 10.4
-t/s at 4.0 instead of 4.7 J, and the 9B Q8_0 from 6.3 to 6.6 t/s at 6.1
-instead of 10.2 J.
+One thread on every allowed core computes it, pinned one a core
+(`GGML_XDNA_HOST_DECODE_THREADS` sets another count); unpinned, 8 threads do.
+Against the array's per-op decode on a Ryzen AI MAX+ 395 (16 cores, with
+`OMP_WAIT_POLICY` unset, see [Running](#running)), the 2B Q4_K_M goes from 20.1
+to 61.9 t/s at 0.94 instead of 1.69 J a token, the 4B Q4_K_M from 9.6 to 30.1
+t/s at 2.4 instead of 4.1 J, the 9B Q4_K_M from 6.4 to 18.8 t/s at 3.4 instead
+of 6.4 J, and the 9B Q8_0 from 6.4 to 12.4 t/s at 4.7 instead of 10.5 J.
 
 `GGML_XDNA_HOST_DECODE_THREADS=0` keeps that decode on the array per op: the
 recurrent bodies (conv, GDN, norms, GLU) run on the host, the projections on
@@ -309,7 +309,11 @@ OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-server -m model.gguf \
   iGPU registered before XDNA, as Vulkan's is); `--device XDNA0` selects the
   NPU.
 - `--poll 0` stops the threadpool busy-polling while the NPU works;
-  `OMP_WAIT_POLICY=PASSIVE` does the same for the host fallback pool.
+  `OMP_WAIT_POLICY=PASSIVE` does the same for the host's OpenMP threads. Use it
+  for a model the fused layers cover (the 0.8B: 3% less energy a decoded token,
+  11% less a prompt token) and leave it unset for a wider one, whose decode runs
+  on host threads that it puts to sleep between ops (the 9B Q4_K_M decodes at
+  18.8 instead of 16.1 t/s and 3.4 instead of 4.4 J a token without it).
 - Offload as usual: `-ngl 99` puts every layer on the device.
 - Leave flash attention on (`-fa on`, or `auto`, the default). The NPU's
   attention routes take llama's `FLASH_ATTN_EXT`; with `-fa off` llama builds
@@ -333,8 +337,8 @@ For users - a trade-off, a size or a location:
 | `GGML_XDNA_SPIN_US` | 0 | poll this many microseconds for completion before blocking; `-1` polls until it completes |
 | `GGML_XDNA_GLUE_THREADS` | 4 | host threads for the ops the backend runs on the host in a decode-sized chunk, except the vocabulary projection, which takes 12 (at most `GGML_XDNA_GLUE_THREADS_BIG`) |
 | `GGML_XDNA_GLUE_THREADS_BIG` | 16 | the same, for a chunk of 32 tokens or more |
-| `GGML_XDNA_HOST_DECODE_THREADS` | 8 | host threads for the decode of a model wider than the fused layers (see [The fused decode recurrent layer](#the-fused-decode-recurrent-layer)); `0` runs that decode per op on the array, slower at more energy a token |
-| `GGML_XDNA_HOST_DECODE_PIN` | 1 | in an OpenMP build, pins those threads one a core, filling one L3 domain before the next, and hands every borrowed thread its CPU mask back after each decode; `0` leaves their placement to the OS, at more energy a token (2.75 against 2.45 J on the 4B) |
+| `GGML_XDNA_HOST_DECODE_THREADS` | one a core | host threads for the decode of a model wider than the fused layers (see [The fused decode recurrent layer](#the-fused-decode-recurrent-layer)): one on every allowed core when they are pinned, 8 when they are not; `0` runs that decode per op on the array, slower at more energy a token |
+| `GGML_XDNA_HOST_DECODE_PIN` | 1 | in an OpenMP build, pins those threads one a core, filling one L3 domain before the next, and hands every borrowed thread its CPU mask back after each decode; `0` leaves 8 threads to the OS, slower (the 4B: 18.7 against 30.1 t/s) |
 | `GGML_XDNA_ARENA_MB` | 256 | size of each chunk of the device-buffer arena, in MiB |
 | `GGML_XDNA_CONV` | 0 | `1` runs the standalone prefill `SSM_CONV` on the array; the host is cheaper, which is why it is off |
 | `GGML_XDNA_GDN_CONV` | 0 | `1` computes the prefill GDN's conv input on the array; the host is faster, which is why it is off |
