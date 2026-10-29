@@ -6,6 +6,7 @@
 #include "xdna-conv-prefill.h"
 #include "xdna-gdn-mm.h"
 #include "xdna-gemv.h"
+#include "xdna-norm.h"
 #include "xdna-pgemm.h"
 #include "xdna-prof.h"
 #include "xdna-quant.h"
@@ -24,8 +25,9 @@
 
 // --- GEMM internals (static) ------------------------------------------------
 
-// K is split into blocks of at most GEMM_K_MAX: a per-core K-loop count above
-// 64 (K > 1024 with tile_k=16) wedges the shared hw_context. GEMM_N_MAX is a
+// The int8 route splits K into blocks of GEMM_K_MAX and zero-pads a short one,
+// so the per-core K-loop count (K / tile_k) never changes between its runs on
+// the shared hw_context; GEMM_K_RUN below gives the reason. GEMM_N_MAX is a
 // practical cap on N: wide projections (e.g. the vocabulary output) need a
 // huge B transpose and run too long on the NPU.
 static const int GEMM_K_MAX     = 1024;
@@ -221,18 +223,82 @@ static xdna_gemm_geom xdna_pick_geom(const xdna_ops * ops, int M, int K, int N, 
     return g;
 }
 
-// Return the device BO holding the packed [K_pad x N] bf16 weight for `src0`,
-// built and cached on first use. K_pad rounds K up to the GEMM block, so every
-// K-block reads a valid slice. Weights are immutable, so the transpose + bf16
-// conversion runs once.
+// K columns of every bf16 GEMM run. The cores read the K-loop count (the
+// per-core K tiles of one output tile) from the stream of each run, and a run
+// whose count differs from the previous run's on the same hardware context
+// hangs the context. Every run therefore has this width: a K that is not a
+// whole number of them ends in a run zero-padded out to it, and a deeper one
+// is several runs whose partial sums the host adds. 512 is the narrowest K of
+// the projections this route carries, so those run unpadded.
+static const int GEMM_K_RUN = 512;
 
-static void f32_to_bf16_run(const float * src, ggml_bf16_t * dst, int64_t n) {
-    uint16_t * d = (uint16_t *) dst;
-    for (int64_t i = 0; i < n; i++) {
-        d[i] = xdna_bf16(src[i]);
+// Rows of the packed weight: K up to a whole number of runs.
+static int gemm_k_rows(int K) {
+    return (K + GEMM_K_RUN - 1) / GEMM_K_RUN * GEMM_K_RUN;
+}
+
+static bool gemm_weight_packable(enum ggml_type type) {
+    return type == GGML_TYPE_BF16 || type == GGML_TYPE_F16 || type == GGML_TYPE_Q4_K;
+}
+
+// Column n of a weight as K bf16 values; `scratch` holds K floats.
+static void gemm_weight_column(const struct ggml_tensor * src0, int n, int K, uint16_t * out, float * scratch) {
+    switch (src0->type) {
+        case GGML_TYPE_BF16:
+            std::memcpy(out, (const uint16_t *) src0->data + (size_t) n * K, (size_t) K * sizeof(uint16_t));
+            return;
+        case GGML_TYPE_F16:
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) src0->data + (size_t) n * K, scratch, K);
+            break;
+        default:
+            // Quantized weights are dequantized once at pack time and stored as
+            // bf16, so the NPU kernel stays unchanged.
+            dequantize_row_q4_K((const block_q4_K *) src0->data + (size_t) n * (K / QK_K), scratch, K);
+            break;
+    }
+    xdna_f32_to_bf16_row(scratch, out, K);
+}
+
+// A strip of columns n0.. into w[k * N + n]. The destination is the
+// transpose, so a strip's columns land as contiguous runs per row rather than
+// K single values N apart.
+static void gemm_pack_strip(const struct ggml_tensor * src0,
+                            int                        K,
+                            int                        n0,
+                            int                        nb,
+                            int                        N,
+                            uint16_t *                 w,
+                            uint16_t *                 cols,
+                            float *                    scratch) {
+    for (int j = 0; j < nb; j++) {
+        gemm_weight_column(src0, n0 + j, K, cols + (size_t) j * K, scratch);
+    }
+    for (int k = 0; k < K; k++) {
+        uint16_t * row = w + (size_t) k * N + n0;
+        for (int j = 0; j < nb; j++) {
+            row[j] = cols[(size_t) j * K + k];
+        }
     }
 }
 
+static void gemm_pack_weight(const struct ggml_tensor * src0, int K, int N, uint16_t * w) {
+    constexpr int NSTRIP    = 64;
+    const int     n_strips = (N + NSTRIP - 1) / NSTRIP;
+#pragma omp parallel num_threads(xdna_host_threads())
+    {
+        std::vector<uint16_t> cols((size_t) NSTRIP * K);
+        std::vector<float>    scratch(K);
+#pragma omp for schedule(static)
+        for (int s = 0; s < n_strips; s++) {
+            const int n0 = s * NSTRIP;
+            gemm_pack_strip(src0, K, n0, std::min(NSTRIP, N - n0), N, w, cols.data(), scratch.data());
+        }
+    }
+}
+
+// Return the device BO holding the packed [K rows x N] bf16 weight for `src0`,
+// built and cached on first use. Weights are immutable, so the transpose + bf16
+// conversion runs once.
 static xdna_buffer * gemm_weight_bo(xdna_ops * ops, const struct ggml_tensor * src0, int K, int N) {
     const xdna_ops::weight_key key = { src0->data, K, N };
     {
@@ -243,49 +309,21 @@ static xdna_buffer * gemm_weight_bo(xdna_ops * ops, const struct ggml_tensor * s
         }
     }
 
-    const int     K_pad = (K + GEMM_K_MAX - 1) / GEMM_K_MAX * GEMM_K_MAX;
-    xdna_buffer * bo_w  = xdna_buffer_alloc(ops->pool->device, (size_t) K_pad * N * sizeof(ggml_bf16_t));
+    // Nothing else packs other types: the buffer would stay zero and the GEMM
+    // would return an all-zero projection with no other symptom. Refuse
+    // instead - gemm_supported must not have accepted the op.
+    if (!gemm_weight_packable(src0->type)) {
+        GGML_LOG_ERROR("%s: gemm: no bf16 packer for %s (%s)\n", "xdna-ops", ggml_get_name(src0),
+                       ggml_type_name(src0->type));
+        return nullptr;
+    }
+    const size_t  bytes = (size_t) gemm_k_rows(K) * N * sizeof(ggml_bf16_t);
+    xdna_buffer * bo_w  = xdna_buffer_alloc(ops->pool->device, bytes);
     if (!bo_w) {
         return nullptr;
     }
-
-    ggml_bf16_t * w = (ggml_bf16_t *) bo_w->data;
-    std::memset(w, 0, (size_t) K_pad * N * sizeof(ggml_bf16_t));
-    if (src0->type == GGML_TYPE_BF16) {
-        const auto * d = (const ggml_bf16_t *) src0->data;
-        for (int n = 0; n < N; n++) {
-            for (int k = 0; k < K; k++) {
-                w[(size_t) k * N + n] = d[(size_t) n * K + k];
-            }
-        }
-    } else if (src0->type == GGML_TYPE_F16) {
-        std::vector<float> row(K);
-        for (int n = 0; n < N; n++) {
-            ggml_fp16_to_fp32_row((const ggml_fp16_t *) src0->data + (size_t) n * K, row.data(), K);
-            for (int k = 0; k < K; k++) {
-                w[(size_t) k * N + n].bits = xdna_bf16(row[k]);
-            }
-        }
-    } else if (src0->type == GGML_TYPE_Q4_K) {
-        // Quantized weights are dequantized once at pack time and stored as
-        // bf16, so the NPU kernel stays unchanged.
-        std::vector<float> row(K);
-        const int          nb = K / QK_K;
-        for (int n = 0; n < N; n++) {
-            dequantize_row_q4_K((const block_q4_K *) src0->data + (size_t) n * nb, row.data(), K);
-            for (int k = 0; k < K; k++) {
-                w[(size_t) k * N + n].bits = xdna_bf16(row[k]);
-            }
-        }
-    } else {
-        // Nothing packs this type: the buffer is still zero here, so running
-        // the GEMM would return an all-zero projection with no other symptom.
-        // Refuse instead - gemm_supported must not have accepted the op.
-        GGML_LOG_ERROR("%s: gemm: no bf16 packer for %s (%s)\n", "xdna-ops", ggml_get_name(src0),
-                       ggml_type_name(src0->type));
-        xdna_buffer_free(bo_w);
-        return nullptr;
-    }
+    std::memset(bo_w->data, 0, bytes);
+    gemm_pack_weight(src0, K, N, (uint16_t *) bo_w->data);
     if (!xdna_buffer_sync_to_device(bo_w)) {
         xdna_buffer_free(bo_w);
         return nullptr;
@@ -617,11 +655,131 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
     return true;
 }
 
+// The host passes over a block's A and C run on the glue's CPU team, in runs of
+// this many rows, so a run's second pass finds it in cache; below the minimum
+// the team costs more than the pass.
+static const int GEMM_ROWS_PER_TASK = 8;
+static const int GEMM_TEAM_MIN_ROWS = 32;
+
+// A block's rows as bf16 into the bank's A buffer: kb_real columns from `src`
+// (rows `ld` floats apart), zeros out to kb, and zero rows from mc to m_rows.
+static void gemm_pack_a(const float * src, int64_t ld, int mc, int m_rows, int kb_real, int kb, uint16_t * a) {
+#pragma omp parallel for num_threads(xdna_chunk_threads()) if (m_rows >= GEMM_TEAM_MIN_ROWS)
+    for (int m = 0; m < m_rows; m++) {
+        uint16_t * row = a + (size_t) m * kb;
+        if (m < mc) {
+            xdna_f32_to_bf16_row(src + m * ld, row, kb_real);
+            std::memset(row + kb_real, 0, (size_t) (kb - kb_real) * sizeof(uint16_t));
+        } else {
+            std::memset(row, 0, (size_t) kb * sizeof(uint16_t));
+        }
+    }
+}
+
+// Poison the first mc rows of the C buffer before the run that writes them
+// (see xdna_buffer_mark).
+static void gemm_mark_c(xdna_buffer * bo_c, int mc, int N) {
+    const size_t row_bytes = (size_t) N * sizeof(float);
+#pragma omp parallel for num_threads(xdna_chunk_threads()) if (mc >= GEMM_TEAM_MIN_ROWS)
+    for (int m0 = 0; m0 < mc; m0 += GEMM_ROWS_PER_TASK) {
+        const int rows = std::min(GEMM_ROWS_PER_TASK, mc - m0);
+        xdna_buffer_mark(bo_c, rows * row_bytes, m0 * row_bytes);
+    }
+}
+
+static void gemm_fold_row(const float * c, float * dst, int N, bool accumulate) {
+    if (!accumulate) {
+        std::memcpy(dst, c, (size_t) N * sizeof(float));
+        return;
+    }
+    for (int n = 0; n < N; n++) {
+        dst[n] += c[n];
+    }
+}
+
+// Read the first mc rows of a finished C block into dst (rows dst_ld floats
+// apart), the first K run of an op by assignment and the others added. False
+// when the device's write to a run of rows did not land.
+static bool gemm_fold_c(xdna_buffer * bo_c, int mc, int N, float * dst, int64_t dst_ld, bool accumulate) {
+    const size_t row_bytes = (size_t) N * sizeof(float);
+    int          failed    = 0;
+#pragma omp parallel for num_threads(xdna_chunk_threads()) if (mc >= GEMM_TEAM_MIN_ROWS)
+    for (int m0 = 0; m0 < mc; m0 += GEMM_ROWS_PER_TASK) {
+        const int     rows = std::min(GEMM_ROWS_PER_TASK, mc - m0);
+        const float * c    = (const float *) xdna_buffer_wait_written(bo_c, rows * row_bytes, m0 * row_bytes);
+        if (!c) {
+#pragma omp atomic write
+            failed = 1;
+            continue;
+        }
+        for (int r = 0; r < rows; r++) {
+            gemm_fold_row(c + (size_t) r * N, dst + (m0 + r) * dst_ld, N, accumulate);
+        }
+    }
+    return failed == 0;
+}
+
+static bool gemm_fold_run(const xdna_ops::pending_op & op, const xdna_ops::pending_run & pr) {
+    const xdna_ops::pending_m_block & mb  = op.m_blocks[pr.mb_idx];
+    const int                         mc  = std::min(op.Mk, op.M - mb.m0);
+    const int64_t                     ld  = op.node->nb[1] / sizeof(float);
+    float *                           dst = (float *) op.node->data + (op.m_off + mb.m0) * ld;
+    return gemm_fold_c(pr.bo_c, mc, op.N, dst, ld, pr.accumulate);
+}
+
+// The kernel for a run of m_rows rows at weight row k0: the stream is built on
+// a miss and bound to the block's xclbin.
+static xdna_kernel * gemm_kernel_for(xdna_ops * ops, const xdna_gemm_geom & geom, int m_rows, int N, int k0) {
+    char name[96];
+    snprintf(name, sizeof(name), "gemm_m%d_r%d_N%d_b%d", geom.tiles.M, m_rows, N, k0);
+    {
+        std::lock_guard<std::mutex> lock(ops->gemm_kernel_mutex);
+        auto                        it = ops->gemm_kernel.find(name);
+        if (it != ops->gemm_kernel.end()) {
+            return it->second;
+        }
+    }
+    xdna_prof::section_timer stream_st("prefill: gemm: stream");
+    xdna_seq                 seq;
+    if (!xdna_gemm_seq_build(&seq, &geom.tiles, m_rows, GEMM_K_RUN, N, (uint32_t) k0 * N * sizeof(ggml_bf16_t))) {
+        GGML_LOG_ERROR("%s: failed to build GEMM stream M=%d K=%d N=%d\n", "xdna-ops", m_rows, GEMM_K_RUN, N);
+        return nullptr;
+    }
+    const std::vector<uint32_t> insts = xdna_seq_build(&seq);
+    xdna_kernel *               kern  = xdna_kernel_pool_get_built(ops->pool, name, geom.xclbin, insts.data(), insts.size());
+    if (kern) {
+        std::lock_guard<std::mutex> lock(ops->gemm_kernel_mutex);
+        ops->gemm_kernel.emplace(name, kern);
+    }
+    return kern;
+}
+
+// Rows a run of the block's mc real rows covers: whole sweeps of the kernel,
+// so the last block of an op does not run the sweeps it has no rows for.
+static int gemm_run_rows(const xdna_gemm_tiles & t, int mc) {
+    const int sweep = t.tile_m * t.n_compute_rows;
+    return (mc + sweep - 1) / sweep * sweep;
+}
+
+// Give every pending run's buffers back.
+static void gemm_drop_pending(xdna_ops * ops) {
+    for (auto & op : ops->pending) {
+        for (auto & mb : op.m_blocks) {
+            for (auto & pr : mb.runs) {
+                xdna_kernel_pool_release_buffer(ops->pool, pr.bo_a);
+                xdna_kernel_pool_release_buffer(ops->pool, pr.bo_c);
+            }
+        }
+    }
+    ops->pending.clear();
+}
+
 // MUL_MAT follows ggml's convention: src0 = weights [K, N] (stored as N rows
 // of K), src1 = activations [K, M] (stored as M rows of K), so dst[M, N] =
 // src1^T @ src0. src1's memory feeds the kernel directly as A [M, K]; src0's
 // memory is transposed to B [K, N]. The stream is built per shape via
-// xdna_gemm_seq_build, so only A's rows are padded to the baked M block.
+// xdna_gemm_seq_build, so only A's rows are padded, to whole sweeps of the
+// baked M block.
 //
 // Submission is pipelined: two A/C buffer banks are ping-ponged. The run for
 // block (m0, k0) is submitted without waiting, then the previous block's run
@@ -642,16 +800,13 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     const xdna_gemm_tiles & tiles = geom.tiles;
     const int               Mk    = tiles.M;  // baked M block of the selected geometry
 
-    // B is a persistent BO with the packed [K_pad x N] weights; each K-block's
+    // B is a persistent BO with the packed [K x N] weights; each K run's
     // stream points into it via its K offset, so no per-call weight copy.
     xdna_buffer * bo_w = gemm_weight_bo(ops, src0, K, N);
     if (!bo_w) {
         return false;
     }
 
-    // All blocks use the full GEMM_K_MAX kernel: a partial K block (K < 1024)
-    // after a run of full blocks wedges the shared hw_context, so the last
-    // block is zero-padded in K and runs the same K1024 kernel as the rest.
     xdna_ops::pending_op op;
     op.node  = node;
     op.M     = M;
@@ -662,12 +817,6 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
         xdna_ops::pending_m_block mb;
         mb.m0 = m0;
         op.m_blocks.push_back(std::move(mb));
-    }
-
-    // Zero the f32 dst once so each K-block's C partial sum can be accumulated
-    // straight into it; no per-op host accumulator or staging copy.
-    for (int m = 0; m < M; m++) {
-        std::memset((char *) node->data + (size_t) (op.m_off + m) * node->nb[1], 0, (size_t) N * sizeof(float));
     }
 
     // Ping-pong A/C banks. Bank b is reused only after its in-flight run has
@@ -696,52 +845,38 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
         }
     } release_banks = { ops, banks };
 
-    for (int k0 = 0; k0 < K; k0 += GEMM_K_MAX) {
-        const int      Kb       = std::min(GEMM_K_MAX, K - k0);
-        const uint32_t b_offset = (uint32_t) k0 * N * 2;
-
-        // Build the instruction stream for (GEMM_K_MAX, N) with this block's
-        // B offset and cache the bound kernel under the shape key.
-        xdna_seq seq;
-        if (!xdna_gemm_seq_build(&seq, &tiles, Mk, GEMM_K_MAX, N, b_offset)) {
-            GGML_LOG_ERROR("%s: failed to build GEMM stream M=%d K=%d N=%d\n", "xdna-ops", M, K, N);
-            return false;
-        }
-        std::vector<uint32_t> insts = xdna_seq_build(&seq);
-
-        char name[64];
-        snprintf(name, sizeof(name), "gemm_K%d_N%d_b%d_m%d", GEMM_K_MAX, N, k0, Mk);
-        xdna_kernel * kern = xdna_kernel_pool_get_built(ops->pool, name, geom.xclbin, insts.data(), insts.size());
-        if (!kern) {
-            return false;
-        }
+    for (int k0 = 0; k0 < K; k0 += GEMM_K_RUN) {
+        const int kb_real = std::min(GEMM_K_RUN, K - k0);
 
         for (auto & mb : op.m_blocks) {
-            const int mc = std::min(Mk, M - mb.m0);
+            const int mc     = std::min(Mk, M - mb.m0);
+            const int m_rows = gemm_run_rows(tiles, mc);
+
+            xdna_kernel * kern = gemm_kernel_for(ops, geom, m_rows, N, k0);
+            if (!kern) {
+                return false;
+            }
 
             // Pack A into the current bank and submit. The NPU starts on this
             // run right away; the previous bank's run (already queued ahead of
             // it) is then waited and read back while this one runs.
             xdna_ops::pending_run & pr = banks[bank];
             if (pr.bo_a == nullptr) {
-                pr.bo_a = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
-                pr.bo_c = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * N * sizeof(float));
+                pr.bo_a = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) m_rows * GEMM_K_RUN * sizeof(ggml_bf16_t));
+                pr.bo_c = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) m_rows * N * sizeof(float));
                 if (!pr.bo_a || !pr.bo_c) {
                     return false;
                 }
             }
-            pr.mb_idx = (int) (&mb - op.m_blocks.data());
+            pr.mb_idx     = (int) (&mb - op.m_blocks.data());
+            pr.accumulate = k0 > 0;
             {
-                ggml_bf16_t * a_map = (ggml_bf16_t *) pr.bo_a->data;
-                std::memset(a_map, 0, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
-                for (int m = 0; m < mc; m++) {
-                    f32_to_bf16_run((const float *) src1->data + (size_t) (mb.m0 + m) * K + k0,
-                                    a_map + (size_t) m * GEMM_K_MAX, Kb);
+                xdna_prof::section_timer st("prefill: gemm: A layout");
+                gemm_pack_a((const float *) src1->data + (size_t) mb.m0 * K + k0, K, mc, m_rows, kb_real, GEMM_K_RUN,
+                            (uint16_t *) pr.bo_a->data);
+                if (!xdna_buffer_sync_to_device_range(pr.bo_a, (size_t) m_rows * GEMM_K_RUN * sizeof(ggml_bf16_t), 0)) {
+                    return false;
                 }
-            }
-
-            if (!xdna_buffer_sync_to_device(pr.bo_a)) {
-                return false;
             }
 
             xdna_buffer * args[3] = { pr.bo_a, bo_w, pr.bo_c };
@@ -749,7 +884,11 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
                 // Marked before the submit: the readback below cannot tell a
                 // landed write from one still pending, and the trailing banks
                 // are read the moment finalize's waits return.
-                xdna_buffer_mark(pr.bo_c, (size_t) mc * N * sizeof(float));
+                {
+                    xdna_prof::section_timer st("prefill: gemm: mark C");
+                    gemm_mark_c(pr.bo_c, mc, N);
+                }
+                xdna_prof::section_timer st("prefill: gemm: start");
                 pr.run = xdna_kernel_run_start(kern, args, 3);
                 if (!pr.run) {
                     return false;
@@ -761,26 +900,15 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
             if (pending_bank >= 0) {
                 xdna_ops::pending_run & prev = banks[pending_bank];
                 {
+                    xdna_prof::section_timer st("prefill: gemm: wait");
                     if (!xdna_run_wait(prev.run)) {
                         return false;
                     }
                 }
-                // Read back only the valid rows: rows [mc, Mk) of a padded
-                // block are zero (the padded A rows are zeroed), so the prefix
-                // is exact and the readback drops to mc*N elements.
-                const xdna_ops::pending_m_block & pmb = op.m_blocks[prev.mb_idx];
-                const int                         pmc = std::min(Mk, M - pmb.m0);
-                const float * c = (const float *) xdna_buffer_wait_written(prev.bo_c, (size_t) pmc * N * sizeof(float));
-                if (!c) {
-                    return false;
-                }
                 {
-                    for (int m = 0; m < pmc; m++) {
-                        float * dst = (float *) ((char *) node->data + (size_t) (op.m_off + pmb.m0 + m) * node->nb[1]);
-                        const float * crow = c + (size_t) m * N;
-                        for (int n = 0; n < N; n++) {
-                            dst[n] += crow[n];
-                        }
+                    xdna_prof::section_timer st("prefill: gemm: unpack");
+                    if (!gemm_fold_run(op, prev)) {
+                        return false;
                     }
                 }
                 xdna_kernel_pool_release_buffer(ops->pool, prev.bo_a);
@@ -812,54 +940,34 @@ bool xdna_ops_finalize(xdna_ops * ops) {
     xdna_prof::section_timer st("prefill: gemm finalize");
 
     // Wait all runs first so all kernels of the layer complete together.
-    for (auto & op : ops->pending) {
-        for (auto & mb : op.m_blocks) {
-            for (auto & pr : mb.runs) {
-                if (!xdna_run_wait(pr.run)) {
-                    for (auto & fop : ops->pending) {
-                        for (auto & fmb : fop.m_blocks) {
-                            for (auto & fpr : fmb.runs) {
-                                xdna_kernel_pool_release_buffer(ops->pool, fpr.bo_a);
-                                xdna_kernel_pool_release_buffer(ops->pool, fpr.bo_c);
-                            }
-                        }
+    {
+        xdna_prof::section_timer wait_st("prefill: gemm finalize: wait");
+        for (auto & op : ops->pending) {
+            for (auto & mb : op.m_blocks) {
+                for (auto & pr : mb.runs) {
+                    if (!xdna_run_wait(pr.run)) {
+                        gemm_drop_pending(ops);
+                        return false;
                     }
-                    ops->pending.clear();
-                    return false;
                 }
             }
         }
     }
 
-    // Read the trailing banks' C straight from their BOs into the (already
-    // zeroed and partially accumulated) f32 dst, then release the buffers.
+    // Read the trailing banks' C straight from their BOs into dst, then
+    // release the buffers.
     bool ok = true;
-    for (auto & op : ops->pending) {
-        const int Mk = op.Mk;  // per-op geometry M block
-        for (auto & mb : op.m_blocks) {
-            const int mc = std::min(Mk, op.M - mb.m0);
-            for (auto & pr : mb.runs) {
-                const float * c = ok ? (const float *) xdna_buffer_wait_written(pr.bo_c, (size_t) mc * op.N * sizeof(float)) : nullptr;
-                if (!c) {
-                    ok = false;
-                    continue;
+    {
+        xdna_prof::section_timer unpack_st("prefill: gemm finalize: unpack");
+        for (auto & op : ops->pending) {
+            for (auto & mb : op.m_blocks) {
+                for (auto & pr : mb.runs) {
+                    ok = ok && gemm_fold_run(op, pr);
                 }
-                for (int m = 0; m < mc; m++) {
-                    float * dst = (float *) ((char *) op.node->data + (size_t) (op.m_off + mb.m0 + m) * op.node->nb[1]);
-                    const float * crow = c + (size_t) m * op.N;
-                    for (int n = 0; n < op.N; n++) {
-                        dst[n] += crow[n];
-                    }
-                }
-            }
-            for (auto & pr : mb.runs) {
-                xdna_kernel_pool_release_buffer(ops->pool, pr.bo_a);
-                xdna_kernel_pool_release_buffer(ops->pool, pr.bo_c);
             }
         }
     }
-
-    ops->pending.clear();
+    gemm_drop_pending(ops);
     return ok;
 }
 
