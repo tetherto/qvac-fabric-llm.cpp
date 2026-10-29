@@ -2148,11 +2148,41 @@ int turbovec_vnni_fused_scan_parity_for_test(ggml_vec_index_t * idx, const float
         if (!turbovec_cpu_dot_product()) {
             return -4;
         }
-        TurboVecPlanesStats stats;
-        const std::vector<float> * centre = nullptr;
-        if (!planes_ready(*idx, stats, centre)) {
+    }
+    // A planes cache that is not ready makes the staged search fall back to
+    // the full scan, so say which part is missing, before and after one
+    // search (a cache built lazily by the first search would show here).
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool ready = false;
+        {
+            std::shared_lock<std::shared_mutex> lock(idx->mutex);
+            TurboVecPlanesStats stats;
+            const std::vector<float> * centre = nullptr;
+            ready = planes_ready(*idx, stats, centre);
+            if (!ready) {
+                const size_t n = idx->slot_to_id.size();
+                const size_t n_blocks = (n + kBlock - 1) / kBlock;
+                const size_t nsg = static_cast<size_t>(idx->dim) / 8;
+                const size_t n_byte_groups =
+                    static_cast<size_t>(idx->dim) / static_cast<size_t>(8 / idx->turbovec_bits);
+                std::fprintf(stderr,
+                    "planes not ready (%s search): n %zu bits %d dim %d planes %d sign %zu/%zu blocked_n_blocks %zu/%zu "
+                    "blocked_data %zu/%zu layout %d sign_layout %d\n",
+                    attempt == 0 ? "before" : "after", n, idx->turbovec_bits, idx->dim, idx->turbovec_planes ? 1 : 0,
+                    idx->turbovec_sign_blocked.size(), n_blocks * nsg * kBlock, idx->turbovec_blocked_n_blocks, n_blocks,
+                    idx->turbovec_blocked_data.size(), n_blocks * n_byte_groups * kBlock,
+                    static_cast<int>(turbovec_layout(*idx)), static_cast<int>(turbovec_sign_layout(*idx)));
+            }
+        }
+        if (ready) {
+            break;
+        }
+        if (attempt == 1) {
             return -5;
         }
+        std::vector<float> warm_scores(static_cast<size_t>(k));
+        std::vector<uint64_t> warm_ids(static_cast<size_t>(k));
+        ggml_vec_index_search(idx, queries, 1, k, warm_scores.data(), warm_ids.data());
     }
 #if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
     const size_t dim = static_cast<size_t>(idx->dim);
