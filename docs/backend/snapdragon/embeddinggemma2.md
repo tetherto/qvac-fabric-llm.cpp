@@ -49,6 +49,8 @@ cmake --install build-eg2-android --prefix pkg-eg2-android/llama.cpp
 
 Use pinned GGUF checkpoints, for example the text BF16 and Q8_0 files from `ggml-org/embeddinggemma-2-GGUF`. Supply their exact repository revisions. The driver hashes each model, binary and corpus. It uses the model tokenizer and preserves the task prefixes in the input fixture. It does not convert, quantize or download models.
 
+> **qvac-b11739:** the F16-mirror cache described below is deferred on this branch, because upstream b11739 rewrote the Hexagon backend. Eligible BF16 matrix weights use b11739's own BF16 HVX matmul kernel instead, so `GGML_HEXAGON_BF16` / `--hex-bf16` have no effect and the memory figures below do not apply. Re-check parity and performance against this section once the mirror is ported.
+
 The Q8_0 checkpoint retains `per_layer_model_proj.weight` in BF16. Hexagon caches an F16 copy of supported BF16 matrix weights on first use and runs their matrix multiplication through the existing F16 kernels. The GGUF and original BF16 bytes remain unchanged, including backend readback. Tensor uploads and buffer clears invalidate the cached copy. This avoids the CPU fallback for the shared per-layer projection without an offline model conversion.
 
 This path accepts contiguous, non-view, two-dimensional BF16 leaf weights with an inner dimension divisible by 32, stored in a Hexagon device buffer, with F32 activations and output. Other BF16 layouts and operations retain their fallback behavior. Computation uses F16 range and precision. The cache adds one F16 copy of each accepted BF16 matrix plus alignment; the EmbeddingGemma 2 projection adds 12 MiB. Check numerical parity for the target model rather than assuming general BF16 arithmetic equivalence.
