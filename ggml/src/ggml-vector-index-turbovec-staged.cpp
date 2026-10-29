@@ -716,8 +716,10 @@ bool exact2_rows(const ggml_vec_index & idx) {
 // planes row (low plane, then sign plane), the full scan's u8 table
 // entries summed exactly and its epilogue applied in its order, so the
 // result is the block scan's score bit for bit.
-float exact2_row_score(const uint8_t * lut, float scale, float bias, const uint8_t * row, size_t nsg, float vscale,
-        bool fma_flush) {
+// The epilogue is a template parameter so the `vpermb` form's loop carries
+// no flush test per byte group (upstream's x86 legacy_score has none).
+template <bool FMA_FLUSH>
+float exact2_row_score_t(const uint8_t * lut, float scale, float bias, const uint8_t * row, size_t nsg, float vscale) {
     const uint8_t * low = row;
     const uint8_t * sign = row + nsg;
     constexpr size_t flush = static_cast<size_t>(kTurboVecFlushEvery) / 2;
@@ -730,12 +732,12 @@ float exact2_row_score(const uint8_t * lut, float scale, float bias, const uint8
         const uint8_t c1 = kPlanesComb.t[((sb & 0x0f) << 4) | (lb & 0x0f)];
         const uint8_t * t = lut + g * 64;
         sum += static_cast<uint32_t>(t[c0 >> 4]) + t[16 + (c0 & 0x0f)] + t[32 + (c1 >> 4)] + t[48 + (c1 & 0x0f)];
-        if (fma_flush && (g + 1) % flush == 0) {
+        if (FMA_FLUSH && (g + 1) % flush == 0) {
             fa = std::fma(scale, static_cast<float>(sum), fa);
             sum = 0;
         }
     }
-    if (!fma_flush) {
+    if (!FMA_FLUSH) {
         const float product = static_cast<float>(sum) * scale;
         const float f = product + bias;
         return f * vscale;
@@ -744,6 +746,12 @@ float exact2_row_score(const uint8_t * lut, float scale, float bias, const uint8
         fa = std::fma(scale, static_cast<float>(sum), fa);
     }
     return fa * vscale;
+}
+
+float exact2_row_score(const uint8_t * lut, float scale, float bias, const uint8_t * row, size_t nsg, float vscale,
+        bool fma_flush) {
+    return fma_flush ? exact2_row_score_t<true>(lut, scale, bias, row, nsg, vscale) :
+                       exact2_row_score_t<false>(lut, scale, bias, row, nsg, vscale);
 }
 
 int64_t low_dot(const LowPlanes & planes, const uint8_t * row) {
