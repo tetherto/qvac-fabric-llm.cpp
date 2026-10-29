@@ -5,6 +5,7 @@
 #include "xdna-gdn-mm.h"
 #include "xdna-gemv.h"
 #include "xdna-norm.h"
+#include "xdna-prof.h"
 #include "xdna-quant.h"
 #include "xdna-runtime.h"
 #include "xdna-seq.h"
@@ -733,7 +734,8 @@ bool pgemm_call(xdna_kernel_pool *  pool,
     // every slab's headers: its blocks times the chunks, the K tiles a block,
     // the tile format, the K steps a tile and the pairs of them
     {
-        uint16_t * ah = (uint16_t *) al->bo->data;
+        xdna_prof::section_timer st("prefill: pgemm: headers");
+        uint16_t *               ah = (uint16_t *) al->bo->data;
         std::memset(ah, 0, h_total);
         for (int sl = 0; sl < n_sl; sl++) {
             for (int h = 0; h < 2; h++) {
@@ -846,8 +848,9 @@ bool pgemm_call(xdna_kernel_pool *  pool,
         }
         cd.valid[c] = v;
     }
-    const size_t  c_bytes = (size_t) slab * MBLK * ldc_s * 4;
-    xdna_buffer * bo_c[2] = {};
+    xdna_prof::section_timer buf_st("prefill: pgemm: buffers");
+    const size_t             c_bytes = (size_t) slab * MBLK * ldc_s * 4;
+    xdna_buffer *            bo_c[2] = {};
     xdna_buffer * sink    = xdna_kernel_pool_acquire_buffer(pool, (size_t) 2 * MBLK * NC * 4);
     xrt::run      runs[2];
     bool          ok = sink != nullptr;
@@ -863,6 +866,7 @@ bool pgemm_call(xdna_kernel_pool *  pool,
         // no dirty line of dst may land over what the array writes
         ok = false;
     }
+    buf_st.stop();
     for (int sl = 0; ok && sl <= n_sl; sl++) {
         if (sl < n_sl) {
             const int nmb = blocks_of(sl);
@@ -873,9 +877,12 @@ bool pgemm_call(xdna_kernel_pool *  pool,
             cs.half[1]    = (uint32_t) fg.half(sl, 1);
             // the stream names this slab's place in dst, so it is bound per
             // slab; a started run keeps the instruction buffer it was given
+            xdna_prof::section_timer      stream_st("prefill: pgemm: stream");
             const std::vector<uint32_t> insts =
                 build_seq(g, ws->plan, nmb, cs, (uint32_t) (sl * 2 * HDR_BYTES), (uint32_t) ag.base(sl));
-            if (!xdna_kernel_bind_insts(pool->device, g_pg.kern, insts.data(), insts.size())) {
+            const bool bound = xdna_kernel_bind_insts(pool->device, g_pg.kern, insts.data(), insts.size());
+            stream_st.stop();
+            if (!bound) {
                 // xdna-runtime names the stream and the reason
                 if (sl > 0) {
                     (void) xdna_run_wait(runs[(sl - 1) % 2]);
@@ -883,25 +890,33 @@ bool pgemm_call(xdna_kernel_pool *  pool,
                 ok = false;
                 break;
             }
-            if (!a_ready && !pack(sl)) {
+            xdna_prof::section_timer pack_st("prefill: pgemm: A layout");
+            const bool               packed = a_ready || pack(sl);
+            pack_st.stop();
+            if (!packed) {
                 if (sl > 0) {
                     xdna_run_wait(runs[(sl - 1) % 2]);
                 }
                 ok = false;
                 break;
             }
-            xdna_buffer * args[4] = { ws->bo, al->bo, direct ? dst_bo : bo_c[sl % 2], sink };
-            runs[sl % 2]          = xdna_kernel_run_start(g_pg.kern, args, 4);
+            xdna_buffer *            args[4] = { ws->bo, al->bo, direct ? dst_bo : bo_c[sl % 2], sink };
+            xdna_prof::section_timer start_st("prefill: pgemm: start");
+            runs[sl % 2] = xdna_kernel_run_start(g_pg.kern, args, 4);
         }
         if (sl > 0) {
-            const int p = sl - 1;
-            if (!xdna_run_wait(runs[p % 2])) {
+            const int                p = sl - 1;
+            xdna_prof::section_timer wait_st("prefill: pgemm: wait");
+            const bool               done = xdna_run_wait(runs[p % 2]);
+            wait_st.stop();
+            if (!done) {
                 ok = false;
                 if (sl < n_sl) {
                     (void) xdna_run_wait(runs[sl % 2]);
                 }
                 break;
             }
+            xdna_prof::section_timer unpack_st("prefill: pgemm: unpack");
             if (!direct && !unpack(bo_c[p % 2], p * slab * MBLK, blocks_of(p) * MBLK)) {
                 ok = false;
                 if (sl < n_sl) {
