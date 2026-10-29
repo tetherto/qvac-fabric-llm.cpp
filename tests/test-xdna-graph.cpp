@@ -823,14 +823,18 @@ int main(void) {
         ggml_free(g.ctx);
     }
 
-    for (int64_t M : { 100, 129, 300 }) {
+    // a call runs the 128-row blocks its rows fill: one up to 128 rows, an odd count at 300 and 520, and 2100
+    // rows are 17 blocks, a 16-block slab and a last one of one block
+    for (int64_t M : { 15, 100, 128, 129, 300, 520, 2100 }) {
         passed = test_output_in_place(npu, cpu, M, tol) && passed;
     }
-    passed = test_repeated_projection(npu, cpu, 200, 3, tol) && passed;
+    for (int64_t M : { 15, 200 }) {
+        passed = test_repeated_projection(npu, cpu, M, 3, tol) && passed;
+    }
 
     const std::vector<std::vector<int64_t>> groups = { { 1024, 512, 512 }, { 2048, 512, 512 }, { 1024, 640 } };
     for (const std::vector<int64_t> & ns : groups) {
-        for (int64_t M : { 100, 200, 300 }) {
+        for (int64_t M : { 15, 100, 128, 200, 300, 2100 }) {
             passed = test_group(npu, cpu, ns, M, tol) && passed;
         }
     }
@@ -845,8 +849,11 @@ int main(void) {
     for (ggml_glu_op op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
         for (bool glu_is_output : { false, true }) {
             for (float scale : { 0.05f, 0.3f }) {
-                passed = test_ffn(npu, cpu, op, glu_is_output, 512, 2048, 200, scale, 3e-3) && passed;
+                for (int64_t M : { 15, 128, 200, 2100 }) {
+                    passed = test_ffn(npu, cpu, op, glu_is_output, 512, 2048, M, scale, 3e-3) && passed;
+                }
                 passed = test_ffn(npu, cpu, op, glu_is_output, 2560, 9216, 300, scale, 3e-3) && passed;
+                passed = test_ffn(npu, cpu, op, glu_is_output, 2560, 9216, 100, scale, 3e-3) && passed;
             }
         }
     }
