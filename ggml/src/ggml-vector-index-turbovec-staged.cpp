@@ -528,6 +528,73 @@ int32_t exact4_sum_blocked(const int8_t * w, const int8_t * levels, const uint8_
 }
 #endif
 
+// Upstream pack.rs PLANES_COMB: entry (sign_nibble << 4) | low_nibble is
+// the 2-bit code byte of the four dims those nibbles cover.
+struct PlanesComb {
+    uint8_t t[256];
+    constexpr PlanesComb() : t{} {
+        for (unsigned i = 0; i < 256; ++i) {
+            t[i] = static_cast<uint8_t>((spread(i >> 4) << 1) | spread(i & 15));
+        }
+    }
+    // A nibble's bits at the even positions of a byte.
+    static constexpr unsigned spread(unsigned n) {
+        return (((n >> 3) & 1) << 6) | (((n >> 2) & 1) << 4) | (((n >> 1) & 1) << 2) | (n & 1);
+    }
+};
+constexpr PlanesComb kPlanesComb;
+
+// Whether a 2-bit index's shortlist is rescored row by row from the
+// planes (upstream legacy_score), and with which epilogue: the `vpermb`
+// scan's (sum * scale + bias, unfused) or the LUT kernels' fused flush
+// every kTurboVecFlushEvery byte groups (NEON, and the vm8 kernel's scalar
+// model). An x86 sequential layout scores with the AVX2 kernel or the
+// scalar loop depending on the CPU, so it keeps the block scan.
+bool exact2_rows(const ggml_vec_index & idx) {
+    if (idx.turbovec_bits != 2) {
+        return false;
+    }
+#if GGML_VEC_INDEX_USE_NEON
+    return true;
+#else
+    return turbovec_scores_vnni_lut(idx) || idx.turbovec_blocked_vm8;
+#endif
+}
+
+// Upstream legacy_score: one row's exact 2-bit score from its packed
+// planes row (low plane, then sign plane), the full scan's u8 table
+// entries summed exactly and its epilogue applied in its order, so the
+// result is the block scan's score bit for bit.
+float exact2_row_score(const uint8_t * lut, float scale, float bias, const uint8_t * row, size_t nsg, float vscale,
+        bool fma_flush) {
+    const uint8_t * low = row;
+    const uint8_t * sign = row + nsg;
+    constexpr size_t flush = static_cast<size_t>(kTurboVecFlushEvery) / 2;
+    uint32_t sum = 0;
+    float fa = bias;
+    for (size_t g = 0; g < nsg; ++g) {
+        const uint8_t sb = sign[g];
+        const uint8_t lb = low[g];
+        const uint8_t c0 = kPlanesComb.t[(sb & 0xf0) | (lb >> 4)];
+        const uint8_t c1 = kPlanesComb.t[((sb & 0x0f) << 4) | (lb & 0x0f)];
+        const uint8_t * t = lut + g * 64;
+        sum += static_cast<uint32_t>(t[c0 >> 4]) + t[16 + (c0 & 0x0f)] + t[32 + (c1 >> 4)] + t[48 + (c1 & 0x0f)];
+        if (fma_flush && (g + 1) % flush == 0) {
+            fa = std::fma(scale, static_cast<float>(sum), fa);
+            sum = 0;
+        }
+    }
+    if (!fma_flush) {
+        const float product = static_cast<float>(sum) * scale;
+        const float f = product + bias;
+        return f * vscale;
+    }
+    if (nsg % flush != 0) {
+        fa = std::fma(scale, static_cast<float>(sum), fa);
+    }
+    return fa * vscale;
+}
+
 int64_t low_dot(const LowPlanes & planes, const uint8_t * row) {
 #if GGML_VEC_INDEX_USE_NEON
     return low_dot_neon(reinterpret_cast<const uint8_t *>(planes.masks.data()), row, planes.row_len);
@@ -1230,6 +1297,9 @@ bool turbovec_staged_search(
     // x86 and from the lane-blocked one on aarch64.
     const bool vm_sign = turbovec_sign_layout(idx) == kTurboVecLayoutVm;
     const bool exact4 = permute_dot && (vm_sign || arm_rules);
+    // A 2-bit shortlist likewise (`legacy_score`), from the packed rows.
+    const bool exact2 = exact2_rows(idx);
+    const bool exact2_fma = !turbovec_scores_vnni_lut(idx);
     std::vector<int8_t> exact4_w;
     bool exact_built = false;
     auto build_exact = [&]() {
@@ -1252,7 +1322,7 @@ bool turbovec_staged_search(
         } else {
             build_turbovec_lut(bits, false, query, dim, exact_lut, exact_scale, exact_bias);
             exact_bias += bias_corr;
-            if (turbovec_scores_vnni_lut(idx)) {
+            if (turbovec_scores_vnni_lut(idx) && !exact2) {
                 exact_split.resize(exact_lut.size());
                 turbovec_split_lut_for_vnni(exact_lut.data(), exact_lut.size() / 32, exact_split.data());
             }
@@ -1272,6 +1342,11 @@ bool turbovec_staged_search(
         const int32_t sum = turbovec_exact4_sum(exact4_w.data(), pd.levels, pd.zero, sign_block, low_row, nsg, v % kBlock);
 #endif
         return std::fma(static_cast<float>(sum), pd.scale, pd.bias) * vscales[v];
+    };
+    auto exact2_score = [&](size_t v) {
+        return exact2_row_score(
+            exact_lut.data(), exact_scale, exact_bias, idx.turbovec_data.data() + v * row_bytes, nsg, vscales[v],
+            exact2_fma);
     };
     auto plain_score = [&](size_t v, float s) {
         return centre != nullptr ? s - kSignCentre * vscales[v] * (*centre)[v] : s;
@@ -1562,15 +1637,27 @@ bool turbovec_staged_search(
         keep_best(list, t_len);
     }
 
-    // Stage four: the exact score for what is left, from the full scan's own
-    // block kernel, so a returned score equals the full scan's.
+    // Stage four: the exact score for what is left, row by row from the
+    // planes where the arithmetic is known, else from the full scan's own
+    // block kernel; either way a returned score equals the full scan's.
     if (!exact_built) {
         build_exact();
     }
     std::sort(list.begin(), list.end(), [](const Candidate & a, const Candidate & b) { return a.slot < b.slot; });
-    if (exact4) {
+    if (exact4 || exact2) {
         std::vector<float> exact(list.size());
-        for_each_candidate(list.size(), [&](size_t i) { exact[i] = exact4_score(list[i].slot); });
+        // The rows are scattered, so each is fetched a few candidates ahead
+        // (upstream rerank_legacy AHEAD).
+        constexpr size_t kAhead = 4;
+        for_each_candidate(list.size(), [&](size_t i) {
+            if (exact2 && i + kAhead < list.size()) {
+                const uint8_t * row = idx.turbovec_data.data() + list[i + kAhead].slot * row_bytes;
+                for (size_t off = 0; off < row_bytes; off += 64) {
+                    prefetch_read(row + off);
+                }
+            }
+            exact[i] = exact4 ? exact4_score(list[i].slot) : exact2_score(list[i].slot);
+        });
         for (size_t i = 0; i < list.size(); ++i) {
             update_topk_heap(heap, k, { exact[i], topk_key(idx, list[i].slot) });
         }
@@ -1884,6 +1971,58 @@ int turbovec_low_kernel_parity_for_test(int kernel) {
     (void) kernel;
     return -1;
 #endif
+}
+
+int turbovec_exact2_row_parity_for_test(const ggml_vec_index_t * idx, const float * query) {
+    std::shared_lock<std::shared_mutex> lock(idx->mutex);
+    if (!is_turbovec(*idx) || idx->turbovec_legacy || !exact2_rows(*idx)) {
+        return -1;
+    }
+    TurboVecPlanesStats stats;
+    const std::vector<float> * centre = nullptr;
+    if (!planes_ready(*idx, stats, centre)) {
+        return -1;
+    }
+    const int dim = idx->dim;
+    const size_t nsg = static_cast<size_t>(dim) / 8;
+    const size_t n = idx->slot_to_id.size();
+    // The query as the search scores it: rotated, then calibrated.
+    std::vector<float> q(static_cast<size_t>(dim));
+    rotate_turbovec_query(false, query, q.data(), dim);
+    float bias_corr = 0.0f;
+    if (!idx->turbovec_tqplus_shift.empty()) {
+        double b = 0.0;
+        for (size_t i = 0; i < q.size(); ++i) {
+            b -= static_cast<double>(q[i]) * static_cast<double>(idx->turbovec_tqplus_shift[i]);
+            q[i] /= idx->turbovec_tqplus_scale[i];
+        }
+        bias_corr = static_cast<float>(b);
+    }
+    std::vector<uint8_t> lut;
+    float scale = 1.0f;
+    float bias = 0.0f;
+    build_turbovec_lut(2, false, q.data(), dim, lut, scale, bias);
+    bias += bias_corr;
+    std::vector<uint8_t> split;
+    if (turbovec_scores_vnni_lut(*idx)) {
+        split.resize(lut.size());
+        turbovec_split_lut_for_vnni(lut.data(), lut.size() / 32, split.data());
+    }
+    const bool fma_flush = !turbovec_scores_vnni_lut(*idx);
+    const size_t row_bytes = turbovec_row_bytes(2, static_cast<size_t>(dim));
+    float block_scores[kBlock];
+    for (size_t block = 0; block * kBlock < n; ++block) {
+        score_turbovec_block(*idx, lut.data(), scale, bias, nullptr, block, block_scores, split.empty() ? nullptr : split.data());
+        for (size_t lane = 0; lane < std::min(kBlock, n - block * kBlock); ++lane) {
+            const size_t v = block * kBlock + lane;
+            const float got = exact2_row_score(
+                lut.data(), scale, bias, idx->turbovec_data.data() + v * row_bytes, nsg, idx->turbovec_scale[v], fma_flush);
+            if (std::memcmp(&got, &block_scores[lane], sizeof(float)) != 0) {
+                return 0;
+            }
+        }
+    }
+    return 1;
 }
 
 int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * unit, std::vector<uint64_t> * masks) {

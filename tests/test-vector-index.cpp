@@ -220,6 +220,7 @@ size_t parallel_pool_threads_for_test(void);
 void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums);
 int parallel_pool_selftest_for_test(int n_threads);
 int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * unit, std::vector<uint64_t> * masks);
+int turbovec_exact2_row_parity_for_test(const ggml_vec_index_t * idx, const float * query);
 int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
@@ -6728,6 +6729,56 @@ void check_turbovec_1x_staged(int x86_rules) {
 // threads and after swap-removes, all equal to the slow reference bit for
 // bit. Scores no fixture records, since upstream generates its fixtures on
 // aarch64; the reference is the formula upstream's kernel computes.
+// The 2-bit row rescore (upstream legacy_score) equals the full scan's
+// block kernel for every lane of every block, under both rule sets,
+// calibrated or not, and in the vm8 layout. An x86 host's sequential
+// layout keeps the block scan, which the hook reports as -1.
+void check_turbovec_1x_exact2_rows(int x86_rules) {
+    turbovec_force_x86_rules_for_test(x86_rules);
+    const int n = kTv1xStagedN;
+    const size_t dim = static_cast<size_t>(kTv1xStagedDim);
+    const std::vector<float> db = tv1x_rows(kTv1xSeedDb, static_cast<size_t>(n), dim);
+    const std::vector<uint64_t> ids = tv1x_ids(static_cast<size_t>(n));
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 3, dim);
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, kTv1xNCalib, dim);
+#if defined(__aarch64__) || defined(_M_ARM64)
+    constexpr bool neon_host = true;
+#else
+    constexpr bool neon_host = false;
+#endif
+    turbovec_force_planes_for_test(1, 0);
+    for (const int vm8 : { 0, 1 }) {
+        if (vm8 != 0 && x86_rules != 0) {
+            continue;
+        }
+        for (const int calibrated : { 0, 1 }) {
+            ggml_vec_index_t * tv = nullptr;
+            if (vm8 != 0) {
+                tv = tv1x_create_with_layout(static_cast<int>(dim), 2, 1, 1);
+            } else {
+                turbovec_force_vector_major_for_test(1);
+                tv = ggml_vec_index_create_turbovec(static_cast<int>(dim), 2);
+            }
+            CHECK(tv != nullptr);
+            if (calibrated != 0) {
+                CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+            }
+            CHECK(ggml_vec_index_add(tv, db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+            const int layout = turbovec_layout_for_test(tv);
+            CHECK(vm8 == 0 || !neon_host || layout == 2);
+            CHECK(x86_rules == 0 || layout == 1);
+            const int expected = !neon_host && layout == 0 ? -1 : 1;
+            for (int q = 0; q < 3; ++q) {
+                CHECK(turbovec_exact2_row_parity_for_test(tv, queries.data() + static_cast<size_t>(q) * dim) == expected);
+            }
+            ggml_vec_index_free(tv);
+            tv1x_reset_kernel_overrides();
+        }
+    }
+    turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_x86_rules_for_test(0);
+}
+
 void check_turbovec_1x_vpermb() {
     // The aarch64-rule indexes below are sequential, whatever the 2-bit
     // vm8 opt-in in the environment says.
@@ -7908,6 +7959,8 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_batch_goldens();
             check_turbovec_1x_staged(0);
             check_turbovec_1x_staged(1);
+            check_turbovec_1x_exact2_rows(0);
+            check_turbovec_1x_exact2_rows(1);
             check_turbovec_1x_vpermb();
             check_turbovec_1x_low_planes_tiny();
             check_turbovec_1x_thread_invariance(0);
