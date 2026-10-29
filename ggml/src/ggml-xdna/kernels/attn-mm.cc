@@ -16,6 +16,10 @@
 // Both cores of the pair run the same softmax on the same full scores, so
 // they agree on P bit for bit.
 //
+// Which keys a row sees is data, not position: each pass carries, per row, the
+// first and last visible key index (a causal, a bidirectional or a banded
+// mask, packed sequences), and the keys of the tiles it streams.
+//
 // Layouts are the mmul's (8, 8) sub-tiles:
 //   K half     (key/8, d/8, 8, 8) bf16 - A
 //   Q half^T   (d/8, row/8, 8, 8) bf16 - B
@@ -50,6 +54,9 @@
 #endif
 #ifndef FA_NK
 #    define FA_NK 32  // keys a tile
+#endif
+#ifndef FA_TR
+#    define FA_TR 256  // bf16 elements after a pass's Q rows: the pass trailer
 #endif
 #ifndef FA_TAU
 #    define FA_TAU 8.0f  // log2 headroom before the output is rescaled
@@ -103,11 +110,10 @@ __attribute__((noinline)) void exp2_block(const float * xp, bfloat16 * out, int 
 // The exponents of a tile, then the weights (P^T).
 alignas(64) float g_x[FA_R * FA_NK];
 
-// k - c of element (key k, row c) of an (8 x 8) tile, for the causal mask.
-alignas(64) const int32_t g_kc[64] = {
-    0,  -1, -2, -3, -4, -5, -6, -7, 1,  0,  -1, -2, -3, -4, -5, -6, 2,  1,  0, -1, -2, -3,
-    -4, -5, 3,  2,  1,  0,  -1, -2, -3, -4, 4,  3,  2,  1,  0,  -1, -2, -3, 5, 4,  3,  2,
-    1,  0,  -1, -2, 6,  5,  4,  3,  2,  1,  0,  -1, 7,  6,  5,  4,  3,  2,  1, 0,
+// The key row k of element (k, c) of an (8 x 8) tile, for the visibility mask.
+alignas(64) const int32_t g_krow[64] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
 };
 
 // The per-column (row of the output) reduction of an (8 x 8) tile, element
@@ -141,13 +147,21 @@ inline v64f col_bcast(const aie::vector<float, 8> & v) {
     return aie::concat(aie::concat(v, v, v, v), aie::concat(v, v, v, v));
 }
 
-// The next tile's first key: tiles arrive in order from key 0.
+inline aie::vector<int32, 64> col_bcast_i(const aie::vector<int32, 8> & v) {
+    return aie::concat(aie::concat(v, v, v, v), aie::concat(v, v, v, v));
+}
+
+// The next tile's first key: a pass streams consecutive tiles from its first.
 int32_t g_k0   = 0;
-// The whole-array design (kernels/attn_mm.py): the call's header and the
-// current pass. A pass is 64 positions - 8 pairs of 8 - of a KV head group.
-int32_t g_p0   = 0;  // the ubatch's first position
+// The whole-array design (kernels/attn_mm.py): the current pass's rows, from
+// the trailer of its Q object, and what the pass says about its tiles.
 int32_t g_pass = 0;
-int32_t g_q0   = 0;  // this core's first position in the pass
+alignas(64) int32_t g_lo[FA_R];  // first visible key of each row
+alignas(64) int32_t g_hi[FA_R];  // last visible key of each row
+int32_t g_lo_min[FA_R / 8], g_lo_max[FA_R / 8], g_hi_min[FA_R / 8], g_hi_max[FA_R / 8];  // per row block
+int32_t g_vis_lo = 0, g_vis_hi = 0;  // the keys any row of the pass sees
+bool    g_first  = true;             // no tile of the row blocks has been seen yet
+bool    g_skip   = false;            // the current tile has no visible key for this pair
 
 }  // namespace
 
@@ -155,7 +169,7 @@ extern "C" {
 
 // Start a row block: O half zero, m = M0, l = 0. `ml` is m[R] then l[R].
 void fa_begin(float * o, float * ml) {
-    g_k0         = 0;
+    g_first      = true;
     const v16f z = aie::zeros<float, 16>();
     for (int i = 0; i < R * DH; i += 16) {
         aie::store_v(o + i, z);
@@ -168,6 +182,12 @@ void fa_begin(float * o, float * ml) {
 
 // This core's half of the tile's scores: S^T = K_half . Q_half^T.
 void fa_scores(const bfloat16 * q, const bfloat16 * kv, float * s) {
+    // a tile outside every row's keys is skipped by all three steps of a tile,
+    // and by the neighbour: it holds the same rows
+    g_skip = g_k0 + NK <= g_vis_lo || g_k0 > g_vis_hi;
+    if (g_skip) {
+        return;
+    }
     const v16f z = aie::zeros<float, 16>();
     for (int i = 0; i < R * NK; i += 16) {
         aie::store_v(s + i, z);
@@ -176,9 +196,9 @@ void fa_scores(const bfloat16 * q, const bfloat16 * kv, float * s) {
 }
 
 // The online softmax over the tile, from both halves of its scores. The
-// host scales Q by log2(e) / sqrt(D), so a score is already the exponent of
-// 2 its weight is. Rows are (head, position q0 + row % 8); the tile's keys
-// are the next NK. Writes P^T (bf16).
+// host scales Q by log2(e) * the attention scale, so a score is already the
+// exponent of 2 its weight is. A row sees the keys g_lo .. g_hi of its pass;
+// the tile's keys are the next NK. Writes P^T (bf16).
 //
 // A row's max is only moved - and the output and sum rescaled by 2^(m_old -
 // m_new) - when the tile's max passes the kept one by more than FA_TAU: the
@@ -186,25 +206,32 @@ void fa_scores(const bfloat16 * q, const bfloat16 * kv, float * s) {
 // the rescale (4096 f32 products a tile, which this core emulates) is rare.
 // The same correction goes into the output and the sum, so it cancels in the
 // final division whatever its rounding.
-void fa_update(const float * s_own, const float * s_nb, float * o, bfloat16 * p, float * ml, int32_t q0) {
+void fa_update(const float * s_own, const float * s_nb, float * o, bfloat16 * p, float * ml) {
     const int32_t k0 = g_k0;
     g_k0 += NK;
+    if (g_skip) {
+        return;
+    }
+    const bool first = g_first;
+    g_first          = false;
     aie::set_rounding(aie::rounding_mode::conv_even);
-    const bool diag = k0 + NK - 1 > q0;
     for (int qb = 0; qb < RB; qb++) {
-        v64f f[KB];
+        // every row of the block sees the whole tile
+        const bool clear = k0 >= g_lo_max[qb] && k0 + NK - 1 <= g_hi_min[qb];
+        v64f       f[KB];
         for (int kb = 0; kb < KB; kb++) {
             const int off = (kb * RB + qb) * 64;
             f[kb]         = aie::add(aie::load_v<64>(s_own + off), aie::load_v<64>(s_nb + off));
-            if (diag) {
-                // key k0 + kb * 8 + k is past position q0 + c when
-                // t + (k - c) > 0, t = k0 + kb * 8 - q0
-                const int32_t t = k0 + kb * 8 - q0;
-                if (t >= 8) {
+            if (!clear) {
+                const int32_t key0 = k0 + kb * 8;
+                if (key0 > g_hi_max[qb] || key0 + 7 < g_lo_min[qb]) {
                     f[kb] = aie::broadcast<float, 64>(MASK);
-                } else if (t > -8) {
-                    const auto past = aie::gt(aie::load_v<64>(g_kc), aie::broadcast<int32, 64>(-t));
-                    f[kb]           = aie::select(f[kb], aie::broadcast<float, 64>(MASK), past);
+                } else if (key0 < g_lo_max[qb] || key0 + 7 > g_hi_min[qb]) {
+                    const auto key  = aie::add(aie::broadcast<int32, 64>(key0), aie::load_v<64>(g_krow));
+                    const auto lo   = col_bcast_i(aie::load_v<8>(g_lo + qb * 8));
+                    const auto hi   = col_bcast_i(aie::load_v<8>(g_hi + qb * 8));
+                    f[kb]           = aie::select(f[kb], aie::broadcast<float, 64>(MASK), aie::lt(key, lo));
+                    f[kb]           = aie::select(f[kb], aie::broadcast<float, 64>(MASK), aie::gt(key, hi));
                 }
             }
         }
@@ -218,7 +245,7 @@ void fa_update(const float * s_own, const float * s_nb, float * o, bfloat16 * p,
         const auto                  grow = aie::gt(cm, aie::add(m, aie::broadcast<float, 8>(FA_TAU)));
         if (!grow.empty()) {
             const aie::vector<float, 8> m_new = aie::max(m, cm);
-            if (k0 > 0) {
+            if (!first) {
                 const aie::vector<float, 16> d = aie::concat(aie::sub(m, m_new), aie::zeros<float, 8>());
                 alignas(64) float            xd[32];
                 alignas(64) bfloat16         ed[32];
@@ -254,31 +281,55 @@ void fa_update(const float * s_own, const float * s_nb, float * o, bfloat16 * p,
 }
 
 // The call's header, the first object of the core's Q stream: word 0 the
-// passes, word 1 the ubatch's first position (the cache rows before it are
-// the context).
+// passes.
 void fa_hdr(const bfloat16 * h, int32_t * cnt) {
     const int32_t * w = (const int32_t *) h;
     cnt[0]            = w[0];
-    g_p0              = w[1];
     g_pass            = 0;
 }
 
-// Start a pass for the pair `pidx` (0..7) of the group: its positions, and in
-// cnt[1] the key tiles the pass streams - up to the group's last position.
-void fa_pass(float * o, float * ml, int32_t * cnt, int32_t pidx) {
-    const int32_t base = g_p0 + g_pass * 64;
-    g_q0               = base + pidx * 8;
-    cnt[1]             = (base + 64 + NK - 1) / NK;
+// Start a pass from the trailer after its Q rows: word 0 the first key of
+// the first tile it streams, word 1 the tiles, then each row's first and last
+// visible key. cnt[1] is the pass's tile count.
+void fa_pass(float * o, float * ml, int32_t * cnt, const bfloat16 * q) {
+    const int32_t * w = (const int32_t *) (q + R * DH);
+    g_k0              = w[0];
+    cnt[1]            = w[1];
+    g_vis_lo          = w[2];
+    g_vis_hi          = w[2 + R];
+    for (int r = 0; r < R; r++) {
+        g_lo[r]   = w[2 + r];
+        g_hi[r]   = w[2 + R + r];
+        g_vis_lo  = g_lo[r] < g_vis_lo ? g_lo[r] : g_vis_lo;
+        g_vis_hi  = g_hi[r] > g_vis_hi ? g_hi[r] : g_vis_hi;
+    }
+    for (int qb = 0; qb < RB; qb++) {
+        int32_t lo_min = g_lo[qb * 8], lo_max = lo_min, hi_min = g_hi[qb * 8], hi_max = hi_min;
+        for (int c = 1; c < 8; c++) {
+            const int32_t lo = g_lo[qb * 8 + c], hi = g_hi[qb * 8 + c];
+            lo_min = lo < lo_min ? lo : lo_min;
+            lo_max = lo > lo_max ? lo : lo_max;
+            hi_min = hi < hi_min ? hi : hi_min;
+            hi_max = hi > hi_max ? hi : hi_max;
+        }
+        g_lo_min[qb] = lo_min;
+        g_lo_max[qb] = lo_max;
+        g_hi_min[qb] = hi_min;
+        g_hi_max[qb] = hi_max;
+    }
     g_pass++;
     fa_begin(o, ml);
 }
 
 void fa_update_p(const float * s_own, const float * s_nb, float * o, bfloat16 * p, float * ml) {
-    fa_update(s_own, s_nb, o, p, ml, g_q0);
+    fa_update(s_own, s_nb, o, p, ml);
 }
 
 // O^T_half += V_half^T . P^T; V^T is the tile's second object.
 void fa_pv(const bfloat16 * p, const bfloat16 * v, float * o) {
+    if (g_skip) {
+        return;
+    }
     matmul_vectorized_2x2_mmul<bfloat16, float, DH / 8, NK / 8, R / 8, 8, 8, 8, true, true>(v, p, o);
 }
 

@@ -1,8 +1,8 @@
 # The prefill attention on the whole array (kernels/attn_mm.py) against numpy:
 # Qwen3.5's full-attention shape (8 query heads, 2 KV heads, D = 256), causal,
-# NPASS passes of 64 positions after P0 positions of context.
+# NPASS passes of 64 positions.
 # On the bench, in the IRON env:
-#   NPU_CACHE_HOME=$(mktemp -d) python probes/fa_design_check.py [NPASS] [P0]
+#   NPU_CACHE_HOME=$(mktemp -d) python probes/fa_design_check.py [NPASS]
 import sys
 import time
 from pathlib import Path
@@ -17,11 +17,11 @@ sys.path.insert(0, str(here))
 import attn_mm as am  # noqa: E402
 
 NPASS = int(sys.argv[1]) if len(sys.argv) > 1 else 2
-P0 = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 bf16 = ml_dtypes.bfloat16
-COLS, R, D, DH, NK, PASS = am.COLS, am.R, am.D, am.DH, am.NK, am.PASS
+COLS, R, D, DH, NK, TR = am.COLS, am.R, am.D, am.DH, am.NK, am.TR
+PASS = 64                                                           # positions a pass: 8 pairs x 4 heads x 8
 NTOK = NPASS * PASS
-T_MAX = am.tiles_of(P0, NPASS - 1)
+T_MAX = am.tiles_of(NPASS - 1)
 NKEY = T_MAX * NK
 
 
@@ -37,10 +37,10 @@ K = rng.standard_normal((NKEY, 2, D)).astype(np.float32).astype(bf16)
 V = rng.standard_normal((NKEY, 2, D)).astype(np.float32).astype(bf16)
 Qs = (Q * np.float32(np.log2(np.e) / 16)).astype(bf16)
 
-# Q: per column the header object, then per pass the 4 cores' Q half^T
-qbuf = np.zeros((COLS, 1 + NPASS, 4, R * DH), bf16)
-hdr = np.zeros(R * DH // 2, np.int32)
-hdr[:2] = [NPASS, P0]
+# Q: per column the header object, then per pass the 4 cores' Q half^T and trailer
+qbuf = np.zeros((COLS, 1 + NPASS, 4, am.Q_OBJ), bf16)
+hdr = np.zeros(am.Q_OBJ // 2, np.int32)
+hdr[0] = NPASS
 qbuf[:, 0, :, :] = hdr.view(bf16)
 for col in range(COLS):
     for i in range(4):
@@ -51,7 +51,11 @@ for col in range(COLS):
                 for j in range(8):
                     t = p * PASS + pidx * 8 + j
                     rows[hh * 8 + j] = Qs[t, 4 * g + hh, h * DH:(h + 1) * DH]
-            qbuf[col, 1 + p, i] = blk(rows.T.astype(bf16))
+            tr = np.zeros(TR // 2, np.int32)
+            tr[0], tr[1] = 0, am.tiles_of(p)                          # keys from 0, the pass's tiles
+            tr[2:2 + R] = 0                                           # a row sees keys 0 .. its position
+            tr[2 + R:2 + 2 * R] = [p * PASS + pidx * 8 + r % 8 for r in range(R)]
+            qbuf[col, 1 + p, i] = np.concatenate([blk(rows.T.astype(bf16)), tr.view(bf16)])
 # KV: [g][h][tile] of [K half | V half^T]
 kvbuf = np.zeros((2, 2, T_MAX, 2 * NK * DH), bf16)
 for g in range(2):
@@ -68,7 +72,7 @@ np.copyto(q_t.numpy(), qbuf.reshape(-1))
 np.copyto(kv_t.numpy(), kvbuf.reshape(-1))
 q_t._sync_to_device()
 kv_t._sync_to_device()
-run = lambda: am.attn(q_t, kv_t, o_t, NPASS=NPASS, P0=P0)
+run = lambda: am.attn(q_t, kv_t, o_t, NPASS=NPASS)
 run()
 o_t._sync_from_device()
 ob = o_t.numpy().reshape(COLS, NPASS, 4, R, DH)             # a core's rows, as the MemTile leaves them
@@ -88,17 +92,17 @@ Kd, Vd = K.astype(np.float64), V.astype(np.float64)
 for qh in range(8):
     g = qh // 4
     S = Q[:, qh, :].astype(np.float64) @ Kd[:, g, :].T / 16.0          # (tok, key)
-    pos = P0 + np.arange(NTOK)
+    pos = np.arange(NTOK)
     S[np.arange(NKEY)[None, :] > pos[:, None]] = -np.inf
     P = np.exp(S - S.max(1, keepdims=True))
     ref[:, qh, :] = (P / P.sum(1, keepdims=True)) @ Vd[:, g, :]
 rel = np.sqrt(((got - ref) ** 2).mean() / (ref ** 2).mean())
-print(f"passes {NPASS} P0 {P0} ({NTOK} positions, {NKEY} keys): rel rms err {rel:.3e}")
+print(f"passes {NPASS} ({NTOK} positions, {NKEY} keys): rel rms err {rel:.3e}")
 print("PASS" if rel < 3e-2 else "FAIL")
 ts = []
 for _ in range(5):
     t0 = time.perf_counter()
     run()
     ts.append(time.perf_counter() - t0)
-macs = 8 * sum((P0 + t + 1) for t in range(NTOK)) * D * 2
+macs = 8 * sum((t + 1) for t in range(NTOK)) * D * 2
 print(f"  min {min(ts) * 1e3:.3f} ms a call, {macs / min(ts) / 1e12:.2f} TMAC/s useful")
