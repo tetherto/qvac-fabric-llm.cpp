@@ -302,9 +302,15 @@ SignLut build_sign_lut(const float * q, float m, int dim, bool single_query) {
         scale = 1.0f;
     }
     out.values.resize(n_groups * 32);
-    for (size_t i = 0; i < out.values.size(); ++i) {
-        const float r = std::max(0.0f, std::min(max_lut, round_half_away_f32((values[i] - mins[i / 16]) * inv_scale)));
-        out.values[i] = static_cast<uint8_t>(r);
+    // Sixteen entries share a minimum: one invariant per inner loop, which
+    // vectorises (upstream quantise_tables).
+    for (size_t s = 0; s < n_groups * 2; ++s) {
+        const float mn = mins[s];
+        const float * in = values.data() + s * 16;
+        uint8_t * o = out.values.data() + s * 16;
+        for (size_t i = 0; i < 16; ++i) {
+            o[i] = static_cast<uint8_t>(std::max(0.0f, std::min(max_lut, round_half_away_f32((in[i] - mn) * inv_scale))));
+        }
     }
     out.scale = scale;
     out.bias = bias;

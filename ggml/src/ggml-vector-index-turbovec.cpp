@@ -2247,7 +2247,10 @@ static void set_blocked_lane_byte(uint8_t * group_bytes, size_t lane, uint8_t va
 
 static int8_t turbovec_round_i8(float value) {
     // Rust `(x).round().clamp(-127.0, 127.0) as i8`: half away from zero.
-    return static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, std::round(value))));
+    // round_half_away_f32 is std::round but for the sign of a zero, which
+    // the integer cast erases; std::round itself is a libm call per weight
+    // on x86's baseline.
+    return static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, round_half_away_f32(value))));
 }
 
 // The query rounded to int8 under one scale (upstream `build_permute_dot`).
