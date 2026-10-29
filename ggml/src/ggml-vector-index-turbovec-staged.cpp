@@ -1279,6 +1279,29 @@ bool turbovec_staged_search(
             // A short range never needs the full 2 * s_len.
             col.start(s_len, seed, std::min(2 * s_len, (block_end - block_begin) * kBlock + 1),
                 split ? &floor_score : nullptr);
+            if (vm_sign && scan_blocks.empty()) {
+                // The `vpermb` scan over several blocks per call, so a lone
+                // query walks them in pairs (upstream
+                // search_single_query_vnni_blk2); the scores are the
+                // one-block call's.
+                constexpr size_t kGroup = 8;
+                float group_scores[kGroup * kBlock];
+                float * out = group_scores;
+                const uint8_t * lut = sign_lut.values.data();
+                const uint8_t * split_lut = sign_lut.split.empty() ? nullptr : sign_lut.split.data();
+                for (size_t block = block_begin; block < block_end; block += kGroup) {
+                    const size_t n_group = std::min(kGroup, block_end - block);
+                    score_turbovec_lut_blocks_vnni(&lut, split_lut != nullptr ? &split_lut : nullptr, &sign_lut.scale,
+                        &sign_lut.bias, 1, idx.turbovec_sign_blocked.data(), vscales, block, n_group, n, 2, dim / 2,
+                        &out);
+                    for (size_t b = 0; b < n_group; ++b) {
+                        col.add_block(group_scores + b * kBlock, block + b, std::min(kBlock, n - (block + b) * kBlock),
+                            allowed_mask);
+                    }
+                }
+                col.finish();
+                return;
+            }
             float block_scores[kBlock];
             for (size_t block = block_begin; block < block_end; ++block) {
                 if (!scan_blocks.empty() && scan_blocks[block] == 0) {
