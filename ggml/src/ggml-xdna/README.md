@@ -133,14 +133,17 @@ Q8_0 and BF16 files) runs without a model-specific path:
   orders its graph for it. All but the last end on a whole 512 columns and
   every node must lie in one of the backend's buffers.
 - The norms, RoPE, the mean pooling and, in the BF16 file, the GEGLU are host
-  glue. So is the attention up to ~2300 tokens. The prefill attention kernel
-  takes the 20 sliding-window layers (4 query heads over 2 KV heads of 256, a
-  window and the packed sequence, scale 1), but each call pays two hardware-context
-  switches (~5 ms, the projections around it are another xclbin), which the
-  host's ~2.6 ms a layer at 912 tokens does not repay. Past the break-even
-  the array takes those layers: a 3200-token Q8_0 input runs 4% faster, 4097
-  tokens 3% and 6138 tokens 9%. The four full-attention layers (heads of 512,
-  one KV head) stay on the host, ~5.6 ms each at 912 tokens and 92 ms at 4096.
+  glue. So is the attention, on the backend's own host kernel
+  (`xdna-host-attn.cpp`, `GGML_XDNA_HOST_FA=0` for ggml-cpu's op): AVX-512
+  tiles of f32 FMAs over f16 K and V, which read each row's visible keys off the
+  mask, so the window of a sliding layer and the packed sequences cost only the
+  keys they show. Its results match ggml-cpu's to an NMSE of ~1e-13. At 912
+  tokens a sliding-window layer takes ~1.0 ms and a full-attention layer
+  (heads of 512, one KV head) ~2.2 ms, against ggml-cpu's 2.4 and 4.9 ms.
+  The array's prefill attention kernel (4 query heads over 2 KV heads of 256,
+  a window and the packed sequence, scale 1) takes a call once it is large
+  enough to repay its two hardware-context switches (~5 ms, the projections
+  around it are another xclbin); see `GGML_XDNA_FA_MM`.
 - An input of one token runs whole on the host, as the decode of a model
   wider or narrower than the fused layers does. The model's residual width is
   512, not 1024, so the backend logs once that "its decode runs on the host",
@@ -461,6 +464,7 @@ report, not for tuning: every one costs more time or energy than the default.
 | `GGML_XDNA_GDN_MM` | the prefill gated delta rule on the array |
 | `GGML_XDNA_GDN_IN` | the prefill GDN's conv input, norms and state copy fed straight into the array |
 | `GGML_XDNA_FA_MM` | the prefill attention on the array: `0` the host, `2` the array whatever the size |
+| `GGML_XDNA_HOST_FA` | the backend's own host attention kernel: ggml-cpu's op runs instead. `2` runs the portable kernels in place of the AVX-512 ones |
 
 Diagnostics - nothing is measured unless they are set:
 
@@ -516,6 +520,8 @@ Diagnostics - nothing is measured unless they are set:
 | `xdna-head.h/.cpp` | the decode's vocabulary projection on the pool, with its exact and 4-bit rows |
 | `xdna-pgemm.h/.cpp` | the prefill GEMM in the decode GEMV's weight tiles, and what it folds in (norm, SwiGLU or GeGLU, gate into A) and the projections it runs as one |
 | `xdna-attn-mm.h/.cpp` | the prefill attention on the array |
+| `xdna-host-attn.h/.cpp`, `xdna-host-attn-ops.h` | the prefill attention on the host: the work items, and the AVX-512 and portable kernels |
+| `xdna-attn-mask.h` | an attention mask read on its f16 bits, as the array route and the host kernel both take it |
 | `xdna-gdn-mm.h/.cpp` | the prefill gated delta rule on the array, and the GDN input it is fed |
 | `xdna-conv-prefill.h/.cpp` | SSM_CONV prefill runner (opt-in) |
 | `xdna-norm.h` | the host RMS_NORM, rounded as ggml's CPU op rounds it |

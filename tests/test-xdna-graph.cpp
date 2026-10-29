@@ -18,10 +18,16 @@
 // A prefill FLASH_ATTN_EXT in the shapes llama builds - the 8 query heads of
 // Qwen3.5 over a causal cache, and a bidirectional or banded attention of 4
 // query heads with packed sequences, K and V cast to f16 - computed on the
-// array and on the CPU backend. The array answers to ~2e-4 NMSE and the host
-// path bit for bit, so the two are told apart: a mask the design cannot follow,
-// or a call too small (the size rule, tried either side of both its bounds),
-// has to come out equal.
+// array and on the CPU backend. The array answers to ~2e-4 NMSE, the backend's
+// own host kernel (xdna-host-attn.cpp) to ~1e-13 and ggml-cpu's op bit for bit,
+// so the three are told apart: a mask the design cannot follow, or a call too
+// small for the array (the size rule, tried either side of both its bounds),
+// comes out within the host kernel's bound (looser below the 64 queries of
+// ggml-cpu's tile, whose own op is the less exact there). The host kernel is
+// run on heads of 64 to 512, 1 to 8 query heads a KV head, f16 and f32 K and
+// V, causal, bidirectional and banded masks, packed sequences, a mask with
+// holes and one with finite values, and on its portable kernels
+// (GGML_XDNA_HOST_FA=2).
 //
 // BF16 and F16 weight projections, which no quantized route carries, through
 // the bf16 GEMM: an M that fits the decode block, one that takes several
@@ -208,7 +214,20 @@ static norm_graph build_one_token(ggml_backend_t cpu, int64_t K, int64_t N) {
     return g;
 }
 
-enum fa_mask { FA_CAUSAL, FA_FULL, FA_BAND, FA_HOLES };
+enum fa_mask { FA_CAUSAL, FA_FULL, FA_BAND, FA_HOLES, FA_BIAS };
+
+static const int FA_KV_HEADS = 2;
+static const int FA_HEAD_DIM = 256;
+
+// the array's bf16 answers to ~2e-4, the host kernel's f32 to ~1e-13, ggml-cpu's own op exactly
+static const double FA_ARRAY_NMSE_MIN = 1e-6;
+static const double FA_ARRAY_NMSE_MAX = 1e-3;
+static const double FA_HOST_NMSE_MAX  = 1e-9;
+// ggml-cpu's op below 64 queries (its tile) rounds Q and sums V in f16 and is itself ~1e-6 off the exact value
+static const int    FA_CPU_TILE_QUERIES    = 64;
+static const double FA_HOST_NMSE_UNTILED_MAX = 1e-5;
+// fewer queries than this stay on ggml-cpu's op
+static const int FA_HOST_MIN_QUERIES = 8;
 
 // GGML_XDNA_FA_MM: the host, the array from the size rule's bound, the array whatever the size
 enum fa_route { FA_ROUTE_HOST = 0, FA_ROUTE_BY_SIZE = 1, FA_ROUTE_ARRAY = 2 };
@@ -226,10 +245,11 @@ struct fa_case {
     float        scale;
     bool         cache_view;  // K and V as views of a cache, not a cast
     bool         on_array;    // expected to run on the array
+    int          head_dim = FA_HEAD_DIM;
+    int          kv_heads = FA_KV_HEADS;
+    bool         kv_f32   = false;
+    int          host_fa  = 1;      // GGML_XDNA_HOST_FA: 0 ggml-cpu, 1 the kernels, 2 the portable ones
 };
-
-static const int FA_KV_HEADS = 2;
-static const int FA_HEAD_DIM = 256;
 
 // The graph the model builds around one attention: a projection of n_tokens
 // beside it, so the backend sees a prefill graph and starts a new mask epoch.
@@ -238,19 +258,20 @@ static norm_graph build_fa(ggml_backend_t cpu, const fa_case & c) {
     ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
     g.ctx               = ggml_init(ip);
     const int64_t n_kv  = ((int64_t) c.n_ctx + c.n_tokens + c.pad - 1) / c.pad * c.pad;
-    const int64_t D     = FA_HEAD_DIM;
+    const int64_t D     = c.head_dim;
+    const ggml_type kv_type = c.kv_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16;
 
     ggml_tensor * qr = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, D, c.heads, c.n_tokens);
     ggml_tensor * q  = ggml_permute(g.ctx, qr, 0, 2, 1, 3);
     ggml_tensor * kr, *vr, *k, *v;
     if (c.cache_view) {
-        kr = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F16, D, FA_KV_HEADS, n_kv);
-        vr = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F16, D, FA_KV_HEADS, n_kv);
+        kr = ggml_new_tensor_3d(g.ctx, kv_type, D, c.kv_heads, n_kv);
+        vr = ggml_new_tensor_3d(g.ctx, kv_type, D, c.kv_heads, n_kv);
         k  = ggml_permute(g.ctx, kr, 0, 2, 1, 3);
         v  = ggml_permute(g.ctx, vr, 0, 2, 1, 3);
     } else {
-        kr = k = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F16, D, n_kv, FA_KV_HEADS);
-        vr = v = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F16, D, n_kv, FA_KV_HEADS);
+        kr = k = ggml_new_tensor_3d(g.ctx, kv_type, D, n_kv, c.kv_heads);
+        vr = v = ggml_new_tensor_3d(g.ctx, kv_type, D, n_kv, c.kv_heads);
     }
     ggml_tensor * m  = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, n_kv, c.n_tokens);
     ggml_tensor * dw = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, 64);
@@ -289,8 +310,14 @@ static bool fa_visible(const fa_case & c, int t, int j) {
         case FA_FULL:   return true;
         case FA_BAND:   return std::abs(p_j - p_t) <= c.window;
         case FA_HOLES:  return j % 2 == 0;
+        case FA_BIAS:   return std::abs(p_j - p_t) <= c.window;
     }
     return false;
+}
+
+// what a visible key adds to its score: nothing, or for FA_BIAS a finite value
+static float fa_value(const fa_case & c, int j) {
+    return c.mask == FA_BIAS ? -0.1f * (float) (j % 7) : 0.0f;
 }
 
 static void set_fa_inputs(norm_graph & g, const fa_case & c) {
@@ -316,7 +343,7 @@ static void set_fa_inputs(norm_graph & g, const fa_case & c) {
     for (int t = 0; t < c.n_tokens; t++) {
         for (int64_t j = 0; j < m->ne[0]; j++) {
             if (fa_visible(c, t, (int) j)) {
-                mk[(size_t) t * m->ne[0] + j] = ggml_fp32_to_fp16(0.0f);
+                mk[(size_t) t * m->ne[0] + j] = ggml_fp32_to_fp16(fa_value(c, (int) j));
             }
         }
     }
@@ -325,6 +352,18 @@ static void set_fa_inputs(norm_graph & g, const fa_case & c) {
         std::vector<float> f(ggml_nelements(g.inputs[i]), 0.5f);
         ggml_backend_tensor_set(g.inputs[i], f.data(), 0, ggml_nbytes(g.inputs[i]));
     }
+}
+
+// Where a case ran tells in how it differs from ggml-cpu's op: the array in ~2e-4, the host kernel in a
+// rounding that is not 0, and ggml-cpu's own op (the kernel off, or too few queries) in nothing
+static bool fa_result_ok(const fa_case & c, double e) {
+    if (c.on_array) {
+        return e > FA_ARRAY_NMSE_MIN && e < FA_ARRAY_NMSE_MAX;
+    }
+    if (c.host_fa == 0 || c.n_tokens < FA_HOST_MIN_QUERIES) {
+        return e == 0.0;
+    }
+    return e > 0.0 && e < (c.n_tokens < FA_CPU_TILE_QUERIES ? FA_HOST_NMSE_UNTILED_MAX : FA_HOST_NMSE_MAX);
 }
 
 static void set_fa_route(fa_route route) {
@@ -779,9 +818,32 @@ int main(void) {
         { "by size: over both bounds",                FA_ROUTE_BY_SIZE,      4, 1600,    0,   1,  1, FA_FULL,     0, 1.0f,    false, true },
         { "by size: 8 heads, 1100 keys of context",   FA_ROUTE_BY_SIZE,      8,  600, 1100, 256,  1, FA_CAUSAL,   0, 0.0625f, true,  false },
         { "by size: 8 heads, 1500 keys of context",   FA_ROUTE_BY_SIZE,      8,  600, 1500, 256,  1, FA_CAUSAL,   0, 0.0625f, true,  true },
+        // the host kernel: every case on the host (the array route off), whatever it would have chosen
+        { "host: causal 8 heads, cache view",         FA_ROUTE_HOST,         8,  517,    0, 256,  1, FA_CAUSAL,   0, 0.0625f, true,  false },
+        { "host: causal with 1100 keys of context",   FA_ROUTE_HOST,         8,  301, 1100, 256,  1, FA_CAUSAL,   0, 0.0625f, true,  false },
+        { "host: bidirectional, 3 sequences",         FA_ROUTE_HOST,         4,  777,    0,   1,  3, FA_FULL,     0, 1.0f,    false, false },
+        { "host: band 512, 2 sequences",              FA_ROUTE_HOST,         4,  901,    0,   1,  2, FA_BAND,   512, 1.0f,    false, false },
+        { "host: band 40, one sequence",              FA_ROUTE_HOST,         4,  333,    0,   1,  1, FA_BAND,    40, 1.0f,    false, false },
+        { "host: 40 sequences of 16 tokens",          FA_ROUTE_HOST,         4,  640,    0,   1, 40, FA_FULL,     0, 1.0f,    false, false },
+        { "host: a mask with holes",                  FA_ROUTE_HOST,         4,  700,    0,   1,  1, FA_HOLES,    0, 1.0f,    false, false },
+        { "host: a mask with finite values",          FA_ROUTE_HOST,         4,  300,    0,   1,  1, FA_BIAS,    60, 1.0f,    false, false },
+        { "host: 8 tokens, the least it takes",       FA_ROUTE_HOST,         4,    8,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false },
+        { "host: 7 tokens stay on ggml-cpu",          FA_ROUTE_HOST,         4,    7,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false },
+        { "host: heads of 512, one KV head",          FA_ROUTE_HOST,         4,  301,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false, 512, 1 },
+        { "host: heads of 64, 2 query heads a group", FA_ROUTE_HOST,         4,  200,    0,   1,  1, FA_CAUSAL,   0, 0.125f,  false, false, 64, 2 },
+        { "host: heads of 80, 3 query heads a group", FA_ROUTE_HOST,         6,  250,    0,   1,  1, FA_BAND,    70, 0.1f,    false, false, 80, 2 },
+        { "host: 1 query head a group",               FA_ROUTE_HOST,         2,  260,    0,   1,  1, FA_CAUSAL,   0, 0.0625f, false, false },
+        { "host: 8 query heads, one KV head",         FA_ROUTE_HOST,         8,  260,    0,   1,  1, FA_CAUSAL,   0, 0.0625f, false, false, 128, 1 },
+        { "host: f32 K and V",                        FA_ROUTE_HOST,         4,  500,    0,   1,  1, FA_BAND,   120, 1.0f,    false, false, 256, 2, true },
+        { "host: f32 K and V, cache view",            FA_ROUTE_HOST,         8,  300,  200, 128,  1, FA_CAUSAL,   0, 0.0625f, true,  false, 256, 2, true },
+        { "host: ggml-cpu's op (HOST_FA=0)",          FA_ROUTE_HOST,         4,  600,    0,   1,  1, FA_BAND,   512, 1.0f,    false, false, 256, 2, false, 0 },
+        { "portable: band 512, 2 sequences",          FA_ROUTE_HOST,         4,  901,    0,   1,  2, FA_BAND,   512, 1.0f,    false, false, 256, 2, false, 2 },
+        { "portable: causal 8 heads, f32 cache view", FA_ROUTE_HOST,         8,  300,  200, 128,  1, FA_CAUSAL,   0, 0.0625f, true,  false, 256, 2, true,  2 },
+        { "portable: a mask with finite values",      FA_ROUTE_HOST,         4,  300,    0,   1,  1, FA_BIAS,    60, 1.0f,    false, false, 80, 2, false, 2 },
     };
     for (const fa_case & c : fa_cases) {
         set_fa_route(c.route);
+        setenv("GGML_XDNA_HOST_FA", std::to_string(c.host_fa).c_str(), 1);
         norm_graph               g = build_fa(cpu, c);
         std::vector<float>       want, got;
         if (!run_fa(g, c, cpu, want) || !run_fa(g, c, npu, got)) {
@@ -789,13 +851,14 @@ int main(void) {
             return 1;
         }
         const double e  = nmse(want, got);
-        const bool   ok = c.on_array ? e > 0.0 && e < 1e-3 : e == 0.0;
+        const bool   ok = fa_result_ok(c, e);
         passed          = passed && ok;
-        std::printf("FLASH_ATTN_EXT %-42s nmse %.3g %s\n", c.name, e, ok ? "ok" : "FAIL");
+        std::printf("FLASH_ATTN_EXT %-52s nmse %.3g %s\n", c.name, e, ok ? "ok" : "FAIL");
         ggml_backend_buffer_free(g.buf);
         ggml_free(g.ctx);
     }
     unsetenv("GGML_XDNA_FA_MM");
+    unsetenv("GGML_XDNA_HOST_FA");
 
     const gemm_case gemm_cases[] = {
         { "decode block",     GGML_TYPE_BF16, 15,  { { 512, 1024 }, { 1024, 512 } } },
