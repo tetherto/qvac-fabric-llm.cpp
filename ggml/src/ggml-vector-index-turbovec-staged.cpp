@@ -160,7 +160,7 @@ SignLut build_sign_lut(const float * q, float m, int dim, bool single_query) {
     }
     out.values.resize(n_groups * 32);
     for (size_t i = 0; i < out.values.size(); ++i) {
-        const float r = std::max(0.0f, std::min(max_lut, std::round((values[i] - mins[i / 16]) * inv_scale)));
+        const float r = std::max(0.0f, std::min(max_lut, round_half_away_f32((values[i] - mins[i / 16]) * inv_scale)));
         out.values[i] = static_cast<uint8_t>(r);
     }
     out.scale = scale;
