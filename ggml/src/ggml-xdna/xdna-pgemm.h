@@ -110,3 +110,11 @@ bool xdna_pgemm_run_pair(struct xdna_kernel_pool *  pool,
                          const struct ggml_tensor * b,
                          float *                    a_out,
                          float *                    b_out);
+
+// Projections of one activation that follow each other in the graph (a layer's
+// Q, K and V) and fit one weight: one call, the output of each straight into
+// its own node (GGML_XDNA_PGEMM_GROUP=0: off). All but the last end on a whole
+// 512 columns; every node is in one of the backend's buffers. The caller runs
+// the call at the first of them and skips the rest.
+bool xdna_pgemm_group_supported(struct ggml_tensor * const * mm, int n);
+bool xdna_pgemm_run_group(struct xdna_kernel_pool * pool, struct ggml_tensor * const * mm, int n);
