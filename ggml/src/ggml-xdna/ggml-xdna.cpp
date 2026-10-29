@@ -1749,14 +1749,9 @@ static int64_t xdna_rec_width(const ggml_cgraph * cgraph) {
     return 0;
 }
 
-// Host threads for the decode of a model the fused designs do not cover; 0
-// keeps that decode on the per-op NPU route.
-static constexpr int XDNA_HOST_DECODE_THREADS = 8;
-
-static int xdna_host_decode_threads(void) {
-    static const int n = std::max(0, xdna_env_int("GGML_XDNA_HOST_DECODE_THREADS", XDNA_HOST_DECODE_THREADS));
-    return n;
-}
+// Host threads for the decode of a model the fused designs do not cover
+// (xdna_host_decode_default); 0 keeps that decode on the per-op NPU route.
+static int xdna_host_decode_threads(void);
 
 // Whether those threads are pinned (xdna_decode_cpus); 0 leaves them to the OS.
 // Only under OpenMP: a plain ggml threadpool keeps its pinned workers polling.
@@ -1850,6 +1845,26 @@ static std::vector<xdna_core> xdna_allowed_cores(const cpu_set_t & allowed) {
     return cores;
 }
 
+// The count when the threads are not pinned: under OMP_WAIT_POLICY=PASSIVE, 16
+// unpinned threads decoded the 4B 12% faster than 8 at 45% more energy a token.
+static constexpr int XDNA_HOST_DECODE_THREADS_UNPINNED = 8;
+
+// Pinned, one thread on every allowed core: with OMP_WAIT_POLICY unset, the 16 cores of a Ryzen
+// AI MAX+ 395 decode the 2B-9B 61-86% faster than 8 on one L3 domain, at -21% to +3% energy a token.
+static int xdna_host_decode_default(void) {
+    cpu_set_t allowed;
+    if (!xdna_host_decode_pin() || sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return XDNA_HOST_DECODE_THREADS_UNPINNED;
+    }
+    const int n = (int) xdna_allowed_cores(allowed).size();
+    return n > 0 ? n : XDNA_HOST_DECODE_THREADS_UNPINNED;
+}
+
+static int xdna_host_decode_threads(void) {
+    static const int n = std::max(0, xdna_env_int("GGML_XDNA_HOST_DECODE_THREADS", xdna_host_decode_default()));
+    return n;
+}
+
 // n allowed CPUs, one a core, filling one L3 domain before the next; empty when
 // there are fewer cores or no topology.
 static std::vector<int> xdna_decode_cpus(int n) {
@@ -1879,8 +1894,7 @@ struct xdna_host_cpu {
     bool           pinned  = false;
 };
 
-// The host decode's CPU backend, its threads pinned one a core within one L3
-// domain while the others idle: less energy a token than spreading them.
+// The host decode's CPU backend, its threads pinned one a core (xdna_decode_cpus).
 static const xdna_host_cpu & xdna_host_decode_cpu(void) {
     static const xdna_host_cpu cpu = [] {
         xdna_host_cpu h;
