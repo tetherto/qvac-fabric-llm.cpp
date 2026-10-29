@@ -251,6 +251,19 @@ bool xdna_insts_read_file(const char * path, std::vector<uint32_t> & out) {
     return true;
 }
 
+xdna_kernel * xdna_kernel_clone(const xdna_kernel * proto) {
+    if (!proto) {
+        GGML_LOG_ERROR("%s: kernel clone: null kernel\n", "xdna-runtime");
+        return nullptr;
+    }
+    xdna_kernel * kern = new xdna_kernel;
+    kern->device       = proto->device;
+    kern->context      = proto->context;
+    kern->kernel       = proto->kernel;
+    kern->xclbin_name  = proto->xclbin_name;
+    return kern;
+}
+
 bool xdna_kernel_bind_insts(xdna_device * dev, xdna_kernel * kern, const uint32_t * insts, size_t n_words) {
     if (!dev || !kern || !insts || n_words == 0) {
         GGML_LOG_ERROR("%s: bind insts: null device/kernel/insts or empty stream\n", "xdna-runtime");
