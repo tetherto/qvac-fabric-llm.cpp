@@ -51,9 +51,10 @@ struct xdna_ops {
     std::unordered_map<int, std::string> i8_xclbin;    // block -> int8 stem
 
     // Packed-weight cache: tensor data pointer + K + N -> device BO holding the
-    // transposed [K_pad x N] bf16 weights (K_pad = K rounded up to the GEMM
-    // block). Weights are immutable, so the pack (transpose + bf16 conversion)
-    // is done once per tensor and reused; kernels point into it via B offsets.
+    // transposed [K_pad x N] bf16 weights (K_pad = K rounded up to a whole
+    // number of GEMM_K_RUN runs). Weights are immutable, so the pack
+    // (transpose + bf16 conversion) is done once per tensor and reused;
+    // kernels point into it via B offsets.
     struct weight_key {
         const void * data = nullptr;
         int          K    = 0;
@@ -89,18 +90,19 @@ struct xdna_ops {
 
     // Batching: MUL_MAT ops are submitted (started without wait) and collected
     // here; xdna_ops_finalize() waits them all, reads C back, and writes dst.
-    // Each op is tiled in M (the baked M block) and K (GEMM_K_MAX blocks): a
-    // pending_run is one (M-block, K-block) submission.
+    // Each op is tiled in M (the baked M block) and K (GEMM_K_RUN runs): a
+    // pending_run is one (M-block, K-run) submission.
     struct pending_run {
         xrt::run      run;
-        xdna_buffer * bo_c   = nullptr;  // held until readback
-        xdna_buffer * bo_a   = nullptr;  // released after readback
-        int           mb_idx = 0;        // index into pending_op::m_blocks
+        xdna_buffer * bo_c       = nullptr;  // held until readback
+        xdna_buffer * bo_a       = nullptr;  // released after readback
+        int           mb_idx     = 0;        // index into pending_op::m_blocks
+        bool          accumulate = false;    // adds to dst: not the op's first K run
     };
 
     struct pending_m_block {
         int                      m0 = 0;  // dst row offset of this M-block
-        std::vector<pending_run> runs;    // one per K-block
+        std::vector<pending_run> runs;    // one per K run
     };
 
     struct pending_op {
@@ -113,6 +115,11 @@ struct xdna_ops {
     };
 
     std::vector<pending_op> pending;
+
+    // The bound kernel of each GEMM stream by shape, so a repeated shape does
+    // not build its stream again.
+    std::unordered_map<std::string, xdna_kernel *> gemm_kernel;
+    std::mutex                                     gemm_kernel_mutex;
 
     // Decode GEMV runners, keyed by the first weight of the dispatch. The
     // packed weights live in the runner's device buffer for the process
