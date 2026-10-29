@@ -46,13 +46,14 @@ bool xdna_pgemm_run_into(struct xdna_kernel_pool * pool,
                          struct xdna_buffer *      bo,
                          size_t                    off);
 
-// A SWIGLU of two such MUL_MATs of one activation (the FFN's gate and up,
-// weights of one type) the array runs whole: one call, the cores applying
-// silu(gate) * up before C leaves them (GGML_XDNA_PGEMM_GLU=0: off). The
-// caller skips the two MUL_MATs, whose outputs nothing else may read.
+// A SWIGLU or GEGLU of two such MUL_MATs of one activation (the FFN's gate
+// and up, weights of one type) the array runs whole: one call, the cores
+// applying silu(gate) * up, or gelu(gate) * up in its tanh form, before C
+// leaves them (GGML_XDNA_PGEMM_GLU=0: off). The caller skips the two
+// MUL_MATs, whose outputs nothing else may read.
 bool xdna_pgemm_glu_supported(const struct ggml_tensor * glu);
 bool xdna_pgemm_run_glu(struct xdna_kernel_pool * pool, struct ggml_tensor * glu);
-// The same SwiGLU written by the cores in bf16 straight into the A layout of
+// The same GLU written by the cores in bf16 straight into the A layout of
 // `down`, the MUL_MAT that reads it (GGML_XDNA_PGEMM_GLU_A=0: off): the GLU's
 // own output is not written, and down's call finds its A laid out. The caller
 // runs down next and lets nothing else read the GLU's node.
