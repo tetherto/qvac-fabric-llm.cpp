@@ -14033,6 +14033,7 @@ static void add_speech_htp_cases(std::vector<std::unique_ptr<test_case>> & cases
     cases.emplace_back(new test_speech_matmul_precision(GGML_TYPE_F16, GGML_TYPE_F16, 32, 33, 32, {1, 1}, {1, 1}));
     cases.emplace_back(new test_speech_matmul_precision(GGML_TYPE_F16, GGML_TYPE_F32, 64, 32, 128, {2, 1}, {1, 1}));
     cases.emplace_back(new test_speech_matmul_precision(GGML_TYPE_Q8_0, GGML_TYPE_F32, 64, 32, 128, {1, 1}, {1, 1}));
+    cases.emplace_back(new test_speech_matmul_precision(GGML_TYPE_BF16, GGML_TYPE_F32, 65, 17, 128, {1, 1}, {1, 1}));
     add_speech_htp_type_cases(cases, GGML_TYPE_F32);
     add_speech_htp_type_cases(cases, GGML_TYPE_F16);
     cases.emplace_back(new test_speech_htp<test_get_rows>(GGML_TYPE_BF16, 33, 11, 5, 2, 1, true, true, 1));
