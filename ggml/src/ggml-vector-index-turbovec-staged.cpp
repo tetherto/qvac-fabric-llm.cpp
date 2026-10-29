@@ -1351,7 +1351,8 @@ bool turbovec_staged_search(
         plain_lut = build_sign_lut(q_sign.data(), m, dim, false);
         plain_lut.bias += bias_corr;
     }
-    const SignLut & rank_lut = plain_lut.values.empty() ? sign_lut : plain_lut;
+    // Read by the NEON table ranking only.
+    [[maybe_unused]] const SignLut & rank_lut = plain_lut.values.empty() ? sign_lut : plain_lut;
     // The query's tables for the ranking and the exact rescore. A split
     // query builds them while its blocks are scanned.
     LowPlanes low_planes;
