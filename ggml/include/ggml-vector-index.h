@@ -4,7 +4,7 @@
 //
 // This public C API supports full f32 storage (`bit_width=32`), q8 storage
 // (`bit_width=8`), packed q4 storage (`bit_width=4`), and distinct TurboVec
-// q2/q4 modes with CPU search directly against quantized codes.
+// 2-, 3- and 4-bit modes with CPU search directly against quantized codes.
 // q8 and q4 use NEON when available. Supported x86 CMake builds compile AVX2
 // kernels separately and runtime-dispatch them from a non-AVX2 baseline.
 //
@@ -117,8 +117,8 @@ GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim)
 // sample fits quantiles that hurt recall. Calibrate before adding when you
 // can: re-encoding stored rows is a second quantization. May be called again
 // to refit. Requires `n >= 2`. Returns GGML_VEC_INDEX_E_INVALID_ARG for a
-// non-TurboVec or legacy (v3-loaded) index, invalid values, or a sample whose
-// fit is the identity. Invalidates prepared filters and IVF state.
+// non-TurboVec, legacy (v3-loaded), mmap-loaded or delta-bound index, a NULL
+// `sample`, invalid values, or a sample whose fit is the identity. Invalidates prepared filters and IVF state.
 GGML_VEC_INDEX_API int ggml_vec_index_turbovec_calibrate(
     ggml_vec_index_t * idx,
     const float * sample,
@@ -157,11 +157,12 @@ GGML_VEC_INDEX_API int ggml_vec_index_threads(const ggml_vec_index_t * idx);
 // associating each with the corresponding `ids[i]` (caller-owned external id).
 // Returns 0 on success. Returns GGML_VEC_INDEX_E_DUPLICATE if any id already
 // exists in the index; in that case the index is unchanged (atomic add).
-// All vector components must be finite. TurboVec q2/q4 also require
+// All vector components must be finite. TurboVec indexes also require
 // `abs(component) < 1e16`. UINT64_MAX is reserved for search result padding and
 // is not a valid id. `n == 0` is a no-op on handles that accept plain
 // mutations. Live index length and total allocated slots are capped at INT_MAX;
-// compact after bulk removes to reclaim tombstoned slots.
+// compact after bulk removes to reclaim tombstoned slots (TurboVec 1.x
+// indexes leave none, see `ggml_vec_index_remove`).
 GGML_VEC_INDEX_API int ggml_vec_index_add(
     ggml_vec_index_t * idx,
     const float      * vectors,
@@ -178,7 +179,8 @@ GGML_VEC_INDEX_API int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id
 
 // Physically removes deleted slots from in-memory storage. This does not write
 // to disk. If any slots are removed, prepared filters and IVF state are
-// invalidated. Returns 0 on success, negative on error.
+// invalidated. A TurboVec 1.x index has no deleted slots, so this is a no-op
+// there. Returns 0 on success, negative on error.
 GGML_VEC_INDEX_API int ggml_vec_index_compact(ggml_vec_index_t * idx);
 
 // Logged mutations for incremental persistence. These update `idx` and append
@@ -227,7 +229,7 @@ GGML_VEC_INDEX_API int ggml_vec_index_remove_logged(
 // Read-only.
 GGML_VEC_INDEX_API int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id);
 
-// Optional cache warmup. TurboVec q2/q4 precompute rotation and codebook state;
+// Optional cache warmup. TurboVec indexes precompute rotation and codebook state;
 // other storage modes ignore this call. Existing callers do not need to call
 // this; use `ggml_vec_index_build_ivf` when ANN search preparation is needed.
 GGML_VEC_INDEX_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
@@ -265,7 +267,7 @@ GGML_VEC_INDEX_API int ggml_vec_index_build_ivf(
 // `query[i] * (q_code * per_vector_scale)`, without expanding the stored
 // matrix back to f32. Callers that want cosine similarity must L2-normalize
 // their vectors before insert AND before query; the index does NOT normalize
-// internally. All query components must be finite; TurboVec q2/q4 also require
+// internally. All query components must be finite; TurboVec indexes also require
 // `abs(component) < 1e16`. SIMD and scalar reduction order can produce small
 // score differences across CPU architectures.
 GGML_VEC_INDEX_API int ggml_vec_index_search(
@@ -481,7 +483,10 @@ GGML_VEC_INDEX_API int ggml_vec_index_ids(
     size_t                   capacity,
     size_t                 * out_count);
 
-// File format (.tvim versions 2 and 3, all little-endian):
+// File format (.tvim versions 2 and 3, all little-endian). TurboVec 1.x
+// indexes write upstream turbovec's v8 container instead (see
+// docs/vector-index.md); v3 below is the legacy TurboVec format, still read
+// and written for indexes loaded from it.
 // "TQ+" here is the TurboVec per-coordinate calibration scheme, unrelated to
 // ggml tensor types GGML_TYPE_TQ1_0 and GGML_TYPE_TQ2_0.
 //
@@ -501,7 +506,7 @@ GGML_VEC_INDEX_API int ggml_vec_index_ids(
 //   32      ...    qparams:
 //                    - f32: empty
 //                    - q4/q8: N float32 scales
-//                    - TurboVec q2/q4: N float32 score-correction scales
+//                    - legacy TurboVec q2/q4: N float32 score-correction scales
 //   ...     ...    TQ+ calibration (v3): D float32 shifts, then D float32 scales
 //   ...     ...    vectors:
 //                    - f32: N*D float32 values, row-major
@@ -524,7 +529,7 @@ GGML_VEC_INDEX_API int ggml_vec_index_ids(
 // the header CRC covers bytes [0, 32), and
 // the CRC32C of an empty section is zero.
 // Legacy v2 files with flags=0 and no checksum trailer remain readable.
-// Writers emit checksummed v2/v3 files. Readers reject unknown versions and
+// Writers emit checksummed v2/v3 files (v8 for TurboVec 1.x). Readers reject unknown versions and
 // flag bits; they also accept legacy v1 f32 snapshots. Legacy bit_width=8
 // snapshots migrate to q8, while all other legacy widths migrate to f32.
 //

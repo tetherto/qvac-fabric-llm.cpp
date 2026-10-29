@@ -371,13 +371,16 @@ struct ggml_vec_index {
     // True for an index loaded from a v3 snapshot: it keeps the turbovec 0.9
     // QR rotation, codebook and first-add calibration it was written with.
     bool turbovec_legacy = false;
-    // The blocked cache uses upstream's vector-major layout (1.x 4-bit
-    // indexes on hosts that score with permute-dot); fixed at creation.
+    // The blocked cache uses upstream's vector-major layout (1.x indexes on
+    // hosts with the dot-product kernels: 4-bit on aarch64, 2 to 4 bits on
+    // x86); fixed at creation.
     bool turbovec_blocked_vm = false;
     // The blocked cache uses upstream's wider `vm8` unit instead (aarch64
     // with i8mm: 4-bit indexes whose byte-group count is a multiple of
     // eight, and 2-bit ones under TURBOVEC_2BIT_VM8=1); fixed at creation
     // and never persisted, since snapshots are written from sequential rows.
+    // A 4-bit vm8 index keeps `turbovec_blocked_vm` set as well (it scores
+    // with permute-dot); `turbovec_layout` gives vm8 priority.
     bool turbovec_blocked_vm8 = false;
     // Created under upstream's x86 rules (turbovec_x86_rules); fixed at
     // creation. With the vector-major layout, 2- and 3-bit codes score
@@ -710,10 +713,11 @@ int turbovec_index_hashes_for_test(
 #endif
 // Whether this CPU runs upstream turbovec's dot-product ("vector-major")
 // kernels: aarch64 with dot product, x86 with AVX-512 F/BW/VBMI/VNNI. Those
-// hosts score 4-bit codes with int8 permute-dot arithmetic.
+// hosts score 4-bit codes with int8 permute-dot arithmetic, and x86 also
+// scans 2- and 3-bit codes in the vector-major layout with `vpermb`.
 bool turbovec_cpu_vector_major();
 // The CPU's own dot-product support, which a test override cannot change:
-// gates the SDOT instructions themselves.
+// gates the SDOT and AVX-512 VNNI instructions themselves.
 bool turbovec_cpu_dot_product();
 // Runtime CPU features gating the rotation, encode, layout and checksum
 // kernels, as upstream turbovec gates them with is_x86_feature_detected!.
@@ -928,8 +932,6 @@ bool turbovec_planes_wanted(int bits, int dim, size_t n_vectors);
 void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot);
 void turbovec_planes_reset(ggml_vec_index & idx);
 void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
-// Searches one query (rotated, TQ+-calibrated) in stages into `heap`;
-// returns false when the index is not set up for it.
 // How a staged search is run, following upstream's batch bookkeeping.
 struct TurboVecStagedOpts {
     // The call searches one query: on aarch64 its sign tables cap at 31.
@@ -945,6 +947,9 @@ struct TurboVecStagedOpts {
     // Threads the one query may split its blocks over (a batch already
     // splits across queries and passes 1). The results do not depend on it.
     int n_threads = 1;
+    // Skip the sampled seed: a batch's rescan of a query whose seed ran
+    // short, which upstream runs unseeded. The results do not depend on it.
+    bool unseeded = false;
     // The query's shortlist, when the caller scanned the sign region for it
     // (a batch): sign scores under the centred tables, by slot. The call
     // then ranks and rescores it and skips the scan.
@@ -965,6 +970,8 @@ bool turbovec_staged_search_batch(
     int k,
     int n_threads,
     std::vector<std::vector<ScoreId>> & heaps);
+// Searches one query (rotated, TQ+-calibrated) in stages into `heap`;
+// returns false when the index is not set up for it.
 bool turbovec_staged_search(
     const ggml_vec_index & idx,
     const float * query,
@@ -1006,7 +1013,6 @@ float dot_turbovec_bits_lut_row(
     const float * scales,
     int bits,
     int dim);
-void quantize_turbovec_q2_row(const float * src, uint8_t * dst, float * scales, int dim);
 void quantize_turbovec_batch(
     const float * src,
     int n,
@@ -1104,31 +1110,6 @@ void turbovec_sync_unbind(ggml_vec_index & idx) noexcept;
 // next sync's redo ops.
 void turbovec_sync_note_remove(ggml_vec_index & idx, size_t slot) noexcept;
 int turbovec_v8_sync(ggml_vec_index & idx, const char * path);
-void decode_turbovec_q2_row(const uint8_t * codes, const float * scales, float * dst, int dim);
-void decode_turbovec_q2_row_calibrated(
-    const uint8_t * codes,
-    const float * scales,
-    const float * tqplus_shift,
-    const float * tqplus_scale,
-    float * dst,
-    int dim);
-void build_turbovec_q2_lut(const float * rotated_query, int dim, std::vector<uint8_t> & lut, float & scale, float & bias);
-float dot_turbovec_q2_lut_row(const uint8_t * lut, float lut_scale, float lut_bias, const uint8_t * codes, const float * scales, int dim);
-float dot_turbovec_q2_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim);
-float dot_turbovec_q2_row(const float * query, const uint8_t * codes, const float * scales, int dim);
-void quantize_turbovec_q4_row(const float * src, uint8_t * dst, float * scales, int dim);
-void decode_turbovec_q4_row(const uint8_t * codes, const float * scales, float * dst, int dim);
-void decode_turbovec_q4_row_calibrated(
-    const uint8_t * codes,
-    const float * scales,
-    const float * tqplus_shift,
-    const float * tqplus_scale,
-    float * dst,
-    int dim);
-void build_turbovec_q4_lut(const float * rotated_query, int dim, std::vector<uint8_t> & lut, float & scale, float & bias);
-float dot_turbovec_q4_lut_row(const uint8_t * lut, float lut_scale, float lut_bias, const uint8_t * codes, const float * scales, int dim);
-float dot_turbovec_q4_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim);
-float dot_turbovec_q4_row(const float * query, const uint8_t * codes, const float * scales, int dim);
 // Patches the blocked cache for a swap-remove of `slot` whose last slot
 // (`last`, already removed from the rows) moved into it.
 void turbovec_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
