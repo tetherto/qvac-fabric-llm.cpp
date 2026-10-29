@@ -37,6 +37,10 @@ bool env_flag_set(const char * name) {
 
 // The hardware half of upstream's `use_vector_major`: the instructions its
 // dot-product kernels need, without the environment opt-out.
+// It follows the CPU, not the build: where the kernels are not compiled in
+// (MSVC cl on ARM64 has no SDOT kernel; an x86 build without the VNNI
+// objects), the vector-major layout is scored by the scalar models, which
+// keep upstream's results but run far slower than the LUT scan.
 bool detect_dot_product() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     // ARMv8.2 dot product (SDOT), upstream `use_vector_major` on aarch64.
@@ -156,8 +160,9 @@ bool detect_i8mm() {
 #define HWCAP2_I8MM (1 << 13)
 #endif
     return (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0;
-#elif defined(_WIN32) && defined(PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE)
-    return IsProcessorFeaturePresent(PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE) != 0;
+#elif defined(_WIN32)
+    // Older SDKs lack the name; 66 is its value, as in ggml-feats.h.
+    return IsProcessorFeaturePresent(66 /* PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE */) != 0;
 #else
     return false;
 #endif

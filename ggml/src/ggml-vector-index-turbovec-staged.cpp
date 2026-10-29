@@ -8,11 +8,11 @@
 // path (search.rs `search` with a `PlanesRef`, `rerank_legacy`, `Refine`).
 // Upstream's seeded collectors only speed the shortlist up, except that on
 // aarch64 the one query of a batch whose seed runs short is rescanned with
-// single-query tables; the port seeds the same way and reports that query. Upstream's in-scan
-// refinement on a thread pool, which can return other rows than its
-// single-threaded path, is not reproduced: a lone query here splits the
-// shortlist scan, the ranking and the rescore across threads and still
-// returns the single-threaded results.
+// single-query tables; the port seeds the same way and reports that query.
+// Upstream's in-scan refinement on a thread pool, which can return other
+// rows than its single-threaded path, is not reproduced: a lone query here
+// splits the shortlist scan, the ranking and the rescore across threads and
+// still returns the single-threaded results.
 
 #include "ggml-vector-index-impl.h"
 
@@ -83,8 +83,10 @@ inline void prefetch_read(const void * p) {
 #endif
 }
 
-// Trailing zero bits of a non-zero word.
+// Trailing zero bits of a non-zero word (callers check; the loop below
+// would never end on zero).
 inline int ctz64(uint64_t x) {
+    assert(x != 0);
 #if defined(__GNUC__) || defined(__clang__)
     return __builtin_ctzll(x);
 #else
@@ -415,13 +417,15 @@ LowPlanes build_low_planes(const float * q, float m, int dim) {
     const bool valid = q_max > 0.0f && std::isfinite(q_max);
     const bool overflow = valid && static_cast<double>(top) / q_max >= 0x1.fffffep127 + 0x1p103;
     const float inv = valid && !overflow ? top / q_max : 0.0f;
-    bool built = false;
+    // A non-finite q_max (an infinite coordinate) would make inf * 0 a NaN,
+    // which Rust casts to 0 and C++ may not cast: every weight stays 0.
+    bool built = !valid;
 #if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL)
     // Upstream's AVX-512 build (sixteen coordinates a step), where dim
     // allows it; the same weights as the loop below. Its conversions are
     // not saturating, so an overflowing query takes the loop.
     const VecIndexCpuFeatures & features = vec_index_cpu_features();
-    if (!overflow && dim % 16 == 0 && features.avx512bw && features.avx2 &&
+    if (valid && !overflow && dim % 16 == 0 && features.avx512bw && features.avx2 &&
         g_low_kernels_enabled.load(std::memory_order_relaxed)) {
         out.sum_w = ggml_vec_index_detail::turbovec_build_low_masks_avx512(
             q, static_cast<size_t>(dim), inv, static_cast<uint32_t>(top), masks.data());
@@ -1103,6 +1107,8 @@ struct Collector {
             return;
         }
         if (cut) {
+            // Unlike the SSE2 walk, vcgtq drops a NaN lane; the API's finite,
+            // bounded inputs keep sign scores finite, so the two agree.
             const float32x4_t thr = vdupq_n_f32(static_cast<float>(threshold));
             for (size_t half = 0; half < 2; ++half) {
                 const uint16x4_t c0 = vmovn_u32(vcgtq_f32(v[half * 4], thr));
@@ -1338,9 +1344,14 @@ bool turbovec_staged_search(
                 kSignCentre * idx.turbovec_tqplus_shift[static_cast<size_t>(d)] / idx.turbovec_tqplus_scale[static_cast<size_t>(d)];
         }
     }
-    SignLut sign_lut = build_sign_lut(q_sign.data(), m, dim, arm_rules && (single_query || opts.sign_single));
-    sign_lut.bias += bias_corr;
-    split_sign_lut(idx, sign_lut);
+    // A batch query arrives with its shortlist scanned, so its sign tables
+    // are needed only by the NEON table ranking.
+    SignLut sign_lut;
+    if (opts.shortlist == nullptr || table_rank) {
+        sign_lut = build_sign_lut(q_sign.data(), m, dim, arm_rules && (single_query || opts.sign_single));
+        sign_lut.bias += bias_corr;
+        split_sign_lut(idx, sign_lut);
+    }
     SignLut plain_lut;
     if (refines && table_rank && calibrated) {
         plain_lut = build_sign_lut(query, m, dim, single_query);
@@ -1472,7 +1483,7 @@ bool turbovec_staged_search(
         // all instead of ratcheting a top s_len, and rescans a query that
         // comes back with fewer than s_len rows above the seed. With s_len
         // rows above it the rows kept are exactly the unseeded top s_len.
-        const bool seeded = (arm_rules || vm_sign) && allowed_mask == nullptr && 2 * s_len < n_allowed &&
+        const bool seeded = !opts.unseeded && (arm_rules || vm_sign) && allowed_mask == nullptr && 2 * s_len < n_allowed &&
             n / kBlock >= kSeedMinBlocks;
         float seed = -std::numeric_limits<float>::infinity();
         if (seeded) {
@@ -1885,12 +1896,14 @@ bool turbovec_staged_search_batch(
         }
     }
     heaps.assign(n_q_sz, {});
-    auto run_query = [&](size_t q, const std::vector<ScoreId> * shortlist, bool sign_single) {
+    auto run_query = [&](size_t q, const std::vector<ScoreId> * shortlist, bool sign_single, bool rescan,
+                         int query_threads) {
         TurboVecStagedOpts o;
         o.single_query = false;
         o.sign_single = sign_single;
-        o.n_threads = 1;
+        o.n_threads = query_threads;
         o.shortlist = shortlist;
+        o.unseeded = rescan;
         turbovec_staged_search(idx, score_queries.data() + q * dim_sz, biases[q], k, nullptr, o, heaps[q]);
     };
 
@@ -1982,14 +1995,14 @@ bool turbovec_staged_search_batch(
                 std::nth_element(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(s_len - 1), top.end(), score_id_better);
                 top.resize(s_len);
             }
-            run_query(q, &top, false);
+            run_query(q, &top, false, false, 1);
         }
     });
 
     // Upstream rescans a batch's short queries unseeded: one alone through
     // the single-query scan and, under the aarch64 rules, its narrower
-    // tables, several with the batch tables. The lone scan does both:
-    // seeded again, it comes back short again and rescans itself unseeded.
+    // tables, several with the batch tables. A lone one may split its
+    // blocks over every thread, as a lone search does.
     std::vector<size_t> short_queries;
     for (size_t q = 0; q < n_q_sz; ++q) {
         if (seed_short[q] != 0) {
@@ -1997,7 +2010,9 @@ bool turbovec_staged_search_batch(
         }
     }
     const bool lone_short = short_queries.size() == 1;
-    parallel_for(short_queries.size(), n_threads, [&](size_t i, size_t) { run_query(short_queries[i], nullptr, lone_short); });
+    parallel_for(short_queries.size(), n_threads, [&](size_t i, size_t) {
+        run_query(short_queries[i], nullptr, lone_short, true, lone_short ? n_threads : 1);
+    });
     return true;
 }
 
@@ -2151,8 +2166,8 @@ int turbovec_vnni_fused_scan_parity_for_test(ggml_vec_index_t * idx, const float
         }
     }
     // A planes cache that is not ready makes the staged search fall back to
-    // the full scan, so say which part is missing, before and after one
-    // search (a cache built lazily by the first search would show here).
+    // the full scan: check before and after one search (a cache built lazily
+    // by the first search shows here), and return -5 when it never is.
     for (int attempt = 0; attempt < 2; ++attempt) {
         bool ready = false;
         {
@@ -2160,20 +2175,6 @@ int turbovec_vnni_fused_scan_parity_for_test(ggml_vec_index_t * idx, const float
             TurboVecPlanesStats stats;
             const std::vector<float> * centre = nullptr;
             ready = planes_ready(*idx, stats, centre);
-            if (!ready) {
-                const size_t n = idx->slot_to_id.size();
-                const size_t n_blocks = (n + kBlock - 1) / kBlock;
-                const size_t nsg = static_cast<size_t>(idx->dim) / 8;
-                const size_t n_byte_groups =
-                    static_cast<size_t>(idx->dim) / static_cast<size_t>(8 / idx->turbovec_bits);
-                std::fprintf(stderr,
-                    "planes not ready (%s search): n %zu bits %d dim %d planes %d sign %zu/%zu blocked_n_blocks %zu/%zu "
-                    "blocked_data %zu/%zu layout %d sign_layout %d\n",
-                    attempt == 0 ? "before" : "after", n, idx->turbovec_bits, idx->dim, idx->turbovec_planes ? 1 : 0,
-                    idx->turbovec_sign_blocked.size(), n_blocks * nsg * kBlock, idx->turbovec_blocked_n_blocks, n_blocks,
-                    idx->turbovec_blocked_data.size(), n_blocks * n_byte_groups * kBlock,
-                    static_cast<int>(turbovec_layout(*idx)), static_cast<int>(turbovec_sign_layout(*idx)));
-            }
         }
         if (ready) {
             break;
