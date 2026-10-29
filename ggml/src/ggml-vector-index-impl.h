@@ -240,6 +240,27 @@ inline constexpr size_t kTurboVecParallelMinBlocks = 1024;
 // bit flushes at the same points, so it is shared here.
 inline constexpr int kTurboVecFlushEvery = 256;
 
+// std::round (half away from zero) without the libm call it is on x86's
+// baseline, where it costs the table builds a call per entry (upstream
+// round_half_away_f32, H65). aarch64 keeps std::round: it is one frinta
+// and vectorises, where the form below does not. Below 2^23 the integer
+// conversion is the exact truncation and the fraction is exact in f32; at
+// or above it, and for NaN, a float is already its own rounding. Only the
+// sign of a zero result can differ from std::round, which the callers'
+// max(0, ..) erases.
+inline float round_half_away_f32(float x) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return std::round(x);
+#else
+    if (!(std::fabs(x) < 8388608.0f)) {
+        return x;
+    }
+    const float t = static_cast<float>(static_cast<int32_t>(x));
+    const float f = x - t;
+    return t + static_cast<float>(static_cast<int>(f >= 0.5f) - static_cast<int>(f <= -0.5f));
+#endif
+}
+
 // One parallel_for task: ctx is the caller's functor.
 using ParallelTaskFn = void (*)(void * ctx, size_t task, size_t worker);
 
