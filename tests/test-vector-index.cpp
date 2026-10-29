@@ -6909,7 +6909,7 @@ void check_turbovec_1x_vnni_fused_scan() {
                         for (const int k : { 1, 10, 64, 150 }) {
                             const int status = turbovec_vnni_fused_scan_parity_for_test(tv, queries.data(), nq, k);
                             if (status < 0) {
-                                std::printf("SKIP TurboVec fused vnni scan parity\n");
+                                std::printf("SKIP TurboVec fused vnni scan parity (reason %d)\n", status);
                                 skipped = true;
                                 break;
                             }

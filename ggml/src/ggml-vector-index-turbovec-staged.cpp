@@ -2133,19 +2133,28 @@ int64_t turbovec_batch_scan_count_for_test() {
 }
 
 int turbovec_vnni_fused_scan_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k) {
-#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+    // Below zero: why the parity could not run (-1 kernel not built, -2 not
+    // a staged 1.x index, -3 sign region not vector-major, -4 no dot product,
+    // -5 planes cache not ready), so a skip on a host that should run it
+    // says what to fix. The host checks run everywhere.
     {
         std::shared_lock<std::shared_mutex> lock(idx->mutex);
-        if (!is_turbovec(*idx) || idx->turbovec_legacy || !idx->turbovec_staged_enabled ||
-            turbovec_sign_layout(*idx) != kTurboVecLayoutVm || !turbovec_cpu_dot_product()) {
-            return -1;
+        if (!is_turbovec(*idx) || idx->turbovec_legacy || !idx->turbovec_staged_enabled) {
+            return -2;
+        }
+        if (turbovec_sign_layout(*idx) != kTurboVecLayoutVm) {
+            return -3;
+        }
+        if (!turbovec_cpu_dot_product()) {
+            return -4;
         }
         TurboVecPlanesStats stats;
         const std::vector<float> * centre = nullptr;
         if (!planes_ready(*idx, stats, centre)) {
-            return -1;
+            return -5;
         }
     }
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
     const size_t dim = static_cast<size_t>(idx->dim);
     const size_t k_sz = static_cast<size_t>(k);
     std::vector<float> scores[2];
