@@ -101,7 +101,7 @@ See [docs/coreml-ffn.md](docs/coreml-ffn.md) for the full guide.
 
 ### AMD XDNA (NPU) Backend *(exclusive)*
 
-A ggml backend that runs part of a graph on the AMD XDNA2 NPU (Ryzen AI: Strix Point, Strix Halo, Krackan) through XRT. It is built around Qwen3.5-style models with gated-delta-net layers, where single-token decode runs almost entirely on the NPU array. See [ggml/src/ggml-xdna/README.md](ggml/src/ggml-xdna/README.md) for build, environment variables and troubleshooting.
+A ggml backend that runs part of a graph on the AMD XDNA2 NPU (Ryzen AI: Strix Point, Strix Halo, Krackan) through XRT. It is built around Qwen3.5-style models with gated-delta-net layers, where single-token decode runs almost entirely on the NPU array. The EmbeddingGemma 2 embedding model also runs, checked against the CPU by `test-xdna-embedding`. See [ggml/src/ggml-xdna/README.md](ggml/src/ggml-xdna/README.md) for build, environment variables and troubleshooting.
 
 - **Matrix multiplication**: BF16, F16, Q4_K, Q5_K and Q6_K weights with F32 activations. Decode GEMV keeps weights quantized in memory and applies group parameters on the accumulator. Small batches use a decode GEMM and larger prefill batches use a prefill GEMM, with an int8 path for K-quants.
 - **Fused decode layer**: one design holds the whole recurrent layer of a decode token (conv, norm, gated delta net, gated epilogue, projections and the FFN transition), with the recurrent state kept on the device between tokens.

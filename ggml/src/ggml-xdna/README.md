@@ -4,7 +4,8 @@ A ggml backend that runs part of a llama.cpp graph on the AMD XDNA NPU (Ryzen
 AI, XDNA2 / NPU2: Strix Point, Strix Halo, Krackan) through XRT. It is built
 around one model family - Qwen3.5 with gated-delta-net layers - whose
 single-token decode runs almost entirely on the array; everything else falls
-back to per-op kernels or the host.
+back to per-op kernels or the host. That is also how it runs the EmbeddingGemma
+2 embedding model (see [Embedding models](#embedding-models)).
 
 ## What runs on the NPU
 
@@ -86,6 +87,53 @@ The glue runs on its own CPU backend with its own pool: `GGML_XDNA_GLUE_THREADS`
 (4) for decode-sized chunks, `GGML_XDNA_GLUE_THREADS_BIG` (16) once a chunk has
 32 tokens or more, and 12 (at most `GGML_XDNA_GLUE_THREADS_BIG`) for a decode's
 vocabulary projection. `-t` does not size it.
+
+### Embedding models
+
+EmbeddingGemma 2 (`gemma-embedding2`, the `ggml-org/embeddinggemma-2-GGUF`
+Q8_0 and BF16 files) runs without a model-specific path:
+
+- Its weight projections take the [MUL_MAT](#mul_mat) routes. In the Q8_0
+  file they are all on the array: the `Q8_0` weights through the prefill GEMM,
+  repacked to the 8-bit form with one extra rounding of the codes, and the
+  `BF16` `per_layer_model_proj` through the bf16 GEMM. In the BF16 file the
+  `output` projection (N 768) is not a multiple of 512 and stays on the host.
+- Attention, the norms, RoPE, GEGLU and the mean pooling are host glue. The
+  prefill attention kernel is causal with 256-wide heads, and this model's
+  attention is bidirectional, with a sliding window on most layers.
+- An input of one token runs whole on the host, as the decode of a model
+  wider or narrower than the fused layers does. The model's residual width is
+  512, not 1024, so the backend logs once that "its decode runs on the host",
+  whatever the input length.
+
+Run it with the whole input in one ubatch, which non-causal attention needs:
+
+```sh
+OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-embedding -m embeddinggemma-2-Q8_0.gguf \
+    --device XDNA0 -ngl 99 -fa on --poll 0 -c 2048 -b 2048 -ub 2048 -p "..."
+```
+
+Against the CPU backend on a Ryzen AI MAX+ 395, the pooled embeddings agree
+to a cosine of at least 0.9992 (Q8_0) and 0.9996 (BF16). Every layer's output
+stays within an NMSE of 1.5e-2. That drift comes from the GEMMs: the prefill
+blocks (M >= 64) multiply in bfp16-emulated bf16, and the CPU's own Q8_0
+against BF16 moves the layers by up to 7.1e-3. `test-xdna-embedding -m
+model.gguf` checks both, and `scripts/snapdragon/embeddinggemma2_eval.py
+--device XDNA0 --flash-attn on` runs the packing, ordering and CPU-parity
+checks.
+
+Each GEMM dispatch costs ~0.4 ms of fixed overhead, and a Q8_0 pass makes 169
+of them, so the array pays off on long inputs only (Q8_0, the eval driver's
+corpus, CPU at 16 threads):
+
+| input | CPU | XDNA |
+| :-- | --: | --: |
+| one 1011-token text | 362 ms | 271 ms |
+| eight texts, 1188 tokens, one batch | 444 ms | 364 ms |
+| one 18-33 token query | 7-16 ms | ~100 ms |
+
+The BF16 file is slower on the array (829 ms against 389 ms for the eight
+texts). For short queries, run on the CPU (`--device none`).
 
 ## How it works
 
@@ -227,8 +275,10 @@ prefill kernels); the fused layer never fires there.
   Verified against mlir-aie 1.4.3: the RTP buffer bases in `xdna-seq.h` are read
   back from that toolchain's placement, so a version bump needs them re-read
   from a freshly compiled project (the header says which values).
-- A model the fused decode path covers (see above). A refused quantization is
-  not run by setting `GGML_XDNA_FUSED_LAYER=0`; requantize `ssm_out` (see Build).
+- For a Qwen3.5 decode, a model the fused decode path covers (see above). A
+  refused quantization is not run by setting `GGML_XDNA_FUSED_LAYER=0`;
+  requantize `ssm_out` (see Build). An embedding model does not decode and
+  needs none of this.
 
 ## Build
 
@@ -455,3 +505,6 @@ Diagnostics - nothing is measured unless they are set:
   are host memory, and the free memory it reports is the system's
   `MemAvailable`, which the CPU and any other device on host memory draw from
   too.
+- A non-causal model's attention (EmbeddingGemma 2) runs on the host: the
+  prefill attention kernel is causal only. Its f16 casts of K and V run on the
+  CPU backend, so the graph splits once per layer.
