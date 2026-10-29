@@ -26,11 +26,14 @@ already covered by the Metal/Vulkan parts; they are not a separate merged patch.
 - CUDA implementations of the new speech operations are not part of the merged
   stack. Existing CUDA operations must not be confused with coverage of these
   new operation IDs.
-- The remaining Hexagon implementation is included in this change: col2im-1d,
-  conv-2d-dw, fused depthwise-conv-1d, timestep-embedding, transpose, GELU-erf,
-  F32 attention inputs, F16 HMX activations, partial output tiles, K=9 matmul,
-  BF16 row gathers, and strided copies/im2col. Existing upstream DMA splitting
-  and batched F32 VTCM matmul are retained. Device validation remains required.
+- The remaining Hexagon implementation (col2im-1d, conv-2d-dw, fused
+  depthwise-conv-1d, timestep-embedding, transpose, GELU-erf, F32 attention
+  inputs, F16 HMX activations, partial output tiles, K=9 matmul, BF16 row
+  gathers, and strided copies/im2col) is on `temp-11259` but **deferred on
+  `qvac-b11739`**: upstream b11739 rewrote the Hexagon backend, so those kernels
+  need a separate port. Their tests and the `htp-dma-reader.h` helper are
+  carried; the QDC speech lane accepts unsupported cases until the port lands.
+  Device validation remains required.
 - The SNAKE reviewer reported a successful Galaxy S25 (SM8750, v79) run. The
   three QDC jobs skipped device execution because the API key was unavailable.
   QCS9075M and SM8850 remain unvalidated; green skipped jobs are not device passes.
@@ -120,7 +123,9 @@ The speech group covers vector/tile tails, padding/dilation, planar and channel
 layouts, strides over 64 KiB, fused depthwise convolution with weight buffers,
 F16/BF16 conversion, mixed F32/F16 attention, and partial matmul output tiles.
 New direct-access kernels stage extended-address inputs through DMA on v81.
-The Android and Linux QDC runners require every selected case to execute and
-pass when credentials are available. Without a QDC API key, the workflow skips
+When credentials are available, the Android and Linux QDC runners require the
+run to exit successfully with `Backend HTP0: OK`, so every case that executes
+must pass. On `qvac-b11739` they allow unsupported cases until the deferred
+Hexagon kernels are ported; restore the strict every-case gate with that port. Without a QDC API key, the workflow skips
 device execution. Completion requires actual runs on QCS9075M,
 SM8750, and SM8850; builds and CPU references do not establish HTP correctness.
