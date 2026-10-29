@@ -1504,9 +1504,9 @@ static void build_turbovec_query_lut(
             const size_t lo = static_cast<size_t>(g) * 32 + static_cast<size_t>(i);
             const size_t hi = static_cast<size_t>(g) * 32 + 16 + static_cast<size_t>(i);
             out_values[lo] = static_cast<uint8_t>(
-                std::max(0.0f, std::min(max_lut, std::round((float_vals[lo] - lo_min) * inv_scale))));
+                std::max(0.0f, std::min(max_lut, round_half_away_f32((float_vals[lo] - lo_min) * inv_scale))));
             out_values[hi] = static_cast<uint8_t>(
-                std::max(0.0f, std::min(max_lut, std::round((float_vals[hi] - hi_min) * inv_scale))));
+                std::max(0.0f, std::min(max_lut, round_half_away_f32((float_vals[hi] - hi_min) * inv_scale))));
         }
     }
 }
