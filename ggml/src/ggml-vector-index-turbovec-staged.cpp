@@ -24,6 +24,8 @@
 
 #if GGML_VEC_INDEX_USE_NEON
 #include <arm_neon.h>
+#elif defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>
 #endif
 
 namespace {
@@ -1042,6 +1044,59 @@ struct Collector {
                     }
                     top.push_back({ score, static_cast<uint64_t>(v_slot) });
                 }
+            }
+            if (top.size() >= 2 * s_len) {
+                cut_back();
+            }
+            return;
+        }
+#elif defined(__SSE2__) || defined(_M_X64)
+        // The NEON branch with SSE2, the x86_64 baseline, so no dispatch.
+        // _mm_max_ps does not propagate a NaN the way vmaxq_f32 does, so a
+        // NaN lane is found with cmpunord and keeps its block; in the walk
+        // cmpnle is true for a NaN lane, which the plain loop below pushes
+        // as well. Padding lanes are -inf, so they never count or enter.
+        __m128 v[8];
+        for (size_t i = 0; i < 8; ++i) {
+            v[i] = _mm_loadu_ps(block_scores + i * 4);
+        }
+        if (seed_active) {
+            const __m128 seed_v = _mm_set1_ps(seed);
+            uint32_t above = 0;
+            for (size_t i = 0; i < 8; ++i) {
+                above |= static_cast<uint32_t>(_mm_movemask_ps(_mm_cmpgt_ps(v[i], seed_v))) << (4 * i);
+            }
+            above_seed += static_cast<size_t>(popcount64(above));
+        }
+        const __m128 m0 = _mm_max_ps(_mm_max_ps(v[0], v[1]), _mm_max_ps(v[2], v[3]));
+        const __m128 m1 = _mm_max_ps(_mm_max_ps(v[4], v[5]), _mm_max_ps(v[6], v[7]));
+        __m128 m = _mm_max_ps(m0, m1);
+        m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(1, 0, 3, 2)));
+        m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(2, 3, 0, 1)));
+        const double block_max = static_cast<double>(_mm_cvtss_f32(m));
+        const __m128 unord = _mm_or_ps(_mm_or_ps(_mm_cmpunord_ps(v[0], v[1]), _mm_cmpunord_ps(v[2], v[3])),
+            _mm_or_ps(_mm_cmpunord_ps(v[4], v[5]), _mm_cmpunord_ps(v[6], v[7])));
+        if (_mm_movemask_ps(unord) == 0 && ((cut && block_max <= threshold) || block_max < floor)) {
+            return;
+        }
+        if (cut) {
+            const __m128 thr = _mm_set1_ps(static_cast<float>(threshold));
+            uint64_t bits = 0;
+            for (size_t i = 0; i < 8; ++i) {
+                bits |= static_cast<uint64_t>(_mm_movemask_ps(_mm_cmpnle_ps(v[i], thr))) << (4 * i);
+            }
+            while (bits != 0) {
+                const size_t lane = static_cast<size_t>(ctz64(bits));
+                bits &= bits - 1;
+                const double score = static_cast<double>(block_scores[lane]);
+                if (lane >= count || score < floor) {
+                    continue;
+                }
+                const size_t v_slot = block * kBlock + lane;
+                if (allowed_mask != nullptr && allowed_mask[v_slot] == 0) {
+                    continue;
+                }
+                top.push_back({ score, static_cast<uint64_t>(v_slot) });
             }
             if (top.size() >= 2 * s_len) {
                 cut_back();
