@@ -3828,7 +3828,10 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             }
             for (int j = i + 1; j < cgraph->n_nodes; j++) {
                 struct ggml_tensor * b = cgraph->nodes[j];
-                if (!free_mm(b) || !xdna_pgemm_pair_supported(a, b)) {
+                // the cheap test first: a pair reads one activation, and most
+                // of the graph's projections do not read a's
+                if (b->op != GGML_OP_MUL_MAT || b->src[1] != a->src[1] || !free_mm(b) ||
+                    !xdna_pgemm_pair_supported(a, b)) {
                     continue;
                 }
                 struct ggml_tensor * at = a;
