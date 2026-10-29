@@ -26,6 +26,17 @@
 // in whole blocks, into rows the allocation reserves for it, and the tensor
 // that follows it is untouched.
 //
+// Projections of one activation that follow each other (Q, K and V), in the
+// backend's own buffers: one call writes each output into its own tensor, in
+// whole blocks of 128 rows, and the tensor that follows them is untouched.
+//
+// Projections of one activation that ggml orders apart, each followed by its
+// norm (a layer's Q, K and V): the backend, as a scheduler's graph_optimize,
+// moves them next to each other so that one call can run them. The scheduler
+// computes the graph, and so does the CPU. A projection stays where it is when
+// a node between writes into its activation in place, or when its weight is
+// a node of the graph computed after the first projection.
+//
 // A prompt's FFN, down(GLU(gate(x), up(x))) with SWIGLU and with GEGLU: the
 // backend runs the gate and up projections and the activation as one call,
 // writing the product straight into the down projection's input; with the
@@ -41,6 +52,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -303,6 +315,180 @@ static bool test_ffn(ggml_backend_t npu, ggml_backend_t cpu, ggml_glu_op op, boo
     return passed;
 }
 
+// x (K x M) through Q8_0 projections of `ns[i]` rows each, then a tensor to guard
+static norm_graph build_group(ggml_backend_t be, const std::vector<int64_t> & ns, int64_t M, ggml_tensor ** guard) {
+    const int64_t K = 512;
+    norm_graph    g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    g.inputs            = { x };
+    std::vector<ggml_tensor *> mm;
+    for (int64_t n : ns) {
+        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, K, n);
+        g.inputs.push_back(w);
+        mm.push_back(ggml_mul_mat(g.ctx, w, x));
+    }
+    *guard = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, 2 * 1024);
+    g.gf   = ggml_new_graph(g.ctx);
+    for (ggml_tensor * t : mm) {
+        ggml_build_forward_expand(g.gf, t);
+    }
+    g.checked = mm;
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
+static bool test_group(ggml_backend_t npu, ggml_backend_t cpu, const std::vector<int64_t> & ns, int64_t M, double tol) {
+    ggml_tensor *                   cpu_guard = nullptr;
+    ggml_tensor *                   npu_guard = nullptr;
+    norm_graph                      want_g    = build_group(cpu, ns, M, &cpu_guard);
+    norm_graph                      got_g     = build_group(npu, ns, M, &npu_guard);
+    std::vector<std::vector<float>> want, got;
+    std::vector<float>              pattern(ggml_nelements(npu_guard), 3.0f);
+    bool                            ok = run(want_g, cpu, want);
+    ggml_backend_buffer_clear(got_g.buf, 0);
+    set_inputs(got_g, 1234);
+    ggml_backend_tensor_set(npu_guard, pattern.data(), 0, ggml_nbytes(npu_guard));
+    ok = ok && ggml_backend_graph_compute(npu, got_g.gf) == GGML_STATUS_SUCCESS;
+    std::vector<float> after(pattern.size());
+    ggml_backend_tensor_get(npu_guard, after.data(), 0, ggml_nbytes(npu_guard));
+    double worst = 0;
+    for (size_t i = 0; ok && i < got_g.checked.size(); i++) {
+        worst = std::max(worst, nmse(want[i], get_f32(got_g.checked[i])));
+    }
+    const bool intact = after == pattern;
+    const bool passed = ok && intact && worst < tol;
+    std::printf("MUL_MAT group of %zu, M %-4lld guard %s, worst nmse %.3g %s\n", ns.size(), (long long) M,
+                intact ? "intact" : "OVERWRITTEN", ok ? worst : INFINITY, passed ? "ok" : "FAIL");
+    ggml_backend_buffer_free(want_g.buf);
+    ggml_backend_buffer_free(got_g.buf);
+    ggml_free(want_g.ctx);
+    ggml_free(got_g.ctx);
+    return passed;
+}
+
+// x (K x M) through Q8_0 projections of `ns[i]` rows each, an RMS_NORM after every one and the
+// results joined in that order, as a graph expanded from its output places them: projection,
+// norm, next projection. Nodes are allocated in `ops_be`, or left to the scheduler when null.
+enum class between { nothing, writer, weight_view };
+
+struct ordered_graph {
+    ggml_context *             leaf = nullptr;
+    ggml_context *             ops  = nullptr;
+    ggml_backend_buffer_t      leaf_buf = nullptr;
+    ggml_backend_buffer_t      ops_buf  = nullptr;
+    ggml_cgraph *              gf   = nullptr;
+    std::vector<ggml_tensor *> mm;
+    ggml_tensor *              out = nullptr;
+    norm_graph                 inputs;
+};
+
+// the second projection's weight: a view of a larger tensor, a node of its own
+static ggml_tensor * weight_view(ordered_graph & g, int64_t K, int64_t n) {
+    ggml_tensor * full = ggml_new_tensor_2d(g.leaf, GGML_TYPE_Q8_0, K, n + 128);
+    g.inputs.inputs.push_back(full);
+    return ggml_view_2d(g.ops, full, K, n, full->nb[1], 0);
+}
+
+static ordered_graph build_ordered(ggml_backend_t leaf_be, ggml_backend_t ops_be, const std::vector<int64_t> & ns,
+                                   int64_t M, between what) {
+    const int64_t K = 512;
+    ordered_graph g;
+    ggml_init_params lp = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_init_params op = { ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, true };
+    g.leaf              = ggml_init(lp);
+    g.ops               = ggml_init(op);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.leaf, GGML_TYPE_F32, K, M);
+    g.inputs.inputs     = { x };
+    g.gf                = ggml_new_graph(g.ops);
+    for (size_t i = 0; i < ns.size(); i++) {
+        ggml_tensor * w = nullptr;
+        if (i == 1 && what == between::weight_view) {
+            w = weight_view(g, K, ns[i]);
+        } else {
+            w = ggml_new_tensor_2d(g.leaf, GGML_TYPE_Q8_0, K, ns[i]);
+            g.inputs.inputs.push_back(w);
+        }
+        ggml_tensor * mm = ggml_mul_mat(g.ops, w, x);
+        g.mm.push_back(mm);
+        ggml_tensor * norm = ggml_rms_norm(g.ops, mm, 1e-6f);
+        g.out              = g.out ? ggml_concat(g.ops, g.out, norm, 0) : norm;
+        if (i == 0) {
+            ggml_build_forward_expand(g.gf, g.out);
+            if (what == between::writer) {
+                ggml_build_forward_expand(g.gf, ggml_scale_inplace(g.ops, x, 1.0f));
+            }
+        }
+    }
+    ggml_build_forward_expand(g.gf, g.out);
+    g.leaf_buf = ggml_backend_alloc_ctx_tensors(g.leaf, leaf_be);
+    if (ops_be) {
+        g.ops_buf = ggml_backend_alloc_ctx_tensors(g.ops, ops_be);
+    }
+    return g;
+}
+
+static void free_ordered(ordered_graph & g) {
+    ggml_backend_buffer_free(g.leaf_buf);
+    ggml_backend_buffer_free(g.ops_buf);
+    ggml_free(g.leaf);
+    ggml_free(g.ops);
+}
+
+static int node_index(const ggml_cgraph * gf, const ggml_tensor * t) {
+    for (int i = 0; i < ggml_graph_n_nodes(const_cast<ggml_cgraph *>(gf)); i++) {
+        if (ggml_graph_node(const_cast<ggml_cgraph *>(gf), i) == t) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool next_to(const ordered_graph & g, size_t i) {
+    return node_index(g.gf, g.mm[i]) == node_index(g.gf, g.mm[i - 1]) + 1;
+}
+
+// whether every projection follows the one before it in the scheduler's graph
+static bool projections_adjacent(const ordered_graph & g) {
+    for (size_t i = 1; i < g.mm.size(); i++) {
+        if (!next_to(g, i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Q K V behind their norms through the scheduler against the CPU. `what` is a node between the
+// first and second projection; `group_on` false (GGML_XDNA_PGEMM_GROUP=0) leaves the order as
+// the graph was expanded.
+static bool test_group_order(ggml_backend_t npu, ggml_backend_t cpu, between what, bool group_on, int64_t M,
+                             double tol) {
+    setenv("GGML_XDNA_PGEMM_GROUP", group_on ? "1" : "0", 1);
+    const std::vector<int64_t> ns = { 1024, 512, 512 };
+    ordered_graph              want_g = build_ordered(cpu, cpu, ns, M, what);
+    ordered_graph              got_g  = build_ordered(npu, nullptr, ns, M, what);
+    set_inputs(want_g.inputs, 1234);
+    set_inputs(got_g.inputs, 1234);
+    bool ok = ggml_backend_graph_compute(cpu, want_g.gf) == GGML_STATUS_SUCCESS;
+    ggml_backend_t        backends[2] = { npu, cpu };
+    ggml_backend_sched_t  sched       = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    ok = ok && ggml_backend_sched_alloc_graph(sched, got_g.gf);
+    const bool moved = what == between::nothing ? projections_adjacent(got_g) : next_to(got_g, 1);
+    ok = ok && ggml_backend_sched_graph_compute(sched, got_g.gf) == GGML_STATUS_SUCCESS;
+    const double e      = ok ? nmse(get_f32(want_g.out), get_f32(got_g.out)) : INFINITY;
+    const bool   passed = ok && moved == (group_on && what == between::nothing) && e < tol;
+    const char * names[] = { "norms", "a writer of the activation", "a weight computed after Q" };
+    std::printf("MUL_MAT Q K V behind %-27s M %-4lld GROUP=%d: projections %s, nmse %.3g %s\n",
+                names[(int) what], (long long) M, group_on ? 1 : 0, moved ? "moved together" : "left apart", e,
+                passed ? "ok" : "FAIL");
+    ggml_backend_sched_free(sched);
+    free_ordered(want_g);
+    free_ordered(got_g);
+    unsetenv("GGML_XDNA_PGEMM_GROUP");
+    return passed;
+}
+
 // Qwen3.5-0.8B's residual and FFN widths, and a short prompt's rows
 static constexpr int64_t CROP_EMBD   = 1024;
 static constexpr int64_t CROP_FFN    = 3584;
@@ -421,6 +607,20 @@ int main(void) {
 
     for (int64_t M : { 100, 129, 300 }) {
         passed = test_output_in_place(npu, cpu, M, tol) && passed;
+    }
+
+    const std::vector<std::vector<int64_t>> groups = { { 1024, 512, 512 }, { 2048, 512, 512 }, { 1024, 640 } };
+    for (const std::vector<int64_t> & ns : groups) {
+        for (int64_t M : { 100, 200, 300 }) {
+            passed = test_group(npu, cpu, ns, M, tol) && passed;
+        }
+    }
+
+    for (bool group_on : { true, false }) {
+        passed = test_group_order(npu, cpu, between::nothing, group_on, 200, tol) && passed;
+    }
+    for (between what : { between::writer, between::weight_view }) {
+        passed = test_group_order(npu, cpu, what, true, 200, tol) && passed;
     }
 
     for (ggml_glu_op op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
