@@ -3728,6 +3728,49 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
         }
     }
 
+    // Projections of one activation that follow each other (a layer's Q, K
+    // and V) as one prefill GEMM (xdna_pgemm_group_supported), each output
+    // written to its own node when the call runs at the first of them. Only
+    // views sit between them, so nothing runs between the call and a node
+    // whose memory the allocator handed out at its own place in the graph.
+    struct mm_group {
+        std::vector<struct ggml_tensor *> mm;
+    };
+    std::vector<mm_group>                                  mm_groups;
+    std::unordered_map<const struct ggml_tensor *, size_t> group_of;
+    if (g_glue_n_tokens > 1) {
+        auto group_mm = [&](const struct ggml_tensor * t) {
+            return t->op == GGML_OP_MUL_MAT && !consumed.count(t) && !qkv_of.count(t) &&
+                   !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
+        };
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (!group_mm(cgraph->nodes[i])) {
+                continue;
+            }
+            mm_group g;
+            g.mm.push_back(cgraph->nodes[i]);
+            int j = i + 1;
+            for (; j < cgraph->n_nodes; j++) {
+                struct ggml_tensor * b = cgraph->nodes[j];
+                if (ggml_xdna_is_view_op(b->op)) {
+                    continue;
+                }
+                g.mm.push_back(b);
+                if (!group_mm(b) || !xdna_pgemm_group_supported(g.mm.data(), (int) g.mm.size())) {
+                    g.mm.pop_back();
+                    break;
+                }
+            }
+            if (g.mm.size() >= 2) {
+                for (struct ggml_tensor * t : g.mm) {
+                    group_of[t] = mm_groups.size();
+                }
+                mm_groups.push_back(g);
+                i = j - 1;
+            }
+        }
+    }
+
     // Two small projections of one activation (a recurrent layer's alpha and
     // beta) as one prefill GEMM (xdna_pgemm_pair_supported). It runs before
     // the first projection on the array that reads the same activation (the
@@ -3746,7 +3789,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     if (g_glue_n_tokens > 1) {
         auto free_mm = [&](const struct ggml_tensor * t) {
             return t->op == GGML_OP_MUL_MAT && !consumed.count(t) && !qkv_of.count(t) && !pair_of.count(t) &&
-                   !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
+                   !group_of.count(t) && !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
         };
         for (int i = 0; i < cgraph->n_nodes; i++) {
             struct ggml_tensor * a = cgraph->nodes[i];
@@ -4169,6 +4212,32 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             }
             continue;
         }
+        auto gr = group_of.find(node);
+        if (gr != group_of.end()) {
+            std::vector<struct ggml_tensor *> & mm = mm_groups[gr->second].mm;
+            if (node != mm[0]) {
+                continue;
+            }
+            if (!glue_batch.empty() && !xdna_glue_flush(&ctx->ops, glue_batch)) {
+                return GGML_STATUS_FAILED;
+            }
+            if (!xdna_ops_finalize(&ctx->ops)) {
+                return GGML_STATUS_FAILED;
+            }
+            xdna_pending_wait(ctx);
+            bool ok;
+            {
+                xdna_prof::section_timer st("prefill: pgemm group");
+                ok = xdna_pgemm_run_group(ctx->ops.pool, mm.data(), (int) mm.size());
+            }
+            // one at a time where the node's place is
+            for (size_t k = 0; !ok && k < mm.size(); k++) {
+                if (!xdna_ops_compute(&ctx->ops, mm[k])) {
+                    return GGML_STATUS_FAILED;
+                }
+            }
+            continue;
+        }
         if (consumed.count(node)) {
             continue;
         }
@@ -4504,6 +4573,171 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     }
 }
 
+// graph_optimize moves the projections of one activation that form a group
+// (xdna_pgemm_group_supported) up behind the first: ggml puts K's and V's after Q's norm,
+// whose memory the allocator would hand them, and the group writes every output at once.
+using xdna_node_pos = std::unordered_map<const struct ggml_tensor *, int>;
+
+constexpr int XDNA_MUL_MAT_SRCS = 2;  // the weight and the activation
+
+static const struct ggml_tensor * xdna_storage_of(const struct ggml_tensor * t) {
+    return t->view_src ? t->view_src : t;
+}
+
+static xdna_node_pos xdna_node_positions(const struct ggml_cgraph * graph) {
+    xdna_node_pos pos;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        pos[graph->nodes[i]] = i;
+    }
+    return pos;
+}
+
+// whether `t` and the tensors it views are computed at or before node `limit`
+static bool xdna_ready_at(const xdna_node_pos & pos, const struct ggml_tensor * t, int limit) {
+    for (; t; t = t->view_src) {
+        const auto it = pos.find(t);
+        if (it != pos.end() && it->second > limit) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool xdna_inputs_ready_at(const xdna_node_pos & pos, const struct ggml_tensor * mm, int limit) {
+    for (int k = 0; k < XDNA_MUL_MAT_SRCS; k++) {
+        if (!xdna_ready_at(pos, mm->src[k], limit)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// whether `node` writes into storage `mm` reads
+static bool xdna_overwrites_inputs(const struct ggml_tensor * node, const struct ggml_tensor * mm) {
+    if (ggml_xdna_is_view_op(node->op) || !node->view_src) {
+        return false;
+    }
+    for (int k = 0; k < XDNA_MUL_MAT_SRCS; k++) {
+        if (node->view_src == xdna_storage_of(mm->src[k])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool xdna_no_writer_between(const struct ggml_cgraph * graph, int from, int to, const struct ggml_tensor * mm) {
+    for (int i = from + 1; i < to; i++) {
+        if (xdna_overwrites_inputs(graph->nodes[i], mm)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the projection at node `at` can move up to node `head`'s place
+static bool xdna_can_move_up(const struct ggml_cgraph * graph, const xdna_node_pos & pos, int head, int at) {
+    const struct ggml_tensor * mm = graph->nodes[at];
+    return xdna_inputs_ready_at(pos, mm, head) && xdna_no_writer_between(graph, head, at, mm);
+}
+
+static bool xdna_group_candidate(const struct ggml_tensor * t) {
+    return t->op == GGML_OP_MUL_MAT && !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && t->src[1] && t->src[1]->ne[1] > 1;
+}
+
+// positions of the group candidates that read one activation, by activation
+static std::unordered_map<const struct ggml_tensor *, std::vector<int>> xdna_candidates_by_input(
+    const struct ggml_cgraph * graph) {
+    std::unordered_map<const struct ggml_tensor *, std::vector<int>> by_input;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        if (xdna_group_candidate(graph->nodes[i])) {
+            by_input[graph->nodes[i]->src[1]].push_back(i);
+        }
+    }
+    return by_input;
+}
+
+// the group that starts at candidates[first]: node positions, the first one's among them
+static std::vector<int> xdna_group_from(const struct ggml_cgraph * graph, const xdna_node_pos & pos,
+                                        const std::vector<int> & candidates, size_t first) {
+    std::vector<int>                  group = { candidates[first] };
+    std::vector<struct ggml_tensor *> mm    = { graph->nodes[candidates[first]] };
+    for (size_t k = first + 1; k < candidates.size(); k++) {
+        mm.push_back(graph->nodes[candidates[k]]);
+        if (!xdna_pgemm_group_supported(mm.data(), (int) mm.size()) ||
+            !xdna_can_move_up(graph, pos, group[0], candidates[k])) {
+            break;
+        }
+        group.push_back(candidates[k]);
+    }
+    return group;
+}
+
+static void xdna_groups_of_input(const struct ggml_cgraph * graph, const xdna_node_pos & pos,
+                                 const std::vector<int> & candidates, std::vector<std::vector<int>> & groups) {
+    for (size_t first = 0; first < candidates.size();) {
+        std::vector<int> group = xdna_group_from(graph, pos, candidates, first);
+        first += group.size();
+        if (group.size() >= 2) {
+            groups.push_back(std::move(group));
+        }
+    }
+}
+
+static std::vector<std::vector<int>> xdna_find_groups(const struct ggml_cgraph * graph) {
+    std::vector<std::vector<int>> groups;
+    const xdna_node_pos           pos = xdna_node_positions(graph);
+    for (const auto & input : xdna_candidates_by_input(graph)) {
+        xdna_groups_of_input(graph, pos, input.second, groups);
+    }
+    return groups;
+}
+
+// which nodes a group moves, and the group each first projection heads
+struct xdna_group_layout {
+    std::vector<char>                                 moved;
+    std::unordered_map<int, const std::vector<int> *> head_of;
+};
+
+static xdna_group_layout xdna_layout_of(const struct ggml_cgraph * graph, const std::vector<std::vector<int>> & groups) {
+    xdna_group_layout layout;
+    layout.moved.assign(graph->n_nodes, 0);
+    for (const std::vector<int> & g : groups) {
+        layout.head_of[g[0]] = &g;
+        for (size_t k = 1; k < g.size(); k++) {
+            layout.moved[g[k]] = 1;
+        }
+    }
+    return layout;
+}
+
+// the nodes in their order with each group's later projections right after its first
+static std::vector<struct ggml_tensor *> xdna_order_with_groups(const struct ggml_cgraph *            graph,
+                                                                const std::vector<std::vector<int>> & groups) {
+    const xdna_group_layout           layout = xdna_layout_of(graph, groups);
+    std::vector<struct ggml_tensor *> order;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        if (layout.moved[i]) {
+            continue;
+        }
+        order.push_back(graph->nodes[i]);
+        const auto it = layout.head_of.find(i);
+        for (size_t k = 1; it != layout.head_of.end() && k < it->second->size(); k++) {
+            order.push_back(graph->nodes[(*it->second)[k]]);
+        }
+    }
+    return order;
+}
+
+static void ggml_backend_xdna_graph_optimize(ggml_backend_t, struct ggml_cgraph * graph,
+                                             struct ggml_backend_graph_optimize_params *) {
+    const std::vector<std::vector<int>> groups = xdna_find_groups(graph);
+    if (groups.empty()) {
+        return;
+    }
+    const std::vector<struct ggml_tensor *> order = xdna_order_with_groups(graph, groups);
+    std::copy(order.begin(), order.end(), graph->nodes);
+}
+
 static struct ggml_backend_i xdna_backend_i = {
     /* .get_name                = */ ggml_backend_xdna_get_name,
     /* .free                    = */ ggml_backend_xdna_free,
@@ -4520,7 +4754,7 @@ static struct ggml_backend_i xdna_backend_i = {
     /* .graph_compute           = */ ggml_backend_xdna_graph_compute,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
-    /* .graph_optimize          = */ NULL,
+    /* .graph_optimize          = */ ggml_backend_xdna_graph_optimize,
 };
 
 static ggml_guid_t ggml_backend_xdna_guid(void) {
