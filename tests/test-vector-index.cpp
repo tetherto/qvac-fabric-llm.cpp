@@ -6882,7 +6882,9 @@ void check_turbovec_1x_vpermb() {
 // the kernel cannot run.
 void check_turbovec_1x_vnni_fused_scan() {
     turbovec_force_x86_rules_for_test(1);
-    turbovec_force_planes_for_test(1, 0);
+    // A minimum of one row, so the 20000-row index, below the default
+    // planes threshold, is staged too and covers the unseeded scan.
+    turbovec_force_planes_for_test(1, 1);
     constexpr int nq = 12;
     bool skipped = false;
     for (const int dim : { 64, 96 }) {
@@ -6893,9 +6895,6 @@ void check_turbovec_1x_vnni_fused_scan() {
             const std::vector<uint64_t> ids = tv1x_ids(static_cast<size_t>(n));
             for (const int bits : { 2, 4 }) {
                 for (const int calibrated : { 0, 1 }) {
-                    if (skipped) {
-                        continue;
-                    }
                     turbovec_force_vector_major_for_test(1);
                     auto * tv = ggml_vec_index_create_turbovec(dim, bits);
                     CHECK(tv != nullptr);
@@ -6908,8 +6907,16 @@ void check_turbovec_1x_vnni_fused_scan() {
                         CHECK(ggml_vec_index_set_threads(tv, threads) == GGML_VEC_INDEX_OK);
                         for (const int k : { 1, 10, 64, 150 }) {
                             const int status = turbovec_vnni_fused_scan_parity_for_test(tv, queries.data(), nq, k);
+                            // Only a host without the kernel may skip; any
+                            // other reason means the index is not the staged
+                            // vector-major one this test must check.
+                            CHECK(status == 1 || status == -1 || status == -4);
                             if (status < 0) {
-                                std::printf("SKIP TurboVec fused vnni scan parity (reason %d)\n", status);
+                                // Every cell still runs, so the index checks
+                                // above hold on a host without the kernel too.
+                                if (!skipped) {
+                                    std::printf("SKIP TurboVec fused vnni scan parity (reason %d)\n", status);
+                                }
                                 skipped = true;
                                 break;
                             }
