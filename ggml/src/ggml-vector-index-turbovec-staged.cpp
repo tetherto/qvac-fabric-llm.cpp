@@ -107,6 +107,124 @@ inline int ctz64(uint64_t x) {
 #endif
 }
 
+// Writes src[0..n) to dst[0..n) with the elements pred() accepts first, in
+// their order, and the rest after them, in reverse order; returns how many
+// were accepted. Every element is stored at both ends and the two cursors
+// move by pred's 0 or 1, so the loop has no data-dependent branch: a
+// quickselect over a shortlist's scores mispredicts about every other
+// compare in std::nth_element's partition (upstream's select_nth_unstable
+// partitions this way as well).
+template <class T, class Pred>
+size_t partition_branchless(const T * src, size_t n, T * dst, Pred pred) {
+    size_t l = 0;
+    size_t r = n;
+    for (size_t i = 0; i < n; ++i) {
+        const T x = src[i];
+        const size_t accept = static_cast<size_t>(pred(x));
+        dst[l] = x;
+        dst[r - 1] = x;
+        l += accept;
+        r -= 1 - accept;
+    }
+    return l;
+}
+
+// The k-th best of a[0..n) (1 <= k <= n) under `better`, which returns 1
+// when its first argument ranks first and 0 otherwise, as an integer so the
+// partitions above stay branch-free; `better` must be a strict weak order.
+// Quickselect with two scratch buffers in place of std::nth_element, which
+// left the lone and batch shortlist cuts, the ranking's cuts and the seed
+// at several microseconds each on x86. `a` is read only, so a caller keeps
+// its order and filters by the result (see cut_to_best).
+template <class T, class Better>
+T kth_best(const T * a, size_t n, size_t k, Better better, std::vector<T> & scratch) {
+    assert(k >= 1 && k <= n);
+    scratch.resize(2 * n);
+    T * cur = scratch.data();
+    T * other = scratch.data() + n;
+    const T * src = a;
+    size_t lo = 0;
+    size_t hi = n;
+    // Beyond the depth a balanced run needs the rest goes to introselect.
+    int budget = 0;
+    for (size_t m = n; m > 0; m >>= 1) {
+        budget += 3;
+    }
+    while (hi - lo > 16 && budget-- > 0) {
+        const T & p0 = src[lo];
+        const T & p1 = src[lo + (hi - lo) / 2];
+        const T & p2 = src[hi - 1];
+        // Median of three.
+        const T pivot = better(p0, p1) != 0 ? (better(p1, p2) != 0 ? p1 : (better(p0, p2) != 0 ? p2 : p0)) :
+                                              (better(p0, p2) != 0 ? p0 : (better(p1, p2) != 0 ? p2 : p1));
+        // Those strictly better than the pivot first; the pivot is not among
+        // them, so a step into them shrinks the range.
+        size_t l = lo + partition_branchless(src + lo, hi - lo, cur + lo, [&](const T & x) { return better(x, pivot); });
+        src = cur;
+        std::swap(cur, other);
+        if (k <= l - lo) {
+            hi = l;
+            continue;
+        }
+        k -= l - lo;
+        lo = l;
+        // Then those the pivot does not beat (at least the pivot itself): if
+        // the k-th lies among them it ranks with the pivot.
+        l = lo + partition_branchless(src + lo, hi - lo, cur + lo, [&](const T & x) { return 1 - better(pivot, x); });
+        src = cur;
+        std::swap(cur, other);
+        if (k <= l - lo) {
+            return pivot;
+        }
+        k -= l - lo;
+        lo = l;
+    }
+    if (src != cur) {
+        // The remaining range is in a read-only or the other buffer.
+        std::copy(src + lo, src + hi, cur + lo);
+    }
+    std::nth_element(cur + lo, cur + lo + static_cast<std::ptrdiff_t>(k - 1), cur + hi,
+        [&](const T & x, const T & y) { return better(x, y) != 0; });
+    return cur[lo + k - 1];
+}
+
+// Keeps, in place and in order, the elements of v for which keep() returns
+// 1, without a data-dependent branch; returns their count.
+template <class T, class Keep>
+size_t keep_in_order(std::vector<T> & v, Keep keep) {
+    size_t w = 0;
+    for (size_t i = 0; i < v.size(); ++i) {
+        const T x = v[i];
+        v[w] = x;
+        w += static_cast<size_t>(keep(x));
+    }
+    return w;
+}
+
+// Cuts v (longer than `keep`) to its best `keep` elements under `better`
+// (see kth_best), in the order they had, so a shortlist collected in slot
+// order ranks its rows in slot order; returns the k-th best. The cut is
+// its: whatever it does not beat stays, which is exactly `keep` elements
+// under a strict total order, and ties for the last place are settled by
+// std::nth_element as before.
+template <class T, class Better>
+T cut_to_best(std::vector<T> & v, size_t keep, Better better, std::vector<T> & scratch) {
+    assert(v.size() > keep);
+    const T kth = kth_best(v.data(), v.size(), keep, better, scratch);
+    const size_t kept = keep_in_order(v, [&](const T & x) { return 1 - better(kth, x); });
+    if (kept > keep) {
+        std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(keep - 1),
+            v.begin() + static_cast<std::ptrdiff_t>(kept), [&](const T & x, const T & y) { return better(x, y) != 0; });
+    }
+    v.resize(std::min(kept, keep));
+    return kth;
+}
+
+// score_id_better as an integer without a branch, for the cuts above.
+inline int score_id_better_i(const ScoreId & a, const ScoreId & b) {
+    return static_cast<int>(a.score > b.score) | (static_cast<int>(a.score == b.score) & static_cast<int>(a.id < b.id));
+}
+
 // Shortlist, middle and rescore lengths for a top-k request (upstream
 // planes_shortlist_len, planes_mid_len, planes_rescore_len).
 size_t shortlist_len(size_t k, int bits) {
@@ -797,9 +915,8 @@ float sample_seed(const ggml_vec_index & idx, const SignLut & lut, size_t s_len,
         const size_t block = i * stride + stride / 2;
         score_sign_block(idx, lut, idx.turbovec_sign_blocked.data(), block, n, scores.data() + i * kBlock);
     }
-    std::nth_element(scores.begin(), scores.begin() + static_cast<std::ptrdiff_t>(r - 1), scores.end(),
-        [](float a, float b) { return a > b; });
-    return scores[r - 1];
+    std::vector<float> scratch;
+    return kth_best(scores.data(), n_s, r, [](float a, float b) { return static_cast<int>(a > b); }, scratch);
 }
 
 // Upstream pack.rs `planes_stats`, from the first 64 blocks of the cache.
@@ -980,28 +1097,33 @@ bool candidate_better(const Candidate & a, const Candidate & b) {
     return a.slot < b.slot;
 }
 
+// candidate_better as an integer without a branch, for the cuts.
+inline int candidate_better_i(const Candidate & a, const Candidate & b) {
+    return static_cast<int>(a.score > b.score) | (static_cast<int>(a.score == b.score) & static_cast<int>(a.slot < b.slot));
+}
+
+// Cuts cands to its best `keep` under the strict (score, slot) order, in
+// the order they had, and `tops` (aligned with cands) with them.
 void keep_best(std::vector<Candidate> & cands, size_t keep, std::vector<float> * tops = nullptr) {
     if (cands.size() <= keep) {
         return;
     }
-    std::vector<size_t> order(cands.size());
-    for (size_t i = 0; i < order.size(); ++i) {
-        order[i] = i;
-    }
-    std::nth_element(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(keep - 1), order.end(),
-        [&](size_t a, size_t b) { return candidate_better(cands[a], cands[b]); });
-    order.resize(keep);
-    std::vector<Candidate> kept(keep);
-    std::vector<float> kept_tops;
-    for (size_t i = 0; i < keep; ++i) {
-        kept[i] = cands[order[i]];
+    std::vector<Candidate> scratch;
+    const Candidate kth = kth_best(cands.data(), cands.size(), keep, candidate_better_i, scratch);
+    size_t w = 0;
+    for (size_t i = 0; i < cands.size(); ++i) {
+        const Candidate c = cands[i];
+        cands[w] = c;
         if (tops != nullptr) {
-            kept_tops.push_back((*tops)[order[i]]);
+            (*tops)[w] = (*tops)[i];
         }
+        w += static_cast<size_t>(1 - candidate_better_i(kth, c));
     }
-    cands.swap(kept);
+    // Exactly `keep` under the strict order; only a NaN score, which it
+    // does not cover, can leave more, and then the tail goes.
+    cands.resize(std::min(w, keep));
     if (tops != nullptr) {
-        tops->swap(kept_tops);
+        tops->resize(cands.size());
     }
 }
 
@@ -1073,11 +1195,12 @@ struct Collector {
         floor_score = floor;
     }
 
+    // Scratch for the cuts, kept across them.
+    std::vector<ScoreId> scratch;
+
     void cut_back() {
-        std::nth_element(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(s_len - 1), top.end(), score_id_better);
-        top.resize(s_len);
         cut = true;
-        threshold = top.back().score;
+        threshold = cut_to_best(top, s_len, score_id_better_i, scratch).score;
         if (floor_score != nullptr) {
             double seen = floor_score->load(std::memory_order_relaxed);
             while (threshold > seen && !floor_score->compare_exchange_weak(seen, threshold, std::memory_order_relaxed)) {
@@ -1627,8 +1750,8 @@ bool turbovec_staged_search(
             seed = -std::numeric_limits<float>::infinity();
         }
         if (top.size() > s_len) {
-            std::nth_element(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(s_len - 1), top.end(), score_id_better);
-            top.resize(s_len);
+            std::vector<ScoreId> scratch;
+            cut_to_best(top, s_len, score_id_better_i, scratch);
         }
         list.reserve(top.size());
         for (const ScoreId & c : top) {
@@ -2048,8 +2171,7 @@ bool turbovec_staged_search_batch(
             }
             std::vector<ScoreId> & top = cols[i].top;
             if (top.size() > s_len) {
-                std::nth_element(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(s_len - 1), top.end(), score_id_better);
-                top.resize(s_len);
+                cut_to_best(top, s_len, score_id_better_i, cols[i].scratch);
             }
             run_query(q, &top, false, false, 1);
         }
