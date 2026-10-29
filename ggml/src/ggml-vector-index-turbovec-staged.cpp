@@ -52,16 +52,24 @@ std::atomic<bool> g_low_kernels_enabled{ true };
 #endif
 #if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
 // Off scores a lone query's vector-major sign region block by block
-// through the Collector (tests).
+// through the Collector (tests); the batch flag does the same for a
+// batch's six queries.
 std::atomic<bool> g_vnni_fused_scan_enabled{ true };
+std::atomic<bool> g_vnni_fused_batch_enabled{ true };
 #endif
 #if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL) && defined(GGML_VEC_INDEX_TEST_HOOKS)
-// Fused scans run, for the same test.
+// Fused scans and fused batch tasks run, for the same tests.
 std::atomic<int64_t> g_vnni_fused_scan_count{ 0 };
+std::atomic<int64_t> g_vnni_fused_batch_count{ 0 };
 #endif
 void count_vnni_fused_scan() {
 #if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL) && defined(GGML_VEC_INDEX_TEST_HOOKS)
     g_vnni_fused_scan_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+void count_vnni_fused_batch() {
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL) && defined(GGML_VEC_INDEX_TEST_HOOKS)
+    g_vnni_fused_batch_count.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
 
@@ -1246,10 +1254,9 @@ struct Collector {
         state.cut = col.cut;
     }
 
-    // Blocks [block_begin, block_end) of a vector-major sign region through
-    // the fused kernel: the same rows as add_block over its scores.
-    void scan_vnni(const SignLut & lut, const uint8_t * blocks, const float * vscales, size_t block_begin,
-            size_t block_end, size_t n, size_t n_byte_groups) {
+    // The state the fused kernel reads before each block; the sink keeps
+    // the threshold current and the caller takes the seed count back.
+    ggml_vec_index_detail::TurboVecVnniScanState vnni_state() const {
         ggml_vec_index_detail::TurboVecVnniScanState state;
         state.threshold = threshold;
         state.cut = cut;
@@ -1257,6 +1264,14 @@ struct Collector {
         state.seed = seed;
         state.floor_score = floor_score;
         state.above_seed = above_seed;
+        return state;
+    }
+
+    // Blocks [block_begin, block_end) of a vector-major sign region through
+    // the fused kernel: the same rows as add_block over its scores.
+    void scan_vnni(const SignLut & lut, const uint8_t * blocks, const float * vscales, size_t block_begin,
+            size_t block_end, size_t n, size_t n_byte_groups) {
+        ggml_vec_index_detail::TurboVecVnniScanState state = vnni_state();
         ggml_vec_index_detail::turbovec_vnni_lut_scan_blk2(lut.split.data(), lut.scale, lut.bias, vscales, blocks,
             block_begin, block_end, n, n_byte_groups, state, &Collector::vnni_sink, this);
         above_seed = state.above_seed;
@@ -1278,6 +1293,19 @@ struct Collector {
 bool vnni_fused_scan_ready(const SignLut & lut) {
     return !lut.split.empty() && turbovec_cpu_dot_product() &&
         g_vnni_fused_scan_enabled.load(std::memory_order_relaxed);
+}
+
+// The same for a batch task's queries, every one with split tables.
+bool vnni_fused_batch_ready(const uint8_t * const * splits, size_t n) {
+    if (!turbovec_cpu_dot_product() || !g_vnni_fused_batch_enabled.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (splits[i] == nullptr) {
+            return false;
+        }
+    }
+    return true;
 }
 #endif
 
@@ -1966,23 +1994,47 @@ bool turbovec_staged_search_batch(
             }
 #endif
         } else {
-            // Blocks per `vpermb` call: enough that a lone tail query's
-            // kernel walks its block pairs and the per-call setup is shared.
-            constexpr size_t kVnniGroup = 8;
-            std::vector<float> scores(n_in * kVnniGroup * kBlock);
-            float * outs[kBatchMax] = {};
-            for (size_t i = 0; i < n_in; ++i) {
-                outs[i] = scores.data() + i * kVnniGroup * kBlock;
-            }
-            for (size_t block = 0; block < n_blocks; block += kVnniGroup) {
-                const size_t n_group = std::min(kVnniGroup, n_blocks - block);
-                score_turbovec_lut_blocks_vnni(
-                    lut_ptrs, split_ptrs, lut_scales, lut_biases, static_cast<int>(n_in), idx.turbovec_sign_blocked.data(),
-                    vscales, block, n_group, n, 2, dim / 2, outs);
-                for (size_t b = 0; b < n_group; ++b) {
-                    const size_t count = std::min(kBlock, n - (block + b) * kBlock);
-                    for (size_t i = 0; i < n_in; ++i) {
-                        cols[i].add_block(outs[i] + b * kBlock, block + b, count, nullptr);
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+            if (vnni_fused_batch_ready(split_ptrs, n_in)) {
+                // Every block through the batch kernel, each query's scores
+                // finished and tested in its registers (upstream
+                // search_multi_query_vnni and its epilogue).
+                count_vnni_fused_batch();
+                ggml_vec_index_detail::TurboVecVnniScanState states[kBatchMax];
+                void * ctxs[kBatchMax] = {};
+                for (size_t i = 0; i < n_in; ++i) {
+                    states[i] = cols[i].vnni_state();
+                    ctxs[i] = &cols[i];
+                }
+                ggml_vec_index_detail::turbovec_vnni_lut_scan_batch(split_ptrs, lut_scales, lut_biases,
+                    static_cast<int>(n_in), vscales, idx.turbovec_sign_blocked.data(), 0, n_blocks, n, dim_sz / 8,
+                    states, &Collector::vnni_sink, ctxs);
+                for (size_t i = 0; i < n_in; ++i) {
+                    cols[i].above_seed = states[i].above_seed;
+                }
+            } else
+#endif
+            {
+                // The kernel's scores block by block through the Collector
+                // (a build or host without the fused kernel). Blocks per
+                // `vpermb` call: enough that a lone tail query's kernel walks
+                // its block pairs and the per-call setup is shared.
+                constexpr size_t kVnniGroup = 8;
+                std::vector<float> scores(n_in * kVnniGroup * kBlock);
+                float * outs[kBatchMax] = {};
+                for (size_t i = 0; i < n_in; ++i) {
+                    outs[i] = scores.data() + i * kVnniGroup * kBlock;
+                }
+                for (size_t block = 0; block < n_blocks; block += kVnniGroup) {
+                    const size_t n_group = std::min(kVnniGroup, n_blocks - block);
+                    score_turbovec_lut_blocks_vnni(
+                        lut_ptrs, split_ptrs, lut_scales, lut_biases, static_cast<int>(n_in),
+                        idx.turbovec_sign_blocked.data(), vscales, block, n_group, n, 2, dim / 2, outs);
+                    for (size_t b = 0; b < n_group; ++b) {
+                        const size_t count = std::min(kBlock, n - (block + b) * kBlock);
+                        for (size_t i = 0; i < n_in; ++i) {
+                            cols[i].add_block(outs[i] + b * kBlock, block + b, count, nullptr);
+                        }
                     }
                 }
             }
@@ -2221,6 +2273,50 @@ int turbovec_vnni_fused_scan_parity_for_test(ggml_vec_index_t * idx, const float
     (void) queries;
     (void) n_q;
     (void) k;
+    return -1;
+#endif
+}
+
+int turbovec_vnni_fused_batch_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k) {
+    // The host checks of the lone-scan parity, then -6 when the queries did
+    // not take the staged batch at all (too few for the threads, or no
+    // shortlist), so a cell that proves nothing is not reported as passing.
+    {
+        const int status = turbovec_vnni_fused_scan_parity_for_test(idx, queries, 1, k);
+        if (status < 0) {
+            return status;
+        }
+    }
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+    const size_t k_sz = static_cast<size_t>(k);
+    std::vector<float> scores[2];
+    std::vector<uint64_t> ids[2];
+    for (int fused = 0; fused < 2; ++fused) {
+        scores[fused].assign(static_cast<size_t>(n_q) * k_sz, 0.0f);
+        ids[fused].assign(static_cast<size_t>(n_q) * k_sz, 0);
+        g_vnni_fused_batch_enabled.store(fused != 0, std::memory_order_relaxed);
+        const int64_t before = g_vnni_fused_batch_count.load(std::memory_order_relaxed);
+        const int64_t batches_before = g_batch_scan_count.load(std::memory_order_relaxed);
+        const bool ok = ggml_vec_index_search(idx, queries, n_q, k, scores[fused].data(), ids[fused].data()) ==
+            GGML_VEC_INDEX_OK;
+        g_vnni_fused_batch_enabled.store(true, std::memory_order_relaxed);
+        const int64_t ran = g_vnni_fused_batch_count.load(std::memory_order_relaxed) - before;
+        const int64_t batches = g_batch_scan_count.load(std::memory_order_relaxed) - batches_before;
+        if (!ok) {
+            return 0;
+        }
+        if (batches == 0) {
+            return -6;
+        }
+        // Every task of the fused run must have taken the kernel.
+        if (fused != 0 ? ran != batches : ran != 0) {
+            return 0;
+        }
+    }
+    return ids[0] == ids[1] &&
+        std::memcmp(scores[0].data(), scores[1].data(), scores[0].size() * sizeof(float)) == 0 ? 1 : 0;
+#else
+    (void) n_q;
     return -1;
 #endif
 }
