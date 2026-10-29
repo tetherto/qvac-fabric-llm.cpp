@@ -222,6 +222,7 @@ int parallel_pool_selftest_for_test(int n_threads);
 int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * unit, std::vector<uint64_t> * masks);
 int turbovec_exact2_row_parity_for_test(const ggml_vec_index_t * idx, const float * query);
 int turbovec_vnni_fused_scan_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k);
+int turbovec_vnni_fused_batch_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k);
 int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
@@ -6941,6 +6942,72 @@ void check_turbovec_1x_vnni_fused_scan() {
     turbovec_force_x86_rules_for_test(0);
 }
 
+// The staged batch's fused AVX-512 sign scan (six queries a task through
+// the multi-query kernel, a lone tail through the two-block one) against the
+// same batch with the kernel off: 25 queries make four full tasks and a lone
+// tail, 15 two and a tail of three (one thread only, four threads would
+// search them one by one). Seeded and not, a tail block, k values that cut
+// the collectors back often, calibrated or not. Skipped where the kernel
+// cannot run.
+void check_turbovec_1x_vnni_fused_batch() {
+    turbovec_force_x86_rules_for_test(1);
+    turbovec_force_planes_for_test(1, 1);
+    bool skipped = false;
+    for (const int dim : { 64, 96 }) {
+        const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 25, static_cast<size_t>(dim));
+        const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, 1024, static_cast<size_t>(dim));
+        for (const int n : { 40017, 20000 }) {
+            const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, static_cast<size_t>(n), static_cast<size_t>(dim));
+            const std::vector<uint64_t> ids = tv1x_ids(static_cast<size_t>(n));
+            for (const int bits : { 2, 4 }) {
+                for (const int calibrated : { 0, 1 }) {
+                    turbovec_force_vector_major_for_test(1);
+                    auto * tv = ggml_vec_index_create_turbovec(dim, bits);
+                    CHECK(tv != nullptr);
+                    if (calibrated != 0) {
+                        CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), 1024) == GGML_VEC_INDEX_OK);
+                    }
+                    CHECK(ggml_vec_index_add(tv, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(turbovec_layout_for_test(tv) == 1);
+                    for (const int threads : { 1, 4 }) {
+                        CHECK(ggml_vec_index_set_threads(tv, threads) == GGML_VEC_INDEX_OK);
+                        for (const int nq : { 25, 15 }) {
+                            if (nq == 15 && threads != 1) {
+                                continue;
+                            }
+                            for (const int k : { 1, 10, 64, 150 }) {
+                                const int status = turbovec_vnni_fused_batch_parity_for_test(tv, queries.data(), nq, k);
+                                // Only a host without the kernel may skip: the
+                                // index must be the staged vector-major one and
+                                // the queries must have taken the batch.
+                                CHECK(status == 1 || status == -1 || status == -4);
+                                if (status < 0) {
+                                    if (!skipped) {
+                                        std::printf("SKIP TurboVec fused vnni batch parity (reason %d)\n", status);
+                                    }
+                                    skipped = true;
+                                    break;
+                                }
+                                CHECK(status == 1);
+                            }
+                            if (skipped) {
+                                break;
+                            }
+                        }
+                        if (skipped) {
+                            break;
+                        }
+                    }
+                    ggml_vec_index_free(tv);
+                    tv1x_reset_kernel_overrides();
+                }
+            }
+        }
+    }
+    turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_x86_rules_for_test(0);
+}
+
 void check_turbovec_1x_thread_invariance(int x86_rules) {
     turbovec_force_x86_rules_for_test(x86_rules);
     constexpr int dim = 64;
@@ -8033,6 +8100,7 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_thread_invariance(0);
             check_turbovec_1x_thread_invariance(1);
             check_turbovec_1x_vnni_fused_scan();
+            check_turbovec_1x_vnni_fused_batch();
             check_vector_index_pool();
             check_turbovec_1x_concurrent_search();
             check_turbovec_1x_staged_maintenance(0);
