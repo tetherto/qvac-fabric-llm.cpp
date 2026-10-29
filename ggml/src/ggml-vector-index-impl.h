@@ -696,6 +696,11 @@ int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * 
 // kernel for every lane of every block of a planes index: 1 equal bit for
 // bit, 0 not, -1 when the index rescores by block.
 int turbovec_exact2_row_parity_for_test(const ggml_vec_index_t * idx, const float * query);
+// The staged search's fused AVX-512 sign scan against the block-by-block
+// path over a vector-major sign region: n_q lone top-k searches each way,
+// 1 when every id and score bit agrees, 0 not, -1 when the index or host
+// has no fused scan.
+int turbovec_vnni_fused_scan_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
     uint64_t * codes_hash,

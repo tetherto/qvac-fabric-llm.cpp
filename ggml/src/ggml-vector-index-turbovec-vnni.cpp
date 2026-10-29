@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h>
+#include <limits>
 
 namespace ggml_vec_index_detail {
 
@@ -69,20 +70,23 @@ void vnni_lut_sums_nq(
 
 // Upstream `search_single_query_vnni_blk2`: one query over two blocks in
 // flight, sharing each quad's table loads; prefetches the first block's
-// stream eight quads ahead.
-void vnni_lut_sums_blk2(
+// stream eight quads ahead. The sums stay in a0 and a1 (16 lanes each).
+inline void vnni_lut_acc_blk2(
         const uint8_t * split_lut,
         const uint8_t * block0,
         size_t n_byte_groups,
         size_t bytes_after,
-        int32_t * sums) {
+        __m512i a0[2],
+        __m512i a1[2]) {
     const __m512i m0f = _mm512_set1_epi8(0x0f);
     const __m512i kpos = _mm512_set1_epi32(0x30201000);
     const __m512i ones = _mm512_set1_epi8(1);
     const size_t quads = n_byte_groups / 4;
     const uint8_t * block1 = block0 + n_byte_groups * kBlock;
-    __m512i a0[2] = { _mm512_setzero_si512(), _mm512_setzero_si512() };
-    __m512i a1[2] = { _mm512_setzero_si512(), _mm512_setzero_si512() };
+    a0[0] = _mm512_setzero_si512();
+    a0[1] = _mm512_setzero_si512();
+    a1[0] = _mm512_setzero_si512();
+    a1[1] = _mm512_setzero_si512();
     for (size_t q4 = 0; q4 < quads; ++q4) {
         for (size_t h = 0; h < 2; ++h) {
             const size_t pf = (q4 + 8) * 128 + h * 64;
@@ -104,10 +108,94 @@ void vnni_lut_sums_blk2(
             a1[h] = _mm512_dpbusd_epi32(a1[h], _mm512_permutexvar_epi8(i1hi, thi), ones);
         }
     }
+}
+
+void vnni_lut_sums_blk2(
+        const uint8_t * split_lut,
+        const uint8_t * block0,
+        size_t n_byte_groups,
+        size_t bytes_after,
+        int32_t * sums) {
+    __m512i a0[2];
+    __m512i a1[2];
+    vnni_lut_acc_blk2(split_lut, block0, n_byte_groups, bytes_after, a0, a1);
     _mm512_storeu_si512(reinterpret_cast<void *>(sums), a0[0]);
     _mm512_storeu_si512(reinterpret_cast<void *>(sums + 16), a0[1]);
     _mm512_storeu_si512(reinterpret_cast<void *>(sums + kBlock), a1[0]);
     _mm512_storeu_si512(reinterpret_cast<void *>(sums + kBlock + 16), a1[1]);
+}
+
+// One block of the fused lone-query scan: the `vpermb` epilogue of
+// vnni_lut_finish (ggml-vector-index-turbovec.cpp) in registers, sum *
+// scale + bias as two roundings, times the vector's scale, -inf past the
+// valid lanes; then the per-block tests of the staged Collector's SSE2
+// add_block, which must keep the same rows: lanes above the seed counted
+// (ordered, so a NaN lane does not count), a block without a NaN lane
+// skipped when its best lane cannot enter, and under a threshold only the
+// lanes above it visited, NaN lanes among them (cmp NLE, unordered). The
+// lanes that remain go to the sink compressed. The threshold is a double
+// the collector made from a float, so its float form compares the same.
+inline void vnni_fused_block(
+        const __m512i a[2],
+        __m512 vs,
+        __m512 vb,
+        const float * vector_scales,
+        size_t block,
+        size_t n_vectors,
+        TurboVecVnniScanState & state,
+        TurboVecVnniScanSink sink,
+        void * ctx,
+        size_t & above_seed) {
+    const size_t base = block * kBlock;
+    const size_t valid = n_vectors - base < kBlock ? n_vectors - base : kBlock;
+    const uint32_t valid_mask = valid >= 32 ? 0xffffffffu : (1u << valid) - 1u;
+    const __mmask16 v0 = static_cast<__mmask16>(valid_mask);
+    const __mmask16 v1 = static_cast<__mmask16>(valid_mask >> 16);
+    const __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+    const __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[0]), vs), vb);
+    const __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[1]), vs), vb);
+    const __m512 s0 = _mm512_mask_mul_ps(neg_inf, v0, f0, _mm512_maskz_loadu_ps(v0, vector_scales + base));
+    const __m512 s1 = _mm512_mask_mul_ps(neg_inf, v1, f1, _mm512_maskz_loadu_ps(v1, vector_scales + base + 16));
+    if (state.seed_active) {
+        const __m512 seed = _mm512_set1_ps(state.seed);
+        const uint32_t above = static_cast<uint32_t>(_mm512_cmp_ps_mask(s0, seed, _CMP_GT_OQ)) |
+            (static_cast<uint32_t>(_mm512_cmp_ps_mask(s1, seed, _CMP_GT_OQ)) << 16);
+        above_seed += static_cast<size_t>(_mm_popcnt_u32(above));
+    }
+    const double floor = state.floor_score != nullptr ? state.floor_score->load(std::memory_order_relaxed) :
+                                                        -std::numeric_limits<double>::infinity();
+    const uint32_t unord = static_cast<uint32_t>(_mm512_cmp_ps_mask(s0, s0, _CMP_UNORD_Q)) |
+        (static_cast<uint32_t>(_mm512_cmp_ps_mask(s1, s1, _CMP_UNORD_Q)) << 16);
+    if (unord == 0) {
+        const double block_max = static_cast<double>(_mm512_reduce_max_ps(_mm512_max_ps(s0, s1)));
+        if ((state.cut && block_max <= state.threshold) || block_max < floor) {
+            return;
+        }
+    }
+    uint32_t lanes = valid_mask;
+    if (state.cut) {
+        const __m512 thr = _mm512_set1_ps(static_cast<float>(state.threshold));
+        lanes &= static_cast<uint32_t>(_mm512_cmp_ps_mask(s0, thr, _CMP_NLE_UQ)) |
+            (static_cast<uint32_t>(_mm512_cmp_ps_mask(s1, thr, _CMP_NLE_UQ)) << 16);
+        if (lanes == 0) {
+            return;
+        }
+    }
+    // Compressed in registers, then stored whole: the memory form of
+    // vcompressps is microcoded on some cores.
+    const __mmask16 l0 = static_cast<__mmask16>(lanes);
+    const __mmask16 l1 = static_cast<__mmask16>(lanes >> 16);
+    const size_t n0 = static_cast<size_t>(_mm_popcnt_u32(lanes & 0xffffu));
+    const size_t n1 = static_cast<size_t>(_mm_popcnt_u32(lanes >> 16));
+    const __m512i iota = _mm512_set_epi32(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    alignas(64) float scores[kBlock + 16];
+    alignas(64) int32_t lane_ids[kBlock + 16];
+    _mm512_storeu_ps(scores, _mm512_maskz_compress_ps(l0, s0));
+    _mm512_storeu_ps(scores + n0, _mm512_maskz_compress_ps(l1, s1));
+    _mm512_storeu_si512(reinterpret_cast<void *>(lane_ids), _mm512_maskz_compress_epi32(l0, iota));
+    _mm512_storeu_si512(reinterpret_cast<void *>(lane_ids + n0),
+        _mm512_maskz_compress_epi32(l1, _mm512_add_epi32(iota, _mm512_set1_epi32(16))));
+    sink(ctx, block, floor, scores, lane_ids, n0 + n1, state);
 }
 
 struct HiNibbleShift {
@@ -159,6 +247,43 @@ void turbovec_vnni_lut_sums(
                 break;
         }
     }
+}
+
+void turbovec_vnni_lut_scan_blk2(
+        const uint8_t * split_lut,
+        float scale,
+        float bias,
+        const float * vector_scales,
+        const uint8_t * blocks,
+        size_t block_begin,
+        size_t block_end,
+        size_t n_vectors,
+        size_t n_byte_groups,
+        TurboVecVnniScanState & state,
+        TurboVecVnniScanSink sink,
+        void * ctx) {
+    const size_t block_bytes = n_byte_groups * kBlock;
+    const size_t n_blocks = (n_vectors + kBlock - 1) / kBlock;
+    const __m512 vs = _mm512_set1_ps(scale);
+    const __m512 vb = _mm512_set1_ps(bias);
+    size_t above_seed = state.above_seed;
+    size_t b = block_begin;
+    for (; b + 2 <= block_end; b += 2) {
+        __m512i a0[2];
+        __m512i a1[2];
+        vnni_lut_acc_blk2(split_lut, blocks + b * block_bytes, n_byte_groups, (n_blocks - b) * block_bytes, a0, a1);
+        vnni_fused_block(a0, vs, vb, vector_scales, b, n_vectors, state, sink, ctx, above_seed);
+        vnni_fused_block(a1, vs, vb, vector_scales, b + 1, n_vectors, state, sink, ctx, above_seed);
+    }
+    if (b < block_end) {
+        // The odd tail block, single stream, without prefetch.
+        alignas(64) int32_t sums[kBlock];
+        vnni_lut_sums_nq<1, false>(&split_lut, blocks + b * block_bytes, n_byte_groups, 0, sums);
+        const __m512i a[2] = { _mm512_load_si512(reinterpret_cast<const void *>(sums)),
+            _mm512_load_si512(reinterpret_cast<const void *>(sums + 16)) };
+        vnni_fused_block(a, vs, vb, vector_scales, b, n_vectors, state, sink, ctx, above_seed);
+    }
+    state.above_seed = above_seed;
 }
 
 void turbovec_permute_dot_sums_vnni(

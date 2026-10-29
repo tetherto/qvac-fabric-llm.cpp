@@ -18,7 +18,8 @@
 
 #include <bitset>
 
-#if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL) || defined(GGML_VEC_INDEX_HAVE_VPOPCNT_KERNEL)
+#if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL) || defined(GGML_VEC_INDEX_HAVE_VPOPCNT_KERNEL) || \
+    defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
 #include "ggml-vector-index-x86.h"
 #endif
 
@@ -49,6 +50,20 @@ std::atomic<size_t> g_planes_min_vectors{ kTurboVecPlanesMinVectors };
 // Off keeps the bit-mask build and count on their scalar loops (tests).
 std::atomic<bool> g_low_kernels_enabled{ true };
 #endif
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+// Off scores a lone query's vector-major sign region block by block
+// through the Collector (tests).
+std::atomic<bool> g_vnni_fused_scan_enabled{ true };
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL) && defined(GGML_VEC_INDEX_TEST_HOOKS)
+// Fused scans run, for the same test.
+std::atomic<int64_t> g_vnni_fused_scan_count{ 0 };
+#endif
+void count_vnni_fused_scan() {
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL) && defined(GGML_VEC_INDEX_TEST_HOOKS)
+    g_vnni_fused_scan_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
 
 // Set bits of a word; MSVC has no __builtin_popcount.
 inline int popcount64(uint64_t x) {
@@ -1193,6 +1208,55 @@ struct Collector {
         }
     }
 
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+    // The lanes the fused x86 scan hands over (turbovec_vnni_lut_scan_blk2):
+    // the SSE2 add_block's walk over them, the seed count and the block
+    // tests having run in the kernel. No allowed mask: that scan is only
+    // run unfiltered.
+    void add_lanes(size_t block, double floor, const float * scores, const int32_t * lanes, size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            const double score = static_cast<double>(scores[i]);
+            if (score < floor) {
+                continue;
+            }
+            top.push_back({ score, static_cast<uint64_t>(block * kBlock + static_cast<size_t>(lanes[i])) });
+        }
+        if (top.size() >= 2 * s_len) {
+            cut_back();
+        }
+    }
+
+    static void vnni_sink(
+            void * ctx,
+            size_t block,
+            double floor,
+            const float * scores,
+            const int32_t * lanes,
+            size_t n,
+            ggml_vec_index_detail::TurboVecVnniScanState & state) {
+        Collector & col = *static_cast<Collector *>(ctx);
+        col.add_lanes(block, floor, scores, lanes, n);
+        state.threshold = col.threshold;
+        state.cut = col.cut;
+    }
+
+    // Blocks [block_begin, block_end) of a vector-major sign region through
+    // the fused kernel: the same rows as add_block over its scores.
+    void scan_vnni(const SignLut & lut, const uint8_t * blocks, const float * vscales, size_t block_begin,
+            size_t block_end, size_t n, size_t n_byte_groups) {
+        ggml_vec_index_detail::TurboVecVnniScanState state;
+        state.threshold = threshold;
+        state.cut = cut;
+        state.seed_active = seed_active;
+        state.seed = seed;
+        state.floor_score = floor_score;
+        state.above_seed = above_seed;
+        ggml_vec_index_detail::turbovec_vnni_lut_scan_blk2(lut.split.data(), lut.scale, lut.bias, vscales, blocks,
+            block_begin, block_end, n, n_byte_groups, state, &Collector::vnni_sink, this);
+        above_seed = state.above_seed;
+    }
+#endif
+
     // A range of a split query hands back at most s_len rows.
     void finish() {
         if (floor_score != nullptr && top.size() > s_len) {
@@ -1200,6 +1264,16 @@ struct Collector {
         }
     }
 };
+
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+// Whether a lone query's vector-major sign region is scanned by the fused
+// AVX-512 kernel: the `vpermb` kernel's own gate (turbovec_cpu_dot_product)
+// and split tables, as score_turbovec_lut_blocks_vnni requires.
+bool vnni_fused_scan_ready(const SignLut & lut) {
+    return !lut.split.empty() && turbovec_cpu_dot_product() &&
+        g_vnni_fused_scan_enabled.load(std::memory_order_relaxed);
+}
+#endif
 
 }  // namespace
 
@@ -1419,6 +1493,16 @@ bool turbovec_staged_search(
                 float * out = group_scores;
                 const uint8_t * lut = sign_lut.values.data();
                 const uint8_t * split_lut = sign_lut.split.empty() ? nullptr : sign_lut.split.data();
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+                if (vnni_fused_scan_ready(sign_lut)) {
+                    // The scores finished and tested in the kernel's
+                    // registers (upstream search_single_query_vnni_blk2).
+                    count_vnni_fused_scan();
+                    col.scan_vnni(sign_lut, idx.turbovec_sign_blocked.data(), vscales, block_begin, block_end, n, nsg);
+                    col.finish();
+                    return;
+                }
+#endif
                 for (size_t block = block_begin; block < block_end; block += kGroup) {
                     const size_t n_group = std::min(kGroup, block_end - block);
                     score_turbovec_lut_blocks_vnni(&lut, split_lut != nullptr ? &split_lut : nullptr, &sign_lut.scale,
@@ -2046,5 +2130,53 @@ int64_t turbovec_seed_short_count_for_test() {
 
 int64_t turbovec_batch_scan_count_for_test() {
     return g_batch_scan_count.load(std::memory_order_relaxed);
+}
+
+int turbovec_vnni_fused_scan_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k) {
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+    {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        if (!is_turbovec(*idx) || idx->turbovec_legacy || !idx->turbovec_staged_enabled ||
+            turbovec_sign_layout(*idx) != kTurboVecLayoutVm || !turbovec_cpu_dot_product()) {
+            return -1;
+        }
+        TurboVecPlanesStats stats;
+        const std::vector<float> * centre = nullptr;
+        if (!planes_ready(*idx, stats, centre)) {
+            return -1;
+        }
+    }
+    const size_t dim = static_cast<size_t>(idx->dim);
+    const size_t k_sz = static_cast<size_t>(k);
+    std::vector<float> scores[2];
+    std::vector<uint64_t> ids[2];
+    // Each query searched alone, so the lone scan runs; the fused run must
+    // have taken the kernel, the other must not have.
+    for (int fused = 0; fused < 2; ++fused) {
+        scores[fused].assign(static_cast<size_t>(n_q) * k_sz, 0.0f);
+        ids[fused].assign(static_cast<size_t>(n_q) * k_sz, 0);
+        g_vnni_fused_scan_enabled.store(fused != 0, std::memory_order_relaxed);
+        const int64_t before = g_vnni_fused_scan_count.load(std::memory_order_relaxed);
+        bool ok = true;
+        for (int q = 0; q < n_q && ok; ++q) {
+            ok = ggml_vec_index_search(idx, queries + static_cast<size_t>(q) * dim, 1, k,
+                     scores[fused].data() + static_cast<size_t>(q) * k_sz,
+                     ids[fused].data() + static_cast<size_t>(q) * k_sz) == GGML_VEC_INDEX_OK;
+        }
+        g_vnni_fused_scan_enabled.store(true, std::memory_order_relaxed);
+        const int64_t ran = g_vnni_fused_scan_count.load(std::memory_order_relaxed) - before;
+        if (!ok || (fused != 0 ? ran < n_q : ran != 0)) {
+            return 0;
+        }
+    }
+    return ids[0] == ids[1] &&
+        std::memcmp(scores[0].data(), scores[1].data(), scores[0].size() * sizeof(float)) == 0 ? 1 : 0;
+#else
+    (void) idx;
+    (void) queries;
+    (void) n_q;
+    (void) k;
+    return -1;
+#endif
 }
 #endif
