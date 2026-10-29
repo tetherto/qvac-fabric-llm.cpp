@@ -3853,7 +3853,10 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             }
             for (int j = i + 1; j < cgraph->n_nodes; j++) {
                 struct ggml_tensor * b = cgraph->nodes[j];
-                if (!free_mm(b) || !xdna_pgemm_pair_supported(a, b)) {
+                // the cheap test first: a pair reads one activation, and most
+                // of the graph's projections do not read a's
+                if (b->op != GGML_OP_MUL_MAT || b->src[1] != a->src[1] || !free_mm(b) ||
+                    !xdna_pgemm_pair_supported(a, b)) {
                     continue;
                 }
                 struct ggml_tensor * at = a;
@@ -4251,8 +4254,8 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             size_t        off = 0;
             xdna_buffer * bo  = xdna_gdn_conv_input(ctx->ops.pool, (int) node->ne[1], (int) node->ne[0], &off);
             // Only when the GEMM's rows fit what is left of the conv's buffer
-            // (it writes an even count of 128-row blocks, the buffer holds the
-            // tokens rounded up to 128 and two chunks): otherwise the
+            // (it writes whole 128-row blocks, the buffer holds the tokens
+            // rounded up to 128 and two chunks): otherwise the
             // projection goes to its node and the conv input is prepared on
             // the host, as a refused call would have had it, without the call
             // logging an error for every layer.
