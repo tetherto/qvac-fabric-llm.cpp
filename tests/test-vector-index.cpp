@@ -6881,8 +6881,17 @@ void check_turbovec_1x_thread_invariance(int x86_rules) {
             const int64_t batches_before = turbovec_batch_scan_count_for_test();
             run(1, ref_scores, ref_ids);
             // One thread takes the staged batch, a full task and a tail at
-            // either k; the reference must come from it.
-            CHECK(turbovec_batch_scan_count_for_test() >= batches_before + 4);
+            // either k; the reference must come from it. Under the aarch64
+            // rules that needs the NEON quad kernel, so on an x86 host those
+            // rules run query by query and only the equality below holds.
+#if defined(__aarch64__) || defined(_M_ARM64)
+            const bool batch_expected = true;
+#else
+            const bool batch_expected = x86_rules != 0;
+#endif
+            if (batch_expected) {
+                CHECK(turbovec_batch_scan_count_for_test() >= batches_before + 4);
+            }
             for (const int threads : { 2, 8, 3 }) {
                 std::vector<float> scores;
                 std::vector<uint64_t> out;
