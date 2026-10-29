@@ -231,20 +231,44 @@ __attribute__((noinline)) void expand_group8(const uint8_t *  blk,
     }
 }
 
-// out = silu(g) * u for one block's 64 x 32 gate and up halves of the
-// accumulator (see ggml_xdna_pg_out). g u is formed from bf16 hi/lo pairs in
-// the f32 accumulator; sigmoid(g) = 1 / (1 + 2^t), t = -g log2(e), with 2^t
+// The exponent t of the sigmoid 1 / (1 + 2^t) that GELU's tanh form is
+// gated by: gelu(g) = g sigmoid(2 sqrt(2 / pi) (g + 0.044715 g^3)), so
+// t = -2 sqrt(2 / pi) log2(e) g (1 + 0.044715 g^2), each constant a bf16
+// pair and each product in the f32 accumulator.
+__attribute__((always_inline)) inline xdna::v32f gelu_exponent(const v32bf & gh) {
+    const v32bf kh = aie::broadcast<bfloat16, 32>((bfloat16) (183.0f / 4096.0f));
+    const v32bf kl = aie::broadcast<bfloat16, 32>((bfloat16) (0.044715f - 183.0f / 4096.0f));
+    const v32bf ch = aie::broadcast<bfloat16, 32>((bfloat16) -2.296875f);
+    const v32bf cl = aie::broadcast<bfloat16, 32>((bfloat16) (-2.30220820f + 2.296875f));
+    const v32bf g2 = aie::mul(gh, gh).to_vector<bfloat16>(0);
+    facc32      wa;
+    wa.from_vector(xdna::bc<32>(1.0f), 0);
+    wa                = aie::mac(wa, g2, kh);
+    wa                = aie::mac(wa, g2, kl);
+    const v32f  p     = aie::mul(gh, wa.to_vector<bfloat16>(0)).to_vector<float>(0);
+    const v32bf ph    = xdna::to_bf16(p);
+    const v32bf pl    = xdna::to_bf16(aie::sub(p, xdna::to_f32(ph)));
+    facc32      ta    = aie::mul(ph, ch);
+    ta                = aie::mac(ta, ph, cl);
+    ta                = aie::mac(ta, pl, ch);
+    return ta.to_vector<float>(0);
+}
+
+// out = act(g) * u for one block's 64 x 32 gate and up halves of the
+// accumulator (see ggml_xdna_pg_out), act SiLU or, with `gelu`, GELU. g u is
+// formed from bf16 hi/lo pairs in the f32 accumulator; sigmoid(g) = 1 / (1 +
+// 2^t), t = -g log2(e) (gelu_exponent for GELU), with 2^t
 // as attention's exp2 (2^n in the exponent field, a cubic for 2^f) and the
 // reciprocal by the core's inverse: bf16-level, which is what the next GEMM
 // reads of it.
-// silu(gate) * up of the accumulator's halves. BF16 = false: f32 in the
+// act(gate) * up of the accumulator's halves. BF16 = false: f32 in the
 // (8, 8) sub-tile order the MemTile's join turns into rows. BF16 = true
 // (the next projection's A, mode 2): bf16 [64 rows][32] as 1024 words at the
 // front of the object - each word placed where the join's reordering (a
 // stream word w of [rb 8][cb 4][r 8][c 8] to row-major [64][32] word
 // address) sends it to word row * 16 + col / 2 - and the back half left as
 // it is, which the host lets fall on the next block's rows.
-template <bool BF16> __attribute__((noinline)) void silu_mul(const float * acc, float * out) {
+template <bool BF16> __attribute__((noinline)) void silu_mul(const float * acc, float * out, bool gelu) {
     constexpr int SUB = 64, CB = 8, HB = CB / 2;
     const v32bf   nl2h = aie::broadcast<bfloat16, 32>((bfloat16) -1.4375f);
     const v32bf   nl2l = aie::broadcast<bfloat16, 32>((bfloat16) (-1.44269504f + 1.4375f));
@@ -259,10 +283,15 @@ template <bool BF16> __attribute__((noinline)) void silu_mul(const float * acc, 
             const v32bf gl = xdna::to_bf16(aie::sub(g, xdna::to_f32(gh)));
             const v32bf uh = xdna::to_bf16(u);
             const v32bf ul = xdna::to_bf16(aie::sub(u, xdna::to_f32(uh)));
-            // t = -g log2(e)
-            facc32      ta = aie::mul(gh, nl2h);
-            ta             = aie::mac(ta, gh, nl2l);
-            const v32f t   = ta.to_vector<float>(0);
+            v32f t;
+            if (gelu) {
+                t = gelu_exponent(gh);
+            } else {
+                // t = -g log2(e)
+                facc32 ta = aie::mul(gh, nl2h);
+                ta        = aie::mac(ta, gh, nl2l);
+                t         = ta.to_vector<float>(0);
+            }
             xdna::v16f e0, e1;
             xdna::exp2_bf16_32(t, e0, e1);
             // 1 + 2^t, then its inverse - the sigmoid - by two Newton steps
@@ -410,8 +439,9 @@ void ggml_xdna_expand(const uint8_t * tile, bfloat16 * out, int32_t step, int32_
 // 0..4 are the output blocks the call has (M blocks x chunks), the K tiles a
 // block, whether the tiles are the 8-bit form, the K steps a tile and the
 // pairs of them; word 5 the C objects a block leaves as, word 6 the mode
-// (0: both column halves of the accumulator, 1: SwiGLU of them, 2: that in
-// bf16 as the next projection's A), word 7 the
+// (bits 0-1: 0 both column halves of the accumulator, 1 the gated product of
+// them, 2 that in bf16 as the next projection's A; bit 2: the gate's GELU in
+// place of its SiLU), word 7 the
 // pairs a tile before its last. Two neighbouring cores hold the same tile and each expands
 // every other K step of it for both, so a core expands half the steps it
 // multiplies; `parity` is the core's first step.
@@ -439,10 +469,11 @@ void ggml_xdna_expand_pair(const uint8_t * tile, bfloat16 * out, const int32_t *
 // sub-tiles, [row block][column block]): 64 rows x 32 columns, the same
 // sub-tile order. Mode 0 hands out column half 0 and then half 1; mode 1
 // (a gate/up weight whose core columns are 32 gate then 32 up) the SwiGLU
-// silu(gate) * up of the halves.
+// silu(gate) * up of the halves, or the GeGLU gelu(gate) * up.
 void ggml_xdna_pg_out(const float * acc, float * out, const int32_t * cnt) {
     constexpr int SUB = 64, RB = 8, CB = 8, HB = CB / 2;
-    if (cnt[6] == 0) {
+    const int32_t mode = cnt[6] & 3;
+    if (mode == 0) {
         const int h = pg_half;
         pg_half ^= 1;
         for (int rb = 0; rb < RB; rb++) {
@@ -456,11 +487,12 @@ void ggml_xdna_pg_out(const float * acc, float * out, const int32_t * cnt) {
         }
         return;
     }
-    if (cnt[6] == 2) {
+    const bool gelu = (cnt[6] & 4) != 0;
+    if (mode == 2) {
         aie::set_rounding(aie::rounding_mode::conv_even);
-        silu_mul<true>(acc, out);
+        silu_mul<true>(acc, out, gelu);
     } else {
-        silu_mul<false>(acc, out);
+        silu_mul<false>(acc, out, gelu);
     }
 }
 

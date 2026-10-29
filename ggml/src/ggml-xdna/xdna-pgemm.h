@@ -22,6 +22,12 @@ bool xdna_pgemm_supported(const struct ggml_tensor * op);
 // share an input belong to the previous one.
 void xdna_pgemm_graph_begin(void);
 
+// The bytes a prefill GEMM writes into `op`'s output: its rows rounded up to
+// the array's 128-row blocks, which the host buffer type reports as the
+// tensor's allocation size so the array can write the output in place;
+// 0 when `op` does not go that way.
+size_t xdna_pgemm_out_bytes(const struct ggml_tensor * op);
+
 // Drop the packed weights. They are keyed by a tensor's data pointer, which
 // does not survive the model that owned it.
 void xdna_pgemm_release(void);
@@ -40,13 +46,14 @@ bool xdna_pgemm_run_into(struct xdna_kernel_pool * pool,
                          struct xdna_buffer *      bo,
                          size_t                    off);
 
-// A SWIGLU of two such MUL_MATs of one activation (the FFN's gate and up,
-// weights of one type) the array runs whole: one call, the cores applying
-// silu(gate) * up before C leaves them (GGML_XDNA_PGEMM_GLU=0: off). The
-// caller skips the two MUL_MATs, whose outputs nothing else may read.
+// A SWIGLU or GEGLU of two such MUL_MATs of one activation (the FFN's gate
+// and up, weights of one type) the array runs whole: one call, the cores
+// applying silu(gate) * up, or gelu(gate) * up in its tanh form, before C
+// leaves them (GGML_XDNA_PGEMM_GLU=0: off). The caller skips the two
+// MUL_MATs, whose outputs nothing else may read.
 bool xdna_pgemm_glu_supported(const struct ggml_tensor * glu);
 bool xdna_pgemm_run_glu(struct xdna_kernel_pool * pool, struct ggml_tensor * glu);
-// The same SwiGLU written by the cores in bf16 straight into the A layout of
+// The same GLU written by the cores in bf16 straight into the A layout of
 // `down`, the MUL_MAT that reads it (GGML_XDNA_PGEMM_GLU_A=0: off): the GLU's
 // own output is not written, and down's call finds its A laid out. The caller
 // runs down next and lets nothing else read the GLU's node.
@@ -103,3 +110,11 @@ bool xdna_pgemm_run_pair(struct xdna_kernel_pool *  pool,
                          const struct ggml_tensor * b,
                          float *                    a_out,
                          float *                    b_out);
+
+// Projections of one activation that follow each other in the graph (a layer's
+// Q, K and V) and fit one weight: one call, the output of each straight into
+// its own node (GGML_XDNA_PGEMM_GROUP=0: off). All but the last end on a whole
+// 512 columns; every node is in one of the backend's buffers. The caller runs
+// the call at the first of them and skips the rest.
+bool xdna_pgemm_group_supported(struct ggml_tensor * const * mm, int n);
+bool xdna_pgemm_run_group(struct xdna_kernel_pool * pool, struct ggml_tensor * const * mm, int n);
