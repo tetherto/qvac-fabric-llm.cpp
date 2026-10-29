@@ -61,9 +61,8 @@ constexpr int          A_COL0      = 6;              // the two A streams' shim 
 // laid out already (norm, gate, GLU into A), so cutting a call finer to
 // overlap the host's layout with the array only adds commands, and the
 // command rate costs the package (~1.5 W, 3% of pp4096 at four slabs a
-// call). Below two blocks a run's fixed cost shows.
+// call).
 constexpr int          MAX_BLOCKS  = 16;
-constexpr int          SLAB_MIN    = 2;
 // Longest K the gated passes take, and so the f32 row they lay out in one.
 constexpr int          MAX_K       = 4096;
 // C blocks in flight per column, two descriptors a block (target, sink).
@@ -148,18 +147,20 @@ struct a_layout {
     int                 z_rows = 0;
 };
 
-// A's layout for M rows of K: whole pairs of 128-row blocks in slabs of an
-// even count, per slab its two headers' place, then per half the slab's
-// blocks and one spare (a fused SwiGLU's output lets each block's second
-// half fall on the next block, the last one's on the spare).
+// A's layout for M rows of K: the 128-row blocks the rows fill, in slabs of up
+// to MAX_BLOCKS (a block costs the cores the same whatever rows of it are
+// real: they take its A at the shim channel's rate), per slab its two
+// headers' place, then per half the slab's blocks and one spare (a fused
+// SwiGLU's output lets each block's second half fall on the next block, the
+// last one's on the spare).
 struct a_geom {
     int    n_blk = 0, slab = 0, n_sl = 0;
     size_t a_blk   = 0;  // bytes, a block half
     size_t h_total = 0;  // bytes, every slab's headers
 
     a_geom(int M, int K) {
-        n_blk   = ((M + MBLK - 1) / MBLK + 1) / 2 * 2;
-        slab    = std::max(SLAB_MIN, std::min(MAX_BLOCKS, n_blk)) / 2 * 2;
+        n_blk   = std::max(1, (M + MBLK - 1) / MBLK);
+        slab    = std::min(MAX_BLOCKS, n_blk);
         n_sl    = (n_blk + slab - 1) / slab;
         a_blk   = (size_t) MB * K * 2;
         h_total = (size_t) n_sl * 2 * HDR_BYTES;
@@ -326,9 +327,6 @@ struct c_dest {
     bool     fused    = false;
     uint32_t half[2]  = {};
     uint32_t a_blk    = 0;
-    // blocks of the slab with rows of the output; the rest (the pad to an
-    // even count) go to the sink
-    int      nreal    = 0;
 };
 
 // The segment call object `s` falls in, none past them all
@@ -465,7 +463,7 @@ std::vector<uint32_t> build_seq(const xdna_gemv_geom & g,
                 const int     s   = ch * opc + h;
                 const c_seg * sg  = seg_of(cd, s);
                 const int     col = sg ? (s - sg->obj0) * CHUNK / 2 + c * NC : 0;
-                const bool    real = b < cd.nreal && sg && col < sg->cols;
+                const bool    real = sg && col < sg->cols;
                 xdna_bd       bd   = linear_bd(2 * MBLK * NC / 2);
                 if (real) {
                     bd.d0_size   = NC / 2;
@@ -532,7 +530,7 @@ std::vector<uint32_t> build_seq(const xdna_gemv_geom & g,
         }
         for (int c = 0; c < COLS; c++) {
             const uint32_t id = SH_BD_C + 2 * (uint32_t) (c_e % C_RING);
-            const int      nv = b < cd.nreal ? std::max(0, std::min(opc, cd.valid[c] - ch * opc)) : 0;
+            const int      nv = std::max(0, std::min(opc, cd.valid[c] - ch * opc));
             const int      nx = opc - nv;
             if (nv > 0) {
                 xdna_bd bd;
@@ -628,7 +626,6 @@ std::string seq_key(const weights * ws, int nmb, const c_dest & cd, uint32_t h_o
     put(cd.fused);
     put(cd.half);
     put(cd.a_blk);
-    put(cd.nreal);
     put(nsg);
     key.append((const char *) cd.segs.data(), nsg * sizeof(c_seg));
     return key;
@@ -1100,7 +1097,6 @@ bool pgemm_call(xdna_kernel_pool *  pool,
             if (multi) {
                 cs.segs = segs_after(ov->segs, (size_t) sl * slab * MBLK);
             }
-            cs.nreal      = std::min(nmb, (M - sl * slab * MBLK + MBLK - 1) / MBLK);
             cs.half[0]    = (uint32_t) fg.half(sl, 0);
             cs.half[1]    = (uint32_t) fg.half(sl, 1);
             // the stream names this slab's place in dst, so a kernel is bound
@@ -1558,10 +1554,10 @@ bool xdna_pgemm_run_pair(xdna_kernel_pool *  pool,
     const int     na = (int) a->src[0]->ne[1], nb = (int) b->src[0]->ne[1];
     const int     ldc  = (na + nb + 2 * NC - 1) / (2 * NC) * (2 * NC);
     const int     M    = (int) a->src[1]->ne[1];
-    // as many rows as the call writes: an even count of blocks (a_geom). A
-    // whole block only, as this was, refused every M under 129 - the warm-up
-    // and every short prompt - with "the destination cannot take the output
-    // directly", 18 times a graph on the 0.8B, and ran the pair one by one.
+    // as many rows as the call writes: its blocks (a_geom). A whole block
+    // only, as this was, refused every M under 129 - the warm-up and every
+    // short prompt - with "the destination cannot take the output directly",
+    // 18 times a graph on the 0.8B, and ran the pair one by one.
     const size_t  rows = xdna_pgemm_into_rows(M);
     xdna_buffer * bo   = xdna_kernel_pool_acquire_buffer(pool, rows * ldc * 4);
     if (!bo || !bo->data) {
