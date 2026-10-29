@@ -12,6 +12,7 @@ ggml_add_backend_library(ggml-xdna
                          xdna-ops.cpp
                          xdna-pgemm.cpp
                          xdna-attn-mm.cpp
+                         xdna-host-attn.cpp
                          xdna-gdn-mm.cpp
                          xdna-conv-prefill.cpp
                          xdna-rec.cpp

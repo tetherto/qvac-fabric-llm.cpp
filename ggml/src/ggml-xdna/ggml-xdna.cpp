@@ -9,6 +9,7 @@
 #include "xdna-conv-prefill.h"
 #include "xdna-gdn-mm.h"
 #include "xdna-head.h"
+#include "xdna-host-attn.h"
 #include "xdna-norm.h"
 #include "xdna-ops.h"
 #include "xdna-pgemm.h"
@@ -481,6 +482,17 @@ static bool xdna_glue_has_vocab_mm(const std::vector<struct ggml_tensor *> & bat
     return false;
 }
 
+// A FLASH_ATTN_EXT the backend's own host kernel (xdna-host-attn.cpp) runs in
+// place of ggml-cpu's. Like the other fast ops it goes on its own, in order.
+static bool xdna_attn_fast(struct ggml_tensor * node) {
+    if (node == nullptr || node->op != GGML_OP_FLASH_ATTN_EXT || !xdna_host_attn_supported(node)) {
+        return false;
+    }
+    const std::vector<std::string> op_names = { ggml_op_name(node->op) };
+    xdna_prof::glue_timer          xdna_prof_glue(xdna_prof::glue_signature(op_names), op_names);
+    return xdna_host_attn_run(node);
+}
+
 // Run `node` on the host from within the XDNA chunk. Flushes (waits) all
 // pending NPU submissions first, so the op sees the results of the NPU ops it
 // depends on. Returns false on failure or when the op is not glue-claimed.
@@ -501,6 +513,9 @@ static bool xdna_glue_host_run(xdna_ops * ops, const struct ggml_tensor * node) 
     if (!xdna_ops_finalize(ops)) {
         return false;
     }
+    if (xdna_attn_fast(const_cast<struct ggml_tensor *>(node))) {
+        return true;
+    }
     ggml_backend_cpu_set_n_threads(cpu, xdna_glue_n_threads(g_glue_n_seq_tokens >= 32, xdna_vocab_mm(node)));
     cg->n_nodes  = 1;
     cg->n_leafs  = 0;
@@ -516,6 +531,24 @@ static bool xdna_glue_host_run(xdna_ops * ops, const struct ggml_tensor * node) 
         return false;
     }
     return true;
+}
+
+// An op the glue runs on its own, in order, rather than inside the CPU graph of its batch.
+static bool xdna_glue_runs_alone(const struct ggml_tensor * t) {
+    const bool fast_prompt_op = g_glue_n_seq_tokens >= 32 && ((t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID) ||
+                                                              g_norm_mul.count(t));
+    return fast_prompt_op || (t->op == GGML_OP_FLASH_ATTN_EXT && xdna_host_attn_supported(t));
+}
+
+// The nodes of the batch from `off` that one CPU graph takes: up to the next op that runs alone.
+static size_t xdna_glue_graph_len(const std::vector<struct ggml_tensor *> & batch, size_t off) {
+    const size_t n = std::min<size_t>(64, batch.size() - off);
+    for (size_t j = 1; j < n; j++) {
+        if (xdna_glue_runs_alone(batch[off + j])) {
+            return j;
+        }
+    }
+    return n;
 }
 
 // Flush a batch of consecutive glue (host) ops as one CPU cgraph compute after
@@ -548,18 +581,13 @@ static bool xdna_glue_flush(xdna_ops * ops, std::vector<struct ggml_tensor *> & 
             off += 2;
             continue;
         }
-        size_t n = std::min<size_t>(64, batch.size() - off);
-        if (g_glue_n_seq_tokens >= 32) {
-            for (size_t j = 1; j < n; j++) {
-                const ggml_tensor * t = batch[off + j];
-                if ((t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID) || g_norm_mul.count(t)) {
-                    n = j;
-                    break;
-                }
-            }
+        if (xdna_attn_fast(batch[off])) {
+            off++;
+            continue;
         }
-        cg->n_nodes = (int) n;
-        cg->n_leafs = 0;
+        const size_t n = xdna_glue_graph_len(batch, off);
+        cg->n_nodes    = (int) n;
+        cg->n_leafs    = 0;
         std::vector<std::string> op_names;
         op_names.reserve(n);
         for (size_t j = 0; j < n; j++) {
@@ -3240,6 +3268,8 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // the prefill GEMM's activation layouts belong to the graph that laid them
     // out, so every graph starts a new one, whatever its token count
     xdna_pgemm_graph_begin();
+    // an attention mask is rewritten in place by the next graph, whatever its size
+    xdna_host_attn_graph_begin();
     xdna_model_use(ctx, xdna_graph_model(cgraph));
     if (g_glue_n_tokens > 1) {
         // a prefill rewrites cache rows: flush them all again before the pool reads them
