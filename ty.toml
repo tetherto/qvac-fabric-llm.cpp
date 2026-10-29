@@ -32,7 +32,8 @@ include = [
 unsupported-operator = "ignore"
 not-subscriptable = "ignore"
 
-# The exporter uses its separate, pinned Core ML environment.
+# The exporter uses its separate, pinned Core ML environment. torch declares
+# Module.forward as a Callable attribute, so ty >= 0.0.88 rejects method overrides.
 [[overrides]]
 include = [
     "./examples/embedding-coreml/export_coreml.py",
@@ -40,3 +41,4 @@ include = [
 
 [overrides.rules]
 unresolved-import = "ignore"
+invalid-mutable-override = "ignore"
