@@ -52,15 +52,17 @@ endif()
 # compiles stay in sync.
 #
 # The prefill tile_m is the reuse factor for the weights: one B sweep feeds
-# tile_m * n_compute_rows rows, so the 64-row int8 tile re-reads B from DDR
-# four times less often than the 16-row tile the first prefill kernels used.
-# bf16 cannot go that far - its double-width A/B banks plus the f32 C tile
-# exceed the 64 KB core L1 past 32 rows - so the two routes bake different
-# tiles. The prefill M blocks must stay multiples of tile_m * n_compute_rows.
+# tile_m * n_compute_rows rows, so the 64-row tile re-reads B from DDR half as
+# often as the 32-row one. A core's input streams are the limit of the bf16
+# kernel (a 64x64 B tile is 8 KB for 32 rows of A): the wider tile takes the
+# GEMM of 512 rows by N=12288 from 2.2 to 1.2 ms. It fills the 64 KB core L1
+# exactly with a single f32 C buffer (gemm.py), so the core waits for each C
+# tile to leave. The prefill M blocks must stay multiples of
+# tile_m * n_compute_rows.
 set(XDNA_GEMM_M 32)         # decode M block (tile_m * n_compute_rows)
 set(XDNA_TILE_M 8)          # decode per-core M tile (r=4 native bf16)
 set(XDNA_GEMM_M_BIG 256)    # base prefill M block
-set(XDNA_TILE_M_BIG 32)     # bf16 prefill per-core M tile
+set(XDNA_TILE_M_BIG 64)     # bf16 prefill per-core M tile
 set(XDNA_TILE_M_BIG_I8 64)  # int8 prefill per-core M tile
 set(XDNA_GEMM_M_BIG_EXTRA 512 2048)   # extra prefill M blocks (baked variants)
 # The option was called XDNA_GATED_FMT while the README and the runtime

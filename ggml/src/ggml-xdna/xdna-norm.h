@@ -180,6 +180,15 @@ __attribute__((target("avx2"))) static inline __m256i xdna_bf16x16(__m256i a, __
     return _mm256_permute4x64_epi64(_mm256_packus_epi32(a, b), 0xD8);
 }
 
+// n f32 (a multiple of 16) to bf16: xdna_bf16(x)
+__attribute__((target("avx2"))) static inline void xdna_f32_to_bf16_row(const float * src, uint16_t * dst, int64_t n) {
+    for (int64_t j = 0; j < n; j += 16) {
+        const __m256i a = _mm256_loadu_si256((const __m256i *) (src + j));
+        const __m256i b = _mm256_loadu_si256((const __m256i *) (src + j + 8));
+        _mm256_storeu_si256((__m256i *) (dst + j), xdna_bf16x16(a, b));
+    }
+}
+
 // n f16 (a multiple of 16) to bf16: xdna_bf16(ggml_fp16_to_fp32(x)), exactly
 __attribute__((target("avx2,f16c"))) static inline void xdna_f16_to_bf16_row(const uint16_t * src,
                                                                              uint16_t *       dst,

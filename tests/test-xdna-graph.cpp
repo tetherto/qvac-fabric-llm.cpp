@@ -29,6 +29,14 @@
 // or a call too small (the size rule, tried either side of both its bounds),
 // has to come out equal.
 //
+// BF16 and F16 weight projections, which no quantized route carries, through
+// the bf16 GEMM: an M that fits the decode block, one that takes several
+// prefill blocks, one whose last block is partial and one whose last block
+// holds fewer rows than a sweep of its kernel (it runs a shorter stream); a K
+// of one run, of several and one that ends in a partial run; and, in one
+// graph, projections of different K and N one after the other (the cores hang
+// when consecutive runs differ in their K-loop count).
+//
 // A prefill projection of a row count that is not a whole 128-row block, its
 // tensors in the backend's own buffers: the array writes the output in place,
 // in whole blocks, into rows the allocation reserves for it, and the tensor
@@ -65,6 +73,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <random>
 #include <string>
 #include <vector>
@@ -343,6 +352,44 @@ static bool run_fa(norm_graph & g, const fa_case & c, ggml_backend_t be, std::ve
     res = get_f32(g.checked[0]);
     return true;
 }
+
+struct gemm_shape {
+    int64_t K;
+    int64_t N;
+};
+
+// The projections of `shapes` on M activation rows, in this order and with no
+// other op between them. The activations are one tensor per distinct K.
+static norm_graph build_gemms(ggml_backend_t cpu, enum ggml_type wtype, int64_t M, const std::vector<gemm_shape> & shapes) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 64 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.gf                = ggml_new_graph(g.ctx);
+
+    std::map<int64_t, ggml_tensor *> acts;
+    for (const gemm_shape & sh : shapes) {
+        ggml_tensor *& a = acts[sh.K];
+        if (!a) {
+            a = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, sh.K, M);
+            g.inputs.push_back(a);
+        }
+        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, wtype, sh.K, sh.N);
+        g.inputs.push_back(w);
+        ggml_tensor * out = ggml_mul_mat(g.ctx, w, a);
+        ggml_set_name(out, (std::string("K") + std::to_string(sh.K) + " N" + std::to_string(sh.N)).c_str());
+        ggml_build_forward_expand(g.gf, out);
+        g.checked.push_back(out);
+    }
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+struct gemm_case {
+    const char *            name;
+    enum ggml_type          wtype;
+    int64_t                 M;
+    std::vector<gemm_shape> shapes;
+};
 
 // An N x K Q4_K projection of M tokens followed by a tensor of its own to guard,
 // allocated in `be`'s buffers
@@ -820,6 +867,33 @@ int main(void) {
         ggml_free(g.ctx);
     }
     unsetenv("GGML_XDNA_FA_MM");
+
+    const gemm_case gemm_cases[] = {
+        { "decode block",     GGML_TYPE_BF16, 15,  { { 512, 1024 }, { 1024, 512 } } },
+        { "two blocks",       GGML_TYPE_BF16, 300, { { 512, 1024 }, { 512, 512 } } },
+        { "partial block",    GGML_TYPE_BF16, 912, { { 512, 2048 }, { 512, 512 } } },
+        { "short tail",       GGML_TYPE_BF16, 1100, { { 512, 512 }, { 1024, 512 } } },
+        { "mixed K and N",    GGML_TYPE_BF16, 912, { { 512, 1024 }, { 1024, 512 }, { 2048, 512 }, { 576, 1024 }, { 512, 512 } } },
+        { "f16 weights",      GGML_TYPE_F16,  130, { { 1536, 512 }, { 512, 2048 } } },
+    };
+    for (const gemm_case & c : gemm_cases) {
+        norm_graph                      g = build_gemms(cpu, c.wtype, c.M, c.shapes);
+        std::vector<std::vector<float>> want, got;
+        if (!run(g, cpu, want) || !run(g, npu, got)) {
+            std::printf("test-xdna-graph: compute failed\n");
+            return 1;
+        }
+        for (size_t i = 0; i < g.checked.size(); i++) {
+            const double e  = nmse(want[i], got[i]);
+            const bool   ok = e < tol;
+            passed          = passed && ok;
+            std::printf("MUL_MAT %-4s M%-4lld %-14s %-12s nmse %.3g %s\n", ggml_type_name(c.wtype), (long long) c.M, c.name,
+                        ggml_get_name(g.checked[i]), e, ok ? "ok" : "FAIL");
+        }
+        ggml_backend_buffer_free(g.buf);
+        ggml_free(g.ctx);
+    }
+
     for (int64_t M : { 100, 129, 300 }) {
         passed = test_output_in_place(npu, cpu, M, tol) && passed;
     }
