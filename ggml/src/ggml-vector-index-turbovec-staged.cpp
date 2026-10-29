@@ -1547,10 +1547,13 @@ bool turbovec_staged_search(
         // at most kRankBatch of them (upstream plane_terms): the sign tables
         // over their rows, undone to m * sum(+-q), or the bit masks counted.
         auto plane_terms = [&](size_t begin, size_t end, size_t plane, float * out) {
-            // The rows are scattered over the index, so a batch's lines are
-            // asked for together before any row is read (upstream
-            // prefetch_low); one miss at a time cost more than the count.
-            for (size_t i = begin; i < end; ++i) {
+            // The rows are scattered over the index, so the next batch's
+            // lines are asked for while this one is counted (upstream
+            // rank_first_keep / rank_full_known prefetch_low one step ahead);
+            // asked for just before the read, each row still waited on its
+            // miss. The first batch is asked for here as well.
+            const size_t ahead_end = std::min(list.size(), end + (end - begin));
+            for (size_t i = begin == 0 ? begin : end; i < ahead_end; ++i) {
                 const uint8_t * low = idx.turbovec_data.data() + list[i].slot * row_bytes + plane * nsg;
                 for (size_t off = 0; off < nsg; off += 64) {
                     prefetch_read(low + off);
