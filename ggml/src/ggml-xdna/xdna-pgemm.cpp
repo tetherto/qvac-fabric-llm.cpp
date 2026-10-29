@@ -69,6 +69,13 @@ constexpr int          SLAB_MIN    = 2;
 constexpr int          MAX_K       = 4096;
 // C blocks in flight per column, two descriptors a block (target, sink).
 constexpr int          C_RING      = 3;
+// Header word 6, the cores' output mode: plain halves of the accumulator, the
+// gated product of the gate and up halves as f32, or as bf16 in the next
+// projection's A; PG_MODE_GELU turns the SiLU of the gate into the GELU.
+constexpr int32_t      PG_MODE_PLAIN = 0;
+constexpr int32_t      PG_MODE_GLU   = 1;
+constexpr int32_t      PG_MODE_GLU_A = 2;
+constexpr int32_t      PG_MODE_GELU  = 4;
 // The weights' path, fixed by kernels/pgemm.py
 constexpr uint32_t     W_SHIM_CH   = 1;        // shim MM2S channel
 constexpr uint32_t     W_MT_S2MM   = 5;        // MemTile S2MM channel
@@ -263,6 +270,13 @@ xdna_gemv_geom geom_of(const ggml_tensor * w, int64_t n) {
 
 xdna_gemv_geom geom_of(const ggml_tensor * w) {
     return geom_of(w, w->ne[1]);
+}
+
+// The activations the cores apply to a gate/up pair: SiLU (SWIGLU) or the
+// tanh-approximated GELU (GEGLU), the second selected by a header bit.
+bool glu_gated(const ggml_tensor * glu) {
+    const ggml_glu_op op = ggml_get_glu_op(glu);
+    return op == GGML_GLU_OP_SWIGLU || op == GGML_GLU_OP_GEGLU;
 }
 
 // A linear transfer of `words`, encoded as IRON writes one: unit strides
@@ -542,9 +556,7 @@ weights * weights_for(xdna_kernel_pool *  pool,
     }
     const int N = (int) w->ne[1];
     weights   ws;
-    ws.geom = cat ? geom_of(w, N + up->ne[1]) :
-              up  ? xdna_gemv_variant(w->type, w->ne[0], (int64_t) 2 * N, false, XDNA_GEMV_SPLIT_FUSED, true) :
-                    geom_of(w);
+    ws.geom = cat ? geom_of(w, N + up->ne[1]) : up ? geom_of(w, (int64_t) 2 * N) : geom_of(w);
     if (!ws.geom.valid()) {
         return nullptr;
     }
@@ -732,6 +744,9 @@ bool pgemm_call(xdna_kernel_pool *  pool,
         GGML_LOG_ERROR("%s: the activation layout buffer is null or unmapped\n", "xdna-pgemm");
         return false;
     }
+    // the cores' output mode (kernels/gemm-expand.cc, ggml_xdna_pg_out)
+    const int mode = (fuse ? PG_MODE_GLU_A : glu ? PG_MODE_GLU : PG_MODE_PLAIN) |
+                     (glu && ggml_get_glu_op(node) == GGML_GLU_OP_GEGLU ? PG_MODE_GELU : 0);
     // every slab's headers: its blocks times the chunks, the K tiles a block,
     // the tile format, the K steps a tile and the pairs of them
     {
@@ -741,7 +756,7 @@ bool pgemm_call(xdna_kernel_pool *  pool,
         for (int sl = 0; sl < n_sl; sl++) {
             for (int h = 0; h < 2; h++) {
                 int32_t  words[8] = { blocks_of(sl) * nch,    g.n_tiles(),  q8 ? 1 : 0, steps, steps / 2, glu ? 1 : 2,
-                                     fuse ? 2 : glu ? 1 : 0, steps / 2 - 1 };
+                                     mode,                   steps / 2 - 1 };
                 uint16_t hb[16];                     // (a memcpy: read through a uint16_t
                 std::memcpy(hb, words, sizeof(hb));  // pointer, the ints are dead stores)
                 // the header goes through the MemTile's tiling too: its bf16
@@ -1002,9 +1017,8 @@ bool xdna_pgemm_run_into(xdna_kernel_pool * pool, ggml_tensor * node, xdna_buffe
 }
 
 bool xdna_pgemm_glu_supported(const ggml_tensor * glu) {
-    if (!glu || glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
-        xdna_env_int("GGML_XDNA_PGEMM_GLU", 1) == 0 || glu->type != GGML_TYPE_F32 ||
-        ggml_get_op_params_i32(glu, 1) != 0 || !ggml_is_contiguous(glu)) {
+    if (!glu || glu->op != GGML_OP_GLU || !glu_gated(glu) || xdna_env_int("GGML_XDNA_PGEMM_GLU", 1) == 0 ||
+        glu->type != GGML_TYPE_F32 || ggml_get_op_params_i32(glu, 1) != 0 || !ggml_is_contiguous(glu)) {
         return false;
     }
     const ggml_tensor * gate = glu->src[0];
@@ -1014,8 +1028,7 @@ bool xdna_pgemm_glu_supported(const ggml_tensor * glu) {
         !ggml_are_same_shape(gate, glu)) {
         return false;
     }
-    const xdna_gemv_geom g = xdna_gemv_variant(gate->src[0]->type, gate->src[0]->ne[0], 2 * gate->src[0]->ne[1], false,
-                                               XDNA_GEMV_SPLIT_FUSED, true);
+    const xdna_gemv_geom g = geom_of(gate->src[0], 2 * gate->src[0]->ne[1]);
     return g.valid() && g.n_out() <= 256;
 }
 

@@ -26,6 +26,13 @@
 // in whole blocks, into rows the allocation reserves for it, and the tensor
 // that follows it is untouched.
 //
+// A prompt's FFN, down(GLU(gate(x), up(x))) with SWIGLU and with GEGLU: the
+// backend runs the gate and up projections and the activation as one call,
+// writing the product straight into the down projection's input; with the
+// GLU a graph output it writes the product itself. Activations are scaled
+// to put the gate on the activation's curve and, larger, in its tails. Two
+// sizes: EmbeddingGemma 2's (512, 2048) and Qwen3.5-4B's (2560, 9216).
+//
 // Every intermediate is cleared before each backend runs, so a node read
 // before it was written shows as zeros instead of as the other backend's
 // result. Skips (exit 0) when no XDNA device is registered.
@@ -77,6 +84,7 @@ struct norm_graph {
     std::vector<ggml_tensor *> inputs;
     std::vector<ggml_tensor *> checked;  // compared, in graph order
     int32_t                    out_row = 0;  // what an I32 input (the output-row crop) selects
+    float                      act_scale = 1.0f;  // of the f32 inputs
 };
 
 // K x M activations, an N x K Q4_K projection; side_reader adds SQR(sum)
@@ -139,7 +147,7 @@ static void set_inputs(norm_graph & g, uint32_t seed) {
         std::mt19937       rng((t->type == GGML_TYPE_F32 ? seed : 1234) * 16 + (uint32_t) i);
         std::vector<float> f(ggml_nelements(t));
         for (float & x : f) {
-            x = u(rng);
+            x = u(rng) * (t->type == GGML_TYPE_F32 ? g.act_scale : 1.0f);
         }
         if (t->type == GGML_TYPE_F32) {
             ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
@@ -230,6 +238,56 @@ static bool test_output_in_place(ggml_backend_t npu, ggml_backend_t cpu, int64_t
     std::printf("MUL_MAT in place, M %-4lld alloc %zu of %zu bytes %s, guard %s, nmse %.3g %s\n", (long long) M, room,
                 ggml_nbytes(out), reserved ? "reserved" : "NOT RESERVED", intact ? "intact" : "OVERWRITTEN", e,
                 passed ? "ok" : "FAIL");
+    ggml_backend_buffer_free(want_g.buf);
+    ggml_backend_buffer_free(got_g.buf);
+    ggml_free(want_g.ctx);
+    ggml_free(got_g.ctx);
+    return passed;
+}
+
+// x (K x M) through a gate and an up projection of F rows, joined by `op`
+static norm_graph build_ffn(ggml_backend_t be, ggml_glu_op op, bool glu_is_output, int64_t K, int64_t F, int64_t M,
+                            float scale) {
+    norm_graph    g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.act_scale         = scale;
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * wg    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, K, F);
+    ggml_tensor * wu    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, K, F);
+    ggml_tensor * wd    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, F, K);
+    g.inputs            = { x, wg, wu };
+    ggml_tensor * gate  = ggml_mul_mat(g.ctx, wg, x);
+    ggml_tensor * up    = ggml_mul_mat(g.ctx, wu, x);
+    ggml_tensor * glu =
+        op == GGML_GLU_OP_GEGLU ? ggml_geglu_split(g.ctx, gate, up) : ggml_swiglu_split(g.ctx, gate, up);
+    ggml_set_name(glu, "glu");
+    ggml_tensor * out = glu;
+    if (glu_is_output) {
+        ggml_set_output(glu);
+    } else {
+        g.inputs.push_back(wd);
+        out = ggml_mul_mat(g.ctx, wd, glu);
+        ggml_set_name(out, "down");
+    }
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
+static bool test_ffn(ggml_backend_t npu, ggml_backend_t cpu, ggml_glu_op op, bool glu_is_output, int64_t K, int64_t F,
+                     int64_t M, float scale, double tol) {
+    norm_graph                      want_g = build_ffn(cpu, op, glu_is_output, K, F, M, scale);
+    norm_graph                      got_g  = build_ffn(npu, op, glu_is_output, K, F, M, scale);
+    std::vector<std::vector<float>> want, got;
+    const bool                      ok = run(want_g, cpu, want) && run(got_g, npu, got);
+    const double                    e  = ok ? nmse(want[0], got[0]) : INFINITY;
+    const bool                      passed = ok && e < tol;
+    std::printf("%-6s %-4s K %-5lld F %-5lld M %-4lld scale %-5.2f nmse %.3g %s\n",
+                op == GGML_GLU_OP_GEGLU ? "GEGLU" : "SWIGLU", glu_is_output ? "glu" : "down", (long long) K,
+                (long long) F, (long long) M, scale, e, passed ? "ok" : "FAIL");
     ggml_backend_buffer_free(want_g.buf);
     ggml_backend_buffer_free(got_g.buf);
     ggml_free(want_g.ctx);
@@ -355,6 +413,15 @@ int main(void) {
 
     for (int64_t M : { 100, 129, 300 }) {
         passed = test_output_in_place(npu, cpu, M, tol) && passed;
+    }
+
+    for (ggml_glu_op op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
+        for (bool glu_is_output : { false, true }) {
+            for (float scale : { 0.05f, 0.3f }) {
+                passed = test_ffn(npu, cpu, op, glu_is_output, 512, 2048, 200, scale, 3e-3) && passed;
+                passed = test_ffn(npu, cpu, op, glu_is_output, 2560, 9216, 300, scale, 3e-3) && passed;
+            }
+        }
     }
 
     passed = check_cropped_ffn(cpu, npu, ggml_backend_dev_buffer_type(dev), tol) && passed;
