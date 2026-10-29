@@ -671,6 +671,10 @@ size_t parallel_pool_threads_for_test(void);
 void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums);
 int parallel_pool_selftest_for_test(int n_threads);
 int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * unit, std::vector<uint64_t> * masks);
+// The staged search's 2-bit row rescore against the full scan's block
+// kernel for every lane of every block of a planes index: 1 equal bit for
+// bit, 0 not, -1 when the index rescores by block.
+int turbovec_exact2_row_parity_for_test(const ggml_vec_index_t * idx, const float * query);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
     uint64_t * codes_hash,
