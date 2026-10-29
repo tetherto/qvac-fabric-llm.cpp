@@ -15,6 +15,8 @@ static const double MIN_COSINE     = 0.998;
 static const double MAX_STAGE_NMSE = 5e-2;  // the NPU GEMMs' rounding reaches ~1.5e-2; a wrong op or buffer is O(0.1-1)
 static const int    TOKEN_COUNTS[] = { 1, 8, 40, 70, 600, 1100 };
 static const int    N_INPUTS       = sizeof(TOKEN_COUNTS) / sizeof(TOKEN_COUNTS[0]);
+static const int    N_LONG         = 3200;  // past the array attention's break-even for the sliding-window layers
+static const int    N_CTX_LONG     = 4096;
 static const int    N_SEQ_MAX      = 8;  // divides N_CTX: the worst-case reserve rounds n_tokens up to a multiple of it
 static const int    CHARS_A_TOKEN  = 8;  // at least this many characters of the corpus per wanted token
 static const char   LAYER_OUT[]    = "l_out-";
@@ -68,11 +70,11 @@ static bool capture_stage(struct ggml_tensor * t, bool ask, void * user_data) {
     return true;
 }
 
-static llama_context * make_context(llama_model * model, stage_map * stages) {
+static llama_context * make_context(llama_model * model, stage_map * stages, int n_ctx = N_CTX) {
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx                = N_CTX;
-    cp.n_batch              = N_CTX;
-    cp.n_ubatch             = N_CTX;
+    cp.n_ctx                = n_ctx;
+    cp.n_batch              = n_ctx;
+    cp.n_ubatch             = n_ctx;
     cp.n_seq_max            = N_SEQ_MAX;
     cp.embeddings           = true;
     cp.flash_attn_type      = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -271,6 +273,38 @@ static int check_packed(side & npu, const std::vector<tokens> & inputs, const st
     return failures;
 }
 
+// one long input, whole in one ubatch: the attention the array takes over from the host
+static int check_long(side & cpu, side & npu) {
+    tokens toks = tokenize_corpus(llama_model_get_vocab(cpu.model), N_LONG);
+    if ((int) toks.size() < N_LONG) {
+        return 1;
+    }
+    toks.resize(N_LONG);
+    llama_context * c = make_context(cpu.model, nullptr, N_CTX_LONG);
+    llama_context * n = make_context(npu.model, nullptr, N_CTX_LONG);
+    int             failures = 1;
+    if (c && n) {
+        auto run = [&](llama_context * ctx) {
+            llama_batch b = llama_batch_init(N_CTX_LONG, 0, 1);
+            add_sequence(b, toks, 0);
+            llama_memory_clear(llama_get_memory(ctx), true);
+            const bool ok = llama_decode(ctx, b) == 0;
+            llama_batch_free(b);
+            return ok ? pooled(ctx, 1) : std::vector<embedding>();
+        };
+        const std::vector<embedding> ref = run(c), got = run(n), again = run(n);
+        if (!ref.empty() && !got.empty() && !again.empty()) {
+            const double cos = cosine(ref[0], got[0]);
+            std::printf("long input: %d tokens, pooled cosine %.6f %s, repeat %s\n", N_LONG, cos,
+                        cos >= MIN_COSINE ? "ok" : "FAIL", got[0] == again[0] ? "identical" : "DIFFERS");
+            failures = (cos >= MIN_COSINE ? 0 : 1) + (got[0] == again[0] ? 0 : 1);
+        }
+    }
+    llama_free(n);
+    llama_free(c);
+    return failures;
+}
+
 int main(int argc, char ** argv) {
     const char * model_path = model_arg(argc, argv);
     llama_backend_init();
@@ -287,6 +321,7 @@ int main(int argc, char ** argv) {
         std::vector<embedding>    cpu_single(inputs.size());
         failures += inputs.empty() ? 1 : check_inputs(cpu, npu, inputs, cpu_single);
         failures += inputs.empty() ? 0 : check_packed(npu, inputs, cpu_single);
+        failures += check_long(cpu, npu);
     }
     std::printf("test-xdna-embedding: %s\n", failures == 0 ? "passed" : "FAILED");
     close_side(npu);
