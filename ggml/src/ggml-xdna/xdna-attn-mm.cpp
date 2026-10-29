@@ -248,7 +248,7 @@ void pack_kv(const ggml_tensor * k,
              int64_t             j0,
              int64_t             n_kv) {
     const int64_t t0 = j0 / NK, t1 = (n_kv + NK - 1) / NK;
-#pragma omp parallel for collapse(2) num_threads(xdna_host_threads())
+#pragma omp parallel for collapse(2) num_threads(xdna_chunk_threads())
     for (int64_t t = t0; t < t1; t++) {
         for (int s = 0; s < 4; s++) {
             const int            g = s / 2, h = s % 2;
@@ -409,7 +409,7 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     // rows (the group's 4 heads x 8 positions); past the ubatch zero
     uint16_t *  qh = (uint16_t *) bo_q->data;
     const float qs = (float) (M_LOG2E / 16.0);
-#pragma omp parallel for num_threads(xdna_host_threads())
+#pragma omp parallel for num_threads(xdna_chunk_threads())
     for (int cp = 0; cp < COLS * (1 + npass); cp++) {
         const int  c = cp / (1 + npass), p = cp % (1 + npass) - 1;
         uint16_t * col = qh + (size_t) c * q_col + (size_t) (p + 1) * 4 * Q_OBJ;
@@ -458,7 +458,7 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     if (ok) {
         // O: dst is [D, n_head, n_tokens]
         const float * ob = (const float *) bo_o->data;
-#pragma omp parallel for num_threads(xdna_host_threads())
+#pragma omp parallel for num_threads(xdna_chunk_threads())
         for (int cp = 0; cp < (keep ? 0 : COLS * npass); cp++) {
             const int c = cp / npass, p = cp % npass, g = c / 4;
             for (int i = 0; i < 4; i++) {
@@ -538,7 +538,7 @@ bool xdna_attn_mm_materialize(const ggml_tensor * node) {
     r.base     = (const float *) g_am.kept_bo->data;
     r.o_col    = g_am.kept_col;
     r.n_tokens = g_am.kept_tok;
-#pragma omp parallel for num_threads(xdna_host_threads())
+#pragma omp parallel for num_threads(xdna_chunk_threads())
     for (int64_t t = 0; t < r.n_tokens; t++) {
         for (int h = 0; h < H; h++) {
             const float * p0  = xdna_attn_mm_row(&r, t, h);

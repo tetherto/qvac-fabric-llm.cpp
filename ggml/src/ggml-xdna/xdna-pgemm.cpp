@@ -182,7 +182,7 @@ template <class Row> bool lay_slab(const a_geom & ag, xdna_buffer * bo, int sl, 
     const int  nr = upto < 0 ? nmb * MBLK : std::min(upto, nmb * MBLK);
     uint16_t * ab = (uint16_t *) ((char *) bo->data + ag.base(sl));
     // a few rows are cheaper than waking the team
-#pragma omp parallel for num_threads(xdna_host_threads()) if (nr >= 32)
+#pragma omp parallel for num_threads(xdna_chunk_threads()) if (nr >= 32)
     for (int rr = 0; rr < nr; rr++) {
         const int  m = m0 + rr;
         const int  b = rr / MBLK, hf = (rr % MBLK) / MB, r = rr % MB;
@@ -793,7 +793,7 @@ bool pgemm_call(xdna_kernel_pool *  pool,
             return false;
         }
         const float * c = (const float *) bo->data;
-#pragma omp parallel for num_threads(xdna_host_threads()) if (real >= 32)
+#pragma omp parallel for num_threads(xdna_chunk_threads()) if (real >= 32)
         for (int r = 0; r < real; r++) {
             std::memcpy((char *) node->data + (size_t) (m0 + r) * node->nb[1], c + (size_t) r * ldc_s,
                         (size_t) N * sizeof(float));
