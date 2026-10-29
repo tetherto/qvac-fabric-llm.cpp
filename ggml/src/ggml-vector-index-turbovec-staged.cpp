@@ -1675,12 +1675,16 @@ bool turbovec_staged_search(
                 out[i - begin] = low_planes.unit * static_cast<float>(2 * low_dot(low_planes, low) - low_planes.sum_w);
             }
         };
-        // Runs fn(begin, end) over the list in batches of kRankBatch; a split
-        // query spreads the batches over threads.
+        // Runs fn(begin, end) over the list in steps; a split query spreads
+        // the steps over threads. The table kernel wants its kRankBatch lanes
+        // full; the mask count takes a row at a time, and a short step keeps
+        // the prefetch a few rows ahead instead of a burst of kRankBatch rows
+        // (upstream rank_step).
+        const size_t step = table_rank ? kRankBatch : 8;
         auto for_each_batch = [&](auto && fn) {
             auto run = [&](size_t from, size_t to) {
-                for (size_t b = from; b < to; b += kRankBatch) {
-                    fn(b, std::min(to, b + kRankBatch));
+                for (size_t b = from; b < to; b += step) {
+                    fn(b, std::min(to, b + step));
                 }
             };
             const size_t count = list.size();
