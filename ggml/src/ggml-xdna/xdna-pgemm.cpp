@@ -1,5 +1,6 @@
 #include "xdna-pgemm.h"
 
+#include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "xdna-attn-mm.h"
 #include "xdna-gdn-mm.h"
@@ -828,8 +829,14 @@ bool pgemm_call(xdna_kernel_pool *  pool,
     if (ov) {
         dst_off = ov->off;
     }
-    const size_t m_room = ov ? (size_t) n_blk * MBLK : (size_t) M;
-    const bool   direct = fuse || (dst_bo && (ov || M % MBLK == 0) && N % (2 * NC) == 0 &&
+    // The array writes whole blocks of 128 rows, so a node whose M is not
+    // one needs the rows past its own: its buffer type reports them in its
+    // allocation size (xdna_pgemm_out_bytes), which the allocator reserved.
+    const size_t out_rows = ((size_t) M + MBLK - 1) / MBLK * MBLK;
+    const size_t m_room   = ov ? (size_t) n_blk * MBLK : out_rows;
+    const bool   room     = ov || out_rows == (size_t) M ||
+                      (node->buffer && out_rows * N * 4 <= ggml_backend_buffer_get_alloc_size(node->buffer, node));
+    const bool direct = fuse || (dst_bo && room && N % (2 * NC) == 0 &&
                                  (ov || node->nb[1] == (size_t) N * sizeof(float)) &&
                                  dst_off + m_room * N * 4 <= dst_bo->bytes && dst_off + m_room * N * 4 < (1ull << 32));
     if (ov && !direct) {
@@ -862,11 +869,12 @@ bool pgemm_call(xdna_kernel_pool *  pool,
         g_pg.kern = xdna_kernel_find(pool->device, STEM);
         ok        = g_pg.kern != nullptr;
     }
-    if (ok && direct && !fuse && !xdna_buffer_sync_to_device_range(dst_bo, (size_t) M * N * 4, dst_off)) {
-        // no dirty line of dst may land over what the array writes
-        ok = false;
-    }
     buf_st.stop();
+    if (ok && direct && !fuse) {
+        // no dirty line of dst may land over what the array writes
+        xdna_prof::section_timer flush_st("prefill: pgemm: dst flush");
+        ok = xdna_buffer_sync_to_device_range(dst_bo, (size_t) M * N * 4, dst_off);
+    }
     for (int sl = 0; ok && sl <= n_sl; sl++) {
         if (sl < n_sl) {
             const int nmb = blocks_of(sl);
@@ -926,8 +934,9 @@ bool pgemm_call(xdna_kernel_pool *  pool,
             }
         }
     }
-    if (ok && direct && !ov && !fuse && !xdna_buffer_sync_from_device_range(dst_bo, (size_t) M * N * 4, dst_off)) {
-        ok = false;
+    if (ok && direct && !ov && !fuse) {
+        xdna_prof::section_timer invalidate_st("prefill: pgemm: dst invalidate");
+        ok = xdna_buffer_sync_from_device_range(dst_bo, (size_t) M * N * 4, dst_off);
     }
     if (ok && fuse) {
         fuse->src   = node;
@@ -965,6 +974,13 @@ bool xdna_pgemm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         return false;
     }
     return pgemm_call(pool, node->src[1], ws, node, (int) w->ne[1], false);
+}
+
+size_t xdna_pgemm_out_bytes(const ggml_tensor * op) {
+    if (!xdna_pgemm_supported(op) || op->ne[0] % (2 * NC) != 0) {
+        return 0;
+    }
+    return ((size_t) ggml_nrows(op) + MBLK - 1) / MBLK * MBLK * op->nb[1];
 }
 
 size_t xdna_pgemm_into_rows(int M) {

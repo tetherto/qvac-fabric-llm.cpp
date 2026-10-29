@@ -15,6 +15,11 @@
 // prefill GEMM): a later graph must not reuse the A an earlier one laid out
 // for the same tensor.
 //
+// A prefill projection of a row count that is not a whole 128-row block, its
+// tensors in the backend's own buffers: the array writes the output in place,
+// in whole blocks, into rows the allocation reserves for it, and the tensor
+// that follows it is untouched.
+//
 // Every intermediate is cleared before each backend runs, so a node read
 // before it was written shows as zeros instead of as the other backend's
 // result. Skips (exit 0) when no XDNA device is registered.
@@ -165,6 +170,61 @@ static norm_graph build_one_token(ggml_backend_t cpu, int64_t K, int64_t N) {
     return g;
 }
 
+// An N x K Q4_K projection of M tokens followed by a tensor of its own to guard,
+// allocated in `be`'s buffers
+static norm_graph build_projection(ggml_backend_t be, int64_t K, int64_t N, int64_t M, ggml_tensor ** guard) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * a     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * p     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, N);
+    g.inputs            = { a, p };
+    ggml_tensor * out   = ggml_mul_mat(g.ctx, p, a);
+    ggml_set_name(out, "proj");
+    *guard = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, 2 * 1024);
+    g.gf   = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
+static bool test_output_in_place(ggml_backend_t npu, ggml_backend_t cpu, int64_t M, double tol) {
+    const int64_t K = 1024, N = 1024;
+    ggml_tensor * cpu_guard = nullptr;
+    ggml_tensor * npu_guard = nullptr;
+    norm_graph    want_g    = build_projection(cpu, K, N, M, &cpu_guard);
+    norm_graph    got_g     = build_projection(npu, K, N, M, &npu_guard);
+    ggml_tensor * out       = got_g.checked[0];
+
+    const size_t room     = ggml_backend_buffer_get_alloc_size(got_g.buf, out);
+    const bool   reserved = room >= (size_t) ((M + 127) / 128 * 128) * N * sizeof(float);
+
+    std::vector<float> pattern(ggml_nelements(npu_guard), 3.0f);
+    std::vector<std::vector<float>> want, got;
+    bool ok = run(want_g, cpu, want);
+    ggml_backend_buffer_clear(got_g.buf, 0);
+    set_inputs(got_g, 1234);
+    ggml_backend_tensor_set(npu_guard, pattern.data(), 0, ggml_nbytes(npu_guard));
+    ok = ok && ggml_backend_graph_compute(npu, got_g.gf) == GGML_STATUS_SUCCESS;
+    std::vector<float> after(pattern.size());
+    ggml_backend_tensor_get(npu_guard, after.data(), 0, ggml_nbytes(npu_guard));
+    if (ok) {
+        got = { get_f32(out) };
+    }
+    const bool   intact = after == pattern;
+    const double e      = ok ? nmse(want[0], got[0]) : INFINITY;
+    const bool   passed = ok && reserved && intact && e < tol;
+    std::printf("MUL_MAT in place, M %-4lld alloc %zu of %zu bytes %s, guard %s, nmse %.3g %s\n", (long long) M, room,
+                ggml_nbytes(out), reserved ? "reserved" : "NOT RESERVED", intact ? "intact" : "OVERWRITTEN", e,
+                passed ? "ok" : "FAIL");
+    ggml_backend_buffer_free(want_g.buf);
+    ggml_backend_buffer_free(got_g.buf);
+    ggml_free(want_g.ctx);
+    ggml_free(got_g.ctx);
+    return passed;
+}
+
 int main(void) {
     ggml_backend_load_all();
     ggml_backend_dev_t dev = xdna_device();
@@ -221,6 +281,10 @@ int main(void) {
         ggml_free(g.ctx);
     }
     unsetenv("GGML_XDNA_FUSED_LAYER");
+
+    for (int64_t M : { 100, 129, 300 }) {
+        passed = test_output_in_place(npu, cpu, M, tol) && passed;
+    }
 
     ggml_backend_free(npu);
     ggml_backend_free(cpu);

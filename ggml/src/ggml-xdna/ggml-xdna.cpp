@@ -4829,6 +4829,14 @@ static ggml_backend_buffer_t xdna_hbt_alloc(ggml_backend_buffer_type_t buft, siz
     return ggml_backend_buffer_init(buft, xdna_hb_iface, bo, size);
 }
 
+// A prefill GEMM's output is written in whole blocks of 128 rows
+// (xdna_pgemm_out_bytes): the allocation holds the rows past the tensor's.
+static size_t xdna_hbt_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+    GGML_UNUSED(buft);
+    const size_t bytes = ggml_nbytes(tensor);
+    return tensor->op == GGML_OP_MUL_MAT ? std::max(bytes, xdna_pgemm_out_bytes(tensor)) : bytes;
+}
+
 static size_t xdna_hbt_alignment(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
     return 64;
@@ -4848,7 +4856,7 @@ static ggml_backend_buffer_type_t xdna_host_buffer_type(void) {
                           /* .alloc_buffer   = */ xdna_hbt_alloc,
                           /* .get_alignment  = */ xdna_hbt_alignment,
                           /* .get_max_size   = */ nullptr,
-                          /* .get_alloc_size = */ nullptr,
+                          /* .get_alloc_size = */ xdna_hbt_alloc_size,
                           /* .is_host        = */ xdna_hbt_is_host,
                           },
         /* .device  = */
