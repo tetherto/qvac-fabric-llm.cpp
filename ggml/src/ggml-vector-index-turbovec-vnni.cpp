@@ -26,17 +26,16 @@ constexpr size_t kBlock = 32;
 // (the index is (j << 4) | code for byte j of a vector's dword) and
 // `vpdpbusd` adds the four entries into that vector's u32 lane.
 template <int NQ, bool PF>
-void vnni_lut_sums_nq(
+inline void vnni_lut_acc_nq(
         const uint8_t * const * split_luts,
         const uint8_t * block,
         size_t n_byte_groups,
         size_t bytes_after,
-        int32_t * sums) {
+        __m512i acc[NQ][2]) {
     const __m512i m0f = _mm512_set1_epi8(0x0f);
     const __m512i kpos = _mm512_set1_epi32(0x30201000);
     const __m512i ones = _mm512_set1_epi8(1);
     const size_t quads = n_byte_groups / 4;
-    __m512i acc[NQ][2];
     for (int q = 0; q < NQ; ++q) {
         acc[q][0] = _mm512_setzero_si512();
         acc[q][1] = _mm512_setzero_si512();
@@ -61,6 +60,17 @@ void vnni_lut_sums_nq(
             }
         }
     }
+}
+
+template <int NQ, bool PF>
+void vnni_lut_sums_nq(
+        const uint8_t * const * split_luts,
+        const uint8_t * block,
+        size_t n_byte_groups,
+        size_t bytes_after,
+        int32_t * sums) {
+    __m512i acc[NQ][2];
+    vnni_lut_acc_nq<NQ, PF>(split_luts, block, n_byte_groups, bytes_after, acc);
     for (int q = 0; q < NQ; ++q) {
         _mm512_storeu_si512(reinterpret_cast<void *>(sums + static_cast<size_t>(q) * kBlock), acc[q][0]);
         _mm512_storeu_si512(reinterpret_cast<void *>(sums + static_cast<size_t>(q) * kBlock + 16), acc[q][1]);
@@ -133,7 +143,9 @@ void vnni_lut_sums_blk2(
 // skipped when its best lane cannot enter, and under a threshold only the
 // lanes above it visited, NaN lanes among them (cmp NLE, unordered). The
 // lanes that remain go to the sink compressed. The threshold is a double
-// the collector made from a float, so its float form compares the same.
+// the collector made from a float, so its float form compares the same;
+// so without a floor the block max test says exactly what the lane test
+// says (no lane above the threshold) and is left out.
 inline void vnni_fused_block(
         const __m512i a[2],
         __m512 vs,
@@ -161,14 +173,16 @@ inline void vnni_fused_block(
             (static_cast<uint32_t>(_mm512_cmp_ps_mask(s1, seed, _CMP_GT_OQ)) << 16);
         above_seed += static_cast<size_t>(_mm_popcnt_u32(above));
     }
-    const double floor = state.floor_score != nullptr ? state.floor_score->load(std::memory_order_relaxed) :
-                                                        -std::numeric_limits<double>::infinity();
-    const uint32_t unord = static_cast<uint32_t>(_mm512_cmp_ps_mask(s0, s0, _CMP_UNORD_Q)) |
-        (static_cast<uint32_t>(_mm512_cmp_ps_mask(s1, s1, _CMP_UNORD_Q)) << 16);
-    if (unord == 0) {
-        const double block_max = static_cast<double>(_mm512_reduce_max_ps(_mm512_max_ps(s0, s1)));
-        if ((state.cut && block_max <= state.threshold) || block_max < floor) {
-            return;
+    double floor = -std::numeric_limits<double>::infinity();
+    if (state.floor_score != nullptr) {
+        floor = state.floor_score->load(std::memory_order_relaxed);
+        const uint32_t unord = static_cast<uint32_t>(_mm512_cmp_ps_mask(s0, s0, _CMP_UNORD_Q)) |
+            (static_cast<uint32_t>(_mm512_cmp_ps_mask(s1, s1, _CMP_UNORD_Q)) << 16);
+        if (unord == 0) {
+            const double block_max = static_cast<double>(_mm512_reduce_max_ps(_mm512_max_ps(s0, s1)));
+            if ((state.cut && block_max <= state.threshold) || block_max < floor) {
+                return;
+            }
         }
     }
     uint32_t lanes = valid_mask;
@@ -286,6 +300,107 @@ void turbovec_vnni_lut_scan_blk2(
         vnni_fused_block(a, vs, vb, vector_scales, b, n_vectors, state, sink, ctx, above_seed);
     }
     state.above_seed = above_seed;
+}
+
+namespace {
+
+// Upstream `search_multi_query_vnni::<false, NQ>` with its per-query
+// epilogue: every block of the range through the NQ-query kernel, then each
+// query's sums finished and tested in registers against its own collector
+// state. The scale and bias are broadcast per block so no zmm stays live
+// across the quad loop beyond the accumulators and the table operands.
+template <int NQ>
+void vnni_lut_scan_batch_nq(
+        const uint8_t * const * split_luts,
+        const float * scales,
+        const float * biases,
+        const float * vector_scales,
+        const uint8_t * blocks,
+        size_t block_begin,
+        size_t block_end,
+        size_t n_vectors,
+        size_t n_byte_groups,
+        TurboVecVnniScanState * states,
+        TurboVecVnniScanSink sink,
+        void * const * ctxs) {
+    const size_t block_bytes = n_byte_groups * kBlock;
+    size_t above_seed[NQ];
+    for (int q = 0; q < NQ; ++q) {
+        above_seed[q] = states[q].above_seed;
+    }
+    for (size_t b = block_begin; b < block_end; ++b) {
+        __m512i acc[NQ][2];
+        vnni_lut_acc_nq<NQ, false>(split_luts, blocks + b * block_bytes, n_byte_groups, 0, acc);
+        for (int q = 0; q < NQ; ++q) {
+            vnni_fused_block(acc[q], _mm512_set1_ps(scales[q]), _mm512_set1_ps(biases[q]), vector_scales, b, n_vectors,
+                states[q], sink, ctxs[q], above_seed[q]);
+        }
+    }
+    for (int q = 0; q < NQ; ++q) {
+        states[q].above_seed = above_seed[q];
+    }
+}
+
+} // namespace
+
+void turbovec_vnni_lut_scan_batch(
+        const uint8_t * const * split_luts,
+        const float * scales,
+        const float * biases,
+        int nq,
+        const float * vector_scales,
+        const uint8_t * blocks,
+        size_t block_begin,
+        size_t block_end,
+        size_t n_vectors,
+        size_t n_byte_groups,
+        TurboVecVnniScanState * states,
+        TurboVecVnniScanSink sink,
+        void * const * ctxs) {
+    // Eight queries a pass, as upstream's `acc` array; the callers batch
+    // six. A lone query takes the two-block kernel, as upstream's dispatch
+    // sends nq == 1 to search_single_query_vnni_blk2.
+    if (nq > 8) {
+        for (int q0 = 0; q0 < nq; q0 += 8) {
+            turbovec_vnni_lut_scan_batch(split_luts + q0, scales + q0, biases + q0, nq - q0 < 8 ? nq - q0 : 8,
+                vector_scales, blocks, block_begin, block_end, n_vectors, n_byte_groups, states + q0, sink, ctxs + q0);
+        }
+        return;
+    }
+    switch (nq) {
+        case 1:
+            turbovec_vnni_lut_scan_blk2(split_luts[0], scales[0], biases[0], vector_scales, blocks, block_begin,
+                block_end, n_vectors, n_byte_groups, states[0], sink, ctxs[0]);
+            break;
+        case 2:
+            vnni_lut_scan_batch_nq<2>(split_luts, scales, biases, vector_scales, blocks, block_begin, block_end,
+                n_vectors, n_byte_groups, states, sink, ctxs);
+            break;
+        case 3:
+            vnni_lut_scan_batch_nq<3>(split_luts, scales, biases, vector_scales, blocks, block_begin, block_end,
+                n_vectors, n_byte_groups, states, sink, ctxs);
+            break;
+        case 4:
+            vnni_lut_scan_batch_nq<4>(split_luts, scales, biases, vector_scales, blocks, block_begin, block_end,
+                n_vectors, n_byte_groups, states, sink, ctxs);
+            break;
+        case 5:
+            vnni_lut_scan_batch_nq<5>(split_luts, scales, biases, vector_scales, blocks, block_begin, block_end,
+                n_vectors, n_byte_groups, states, sink, ctxs);
+            break;
+        case 6:
+            vnni_lut_scan_batch_nq<6>(split_luts, scales, biases, vector_scales, blocks, block_begin, block_end,
+                n_vectors, n_byte_groups, states, sink, ctxs);
+            break;
+        case 7:
+            vnni_lut_scan_batch_nq<7>(split_luts, scales, biases, vector_scales, blocks, block_begin, block_end,
+                n_vectors, n_byte_groups, states, sink, ctxs);
+            break;
+        default:
+            vnni_lut_scan_batch_nq<8>(split_luts, scales, biases, vector_scales, blocks, block_begin, block_end,
+                n_vectors, n_byte_groups, states, sink, ctxs);
+            break;
+    }
 }
 
 void turbovec_permute_dot_sums_vnni(

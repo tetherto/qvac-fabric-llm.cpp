@@ -113,6 +113,23 @@ void turbovec_vnni_lut_scan_blk2(
     TurboVecVnniScanState & state,
     TurboVecVnniScanSink sink,
     void * ctx);
+// The same scan for a batch of nq queries (upstream search_multi_query_vnni
+// and its dispatch: eight a pass at most, a lone one through the two-block
+// kernel), each with its own state and sink context.
+void turbovec_vnni_lut_scan_batch(
+    const uint8_t * const * split_luts,
+    const float * scales,
+    const float * biases,
+    int nq,
+    const float * vector_scales,
+    const uint8_t * blocks,
+    size_t block_begin,
+    size_t block_end,
+    size_t n_vectors,
+    size_t n_byte_groups,
+    TurboVecVnniScanState * states,
+    TurboVecVnniScanSink sink,
+    void * const * ctxs);
 // The 4-bit permute-dot scan: upstream's weight layout and zero.
 void turbovec_permute_dot_sums_vnni(
     const int8_t * levels16,

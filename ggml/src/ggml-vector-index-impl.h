@@ -704,6 +704,10 @@ int turbovec_exact2_row_parity_for_test(const ggml_vec_index_t * idx, const floa
 // 1 when every id and score bit agrees, 0 not, -1 when the index or host
 // has no fused scan.
 int turbovec_vnni_fused_scan_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k);
+// The same for the staged batch of n_q queries searched at once: 1 equal,
+// 0 different, below zero the lone test's reasons, -6 when the batch did
+// not run.
+int turbovec_vnni_fused_batch_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
     uint64_t * codes_hash,
