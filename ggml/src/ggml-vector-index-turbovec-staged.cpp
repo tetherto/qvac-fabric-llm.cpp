@@ -91,6 +91,21 @@ inline void prefetch_read(const void * p) {
 #endif
 }
 
+// Hints that every cache line holding [p, p + len) is about to be read,
+// the line of the last byte included. The rows live in a std::vector,
+// and glibc hands a large allocation out 16 bytes past a page boundary,
+// so a 128-byte plane row spans three lines there, not two; a prefetch
+// of offsets 0 and 64 left the third line to miss at full memory latency
+// on every ranked row. Upstream prefetch_low covers the last byte for the
+// same reason.
+inline void prefetch_span(const void * p, size_t len) {
+    const uintptr_t first = reinterpret_cast<uintptr_t>(p) & ~static_cast<uintptr_t>(63);
+    const uintptr_t last = reinterpret_cast<uintptr_t>(p) + len - 1;
+    for (uintptr_t a = first; a <= last; a += 64) {
+        prefetch_read(reinterpret_cast<const void *>(a));
+    }
+}
+
 // Trailing zero bits of a non-zero word (callers check; the loop below
 // would never end on zero).
 inline int ctz64(uint64_t x) {
@@ -1822,10 +1837,7 @@ bool turbovec_staged_search(
             // miss. The first batch is asked for here as well.
             const size_t ahead_end = std::min(list.size(), end + (end - begin));
             for (size_t i = begin == 0 ? begin : end; i < ahead_end; ++i) {
-                const uint8_t * low = idx.turbovec_data.data() + list[i].slot * row_bytes + plane * nsg;
-                for (size_t off = 0; off < nsg; off += 64) {
-                    prefetch_read(low + off);
-                }
+                prefetch_span(idx.turbovec_data.data() + list[i].slot * row_bytes + plane * nsg, nsg);
             }
             if (table_rank) {
 #if GGML_VEC_INDEX_USE_NEON
@@ -1926,10 +1938,7 @@ bool turbovec_staged_search(
         constexpr size_t kAhead = 4;
         for_each_candidate(list.size(), [&](size_t i) {
             if (exact2 && i + kAhead < list.size()) {
-                const uint8_t * row = idx.turbovec_data.data() + list[i + kAhead].slot * row_bytes;
-                for (size_t off = 0; off < row_bytes; off += 64) {
-                    prefetch_read(row + off);
-                }
+                prefetch_span(idx.turbovec_data.data() + list[i + kAhead].slot * row_bytes, row_bytes);
             }
             exact[i] = exact4 ? exact4_score(list[i].slot) : exact2_score(list[i].slot);
         });
