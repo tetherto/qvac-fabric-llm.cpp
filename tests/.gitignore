@@ -6,6 +6,11 @@
 !turbovec-golden-gen/Cargo.toml
 !turbovec-golden-gen/src/
 !turbovec-golden-gen/src/main.rs
+!turbovec-golden-gen-1x/
+!turbovec-golden-gen-1x/Cargo.toml
+!turbovec-golden-gen-1x/Cargo.lock
+!turbovec-golden-gen-1x/src/
+!turbovec-golden-gen-1x/src/main.rs
 turbovec-golden-gen/*.tmp.tv
 *.o
 ggml-common.h
