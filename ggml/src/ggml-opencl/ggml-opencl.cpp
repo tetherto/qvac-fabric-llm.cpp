@@ -6452,6 +6452,16 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
     cl_int err;
     cl_kernel k = clCreateKernel(prog, "flash_attn_f32_f16", &err);
     if (err != CL_SUCCESS) { clReleaseProgram(prog); failed[split ? 1 : 0] = true; return false; }
+    // The split tile launches bm * n_split work-items, more than E031.47 allows
+    // this kernel (Adreno 830). Without it the dispatch stays on the BM tile.
+    if (!ggml_opencl_fa_kernel_fits_wg(backend_ctx, k, split ? cfg->bm * cfg->n_split : cfg->bm,
+                                       split ? "flash_attn_f32_f16 (prefill512 split)" : "flash_attn_f32_f16 (prefill512)",
+                                       dk, dv)) {
+        clReleaseKernel(k);
+        clReleaseProgram(prog);
+        failed[split ? 1 : 0] = true;
+        return false;
+    }
     target[dk_dv] = k;
     if (split) {
         backend_ctx->fa.f32_f16_split_wg_size[dk_dv]       = cfg->bm * cfg->n_split;
