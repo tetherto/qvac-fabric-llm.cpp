@@ -14,16 +14,20 @@ Start with [RESULTS.md](RESULTS.md), the [24-layer preset](configs/qwen3.8-27b-2
 
 ## Dual Neural Engine configuration
 
-The [64-layer dual preset](configs/qwen3.8-27b-64-dual.json) uses both Neural Engines on M3 Ultra. Each of the 64 FFNs keeps its first 8192 channels on Metal. Core ML gets two 4608-channel packages per layer, `ffn-512.mlpackage` and `ffn-512-1.mlpackage`. The runtime loads the second package when it exists, runs both predictions at the same time, and sums them in the existing output conversion. Two concurrent Core ML predictions ran on separate ANEs in our tests; one 6144-channel package took 9.75 ms, two concurrent 3072-channel packages took 5.48 ms.
+The [64-layer dual preset](configs/qwen3.8-27b-64-dual.json) uses both Neural Engines on M3 Ultra. Each of the 64 FFNs keeps its first 8192 channels on Metal. Core ML gets two 4608-channel packages per layer, `ffn-512.mlpackage` and `ffn-512-1.mlpackage`. The runtime loads the second package when it exists and runs both predictions at the same time. Two concurrent Core ML predictions ran on separate ANEs in our tests; one 6144-channel package took 9.75 ms, two concurrent 3072-channel packages took 5.48 ms.
 
-Measured on M3 Ultra (96 GB), 2026-10-30, 3 split repetitions against 6 Metal repetitions:
+By default, each prediction writes its output straight into its own Metal shared buffer (`MLPredictionOptions.outputBackings`) and the Metal join adds the three parts. This removes the CPU copy and sum of the Core ML outputs (about 1.3 ms per layer call) from the critical path. If Core ML ignores a backing, the runtime copies instead and reports it as `output_backing_fallbacks`; all recorded runs reported 0. Set `FFN_COREML_OUTPUT_BACKING=0` to keep the CPU copy, for example for A/B timing.
 
-| Prompt | Metal prefill | Dual prefill | Throughput |
+Measured on M3 Ultra (96 GB), 2026-10-30, same binary and session, 3 repetitions each:
+
+| Prompt | Metal prefill | Dual prefill, output backing | Throughput |
 | --- | ---: | ---: | ---: |
-| 2048 tokens | 6.796 s | 5.491 s | +23.8% |
-| 8192 tokens | 28.062 s | 22.776 s | +23.2% |
+| 2048 tokens | 6.797 s | 4.776 s | +42.3% |
+| 8192 tokens | 28.075 s | 20.067 s | +39.9% |
 
-Decode speed is unchanged, with zero decode offloads. Accuracy was qualified on 65536 held-out tokens of real, non-repeated text (code, documentation, prose, mathematics) instead of repeated prompts. Mean NLL change is +0.00024 nats/token (95% bootstrap upper bound +0.00079), mean KL 0.00042, and the worst domain (prose) +0.00101 nats/token with KL 0.00108. An all-Metal control through the same boundary has mean KL 0.0000014. The repeated-prompt KL suite above overstates divergence for this model; on held-out text it reads 5-10x lower. The held-out gate scripts and raw logs are not committed. Task benchmarks, memory and power were not measured.
+With `FFN_COREML_OUTPUT_BACKING=0`, the same build measured 5.155 s / 21.588 s (+8.0% for backing). Decode speed is unchanged, with zero decode offloads. Accuracy was qualified on 65536 held-out tokens of real, non-repeated text (code, documentation, prose, mathematics) instead of repeated prompts. With output backing, mean NLL change is +0.00026 nats/token (95% bootstrap upper bound +0.00082), mean KL 0.00042, and the worst domain (prose) +0.00109 nats/token with KL 0.00108. An all-Metal control through the same boundary has mean KL 0.0000014. The repeated-prompt KL suite above overstates divergence for this model; on held-out text it reads 5-10x lower. The held-out gate scripts and raw logs are not committed. Task benchmarks, memory and power were not measured.
+
+Moving the split point was slower in both directions (9216 / 4096 + 4096: -3.7%; 7168 / 5120 + 5120: -11.4% at 2048 tokens). Core ML keeps about 128 ANE programs resident per process, and this preset uses 128, so offloading more operations through public Core ML slows every call.
 
 ## Build and run
 
@@ -96,6 +100,7 @@ Compiled-cache reuse follows the embedding-Gemma pattern. It creates `ffn-512.ml
 - `FFN_COREML_DECODE_PLAN=512`: restores the full Metal allocation plan before decode, including output capacity. Omitting this previously caused a decode regression. Transition cost is included in timing.
 - `FFN_COREML_PROFILE=1`: per-layer callback stages. Disable profiling and graph tracing for final timing.
 - `decoder-coreml.mm`: an optional `ffn-512-1` package (package or compiled cache) must start where `ffn-512` ends and share its output scale. Its prediction runs on a GCD queue while the first runs on the calling thread.
+- Output backing: on by default when `FFN_COREML_GPU_RESIDENT` is set and the output scale is 1; `FFN_COREML_OUTPUT_BACKING=0` disables it. Core ML outputs go to the Metal join inputs directly; `ffn-coreml-common.h` adds an optional third join input for the second package.
 
 Callbacks and builder state are process-global. The harness drives contexts serially. Do not enable this as a multi-request/server backend without lifecycle, concurrency, cancellation, cache validation, and fallback work. This branch intentionally preserves the tested experiment rather than introducing production integration.
 

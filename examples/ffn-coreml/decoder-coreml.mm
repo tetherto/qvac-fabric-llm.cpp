@@ -81,6 +81,11 @@ struct decoder_ffn {
     float inverse_scale = 1;
     uint64_t calls = 0;
     bool full_metal = false;
+    // Core ML writes its partials straight into the Metal join inputs
+    bool backed = false;
+    MLPredictionOptions * options = nil;
+    MLPredictionOptions * options2 = nil;
+    uint64_t backing_fallbacks = 0;
     stage_profile profile;
     std::string error;
 
@@ -122,6 +127,44 @@ struct decoder_ffn {
                 partial[t * 5120 + h] = value;
             }
         }
+    }
+
+    void adopt(id<MLFeatureProvider> result, ggml_tensor * target) {
+        MLMultiArray * y = decoder_output(result);
+        if (y.dataPointer == target->data) { return; }
+        ++backing_fallbacks;
+        const float * values = static_cast<const float *>(y.dataPointer);
+        float * out = static_cast<float *>(target->data);
+        size_t row_stride = y.strides[0].unsignedLongLongValue, column_stride = y.strides[1].unsignedLongLongValue;
+        for (int t = 0; t < 512; ++t) {
+            for (int h = 0; h < 5120; ++h) { out[t * 5120 + h] = values[t * row_stride + h * column_stride]; }
+        }
+    }
+
+    void predict_backed() {
+        __block id<MLFeatureProvider> second = nil;
+        __block NSError * second_failure = nil;
+        dispatch_group_t group = dispatch_group_create();
+        if (model2) {
+            MLModel * other = model2;
+            MLDictionaryFeatureProvider * inputs = features;
+            MLPredictionOptions * other_options = options2;
+            dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                @autoreleasepool {
+                    NSError * failure = nil;
+                    second = [other predictionFromFeatures:inputs options:other_options error:&failure];
+                    second_failure = failure;
+                }
+            });
+        }
+        NSError * failure = nil;
+        id<MLFeatureProvider> result = [model predictionFromFeatures:features options:options error:&failure];
+        dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+        profile.end(4);
+        require(result, failure ? failure.localizedDescription.UTF8String : "Core ML prediction failed");
+        require(!model2 || second, second_failure ? second_failure.localizedDescription.UTF8String : "second Core ML prediction failed");
+        adopt(result, join.ane);
+        if (model2) { adopt(second, join.ane2); }
     }
 
     void execute(float * output, bool inputs_ready = false) {
@@ -197,7 +240,23 @@ struct decoder_ffn {
         features = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": input} error:&failure];
         require(features, "integrated FFN provider failed");
         printf("decoder_layer=%d metal_channels=%d coreml_channels=%d coreml2_channels=%d output_scale=%.0f\n", layer, gpu_channels, ane_channels, ane2_channels, scale);
-        join.init(prefix.backend, 5120, 512);
+        // on by default for the resident path; FFN_COREML_OUTPUT_BACKING=0 keeps the CPU copy
+        const char * backing_env = std::getenv("FFN_COREML_OUTPUT_BACKING");
+        backed = gpu_resident && scale == 1 && !(backing_env && strcmp(backing_env, "0") == 0);
+        join.init(prefix.backend, 5120, 512, backed && model2);
+        if (backed) {
+            auto backing = [&](ggml_tensor * target) {
+                require(ggml_backend_metal_tensor_is_shared(target), "output backing requires shared Metal storage");
+                NSError * failure = nil;
+                MLMultiArray * array = [[MLMultiArray alloc] initWithDataPointer:target->data shape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
+                require(array, "output backing allocation failed");
+                MLPredictionOptions * result = [[MLPredictionOptions alloc] init];
+                result.outputBackings = @{@"y": array};
+                return result;
+            };
+            options = backing(join.ane);
+            if (model2) { options2 = backing(join.ane2); }
+        }
         std::vector<float> warm(x.size());
         profile.begin();
         execute(warm.data());
@@ -278,11 +337,11 @@ static bool decoder_resident_compute(ggml_backend_t backend, ggml_tensor * dst, 
                     runtime.features = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": runtime.input} error:&failure];
                     require(runtime.features, "resident Core ML provider failed");
                 }
-                runtime.predict(true);
+                if (runtime.backed) { runtime.predict_backed(); } else { runtime.predict(true); }
                 runtime.profile.end(5);
                 bind_resident_tensor(runtime.join.gpu, runtime.prefix.output);
                 bind_resident_tensor(runtime.join.output, dst);
-                ggml_backend_tensor_set(runtime.join.ane, runtime.partial.data(), 0, runtime.partial.size() * sizeof(float));
+                if (!runtime.backed) { ggml_backend_tensor_set(runtime.join.ane, runtime.partial.data(), 0, runtime.partial.size() * sizeof(float)); }
                 runtime.profile.end(7);
                 require(ggml_backend_graph_compute_async(backend, runtime.join.graph) == GGML_STATUS_SUCCESS, "resident Metal join failed");
                 runtime.profile.end(8);
@@ -563,6 +622,9 @@ int main(int argc, char ** argv) {
                 llama_ffn_coreml_set_builder(nullptr, nullptr);
             }
             llama_model_free(model);
+            uint64_t fallbacks = 0;
+            for (const auto & entry : state.layers) { fallbacks += entry.second->backing_fallbacks; }
+            printf("output_backing_fallbacks=%llu\n", (unsigned long long) fallbacks);
             state.layers.clear();
             if (gpu_resident) { ggml_backend_metal_set_custom2(nullptr, nullptr); }
             llama_backend_free();
