@@ -265,12 +265,12 @@ inline float round_half_away_f32(float x) {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return std::round(x);
 #else
-    const bool small = std::fabs(x) < 8388608.0f;
-    const float c = small ? x : 0.0f;
+    const bool in_range = std::fabs(x) < 8388608.0f;
+    const float c = in_range ? x : 0.0f;
     const float t = static_cast<float>(static_cast<int32_t>(c));
     const float f = c - t;
     const float r = t + static_cast<float>(static_cast<int>(f >= 0.5f) - static_cast<int>(f <= -0.5f));
-    return small ? r : x;
+    return in_range ? r : x;
 #endif
 }
 
@@ -300,8 +300,8 @@ inline void quantise_table16(const float * in, float mn, float inv_scale, float 
     __m128i q[4];
     for (int j = 0; j < 4; ++j) {
         const __m128 x = _mm_mul_ps(_mm_sub_ps(_mm_loadu_ps(in + 4 * j), mn_v), inv_v);
-        const __m128 small = _mm_cmplt_ps(_mm_and_ps(x, abs_mask), limit);
-        const __m128 c = _mm_and_ps(x, small);
+        const __m128 in_range = _mm_cmplt_ps(_mm_and_ps(x, abs_mask), limit);
+        const __m128 c = _mm_and_ps(x, in_range);
         const __m128 t = _mm_cvtepi32_ps(_mm_cvttps_epi32(c));
         const __m128 f = _mm_sub_ps(c, t);
         // A compare mask is 0 or -1, so (f <= -0.5) - (f >= 0.5) is the
@@ -309,7 +309,7 @@ inline void quantise_table16(const float * in, float mn, float inv_scale, float 
         const __m128i adj =
             _mm_sub_epi32(_mm_castps_si128(_mm_cmple_ps(f, neg_half)), _mm_castps_si128(_mm_cmpge_ps(f, half)));
         const __m128 r = _mm_add_ps(t, _mm_cvtepi32_ps(adj));
-        const __m128 rounded = _mm_or_ps(_mm_and_ps(small, r), _mm_andnot_ps(small, x));
+        const __m128 rounded = _mm_or_ps(_mm_and_ps(in_range, r), _mm_andnot_ps(in_range, x));
         q[j] = _mm_cvttps_epi32(_mm_max_ps(_mm_min_ps(rounded, max_v), zero));
     }
     _mm_storeu_si128(reinterpret_cast<__m128i *>(out),
