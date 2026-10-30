@@ -175,7 +175,28 @@ checks.
 A GEMM dispatch costs 0.1 to 0.3 ms at 15 tokens (an empty one still takes
 about 60 us to start and finish), and a Q8_0 pass makes 145 of them, so the
 array pays off on long inputs only (Q8_0, the eval driver's corpus, CPU at 16
-threads):
+threads). Measured with `probes/pgemm_probe.cpp` on the streams the backend
+builds, one command at a time on an idle host (10th percentile, M 15):
+
+- A command with an empty stream takes ~52 us back to back and ~65 us after
+  200 us of idle time, about the gaps between a pass's commands (blocking wait;
+  ~43 and ~59 us polling, `GGML_XDNA_SPIN_US=-1`). ~3 us of it is the start.
+- A command of one 128-row block over one 1024-column chunk at K 512 takes
+  ~125 us: the ~65 us of an empty command, ~47 us of filling and draining the
+  array and ~13.6 us of work. Each further block or chunk adds ~13.6 us at K
+  512, in proportion to K, whatever rows of the block are real: a call runs
+  `ceil(M / 128)` blocks and no fewer. The kernel's own account
+  (`kernels/pgemm.py`) is that its cores' weight expansion, done once per
+  chunk and block, is the bound.
+- The instruction stream is run op by op by the array's command processor, at
+  ~55 ns for a register write, ~72 ns for a 12-word block write, ~105 ns for a
+  mask write and ~175 ns for a DDR address patch. The processor runs ~10 us
+  ahead of the array, so the ops behind the first transfer cost nothing unless
+  the array runs out of work to hide them behind: a stream rewritten to drop
+  its 150 to 300 repeated mask writes is no faster and produces the same bits.
+- Two commands submitted as one run list save ~30 us over two blocking ones.
+  Only a layer's GEGLU and down projection (24 a pass) have no host op between
+  them.
 
 | input | CPU | XDNA |
 | :-- | --: | --: |
