@@ -13,6 +13,10 @@
 
 #include <condition_variable>
 
+#ifndef _WIN32
+#include <pthread.h>
+#endif
+
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
@@ -79,9 +83,8 @@ inline void spin_pause() {
 #endif
 }
 
-// Spins until done() holds or about kSpinMicros pass; true if it held. A
-// search runs a few short jobs back to back, and a helper that would sleep
-// between them pays a wake-up each time.
+// Spins until done() holds or about kSpinMicros pass; true if it held. The
+// caller spins while its last helpers finish, which is usually brief.
 constexpr int64_t kSpinMicros = 50;
 
 template <typename Done>
@@ -142,19 +145,11 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stop_ = true;
-            stop_flag_.store(true, std::memory_order_relaxed);
         }
         wake_.notify_all();
         // No thread is started once stop_ is set, so threads_ is final.
         for (std::thread & thread : threads_) {
-#ifdef _WIN32
-            // A DLL's static destructors run under the loader lock (and at
-            // process exit after its threads are gone), where a join can
-            // hang; the stopped helpers exit on their own.
-            thread.detach();
-#else
             thread.join();
-#endif
         }
     }
 
@@ -162,10 +157,6 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return threads_.size();
     }
-
-#ifndef _WIN32
-    pid_t owner_pid = ::getpid();
-#endif
 
 private:
     // Starts helpers up to `want`; a thread that fails to start leaves the
@@ -190,7 +181,6 @@ private:
             tail_->queue_next = &job;
         }
         tail_ = &job;
-        n_queued_.fetch_add(1, std::memory_order_release);
     }
 
     void dequeue(PoolJob & job) {
@@ -209,20 +199,15 @@ private:
         }
         job.queued = false;
         job.queue_next = nullptr;
-        n_queued_.fetch_sub(1, std::memory_order_relaxed);
     }
 
     void helper_main() {
         std::unique_lock<std::mutex> lock(mutex_);
         for (;;) {
             if (!stop_ && head_ == nullptr) {
-                // Just finished a job, or just started: spin a little for the
-                // next before sleeping.
-                lock.unlock();
-                spin_until([&] {
-                    return n_queued_.load(std::memory_order_acquire) != 0 || stop_flag_.load(std::memory_order_relaxed);
-                });
-                lock.lock();
+                // Idle helpers sleep at once: spinning all of them for the
+                // next job made them contend for the lock without making
+                // back-to-back searches measurably faster.
                 ++sleeping_;
                 wake_.wait(lock, [&] { return stop_ || head_ != nullptr; });
                 --sleeping_;
@@ -262,11 +247,8 @@ private:
     PoolJob * head_ = nullptr;
     PoolJob * tail_ = nullptr;
     bool stop_ = false;
-    // Helpers asleep on wake_ (under the mutex), and lock-free mirrors of
-    // the queue length and stop_ for spinning helpers.
+    // Helpers asleep on wake_ (under the mutex).
     size_t sleeping_ = 0;
-    std::atomic<size_t> n_queued_{ 0 };
-    std::atomic<bool> stop_flag_{ false };
 };
 
 // The pool is never freed: a helper may still be leaving it while static
@@ -276,35 +258,39 @@ std::atomic<Pool *> g_pool{ nullptr };
 std::atomic<bool> g_pool_shut_down{ false };
 
 #ifndef _WIN32
-// A forked child's abandoned copy of its parent's pool, kept referenced so a
-// leak checker still reaches it.
+// A forked child starts a pool of its own on its next parallel_for. The
+// parent's stays referenced here, so a leak checker still reaches it.
 Pool * g_abandoned_pool = nullptr;
+
+void forget_pool_in_child() {
+    g_abandoned_pool = g_pool.exchange(nullptr, std::memory_order_relaxed);
+}
 #endif
+
+// Done once, before the first pool exists.
+void prepare_pool_process() {
+#ifdef _WIN32
+    // Pin this module: helpers outlive any FreeLibrary that would unmap
+    // their code, and the exit-time destructor then has nothing to stop.
+    HMODULE self = nullptr;
+    GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(&g_pool), &self);
+#else
+    pthread_atfork(nullptr, nullptr, forget_pool_in_child);
+#endif
+}
 
 Pool * acquire_pool() {
     if (g_pool_shut_down.load(std::memory_order_acquire)) {
         return nullptr;
     }
     Pool * pool = g_pool.load(std::memory_order_acquire);
-#ifndef _WIN32
-    if (pool != nullptr && pool->owner_pid != ::getpid()) {
-        // A forked child: start a pool of its own.
-        Pool * stale = pool;
-        Pool * fresh = new (std::nothrow) Pool();
-        if (fresh == nullptr) {
-            return nullptr;
-        }
-        if (g_pool.compare_exchange_strong(stale, fresh, std::memory_order_acq_rel)) {
-            g_abandoned_pool = stale;
-            return fresh;
-        }
-        delete fresh;
-        return stale != nullptr && stale->owner_pid == ::getpid() ? stale : nullptr;
-    }
-#endif
     if (pool != nullptr) {
         return pool;
     }
+    static std::once_flag prepared;
+    std::call_once(prepared, prepare_pool_process);
     Pool * fresh = new (std::nothrow) Pool();
     if (fresh == nullptr) {
         return nullptr;
@@ -324,17 +310,18 @@ struct PoolShutdown {
     PoolShutdown & operator=(const PoolShutdown &) = delete;
     ~PoolShutdown() {
         g_pool_shut_down.store(true, std::memory_order_release);
+#ifdef _WIN32
+        // The module is pinned, so this runs only at process exit, after
+        // Windows has ended every other thread, possibly while one held the
+        // pool lock: take no lock and leave the helpers be.
+#else
         // Stopped but kept referenced: never freed, as above, and still
         // reachable through g_pool for a leak checker.
         Pool * pool = g_pool.load(std::memory_order_acquire);
-#ifndef _WIN32
-        if (pool != nullptr && pool->owner_pid != ::getpid()) {
-            return;
-        }
-#endif
         if (pool != nullptr) {
             pool->shutdown();
         }
+#endif
     }
 };
 PoolShutdown g_pool_shutdown;

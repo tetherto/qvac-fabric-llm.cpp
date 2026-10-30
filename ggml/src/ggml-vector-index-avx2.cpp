@@ -1,12 +1,24 @@
 #include "ggml-vector-index-avx2.h"
 
-#include <algorithm>
 #include <cstddef>
 #include <immintrin.h>
-#include <limits>
+#include <cstring>
 
 namespace ggml_vec_index_detail {
 namespace {
+
+// Local stand-ins for the standard min and infinity: an AVX2-built copy of
+// a header inline function could be the copy baseline code links against.
+inline size_t min_size(size_t a, size_t b) {
+    return a < b ? a : b;
+}
+
+inline float negative_infinity() {
+    const uint32_t bits = 0xff800000u;
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
 
 inline double horizontal_sum(__m256d v) {
     const __m128d lo  = _mm256_castpd256_pd128(v);
@@ -104,7 +116,7 @@ void score_turbovec_lut_block_avx2(
     constexpr size_t flush_every = 256;
     const size_t base_vector = block_index * block_size;
     const size_t block_offset = block_index * n_byte_groups * block_size;
-    const size_t valid_lanes = std::min(block_size, n_vectors - base_vector);
+    const size_t valid_lanes = min_size(block_size, n_vectors - base_vector);
     const __m256i nibble_mask = _mm256_set1_epi8(0x0f);
     const __m256 scale = _mm256_set1_ps(lut_scale);
     __m256 float_accum[4] = {
@@ -117,7 +129,7 @@ void score_turbovec_lut_block_avx2(
     const size_t n_batches = (n_byte_groups + flush_every - 1) / flush_every;
     for (size_t batch = 0; batch < n_batches; ++batch) {
         const size_t group_begin = batch * flush_every;
-        const size_t group_end = std::min(group_begin + flush_every, n_byte_groups);
+        const size_t group_end = min_size(group_begin + flush_every, n_byte_groups);
         __m256i accum[4] = {
             _mm256_setzero_si256(),
             _mm256_setzero_si256(),
@@ -181,7 +193,78 @@ void score_turbovec_lut_block_avx2(
         for (size_t lane = 0; lane < block_size; ++lane) {
             out_scores[lane] = lane < valid_lanes ?
                 decoded[lane] * vector_scales[base_vector + lane] :
-                -std::numeric_limits<float>::infinity();
+                negative_infinity();
+        }
+    }
+}
+
+// Upstream search.rs `search_multi_query_avx2`: four queries over one
+// block, sharing the code loads, with the single-query kernel's flush
+// schedule and epilogue per query. Writes fa[query * 32 + lane] = bias +
+// sum over flushes of fmadd(scale, partial); the vector scales are left to
+// the caller.
+void score_turbovec_lut_block4_avx2(
+        const uint8_t * const luts[4],
+        const float scales[4],
+        const float biases[4],
+        const uint8_t * block,
+        size_t n_byte_groups,
+        float * fa_out) {
+    constexpr size_t block_size = 32;
+    constexpr size_t flush_every = 256;
+    const __m256i nibble_mask = _mm256_set1_epi8(0x0f);
+    __m256 v_scales[4];
+    __m256 fa[4][4];
+    for (int q = 0; q < 4; ++q) {
+        v_scales[q] = _mm256_set1_ps(scales[q]);
+        for (int i = 0; i < 4; ++i) {
+            fa[q][i] = _mm256_set1_ps(biases[q]);
+        }
+    }
+    const size_t n_batches = (n_byte_groups + flush_every - 1) / flush_every;
+    for (size_t batch = 0; batch < n_batches; ++batch) {
+        const size_t g_start = batch * flush_every;
+        const size_t g_end = min_size(g_start + flush_every, n_byte_groups);
+        __m256i accus[4][4];
+        for (auto & qa : accus) {
+            for (__m256i & a : qa) {
+                a = _mm256_setzero_si256();
+            }
+        }
+        for (size_t g = g_start; g < g_end; ++g) {
+            const __m256i codes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block + g * block_size));
+            const __m256i clo = _mm256_and_si256(codes, nibble_mask);
+            const __m256i chi = _mm256_and_si256(_mm256_srli_epi16(codes, 4), nibble_mask);
+            for (int q = 0; q < 4; ++q) {
+                const __m256i lut = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(luts[q] + g * 32));
+                const __m256i res0 = _mm256_shuffle_epi8(lut, clo);
+                const __m256i res1 = _mm256_shuffle_epi8(lut, chi);
+                accus[q][0] = _mm256_add_epi16(accus[q][0], res0);
+                accus[q][1] = _mm256_add_epi16(accus[q][1], _mm256_srli_epi16(res0, 8));
+                accus[q][2] = _mm256_add_epi16(accus[q][2], res1);
+                accus[q][3] = _mm256_add_epi16(accus[q][3], _mm256_srli_epi16(res1, 8));
+            }
+        }
+        for (int q = 0; q < 4; ++q) {
+            const __m256i lo_a0 = _mm256_sub_epi16(accus[q][0], _mm256_slli_epi16(accus[q][1], 8));
+            const __m256i hi_a2 = _mm256_sub_epi16(accus[q][2], _mm256_slli_epi16(accus[q][3], 8));
+            const __m256i dis0 = _mm256_add_epi16(
+                _mm256_permute2x128_si256(lo_a0, accus[q][1], 0x21), _mm256_blend_epi32(lo_a0, accus[q][1], 0xf0));
+            const __m256i dis1 = _mm256_add_epi16(
+                _mm256_permute2x128_si256(hi_a2, accus[q][3], 0x21), _mm256_blend_epi32(hi_a2, accus[q][3], 0xf0));
+            const __m256 f0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis0)));
+            const __m256 f1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis0, 1)));
+            const __m256 f2 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis1)));
+            const __m256 f3 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis1, 1)));
+            fa[q][0] = _mm256_fmadd_ps(v_scales[q], f0, fa[q][0]);
+            fa[q][1] = _mm256_fmadd_ps(v_scales[q], f1, fa[q][1]);
+            fa[q][2] = _mm256_fmadd_ps(v_scales[q], f2, fa[q][2]);
+            fa[q][3] = _mm256_fmadd_ps(v_scales[q], f3, fa[q][3]);
+        }
+    }
+    for (int q = 0; q < 4; ++q) {
+        for (int i = 0; i < 4; ++i) {
+            _mm256_storeu_ps(fa_out + static_cast<size_t>(q) * 32 + static_cast<size_t>(i) * 8, fa[q][i]);
         }
     }
 }

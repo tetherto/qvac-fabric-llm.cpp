@@ -15,8 +15,12 @@
 #endif
 
 #if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) || defined(GGML_VEC_INDEX_HAVE_AVX512_KERNEL) || \
-    defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+    defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL) || defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL) || \
+    defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
 #include "ggml-vector-index-x86.h"
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+#include "ggml-vector-index-avx2.h"
 #endif
 
 namespace {
@@ -2006,10 +2010,14 @@ static size_t vm8_offset(size_t g, size_t lane) {
 }
 
 bool turbovec_wants_vector_major(int bits, int dim) {
-    // dim % 8 == 0 for every 1.x index, so a 4-bit group count is a
-    // multiple of four (upstream `vector_major_for` on aarch64).
-    (void) dim;
-    return bits == 4 && turbovec_cpu_vector_major();
+    // Upstream `vector_major_for`: whole four-group units, and a kernel to
+    // read them at this width. x86 has one at every width (permute-dot at
+    // 4 bits, the `vpermb` scan below that); aarch64 only permute-dot.
+    if (bits < 2 || bits > 4 || !turbovec_cpu_vector_major()) {
+        return false;
+    }
+    const size_t n_byte_groups = static_cast<size_t>(dim) / static_cast<size_t>(8 / bits);
+    return n_byte_groups % 4 == 0 && (bits == 4 || turbovec_x86_rules());
 }
 
 bool turbovec_wants_vm8(int bits, int dim) {
@@ -2031,7 +2039,8 @@ static void repack_turbovec_code_block(
         int dim,
         size_t block,
         std::vector<uint8_t> & blocked_codes,
-        TurboVecLayout layout) {
+        TurboVecLayout layout,
+        std::vector<uint8_t> & seq) {
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t codes_per_byte = static_cast<size_t>(8 / bits);
     const size_t n_byte_groups = dim_sz / codes_per_byte;
@@ -2040,8 +2049,8 @@ static void repack_turbovec_code_block(
     const size_t block_offset =
         block * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
     // Each lane's sequential row, converted once: rows past the last
-    // vector stay zero.
-    thread_local std::vector<uint8_t> seq;
+    // vector stay zero. `seq` is the caller's scratch, so pool threads
+    // keep no buffer between calls.
     seq.assign(static_cast<size_t>(kTurboVecScoreBlock) * n_byte_groups, 0);
     for (size_t lane = 0; lane < static_cast<size_t>(kTurboVecScoreBlock); ++lane) {
         const size_t vector = base_vector + lane;
@@ -2067,8 +2076,9 @@ static void repack_turbovec_code_blocks(
     parallel_for((n_repack + kTurboVecBlocksPerTask - 1) / kTurboVecBlocksPerTask, n_threads, [&](size_t task, size_t) {
         const size_t begin = first_block + task * kTurboVecBlocksPerTask;
         const size_t end = std::min(end_block, begin + kTurboVecBlocksPerTask);
+        std::vector<uint8_t> seq;
         for (size_t block = begin; block < end; ++block) {
-            repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, layout);
+            repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, layout, seq);
         }
     });
 }
@@ -2238,6 +2248,26 @@ void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot
     const float qs = turbovec_query_weights(query, dim, out.weights);
     out.scale = cs * qs;
     out.bias = 0.0f;
+    // Upstream's own weight order, which the x86 kernels read: per four
+    // byte groups the four low-nibble (odd) dims, then the four high-nibble
+    // (even) ones, and `zero` = -128 times their sum.
+    out.x86_weights.clear();
+    out.zero = 0;
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+    {
+        const size_t groups = static_cast<size_t>(dim) / 2;
+        out.x86_weights.resize(groups * 2);
+        int32_t wsum = 0;
+        for (size_t g = 0; g < groups; ++g) {
+            const int8_t lo = out.weights[2 * g + 1];
+            const int8_t hi = out.weights[2 * g];
+            out.x86_weights[(g / 4) * 8 + g % 4] = lo;
+            out.x86_weights[(g / 4) * 8 + 4 + g % 4] = hi;
+            wsum += lo + hi;
+        }
+        out.zero = -128 * wsum;
+    }
+#endif
     // The lone-query weights over the vm8 layout (upstream's
     // `build_smmla_a_vm8::<2>(&[pd, pd])`): per octet of byte groups, the
     // eight even (high-nibble) dims twice, then the eight odd ones twice.
@@ -2615,6 +2645,83 @@ static void permute_dot_block_sums_smmla_vm8_2bit(
 }
 #endif
 
+// Cache bytes from the start of `block` to the end of the blocked cache:
+// what the x86 kernels may prefetch.
+static size_t turbovec_bytes_after(size_t n_vectors, size_t block, size_t n_byte_groups) {
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    const size_t n_blocks = (n_vectors + lane_size - 1) / lane_size;
+    return (n_blocks - block) * n_byte_groups * lane_size;
+}
+
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL) && defined(GGML_VEC_INDEX_TEST_HOOKS)
+// 1 picks the GFNI form, 0 the VNNI one, -1 follows the host.
+static std::atomic<int> g_gfni_override{ -1 };
+#endif
+
+// The AVX-512 VNNI (or GFNI) permute-dot sums of nq queries over n_group
+// vector-major blocks, sums[(block * nq + query) * 32 + lane]; false when
+// this build or CPU has no such kernel.
+static bool turbovec_x86_permute_dot_sums(
+        const TurboVecPermuteDot * const * pds,
+        int nq,
+        const uint8_t * blocks,
+        size_t n_group,
+        size_t n_byte_groups,
+        size_t bytes_after,
+        int32_t * sums) {
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+    if (!turbovec_cpu_dot_product()) {
+        return false;
+    }
+    const int8_t * weights[kTurboVecMaxBatch];
+    int32_t zeros[kTurboVecMaxBatch];
+    for (int q = 0; q < nq; ++q) {
+        if (pds[q]->x86_weights.size() != n_byte_groups * 2) {
+            return false;
+        }
+        weights[q] = pds[q]->x86_weights.data();
+        zeros[q] = pds[q]->zero;
+    }
+    bool gfni = turbovec_cpu_gfni();
+#if defined(GGML_VEC_INDEX_TEST_HOOKS)
+    const int forced = g_gfni_override.load(std::memory_order_relaxed);
+    gfni = forced >= 0 ? (forced != 0 && vec_index_cpu_features().gfni) : gfni;
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_GFNI_KERNEL)
+    if (gfni) {
+        ggml_vec_index_detail::turbovec_permute_dot_sums_gfni(
+            pds[0]->levels, weights, zeros, nq, blocks, n_group, n_byte_groups, bytes_after, sums);
+        return true;
+    }
+#else
+    (void) gfni;
+#endif
+    ggml_vec_index_detail::turbovec_permute_dot_sums_vnni(
+        pds[0]->levels, weights, zeros, nq, blocks, n_group, n_byte_groups, bytes_after, sums);
+    return true;
+#else
+    (void) pds;
+    (void) nq;
+    (void) blocks;
+    (void) n_group;
+    (void) n_byte_groups;
+    (void) bytes_after;
+    (void) sums;
+    return false;
+#endif
+}
+
+static bool turbovec_x86_permute_dot_sums(
+        const TurboVecPermuteDot * pd,
+        int nq,
+        const uint8_t * blocks,
+        size_t n_group,
+        size_t n_byte_groups,
+        size_t bytes_after,
+        int32_t * sums) {
+    return turbovec_x86_permute_dot_sums(&pd, nq, blocks, n_group, n_byte_groups, bytes_after, sums);
+}
+
 // Integer permute-dot sums of one query over one block, in any layout:
 // the reference the SIMD kernels must match exactly.
 static void permute_dot_block_sums_scalar(
@@ -2652,6 +2759,15 @@ static void permute_dot_finish(
         size_t base,
         size_t valid,
         float * out_scores) {
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && (defined(__x86_64__) || defined(_M_X64))
+    // Without -mfma here std::fma is a libm call per lane (a software
+    // routine on MSVC); every host that runs these kernels has AVX2 + FMA.
+    if (vec_index_cpu_features().avx2) {
+        ggml_vec_index_detail::permute_dot_finish_avx2(
+            sums, pd.scale, pd.bias, vector_scales + base, valid, out_scores);
+        return;
+    }
+#endif
     for (size_t lane = 0; lane < static_cast<size_t>(kTurboVecScoreBlock); ++lane) {
         out_scores[lane] = lane < valid ?
             std::fma(static_cast<float>(sums[lane]), pd.scale, pd.bias) * vector_scales[base + lane] :
@@ -2677,20 +2793,59 @@ void score_turbovec_permute_dot_block(
     const size_t valid = std::min(lane_size, n_vectors - base);
     const uint8_t * block = blocked_codes + block_index * n_byte_groups * lane_size;
     int32_t sums[kTurboVecScoreBlock] = {};
+    bool done = false;
 #if GGML_VEC_INDEX_USE_NEON && (defined(__clang__) || defined(__GNUC__))
     // SDOT for one query in every layout (see the vm8 kernel for why not
     // SMMLA). dim % 8 == 0 makes the group count a multiple of four.
     const bool has_dot_product = turbovec_cpu_dot_product();
     if (layout == kTurboVecLayoutVm8 && has_dot_product && !pd.vm8_weights.empty()) {
         permute_dot_block_sums_sdot_vm8_single(pd, block, n_byte_groups, sums);
+        done = true;
     } else if (layout != kTurboVecLayoutVm8 && has_dot_product) {
         permute_dot_block_sums_sdot(pd, block, n_byte_groups, layout == kTurboVecLayoutVm, sums);
-    } else
+        done = true;
+    }
 #endif
-    {
+    if (!done && layout == kTurboVecLayoutVm) {
+        done = turbovec_x86_permute_dot_sums(
+            &pd, 1, block, 1, n_byte_groups, turbovec_bytes_after(n_vectors, block_index, n_byte_groups), sums);
+    }
+    if (!done) {
         permute_dot_block_sums_scalar(pd, block, n_byte_groups, 4, layout, valid, sums);
     }
     permute_dot_finish(pd, sums, vector_scales, base, valid, out_scores);
+}
+
+void score_turbovec_permute_dot_blocks(
+        const TurboVecPermuteDot & pd,
+        const uint8_t * blocked_codes,
+        const float * vector_scales,
+        size_t first_block,
+        size_t n_group,
+        size_t n_vectors,
+        int dim,
+        TurboVecLayout layout,
+        float * out_scores) {
+    const size_t n_byte_groups = static_cast<size_t>(dim) / 2;
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    // Upstream's lone query walks eight blocks at once on x86
+    // (`search_multi_query_permute_dot::<1, 8>`).
+    int32_t sums[8 * kTurboVecScoreBlock];
+    if (layout == kTurboVecLayoutVm && n_group <= 8 &&
+        turbovec_x86_permute_dot_sums(
+            &pd, 1, blocked_codes + first_block * n_byte_groups * lane_size, n_group, n_byte_groups,
+            turbovec_bytes_after(n_vectors, first_block, n_byte_groups), sums)) {
+        for (size_t b = 0; b < n_group; ++b) {
+            const size_t base = (first_block + b) * lane_size;
+            permute_dot_finish(pd, sums + b * lane_size, vector_scales, base, std::min(lane_size, n_vectors - base),
+                out_scores + b * lane_size);
+        }
+        return;
+    }
+    for (size_t b = 0; b < n_group; ++b) {
+        score_turbovec_permute_dot_block(
+            pd, blocked_codes, vector_scales, first_block + b, n_vectors, dim, layout, out_scores + b * lane_size);
+    }
 }
 
 void prepare_turbovec_permute_dot_batch(TurboVecPermuteDotBatch & batch, int dim) {
@@ -2808,6 +2963,20 @@ void score_turbovec_permute_dot_batch_block(
         done = true;
     }
 #endif
+    // x86: upstream's batch widths, 10 or 8 queries in one pass (a batch
+    // padded to the width, as upstream pads it, scores its padding lanes
+    // and discards them).
+    if (!done && batch.bits == 4 && batch.layout == kTurboVecLayoutVm && (n == 8 || n == 10)) {
+        int32_t flat[kTurboVecMaxBatch * kTurboVecScoreBlock];
+        if (turbovec_x86_permute_dot_sums(
+                batch.pds, n, block, 1, n_byte_groups, turbovec_bytes_after(n_vectors, block_index, n_byte_groups),
+                flat)) {
+            for (int q = 0; q < n; ++q) {
+                std::memcpy(sums[q], flat + static_cast<size_t>(q) * lane_size, lane_size * sizeof(int32_t));
+            }
+            done = true;
+        }
+    }
     if (!done) {
         for (int q = 0; q < n; ++q) {
             permute_dot_block_sums_scalar(*batch.pds[q], block, n_byte_groups, batch.bits, batch.layout, valid, sums[q]);
@@ -3231,7 +3400,8 @@ void repack_turbovec_sign_codes(
         int dim,
         size_t first_slot,
         std::vector<uint8_t> & sign_blocked,
-        int n_threads) {
+        int n_threads,
+        TurboVecLayout layout) {
     // The sign plane of a bit-plane row is its top plane: one byte per
     // eight coordinates, scanned as an index with dim / 8 byte groups.
     const size_t n_sign_groups = static_cast<size_t>(dim) / 8;
@@ -3257,7 +3427,7 @@ void repack_turbovec_sign_codes(
                     std::memcpy(seq.data() + lane * n_sign_groups, packed_codes + vector * row_bytes + sign_at, n_sign_groups);
                 }
             }
-            write_blocked_block(seq.data(), n_sign_groups, sign_blocked.data() + block * block_bytes, kTurboVecLayoutSeq);
+            write_blocked_block(seq.data(), n_sign_groups, sign_blocked.data() + block * block_bytes, layout);
         }
     });
 }
@@ -3273,12 +3443,12 @@ void turbovec_sign_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t
     }
     uint8_t * src = sign.data() + (last / lane_size) * block_bytes;
     uint8_t * dst = sign.data() + (slot / lane_size) * block_bytes;
+    const TurboVecLayout layout = turbovec_sign_layout(idx);
     for (size_t g = 0; g < n_sign_groups; ++g) {
         if (slot != last) {
-            set_block_lane_byte(
-                dst, g, slot % lane_size, kTurboVecLayoutSeq, block_lane_byte(src, g, last % lane_size, kTurboVecLayoutSeq));
+            set_block_lane_byte(dst, g, slot % lane_size, layout, block_lane_byte(src, g, last % lane_size, layout));
         }
-        set_block_lane_byte(src, g, last % lane_size, kTurboVecLayoutSeq, 0);
+        set_block_lane_byte(src, g, last % lane_size, layout, 0);
     }
     sign.resize(((last + lane_size - 1) / lane_size) * block_bytes);
 }
@@ -3466,6 +3636,240 @@ void score_turbovec_lut_block(
         out_scores[lane] = score * vector_scales[base_vector + lane];
     }
 #endif
+}
+
+void turbovec_split_lut_for_vnni(const uint8_t * lut, size_t n_byte_groups, uint8_t * out) {
+    // Upstream search.rs `split_lut_for_vnni`: per four byte groups, the
+    // four low-nibble sub-tables (entries 16..31 of each group) and then
+    // the four high-nibble ones, so one `vpermb` serves four groups.
+    for (size_t g0 = 0; g0 < n_byte_groups; g0 += 4) {
+        uint8_t * c = out + (g0 / 4) * 128;
+        for (size_t j = 0; j < 4; ++j) {
+            const uint8_t * src = lut + (g0 + j) * 32;
+            std::memcpy(c + j * 16, src + 16, 16);
+            std::memcpy(c + 64 + j * 16, src, 16);
+        }
+    }
+}
+
+// The `vpermb` scan's integer sums for nq queries over one vector-major
+// block, sums[q * 32 + lane]: the sum of the two nibble entries of every
+// byte group, in u32 (upstream `search_multi_query_vnni` accumulates the
+// same entries with `vpdpbusd`). Lanes past `valid` are left zero.
+static void vnni_lut_block_sums_scalar(
+        const uint8_t * const * luts,
+        int nq,
+        const uint8_t * block,
+        size_t n_byte_groups,
+        size_t valid,
+        int32_t * sums) {
+    std::fill(sums, sums + static_cast<size_t>(nq) * kTurboVecScoreBlock, 0);
+    for (size_t q4 = 0; q4 < n_byte_groups / 4; ++q4) {
+        for (size_t lane = 0; lane < valid; ++lane) {
+            const uint8_t * bytes = block + q4 * 128 + (lane / 16) * 64 + (lane % 16) * 4;
+            for (int q = 0; q < nq; ++q) {
+                const uint8_t * t = luts[q] + q4 * 128;
+                uint32_t sum = 0;
+                for (size_t j = 0; j < 4; ++j) {
+                    sum += static_cast<uint32_t>(t[j * 32 + (bytes[j] >> 4)]) + t[j * 32 + 16 + (bytes[j] & 0x0f)];
+                }
+                sums[static_cast<size_t>(q) * kTurboVecScoreBlock + lane] += static_cast<int32_t>(sum);
+            }
+        }
+    }
+}
+
+// The `vpermb` scan's epilogue: one multiply and one add on the converted
+// sum (never fused), times the vector's scale; padding lanes are -inf.
+static void vnni_lut_finish(
+        float scale,
+        float bias,
+        const int32_t * sums,
+        const float * vector_scales,
+        size_t base,
+        size_t valid,
+        float * out_scores) {
+    for (size_t lane = 0; lane < static_cast<size_t>(kTurboVecScoreBlock); ++lane) {
+        if (lane >= valid) {
+            out_scores[lane] = -std::numeric_limits<float>::infinity();
+            continue;
+        }
+        const float product = static_cast<float>(sums[lane]) * scale;
+        const float f = product + bias;
+        out_scores[lane] = f * vector_scales[base + lane];
+    }
+}
+
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+static bool turbovec_vnni_lut_kernel_ready(const uint8_t * const * splits, int nq) {
+    if (!turbovec_cpu_dot_product()) {
+        return false;
+    }
+    for (int q = 0; q < nq; ++q) {
+        if (splits == nullptr || splits[q] == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+void score_turbovec_lut_blocks_vnni(
+        const uint8_t * const * luts,
+        const uint8_t * const * splits,
+        const float * scales,
+        const float * biases,
+        int nq,
+        const uint8_t * blocked_codes,
+        const float * vector_scales,
+        size_t first_block,
+        size_t n_group,
+        size_t n_vectors,
+        int bits,
+        int dim,
+        float * const * out_scores) {
+    const size_t n_byte_groups = static_cast<size_t>(dim) / static_cast<size_t>(8 / bits);
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    const size_t block_bytes = n_byte_groups * lane_size;
+    int32_t sums[kTurboVecMaxBatch * kTurboVecScoreBlock];
+    // A lone query takes two blocks at a time (upstream
+    // `search_single_query_vnni_blk2`), a batch one.
+    const size_t step = nq == 1 ? 2 : 1;
+    for (size_t b = 0; b < n_group; b += step) {
+        const size_t block = first_block + b;
+        const size_t nb = std::min(step, n_group - b);
+        const uint8_t * codes = blocked_codes + block * block_bytes;
+        bool done = false;
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+        if (turbovec_vnni_lut_kernel_ready(splits, nq)) {
+            ggml_vec_index_detail::turbovec_vnni_lut_sums(
+                splits, nq, codes, nb, n_byte_groups, turbovec_bytes_after(n_vectors, block, n_byte_groups), sums);
+            done = true;
+        }
+#else
+        (void) splits;
+#endif
+        for (size_t i = 0; i < nb; ++i) {
+            const size_t base = (block + i) * lane_size;
+            const size_t valid = std::min(lane_size, n_vectors - base);
+            int32_t * block_sums = sums + i * static_cast<size_t>(nq) * lane_size;
+            if (!done) {
+                vnni_lut_block_sums_scalar(luts, nq, codes + i * block_bytes, n_byte_groups, valid, block_sums);
+            }
+            for (int q = 0; q < nq; ++q) {
+                vnni_lut_finish(
+                    scales[q], biases[q], block_sums + static_cast<size_t>(q) * lane_size, vector_scales, base, valid,
+                    out_scores[q] + (b + i) * lane_size);
+            }
+        }
+    }
+}
+
+void score_turbovec_lut_block_vnni(
+        const uint8_t * lut,
+        const uint8_t * split,
+        float lut_scale,
+        float lut_bias,
+        const uint8_t * blocked_codes,
+        const float * vector_scales,
+        size_t block_index,
+        size_t n_vectors,
+        int bits,
+        int dim,
+        float * out_scores) {
+    score_turbovec_lut_blocks_vnni(
+        &lut, split != nullptr ? &split : nullptr, &lut_scale, &lut_bias, 1, blocked_codes, vector_scales, block_index,
+        1, n_vectors, bits, dim, &out_scores);
+}
+
+// The LUT scans' f32 accumulators (bias plus the flushed partials) times
+// the vector scales; padding lanes are -inf.
+[[maybe_unused]] static void lut_fa_finish(
+        const float * fa,
+        const float * vector_scales,
+        size_t base,
+        size_t valid,
+        float * out_scores) {
+    for (size_t lane = 0; lane < static_cast<size_t>(kTurboVecScoreBlock); ++lane) {
+        out_scores[lane] = lane < valid ? fa[lane] * vector_scales[base + lane] : -std::numeric_limits<float>::infinity();
+    }
+}
+
+void score_turbovec_lut_block_pair_4(
+        const uint8_t * const luts[4],
+        const float lut_scales[4],
+        const float lut_biases[4],
+        const uint8_t * blocked_codes,
+        const float * vector_scales,
+        size_t block_index,
+        size_t n_vectors,
+        int bits,
+        int dim,
+        float * const out_scores0[4],
+        float * const out_scores1[4]) {
+#if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL)
+    const VecIndexCpuFeatures & features = vec_index_cpu_features();
+    if (features.avx512bw && features.avx2) {
+        const size_t n_byte_groups = static_cast<size_t>(dim) / static_cast<size_t>(8 / bits);
+        const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+        float fa[2 * 4 * kTurboVecScoreBlock];
+        ggml_vec_index_detail::turbovec_lut_pair_avx512bw(
+            luts, lut_scales, lut_biases, blocked_codes + block_index * n_byte_groups * lane_size, n_byte_groups, fa);
+        for (size_t b = 0; b < 2; ++b) {
+            const size_t base = (block_index + b) * lane_size;
+            const size_t valid = std::min(lane_size, n_vectors - base);
+            for (size_t q = 0; q < 4; ++q) {
+                lut_fa_finish(fa + (b * 4 + q) * lane_size, vector_scales, base, valid, b == 0 ? out_scores0[q] : out_scores1[q]);
+            }
+        }
+        return;
+    }
+#endif
+    score_turbovec_lut_block_4(
+        luts, lut_scales, lut_biases, blocked_codes, vector_scales, block_index, n_vectors, bits, dim, out_scores0);
+    score_turbovec_lut_block_4(
+        luts, lut_scales, lut_biases, blocked_codes, vector_scales, block_index + 1, n_vectors, bits, dim, out_scores1);
+}
+
+int32_t turbovec_exact4_sum_scalar(
+        const int8_t * w,
+        const int8_t * levels,
+        const uint8_t * sign_block,
+        const uint8_t * low_row,
+        size_t nsg,
+        size_t lane) {
+    // Upstream `exact4_sum_scalar`: the four planes' bits rebuild each
+    // dim's code; position 8c + b of `w` is dim 8c + 7 - b.
+    int32_t sum = 0;
+    for (size_t c = 0; c < nsg; ++c) {
+        const uint8_t sb = sign_block[vector_major_offset(c, lane)];
+        const uint8_t p2 = low_row[2 * nsg + c];
+        const uint8_t p1 = low_row[nsg + c];
+        const uint8_t p0 = low_row[c];
+        for (size_t b = 0; b < 8; ++b) {
+            const int code = (((sb >> b) & 1) << 3) | (((p2 >> b) & 1) << 2) | (((p1 >> b) & 1) << 1) | ((p0 >> b) & 1);
+            sum += static_cast<int32_t>(w[c * 8 + b]) * levels[code];
+        }
+    }
+    return sum;
+}
+
+int32_t turbovec_exact4_sum(
+        const int8_t * w,
+        const int8_t * levels,
+        int32_t zero,
+        const uint8_t * sign_block,
+        const uint8_t * low_row,
+        size_t nsg,
+        size_t lane) {
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+    if (turbovec_cpu_dot_product()) {
+        return ggml_vec_index_detail::turbovec_exact4_sum_avx512(w, levels, zero, sign_block, low_row, nsg, lane);
+    }
+#else
+    (void) zero;
+#endif
+    return turbovec_exact4_sum_scalar(w, levels, sign_block, low_row, nsg, lane);
 }
 
 #if GGML_VEC_INDEX_USE_NEON
@@ -3693,6 +4097,22 @@ void score_turbovec_lut_block_4(
         }
     }
 #else
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && (defined(__x86_64__) || defined(_M_X64))
+    // Upstream `search_multi_query_avx2`, the same flush schedule and
+    // epilogue as the single-query AVX2 kernel.
+    if (vec_index_cpu_features().avx2) {
+        const size_t n_byte_groups = static_cast<size_t>(dim) / static_cast<size_t>(8 / bits);
+        const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+        const size_t base = block_index * lane_size;
+        float fa[4 * kTurboVecScoreBlock];
+        ggml_vec_index_detail::score_turbovec_lut_block4_avx2(
+            luts, lut_scales, lut_biases, blocked_codes + block_index * n_byte_groups * lane_size, n_byte_groups, fa);
+        for (size_t q = 0; q < 4; ++q) {
+            lut_fa_finish(fa + q * lane_size, vector_scales, base, std::min(lane_size, n_vectors - base), out_scores[q]);
+        }
+        return;
+    }
+#endif
     for (int query = 0; query < 4; ++query) {
         score_turbovec_lut_block(
             luts[query],
@@ -4518,3 +4938,370 @@ float dot_turbovec_q4_row(const float * query, const uint8_t * codes, const floa
     rotate_turbovec_query(true, query, rotated.data(), dim);
     return dot_turbovec_q4_rotated_row(rotated.data(), codes, scales, dim);
 }
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// The nibble LUT scan's arithmetic as upstream's AVX2, AVX-512 BW and NEON
+// kernels perform it, one lane at a time over this host's sequential blocked
+// layout: per FLUSH_EVERY groups the exact entry sum, folded into
+// fma(scale, sum, acc) from acc = bias, then times the vector's scale.
+static void lut_flush_block_reference(
+        const uint8_t * lut,
+        float scale,
+        float bias,
+        const uint8_t * block,
+        size_t n_byte_groups,
+        const float * vector_scales,
+        size_t base,
+        size_t valid,
+        float * out_scores) {
+    constexpr size_t flush_every = 256;
+    for (size_t lane = 0; lane < static_cast<size_t>(kTurboVecScoreBlock); ++lane) {
+        if (lane >= valid) {
+            out_scores[lane] = -std::numeric_limits<float>::infinity();
+            continue;
+        }
+        float fa = bias;
+        for (size_t g0 = 0; g0 < n_byte_groups; g0 += flush_every) {
+            uint32_t sum = 0;
+            for (size_t g = g0; g < std::min(n_byte_groups, g0 + flush_every); ++g) {
+                const uint8_t byte = blocked_lane_byte(block + g * kTurboVecScoreBlock, lane);
+                sum += static_cast<uint32_t>(lut[g * 32 + (byte >> 4)]) + lut[g * 32 + 16 + (byte & 0x0f)];
+            }
+            fa = std::fma(scale, static_cast<float>(sum), fa);
+        }
+        out_scores[lane] = fa * vector_scales[base + lane];
+    }
+}
+
+// Whether this build and CPU run search kernel `kernel` (see below).
+static bool turbovec_x86_kernel_available(int kernel) {
+    const VecIndexCpuFeatures & features = vec_index_cpu_features();
+    switch (kernel) {
+        case 0:
+        case 1:
+        case 3:
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+            return turbovec_cpu_dot_product();
+#else
+            return false;
+#endif
+        case 2:
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL) && defined(GGML_VEC_INDEX_HAVE_GFNI_KERNEL)
+            return turbovec_cpu_dot_product() && features.gfni;
+#else
+            return false;
+#endif
+        case 4:
+#if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL)
+            return features.avx512bw && features.avx2;
+#else
+            return false;
+#endif
+        case 5:
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && (defined(__x86_64__) || defined(_M_X64))
+            return features.avx2;
+#else
+            return false;
+#endif
+        default:
+            (void) features;
+            return false;
+    }
+}
+
+static bool same_float_bits(const float * a, const float * b, size_t n) {
+    return std::memcmp(a, b, n * sizeof(float)) == 0;
+}
+
+// 1 when the AVX2 permute-dot epilogue matches the scalar fma(sum, scale,
+// bias) * scale bit for bit, 0 on a mismatch, -1 when this build or CPU
+// lacks it.
+int turbovec_pd_finish_parity_for_test() {
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && (defined(__x86_64__) || defined(_M_X64))
+    if (!vec_index_cpu_features().avx2) {
+        return -1;
+    }
+    uint32_t state = 0x6a09e667u;
+    auto next = [&]() {
+        state = state * 1664525u + 1013904223u;
+        return state;
+    };
+    for (int it = 0; it < 20000; ++it) {
+        int32_t sums[32];
+        float scales[32];
+        for (int lane = 0; lane < 32; ++lane) {
+            sums[lane] = static_cast<int32_t>(next() % 80000001u) - 40000000;
+            scales[lane] = (static_cast<float>(next() % 2001u) - 1000.0f) * 1e-6f;
+        }
+        const float scale = (static_cast<float>(next() % 2001u) - 1000.0f) * 1e-7f;
+        const float bias = (static_cast<float>(next() % 2001u) - 1000.0f) * 1e-3f;
+        const size_t valid = next() % 33u;
+        float got[32];
+        ggml_vec_index_detail::permute_dot_finish_avx2(sums, scale, bias, scales, valid, got);
+        for (size_t lane = 0; lane < 32; ++lane) {
+            const float want = lane < valid ? std::fma(static_cast<float>(sums[lane]), scale, bias) * scales[lane] :
+                -std::numeric_limits<float>::infinity();
+            if (std::memcmp(&got[lane], &want, sizeof(float)) != 0) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+#else
+    return -1;
+#endif
+}
+
+// Kernel 0: the AVX-512 VNNI `vpermb` scan; 1: the VNNI permute-dot scan;
+// 2: its GFNI form; 3: the VNNI exact 4-bit planes sum; 4: the AVX-512 BW
+// four-query LUT scan over block pairs; 5: the AVX2 four-query LUT scan
+// (and the AVX2 single-query one); 6: the AVX-512 bit-mask build; 7: the
+// VPOPCNTDQ bit-mask count. Each runs through the dispatch the search uses
+// and is compared bit for bit with its scalar model on random operands,
+// partial tail blocks and every query count the dispatch takes. 1 on a
+// match, 0 on a mismatch, -1 when this build or CPU lacks the kernel.
+int turbovec_search_kernel_parity_for_test(int kernel) {
+    if (kernel == 6 || kernel == 7) {
+        return turbovec_low_kernel_parity_for_test(kernel - 6);
+    }
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    uint32_t state = 0x2545f491u + static_cast<uint32_t>(kernel);
+    auto next = [&]() {
+        state = state * 1664525u + 1013904223u;
+        return state >> 8;
+    };
+    const VecIndexCpuFeatures & features = vec_index_cpu_features();
+    if (kernel == 0) {
+        if (!turbovec_x86_kernel_available(0)) {
+            return -1;
+        }
+        bool ok = true;
+        for (const size_t n_byte_groups : { size_t{ 4 }, size_t{ 48 }, size_t{ 200 }, size_t{ 388 } }) {
+            const size_t n_blocks = 5;
+            const size_t n_vectors = n_blocks * lane_size - 7;
+            std::vector<uint8_t> codes(n_blocks * n_byte_groups * lane_size);
+            for (uint8_t & c : codes) {
+                c = static_cast<uint8_t>(next());
+            }
+            std::vector<float> vscales(n_vectors);
+            for (float & v : vscales) {
+                v = 0.25f + static_cast<float>(next() % 1000) / 997.0f;
+            }
+            std::vector<std::vector<uint8_t>> luts(8), splits(8);
+            const uint8_t * lut_ptrs[8];
+            const uint8_t * split_ptrs[8];
+            float scales[8];
+            float biases[8];
+            for (size_t q = 0; q < 8; ++q) {
+                luts[q].resize(n_byte_groups * 32);
+                for (uint8_t & v : luts[q]) {
+                    v = static_cast<uint8_t>(next() % 128);
+                }
+                splits[q].resize(luts[q].size());
+                turbovec_split_lut_for_vnni(luts[q].data(), n_byte_groups, splits[q].data());
+                lut_ptrs[q] = luts[q].data();
+                split_ptrs[q] = splits[q].data();
+                scales[q] = 0.01f + static_cast<float>(next() % 1000) * 1e-4f;
+                biases[q] = -3.0f + static_cast<float>(next() % 1000) * 1e-3f;
+            }
+            for (int nq = 1; nq <= 8 && ok; ++nq) {
+                for (const size_t n_group : { size_t{ 1 }, size_t{ 2 }, size_t{ 3 }, n_blocks }) {
+                    for (size_t first = 0; first + n_group <= n_blocks && ok; first += n_group) {
+                        std::vector<float> got(8 * n_blocks * lane_size), want(got.size());
+                        float * got_ptrs[8];
+                        float * want_ptrs[8];
+                        for (size_t q = 0; q < 8; ++q) {
+                            got_ptrs[q] = got.data() + q * n_blocks * lane_size;
+                            want_ptrs[q] = want.data() + q * n_blocks * lane_size;
+                        }
+                        score_turbovec_lut_blocks_vnni(lut_ptrs, split_ptrs, scales, biases, nq, codes.data(),
+                            vscales.data(), first, n_group, n_vectors, 2, static_cast<int>(n_byte_groups * 4), got_ptrs);
+                        score_turbovec_lut_blocks_vnni(lut_ptrs, nullptr, scales, biases, nq, codes.data(),
+                            vscales.data(), first, n_group, n_vectors, 2, static_cast<int>(n_byte_groups * 4), want_ptrs);
+                        ok = ok && same_float_bits(got.data(), want.data(), got.size());
+                    }
+                }
+            }
+        }
+        return ok ? 1 : 0;
+    }
+    if (kernel == 1 || kernel == 2 || kernel == 3) {
+        if (!turbovec_x86_kernel_available(kernel)) {
+            return -1;
+        }
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+        g_gfni_override.store(kernel == 2 ? 1 : 0, std::memory_order_relaxed);
+#endif
+        bool ok = true;
+        for (const int dim : { 8, 96, 200, 784 }) {
+            const size_t n_byte_groups = static_cast<size_t>(dim) / 2;
+            const size_t n_blocks = 11;
+            const size_t n_vectors = n_blocks * lane_size - 5;
+            std::vector<uint8_t> codes(n_blocks * n_byte_groups * lane_size);
+            for (uint8_t & c : codes) {
+                c = static_cast<uint8_t>(next());
+            }
+            std::vector<float> vscales(n_vectors);
+            for (float & v : vscales) {
+                v = 0.25f + static_cast<float>(next() % 1000) / 997.0f;
+            }
+            std::vector<TurboVecPermuteDot> pds(10);
+            std::vector<float> query(static_cast<size_t>(dim));
+            for (TurboVecPermuteDot & pd : pds) {
+                for (float & x : query) {
+                    x = static_cast<float>(static_cast<int>(next() % 2001) - 1000) / 997.0f;
+                }
+                build_turbovec_permute_dot(query.data(), dim, pd, false);
+                pd.bias = static_cast<float>(static_cast<int>(next() % 101) - 50) / 7.0f;
+            }
+            auto reference = [&](const TurboVecPermuteDot & pd, size_t block, float * out) {
+                int32_t sums[kTurboVecScoreBlock];
+                const size_t base = block * lane_size;
+                const size_t valid = std::min(lane_size, n_vectors - base);
+                permute_dot_block_sums_scalar(pd, codes.data() + block * n_byte_groups * lane_size, n_byte_groups, 4,
+                    kTurboVecLayoutVm, valid, sums);
+                permute_dot_finish(pd, sums, vscales.data(), base, valid, out);
+            };
+            if (kernel == 3) {
+                // The planes of every vector: the sign region in the
+                // vector-major layout, the packed rows' low planes.
+                const size_t nsg = static_cast<size_t>(dim) / 8;
+                if (nsg % 4 != 0) {
+                    continue;
+                }
+                std::vector<uint8_t> sign(n_blocks * nsg * lane_size);
+                std::vector<uint8_t> rows(n_vectors * 4 * nsg);
+                for (uint8_t & b : sign) {
+                    b = static_cast<uint8_t>(next());
+                }
+                for (uint8_t & b : rows) {
+                    b = static_cast<uint8_t>(next());
+                }
+                const TurboVecPermuteDot & pd = pds[0];
+                std::vector<int8_t> w((static_cast<size_t>(dim) + 63) / 64 * 64, 0);
+                int32_t wsum = 0;
+                for (int d = 0; d < dim; ++d) {
+                    w[static_cast<size_t>(d / 8) * 8 + 7 - static_cast<size_t>(d % 8)] = pd.weights[static_cast<size_t>(d)];
+                    wsum += pd.weights[static_cast<size_t>(d)];
+                }
+                for (size_t v = 0; v < n_vectors && ok; ++v) {
+                    const uint8_t * sign_block = sign.data() + (v / lane_size) * nsg * lane_size;
+                    const int32_t got = turbovec_exact4_sum(
+                        w.data(), pd.levels, -128 * wsum, sign_block, rows.data() + v * 4 * nsg, nsg, v % lane_size);
+                    const int32_t want = turbovec_exact4_sum_scalar(
+                        w.data(), pd.levels, sign_block, rows.data() + v * 4 * nsg, nsg, v % lane_size);
+                    ok = got == want;
+                }
+                continue;
+            }
+            // A lone query, one to eleven blocks at a time.
+            for (size_t n_group = 1; n_group <= 8 && ok; ++n_group) {
+                for (size_t first = 0; first + n_group <= n_blocks && ok; first += n_group) {
+                    std::vector<float> got(n_group * lane_size), want(got.size());
+                    score_turbovec_permute_dot_blocks(pds[3], codes.data(), vscales.data(), first, n_group, n_vectors,
+                        dim, kTurboVecLayoutVm, got.data());
+                    for (size_t b = 0; b < n_group; ++b) {
+                        reference(pds[3], first + b, want.data() + b * lane_size);
+                    }
+                    ok = same_float_bits(got.data(), want.data(), got.size());
+                }
+            }
+            // Upstream's batch widths, and a query count it pads to them.
+            for (const int n : { 8, 10, 3 }) {
+                TurboVecPermuteDotBatch batch;
+                batch.n = n;
+                batch.bits = 4;
+                batch.layout = kTurboVecLayoutVm;
+                for (int q = 0; q < n; ++q) {
+                    batch.pds[q] = &pds[static_cast<size_t>(q)];
+                }
+                prepare_turbovec_permute_dot_batch(batch, dim);
+                for (size_t block = 0; block < n_blocks && ok; ++block) {
+                    std::vector<float> got(static_cast<size_t>(n) * lane_size), want(got.size());
+                    float * got_ptrs[kTurboVecMaxBatch];
+                    for (int q = 0; q < n; ++q) {
+                        got_ptrs[q] = got.data() + static_cast<size_t>(q) * lane_size;
+                        reference(pds[static_cast<size_t>(q)], block, want.data() + static_cast<size_t>(q) * lane_size);
+                    }
+                    score_turbovec_permute_dot_batch_block(batch, codes.data(), vscales.data(), block, n_vectors, dim, got_ptrs);
+                    ok = same_float_bits(got.data(), want.data(), got.size());
+                }
+            }
+        }
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+        g_gfni_override.store(-1, std::memory_order_relaxed);
+#endif
+        return ok ? 1 : 0;
+    }
+    if (kernel == 4 || kernel == 5) {
+        if (!turbovec_x86_kernel_available(kernel)) {
+            return -1;
+        }
+        bool ok = true;
+        // Group counts below, at and across a flush, odd and even.
+        for (const size_t n_byte_groups : { size_t{ 1 }, size_t{ 100 }, size_t{ 256 }, size_t{ 257 }, size_t{ 600 } }) {
+            const size_t n_blocks = 5;
+            const size_t n_vectors = n_blocks * lane_size - 9;
+            std::vector<uint8_t> codes(n_blocks * n_byte_groups * lane_size);
+            for (uint8_t & c : codes) {
+                c = static_cast<uint8_t>(next());
+            }
+            std::vector<float> vscales(n_vectors);
+            for (float & v : vscales) {
+                v = 0.25f + static_cast<float>(next() % 1000) / 997.0f;
+            }
+            std::vector<uint8_t> luts[4];
+            const uint8_t * lut_ptrs[4];
+            float scales[4];
+            float biases[4];
+            for (size_t q = 0; q < 4; ++q) {
+                luts[q].resize(n_byte_groups * 32);
+                for (uint8_t & v : luts[q]) {
+                    v = static_cast<uint8_t>(next() % 128);
+                }
+                lut_ptrs[q] = luts[q].data();
+                scales[q] = 0.01f + static_cast<float>(next() % 1000) * 1e-4f;
+                biases[q] = -3.0f + static_cast<float>(next() % 1000) * 1e-3f;
+            }
+            // dim for 4-bit codes: two per byte group.
+            const int dim = static_cast<int>(n_byte_groups * 2);
+            for (size_t block = 0; block + (kernel == 4 ? 1 : 0) < n_blocks && ok; ++block) {
+                std::vector<float> got(8 * lane_size), want(got.size());
+                float * got0[4];
+                float * got1[4];
+                for (size_t q = 0; q < 4; ++q) {
+                    got0[q] = got.data() + q * lane_size;
+                    got1[q] = got.data() + (4 + q) * lane_size;
+                    for (size_t b = 0; b < 2; ++b) {
+                        const size_t blk = std::min(block + b, n_blocks - 1);
+                        const size_t base = blk * lane_size;
+                        lut_flush_block_reference(lut_ptrs[q], scales[q], biases[q],
+                            codes.data() + blk * n_byte_groups * lane_size, n_byte_groups, vscales.data(), base,
+                            std::min(lane_size, n_vectors - base), want.data() + (b * 4 + q) * lane_size);
+                    }
+                }
+                if (kernel == 4) {
+                    score_turbovec_lut_block_pair_4(
+                        lut_ptrs, scales, biases, codes.data(), vscales.data(), block, n_vectors, 4, dim, got0, got1);
+                    ok = same_float_bits(got.data(), want.data(), got.size());
+                } else {
+                    score_turbovec_lut_block_4(
+                        lut_ptrs, scales, biases, codes.data(), vscales.data(), block, n_vectors, 4, dim, got0);
+                    ok = same_float_bits(got.data(), want.data(), 4 * lane_size);
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && (defined(__x86_64__) || defined(_M_X64))
+                    for (size_t q = 0; q < 4 && ok; ++q) {
+                        ggml_vec_index_detail::score_turbovec_lut_block_avx2(lut_ptrs[q], scales[q], biases[q],
+                            codes.data(), vscales.data(), block, n_byte_groups, n_vectors, got0[q]);
+                        ok = same_float_bits(got0[q], want.data() + q * lane_size, lane_size);
+                    }
+#endif
+                }
+            }
+        }
+        (void) features;
+        return ok ? 1 : 0;
+    }
+    (void) features;
+    return -1;
+}
+#endif

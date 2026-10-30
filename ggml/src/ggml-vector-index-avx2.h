@@ -17,5 +17,12 @@ void score_turbovec_lut_block_avx2(
     size_t n_byte_groups,
     size_t n_vectors,
     float * out_scores);
+void score_turbovec_lut_block4_avx2(
+    const uint8_t * const luts[4],
+    const float scales[4],
+    const float biases[4],
+    const uint8_t * block,
+    size_t n_byte_groups,
+    float * fa_out);
 
 } // namespace ggml_vec_index_detail
