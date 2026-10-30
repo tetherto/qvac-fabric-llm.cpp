@@ -1081,6 +1081,8 @@ constexpr size_t kCentreRowsPerTask = 4096;
 constexpr size_t kRankPerTask = 64;
 // Candidates one ranking batch gathers (upstream RANK_BATCH).
 constexpr size_t kRankBatch = 32;
+// Ranking steps the row prefetch runs ahead of the count.
+constexpr size_t kRankAhead = 2;
 // Shortlist ranges per thread of a split scan: each range fills a shortlist
 // of its own before it can prune, so fewer ranges than the full scan's.
 constexpr size_t kRangesPerThread = 2;
@@ -1830,13 +1832,16 @@ bool turbovec_staged_search(
         // at most kRankBatch of them (upstream plane_terms): the sign tables
         // over their rows, undone to m * sum(+-q), or the bit masks counted.
         auto plane_terms = [&](size_t begin, size_t end, size_t plane, float * out) {
-            // The rows are scattered over the index, so the next batch's
-            // lines are asked for while this one is counted (upstream
-            // rank_first_keep / rank_full_known prefetch_low one step ahead);
-            // asked for just before the read, each row still waited on its
-            // miss. The first batch is asked for here as well.
-            const size_t ahead_end = std::min(list.size(), end + (end - begin));
-            for (size_t i = begin == 0 ? begin : end; i < ahead_end; ++i) {
+            // The rows are scattered over the index, so the lines of the
+            // batch kRankAhead steps on are asked for while this one is
+            // counted; asked for just before the read, each row still waited
+            // on its miss. Upstream (rank_first_keep / rank_full_known) goes
+            // one step ahead; two measured 9 us faster at q4 k64 on Zen 5
+            // and the same on Apple M5. The first batches are asked for here
+            // as well.
+            const size_t span = end - begin;
+            const size_t ahead_end = std::min(list.size(), end + kRankAhead * span);
+            for (size_t i = begin == 0 ? begin : end + (kRankAhead - 1) * span; i < ahead_end; ++i) {
                 prefetch_span(idx.turbovec_data.data() + list[i].slot * row_bytes + plane * nsg, nsg);
             }
             if (table_rank) {
