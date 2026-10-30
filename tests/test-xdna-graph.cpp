@@ -560,9 +560,15 @@ static bool test_fa_computed_masks(ggml_backend_t npu, ggml_backend_t cpu, fa_ro
     return ok;
 }
 
+// Where a projection is expected to run: either, the host (the CPU backend's own
+// product, bit for bit) or the array (a different order of summing, so not bit for bit).
+enum gemm_route { GEMM_ROUTE_ANY, GEMM_ROUTE_HOST, GEMM_ROUTE_ARRAY };
+
 struct gemm_shape {
-    int64_t K;
-    int64_t N;
+    int64_t        K;
+    int64_t        N;
+    enum ggml_type wtype = GGML_TYPE_COUNT;  // the case's when unset
+    gemm_route     route = GEMM_ROUTE_ANY;
 };
 
 // The projections of `shapes` on M activation rows, in this order and with no
@@ -580,7 +586,7 @@ static norm_graph build_gemms(ggml_backend_t cpu, enum ggml_type wtype, int64_t 
             a = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, sh.K, M);
             g.inputs.push_back(a);
         }
-        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, wtype, sh.K, sh.N);
+        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, sh.wtype == GGML_TYPE_COUNT ? wtype : sh.wtype, sh.K, sh.N);
         g.inputs.push_back(w);
         ggml_tensor * out = ggml_mul_mat(g.ctx, w, a);
         ggml_set_name(out, (std::string("K") + std::to_string(sh.K) + " N" + std::to_string(sh.N)).c_str());
@@ -748,8 +754,9 @@ static bool test_ffn(ggml_backend_t npu, ggml_backend_t cpu, ggml_glu_op op, boo
     return passed;
 }
 
-// x (K x M) through Q8_0 projections of `ns[i]` rows each, then a tensor to guard
-static norm_graph build_group(ggml_backend_t be, const std::vector<int64_t> & ns, int64_t M, ggml_tensor ** guard) {
+// x (K x M) through `wtype` projections of `ns[i]` rows each, then a tensor to guard
+static norm_graph build_group(ggml_backend_t be, const std::vector<int64_t> & ns, int64_t M, ggml_tensor ** guard,
+                              enum ggml_type wtype = GGML_TYPE_Q8_0) {
     const int64_t K = 512;
     norm_graph    g;
     ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
@@ -758,7 +765,7 @@ static norm_graph build_group(ggml_backend_t be, const std::vector<int64_t> & ns
     g.inputs            = { x };
     std::vector<ggml_tensor *> mm;
     for (int64_t n : ns) {
-        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, K, n);
+        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, wtype, K, n);
         g.inputs.push_back(w);
         mm.push_back(ggml_mul_mat(g.ctx, w, x));
     }
@@ -772,11 +779,12 @@ static norm_graph build_group(ggml_backend_t be, const std::vector<int64_t> & ns
     return g;
 }
 
-static bool test_group(ggml_backend_t npu, ggml_backend_t cpu, const std::vector<int64_t> & ns, int64_t M, double tol) {
+static bool test_group(ggml_backend_t npu, ggml_backend_t cpu, const std::vector<int64_t> & ns, int64_t M, double tol,
+                       enum ggml_type wtype = GGML_TYPE_Q8_0) {
     ggml_tensor *                   cpu_guard = nullptr;
     ggml_tensor *                   npu_guard = nullptr;
-    norm_graph                      want_g    = build_group(cpu, ns, M, &cpu_guard);
-    norm_graph                      got_g     = build_group(npu, ns, M, &npu_guard);
+    norm_graph                      want_g    = build_group(cpu, ns, M, &cpu_guard, wtype);
+    norm_graph                      got_g     = build_group(npu, ns, M, &npu_guard, wtype);
     std::vector<std::vector<float>> want, got;
     std::vector<float>              pattern(ggml_nelements(npu_guard), 3.0f);
     bool                            ok = run(want_g, cpu, want);
@@ -792,13 +800,54 @@ static bool test_group(ggml_backend_t npu, ggml_backend_t cpu, const std::vector
     }
     const bool intact = after == pattern;
     const bool passed = ok && intact && worst < tol;
-    std::printf("MUL_MAT group of %zu, M %-4lld guard %s, worst nmse %.3g %s\n", ns.size(), (long long) M,
-                intact ? "intact" : "OVERWRITTEN", ok ? worst : INFINITY, passed ? "ok" : "FAIL");
+    std::printf("MUL_MAT %-4s group of %zu, M %-4lld guard %s, worst nmse %.3g %s\n", ggml_type_name(wtype), ns.size(),
+                (long long) M, intact ? "intact" : "OVERWRITTEN", ok ? worst : INFINITY, passed ? "ok" : "FAIL");
     ggml_backend_buffer_free(want_g.buf);
     ggml_backend_buffer_free(got_g.buf);
     ggml_free(want_g.ctx);
     ggml_free(got_g.ctx);
     return passed;
+}
+
+typedef int (*gemm_count_fn)(void);
+
+// The outputs of a group of bf16 projections with the group on and off (GGML_XDNA_GEMM_GROUP=0):
+// each column of C depends on its own weights and the activation only, so the two are the same bits,
+// and a slice put in the wrong node or at the wrong column shows. The group is one bf16 GEMM call,
+// one by one is a call each.
+static bool test_group_matches_one_by_one(ggml_backend_t npu, const std::vector<int64_t> & ns, int64_t M) {
+    auto calls = (gemm_count_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_gemm_count");
+    if (!calls) {
+        std::printf("test-xdna-graph: the backend has no GEMM call count\n");
+        return false;
+    }
+    ggml_tensor *                   guard_a = nullptr;
+    ggml_tensor *                   guard_b = nullptr;
+    norm_graph                      grouped = build_group(npu, ns, M, &guard_a, GGML_TYPE_BF16);
+    norm_graph                      single  = build_group(npu, ns, M, &guard_b, GGML_TYPE_BF16);
+    set_inputs(grouped, 1234);
+    set_inputs(single, 1234);
+    setenv("GGML_XDNA_GEMM_GROUP", "1", 1);
+    const int before = calls();
+    bool      ok     = ggml_backend_graph_compute(npu, grouped.gf) == GGML_STATUS_SUCCESS;
+    const int group  = calls() - before;
+    setenv("GGML_XDNA_GEMM_GROUP", "0", 1);
+    ok               = ok && ggml_backend_graph_compute(npu, single.gf) == GGML_STATUS_SUCCESS;
+    const int alone  = calls() - before - group;
+    unsetenv("GGML_XDNA_GEMM_GROUP");
+    bool same = ok;
+    for (size_t i = 0; ok && i < grouped.checked.size(); i++) {
+        same = same && get_f32(grouped.checked[i]) == get_f32(single.checked[i]);
+    }
+    const bool runs = group == 1 && alone == (int) ns.size();
+    std::printf("MUL_MAT BF16 group of %zu, M %-4lld one by one: %s, GEMM calls %d and %d %s\n", ns.size(),
+                (long long) M, same ? "bit-identical" : "DIFFERENT", group, alone, same && runs ? "ok" : "FAIL");
+    ggml_backend_buffer_free(grouped.buf);
+    ggml_backend_buffer_free(single.buf);
+    ggml_free(grouped.ctx);
+    ggml_free(single.ctx);
+    return same && runs;
 }
 
 // x (K x M) through Q8_0 projections of `ns[i]` rows each, an RMS_NORM after every one and the
@@ -818,14 +867,14 @@ struct ordered_graph {
 };
 
 // the second projection's weight: a view of a larger tensor, a node of its own
-static ggml_tensor * weight_view(ordered_graph & g, int64_t K, int64_t n) {
-    ggml_tensor * full = ggml_new_tensor_2d(g.leaf, GGML_TYPE_Q8_0, K, n + 128);
+static ggml_tensor * weight_view(ordered_graph & g, int64_t K, int64_t n, enum ggml_type wtype) {
+    ggml_tensor * full = ggml_new_tensor_2d(g.leaf, wtype, K, n + 128);
     g.inputs.inputs.push_back(full);
     return ggml_view_2d(g.ops, full, K, n, full->nb[1], 0);
 }
 
 static ordered_graph build_ordered(ggml_backend_t leaf_be, ggml_backend_t ops_be, const std::vector<int64_t> & ns,
-                                   int64_t M, between what) {
+                                   int64_t M, between what, enum ggml_type wtype) {
     const int64_t K = 512;
     ordered_graph g;
     ggml_init_params lp = { ggml_tensor_overhead() * 8, nullptr, true };
@@ -838,9 +887,9 @@ static ordered_graph build_ordered(ggml_backend_t leaf_be, ggml_backend_t ops_be
     for (size_t i = 0; i < ns.size(); i++) {
         ggml_tensor * w = nullptr;
         if (i == 1 && what == between::weight_view) {
-            w = weight_view(g, K, ns[i]);
+            w = weight_view(g, K, ns[i], wtype);
         } else {
-            w = ggml_new_tensor_2d(g.leaf, GGML_TYPE_Q8_0, K, ns[i]);
+            w = ggml_new_tensor_2d(g.leaf, wtype, K, ns[i]);
             g.inputs.inputs.push_back(w);
         }
         ggml_tensor * mm = ggml_mul_mat(g.ops, w, x);
@@ -896,11 +945,12 @@ static bool projections_adjacent(const ordered_graph & g) {
 // first and second projection; `group_on` false (GGML_XDNA_PGEMM_GROUP=0) leaves the order as
 // the graph was expanded.
 static bool test_group_order(ggml_backend_t npu, ggml_backend_t cpu, between what, bool group_on, int64_t M,
-                             double tol) {
-    setenv("GGML_XDNA_PGEMM_GROUP", group_on ? "1" : "0", 1);
+                             double tol, enum ggml_type wtype = GGML_TYPE_Q8_0) {
+    const char * group_env = wtype == GGML_TYPE_BF16 ? "GGML_XDNA_GEMM_GROUP" : "GGML_XDNA_PGEMM_GROUP";
+    setenv(group_env, group_on ? "1" : "0", 1);
     const std::vector<int64_t> ns = { 1024, 512, 512 };
-    ordered_graph              want_g = build_ordered(cpu, cpu, ns, M, what);
-    ordered_graph              got_g  = build_ordered(npu, nullptr, ns, M, what);
+    ordered_graph              want_g = build_ordered(cpu, cpu, ns, M, what, wtype);
+    ordered_graph              got_g  = build_ordered(npu, nullptr, ns, M, what, wtype);
     set_inputs(want_g.inputs, 1234);
     set_inputs(got_g.inputs, 1234);
     bool ok = ggml_backend_graph_compute(cpu, want_g.gf) == GGML_STATUS_SUCCESS;
@@ -912,13 +962,13 @@ static bool test_group_order(ggml_backend_t npu, ggml_backend_t cpu, between wha
     const double e      = ok ? nmse(get_f32(want_g.out), get_f32(got_g.out)) : INFINITY;
     const bool   passed = ok && moved == (group_on && what == between::nothing) && e < tol;
     const char * names[] = { "norms", "a writer of the activation", "a weight computed after Q" };
-    std::printf("MUL_MAT Q K V behind %-27s M %-4lld GROUP=%d: projections %s, nmse %.3g %s\n",
-                names[(int) what], (long long) M, group_on ? 1 : 0, moved ? "moved together" : "left apart", e,
-                passed ? "ok" : "FAIL");
+    std::printf("MUL_MAT %-4s Q K V behind %-27s M %-4lld GROUP=%d: projections %s, nmse %.3g %s\n",
+                ggml_type_name(wtype), names[(int) what], (long long) M, group_on ? 1 : 0,
+                moved ? "moved together" : "left apart", e, passed ? "ok" : "FAIL");
     ggml_backend_sched_free(sched);
     free_ordered(want_g);
     free_ordered(got_g);
-    unsetenv("GGML_XDNA_PGEMM_GROUP");
+    unsetenv(group_env);
     return passed;
 }
 
@@ -1152,6 +1202,16 @@ int main(void) {
         { "short tail",       GGML_TYPE_BF16, 1100, { { 512, 512 }, { 1024, 512 } } },
         { "mixed K and N",    GGML_TYPE_BF16, 912, { { 512, 1024 }, { 1024, 512 }, { 2048, 512 }, { 576, 1024 }, { 512, 512 } } },
         { "f16 weights",      GGML_TYPE_F16,  130, { { 1536, 512 }, { 512, 2048 } } },
+        // a bf16 projection between pgemm ones pays two context switches: the host does a small one
+        // (EmbeddingGemma 2's per_layer_model_proj), the array a large one, and between bf16 ones no switch is paid
+        { "among pgemm, small", GGML_TYPE_BF16, 15,
+          { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_HOST }, { 512, 1024, GGML_TYPE_Q4_K } } },
+        { "among pgemm, mid",   GGML_TYPE_BF16, 132,
+          { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_HOST }, { 512, 1024, GGML_TYPE_Q4_K } } },
+        { "among pgemm, large", GGML_TYPE_BF16, 2560,
+          { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_ARRAY }, { 512, 1024, GGML_TYPE_Q4_K } } },
+        { "among bf16",         GGML_TYPE_BF16, 15,
+          { { 512, 1024 }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_ARRAY }, { 512, 1024 } } },
     };
     for (const gemm_case & c : gemm_cases) {
         norm_graph                      g = build_gemms(cpu, c.wtype, c.M, c.shapes);
@@ -1161,10 +1221,12 @@ int main(void) {
             return 1;
         }
         for (size_t i = 0; i < g.checked.size(); i++) {
-            const double e  = nmse(want[i], got[i]);
-            const bool   ok = e < tol;
-            passed          = passed && ok;
-            std::printf("MUL_MAT %-4s M%-4lld %-14s %-12s nmse %.3g %s\n", ggml_type_name(c.wtype), (long long) c.M, c.name,
+            const double e     = nmse(want[i], got[i]);
+            const bool   exact = e == 0.0;
+            const gemm_route route = c.shapes[i].route;
+            const bool   ok    = e < tol && (route != GEMM_ROUTE_HOST || exact) && (route != GEMM_ROUTE_ARRAY || !exact);
+            passed             = passed && ok;
+            std::printf("MUL_MAT %-4s M%-4lld %-20s %-12s nmse %.3g %s\n", ggml_type_name(c.wtype), (long long) c.M, c.name,
                         ggml_get_name(g.checked[i]), e, ok ? "ok" : "FAIL");
         }
         ggml_backend_buffer_free(g.buf);
@@ -1194,6 +1256,22 @@ int main(void) {
     }
     for (between what : { between::writer, between::weight_view }) {
         passed = test_group_order(npu, cpu, what, true, 200, tol) && passed;
+    }
+
+    // a layer's Q, K and V (the narrow ones of a local layer and the wide Q of a global one) and its up and
+    // gate on the bf16 GEMM, from a decode-sized batch to two blocks
+    const std::vector<std::vector<int64_t>> bf16_groups = { { 1024, 512, 512 }, { 2048, 512, 512 }, { 2048, 2048 } };
+    for (const std::vector<int64_t> & ns : bf16_groups) {
+        for (int64_t M : { 15, 200, 912 }) {
+            passed = test_group(npu, cpu, ns, M, tol, GGML_TYPE_BF16) && passed;
+            passed = test_group_matches_one_by_one(npu, ns, M) && passed;
+        }
+    }
+    for (bool group_on : { true, false }) {
+        passed = test_group_order(npu, cpu, between::nothing, group_on, 200, tol, GGML_TYPE_BF16) && passed;
+    }
+    for (between what : { between::writer, between::weight_view }) {
+        passed = test_group_order(npu, cpu, what, true, 200, tol, GGML_TYPE_BF16) && passed;
     }
 
     for (ggml_glu_op op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
