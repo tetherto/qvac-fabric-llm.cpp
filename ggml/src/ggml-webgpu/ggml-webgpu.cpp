@@ -4850,6 +4850,15 @@ static const struct ggml_backend_reg_i ggml_backend_webgpu_reg_i = {
 
 /* End GGML Backend Registration Interface */
 
+// Dawn's Null backend accepts every feature and executes nothing, so a host
+// without a usable GPU would otherwise "run" inference on it and return
+// garbage instead of falling back to the CPU backend.
+static bool ggml_webgpu_adapter_is_null_backend(const wgpu::Adapter & adapter) {
+    wgpu::AdapterInfo info;
+    adapter.GetInfo(&info);
+    return info.backendType == wgpu::BackendType::Null;
+}
+
 ggml_backend_reg_t ggml_backend_webgpu_reg() {
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_reg()");
 
@@ -4898,6 +4907,8 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
     // WebGPU backend requires f16 support and, on native, implicit device synchronization.
     if (adapter == nullptr) {
         GGML_LOG_WARN("ggml_webgpu: no adapter available, backend disabled\n");
+    } else if (ggml_webgpu_adapter_is_null_backend(adapter)) {
+        GGML_LOG_WARN("ggml_webgpu: only Dawn's Null adapter is available (no usable GPU), backend disabled\n");
     } else if (!adapter.HasFeature(wgpu::FeatureName::ShaderF16)) {
         GGML_LOG_WARN("ggml_webgpu: adapter lacks shader-f16, backend disabled\n");
 #ifdef __EMSCRIPTEN__
