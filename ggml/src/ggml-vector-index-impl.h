@@ -40,6 +40,15 @@
 #define GGML_VEC_INDEX_USE_NEON 0
 #endif
 
+// SSE2 is the x86-64 baseline, so the table quantisation below needs no
+// dispatch.
+#if !GGML_VEC_INDEX_USE_NEON && (defined(__SSE2__) || defined(_M_X64))
+#define GGML_VEC_INDEX_USE_SSE2 1
+#include <emmintrin.h>
+#else
+#define GGML_VEC_INDEX_USE_SSE2 0
+#endif
+
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/file.h>
@@ -246,14 +255,12 @@ inline constexpr int kTurboVecFlushEvery = 256;
 // and vectorises. Below 2^23 the integer conversion is the exact
 // truncation and the fraction is exact in f32; at or above it, and for
 // NaN, a float is already its own rounding. Written as two selects rather
-// than an early return so the table builds' loops vectorise with SSE2
-// (cvttps2dq, cmpps, and the comparisons added as integers): an early
-// return kept them scalar, at about 2 ns an entry on x86 for the 4096
-// sign-table entries and 8192 exact-table entries at dim 1024. Checked
-// against the earlier form and std::round over every float: only the sign
-// of a zero result can differ from std::round, which the callers' max(0,
-// ..) or integer cast erases. The cast's operand is zeroed where it would
-// be out of range, so it is always defined.
+// than an early return, which is the form quantise_table16 below spells
+// out in SSE2 for the table builds; the scalar form serves the per-weight
+// callers. Checked against the earlier form and std::round over every
+// float: only the sign of a zero result can differ from std::round, which
+// the callers' max(0, ..) or integer cast erases. The cast's operand is
+// zeroed where it would be out of range, so it is always defined.
 inline float round_half_away_f32(float x) {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return std::round(x);
@@ -264,6 +271,53 @@ inline float round_half_away_f32(float x) {
     const float f = c - t;
     const float r = t + static_cast<float>(static_cast<int>(f >= 0.5f) - static_cast<int>(f <= -0.5f));
     return small ? r : x;
+#endif
+}
+
+// Sixteen table entries that share one minimum, quantised to u8 (upstream
+// quantise_tables): round_half_away_f32((in[i] - mn) * inv_scale) clamped
+// to [0, max_lut], max_lut at most 255. On x86 the loop is spelled out in
+// SSE2, operation for operation the scalar form above (subps, mulps,
+// andps for fabs, cmpps, cvttps2dq, cvtdq2ps, the two compare masks added
+// as integers, the selects as masks), because GCC left the scalar loop
+// unvectorised on the x86 Ubuntu host where clang vectorised it, at about
+// 2 ns an entry over 4096 sign-table and 8192 exact-table entries at dim
+// 1024. minps(a, b) is a < b ? a : b and maxps(a, b) is a > b ? a : b,
+// NaN and signed zeros included, which are std::min(max_lut, v) and
+// std::max(0.0f, v) exactly; the clamped value is an integer in [0, 255],
+// so the packs to bytes never saturate. aarch64 keeps the scalar loop,
+// which its compiler vectorises around frinta.
+inline void quantise_table16(const float * in, float mn, float inv_scale, float max_lut, uint8_t * out) {
+#if GGML_VEC_INDEX_USE_SSE2
+    const __m128  mn_v     = _mm_set1_ps(mn);
+    const __m128  inv_v    = _mm_set1_ps(inv_scale);
+    const __m128  max_v    = _mm_set1_ps(max_lut);
+    const __m128  zero     = _mm_setzero_ps();
+    const __m128  abs_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7fffffff));
+    const __m128  limit    = _mm_set1_ps(8388608.0f);
+    const __m128  half     = _mm_set1_ps(0.5f);
+    const __m128  neg_half = _mm_set1_ps(-0.5f);
+    __m128i q[4];
+    for (int j = 0; j < 4; ++j) {
+        const __m128 x = _mm_mul_ps(_mm_sub_ps(_mm_loadu_ps(in + 4 * j), mn_v), inv_v);
+        const __m128 small = _mm_cmplt_ps(_mm_and_ps(x, abs_mask), limit);
+        const __m128 c = _mm_and_ps(x, small);
+        const __m128 t = _mm_cvtepi32_ps(_mm_cvttps_epi32(c));
+        const __m128 f = _mm_sub_ps(c, t);
+        // A compare mask is 0 or -1, so (f <= -0.5) - (f >= 0.5) is the
+        // scalar's (f >= 0.5) - (f <= -0.5).
+        const __m128i adj =
+            _mm_sub_epi32(_mm_castps_si128(_mm_cmple_ps(f, neg_half)), _mm_castps_si128(_mm_cmpge_ps(f, half)));
+        const __m128 r = _mm_add_ps(t, _mm_cvtepi32_ps(adj));
+        const __m128 rounded = _mm_or_ps(_mm_and_ps(small, r), _mm_andnot_ps(small, x));
+        q[j] = _mm_cvttps_epi32(_mm_max_ps(_mm_min_ps(rounded, max_v), zero));
+    }
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(out),
+        _mm_packus_epi16(_mm_packs_epi32(q[0], q[1]), _mm_packs_epi32(q[2], q[3])));
+#else
+    for (size_t i = 0; i < 16; ++i) {
+        out[i] = static_cast<uint8_t>(std::max(0.0f, std::min(max_lut, round_half_away_f32((in[i] - mn) * inv_scale))));
+    }
 #endif
 }
 
