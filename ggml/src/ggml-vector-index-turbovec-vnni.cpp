@@ -2,9 +2,16 @@
 // kernels over upstream's vector-major layout, ported from upstream turbovec
 // 1.1.2 search.rs. Built with AVX-512 F, BW, VBMI and VNNI enabled and
 // called only after a runtime check for all four (turbovec_cpu_dot_product).
-// Every kernel returns exact integer sums, equal to its scalar model's in
-// ggml-vector-index-turbovec.cpp whatever the order of accumulation; the
-// float epilogue is shared with that model.
+// The sum kernels return exact integer sums, equal to their scalar model's
+// in ggml-vector-index-turbovec.cpp whatever the order of accumulation, and
+// leave the float epilogue to that model. The fused scans
+// (turbovec_vnni_lut_scan_blk2, turbovec_vnni_lut_scan_batch) finish the
+// epilogue in registers with vnni_lut_finish's roundings and run the
+// staged collector's seed, threshold and floor tests themselves.
+//
+// Like every ISA object here it must not instantiate a shared inline
+// function (std::numeric_limits, std::atomic's members, <algorithm>): the
+// linker may keep this object's AVX-512 copy for baseline callers.
 
 #include "ggml-vector-index-x86.h"
 #include "ggml-vector-index-turbovec-pd-x86.h"
@@ -13,13 +20,44 @@
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h>
-#include <limits>
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
 
 namespace ggml_vec_index_detail {
 
 namespace {
 
 constexpr size_t kBlock = 32;
+
+float neg_inf_f32() {
+    const uint32_t bits = 0xff800000u;
+    float v = 0.0f;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+double neg_inf_f64() {
+    const uint64_t bits = 0xfff0000000000000ull;
+    double v = 0.0;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+// A relaxed load of the shared floor, the same builtin each standard
+// library's std::atomic<double>::load uses, without instantiating it. The
+// staged search asserts that the atomic is a bare double.
+double load_floor_relaxed(const std::atomic<double> * floor) {
+    const double * p = reinterpret_cast<const double *>(floor);
+    double v = 0.0;
+#if defined(_MSC_VER) && !defined(__clang__)
+    const long long bits = __iso_volatile_load64(reinterpret_cast<const volatile long long *>(p));
+    std::memcpy(&v, &bits, sizeof(v));
+#else
+    __atomic_load(p, &v, __ATOMIC_RELAXED);
+#endif
+    return v;
+}
 
 // Upstream `search_multi_query_vnni::<PF, NQ>`: per four byte groups,
 // `vpermb` picks each byte's entry from the four groups' 16-entry tables
@@ -162,7 +200,7 @@ inline void vnni_fused_block(
     const uint32_t valid_mask = valid >= 32 ? 0xffffffffu : (1u << valid) - 1u;
     const __mmask16 v0 = static_cast<__mmask16>(valid_mask);
     const __mmask16 v1 = static_cast<__mmask16>(valid_mask >> 16);
-    const __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+    const __m512 neg_inf = _mm512_set1_ps(neg_inf_f32());
     const __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[0]), vs), vb);
     const __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[1]), vs), vb);
     const __m512 s0 = _mm512_mask_mul_ps(neg_inf, v0, f0, _mm512_maskz_loadu_ps(v0, vector_scales + base));
@@ -173,9 +211,9 @@ inline void vnni_fused_block(
             (static_cast<uint32_t>(_mm512_cmp_ps_mask(s1, seed, _CMP_GT_OQ)) << 16);
         above_seed += static_cast<size_t>(_mm_popcnt_u32(above));
     }
-    double floor = -std::numeric_limits<double>::infinity();
+    double floor = neg_inf_f64();
     if (state.floor_score != nullptr) {
-        floor = state.floor_score->load(std::memory_order_relaxed);
+        floor = load_floor_relaxed(state.floor_score);
         const uint32_t unord = static_cast<uint32_t>(_mm512_cmp_ps_mask(s0, s0, _CMP_UNORD_Q)) |
             (static_cast<uint32_t>(_mm512_cmp_ps_mask(s1, s1, _CMP_UNORD_Q)) << 16);
         if (unord == 0) {
