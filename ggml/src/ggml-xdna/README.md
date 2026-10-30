@@ -37,6 +37,14 @@ whole number of them ends in a run zero-padded out to 512. A block of A rows
 runs only the sweeps its rows fill (`tile_m` rows on each of the four compute
 rows); each sweep reads the weights from DDR once.
 
+The array's writes to C are not cache coherent, so the host marks the rows a
+run will write with a pattern before the submit and reads a row chunk only once
+the pattern is gone. The array has been seen, intermittently, to leave the
+first 64 bytes of a block's C unwritten (the first run of a kernel with a
+second command queued behind it; a re-run writes the block in full). The run is
+then started again, up to twice, and only the chunks that did not land are
+read; each event logs a warning. A block still marked after that fails the op.
+
 ### The fused decode recurrent layer
 
 The default decode path (`GGML_XDNA_FUSED_LAYER=0` disables it). One design,
