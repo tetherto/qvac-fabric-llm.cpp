@@ -1220,6 +1220,10 @@ struct Collector {
     // range may drop a row that scores strictly less (a tie may still win
     // on its slot). Null for a lone range.
     std::atomic<double> * floor_score = nullptr;
+    // The VNNI fused scan reads the floor as a bare double (vnni.cpp
+    // load_floor_relaxed), so it needs the atomic to be one.
+    static_assert(sizeof(std::atomic<double>) == sizeof(double) && std::atomic<double>::is_always_lock_free,
+        "std::atomic<double> must be a lock-free bare double");
 
     void start(size_t s_len_, float seed_, size_t reserve, std::atomic<double> * floor) {
         top.clear();
