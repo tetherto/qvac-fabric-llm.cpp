@@ -147,6 +147,11 @@ struct xdna_ops {
 
     std::vector<gemv_group>                             gemv_groups;
     std::unordered_map<const struct ggml_tensor *, int> gemv_group_of;
+
+    // Projections of the bf16 GEMM that the host runs in this graph, because
+    // the host is quicker than the array plus the hardware-context switches
+    // into and out of the bf16 design (xdna_ops_plan_gemm).
+    std::unordered_set<const struct ggml_tensor *> gemm_host;
 };
 
 // Find the projections of `cgraph` that share an activation and record them as
@@ -157,6 +162,12 @@ struct xdna_ops {
 void xdna_ops_plan_gemv(xdna_ops *                                             ops,
                         const struct ggml_cgraph *                             cgraph,
                         const std::unordered_set<const struct ggml_tensor *> * skip);
+
+// Decide which bf16-GEMM projections of `cgraph` run on the host. A projection
+// between commands of another design (the pgemm ones) pays a hardware-context
+// switch in and another out, and below a size the host does it in less than
+// that. Call once per prefill graph, after xdna_ops_plan_gemv.
+void xdna_ops_plan_gemm(xdna_ops * ops, const struct ggml_cgraph * cgraph);
 
 // Discover the GEMM xclbin and set up the fixed geometry.
 void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool);
