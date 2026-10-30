@@ -82,7 +82,7 @@ path for a model the fused design does cover.
 | `SSM_CONV`, from 64 tokens | `kernels/conv.py` | opt-in, `GGML_XDNA_CONV=1`; the host is cheaper and is what runs otherwise |
 | the prefill GDN's conv input | `kernels/gdn_conv.py` | opt-in, `GGML_XDNA_GDN_CONV=1`; the host is faster (pp512 1900 against 1680 t/s on the 0.8B) and is what runs otherwise |
 | `GATED_DELTA_NET`, from 144 tokens a sequence | `kernels/gdn_mm.py` | on, `GGML_XDNA_GDN_MM=0` for the host; below 144 the host is quicker at less energy a token |
-| `FLASH_ATTN_EXT` of 2 KV heads and D = 256, from 64M visible (query, key, head) triples a call | `kernels/attn_mm.py` | on, `GGML_XDNA_FA_MM=0` for the host, `=2` for the array whatever the size; below that the host kernel is quicker: a call pays two hardware-context switches (~5 ms) |
+| `FLASH_ATTN_EXT` of 2 KV heads and D = 256, from 64M visible (query, key, head) triples a call (8M where ggml-cpu's op would run it) | `kernels/attn_mm.py` | on, `GGML_XDNA_FA_MM=0` for the host, `=2` for the array whatever the size; below that the host is quicker: a call pays two hardware-context switches (~5 ms) |
 
 ### Everything else
 
@@ -137,15 +137,20 @@ Q8_0 and BF16 files) runs without a model-specific path:
   (`xdna-host-attn.cpp`, `GGML_XDNA_HOST_FA=0` for ggml-cpu's op): AVX-512
   tiles of f32 FMAs over f16 K and V, which read each row's visible keys off the
   mask, so the window of a sliding layer and the packed sequences cost only the
-  keys they show. Its results match ggml-cpu's to an NMSE of ~1e-13. At 912
-  tokens a sliding-window layer takes ~1.0 ms and a full-attention layer
-  (heads of 512, one KV head) ~2.2 ms, against ggml-cpu's 2.4 and 4.9 ms.
+  keys they show. Its results match ggml-cpu's to an NMSE of 5e-14 to 1.6e-12
+  from 64 queries up and to ~1e-6 below (where ggml-cpu's own f16 path is the
+  inexact one). It takes 8 queries and up; a CPU without AVX-512 keeps
+  ggml-cpu's op. At 912 tokens a sliding-window layer takes ~1.0 ms and a
+  full-attention layer (heads of 512, one KV head) ~2.2 ms, against
+  ggml-cpu's 2.4 and 4.9 ms.
   The array's prefill attention kernel (4 query heads over 2 KV heads of 256,
   a window and the packed sequence, scale 1) takes a call once it is large
   enough to repay its two hardware-context switches (~5 ms, the projections
   around it are another xclbin): from 64M visible (query, key, head) triples,
   which is a Qwen3.5-0.8B prefill at a depth of ~16k tokens or an
-  EmbeddingGemma 2 input of ~16k tokens (see `GGML_XDNA_FA_MM`).
+  EmbeddingGemma 2 input of ~16k tokens; from 8M where ggml-cpu's op would run
+  the node instead (see `GGML_XDNA_FA_MM`). It reads the mask of a graph input
+  only: an attention whose mask the graph computes runs on the host.
 - An input of one token runs whole on the host, as the decode of a model
   wider or narrower than the fused layers does. The model's residual width is
   512, not 1024, so the backend logs once that "its decode runs on the host",
