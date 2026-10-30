@@ -5368,6 +5368,12 @@ static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const c
     if (std::strcmp(name, "ggml_backend_xdna_device_ready") == 0) {
         return (void *) ggml_backend_xdna_device_ready;
     }
+    if (std::strcmp(name, "ggml_backend_xdna_test_lose_c_lines") == 0) {
+        return (void *) xdna_ops_test_lose_c_lines;
+    }
+    if (std::strcmp(name, "ggml_backend_xdna_test_rerun_count") == 0) {
+        return (void *) xdna_ops_test_rerun_count;
+    }
     if (std::strcmp(name, "ggml_backend_xdna_test_gemm_count") == 0) {
         return (void *) xdna_ops_test_gemm_count;
     }

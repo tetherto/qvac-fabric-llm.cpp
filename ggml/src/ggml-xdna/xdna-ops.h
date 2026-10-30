@@ -102,6 +102,8 @@ struct xdna_ops {
         xrt::run      run;
         xdna_buffer * bo_c       = nullptr;  // held until readback
         xdna_buffer * bo_a       = nullptr;  // released after readback
+        xdna_buffer * bo_w       = nullptr;  // the packed weights, for a re-run
+        xdna_kernel * kern       = nullptr;  // the run's kernel, for a re-run
         int           mb_idx     = 0;        // index into pending_op::m_blocks
         bool          accumulate = false;    // adds to dst: not the op's first K run
     };
@@ -217,6 +219,8 @@ bool xdna_ops_compute(xdna_ops * ops, struct ggml_tensor * node);
 // and release buffers. Safe to call when nothing is pending.
 bool xdna_ops_finalize(xdna_ops * ops);
 
-// Test hook, reached through the registry's proc address: the bf16 GEMM calls so far, one a group or a lone
-// projection.
-int xdna_ops_test_gemm_count(void);
+// Test hooks, reached through the registry's proc addresses: the next `blocks` folded bf16 GEMM blocks have their first C
+// line poisoned again `times` times each, as a write that did not land would leave it; the re-runs so far.
+void xdna_ops_test_lose_c_lines(int blocks, int times);
+int  xdna_ops_test_rerun_count(void);
+int  xdna_ops_test_gemm_count(void);

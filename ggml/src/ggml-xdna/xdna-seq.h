@@ -273,8 +273,14 @@ bool xdna_gemm_seq_supported(const xdna_gemm_tiles * tiles, int M, int K, int N)
 // `tiles`. Buffer layout (row-major): arg 0 = A [M x K] bf16, arg 1 = B
 // [K x N] bf16, arg 2 = C [M x N] f32. M must equal the baked block.
 // `b_offset` (bytes) shifts the B base address, so a K-block can point into a
-// persistent full-weight buffer.
-bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * tiles, int M, int K, int N, uint32_t b_offset = 0);
+// persistent full-weight buffer; `c_offset` does the same for C.
+bool xdna_gemm_seq_build(xdna_seq *             seq,
+                         const xdna_gemm_tiles * tiles,
+                         int                     M,
+                         int                     K,
+                         int                     N,
+                         uint32_t                b_offset = 0,
+                         uint32_t                c_offset = 0);
 
 // Geometry of the merged conv+norm+gdn decode kernel (fused_layer.xclbin,
 // kernels/fused_layer.py). The worker layout is the rec_full design: conv on
