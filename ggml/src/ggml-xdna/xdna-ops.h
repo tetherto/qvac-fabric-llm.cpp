@@ -54,13 +54,16 @@ struct xdna_ops {
     // transposed [K_pad x N] bf16 weights (K_pad = K rounded up to a whole
     // number of GEMM_K_RUN runs). Weights are immutable, so the pack
     // (transpose + bf16 conversion) is done once per tensor and reused;
-    // kernels point into it via B offsets.
+    // kernels point into it via B offsets. Projections run as one GEMM are
+    // packed side by side along N; `tag` tells their set from the first
+    // weight's alone (0 for one weight).
     struct weight_key {
         const void * data = nullptr;
         int          K    = 0;
         int          N    = 0;
+        size_t       tag  = 0;
 
-        bool operator==(const weight_key & o) const { return data == o.data && K == o.K && N == o.N; }
+        bool operator==(const weight_key & o) const { return data == o.data && K == o.K && N == o.N && tag == o.tag; }
     };
 
     struct weight_hash {
@@ -68,6 +71,7 @@ struct xdna_ops {
             size_t h = std::hash<const void *>{}(k.data);
             h        = h * 31 + (size_t) k.K;
             h        = h * 31 + (size_t) k.N;
+            h        = h * 31 + k.tag;
             return h;
         }
     };
@@ -105,8 +109,15 @@ struct xdna_ops {
         std::vector<pending_run> runs;    // one per K run
     };
 
+    // Columns [n0, n0 + n) of an op's C are the rows of node's output
+    struct pending_out {
+        struct ggml_tensor * node = nullptr;
+        int                  n0   = 0;
+        int                  n    = 0;
+    };
+
     struct pending_op {
-        struct ggml_tensor *         node  = nullptr;
+        std::vector<pending_out>     outs;       // one per projection of the op
         int                          Mk    = 0;  // M block of the geometry used (32 or 64)
         int                          m_off = 0;  // first row of the range in the op
         int                          M     = 0;  // total rows of the op
@@ -180,6 +191,16 @@ void xdna_ops_release_weights(xdna_ops * ops);
 
 // True when `op` can be run on the NPU. Dispatches per-op (only GEMM so far).
 bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op);
+
+// True when `mm` (n >= 2 projections) can run as one bf16 GEMM: they read one
+// activation, every one is on the bf16 route, and their columns together fit
+// the GEMM. Their weights are packed side by side, and each output goes to its
+// own node.
+bool xdna_ops_gemm_group_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n);
+
+// Submit the projections of a supported group as one GEMM; xdna_ops_finalize
+// writes every output. False on failure, with nothing pending.
+bool xdna_ops_compute_group(xdna_ops * ops, struct ggml_tensor * const * mm, int n);
 
 // Execute `node` on the NPU. Dispatches per-op; returns false on failure.
 // With batching this only submits (starts) the kernels; call xdna_ops_finalize

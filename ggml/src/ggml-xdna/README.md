@@ -133,6 +133,13 @@ Q8_0 and BF16 files) runs without a model-specific path:
   group up behind the first, before the scheduler allocates the graph; no model
   orders its graph for it. All but the last end on a whole 512 columns and
   every node must lie in one of the backend's buffers.
+- The bf16 GEMM takes a layer's Q, K and V, and its gate and up, the same way
+  (`GGML_XDNA_GEMM_GROUP=0`: one GEMM each): the weights are packed side by side
+  along N and each output is a slice of the one C. A run of the array has a
+  fixed cost and the host pays one A layout and one pipeline fill and drain for
+  every GEMM, so at 912 tokens one of 2048 columns took 1.1 ms where the three
+  of 1024, 512 and 512 took 0.67, 0.5 and 0.5, and one of 4096 took 2.15 ms
+  where two of 2048 took 2.3.
 - A bf16 projection among pgemm commands (the Q8_0 file's
   `per_layer_model_proj`, K 512 and N 12288) costs the array two
   hardware-context switches on top of its own run. When the host's time for it
@@ -467,6 +474,7 @@ report, not for tuning: every one costs more time or energy than the default.
 | `GGML_XDNA_PGEMM_GLU_A` | the SwiGLU or GeGLU written into the down projection's A |
 | `GGML_XDNA_PGEMM_GROUP` | consecutive projections of one activation (Q, K and V) run as one GEMM, each output into its own node |
 | `GGML_XDNA_GEMM_HOST` | a bf16 projection among pgemm commands runs on the host when that is quicker than the array's run plus the two context switches |
+| `GGML_XDNA_GEMM_GROUP` | projections of one activation on the bf16 GEMM (Q, K and V; gate and up) run as one GEMM, each output into its own node |
 | `GGML_XDNA_GDN_MM` | the prefill gated delta rule on the array |
 | `GGML_XDNA_GDN_IN` | the prefill GDN's conv input, norms and state copy fed straight into the array |
 | `GGML_XDNA_FA_MM` | the prefill attention on the array: `0` the host, `2` the array whatever the size |
