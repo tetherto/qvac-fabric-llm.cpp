@@ -6,12 +6,32 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    8
+// qvac fork: downstream ggml_op insertions shift the serialized op ids
+// relative to upstream, so the wire format is incompatible with stock
+// llama.cpp peers even though the message framing is unchanged. Keep the
+// major version in the downstream namespace (>= 100), bumping it for
+// incompatible changes, so mismatched peers are rejected at the HELLO
+// handshake instead of misdecoding graphs. The
+// HELLO fields are uint8_t on the wire, so the value must stay <= 255.
+// upstream b11514 owns 8 (fork 108); the fork wire diverged at pick 300
+// (command queue, session ids, acks), so fork majors here run one ahead of
+// the b11259 fork:
+// 109 adds butterfly communicator rounds and round-tagged peer frames
+//     (b11259 fork: 108); 109.1 adds RPC_CMD_SET_TENSOR_2D_HASH.
+// 110 adds cache flags to SET_TENSOR and SET_TENSOR_2D (b11259 fork: 109).
+// 111 widens rpc_tensor::name with GGML_MAX_NAME 128 (temp-11018: 110).
+// 112 adds the speech ops to the ggml_op enum (temp-11018: 111).
+// 113 adds GATED_DELTA_NET_DEFERRED and GDN_CONV_DEFERRED to the ggml_op enum
+//     (temp-11259: 112).
+// A minor bump is additive: the client still accepts a server with an older
+// minor and must gate every command introduced by a later minor on the minor
+// the server announces at HELLO.
+#define RPC_PROTO_MAJOR_VERSION    113
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 127, "GGML_OP_COUNT has changed - update the RPC protocol version");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
@@ -27,8 +47,32 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, 
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
 
+// Managed server lifecycle for in-process hosts such as mobile Bare apps.
+// create() initializes devices and binds the listening socket synchronously;
+// run() blocks until stop() is requested and must be called from a worker
+// thread. The caller must wait for run() to return before calling free().
+// An endpoint with port 0 binds an ephemeral port; get_port() returns it.
+typedef struct ggml_backend_rpc_server * ggml_backend_rpc_server_t;
+GGML_BACKEND_API ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
+        const char * endpoint, const char * cache_dir,
+        size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+GGML_BACKEND_API void ggml_backend_rpc_server_run(ggml_backend_rpc_server_t server);
+GGML_BACKEND_API void ggml_backend_rpc_server_stop(ggml_backend_rpc_server_t server);
+GGML_BACKEND_API void ggml_backend_rpc_server_free(ggml_backend_rpc_server_t server);
+// Port the server is listening on (always > 0), or -1 when server is NULL.
+GGML_BACKEND_API int ggml_backend_rpc_server_get_port(ggml_backend_rpc_server_t server);
+
+// True when new connections will try RDMA: the RDMA library loaded, it lists an
+// RDMA device, and GGML_RPC_NO_RDMA is unset. Connections fall back to TCP when
+// the peer or the link cannot use it.
+GGML_BACKEND_API bool ggml_backend_rpc_rdma_supported(void);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
+
+// Connects to `endpoint` and caches the connection without registering it as a backend.
+// Different endpoints can connect concurrently; same-endpoint callers share one attempt.
+GGML_BACKEND_API bool ggml_backend_rpc_prefetch_connection(const char * endpoint);
 
 #ifdef  __cplusplus
 }

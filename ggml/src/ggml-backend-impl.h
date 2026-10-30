@@ -91,8 +91,16 @@ extern "C" {
     // buffer that contains a collection of buffers
     GGML_API ggml_backend_buffer_t ggml_backend_multi_buffer_alloc_buffer(ggml_backend_buffer_t * buffers, size_t n_buffers);
     GGML_API bool                  ggml_backend_buffer_is_multi_buffer(ggml_backend_buffer_t buffer);
+    GGML_API ggml_backend_buffer_t ggml_backend_multi_buffer_get_buffer(ggml_backend_buffer_t buffer, const void * addr);
     GGML_API void                  ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API void                  ggml_backend_meta_buffer_set_usage (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
+
+    // graph allocator internals
+    struct ggml_gallocr;
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((visibility("hidden")))
+#endif
+    bool ggml_gallocr_share_buffers(struct ggml_gallocr * dst, struct ggml_gallocr * src);
 
     //
     // Backend (meta)
@@ -224,6 +232,13 @@ extern "C" {
         void * context;
     };
 
+    // for ops that update a src in place: on a device that cannot use the buffer of that src, the scheduler gives the op a copy and the update is lost
+    static inline bool ggml_backend_dev_supports_inplace_src(ggml_backend_dev_t dev, const struct ggml_tensor * src) {
+        const struct ggml_tensor * t = src->view_src ? src->view_src : src;
+        // no buffer yet, e.g. in test-backend-ops
+        return t->buffer == NULL || dev->iface.supports_buft(dev, t->buffer->buft);
+    }
+
     //
     // Backend (reg)
     //
@@ -261,6 +276,7 @@ extern "C" {
             GGML_BACKEND_API ggml_backend_reg_t ggml_backend_init(void); \
             }                                                            \
             ggml_backend_reg_t ggml_backend_init(void) {                 \
+                ggml_time_init();                                        \
                 return reg_fn();                                         \
             }
 #        define GGML_BACKEND_DL_SCORE_IMPL(score_fn)       \
@@ -268,17 +284,20 @@ extern "C" {
             GGML_BACKEND_API int ggml_backend_score(void); \
             }                                              \
             int ggml_backend_score(void) {                 \
+                ggml_time_init();                          \
                 return score_fn();                         \
             }
 #    else
 #        define GGML_BACKEND_DL_IMPL(reg_fn)                              \
             GGML_BACKEND_API ggml_backend_reg_t ggml_backend_init(void);  \
             ggml_backend_reg_t                  ggml_backend_init(void) { \
+                ggml_time_init();                                         \
                 return reg_fn();                                          \
             }
 #        define GGML_BACKEND_DL_SCORE_IMPL(score_fn)        \
             GGML_BACKEND_API int ggml_backend_score(void);  \
             int                  ggml_backend_score(void) { \
+                ggml_time_init();                           \
                 return score_fn();                          \
             }
 #    endif

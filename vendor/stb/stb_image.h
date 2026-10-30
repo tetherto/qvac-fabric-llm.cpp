@@ -1,6 +1,10 @@
 /* stb_image - v2.30 - public domain image loader - http://nothings.org/stb
                                   no warranty implied; use at your own risk
 
+   QVAC local modification, re-applied by scripts/sync_vendor.py: QVAC-26299
+   bounds the PNG zlib decode to the size implied by IHDR (stbi__png_raw_len,
+   stbi__zlib_decode_exact_headerflag).
+
    Do this:
       #define STB_IMAGE_IMPLEMENTATION
    before you include this file in *one* C or C++ file to create the implementation.
@@ -4554,6 +4558,28 @@ STBIDEF char *stbi_zlib_decode_malloc_guesssize_headerflag(const char *buffer, i
    }
 }
 
+#ifndef STBI_NO_PNG
+// QVAC-26299: fixed-size variant for PNG. The expandable decode above grows
+// the buffer up to UINT_MAX/2 whatever the image size, so a 1x1 PNG with a
+// few MB of deflated zeros allocated ~2 GiB. With exp=0 a stream that writes
+// past olen fails in stbi__zexpand with "output buffer limit".
+static char *stbi__zlib_decode_exact_headerflag(const char *buffer, int len, int olen, int *outlen, int parse_header)
+{
+   stbi__zbuf a;
+   char *p = (char *) stbi__malloc(olen);
+   if (p == NULL) return NULL;
+   a.zbuffer = (stbi_uc *) buffer;
+   a.zbuffer_end = (stbi_uc *) buffer + len;
+   if (stbi__do_zlib(&a, p, olen, 0, parse_header)) {
+      if (outlen) *outlen = (int) (a.zout - a.zout_start);
+      return a.zout_start;
+   } else {
+      STBI_FREE(a.zout_start);
+      return NULL;
+   }
+}
+#endif
+
 STBIDEF int stbi_zlib_decode_buffer(char *obuffer, int olen, char const *ibuffer, int ilen)
 {
    stbi__zbuf a;
@@ -4855,6 +4881,38 @@ static int stbi__create_png_image_raw(stbi__png *a, stbi_uc *raw, stbi__uint32 r
    STBI_FREE(filter_buf);
    if (!all_ok) return 0;
 
+   return 1;
+}
+
+// QVAC-26299: exact length of the filtered scanlines the zlib stream must
+// produce, with the same per-pass geometry as stbi__create_png_image below
+// (empty Adam7 passes contribute nothing, not even filter bytes).
+static int stbi__png_raw_len(stbi__png *a, int depth, int interlaced, int *raw_len)
+{
+   static const int xorig[] = { 0,4,0,2,0,1,0 };
+   static const int yorig[] = { 0,0,4,0,2,0,1 };
+   static const int xspc[]  = { 8,8,4,4,2,2,1 };
+   static const int yspc[]  = { 8,8,8,4,4,2,2 };
+   int img_n = a->s->img_n;
+   int total = 0, p, x, y, row, len;
+   for (p=0; p < (interlaced ? 7 : 1); ++p) {
+      if (interlaced) {
+         x = (a->s->img_x - xorig[p] + xspc[p]-1) / xspc[p];
+         y = (a->s->img_y - yorig[p] + yspc[p]-1) / yspc[p];
+      } else {
+         x = a->s->img_x;
+         y = a->s->img_y;
+      }
+      if (x && y) {
+         if (!stbi__mad3sizes_valid(img_n, x, depth, 7)) return stbi__err("too large", "Corrupt PNG");
+         row = (((img_n * x * depth) + 7) >> 3) + 1;
+         if (!stbi__mul2sizes_valid(row, y)) return stbi__err("too large", "Corrupt PNG");
+         len = row * y;
+         if (!stbi__addsizes_valid(total, len)) return stbi__err("too large", "Corrupt PNG");
+         total += len;
+      }
+   }
+   *raw_len = total;
    return 1;
 }
 
@@ -5197,14 +5255,18 @@ static int stbi__parse_png_file(stbi__png *z, int scan, int req_comp)
          }
 
          case STBI__PNG_TYPE('I','E','N','D'): {
-            stbi__uint32 raw_len, bpl;
+            stbi__uint32 raw_len;
+            int exact_len;
             if (first) return stbi__err("first not IHDR", "Corrupt PNG");
             if (scan != STBI__SCAN_load) return 1;
             if (z->idata == NULL) return stbi__err("no IDAT","Corrupt PNG");
-            // initial guess for decoded data size to avoid unnecessary reallocs
-            bpl = (s->img_x * z->depth + 7) / 8; // bytes per line, per component
-            raw_len = bpl * s->img_y * s->img_n /* pixels */ + s->img_y /* filter mode per row */;
-            z->expanded = (stbi_uc *) stbi_zlib_decode_malloc_guesssize_headerflag((char *) z->idata, ioff, raw_len, (int *) &raw_len, !is_iphone);
+            // QVAC-26299: decode into a buffer of exactly the declared size
+            // instead of a growable guess, so memory is bounded by IHDR and a
+            // stream that inflates past it is rejected ("output buffer limit").
+            // This also rejects the trailing-zeros files that issue #276 let
+            // through; refusing is intended here.
+            if (!stbi__png_raw_len(z, z->depth, interlace, &exact_len)) return 0;
+            z->expanded = (stbi_uc *) stbi__zlib_decode_exact_headerflag((char *) z->idata, ioff, exact_len, (int *) &raw_len, !is_iphone);
             if (z->expanded == NULL) return 0; // zlib should set error
             STBI_FREE(z->idata); z->idata = NULL;
             if ((req_comp == s->img_n+1 && req_comp != 3 && !pal_img_n) || has_trans)

@@ -1,0 +1,56 @@
+#version 450
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+// dim-0 concat whose src1 is transposed. The generic kernel reads src1 with the transposed
+// stride, so neighbouring lanes touch different cache lines. Stage a 32x32 tile in shared
+// memory instead, which keeps both the load and the store coalesced. 33 columns pads away
+// the shared-memory bank conflicts.
+shared A_TYPE tmp[32][33];
+
+void main() {
+    const uint tx = gl_LocalInvocationID.x;
+    const uint ty = gl_LocalInvocationID.y;
+
+    const uint row = gl_WorkGroupID.x * 32 + tx;
+
+    const uint d_offset = get_doffset();
+    const uint a_offset = get_aoffset();
+    const uint b_offset = get_boffset();
+
+    // src0 is already contiguous, copy it straight through.
+    if (gl_WorkGroupID.y == 0 && row < p.ne01) {
+        const uint d_row = d_offset + row*p.nb21;
+        const uint a_row = a_offset + row*p.nb01;
+        for (uint i0 = ty; i0 < p.ne00; i0 += 8) {
+            data_d[d_row + i0*p.nb20] = D_TYPE(data_a[a_row + i0*p.nb00]);
+        }
+    }
+
+    if (row < p.ne11) {
+        const uint b_row = b_offset + row*p.nb11;
+        [[unroll]] for (uint j = 0; j < 32; j += 8) {
+            const uint c = gl_WorkGroupID.y * 32 + ty + j;
+            if (c < p.ne10) {
+                tmp[ty + j][tx] = A_TYPE(data_b[b_row + c*p.nb10]);
+            }
+        }
+    }
+
+    // every invocation reaches the barrier, also in a partial tile
+    barrier();
+
+    const uint col = gl_WorkGroupID.y * 32 + tx;
+    if (col < p.ne10) {
+        const uint d_col = d_offset + (p.ne00 + col)*p.nb20;
+        [[unroll]] for (uint j = 0; j < 32; j += 8) {
+            const uint r = gl_WorkGroupID.x * 32 + ty + j;
+            if (r < p.ne11) {
+                data_d[d_col + r*p.nb21] = D_TYPE(tmp[tx][ty + j]);
+            }
+        }
+    }
+}

@@ -1,0 +1,8 @@
+[package]
+name = "turbovec-golden-gen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+faer = "0.20"
+turbovec = "0.9"

@@ -4,6 +4,7 @@ constant bool FC_ssm_conv_silu [[function_constant(FC_SSM_CONV + 1)]];
 constant int  FC_ssm_conv_nc    [[function_constant(FC_SSM_CONV + 2)]];
 
 // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
+constant short FC_ssm_conv_bs   [[function_constant(FC_SSM_CONV + 0)]];
 kernel void kernel_ssm_conv_f32_f32(
         constant ggml_metal_kargs_ssm_conv & args,
         device const  void * src0,
@@ -12,9 +13,13 @@ kernel void kernel_ssm_conv_f32_f32(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
+    const int64_t ir = (int64_t) tgpig.x * ntg.x + tpitg.x;
     const int64_t i2 = tgpig.y;
     const int64_t i3 = tgpig.z;
+
+    if (ir >= args.ne01) {
+        return;
+    }
 
     const int64_t nc  = FC_ssm_conv_nc;
   //const int64_t ncs = args.ne00;
@@ -43,9 +48,13 @@ kernel void kernel_ssm_conv_f32_f32_4(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
+    const int64_t ir = (int64_t) tgpig.x * ntg.x + tpitg.x;
     const int64_t i2 = tgpig.y;
     const int64_t i3 = tgpig.z;
+
+    if (ir >= args.ne01) {
+        return;
+    }
 
     const int64_t nc  = FC_ssm_conv_nc;
   //const int64_t ncs = args.ne00;
@@ -65,8 +74,6 @@ kernel void kernel_ssm_conv_f32_f32_4(
 
     x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
 }
-
-constant short FC_ssm_conv_bs   [[function_constant(FC_SSM_CONV + 0)]];
 
 // Batched version: each threadgroup processes multiple tokens for better efficiency
 // Thread layout: each thread handles one token, threadgroup covers BATCH_SIZE tokens
@@ -158,6 +165,73 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
     }
 
     x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
+}
+
+// ref: ggml.c:ggml_compute_forward_ssm_conv_back_sx_f32
+kernel void kernel_ssm_conv_back_sx_f32(
+        constant ggml_metal_kargs_ssm_conv_back_sx & args,
+        device const char * g_in,    // grad_out {d_inner, n_t, n_s}
+        device const char * c_in,    // c        {d_conv, d_inner}
+        device       char * dst,     // grad_sx  {ncs, d_inner, n_s}
+        uint3 tpig[[thread_position_in_grid]]) {
+    const int p  = tpig.x;
+    const int i1 = tpig.y;
+    const int i3 = tpig.z;
+
+    if (p >= args.ncs || i1 >= args.nr || i3 >= args.n_s) {
+        return;
+    }
+
+    device const float * grad = (device const float *) g_in;
+    device const float * c    = (device const float *) c_in;
+    device       float * d    = (device       float *) dst;
+
+    float sumf = 0.0f;
+
+    if (args.n_t > 0) {
+        const uint64_t grad_base = i1*args.grad_nb0 + i3*args.grad_nb2;
+        const uint64_t c_base    = i1*args.c_nb1;
+
+        const int t0 = (p + 1 > args.nc) ? (p + 1 - args.nc) : 0;
+        const int t1 = min(args.n_t - 1, p);
+
+        for (int t = t0; t <= t1; ++t) {
+            sumf += grad[grad_base + t*args.grad_nb1] * c[c_base + (p - t)];
+        }
+    }
+
+    d[p*args.dst_nb0 + i1*args.dst_nb1 + i3*args.dst_nb2] = sumf;
+}
+
+// ref: ggml.c:ggml_compute_forward_ssm_conv_back_c_f32
+kernel void kernel_ssm_conv_back_c_f32(
+        constant ggml_metal_kargs_ssm_conv_back_c & args,
+        device const char * g_in,    // grad_out {d_inner, n_t, n_s}
+        device const char * sx_in,   // sx       {ncs, d_inner, n_s}
+        device       char * dst,     // grad_c   {d_conv, d_inner}
+        uint3 tpig[[thread_position_in_grid]]) {
+    const int i0 = tpig.x;
+    const int i1 = tpig.y;
+
+    if (i0 >= args.nc || i1 >= args.nr) {
+        return;
+    }
+
+    device const float * grad = (device const float *) g_in;
+    device const float * sx   = (device const float *) sx_in;
+    device       float * d    = (device       float *) dst;
+
+    float sumf = 0.0f;
+
+    for (int i3 = 0; i3 < args.n_s; ++i3) {
+        const uint64_t grad_base = i1*args.grad_nb0 + i3*args.grad_nb2;
+        const uint64_t sx_base   = i0*args.sx_nb0 + i1*args.sx_nb1 + i3*args.sx_nb2;
+        for (int i2 = 0; i2 < args.n_t; ++i2) {
+            sumf += grad[grad_base + i2*args.grad_nb1] * sx[sx_base + i2*args.sx_nb0];
+        }
+    }
+
+    d[i0 + i1*args.dst_nb1] = sumf;
 }
 
 // ref: ggml.c:ggml_compute_forward_ssm_scan_f32, Mamba-2 part
@@ -472,5 +546,81 @@ kernel void kernel_ssm_scan_ssd_mma_f32(
 
         // All state tiles must be visible before the next chunk consumes s_buff as S_prev.
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    }
+}
+
+// causal depthwise conv (d_conv = 4) + SiLU with a deferred conv-state commit, see ggml_gdn_conv_deferred.
+// one threadgroup per (head of head_dim channels, token, seq), one thread per channel: the conv has no
+// sequential dependency, so every token runs in parallel. the leading n_norm heads are L2-normalized with
+// a threadgroup reduction. each token stores its own conv input into the history (token 0 also the window).
+kernel void kernel_gdn_conv_deferred_f32(
+        constant ggml_metal_kargs_gdn_conv_deferred & args,
+        device const char * x,
+        device const char * w,
+        device       char * hist,
+        device const char * rec_idx,
+        device       char * dst,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg3[[threads_per_threadgroup]]) {
+    const int ih  = tgpig.x; // head
+    const int t   = tgpig.y; // token
+    const int is  = tgpig.z; // seq
+    const int ntg = ntg3.x;
+    const int C   = args.C;
+    const int c   = ih*ntg + tiitg;
+
+    device const int * idx = (device const int *) rec_idx + 3*is;
+    const int pending = clamp(idx[0], 0, args.K);
+
+    device const float * h_in  = (device const float *) (hist + (uint64_t) idx[1]*args.nb_h1);
+    device       float * h_out = (device       float *) (hist + (uint64_t) idx[2]*args.nb_h1);
+
+    device const char * xs = x + is*args.nb_x2 + c*sizeof(float);
+
+    // conv input column i: the window for i < 3, then the new inputs
+    float ci[4];
+    for (int j = 0; j < 4; ++j) {
+        const int i = t + j;
+        ci[j] = i < 3 ? h_in[(pending + i)*C + c] : *(device const float *) (xs + (i - 3)*args.nb_x1);
+    }
+
+    device const float * wc = (device const float *) w + 4*c;
+
+    float sumf = 0.0f;
+    sumf += ci[0]*wc[0];
+    sumf += ci[1]*wc[1];
+    sumf += ci[2]*wc[2];
+    sumf += ci[3]*wc[3];
+
+    float y = sumf/(1.0f + exp(-sumf));
+
+    if (ih < args.n_norm) {
+        const float sq = simd_sum(y*y);
+        if (tiisg == 0) {
+            shmem[sgitg] = sq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float tot = 0.0f;
+        for (short i = 0; i < ntg/32; ++i) {
+            tot += shmem[i];
+        }
+        y *= 1.0f/sqrt(tot + args.eps);
+    }
+
+    *(device float *) (dst + t*args.nb1 + is*args.nb2 + c*sizeof(float)) = y;
+
+    // keep the last R + 3 conv input columns, i.e. column i - (n_tokens - R) for i >= n_tokens - R
+    const int i0 = args.n_tokens - min(args.n_tokens, args.K);
+    if (t + 3 >= i0) {
+        h_out[(t + 3 - i0)*C + c] = ci[3];
+    }
+    if (t == 0) {
+        for (int i = i0; i < 3; ++i) {
+            h_out[(i - i0)*C + c] = ci[i];
+        }
     }
 }

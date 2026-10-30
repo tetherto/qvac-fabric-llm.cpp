@@ -1,0 +1,40 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+#include "generic_head.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X {A_TYPE data_a[];}; // predictions
+layout (binding = 1) readonly buffer Y {B_TYPE data_b[];}; // targets
+layout (binding = 2) readonly buffer M {C_TYPE data_m[];}; // mask; values > 0.5 are counted
+layout (binding = 3) buffer D {uint data_d[];};            // 32-bit count in the zeroed I64 output
+
+const uint CHUNK_SIZE = 512;
+
+shared uint sdata[CHUNK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint idx = gl_WorkGroupID.x * CHUNK_SIZE + tid;
+
+    sdata[tid] = 0;
+    if (idx < p.KX && data_m[idx * p.KY] > 0.5 && data_a[idx] == data_b[idx]) {
+        sdata[tid] = 1;
+    }
+    barrier();
+
+    [[unroll]]
+    for (uint s = CHUNK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        atomicAdd(data_d[0], sdata[0]);
+    }
+}

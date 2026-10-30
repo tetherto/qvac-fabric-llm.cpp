@@ -273,13 +273,61 @@ static bool check_chained_pack_reader() {
     return report_reader("reader of a chained MUL_MAT+ADD sum", packed, after);
 }
 
+struct alloc_dep {
+    ggml_tensor * tensor;
+    ggml_tensor * until;
+};
+
+static bool check_norm_alloc_deps(ggml_type type, int64_t rows, bool dependent) {
+    ggml_context * ctx = graph_ctx();
+    ggml_tensor * x    = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_k, rows), scale);
+    ggml_tensor * norm = ggml_rms_norm(ctx, x, norm_eps);
+    ggml_tensor * mul  = ggml_mul(ctx, norm, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_k));
+    ggml_tensor * mm   = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, n_k, n_m),
+        dependent ? mul : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_k, rows));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    expand_all(graph, { mul, mm });
+
+    std::vector<alloc_dep> deps;
+    ggml_metal_fusion_add_alloc_deps(&deps, [](void * user_data, ggml_tensor * tensor, ggml_tensor * until) {
+        ((std::vector<alloc_dep> *) user_data)->push_back({ tensor, until });
+    }, graph);
+    ggml_graph_optimize(graph);
+
+    int kept_until = -1;
+    for (const alloc_dep & dep : deps) {
+        if (dep.tensor == x && node_index(graph, dep.until) > kept_until) {
+            kept_until = node_index(graph, dep.until);
+        }
+    }
+    const bool fused_mv = dependent && (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_MXFP4);
+    const int required = node_index(graph, fused_mv ? mm : mul);
+    const bool ok = kept_until >= required && (dependent || node_index(graph, mm) < node_index(graph, norm));
+    std::printf("norm input lifetime, %s rows %lld dependent %d: %s\n",
+        ggml_type_name(type), (long long) rows, dependent, ok ? "OK" : "FAIL");
+    ggml_free(ctx);
+    return ok;
+}
+
+static int run_norm_alloc_deps_cases() {
+    int failures = 0;
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_MXFP4 }) {
+        for (int64_t rows : { 1, 4, 9, 64 }) {
+            for (bool dependent : { false, true }) {
+                failures += check_norm_alloc_deps(type, rows, dependent) ? 0 : 1;
+            }
+        }
+    }
+    return failures;
+}
+
 int main() {
     const std::vector<device_case> devices = {
         { "native simdgroup matrices",       true,  true },
         { "probed or no simdgroup matrices", false, true },
     };
     const int failures = run_pack_cases(devices) + (check_chained_pack_reader() ? 0 : 1) + run_row_independent_pack_cases() +
-        (check_encoder_skips_weight_residual() ? 0 : 1);
+        (check_encoder_skips_weight_residual() ? 0 : 1) + run_norm_alloc_deps_cases();
 
     return failures == 0 ? 0 : 1;
 }

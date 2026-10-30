@@ -63,7 +63,6 @@ struct llama_ubatch {
 
     struct data_t {
         std::vector<llama_token>    token;
-        std::vector<float>          embd;
         std::vector<float>          embd_state;
         std::vector<llama_pos>      pos;
         std::vector<int32_t>        n_seq_id;
@@ -79,6 +78,7 @@ struct llama_ubatch {
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
+    // exception: the embd of a split ubatch points into its llama_batch_allocr, valid until the allocator's next split_reset()
     std::shared_ptr<data_t> data;
 };
 
@@ -232,6 +232,9 @@ private:
     std::vector<int32_t>        seq_idx;
     std::vector<int8_t>         output;
     std::vector<int32_t>        decision_order; // empty if no entry has one
+
+    // embeddings of the ubatches split from the batch, kept across batches so that large rows do not page-fault fresh memory
+    std::vector<float> ubatch_embd;
 
     using pos_set_t = std::set<llama_pos>;
     using seq_cpl_t = std::vector<bool>;

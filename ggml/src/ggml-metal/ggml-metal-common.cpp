@@ -32,6 +32,11 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg
            ggml_metal_fwht_supported_size(op->src[1]->ne[0], max_tg_mem);
 }
 
+struct ggml_metal_fwht_operands ggml_metal_fwht_signed_operands(const struct ggml_tensor * mul) {
+    const bool x_first = ggml_are_same_shape(mul, mul->src[0]);
+    return { x_first ? mul->src[0] : mul->src[1], x_first ? mul->src[1] : mul->src[0] };
+}
+
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
@@ -55,14 +60,18 @@ static constexpr int64_t GGML_METAL_MMA_ROWS_MAX = 16;
 // src1 rows per 8x8 simdgroup matrix tile of the few-row MMA kernels
 static constexpr int64_t GGML_METAL_MMA_TILE_ROWS = 8;
 
-// weights per K step of the q5_K and generic few-row MMA kernels
+// weights per K step of the q5_K, pq2_0 and generic few-row MMA kernels
 static constexpr int64_t GGML_METAL_MMA_K_CHUNK = 64;
 
 enum ggml_metal_mma_kind ggml_metal_mul_mv_mma_kind(enum ggml_type type, int rt) {
     if (type == GGML_TYPE_Q4_0 || (type == GGML_TYPE_Q8_0 && rt == 1)) {
         return GGML_METAL_MMA_KIND_BLK;
     }
-    return type == GGML_TYPE_Q5_K ? GGML_METAL_MMA_KIND_Q5_K : GGML_METAL_MMA_KIND_GEN;
+    switch (type) {
+        case GGML_TYPE_Q5_K:  return GGML_METAL_MMA_KIND_Q5_K;
+        case GGML_TYPE_PQ2_0: return GGML_METAL_MMA_KIND_PQ2_0;
+        default:              return GGML_METAL_MMA_KIND_GEN;
+    }
 }
 
 int ggml_metal_mul_mv_mma_rt(const struct ggml_tensor * op) {
@@ -73,6 +82,7 @@ static bool ggml_metal_mul_mv_mma_type_supported(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
+        case GGML_TYPE_PQ2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -117,15 +127,13 @@ static bool ggml_metal_mul_mat_mma_type_ok(const struct ggml_tensor * op) {
     return step > 0 && src0->ne[0] % step == 0 && src0->nb[0] == ggml_type_size(src0->type);
 }
 
-// the fewest src1 rows at which the few-row MMA kernels beat the mat-vec kernels (measured on an M3 Ultra)
+// the fewest src1 rows at which the few-row MMA kernels beat the mat-vec kernels (measured on an M3 Ultra). F32 and BF16
+// start at 2: their weights in quantized models are small (MoE routers, GDN alpha/beta, the DFlash fc), and there the
+// mat-vec kernels are up to 3x slower at 2..5 rows
 static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_F32:
-            return 6;
         case GGML_TYPE_TQ2_0:
             return 5;
-        case GGML_TYPE_BF16:
-            return 4;
         case GGML_TYPE_F16:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_K:
@@ -155,6 +163,17 @@ bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
 
 bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op) {
     return ggml_metal_mul_mv_mma_type_supported(op->src[0]->type) && op->src[1]->type == GGML_TYPE_F32;
+}
+
+bool ggml_metal_mul_mat_mv_may_add(const struct ggml_tensor * op) {
+    const ggml_type type = op->src[0]->type;
+
+    return (type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_MXFP4) && op->src[1]->type == GGML_TYPE_F32 &&
+        ggml_get_op_params_i32(op, 1) != GGML_HINT_SRC0_IS_HADAMARD;
+}
+
+bool ggml_metal_mul_mat_mv_use_add(const struct ggml_tensor * op) {
+    return ggml_metal_mul_mat_mv_may_add(op) && op->src[1]->ne[1] == 1;
 }
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)
