@@ -119,6 +119,10 @@ static constexpr uint32_t XDNA_POISON_F32 = 0x7FC0DEADu;
 // land on top of the device's output. Mark before the dispatch that writes it.
 void xdna_buffer_mark(xdna_buffer * buf, size_t bytes, size_t offset = 0);
 
+// xdna_buffer_mark for a large range the host does not read before the dispatch: the pattern goes out in
+// non-temporal stores, so a line the range does not hold in cache is never fetched to be overwritten.
+void xdna_buffer_mark_bulk(xdna_buffer * buf, size_t bytes, size_t offset = 0);
+
 // Wait until the device has written every word of [offset, offset+bytes) and
 // return the buffer's map at that offset, so the caller reads it in place; or
 // nullptr when the pattern survived every pass.
