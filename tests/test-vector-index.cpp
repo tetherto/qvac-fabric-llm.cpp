@@ -221,6 +221,7 @@ void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums);
 int parallel_pool_selftest_for_test(int n_threads);
 int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * unit, std::vector<uint64_t> * masks);
 int turbovec_exact2_row_parity_for_test(const ggml_vec_index_t * idx, const float * query);
+int turbovec_rounding_parity_for_test(void);
 int turbovec_vnni_fused_scan_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k);
 int turbovec_vnni_fused_batch_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k);
 int turbovec_sync_plan_for_test(
@@ -6730,6 +6731,66 @@ void check_turbovec_1x_staged(int x86_rules) {
     turbovec_force_x86_rules_for_test(0);
 }
 
+// The staged search at dims where its sign scan flushes its u16 sums
+// (every 256 sign groups, so dim 2048 and up) and the ranking widens its
+// table sums: every returned score is the full scan's for that id. 2080
+// ends on a partial flush group.
+void check_turbovec_1x_staged_wide_dims(int x86_rules) {
+    turbovec_force_x86_rules_for_test(x86_rules);
+    turbovec_force_planes_for_test(1, 0);
+    turbovec_force_vector_major_for_test(1);
+    const int n = 3000;
+    for (const int k : { 10, 64 }) {
+        for (const int dim_i : { 2048, 2080 }) {
+            const size_t dim = static_cast<size_t>(dim_i);
+            const std::vector<float> db = tv1x_rows(kTv1xSeedDb, static_cast<size_t>(n), dim);
+            const std::vector<uint64_t> ids = tv1x_ids(static_cast<size_t>(n));
+            const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 3, dim);
+            const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, kTv1xNCalib, dim);
+            for (const int bits : { 2, 4 }) {
+                for (const int calibrated : { 0, 1 }) {
+                    auto * tv = ggml_vec_index_create_turbovec(dim_i, bits);
+                    CHECK(tv != nullptr);
+                    if (calibrated != 0) {
+                        CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+                    }
+                    CHECK(ggml_vec_index_add(tv, db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+                    std::vector<float> staged_scores(static_cast<size_t>(3 * k));
+                    std::vector<uint64_t> staged_ids(staged_scores.size());
+                    CHECK(ggml_vec_index_search(tv, queries.data(), 3, k, staged_scores.data(), staged_ids.data()) ==
+                          GGML_VEC_INDEX_OK);
+                    CHECK(ggml_vec_index_turbovec_set_staged(tv, 0) == GGML_VEC_INDEX_OK);
+                    std::vector<float> full_scores(staged_scores.size());
+                    std::vector<uint64_t> full_ids(staged_scores.size());
+                    CHECK(ggml_vec_index_search(tv, queries.data(), 3, k, full_scores.data(), full_ids.data()) ==
+                          GGML_VEC_INDEX_OK);
+                    size_t shared = 0;
+                    for (size_t i = 0; i < staged_ids.size(); ++i) {
+                        const size_t q = i / static_cast<size_t>(k);
+                        for (size_t j = q * static_cast<size_t>(k); j < (q + 1) * static_cast<size_t>(k); ++j) {
+                            if (full_ids[j] == staged_ids[i]) {
+                                CHECK(full_scores[j] == staged_scores[i]);
+                                ++shared;
+                            }
+                        }
+                    }
+                    CHECK(shared * 10 >= staged_ids.size() * 8);
+                    ggml_vec_index_free(tv);
+                }
+            }
+        }
+    }
+    turbovec_force_vector_major_for_test(-1);
+    turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_x86_rules_for_test(0);
+}
+
+// round_half_away_f32 and quantise_table16 (the x86 table builds' rounding)
+// against std::round at its edges; the hook reports the first mismatch.
+void check_turbovec_rounding_helpers() {
+    CHECK(turbovec_rounding_parity_for_test() == 0);
+}
+
 // Upstream's x86 2- and 3-bit search (the `vpermb` scan over vector-major
 // codes, exact u32 table sums, then sum * scale + bias unfused): lone
 // queries, every batch width and tail, filters, block groups split across
@@ -6742,44 +6803,48 @@ void check_turbovec_1x_staged(int x86_rules) {
 // layout keeps the block scan, which the hook reports as -1.
 void check_turbovec_1x_exact2_rows(int x86_rules) {
     turbovec_force_x86_rules_for_test(x86_rules);
-    const int n = kTv1xStagedN;
-    const size_t dim = static_cast<size_t>(kTv1xStagedDim);
-    const std::vector<float> db = tv1x_rows(kTv1xSeedDb, static_cast<size_t>(n), dim);
-    const std::vector<uint64_t> ids = tv1x_ids(static_cast<size_t>(n));
-    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 3, dim);
-    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, kTv1xNCalib, dim);
 #if defined(__aarch64__) || defined(_M_ARM64)
     constexpr bool neon_host = true;
 #else
     constexpr bool neon_host = false;
 #endif
     turbovec_force_planes_for_test(1, 0);
-    for (const int vm8 : { 0, 1 }) {
-        if (vm8 != 0 && x86_rules != 0) {
-            continue;
-        }
-        for (const int calibrated : { 0, 1 }) {
-            ggml_vec_index_t * tv = nullptr;
-            if (vm8 != 0) {
-                tv = tv1x_create_with_layout(static_cast<int>(dim), 2, 1, 1);
-            } else {
-                turbovec_force_vector_major_for_test(1);
-                tv = ggml_vec_index_create_turbovec(static_cast<int>(dim), 2);
+    // dim 1024 is the first to reach the row scorer's FMA flush (every 128
+    // sign groups); 1056 flushes with a partial group after it.
+    for (const int dim_i : { kTv1xStagedDim, 1024, 1056 }) {
+        const int n = dim_i == kTv1xStagedDim ? kTv1xStagedN : 4000;
+        const size_t dim = static_cast<size_t>(dim_i);
+        const std::vector<float> db = tv1x_rows(kTv1xSeedDb, static_cast<size_t>(n), dim);
+        const std::vector<uint64_t> ids = tv1x_ids(static_cast<size_t>(n));
+        const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 3, dim);
+        const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, kTv1xNCalib, dim);
+        for (const int vm8 : { 0, 1 }) {
+            if (vm8 != 0 && x86_rules != 0) {
+                continue;
             }
-            CHECK(tv != nullptr);
-            if (calibrated != 0) {
-                CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+            for (const int calibrated : { 0, 1 }) {
+                ggml_vec_index_t * tv = nullptr;
+                if (vm8 != 0) {
+                    tv = tv1x_create_with_layout(static_cast<int>(dim), 2, 1, 1);
+                } else {
+                    turbovec_force_vector_major_for_test(1);
+                    tv = ggml_vec_index_create_turbovec(static_cast<int>(dim), 2);
+                }
+                CHECK(tv != nullptr);
+                if (calibrated != 0) {
+                    CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+                }
+                CHECK(ggml_vec_index_add(tv, db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+                const int layout = turbovec_layout_for_test(tv);
+                CHECK(vm8 == 0 || !neon_host || layout == 2);
+                CHECK(x86_rules == 0 || layout == 1);
+                const int expected = !neon_host && layout == 0 ? -1 : 1;
+                for (int q = 0; q < 3; ++q) {
+                    CHECK(turbovec_exact2_row_parity_for_test(tv, queries.data() + static_cast<size_t>(q) * dim) == expected);
+                }
+                ggml_vec_index_free(tv);
+                tv1x_reset_kernel_overrides();
             }
-            CHECK(ggml_vec_index_add(tv, db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
-            const int layout = turbovec_layout_for_test(tv);
-            CHECK(vm8 == 0 || !neon_host || layout == 2);
-            CHECK(x86_rules == 0 || layout == 1);
-            const int expected = !neon_host && layout == 0 ? -1 : 1;
-            for (int q = 0; q < 3; ++q) {
-                CHECK(turbovec_exact2_row_parity_for_test(tv, queries.data() + static_cast<size_t>(q) * dim) == expected);
-            }
-            ggml_vec_index_free(tv);
-            tv1x_reset_kernel_overrides();
         }
     }
     turbovec_force_planes_for_test(-1, 0);
@@ -8095,6 +8160,9 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_staged(1);
             check_turbovec_1x_exact2_rows(0);
             check_turbovec_1x_exact2_rows(1);
+            check_turbovec_1x_staged_wide_dims(0);
+            check_turbovec_1x_staged_wide_dims(1);
+            check_turbovec_rounding_helpers();
             check_turbovec_1x_vpermb();
             check_turbovec_1x_low_planes_tiny();
             check_turbovec_1x_thread_invariance(0);

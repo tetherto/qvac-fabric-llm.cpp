@@ -2352,6 +2352,51 @@ int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * 
     return planes.sum_w;
 }
 
+int turbovec_rounding_parity_for_test() {
+    // Ties both ways, the largest float below a half, the 2^23 edge where a
+    // float is its own rounding, values past the table's max, NaN and inf.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    const float edges[] = { 0.0f, -0.0f, 0.5f, -0.5f, 1.5f, -1.5f, 2.5f, -2.5f, 0.49999997f, -0.49999997f,
+        14.5f, 15.5f, 254.5f, 255.5f, 256.0f, 8388607.5f, -8388607.5f, 8388608.0f, -8388608.0f, 8388609.0f,
+        1e30f, -1e30f, nan, inf, -inf };
+    int case_no = 0;
+    for (const float x : edges) {
+        ++case_no;
+        const float want = std::round(x);
+        const float got = round_half_away_f32(x);
+        if (!(got == want || (std::isnan(got) && std::isnan(want)))) {
+            return case_no;
+        }
+    }
+    // Each table entry is (in - mn) * inv_scale; mn 0 and inv_scale 1 put
+    // the edges above in exactly. NaN and inf are left out: a table entry
+    // is always finite.
+    std::vector<float> in;
+    for (const float x : edges) {
+        if (std::isfinite(x)) {
+            in.push_back(x);
+        }
+    }
+    while (in.size() % 16 != 0) {
+        in.push_back(in[in.size() % 7]);
+    }
+    for (const float max_lut : { 15.0f, 255.0f }) {
+        for (size_t g = 0; g < in.size(); g += 16) {
+            uint8_t out[16];
+            quantise_table16(in.data() + g, 0.0f, 1.0f, max_lut, out);
+            for (size_t i = 0; i < 16; ++i) {
+                ++case_no;
+                const float want = std::max(0.0f, std::min(max_lut, std::round(in[g + i])));
+                if (static_cast<float>(out[i]) != want) {
+                    return case_no;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 void turbovec_force_planes_for_test(int mode, size_t min_vectors) {
     g_planes_override.store(mode, std::memory_order_relaxed);
     g_planes_min_vectors.store(min_vectors == 0 ? kTurboVecPlanesMinVectors : min_vectors, std::memory_order_relaxed);
