@@ -129,7 +129,13 @@ struct img_tool {
             return {0, 0};
         }
 
-        auto round_by_factor = [f = opts.align_size](float x) { return static_cast<int>(std::round(x / static_cast<float>(f))) * f; };
+        auto round_by_factor = [f = opts.align_size](int x) {
+            const int quotient = x / f;
+            const int remainder = x % f;
+            // Round ties to even, independently of the floating-point rounding mode.
+            const bool up = remainder > f - remainder || (remainder == f - remainder && quotient % 2 != 0);
+            return (quotient + up) * f;
+        };
         auto ceil_by_factor  = [f = opts.align_size](double x) { return static_cast<int>(std::ceil(x / static_cast<double>(f))) * f; };
         auto floor_by_factor = [f = opts.align_size](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
 
@@ -145,7 +151,7 @@ struct img_tool {
             w_bar = ceil_by_factor(width  * scale);
             h_bar = ceil_by_factor(height * scale);
         } else {
-            // always align up first
+            // align to the nearest multiple first
             w_bar = std::max(opts.align_size, round_by_factor(width));
             h_bar = std::max(opts.align_size, round_by_factor(height));
         }
@@ -781,6 +787,10 @@ mtmd_image_preproc_out mtmd_image_preprocessor_fixed_size::preprocess(const clip
 }
 
 // Resize to [min_pixels, max_pixels] with aspect ratio preserved, aligned to `align_px`, single f32 output.
+clip_image_size mtmd_calc_dynamic_image_size(const clip_image_size & size, int align_size, int min_pixels, int max_pixels) {
+    return img_tool::calc_size_preserved_ratio(size, {align_size, min_pixels, max_pixels, 0});
+}
+
 static mtmd_image_preproc_out preprocess_dyn_size_aligned(
         const clip_image_u8 & img,
         const clip_hparams & hparams,
@@ -789,14 +799,8 @@ static mtmd_image_preproc_out preprocess_dyn_size_aligned(
     GGML_ASSERT(align_px > 0);
     clip_image_u8 resized_image;
     const clip_image_size img_size = img.get_size();
-    const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
-        img_size,
-        {
-            /* align_size   */ align_px,
-            /* min_pixels   */ hparams.image_min_pixels,
-            /* max_pixels   */ hparams.image_max_pixels,
-            /* longest_edge */ 0,
-        });
+    const clip_image_size target_size = mtmd_calc_dynamic_image_size(
+        img_size, align_px, hparams.image_min_pixels, hparams.image_max_pixels);
     img_tool::resize(img, resized_image, target_size,
                      hparams.image_resize_algo,
                      hparams.image_resize_pad,
