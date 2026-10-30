@@ -210,6 +210,7 @@ struct metal_join {
     ggml_cgraph * graph = nullptr;
     ggml_tensor * gpu = nullptr;
     ggml_tensor * ane = nullptr;
+    ggml_tensor * ane2 = nullptr;
     ggml_tensor * output = nullptr;
 
     ~metal_join() {
@@ -219,23 +220,30 @@ struct metal_join {
         ggml_free(ctx);
     }
 
-    void init(ggml_backend_t device, int hidden, int tokens) {
+    // second: add a separate input for a second Core ML partial
+    void init(ggml_backend_t device, int hidden, int tokens, bool second = false) {
         backend = device;
-        ctx = ggml_init({ggml_tensor_overhead() * 3 + ggml_graph_overhead_custom(8, false), nullptr, true});
+        ctx = ggml_init({ggml_tensor_overhead() * 5 + ggml_graph_overhead_custom(8, false), nullptr, true});
         require(ctx, "could not create Metal join context");
         gpu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
         ane = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
         ggml_set_input(gpu);
         ggml_set_input(ane);
+        if (second) {
+            ane2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
+            ggml_set_input(ane2);
+        }
         inputs = ggml_backend_alloc_ctx_tensors(ctx, backend);
         require(inputs, "could not allocate Metal join inputs");
+        ggml_backend_buffer_clear(inputs, 0);
         output = ggml_add(ctx, gpu, ane);
+        if (ane2) { output = ggml_add(ctx, output, ane2); }
         ggml_set_output(output);
         graph = ggml_new_graph_custom(ctx, 8, false);
         ggml_build_forward_expand(graph, output);
         alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         require(ggml_gallocr_alloc_graph(alloc, graph), "could not allocate Metal join graph");
-        require(output->data != gpu->data && output->data != ane->data, "Metal join inputs alias output");
+        require(output->data != gpu->data && output->data != ane->data && (!ane2 || output->data != ane2->data), "Metal join inputs alias output");
     }
 
     void run(ggml_tensor * prefix, const std::vector<float> & partial) {
