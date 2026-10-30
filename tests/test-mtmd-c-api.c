@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#undef NDEBUG
 #include <assert.h>
 
 #include "mtmd.h"
@@ -101,10 +102,35 @@ int main(void) {
         mtmd_input_chunk * loaded = mtmd_input_chunk_load(buf, expected_len);
         assert(loaded != NULL);
 
+        uint64_t version;
+        memcpy(&version, buf, sizeof(version));
+        const uint64_t old_version = 2;
+        memcpy(buf, &old_version, sizeof(old_version));
+        assert(mtmd_input_chunk_load(buf, expected_len) == NULL);
+        memcpy(buf, &version, sizeof(version));
+
         // metadata must match the original chunk
         assert(mtmd_input_chunk_get_type(loaded) == type);
         assert(mtmd_input_chunk_get_n_tokens(loaded) == mtmd_input_chunk_get_n_tokens(chunk));
         assert(mtmd_input_chunk_get_n_pos(loaded) == mtmd_input_chunk_get_n_pos(chunk));
+
+        if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            mtmd_input_chunk * placeholder = mtmd_input_chunk_get_placeholder(chunk);
+            assert(placeholder != NULL);
+            assert(mtmd_input_chunk_get_n_tokens(placeholder) == mtmd_input_chunk_get_n_tokens(chunk));
+            assert(mtmd_input_chunk_get_n_pos(placeholder) == mtmd_input_chunk_get_n_pos(chunk));
+            const mtmd_image_tokens * original = mtmd_input_chunk_get_tokens_image(chunk);
+            const mtmd_image_tokens * restored = mtmd_input_chunk_get_tokens_image(loaded);
+            const mtmd_image_tokens * cached = mtmd_input_chunk_get_tokens_image(placeholder);
+            for (size_t j = 0; j < mtmd_image_tokens_get_n_tokens(original); ++j) {
+                struct mtmd_decoder_pos a = mtmd_image_tokens_get_decoder_pos(original, 7, j);
+                struct mtmd_decoder_pos b = mtmd_image_tokens_get_decoder_pos(restored, 7, j);
+                struct mtmd_decoder_pos c = mtmd_image_tokens_get_decoder_pos(cached, 7, j);
+                assert(a.t == b.t && a.x == b.x && a.y == b.y && a.z == b.z);
+                assert(a.t == c.t && a.x == c.x && a.y == c.y && a.z == c.z);
+            }
+            mtmd_input_chunk_free(placeholder);
+        }
 
         if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
             size_t n_tok_orig, n_tok_loaded;
