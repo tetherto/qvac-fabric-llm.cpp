@@ -888,7 +888,7 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
             dim,
             idx->turbovec_blocked_data,
             idx->turbovec_blocked_n_blocks,
-            idx->turbovec_blocked_vm);
+            turbovec_layout(*idx));
     }
     turbovec_planes_refresh(*idx, 0);
     rebuild_state_hash(*idx);

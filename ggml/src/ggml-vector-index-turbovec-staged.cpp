@@ -219,7 +219,9 @@ bool turbovec_planes_for(int bits, int dim) {
     // and 4-bit planes with its dot-product kernels; x86 needs AVX-512
     // kernels this port does not have yet.
 #if GGML_VEC_INDEX_USE_NEON
-    if (dim % 32 != 0) {
+    // TURBOVEC_2BIT_VM8 replaces the classic NEON scan the sign region
+    // needs, so upstream drops the planes layout at both widths.
+    if (dim % 32 != 0 || turbovec_vm8_2bit_enabled()) {
         return false;
     }
     return bits == 2 || (bits == 4 && turbovec_cpu_vector_major());
@@ -641,7 +643,7 @@ bool turbovec_staged_search(
     bool exact_built = false;
     auto build_exact = [&]() {
         if (permute_dot) {
-            build_turbovec_permute_dot(query, dim, pd);
+            build_turbovec_permute_dot(query, dim, pd, turbovec_layout(idx) == kTurboVecLayoutVm8);
             pd.bias = bias_corr;
         } else {
             build_turbovec_lut(bits, false, query, dim, exact_lut, exact_scale, exact_bias);

@@ -4708,7 +4708,8 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                 idx->turbovec_bits,
                 dim,
                 idx->turbovec_blocked_data,
-                idx->turbovec_blocked_n_blocks);
+                idx->turbovec_blocked_n_blocks,
+                turbovec_layout(*idx));
         }
 
         rebuild_state_hash(*idx);
