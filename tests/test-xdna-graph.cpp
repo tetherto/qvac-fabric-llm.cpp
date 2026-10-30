@@ -540,9 +540,15 @@ static bool test_fa_computed_masks(ggml_backend_t npu, ggml_backend_t cpu, fa_ro
     return ok;
 }
 
+// Where a projection is expected to run: either, the host (the CPU backend's own
+// product, bit for bit) or the array (a different order of summing, so not bit for bit).
+enum gemm_route { GEMM_ROUTE_ANY, GEMM_ROUTE_HOST, GEMM_ROUTE_ARRAY };
+
 struct gemm_shape {
-    int64_t K;
-    int64_t N;
+    int64_t        K;
+    int64_t        N;
+    enum ggml_type wtype = GGML_TYPE_COUNT;  // the case's when unset
+    gemm_route     route = GEMM_ROUTE_ANY;
 };
 
 // The projections of `shapes` on M activation rows, in this order and with no
@@ -560,7 +566,7 @@ static norm_graph build_gemms(ggml_backend_t cpu, enum ggml_type wtype, int64_t 
             a = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, sh.K, M);
             g.inputs.push_back(a);
         }
-        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, wtype, sh.K, sh.N);
+        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, sh.wtype == GGML_TYPE_COUNT ? wtype : sh.wtype, sh.K, sh.N);
         g.inputs.push_back(w);
         ggml_tensor * out = ggml_mul_mat(g.ctx, w, a);
         ggml_set_name(out, (std::string("K") + std::to_string(sh.K) + " N" + std::to_string(sh.N)).c_str());
@@ -728,8 +734,9 @@ static bool test_ffn(ggml_backend_t npu, ggml_backend_t cpu, ggml_glu_op op, boo
     return passed;
 }
 
-// x (K x M) through Q8_0 projections of `ns[i]` rows each, then a tensor to guard
-static norm_graph build_group(ggml_backend_t be, const std::vector<int64_t> & ns, int64_t M, ggml_tensor ** guard) {
+// x (K x M) through `wtype` projections of `ns[i]` rows each, then a tensor to guard
+static norm_graph build_group(ggml_backend_t be, const std::vector<int64_t> & ns, int64_t M, ggml_tensor ** guard,
+                              enum ggml_type wtype = GGML_TYPE_Q8_0) {
     const int64_t K = 512;
     norm_graph    g;
     ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
@@ -1049,6 +1056,16 @@ int main(void) {
         { "short tail",       GGML_TYPE_BF16, 1100, { { 512, 512 }, { 1024, 512 } } },
         { "mixed K and N",    GGML_TYPE_BF16, 912, { { 512, 1024 }, { 1024, 512 }, { 2048, 512 }, { 576, 1024 }, { 512, 512 } } },
         { "f16 weights",      GGML_TYPE_F16,  130, { { 1536, 512 }, { 512, 2048 } } },
+        // a bf16 projection between pgemm ones pays two context switches: the host does a small one
+        // (EmbeddingGemma 2's per_layer_model_proj), the array a large one, and between bf16 ones no switch is paid
+        { "among pgemm, small", GGML_TYPE_BF16, 15,
+          { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_HOST }, { 512, 1024, GGML_TYPE_Q4_K } } },
+        { "among pgemm, mid",   GGML_TYPE_BF16, 132,
+          { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_HOST }, { 512, 1024, GGML_TYPE_Q4_K } } },
+        { "among pgemm, large", GGML_TYPE_BF16, 2560,
+          { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_ARRAY }, { 512, 1024, GGML_TYPE_Q4_K } } },
+        { "among bf16",         GGML_TYPE_BF16, 15,
+          { { 512, 1024 }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_ARRAY }, { 512, 1024 } } },
     };
     for (const gemm_case & c : gemm_cases) {
         norm_graph                      g = build_gemms(cpu, c.wtype, c.M, c.shapes);
@@ -1058,10 +1075,12 @@ int main(void) {
             return 1;
         }
         for (size_t i = 0; i < g.checked.size(); i++) {
-            const double e  = nmse(want[i], got[i]);
-            const bool   ok = e < tol;
-            passed          = passed && ok;
-            std::printf("MUL_MAT %-4s M%-4lld %-14s %-12s nmse %.3g %s\n", ggml_type_name(c.wtype), (long long) c.M, c.name,
+            const double e     = nmse(want[i], got[i]);
+            const bool   exact = e == 0.0;
+            const gemm_route route = c.shapes[i].route;
+            const bool   ok    = e < tol && (route != GEMM_ROUTE_HOST || exact) && (route != GEMM_ROUTE_ARRAY || !exact);
+            passed             = passed && ok;
+            std::printf("MUL_MAT %-4s M%-4lld %-20s %-12s nmse %.3g %s\n", ggml_type_name(c.wtype), (long long) c.M, c.name,
                         ggml_get_name(g.checked[i]), e, ok ? "ok" : "FAIL");
         }
         ggml_backend_buffer_free(g.buf);
