@@ -131,7 +131,8 @@ size_t partition_branchless(const T * src, size_t n, T * dst, Pred pred) {
 
 // The k-th best of a[0..n) (1 <= k <= n) under `better`, which returns 1
 // when its first argument ranks first and 0 otherwise, as an integer so the
-// partitions above stay branch-free; `better` must be a strict weak order.
+// partitions above stay branch-free; `better` must be a strict weak order
+// and a class type (see ScoreIdBetterI), never a function pointer.
 // Quickselect with two scratch buffers in place of std::nth_element, which
 // left the lone and batch shortlist cuts, the ranking's cuts and the seed
 // at several microseconds each on x86. `a` is read only, so a caller keeps
@@ -220,10 +221,18 @@ T cut_to_best(std::vector<T> & v, size_t keep, Better better, std::vector<T> & s
     return kth;
 }
 
-// score_id_better as an integer without a branch, for the cuts above.
-inline int score_id_better_i(const ScoreId & a, const ScoreId & b) {
-    return static_cast<int>(a.score > b.score) | (static_cast<int>(a.score == b.score) & static_cast<int>(a.id < b.id));
-}
+// score_id_better as an integer without a branch, for the cuts above. A
+// function object, not a function: handed over as a pointer, the compare
+// is an indirect call per element unless the compiler clones the select
+// for the constant pointer, and GCC does not (every compare in
+// cut_to_best and keep_best was an indirect call), which left the cuts
+// slower than std::nth_element on the x86 Ubuntu host while clang inlined
+// them. A class type instantiates the select on the comparator itself.
+struct ScoreIdBetterI {
+    int operator()(const ScoreId & a, const ScoreId & b) const {
+        return static_cast<int>(a.score > b.score) | (static_cast<int>(a.score == b.score) & static_cast<int>(a.id < b.id));
+    }
+};
 
 // Shortlist, middle and rescore lengths for a top-k request (upstream
 // planes_shortlist_len, planes_mid_len, planes_rescore_len).
@@ -1105,10 +1114,13 @@ bool candidate_better(const Candidate & a, const Candidate & b) {
     return a.slot < b.slot;
 }
 
-// candidate_better as an integer without a branch, for the cuts.
-inline int candidate_better_i(const Candidate & a, const Candidate & b) {
-    return static_cast<int>(a.score > b.score) | (static_cast<int>(a.score == b.score) & static_cast<int>(a.slot < b.slot));
-}
+// candidate_better as an integer without a branch, for the cuts (a
+// function object for the reason ScoreIdBetterI is).
+struct CandidateBetterI {
+    int operator()(const Candidate & a, const Candidate & b) const {
+        return static_cast<int>(a.score > b.score) | (static_cast<int>(a.score == b.score) & static_cast<int>(a.slot < b.slot));
+    }
+};
 
 // Cuts cands to its best `keep` under the strict (score, slot) order, in
 // the order they had, and `tops` (aligned with cands) with them.
@@ -1117,7 +1129,8 @@ void keep_best(std::vector<Candidate> & cands, size_t keep, std::vector<float> *
         return;
     }
     std::vector<Candidate> scratch;
-    const Candidate kth = kth_best(cands.data(), cands.size(), keep, candidate_better_i, scratch);
+    const CandidateBetterI better;
+    const Candidate kth = kth_best(cands.data(), cands.size(), keep, better, scratch);
     size_t w = 0;
     for (size_t i = 0; i < cands.size(); ++i) {
         const Candidate c = cands[i];
@@ -1125,7 +1138,7 @@ void keep_best(std::vector<Candidate> & cands, size_t keep, std::vector<float> *
         if (tops != nullptr) {
             (*tops)[w] = (*tops)[i];
         }
-        w += static_cast<size_t>(1 - candidate_better_i(kth, c));
+        w += static_cast<size_t>(1 - better(kth, c));
     }
     // Exactly `keep` under the strict order; only a NaN score, which it
     // does not cover, can leave more, and then the tail goes.
@@ -1208,7 +1221,7 @@ struct Collector {
 
     void cut_back() {
         cut = true;
-        threshold = cut_to_best(top, s_len, score_id_better_i, scratch).score;
+        threshold = cut_to_best(top, s_len, ScoreIdBetterI{},scratch).score;
         if (floor_score != nullptr) {
             double seen = floor_score->load(std::memory_order_relaxed);
             while (threshold > seen && !floor_score->compare_exchange_weak(seen, threshold, std::memory_order_relaxed)) {
@@ -1759,7 +1772,7 @@ bool turbovec_staged_search(
         }
         if (top.size() > s_len) {
             std::vector<ScoreId> scratch;
-            cut_to_best(top, s_len, score_id_better_i, scratch);
+            cut_to_best(top, s_len, ScoreIdBetterI{},scratch);
         }
         list.reserve(top.size());
         for (const ScoreId & c : top) {
@@ -2179,7 +2192,7 @@ bool turbovec_staged_search_batch(
             }
             std::vector<ScoreId> & top = cols[i].top;
             if (top.size() > s_len) {
-                cut_to_best(top, s_len, score_id_better_i, cols[i].scratch);
+                cut_to_best(top, s_len, ScoreIdBetterI{},cols[i].scratch);
             }
             run_query(q, &top, false, false, 1);
         }
