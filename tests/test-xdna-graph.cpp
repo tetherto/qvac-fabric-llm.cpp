@@ -275,6 +275,7 @@ struct fa_case {
     int          mask_extra_rows = 0;  // mask rows past the queries, visible
     int          mask_extra_cols = 0;  // mask columns past the keys, visible
     bool         cpu_op   = false;  // a shape the kernel does not take: ggml-cpu's op runs it
+    bool         cast_f32 = false;  // K and V computed in f32 and cast to f16 as the model does with no KV cache
 };
 
 // The graph the model builds around one attention: a projection of n_tokens
@@ -296,6 +297,11 @@ static norm_graph build_fa(ggml_backend_t cpu, const fa_case & c) {
         vr = ggml_new_tensor_3d(g.ctx, kv_type, Dv, c.kv_heads, n_kv);
         k  = ggml_permute(g.ctx, kr, 0, 2, 1, 3);
         v  = ggml_permute(g.ctx, vr, 0, 2, 1, 3);
+    } else if (c.cast_f32) {
+        kr = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, D, c.kv_heads, n_kv);
+        vr = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, Dv, c.kv_heads, n_kv);
+        k  = ggml_cast(g.ctx, ggml_permute(g.ctx, kr, 0, 2, 1, 3), GGML_TYPE_F16);
+        v  = ggml_cast(g.ctx, ggml_permute(g.ctx, vr, 0, 2, 1, 3), GGML_TYPE_F16);
     } else {
         kr = k = ggml_new_tensor_3d(g.ctx, kv_type, D, n_kv, c.kv_heads);
         vr = v = ggml_new_tensor_3d(g.ctx, kv_type, Dv, n_kv, c.kv_heads);
@@ -407,6 +413,21 @@ static bool fa_result_ok(const fa_case & c, double e) {
 
 static void set_fa_route(fa_route route) {
     setenv("GGML_XDNA_FA_MM", std::to_string((int) route).c_str(), 1);
+}
+
+// whether `be` takes every cast of the graph's K and V (two at least)
+static bool casts_claimed(ggml_backend_t be, ggml_cgraph * gf) {
+    int n = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->op == GGML_OP_CPY) {
+            n++;
+            if (!ggml_backend_supports_op(be, t)) {
+                return false;
+            }
+        }
+    }
+    return n >= 2;
 }
 
 static bool run_fa(norm_graph & g, const fa_case & c, ggml_backend_t be, std::vector<float> & res) {
@@ -901,6 +922,30 @@ static bool test_group_order(ggml_backend_t npu, ggml_backend_t cpu, between wha
     return passed;
 }
 
+// A cast to F16 is claimed from F32 only, and GGML_XDNA_GLUE_CAST=0 leaves it to the scheduler; a cast to F32
+// takes the plain F32 rule whatever its source, with the switch on or off.
+static bool test_cast_claims(ggml_backend_t npu, ggml_backend_t cpu) {
+    ggml_init_params      ip     = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_context *        ctx    = ggml_init(ip);
+    ggml_tensor *         f32    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 8);
+    ggml_tensor *         f16    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 8);
+    ggml_tensor *         to_f16 = ggml_cast(ctx, f32, GGML_TYPE_F16);
+    ggml_tensor *         to_f32 = ggml_cast(ctx, f16, GGML_TYPE_F32);
+    ggml_backend_buffer_t buf    = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    const bool            on16   = ggml_backend_supports_op(npu, to_f16);
+    const bool            on32   = ggml_backend_supports_op(npu, to_f32);
+    setenv("GGML_XDNA_GLUE_CAST", "0", 1);
+    const bool off16 = ggml_backend_supports_op(npu, to_f16);
+    const bool off32 = ggml_backend_supports_op(npu, to_f32);
+    unsetenv("GGML_XDNA_GLUE_CAST");
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    const bool ok = on16 && on32 && !off16 && off32;
+    std::printf("CPY casts claimed: to F16 %d, to F32 %d; GLUE_CAST=0: to F16 %d, to F32 %d %s\n", on16, on32, off16,
+                off32, ok ? "ok" : "FAIL");
+    return ok;
+}
+
 // Qwen3.5-0.8B's residual and FFN widths, and a short prompt's rows
 static constexpr int64_t CROP_EMBD   = 1024;
 static constexpr int64_t CROP_FFN    = 3584;
@@ -1073,6 +1118,8 @@ int main(void) {
         // the bound by size follows the route that would run: 64M visible triples for the host kernel, 8M when ggml-cpu's op would
         { "by size: 21M triples, the host kernel",    FA_ROUTE_BY_SIZE,      4, 2300,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false },
         { "by size: 21M triples, HOST_FA=0: the array", FA_ROUTE_BY_SIZE,    4, 2300,    0,   1,  1, FA_FULL,     0, 1.0f,    false, true,  256, 2, false, 0 },
+        { "K and V cast from f32: the host",          FA_ROUTE_HOST,         4,  912,    0,   1,  1, FA_BAND,   512, 1.0f,    false, false, 256, 2, false, 1, 0, 0, 0, false, true },
+        { "K and V cast from f32: the array",         FA_ROUTE_ARRAY,        4, 1300,    0,   1,  2, FA_BAND,   512, 1.0f,    false, true,  256, 2, false, 1, 0, 0, 0, false, true },
     };
     for (const fa_case & c : fa_cases) {
         set_fa_route(c.route);
@@ -1084,9 +1131,11 @@ int main(void) {
             return 1;
         }
         const double e  = nmse(want, got);
-        const bool   ok = fa_result_ok(c, e);
-        passed          = passed && ok;
-        std::printf("FLASH_ATTN_EXT %-52s nmse %.3g %s\n", c.name, e, ok ? "ok" : "FAIL");
+        // the casts of such a graph are the backend's own (host ops inside its chunk), not a split to the CPU
+        const bool   claimed = !c.cast_f32 || casts_claimed(npu, g.gf);
+        const bool   ok      = claimed && fa_result_ok(c, e);
+        passed               = passed && ok;
+        std::printf("FLASH_ATTN_EXT %-52s nmse %.3g %s%s\n", c.name, e, claimed ? "" : "casts not claimed ", ok ? "ok" : "FAIL");
         ggml_backend_buffer_free(g.buf);
         ggml_free(g.ctx);
     }
@@ -1121,6 +1170,8 @@ int main(void) {
         ggml_backend_buffer_free(g.buf);
         ggml_free(g.ctx);
     }
+
+    passed = test_cast_claims(npu, cpu) && passed;
 
     // a call runs the 128-row blocks its rows fill: one up to 128 rows, an odd count at 300 and 520, and 2100
     // rows are 17 blocks, a 16-block slab and a last one of one block
