@@ -30,9 +30,49 @@ struct stage_profile {
     }
 };
 
+static MLMultiArray * decoder_output(id<MLFeatureProvider> result) {
+    MLMultiArray * y = [result featureValueForName:@"y"].multiArrayValue;
+    require(y && y.dataType == MLMultiArrayDataTypeFloat32 && y.shape.count == 2 && y.shape[0].intValue == 512 && y.shape[1].intValue == 5120, "unexpected decoder FFN output");
+    return y;
+}
+
+static MLModel * decoder_load(const std::string & assets, const char * name, int layer, temporary_model & compiled) {
+    NSError * failure = nil;
+    NSString * path = [NSString stringWithFormat:@"%s/%s.mlpackage", assets.c_str(), name];
+    NSURL * model_url = nil;
+    if (std::getenv("FFN_COREML_CACHE_COMPILED")) {
+        NSString * cache_path = [[NSString stringWithFormat:@"%s/%s.mlmodelc", assets.c_str(), name] stringByResolvingSymlinksInPath];
+        model_url = [NSURL fileURLWithPath:cache_path];
+        NSFileManager * files = [NSFileManager defaultManager];
+        const bool create_cache = ![files fileExistsAtPath:cache_path];
+        if (create_cache) {
+            compiled.url = [MLModel compileModelAtURL:[NSURL fileURLWithPath:path] error:&failure];
+            require(compiled.url, failure ? failure.localizedDescription.UTF8String : "decoder Core ML compilation failed");
+            NSURL * staging = [NSURL fileURLWithPath:[cache_path stringByAppendingFormat:@".%@.tmp", NSUUID.UUID.UUIDString]];
+            if (![files copyItemAtURL:compiled.url toURL:staging error:&failure] || ![files moveItemAtURL:staging toURL:model_url error:&failure]) {
+                [files removeItemAtURL:staging error:nullptr];
+                require(false, failure ? failure.localizedDescription.UTF8String : "compiled cache creation failed");
+            }
+        }
+        printf("decoder_compiled_cache_layer=%d created=%d path=%s\n", layer, int(create_cache), cache_path.UTF8String);
+    } else {
+        compiled.url = [MLModel compileModelAtURL:[NSURL fileURLWithPath:path] error:&failure];
+        require(compiled.url, failure ? failure.localizedDescription.UTF8String : "decoder Core ML compilation failed");
+        model_url = compiled.url;
+    }
+    MLModelConfiguration * configuration = [[MLModelConfiguration alloc] init];
+    configuration.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
+    MLModel * model = [MLModel modelWithContentsOfURL:model_url configuration:configuration error:&failure];
+    require(model, failure ? failure.localizedDescription.UTF8String : "decoder Core ML load failed");
+    return model;
+}
+
 struct decoder_ffn {
     temporary_model compiled{nil};
+    temporary_model compiled2{nil};
     MLModel * model = nil;
+    // optional second suffix package, run at the same time on the other ANE
+    MLModel * model2 = nil;
     MLMultiArray * input = nil;
     MLDictionaryFeatureProvider * features = nil;
     metal_ffn prefix;
@@ -47,17 +87,37 @@ struct decoder_ffn {
     void predict(bool resident = false) {
         if (!direct_input && !resident) { memcpy(input.dataPointer, x.data(), x.size() * sizeof(float)); }
         profile.end(3);
+        __block id<MLFeatureProvider> second = nil;
+        __block NSError * second_failure = nil;
+        dispatch_group_t group = dispatch_group_create();
+        if (model2) {
+            MLModel * other = model2;
+            MLDictionaryFeatureProvider * inputs = features;
+            dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                @autoreleasepool {
+                    NSError * failure = nil;
+                    second = [other predictionFromFeatures:inputs error:&failure];
+                    second_failure = failure;
+                }
+            });
+        }
         NSError * failure = nil;
         id<MLFeatureProvider> result = [model predictionFromFeatures:features error:&failure];
+        dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
         profile.end(4);
         require(result, failure ? failure.localizedDescription.UTF8String : "Core ML prediction failed");
-        MLMultiArray * y = [result featureValueForName:@"y"].multiArrayValue;
-        require(y && y.dataType == MLMultiArrayDataTypeFloat32 && y.shape.count == 2 && y.shape[0].intValue == 512 && y.shape[1].intValue == 5120, "unexpected decoder FFN output");
+        require(!model2 || second, second_failure ? second_failure.localizedDescription.UTF8String : "second Core ML prediction failed");
+        MLMultiArray * y = decoder_output(result);
+        MLMultiArray * y2 = model2 ? decoder_output(second) : nil;
         const float * values = static_cast<const float *>(y.dataPointer);
+        const float * values2 = y2 ? static_cast<const float *>(y2.dataPointer) : nullptr;
         size_t row_stride = y.strides[0].unsignedLongLongValue, column_stride = y.strides[1].unsignedLongLongValue;
+        size_t row_stride2 = y2 ? y2.strides[0].unsignedLongLongValue : 0, column_stride2 = y2 ? y2.strides[1].unsignedLongLongValue : 0;
         for (int t = 0; t < 512; ++t) {
             for (int h = 0; h < 5120; ++h) {
-                float value = values[t * row_stride + h * column_stride] * inverse_scale;
+                float value = values[t * row_stride + h * column_stride];
+                if (values2) { value += values2[t * row_stride2 + h * column_stride2]; }
+                value *= inverse_scale;
                 if (!std::isfinite(value)) { throw std::runtime_error("non-finite integrated FFN output"); }
                 partial[t * 5120 + h] = value;
             }
@@ -108,37 +168,23 @@ struct decoder_ffn {
             return;
         }
         NSError * failure = nil;
-        NSString * path = [NSString stringWithFormat:@"%s/ffn-512.mlpackage", assets.c_str()];
-        NSURL * model_url = nil;
-        if (std::getenv("FFN_COREML_CACHE_COMPILED")) {
-            NSString * cache_path = [[NSString stringWithFormat:@"%s/ffn-512.mlmodelc", assets.c_str()] stringByResolvingSymlinksInPath];
-            model_url = [NSURL fileURLWithPath:cache_path];
-            NSFileManager * files = [NSFileManager defaultManager];
-            const bool create_cache = ![files fileExistsAtPath:cache_path];
-            if (create_cache) {
-                compiled.url = [MLModel compileModelAtURL:[NSURL fileURLWithPath:path] error:&failure];
-                require(compiled.url, failure ? failure.localizedDescription.UTF8String : "decoder Core ML compilation failed");
-                NSURL * staging = [NSURL fileURLWithPath:[cache_path stringByAppendingFormat:@".%@.tmp", NSUUID.UUID.UUIDString]];
-                if (![files copyItemAtURL:compiled.url toURL:staging error:&failure] || ![files moveItemAtURL:staging toURL:model_url error:&failure]) {
-                    [files removeItemAtURL:staging error:nullptr];
-                    require(false, failure ? failure.localizedDescription.UTF8String : "compiled cache creation failed");
-                }
-            }
-            printf("decoder_compiled_cache_layer=%d created=%d path=%s\n", layer, int(create_cache), cache_path.UTF8String);
-        } else {
-            compiled.url = [MLModel compileModelAtURL:[NSURL fileURLWithPath:path] error:&failure];
-            require(compiled.url, failure ? failure.localizedDescription.UTF8String : "decoder Core ML compilation failed");
-            model_url = compiled.url;
-        }
-        MLModelConfiguration * configuration = [[MLModelConfiguration alloc] init];
-        configuration.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
-        model = [MLModel modelWithContentsOfURL:model_url configuration:configuration error:&failure];
-        require(model, failure ? failure.localizedDescription.UTF8String : "decoder Core ML load failed");
+        model = decoder_load(assets, "ffn-512", layer, compiled);
         NSDictionary * metadata = model.modelDescription.metadata[MLModelCreatorDefinedKey];
         int gpu_channels = [metadata[@"channel_start"] intValue];
         int ane_channels = [metadata[@"channel_count"] intValue];
-        require([metadata[@"source_layer"] intValue] == layer && gpu_channels > 0 && gpu_channels % 256 == 0 && ane_channels > 0 && gpu_channels + ane_channels == 17408, "wrong integrated FFN package");
+        int ane2_channels = 0;
         double scale = [metadata[@"output_scale"] doubleValue];
+        NSFileManager * files = [NSFileManager defaultManager];
+        NSString * second = [NSString stringWithFormat:@"%s/ffn-512-1", assets.c_str()];
+        if ([files fileExistsAtPath:[second stringByAppendingString:@".mlpackage"]] ||
+            (std::getenv("FFN_COREML_CACHE_COMPILED") && [files fileExistsAtPath:[[second stringByAppendingString:@".mlmodelc"] stringByResolvingSymlinksInPath]])) {
+            model2 = decoder_load(assets, "ffn-512-1", layer, compiled2);
+            NSDictionary * metadata2 = model2.modelDescription.metadata[MLModelCreatorDefinedKey];
+            ane2_channels = [metadata2[@"channel_count"] intValue];
+            require([metadata2[@"source_layer"] intValue] == layer && [metadata2[@"channel_start"] intValue] == gpu_channels + ane_channels &&
+                    [metadata2[@"output_scale"] doubleValue] == scale && ane2_channels > 0, "second FFN package must follow the first");
+        }
+        require([metadata[@"source_layer"] intValue] == layer && gpu_channels > 0 && gpu_channels % 256 == 0 && ane_channels > 0 && gpu_channels + ane_channels + ane2_channels == 17408, "wrong integrated FFN package");
         require(scale == 1 || scale == 16, "unsupported integrated output scale");
         inverse_scale = 1.0 / scale;
         prefix.init(gguf, assets, layer, 512, false, gpu_channels, true, direct_input);
@@ -150,7 +196,7 @@ struct decoder_ffn {
         require(input, "integrated FFN input allocation failed");
         features = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": input} error:&failure];
         require(features, "integrated FFN provider failed");
-        printf("decoder_layer=%d metal_channels=%d coreml_channels=%d output_scale=%.0f\n", layer, gpu_channels, ane_channels, scale);
+        printf("decoder_layer=%d metal_channels=%d coreml_channels=%d coreml2_channels=%d output_scale=%.0f\n", layer, gpu_channels, ane_channels, ane2_channels, scale);
         join.init(prefix.backend, 5120, 512);
         std::vector<float> warm(x.size());
         profile.begin();

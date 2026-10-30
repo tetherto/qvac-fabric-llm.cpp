@@ -12,6 +12,19 @@ Start with [RESULTS.md](RESULTS.md), the [24-layer preset](configs/qwen3.8-27b-2
 - Layer 31 uses FP16 weights. The other 23 sidecars use 8-bit per-tensor palettes, tanh SiLU, channel chunks of 2048, and output scale 1.
 - Attention, recurrent-state operations, other FFN channels, and single-token decode remain on Metal. This is about 13.24% of uniform-width FFN channel work, not 24 complete layers or 13.24% of total prefill time.
 
+## Dual Neural Engine configuration
+
+The [64-layer dual preset](configs/qwen3.8-27b-64-dual.json) uses both Neural Engines on M3 Ultra. Each of the 64 FFNs keeps its first 8192 channels on Metal. Core ML gets two 4608-channel packages per layer, `ffn-512.mlpackage` and `ffn-512-1.mlpackage`. The runtime loads the second package when it exists, runs both predictions at the same time, and sums them in the existing output conversion. Two concurrent Core ML predictions ran on separate ANEs in our tests; one 6144-channel package took 9.75 ms, two concurrent 3072-channel packages took 5.48 ms.
+
+Measured on M3 Ultra (96 GB), 2026-10-30, 3 split repetitions against 6 Metal repetitions:
+
+| Prompt | Metal prefill | Dual prefill | Throughput |
+| --- | ---: | ---: | ---: |
+| 2048 tokens | 6.796 s | 5.491 s | +23.8% |
+| 8192 tokens | 28.062 s | 22.776 s | +23.2% |
+
+Decode speed is unchanged, with zero decode offloads. Accuracy was qualified on 65536 held-out tokens of real, non-repeated text (code, documentation, prose, mathematics) instead of repeated prompts. Mean NLL change is +0.00024 nats/token (95% bootstrap upper bound +0.00079), mean KL 0.00042, and the worst domain (prose) +0.00101 nats/token with KL 0.00108. An all-Metal control through the same boundary has mean KL 0.0000014. The repeated-prompt KL suite above overstates divergence for this model; on held-out text it reads 5-10x lower. The held-out gate scripts and raw logs are not committed. Task benchmarks, memory and power were not measured.
+
 ## Build and run
 
 Use Apple Silicon/macOS with Core ML and Metal. Exports target macOS 15; conversion used coremltools 9.0.
@@ -44,7 +57,16 @@ A full qualification checks code/prose/math at 512 and 2048 tokens, plus build-g
 
 `ASSETS/layers.txt` lists selected IDs. Each `ASSETS/layerN/ffn-512.mlpackage` contains that layer's suffix. Weights and compiled models are not committed. On the original benchmark Mac, the retained 24-layer selection is `$HOME/qwen38-overall-20261029/combined/expand24/selection`. Connection details remain in the task conversation. Recorded paths replace the original user home with `${HOME}`.
 
-To recreate packages from the same GGUF, install coremltools 9.0 and the `gguf-py` dependencies, then use a fresh asset directory:
+`export_sidecar.py` builds a complete asset directory from a preset: it exports and palettizes every selected layer, writes one or two packages per layer, `layers.txt`, and an `export.json` manifest with the GGUF SHA256, tool hashes and channel ranges. The destination must not exist; failures remove temporary output. Use a separate Python environment with the pinned requirements:
+
+```sh
+python3 -m venv .venv-ffn-coreml
+.venv-ffn-coreml/bin/python -m pip install -r examples/ffn-coreml/requirements.txt
+.venv-ffn-coreml/bin/python examples/ffn-coreml/export_sidecar.py "$MODEL" \
+  examples/ffn-coreml/configs/qwen3.8-27b-64-dual.json "$ASSETS" --workers 8
+```
+
+The 64-layer dual export needs about 8.4 GB for compressed packages, plus the same again for compiled caches unless they are APFS clones. The equivalent manual steps for the 24-layer preset, with the low-level tools:
 
 ```sh
 mkdir -p "$ASSETS"
@@ -73,6 +95,7 @@ Compiled-cache reuse follows the embedding-Gemma pattern. It creates `ffn-512.ml
 - `FFN_COREML_SINGLE_ENCODER`: scopes single-encoder execution to registered custom graphs. This avoids an observed fusion-boundary numerical change. It restores the configured default encoder count; future general-purpose support must preserve any runtime override instead.
 - `FFN_COREML_DECODE_PLAN=512`: restores the full Metal allocation plan before decode, including output capacity. Omitting this previously caused a decode regression. Transition cost is included in timing.
 - `FFN_COREML_PROFILE=1`: per-layer callback stages. Disable profiling and graph tracing for final timing.
+- `decoder-coreml.mm`: an optional `ffn-512-1` package (package or compiled cache) must start where `ffn-512` ends and share its output scale. Its prediction runs on a GCD queue while the first runs on the calling thread.
 
 Callbacks and builder state are process-global. The harness drives contexts serially. Do not enable this as a multi-request/server backend without lifecycle, concurrency, cancellation, cache validation, and fallback work. This branch intentionally preserves the tested experiment rather than introducing production integration.
 

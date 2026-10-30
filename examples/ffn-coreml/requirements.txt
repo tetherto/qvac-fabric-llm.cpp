@@ -1,0 +1,5 @@
+# Keep the validated Core ML sidecar toolchain in its separate environment.
+coremltools==9.0  # check_requirements: ignore "=="
+numpy==2.0.2  # check_requirements: ignore "=="
+pyyaml==6.0.3  # check_requirements: ignore "=="
+tqdm==4.70.1  # check_requirements: ignore "=="
