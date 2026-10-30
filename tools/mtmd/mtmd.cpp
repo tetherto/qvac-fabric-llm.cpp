@@ -29,7 +29,7 @@
 #include <vector>
 
 // remember to bump this if the serialization format changes
-#define MTMD_SERIALIZATION_VERSION 2
+#define MTMD_SERIALIZATION_VERSION 3
 
 struct mtmd_serialization {
     // note: using 64-bit here for future-proofing
@@ -275,6 +275,8 @@ struct mtmd_image_tokens {
         ser.write((uint32_t)pos);
         ser.write(image_idx);
         ser.write(n_temporal_merge);
+        ser.write(grid_x);
+        ser.write(grid_y);
         ser.write(id);
         batch_f32.serialize(ser);
     }
@@ -288,6 +290,8 @@ struct mtmd_image_tokens {
         pos = (mtmd_pos_type)pos_raw;
         image_idx = ser.read<uint32_t>();
         n_temporal_merge = ser.read<uint32_t>();
+        grid_x = ser.read<uint32_t>();
+        grid_y = ser.read<uint32_t>();
         id = ser.read<std::string>();
         batch_f32.deserialize(ser);
     }
@@ -2742,6 +2746,19 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
         nullptr, // audio tokens
     };
     chunks->entries.emplace_back(std::move(chunk_image));
+
+    for (const auto & grid : std::vector<std::pair<uint32_t, uint32_t>>{{1, 1}, {2, 1}, {3, 1}, {2, 2}}) {
+        mtmd_image_tokens_ptr tiled(new mtmd_image_tokens);
+        tiled->nx = 24 * grid.first;
+        tiled->ny = 24 * grid.second;
+        tiled->pos = MTMD_POS_TYPE_MROPE;
+        tiled->grid_x = grid.first;
+        tiled->grid_y = grid.second;
+        tiled->n_temporal_merge = 2;
+        tiled->batch_f32.entries.resize(std::max(2u, grid.first * grid.second));
+        tiled->id = "tiled_image";
+        chunks->entries.push_back({MTMD_INPUT_CHUNK_TYPE_IMAGE, {}, std::move(tiled), nullptr});
+    }
 
     return chunks;
 }
