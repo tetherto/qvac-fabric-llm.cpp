@@ -100,6 +100,12 @@ static bool xdna_glue_claims(const struct ggml_tensor * op) {
         return op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
                (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
     }
+    // An F32 -> F16 ggml_cast (a CPY into its own result), as llama casts K and V
+    // before the attention of a model with no KV cache. Casts to F32 take the rule below.
+    if (op->op == GGML_OP_CPY && op->src[1] == op && op->type == GGML_TYPE_F16) {
+        return xdna_env_int("GGML_XDNA_GLUE_CAST", 1) != 0 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
+               ggml_is_contiguous(op);
+    }
     // Host-fallback writes op->data; only claim plain contiguous f32 tensors.
     if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
         return false;
