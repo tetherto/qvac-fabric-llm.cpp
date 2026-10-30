@@ -13,10 +13,15 @@ struct ggml_tensor;
 struct xdna_kernel_pool;
 
 // True when `op` is a MUL_MAT this route runs: a weight the decode GEMV packs
-// (or Q8_0, into its 8-bit form),
-// at least 64 activation rows, and the artifact present (GGML_XDNA_PGEMM=0
-// turns the route off).
+// (or Q8_0, into its 8-bit form), an activation of any number of rows, and the
+// artifact present (GGML_XDNA_PGEMM=0 turns the route off), unless it is one
+// block of rows or fewer and its product is below GGML_XDNA_PGEMM_MIN_MACS
+// multiply-adds: the host does that one.
 bool xdna_pgemm_supported(const struct ggml_tensor * op);
+
+// True when `op` is a MUL_MAT this route could run but leaves to the host for
+// its size. The bf16 GEMM must not take it either.
+bool xdna_pgemm_host_cheaper(const struct ggml_tensor * op);
 
 // A graph is starting: the activation layouts kept for the projections that
 // share an input belong to the previous one.

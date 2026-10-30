@@ -103,7 +103,8 @@ EmbeddingGemma 2 (`gemma-embedding2`, the `ggml-org/embeddinggemma-2-GGUF`
 Q8_0 and BF16 files) runs without a model-specific path:
 
 - Its weight projections take the [MUL_MAT](#mul_mat) routes. In the Q8_0
-  file they are all on the array: the `Q8_0` weights through the prefill GEMM,
+  file they are on the array, except for the small calls of short inputs (see
+  the size rule below): the `Q8_0` weights through the prefill GEMM,
   repacked to the 8-bit form with one extra rounding of the codes, and the
   `BF16` `per_layer_model_proj` through the bf16 GEMM. In the BF16 file every
   projection but `output` is on the array: its N is 768, not a multiple of
@@ -192,11 +193,25 @@ builds, one command at a time on an idle host (10th percentile, M 15):
   Only a layer's GEGLU and down projection (24 a pass) have no host op between
   them.
 
+So a call of one block of rows or fewer whose product (rows x K x N) is below
+`GGML_XDNA_PGEMM_MIN_MACS` multiply-adds (40 million) is left to the host: the
+CPU backend computes it inside the NPU chunk, in its own arithmetic and with
+the glue's threads, and the weight is never packed for the array. A 15-token
+EmbeddingGemma 2 Q8_0 pass makes every projection that way and takes 16.8 ms
+instead of 44.2 (0.80 J instead of 1.89); at 67 tokens the small ones do and
+the pass takes 0.87 of the time; from 132 tokens on, the products are large or
+the calls span blocks, and nothing changes. A larger threshold or no row limit
+lost: at 262 tokens, 100 million multiply-adds took 1.03 of the array's time
+and 400 million 1.19, and above 100 million the host also costs more energy.
+Qwen3.5-0.8B's prefill of 128 tokens, whose gated-delta-net projections are
+this small, runs 12 to 26% faster (two ABBA runs; pp128 is bimodal); at 512
+tokens they stay on the array and pp512 is unchanged.
+
 | input | CPU | XDNA |
 | :-- | --: | --: |
 | one 1011-token text | 362 ms | 271 ms |
 | eight texts, 1188 tokens, one batch | 444 ms | 364 ms |
-| one 18-33 token query | 7-16 ms | ~100 ms |
+| one 15-token query | 7.5 ms | 17 ms |
 
 The BF16 file is still slower on the array in time and cheaper in energy: one
 912-token text takes 263 ms and 15.4 J per pass against the CPU's 196 ms and
@@ -452,6 +467,7 @@ For users - a trade-off, a size or a location:
 | `GGML_XDNA_SPIN_US` | 0 | poll this many microseconds for completion before blocking; `-1` polls until it completes |
 | `GGML_XDNA_GLUE_THREADS` | 4 | host threads for the ops the backend runs on the host in a decode-sized chunk, except the vocabulary projection, which takes 12 (at most `GGML_XDNA_GLUE_THREADS_BIG`) |
 | `GGML_XDNA_GLUE_THREADS_BIG` | 16 | the same, for a chunk of 32 tokens or more |
+| `GGML_XDNA_PGEMM_MIN_MACS` | 40000000 | the multiply-adds (rows x K x N) below which a prefill GEMM call of one 128-row block or fewer is left to the host, a command costing ~125 us before the array computes anything; `0` leaves every call to the array |
 | `GGML_XDNA_HOST_DECODE_THREADS` | 8 | host threads for the decode of a model wider than the fused layers (see [The fused decode recurrent layer](#the-fused-decode-recurrent-layer)); `0` runs that decode per op on the array, slower at more energy a token |
 | `GGML_XDNA_HOST_DECODE_PIN` | 1 | in an OpenMP build, pins those threads one a core, filling one L3 domain before the next, and hands every borrowed thread its CPU mask back after each decode; `0` leaves their placement to the OS, at more energy a token (2.75 against 2.45 J on the 4B) |
 | `GGML_XDNA_ARENA_MB` | 256 | size of each chunk of the device-buffer arena, in MiB |

@@ -1208,6 +1208,10 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     if (xdna_pgemm_supported(op)) {
         return true;
     }
+    // Too small for a command: the host runs it, not the bf16 GEMM below.
+    if (xdna_pgemm_host_cheaper(op)) {
+        return false;
+    }
 
     if (ops->gemm_xclbin_decode.empty()) {
         return false;

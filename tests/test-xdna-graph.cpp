@@ -419,6 +419,48 @@ static norm_graph build_projection(ggml_backend_t be, int64_t K, int64_t N, int6
     return g;
 }
 
+struct size_case {
+    const char *   name;
+    enum ggml_type wtype;
+    int64_t        M, K, N;
+    bool           on_array;
+};
+
+// A call of one block of rows or fewer whose product is below GGML_XDNA_PGEMM_MIN_MACS multiply-adds is the
+// host's, in the CPU backend's own bits whatever the weight type (the bf16 GEMM does not take it either); a
+// larger product or more rows is the array's. The graphs stay allocated to the end: the packed weights are
+// keyed by the tensors' addresses, which a freed one hands on.
+static bool test_size_rule(ggml_backend_t npu, ggml_backend_t cpu, double tol) {
+    const size_case cases[] = {
+        { "Q8_0, 15 rows: the host",                GGML_TYPE_Q8_0, 15,  1024, 1024, false },
+        { "Q4_K, 15 rows: the host",                GGML_TYPE_Q4_K, 15,  1024, 1024, false },
+        { "Q8_0, one block of rows: the host",      GGML_TYPE_Q8_0, 128, 512,  512,  false },
+        { "Q8_0, 100 rows, a large product: array", GGML_TYPE_Q8_0, 100, 1024, 1024, true },
+        { "Q4_K, 100 rows, a large product: array", GGML_TYPE_Q4_K, 100, 1024, 1024, true },
+        { "Q8_0, 129 rows, a small product: array", GGML_TYPE_Q8_0, 129, 512,  512,  true },
+    };
+    std::vector<norm_graph> graphs;
+    bool                    passed = true;
+    for (const size_case & c : cases) {
+        graphs.push_back(build_gemms(cpu, c.wtype, c.M, { { c.K, c.N } }));
+        norm_graph &                    g = graphs.back();
+        std::vector<std::vector<float>> want, got;
+        if (!run(g, cpu, want) || !run(g, npu, got)) {
+            std::printf("test-xdna-graph: compute failed\n");
+            return false;
+        }
+        const double e  = nmse(want[0], got[0]);
+        const bool   ok = ggml_backend_supports_op(npu, g.checked[0]) && (c.on_array ? e > 0.0 && e < tol : e == 0.0);
+        passed          = passed && ok;
+        std::printf("MUL_MAT size rule, %-41s nmse %.3g %s\n", c.name, e, ok ? "ok" : "FAIL");
+    }
+    for (norm_graph & g : graphs) {
+        ggml_backend_buffer_free(g.buf);
+        ggml_free(g.ctx);
+    }
+    return passed;
+}
+
 static bool test_output_in_place(ggml_backend_t npu, ggml_backend_t cpu, int64_t M, double tol) {
     const int64_t K = 1024, N = 1024;
     ggml_tensor * cpu_guard = nullptr;
@@ -742,6 +784,9 @@ int main(void) {
     // Q8_K on the CPU, which leaves them 1-2e-4 apart
     const double tol    = 1e-3;
     bool         passed = true;
+
+    // the route cases below are about the array at small sizes; the size rule has its own at the end
+    setenv("GGML_XDNA_PGEMM_MIN_MACS", "0", 1);
     for (bool side_reader : { false, true }) {
         norm_graph                      g = build(cpu, side_reader, 1024, 1024, 128);
         std::vector<std::vector<float>> want, got;
@@ -882,6 +927,12 @@ int main(void) {
             }
         }
     }
+
+    // a new backend context drops the weights the earlier cases packed
+    ggml_backend_free(npu);
+    npu = ggml_backend_dev_init(dev, nullptr);
+    unsetenv("GGML_XDNA_PGEMM_MIN_MACS");
+    passed = npu != nullptr && test_size_rule(npu, cpu, tol) && passed;
 
     ggml_backend_free(npu);
     ggml_backend_free(cpu);

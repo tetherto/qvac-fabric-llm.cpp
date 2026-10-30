@@ -65,6 +65,10 @@ constexpr int          A_COL0      = 6;              // the two A streams' shim 
 constexpr int          MAX_BLOCKS  = 16;
 // Longest K the gated passes take, and so the f32 row they lay out in one.
 constexpr int          MAX_K       = 4096;
+// A command costs ~125 us before the array computes anything, so a call of one block or less whose product
+// (rows x K x N) is below this many multiply-adds is cheaper on the host: 15 tokens ran in 16.5 ms with it, 31.8
+// without. A call of several blocks stays: the host's cost grows with its rows, the command's hardly.
+constexpr int          PGEMM_MIN_MACS = 40000000;
 // C blocks in flight per column, two descriptors a block (target, sink).
 constexpr int          C_RING      = 3;
 // Header word 6, the cores' output mode: plain halves of the accumulator, the
@@ -762,7 +766,7 @@ weights * weights_for(xdna_kernel_pool *                       pool,
 // ggml-xdna.cpp: the BO a host pointer of the backend's buffers lies in
 xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset);
 
-bool xdna_pgemm_supported(const ggml_tensor * op) {
+static bool pgemm_shape_supported(const ggml_tensor * op) {
     if (!op || op->op != GGML_OP_MUL_MAT || xdna_env_int("GGML_XDNA_PGEMM", 1) == 0 || !artifact_present()) {
         return false;
     }
@@ -803,6 +807,20 @@ bool xdna_pgemm_supported(const ggml_tensor * op) {
     }
     const xdna_gemv_geom g = geom_of(w);
     return g.valid() && g.K % KS == 0 && g.n_out() <= 256;
+}
+
+static bool pgemm_below_min_macs(const ggml_tensor * op) {
+    const int64_t rows = ggml_nrows(op->src[1]);
+    const int64_t macs = op->src[1]->ne[0] * rows * op->src[0]->ne[1];
+    return rows <= MBLK && macs < (int64_t) xdna_env_int("GGML_XDNA_PGEMM_MIN_MACS", PGEMM_MIN_MACS);
+}
+
+bool xdna_pgemm_supported(const ggml_tensor * op) {
+    return pgemm_shape_supported(op) && !pgemm_below_min_macs(op);
+}
+
+bool xdna_pgemm_host_cheaper(const ggml_tensor * op) {
+    return pgemm_shape_supported(op) && pgemm_below_min_macs(op);
 }
 
 void xdna_pgemm_graph_begin(void) {
