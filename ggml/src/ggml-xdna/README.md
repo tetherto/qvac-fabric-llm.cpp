@@ -82,7 +82,7 @@ path for a model the fused design does cover.
 | `SSM_CONV`, from 64 tokens | `kernels/conv.py` | opt-in, `GGML_XDNA_CONV=1`; the host is cheaper and is what runs otherwise |
 | the prefill GDN's conv input | `kernels/gdn_conv.py` | opt-in, `GGML_XDNA_GDN_CONV=1`; the host is faster (pp512 1900 against 1680 t/s on the 0.8B) and is what runs otherwise |
 | `GATED_DELTA_NET`, from 144 tokens a sequence | `kernels/gdn_mm.py` | on, `GGML_XDNA_GDN_MM=0` for the host; below 144 the host is quicker at less energy a token |
-| `FLASH_ATTN_EXT` of 2 KV heads and D = 256, from 8M visible (query, key, head) triples a call | `kernels/attn_mm.py` | on, `GGML_XDNA_FA_MM=0` for the host, `=2` for the array whatever the size; below that the host is quicker: a call pays two hardware-context switches (~5 ms) |
+| `FLASH_ATTN_EXT` of 2 KV heads and D = 256, from 64M visible (query, key, head) triples a call | `kernels/attn_mm.py` | on, `GGML_XDNA_FA_MM=0` for the host, `=2` for the array whatever the size; below that the host kernel is quicker: a call pays two hardware-context switches (~5 ms) |
 
 ### Everything else
 
@@ -143,7 +143,9 @@ Q8_0 and BF16 files) runs without a model-specific path:
   The array's prefill attention kernel (4 query heads over 2 KV heads of 256,
   a window and the packed sequence, scale 1) takes a call once it is large
   enough to repay its two hardware-context switches (~5 ms, the projections
-  around it are another xclbin); see `GGML_XDNA_FA_MM`.
+  around it are another xclbin): from 64M visible (query, key, head) triples,
+  which is a Qwen3.5-0.8B prefill at a depth of ~16k tokens or an
+  EmbeddingGemma 2 input of ~16k tokens (see `GGML_XDNA_FA_MM`).
 - An input of one token runs whole on the host, as the decode of a model
   wider or narrower than the fused layers does. The model's residual width is
   512, not 1024, so the backend logs once that "its decode runs on the host",
@@ -544,8 +546,8 @@ Diagnostics - nothing is measured unless they are set:
 - The device reports itself to the scheduler as an integrated GPU: its buffers
   are host memory, and the free memory it reports is all of system memory, so
   any `--fit` accounting is nominal.
-- EmbeddingGemma 2's attention runs on the host below ~2300 tokens, and its
-  full-attention layers (heads of 512, one KV head) at any length: the prefill
-  attention kernel takes heads of 256 over 2 KV heads, and each call pays two
-  hardware-context switches. Its f16 casts of K and V run on the CPU backend,
-  so the graph splits once per layer.
+- EmbeddingGemma 2's attention runs on the host kernel below ~16k tokens, and
+  its full-attention layers (heads of 512, one KV head) at any length: the
+  prefill attention kernel takes heads of 256 over 2 KV heads, and each call
+  pays two hardware-context switches. Its f16 casts of K and V run on the CPU
+  backend, so the graph splits once per layer.
