@@ -24,10 +24,12 @@
 // small for the array (the size rule, tried either side of both its bounds),
 // comes out within the host kernel's bound (looser below the 64 queries of
 // ggml-cpu's tile, whose own op is the less exact there). The host kernel is
-// run on heads of 64 to 512, 1 to 8 query heads a KV head, f16 and f32 K and
-// V, causal, bidirectional and banded masks, packed sequences, a mask with
-// holes and one with finite values, and on its portable kernels
-// (GGML_XDNA_HOST_FA=2).
+// run on heads of 64 to 1024, K and V heads of different sizes, 1 to 32 query
+// heads a KV head, f16 and f32 K and V, causal, bidirectional and banded masks,
+// packed sequences, rows that see nothing, a mask with holes and one with
+// finite values, masks with rows and columns past the queries and keys, and on
+// its portable kernels (GGML_XDNA_HOST_FA=2). Two attentions of one graph whose
+// mask a node rewrites in place between them each get their own mask's answer.
 //
 // BF16 and F16 weight projections, which no quantized route carries, through
 // the bf16 GEMM: an M that fits the decode block, one that takes several
@@ -214,7 +216,7 @@ static norm_graph build_one_token(ggml_backend_t cpu, int64_t K, int64_t N) {
     return g;
 }
 
-enum fa_mask { FA_CAUSAL, FA_FULL, FA_BAND, FA_HOLES, FA_BIAS };
+enum fa_mask { FA_CAUSAL, FA_FULL, FA_BAND, FA_HOLES, FA_BIAS, FA_EMPTY_ROWS };
 
 static const int FA_KV_HEADS = 2;
 static const int FA_HEAD_DIM = 256;
@@ -249,6 +251,10 @@ struct fa_case {
     int          kv_heads = FA_KV_HEADS;
     bool         kv_f32   = false;
     int          host_fa  = 1;      // GGML_XDNA_HOST_FA: 0 ggml-cpu, 1 the kernels, 2 the portable ones
+    int          v_dim    = 0;      // head size of V when it is not K's
+    int          mask_extra_rows = 0;  // mask rows past the queries, visible
+    int          mask_extra_cols = 0;  // mask columns past the keys, visible
+    bool         cpu_op   = false;  // a shape the kernel does not take: ggml-cpu's op runs it
 };
 
 // The graph the model builds around one attention: a projection of n_tokens
@@ -259,6 +265,7 @@ static norm_graph build_fa(ggml_backend_t cpu, const fa_case & c) {
     g.ctx               = ggml_init(ip);
     const int64_t n_kv  = ((int64_t) c.n_ctx + c.n_tokens + c.pad - 1) / c.pad * c.pad;
     const int64_t D     = c.head_dim;
+    const int64_t Dv    = c.v_dim ? c.v_dim : D;
     const ggml_type kv_type = c.kv_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16;
 
     ggml_tensor * qr = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, D, c.heads, c.n_tokens);
@@ -266,14 +273,15 @@ static norm_graph build_fa(ggml_backend_t cpu, const fa_case & c) {
     ggml_tensor * kr, *vr, *k, *v;
     if (c.cache_view) {
         kr = ggml_new_tensor_3d(g.ctx, kv_type, D, c.kv_heads, n_kv);
-        vr = ggml_new_tensor_3d(g.ctx, kv_type, D, c.kv_heads, n_kv);
+        vr = ggml_new_tensor_3d(g.ctx, kv_type, Dv, c.kv_heads, n_kv);
         k  = ggml_permute(g.ctx, kr, 0, 2, 1, 3);
         v  = ggml_permute(g.ctx, vr, 0, 2, 1, 3);
     } else {
         kr = k = ggml_new_tensor_3d(g.ctx, kv_type, D, n_kv, c.kv_heads);
-        vr = v = ggml_new_tensor_3d(g.ctx, kv_type, D, n_kv, c.kv_heads);
+        vr = v = ggml_new_tensor_3d(g.ctx, kv_type, Dv, n_kv, c.kv_heads);
     }
-    ggml_tensor * m  = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, n_kv, c.n_tokens);
+    ggml_tensor * m  = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, n_kv + c.mask_extra_cols, c.n_tokens + c.mask_extra_rows);
+    ggml_set_input(m);  // as the model's mask is: its spans are kept for the graph
     ggml_tensor * dw = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, 64);
     ggml_tensor * dx = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, c.n_tokens);
     g.inputs         = { qr, kr, vr, m, dw, dx };
@@ -287,6 +295,11 @@ static norm_graph build_fa(ggml_backend_t cpu, const fa_case & c) {
     g.checked = { out };
     g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
     return g;
+}
+
+// FA_EMPTY_ROWS: single rows and a run of rows long enough to empty whole items see nothing
+static bool fa_row_empty(int t) {
+    return t % 10 == 3 || (t >= 32 && t < 64);
 }
 
 // which keys a token sees: the same sequence, and the mask's own rule
@@ -311,6 +324,7 @@ static bool fa_visible(const fa_case & c, int t, int j) {
         case FA_BAND:   return std::abs(p_j - p_t) <= c.window;
         case FA_HOLES:  return j % 2 == 0;
         case FA_BIAS:   return std::abs(p_j - p_t) <= c.window;
+        case FA_EMPTY_ROWS: return !fa_row_empty(t);
     }
     return false;
 }
@@ -320,30 +334,35 @@ static float fa_value(const fa_case & c, int j) {
     return c.mask == FA_BIAS ? -0.1f * (float) (j % 7) : 0.0f;
 }
 
+static void set_normal(ggml_tensor * t, std::mt19937 & rng, std::normal_distribution<float> & nd) {
+    std::vector<float> f(ggml_nelements(t));
+    for (float & x : f) {
+        x = nd(rng);
+    }
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
+        return;
+    }
+    std::vector<ggml_fp16_t> h(f.size());
+    ggml_fp32_to_fp16_row(f.data(), h.data(), (int64_t) f.size());
+    ggml_backend_tensor_set(t, h.data(), 0, ggml_nbytes(t));
+}
+
 static void set_fa_inputs(norm_graph & g, const fa_case & c) {
     std::mt19937 rng(77);
     // q and k are small, as a model that normalises them leaves them: a score of a few
     std::normal_distribution<float> nd(0.0f, c.scale < 0.5f ? 1.0f : 0.25f);
     for (size_t i = 0; i < 3; i++) {
-        ggml_tensor *      t = g.inputs[i];
-        std::vector<float> f(ggml_nelements(t));
-        for (float & x : f) {
-            x = nd(rng);
-        }
-        if (t->type == GGML_TYPE_F32) {
-            ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
-        } else {
-            std::vector<ggml_fp16_t> h(f.size());
-            ggml_fp32_to_fp16_row(f.data(), h.data(), (int64_t) f.size());
-            ggml_backend_tensor_set(t, h.data(), 0, ggml_nbytes(t));
-        }
+        set_normal(g.inputs[i], rng, nd);
     }
-    ggml_tensor *            m = g.inputs[3];
+    ggml_tensor *            m    = g.inputs[3];
+    const int64_t            n_kv = m->ne[0] - c.mask_extra_cols;
     std::vector<ggml_fp16_t> mk((size_t) ggml_nelements(m), ggml_fp32_to_fp16(-INFINITY));
-    for (int t = 0; t < c.n_tokens; t++) {
+    for (int64_t t = 0; t < m->ne[1]; t++) {
         for (int64_t j = 0; j < m->ne[0]; j++) {
-            if (fa_visible(c, t, (int) j)) {
-                mk[(size_t) t * m->ne[0] + j] = ggml_fp32_to_fp16(fa_value(c, (int) j));
+            const bool padding = t >= c.n_tokens || j >= n_kv;
+            if (padding || fa_visible(c, (int) t, (int) j)) {
+                mk[(size_t) t * m->ne[0] + j] = ggml_fp32_to_fp16(padding ? 0.0f : fa_value(c, (int) j));
             }
         }
     }
@@ -360,7 +379,7 @@ static bool fa_result_ok(const fa_case & c, double e) {
     if (c.on_array) {
         return e > FA_ARRAY_NMSE_MIN && e < FA_ARRAY_NMSE_MAX;
     }
-    if (c.host_fa == 0 || c.n_tokens < FA_HOST_MIN_QUERIES) {
+    if (c.host_fa == 0 || c.cpu_op || c.n_tokens < FA_HOST_MIN_QUERIES) {
         return e == 0.0;
     }
     return e > 0.0 && e < (c.n_tokens < FA_CPU_TILE_QUERIES ? FA_HOST_NMSE_UNTILED_MAX : FA_HOST_NMSE_MAX);
@@ -378,6 +397,126 @@ static bool run_fa(norm_graph & g, const fa_case & c, ggml_backend_t be, std::ve
     }
     res = get_f32(g.checked[0]);
     return true;
+}
+
+// Two attentions of one graph that read different masks held in one tensor: a node rewrites the mask in
+// place between them, so both see the same address and shape. A computed mask has nothing to read before the
+// graph runs and no stable content while it does, so neither route may keep an answer for it: both
+// attentions are the host kernel's, each with its own mask.
+static const int FA_MASKS_TOKENS = 300;
+static const int FA_MASKS_WINDOW = 40;
+static const int FA_MASKS_HEADS  = 4;
+
+static std::vector<ggml_fp16_t> fa_masks_values(bool band) {
+    const int                n = FA_MASKS_TOKENS;
+    std::vector<ggml_fp16_t> m((size_t) n * n, ggml_fp32_to_fp16(-INFINITY));
+    for (int t = 0; t < n; t++) {
+        for (int j = 0; j < n; j++) {
+            if (band ? std::abs(j - t) <= FA_MASKS_WINDOW : j <= t) {
+                m[(size_t) t * n + j] = ggml_fp32_to_fp16(0.0f);
+            }
+        }
+    }
+    return m;
+}
+
+struct fa_masks_graph {
+    ggml_context *             ctx = nullptr;
+    ggml_backend_buffer_t      buf = nullptr;
+    ggml_cgraph *              gf  = nullptr;
+    std::vector<ggml_tensor *> in;  // q, k, v, the first mask, the second mask as f32 rows, their row ids, a projection
+    ggml_tensor *              out[2] = {};
+};
+
+static ggml_tensor * add_masked_attention(fa_masks_graph & g, ggml_tensor * q, ggml_tensor * mask) {
+    ggml_tensor * out = ggml_flash_attn_ext(g.ctx, q, g.in[1], g.in[2], mask, 1.0f, 0.0f, 0.0f);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
+    ggml_set_output(out);
+    ggml_build_forward_expand(g.gf, out);
+    return out;
+}
+
+static fa_masks_graph build_fa_masks(ggml_backend_t cpu) {
+    fa_masks_graph   g;
+    const int64_t    n  = FA_MASKS_TOKENS, D = FA_HEAD_DIM;
+    ggml_init_params ip = { ggml_tensor_overhead() * 24 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.in                = { ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, D, FA_MASKS_HEADS, n),
+                            ggml_new_tensor_3d(g.ctx, GGML_TYPE_F16, D, n, FA_KV_HEADS),
+                            ggml_new_tensor_3d(g.ctx, GGML_TYPE_F16, D, n, FA_KV_HEADS),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, n, n),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, n, n),
+                            ggml_new_tensor_1d(g.ctx, GGML_TYPE_I64, n),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, 64),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, n) };
+    g.gf                = ggml_new_graph(g.ctx);
+    ggml_tensor * q     = ggml_permute(g.ctx, g.in[0], 0, 2, 1, 3);
+    g.out[0]            = add_masked_attention(g, q, g.in[3]);
+    g.out[1]            = add_masked_attention(g, q, ggml_set_rows(g.ctx, g.in[3], g.in[4], g.in[5]));
+    ggml_build_forward_expand(g.gf, ggml_mul_mat(g.ctx, g.in[6], g.in[7]));
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+static void set_fa_masks_inputs(fa_masks_graph & g) {
+    const int                       n = FA_MASKS_TOKENS;
+    std::mt19937                    rng(77);
+    std::normal_distribution<float> nd(0.0f, 0.25f);
+    for (int i = 0; i < 3; i++) {
+        set_normal(g.in[i], rng, nd);
+    }
+    const std::vector<ggml_fp16_t> first = fa_masks_values(false), second = fa_masks_values(true);
+    ggml_backend_tensor_set(g.in[3], first.data(), 0, ggml_nbytes(g.in[3]));
+    std::vector<float> rows((size_t) n * n);
+    ggml_fp16_to_fp32_row(second.data(), rows.data(), (int64_t) rows.size());
+    ggml_backend_tensor_set(g.in[4], rows.data(), 0, ggml_nbytes(g.in[4]));
+    std::vector<int64_t> ids(n);
+    for (int i = 0; i < n; i++) {
+        ids[i] = i;
+    }
+    ggml_backend_tensor_set(g.in[5], ids.data(), 0, ggml_nbytes(g.in[5]));
+    for (size_t i = 6; i < g.in.size(); i++) {
+        std::vector<float> f(ggml_nelements(g.in[i]), 0.5f);
+        ggml_backend_tensor_set(g.in[i], f.data(), 0, ggml_nbytes(g.in[i]));
+    }
+}
+
+static bool run_fa_masks(fa_masks_graph & g, ggml_backend_t be, std::vector<float> * res) {
+    ggml_backend_buffer_clear(g.buf, 0);
+    set_fa_masks_inputs(g);
+    if (ggml_backend_graph_compute(be, g.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    for (int i = 0; i < 2; i++) {
+        res[i] = get_f32(g.out[i]);
+    }
+    return true;
+}
+
+static bool test_fa_computed_masks(ggml_backend_t npu, ggml_backend_t cpu, fa_route route) {
+    const char * name = route == FA_ROUTE_ARRAY ? "array route" : "host route";
+    set_fa_route(route);
+    setenv("GGML_XDNA_HOST_FA", "1", 1);
+    fa_masks_graph     g = build_fa_masks(cpu);
+    std::vector<float> want[2], got[2];
+    if (!run_fa_masks(g, cpu, want) || !run_fa_masks(g, npu, got)) {
+        std::printf("test-xdna-graph: compute failed\n");
+        return false;
+    }
+    const bool shared = g.out[0]->src[3]->data == g.out[1]->src[3]->data;
+    bool       ok     = shared;
+    for (int i = 0; i < 2; i++) {
+        const double e    = nmse(want[i], got[i]);
+        const bool   fits = e > 0.0 && e < FA_HOST_NMSE_MAX;
+        ok                = ok && fits;
+        std::printf("FLASH_ATTN_EXT rewritten mask, %-11s attention %d nmse %.3g %s\n", name, i, e, fits ? "ok" : "FAIL");
+    }
+    std::printf("FLASH_ATTN_EXT rewritten mask, %-11s both masks at one address: %s\n", name, shared ? "yes" : "NO FAIL");
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
+    unsetenv("GGML_XDNA_FA_MM");
+    unsetenv("GGML_XDNA_HOST_FA");
+    return ok;
 }
 
 struct gemm_shape {
@@ -840,6 +979,21 @@ int main(void) {
         { "portable: band 512, 2 sequences",          FA_ROUTE_HOST,         4,  901,    0,   1,  2, FA_BAND,   512, 1.0f,    false, false, 256, 2, false, 2 },
         { "portable: causal 8 heads, f32 cache view", FA_ROUTE_HOST,         8,  300,  200, 128,  1, FA_CAUSAL,   0, 0.0625f, true,  false, 256, 2, true,  2 },
         { "portable: a mask with finite values",      FA_ROUTE_HOST,         4,  300,    0,   1,  1, FA_BIAS,    60, 1.0f,    false, false, 80, 2, false, 2 },
+        { "host: rows that see nothing",              FA_ROUTE_HOST,         4,  200,    0,   1,  1, FA_EMPTY_ROWS, 0, 1.0f,  false, false },
+        { "portable: rows that see nothing",          FA_ROUTE_HOST,         4,  200,    0,   1,  1, FA_EMPTY_ROWS, 0, 1.0f,  false, false, 256, 2, false, 2 },
+        { "host: K heads of 192, V heads of 128",     FA_ROUTE_HOST,         4,  250,    0,   1,  1, FA_CAUSAL,   0, 0.0722f, false, false, 192, 1, false, 1, 128 },
+        { "host: K heads of 64, V heads of 256",      FA_ROUTE_HOST,         4,  260,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false, 64, 2, false, 1, 256 },
+        { "host: 16 query heads, one KV head",        FA_ROUTE_HOST,        16,  200,    0,   1,  1, FA_CAUSAL,   0, 0.125f,  false, false, 64, 1 },
+        { "host: 32 query heads, one KV head (most)", FA_ROUTE_HOST,        32,  150,    0,   1,  1, FA_CAUSAL,   0, 0.125f,  false, false, 64, 1 },
+        { "host: 33 query heads stay on ggml-cpu",    FA_ROUTE_HOST,        33,  100,    0,   1,  1, FA_CAUSAL,   0, 0.125f,  false, false, 64, 1, false, 1, 0, 0, 0, true },
+        { "host: heads of 1024 (the most)",           FA_ROUTE_HOST,         2,  100,    0,   1,  1, FA_CAUSAL,   0, 0.03125f, false, false, 1024, 1 },
+        { "host: heads of 1040 stay on ggml-cpu",     FA_ROUTE_HOST,         2,  100,    0,   1,  1, FA_CAUSAL,   0, 0.03125f, false, false, 1040, 1, false, 1, 0, 0, 0, true },
+        { "host: a mask with 64 rows past the queries", FA_ROUTE_HOST,       4,  300,    0,   1,  1, FA_CAUSAL,   0, 0.0625f, false, false, 256, 2, false, 1, 0, 64 },
+        { "host: a mask 16 columns wider than the keys", FA_ROUTE_HOST,      4,  300,    0,   1,  1, FA_BAND,    60, 1.0f,    false, false, 256, 2, false, 1, 0, 0, 16 },
+        { "array: a mask with 64 rows past the queries", FA_ROUTE_ARRAY,     4,  700,    0,   1,  1, FA_CAUSAL,   0, 0.0625f, false, true,  256, 2, false, 1, 0, 64 },
+        // the bound by size follows the route that would run: 64M visible triples for the host kernel, 8M when ggml-cpu's op would
+        { "by size: 21M triples, the host kernel",    FA_ROUTE_BY_SIZE,      4, 2300,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false },
+        { "by size: 21M triples, HOST_FA=0: the array", FA_ROUTE_BY_SIZE,    4, 2300,    0,   1,  1, FA_FULL,     0, 1.0f,    false, true,  256, 2, false, 0 },
     };
     for (const fa_case & c : fa_cases) {
         set_fa_route(c.route);
@@ -859,6 +1013,9 @@ int main(void) {
     }
     unsetenv("GGML_XDNA_FA_MM");
     unsetenv("GGML_XDNA_HOST_FA");
+    for (fa_route route : { FA_ROUTE_HOST, FA_ROUTE_ARRAY }) {
+        passed = test_fa_computed_masks(npu, cpu, route) && passed;
+    }
 
     const gemm_case gemm_cases[] = {
         { "decode block",     GGML_TYPE_BF16, 15,  { { 512, 1024 }, { 1024, 512 } } },

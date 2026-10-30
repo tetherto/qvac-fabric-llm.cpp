@@ -1,14 +1,7 @@
 #pragma once
 
-// The arithmetic of the host attention kernel (xdna-host-attn.cpp), in two
-// sets with the same interface: portable_ops, plain loops, and avx512_ops, for
-// a CPU with AVX-512 (picked at run time; this backend is built without
-// -march). Every set computes, for one block of KB keys,
-//   qk              s[i][j] = q[i] . k[j]
-//   softmax_row     the scores of a row become weights in place, with the
-//                   running maximum M and sum L of the row's earlier blocks
-//   pv              o[i] = o[i] * rs[i] + sum_j p[i][j] v[j]
-// in f32, K and V read as stored (f16 widened in the load, or f32).
+// The arithmetic of the host attention kernel (xdna-host-attn.cpp) as portable_ops and avx512_ops, one interface;
+// avx512_ops is picked at run time because this backend is built without -march.
 
 #include "ggml.h"
 

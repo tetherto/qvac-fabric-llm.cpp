@@ -3,10 +3,18 @@
 // Reading an attention mask on its f16 bits, shared by the array route
 // (xdna-attn-mm.cpp) and the host kernel (xdna-host-attn.cpp).
 
+#include "ggml.h"
+
 #include <cstdint>
 #include <cstring>
 
 namespace xdna_attn_mask {
+
+// Only a graph input holds one set of values at one address for the whole graph: a computed mask's memory
+// is reused or rewritten by later nodes, so what was read off it by address may not be kept.
+inline bool is_graph_input(const ggml_tensor * m) {
+    return m && (m->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+}
 
 // On the f16 bits: a visible key is 0.0 (0x0000 or 0x8000), a hidden one below
 // -1e30, which in f16 is only -inf (0xFC00). Converting each value to f32 cost

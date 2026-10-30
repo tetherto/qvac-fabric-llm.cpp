@@ -12,16 +12,8 @@
 #include <mutex>
 #include <vector>
 
-// An online-softmax attention over blocks of KB keys. One work item is the
-// rows of a few positions over all the query heads of one KV head, so the K
-// and V blocks it streams are read once for every head of the group. For a
-// block the item computes the scores of its rows in 4 x 4 register tiles (a
-// dot over the head size per row and key), then the softmax of each row, then
-// P V in 4 x 64 tiles. A tile that sees no key of the block skips it, so a
-// band, a causal mask or a packed sequence cost the keys they show, not the
-// whole matrix. The blocks sit on the grid of absolute keys, so a row's result
-// does not depend on how the rows are split into items, or on the thread count.
-// Accumulation is f32, as ggml-cpu's.
+// Online-softmax attention over blocks of 64 keys on the grid of absolute keys; one work item is a few
+// positions over the query heads of one KV head. Accumulation is f32, as ggml-cpu's.
 
 namespace {
 
@@ -104,28 +96,41 @@ struct row_spans {
     bool                 pure = true;
 };
 
+// Fills the spans of the positions [t0, t1); returns how many of their rows show values other than 0.
+int64_t scan_range(const ggml_tensor * m, int64_t t0, int64_t t1, int64_t n_kv, row_spans * out) {
+    int64_t impure = 0;
+    for (int64_t t = t0; t < t1; t++) {
+        const uint16_t * row   = (const uint16_t *) ((const char *) m->data + t * m->nb[1]);
+        const int64_t    first = first_not_hidden(row, n_kv);
+        const int64_t    last  = last_not_hidden(row, n_kv);
+        out->lo[t]             = (int32_t) first;
+        out->hi[t]             = (int32_t) last;
+        impure += first <= last && !all_visible(row, first, last);
+    }
+    return impure;
+}
+
+int64_t scan_parallel(const ggml_tensor * m, const shape & s, row_spans * out) {
+    int64_t impure = 0;
+#pragma omp parallel for num_threads(xdna_chunk_threads()) reduction(+ : impure)
+    for (int64_t t = 0; t < s.n_q; t++) {
+        impure += scan_range(m, t, t + 1, s.n_kv, out);
+    }
+    return impure;
+}
+
 void scan_rows(const ggml_tensor * m, const shape & s, row_spans * out) {
     out->lo.assign((size_t) s.n_q, 0);
     out->hi.assign((size_t) s.n_q, (int32_t) (s.n_kv - 1));
     if (!m) {
         return;
     }
-    int64_t impure = 0;
-#pragma omp parallel for num_threads(xdna_chunk_threads()) if (s.n_q * s.n_kv >= SCAN_PARALLEL_MIN_ENTRIES) reduction(+ : impure)
-    for (int64_t t = 0; t < s.n_q; t++) {
-        const uint16_t * row   = (const uint16_t *) ((const char *) m->data + t * m->nb[1]);
-        const int64_t    first = first_not_hidden(row, s.n_kv);
-        const int64_t    last  = last_not_hidden(row, s.n_kv);
-        out->lo[t]             = (int32_t) first;
-        out->hi[t]             = (int32_t) last;
-        if (first <= last && !all_visible(row, first, last)) {
-            impure++;
-        }
-    }
-    out->pure = impure == 0;
+    const bool    parallel = s.n_q * s.n_kv >= SCAN_PARALLEL_MIN_ENTRIES;
+    const int64_t impure   = parallel ? scan_parallel(m, s, out) : scan_range(m, 0, s.n_q, s.n_kv, out);
+    out->pure              = impure == 0;
 }
 
-// Every attention layer of a graph reads one of two masks; the spans of each
+// Every attention layer of a graph reads one of two input masks; the spans of each
 // are scanned once a graph (xdna_host_attn_graph_begin starts a new one: a
 // new ubatch rewrites the mask in place).
 struct span_memo {
@@ -163,18 +168,22 @@ void keep_spans(const ggml_tensor * m, const shape & s, std::shared_ptr<const ro
     sl           = { g_spans.epoch, m->data, s.n_kv, s.n_q, m->ne[0], m->nb[1], std::move(rows) };
 }
 
-std::shared_ptr<const row_spans> spans_of(const ggml_tensor * m, const shape & s) {
-    std::lock_guard<std::mutex> lock(g_spans.mtx);
-    if (m) {
-        if (auto kept = find_spans(m, s)) {
-            return kept;
-        }
-    }
+std::shared_ptr<const row_spans> scan_spans(const ggml_tensor * m, const shape & s) {
     auto rows = std::make_shared<row_spans>();
     scan_rows(m, s, rows.get());
-    if (m) {
-        keep_spans(m, s, rows);
+    return rows;
+}
+
+std::shared_ptr<const row_spans> spans_of(const ggml_tensor * m, const shape & s) {
+    if (!is_graph_input(m)) {
+        return scan_spans(m, s);
     }
+    std::lock_guard<std::mutex> lock(g_spans.mtx);
+    if (auto kept = find_spans(m, s)) {
+        return kept;
+    }
+    auto rows = scan_spans(m, s);
+    keep_spans(m, s, rows);
     return rows;
 }
 

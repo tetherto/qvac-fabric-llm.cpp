@@ -1,9 +1,6 @@
 #pragma once
 
-// Prefill attention on the host's SIMD units (xdna-host-attn.cpp): the
-// GGML_OP_FLASH_ATTN_EXT nodes the glue would otherwise hand to ggml-cpu. It
-// reads the mask's visible key run of each row, so the window of a sliding
-// layer, a causal mask and packed sequences cost only the keys they show.
+// Prefill attention on the host's SIMD units, for the FLASH_ATTN_EXT nodes the glue would hand to ggml-cpu.
 // GGML_XDNA_HOST_FA=0 leaves them to ggml-cpu; 2 runs the portable kernels.
 
 struct ggml_tensor;

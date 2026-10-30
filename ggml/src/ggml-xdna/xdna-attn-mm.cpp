@@ -2,6 +2,7 @@
 
 #include "ggml-impl.h"
 #include "xdna-attn-mask.h"
+#include "xdna-host-attn.h"
 #include "xdna-norm.h"
 #include "xdna-prof.h"
 #include "xdna-runtime.h"
@@ -65,12 +66,16 @@ constexpr int          KV_RING = 3;            // K/V descriptors in flight a st
 // A call pays two hardware-context switches, one into the design and one back
 // to the projections around it (~2.5 ms each: probes/attn_probe.cpp --proj 4
 // measures 5.0 ms a layer), and its own time is ~0.3 ns a visible (query, key,
-// head) against ~0.36 ns on the host kernel (xdna-host-attn.cpp). Qwen3.5's
-// pp512 on the 0.8B is 9% .. 17% quicker on the host kernel at a depth of 2048
-// .. 8192 (9M .. 35M of them a call), level within the run-to-run noise at
-// 12288 .. 16384 (51M .. 68M) and 6% .. 14% slower from 20480 (85M).
-constexpr int64_t FA_MIN_PAIR_HEADS = 64 << 20;
-constexpr int64_t FA_MIN_TOKENS     = 64;  // below it a call's fixed cost is the whole of it
+// head). The host takes ~0.36 ns with the backend's kernel (xdna-host-attn.cpp):
+// Qwen3.5's pp512 on the 0.8B is 9% .. 17% quicker there at a depth of 2048 ..
+// 8192 (9M .. 35M of them a call), level within the run-to-run noise at 12288
+// .. 16384 (51M .. 68M) and 6% .. 14% slower from 20480 (85M). Where the kernel
+// cannot take the node (GGML_XDNA_HOST_FA=0, a CPU without AVX-512, a shape it
+// does not do) ggml-cpu's op takes ~1.0 ns: there the array was 14% .. 5%
+// slower at a depth of 256 .. 1024 (2.6M .. 5.2M) and 3% quicker at 2048 (9.4M).
+constexpr int64_t FA_MIN_PAIR_HEADS_HOST_KERNEL = 64 << 20;
+constexpr int64_t FA_MIN_PAIR_HEADS_CPU_OP      = 8 << 20;
+constexpr int64_t FA_MIN_TOKENS                 = 64;  // below it a call's fixed cost is the whole of it
 
 // How the rows of a pair are laid out: the query heads of a KV head group
 // share its K/V, and a pair holds all of them at pp positions each.
@@ -194,7 +199,8 @@ bool scan_mask(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens, mask_rows 
 // it each time was 12 whole-mask passes an ubatch on the 0.8B, n_tokens x n_kv
 // values each - 8% of a 16k prompt's prefill energy. The answer is kept for
 // the graph (xdna_attn_mm_graph_begin starts a new one: a new ubatch rewrites
-// the mask in place).
+// the mask in place). Only a graph input is read: a computed mask holds nothing
+// to scan before the graph runs, so its attention goes to the host.
 struct mask_memo {
     static constexpr int SLOTS = 4;
     struct slot {
@@ -211,7 +217,7 @@ struct mask_memo {
 } g_mask;
 
 std::shared_ptr<const mask_rows> mask_of(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
-    if (!m || !m->data) {
+    if (!m || !m->data || !xdna_attn_mask::is_graph_input(m)) {
         return nullptr;
     }
     std::lock_guard<std::mutex> lock(g_mask.mtx);
@@ -426,9 +432,9 @@ bool shapes_supported(const ggml_tensor * node, geometry * geo, int64_t * n_toke
 
 }  // namespace
 
-// GGML_XDNA_FA_MM: 0 the host, 1 the array from FA_MIN_PAIR_HEADS visible
-// (query, key, head) triples a call, 2 the array whatever the size (tests,
-// bisection).
+// GGML_XDNA_FA_MM: 0 the host, 1 the array from FA_MIN_PAIR_HEADS_* visible
+// (query, key, head) triples a call (the bound of the host route that would run
+// the node), 2 the array whatever the size (tests, bisection).
 bool xdna_attn_mm_supported(const ggml_tensor * node) {
     const int mode = xdna_env_int("GGML_XDNA_FA_MM", 1);
     if (!node || node->op != GGML_OP_FLASH_ATTN_EXT || mode == 0 || !artifact_present()) {
@@ -440,8 +446,9 @@ bool xdna_attn_mm_supported(const ggml_tensor * node) {
         return false;
     }
     const int64_t n_head = (int64_t) geo.hg * KVH;
+    const int64_t bound  = xdna_host_attn_supported(node) ? FA_MIN_PAIR_HEADS_HOST_KERNEL : FA_MIN_PAIR_HEADS_CPU_OP;
     // the most it can see, before the mask is scanned
-    if (mode != 2 && n_tokens * n_kv * n_head < FA_MIN_PAIR_HEADS) {
+    if (mode != 2 && n_tokens * n_kv * n_head < bound) {
         return false;
     }
     float params[3] = { 0.0f, 0.0f, 0.0f };
@@ -450,7 +457,7 @@ bool xdna_attn_mm_supported(const ggml_tensor * node) {
         return false;  // the scale is in the host's Q; no ALiBi, no softcap
     }
     const std::shared_ptr<const mask_rows> mr = mask_of(node->src[3], n_kv, n_tokens);
-    return mr && (mode == 2 || mr->visible * n_head >= FA_MIN_PAIR_HEADS);
+    return mr && (mode == 2 || mr->visible * n_head >= bound);
 }
 
 namespace {
