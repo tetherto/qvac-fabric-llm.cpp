@@ -65,10 +65,11 @@ constexpr int          KV_RING = 3;            // K/V descriptors in flight a st
 // A call pays two hardware-context switches, one into the design and one back
 // to the projections around it (~2.5 ms each: probes/attn_probe.cpp --proj 4
 // measures 5.0 ms a layer), and its own time is ~0.3 ns a visible (query, key,
-// head) against ~1.0 ns on the host. They meet at about 8M of them: Qwen3.5's
-// pp512 on the 0.8B at depth 256 .. 1024 (2.6M .. 5.2M) is 14% .. 5% slower on
-// the array, at depth 2048 (9.4M) 3% quicker, at 4096 8%.
-constexpr int64_t FA_MIN_PAIR_HEADS = 8 << 20;
+// head) against ~0.36 ns on the host kernel (xdna-host-attn.cpp). Qwen3.5's
+// pp512 on the 0.8B is 9% .. 17% quicker on the host kernel at a depth of 2048
+// .. 8192 (9M .. 35M of them a call), level within the run-to-run noise at
+// 12288 .. 16384 (51M .. 68M) and 6% .. 14% slower from 20480 (85M).
+constexpr int64_t FA_MIN_PAIR_HEADS = 64 << 20;
 constexpr int64_t FA_MIN_TOKENS     = 64;  // below it a call's fixed cost is the whole of it
 
 // How the rows of a pair are laid out: the query heads of a KV head group
