@@ -91,6 +91,21 @@ inline void prefetch_read(const void * p) {
 #endif
 }
 
+// Hints that every cache line holding [p, p + len) is about to be read,
+// the line of the last byte included. The rows live in a std::vector,
+// and glibc hands a large allocation out 16 bytes past a page boundary,
+// so a 128-byte plane row spans three lines there, not two; a prefetch
+// of offsets 0 and 64 left the third line to miss at full memory latency
+// on every ranked row. Upstream prefetch_low covers the last byte for the
+// same reason.
+inline void prefetch_span(const void * p, size_t len) {
+    const uintptr_t first = reinterpret_cast<uintptr_t>(p) & ~static_cast<uintptr_t>(63);
+    const uintptr_t last = reinterpret_cast<uintptr_t>(p) + len - 1;
+    for (uintptr_t a = first; a <= last; a += 64) {
+        prefetch_read(reinterpret_cast<const void *>(a));
+    }
+}
+
 // Trailing zero bits of a non-zero word (callers check; the loop below
 // would never end on zero).
 inline int ctz64(uint64_t x) {
@@ -131,7 +146,8 @@ size_t partition_branchless(const T * src, size_t n, T * dst, Pred pred) {
 
 // The k-th best of a[0..n) (1 <= k <= n) under `better`, which returns 1
 // when its first argument ranks first and 0 otherwise, as an integer so the
-// partitions above stay branch-free; `better` must be a strict weak order.
+// partitions above stay branch-free; `better` must be a strict weak order
+// and a class type (see ScoreIdBetterI), never a function pointer.
 // Quickselect with two scratch buffers in place of std::nth_element, which
 // left the lone and batch shortlist cuts, the ranking's cuts and the seed
 // at several microseconds each on x86. `a` is read only, so a caller keeps
@@ -220,10 +236,18 @@ T cut_to_best(std::vector<T> & v, size_t keep, Better better, std::vector<T> & s
     return kth;
 }
 
-// score_id_better as an integer without a branch, for the cuts above.
-inline int score_id_better_i(const ScoreId & a, const ScoreId & b) {
-    return static_cast<int>(a.score > b.score) | (static_cast<int>(a.score == b.score) & static_cast<int>(a.id < b.id));
-}
+// score_id_better as an integer without a branch, for the cuts above. A
+// function object, not a function: handed over as a pointer, the compare
+// is an indirect call per element unless the compiler clones the select
+// for the constant pointer, and GCC does not (every compare in
+// cut_to_best and keep_best was an indirect call), which left the cuts
+// slower than std::nth_element on the x86 Ubuntu host while clang inlined
+// them. A class type instantiates the select on the comparator itself.
+struct ScoreIdBetterI {
+    int operator()(const ScoreId & a, const ScoreId & b) const {
+        return static_cast<int>(a.score > b.score) | (static_cast<int>(a.score == b.score) & static_cast<int>(a.id < b.id));
+    }
+};
 
 // Shortlist, middle and rescore lengths for a top-k request (upstream
 // planes_shortlist_len, planes_mid_len, planes_rescore_len).
@@ -1057,6 +1081,8 @@ constexpr size_t kCentreRowsPerTask = 4096;
 constexpr size_t kRankPerTask = 64;
 // Candidates one ranking batch gathers (upstream RANK_BATCH).
 constexpr size_t kRankBatch = 32;
+// Ranking steps the row prefetch runs ahead of the count.
+constexpr size_t kRankAhead = 2;
 // Shortlist ranges per thread of a split scan: each range fills a shortlist
 // of its own before it can prune, so fewer ranges than the full scan's.
 constexpr size_t kRangesPerThread = 2;
@@ -1105,10 +1131,13 @@ bool candidate_better(const Candidate & a, const Candidate & b) {
     return a.slot < b.slot;
 }
 
-// candidate_better as an integer without a branch, for the cuts.
-inline int candidate_better_i(const Candidate & a, const Candidate & b) {
-    return static_cast<int>(a.score > b.score) | (static_cast<int>(a.score == b.score) & static_cast<int>(a.slot < b.slot));
-}
+// candidate_better as an integer without a branch, for the cuts (a
+// function object for the reason ScoreIdBetterI is).
+struct CandidateBetterI {
+    int operator()(const Candidate & a, const Candidate & b) const {
+        return static_cast<int>(a.score > b.score) | (static_cast<int>(a.score == b.score) & static_cast<int>(a.slot < b.slot));
+    }
+};
 
 // Cuts cands to its best `keep` under the strict (score, slot) order, in
 // the order they had, and `tops` (aligned with cands) with them.
@@ -1117,7 +1146,8 @@ void keep_best(std::vector<Candidate> & cands, size_t keep, std::vector<float> *
         return;
     }
     std::vector<Candidate> scratch;
-    const Candidate kth = kth_best(cands.data(), cands.size(), keep, candidate_better_i, scratch);
+    const CandidateBetterI better;
+    const Candidate kth = kth_best(cands.data(), cands.size(), keep, better, scratch);
     size_t w = 0;
     for (size_t i = 0; i < cands.size(); ++i) {
         const Candidate c = cands[i];
@@ -1125,7 +1155,7 @@ void keep_best(std::vector<Candidate> & cands, size_t keep, std::vector<float> *
         if (tops != nullptr) {
             (*tops)[w] = (*tops)[i];
         }
-        w += static_cast<size_t>(1 - candidate_better_i(kth, c));
+        w += static_cast<size_t>(1 - better(kth, c));
     }
     // Exactly `keep` under the strict order; only a NaN score, which it
     // does not cover, can leave more, and then the tail goes.
@@ -1208,7 +1238,7 @@ struct Collector {
 
     void cut_back() {
         cut = true;
-        threshold = cut_to_best(top, s_len, score_id_better_i, scratch).score;
+        threshold = cut_to_best(top, s_len, ScoreIdBetterI{},scratch).score;
         if (floor_score != nullptr) {
             double seen = floor_score->load(std::memory_order_relaxed);
             while (threshold > seen && !floor_score->compare_exchange_weak(seen, threshold, std::memory_order_relaxed)) {
@@ -1759,7 +1789,7 @@ bool turbovec_staged_search(
         }
         if (top.size() > s_len) {
             std::vector<ScoreId> scratch;
-            cut_to_best(top, s_len, score_id_better_i, scratch);
+            cut_to_best(top, s_len, ScoreIdBetterI{},scratch);
         }
         list.reserve(top.size());
         for (const ScoreId & c : top) {
@@ -1802,17 +1832,17 @@ bool turbovec_staged_search(
         // at most kRankBatch of them (upstream plane_terms): the sign tables
         // over their rows, undone to m * sum(+-q), or the bit masks counted.
         auto plane_terms = [&](size_t begin, size_t end, size_t plane, float * out) {
-            // The rows are scattered over the index, so the next batch's
-            // lines are asked for while this one is counted (upstream
-            // rank_first_keep / rank_full_known prefetch_low one step ahead);
-            // asked for just before the read, each row still waited on its
-            // miss. The first batch is asked for here as well.
-            const size_t ahead_end = std::min(list.size(), end + (end - begin));
-            for (size_t i = begin == 0 ? begin : end; i < ahead_end; ++i) {
-                const uint8_t * low = idx.turbovec_data.data() + list[i].slot * row_bytes + plane * nsg;
-                for (size_t off = 0; off < nsg; off += 64) {
-                    prefetch_read(low + off);
-                }
+            // The rows are scattered over the index, so the lines of the
+            // batch kRankAhead steps on are asked for while this one is
+            // counted; asked for just before the read, each row still waited
+            // on its miss. Upstream (rank_first_keep / rank_full_known) goes
+            // one step ahead; two measured 9 us faster at q4 k64 on Zen 5
+            // and the same on Apple M5. The first batches are asked for here
+            // as well.
+            const size_t span = end - begin;
+            const size_t ahead_end = std::min(list.size(), end + kRankAhead * span);
+            for (size_t i = begin == 0 ? begin : end + (kRankAhead - 1) * span; i < ahead_end; ++i) {
+                prefetch_span(idx.turbovec_data.data() + list[i].slot * row_bytes + plane * nsg, nsg);
             }
             if (table_rank) {
 #if GGML_VEC_INDEX_USE_NEON
@@ -1913,10 +1943,7 @@ bool turbovec_staged_search(
         constexpr size_t kAhead = 4;
         for_each_candidate(list.size(), [&](size_t i) {
             if (exact2 && i + kAhead < list.size()) {
-                const uint8_t * row = idx.turbovec_data.data() + list[i + kAhead].slot * row_bytes;
-                for (size_t off = 0; off < row_bytes; off += 64) {
-                    prefetch_read(row + off);
-                }
+                prefetch_span(idx.turbovec_data.data() + list[i + kAhead].slot * row_bytes, row_bytes);
             }
             exact[i] = exact4 ? exact4_score(list[i].slot) : exact2_score(list[i].slot);
         });
@@ -2179,7 +2206,7 @@ bool turbovec_staged_search_batch(
             }
             std::vector<ScoreId> & top = cols[i].top;
             if (top.size() > s_len) {
-                cut_to_best(top, s_len, score_id_better_i, cols[i].scratch);
+                cut_to_best(top, s_len, ScoreIdBetterI{},cols[i].scratch);
             }
             run_query(q, &top, false, false, 1);
         }
