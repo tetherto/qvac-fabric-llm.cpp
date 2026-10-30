@@ -1498,16 +1498,10 @@ static void build_turbovec_query_lut(
     }
     const float inv_scale = 1.0f / out_scale;
     for (int g = 0; g < n_byte_groups; ++g) {
-        const float lo_min = mins[static_cast<size_t>(g) * 2];
-        const float hi_min = mins[static_cast<size_t>(g) * 2 + 1];
-        for (int i = 0; i < 16; ++i) {
-            const size_t lo = static_cast<size_t>(g) * 32 + static_cast<size_t>(i);
-            const size_t hi = static_cast<size_t>(g) * 32 + 16 + static_cast<size_t>(i);
-            out_values[lo] = static_cast<uint8_t>(
-                std::max(0.0f, std::min(max_lut, round_half_away_f32((float_vals[lo] - lo_min) * inv_scale))));
-            out_values[hi] = static_cast<uint8_t>(
-                std::max(0.0f, std::min(max_lut, round_half_away_f32((float_vals[hi] - hi_min) * inv_scale))));
-        }
+        const size_t lo = static_cast<size_t>(g) * 32;
+        const size_t hi = lo + 16;
+        quantise_table16(float_vals.data() + lo, mins[static_cast<size_t>(g) * 2], inv_scale, max_lut, out_values.data() + lo);
+        quantise_table16(float_vals.data() + hi, mins[static_cast<size_t>(g) * 2 + 1], inv_scale, max_lut, out_values.data() + hi);
     }
 }
 
