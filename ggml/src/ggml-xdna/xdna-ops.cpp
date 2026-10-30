@@ -698,33 +698,72 @@ static void gemm_fold_row(const float * c, float * dst, int N, bool accumulate) 
 }
 
 // Read the first mc rows of a finished C block into dst (rows dst_ld floats
-// apart), the first K run of an op by assignment and the others added. False
-// when the device's write to a run of rows did not land.
-static bool gemm_fold_c(xdna_buffer * bo_c, int mc, int N, float * dst, int64_t dst_ld, bool accumulate) {
+// apart), the first K run of an op by assignment and the others added. `lost`
+// has one flag per GEMM_ROWS_PER_TASK rows: set (the default, when empty) for
+// a chunk still to be read, cleared once it is folded. False while a chunk's
+// write did not land, so a second call folds only the chunks the first missed.
+static bool gemm_fold_c(xdna_buffer *      bo_c,
+                        int                mc,
+                        int                N,
+                        float *            dst,
+                        int64_t            dst_ld,
+                        bool               accumulate,
+                        std::vector<char> & lost) {
     const size_t row_bytes = (size_t) N * sizeof(float);
-    int          failed    = 0;
+    const int    n_chunks  = (mc + GEMM_ROWS_PER_TASK - 1) / GEMM_ROWS_PER_TASK;
+    if (lost.empty()) {
+        lost.assign(n_chunks, 1);
+    }
 #pragma omp parallel for num_threads(xdna_chunk_threads()) if (mc >= GEMM_TEAM_MIN_ROWS)
-    for (int m0 = 0; m0 < mc; m0 += GEMM_ROWS_PER_TASK) {
+    for (int ci = 0; ci < n_chunks; ci++) {
+        if (!lost[ci]) {
+            continue;
+        }
+        const int     m0   = ci * GEMM_ROWS_PER_TASK;
         const int     rows = std::min(GEMM_ROWS_PER_TASK, mc - m0);
         const float * c    = (const float *) xdna_buffer_wait_written(bo_c, rows * row_bytes, m0 * row_bytes);
         if (!c) {
-#pragma omp atomic write
-            failed = 1;
             continue;
         }
         for (int r = 0; r < rows; r++) {
             gemm_fold_row(c + (size_t) r * N, dst + (m0 + r) * dst_ld, N, accumulate);
         }
+        lost[ci] = 0;
     }
-    return failed == 0;
+    return std::find(lost.begin(), lost.end(), 1) == lost.end();
 }
 
-static bool gemm_fold_run(const xdna_ops::pending_op & op, const xdna_ops::pending_run & pr) {
+// The array has been seen to leave the first 64 B of a block's C unwritten
+// (the first run of a kernel, a second command queued right behind it). The
+// run is deterministic and its A, B and C are intact, so it is started again
+// and only the chunks that did not land are read; a few attempts, then the
+// run is reported lost as before.
+static const int GEMM_RERUNS = 2;
+
+static bool gemm_rerun(xdna_ops::pending_run & pr, int mc, int N) {
+    gemm_mark_c(pr.bo_c, mc, N);
+    xdna_buffer * args[3] = { pr.bo_a, pr.bo_w, pr.bo_c };
+    pr.run                = xdna_kernel_run_start(pr.kern, args, 3);
+    return pr.run && xdna_run_wait(pr.run);
+}
+
+static bool gemm_fold_run(const xdna_ops::pending_op & op, xdna_ops::pending_run & pr) {
     const xdna_ops::pending_m_block & mb  = op.m_blocks[pr.mb_idx];
     const int                         mc  = std::min(op.Mk, op.M - mb.m0);
     const int64_t                     ld  = op.node->nb[1] / sizeof(float);
     float *                           dst = (float *) op.node->data + (op.m_off + mb.m0) * ld;
-    return gemm_fold_c(pr.bo_c, mc, op.N, dst, ld, pr.accumulate);
+    std::vector<char>                 lost;
+    for (int attempt = 0; !gemm_fold_c(pr.bo_c, mc, op.N, dst, ld, pr.accumulate, lost); attempt++) {
+        if (attempt == GEMM_RERUNS) {
+            return false;
+        }
+        GGML_LOG_WARN("%s: %zu of %zu row chunks of a GEMM block did not land; running the block again\n", "xdna-ops",
+                      (size_t) std::count(lost.begin(), lost.end(), 1), lost.size());
+        if (!gemm_rerun(pr, mc, op.N)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // The kernel for a run of m_rows rows at weight row k0: the stream is built on
@@ -870,6 +909,8 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
             }
             pr.mb_idx     = (int) (&mb - op.m_blocks.data());
             pr.accumulate = k0 > 0;
+            pr.bo_w       = bo_w;
+            pr.kern       = kern;
             {
                 xdna_prof::section_timer st("prefill: gemm: A layout");
                 gemm_pack_a((const float *) src1->data + (size_t) mb.m0 * K + k0, K, mc, m_rows, kb_real, GEMM_K_RUN,

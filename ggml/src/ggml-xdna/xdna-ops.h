@@ -96,6 +96,8 @@ struct xdna_ops {
         xrt::run      run;
         xdna_buffer * bo_c       = nullptr;  // held until readback
         xdna_buffer * bo_a       = nullptr;  // released after readback
+        xdna_buffer * bo_w       = nullptr;  // the packed weights, for a re-run
+        xdna_kernel * kern       = nullptr;  // the run's kernel, for a re-run
         int           mb_idx     = 0;        // index into pending_op::m_blocks
         bool          accumulate = false;    // adds to dst: not the op's first K run
     };
