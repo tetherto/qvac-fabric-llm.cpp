@@ -6,7 +6,6 @@
 // (vec_index_cpu_features); every kernel is bit-identical to its scalar
 // reference.
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -83,8 +82,10 @@ struct TurboVecVnniScanState {
     bool seed_active = false;
     float seed = 0.0f;
     // A split query's shared floor, null for a lone range: a block whose
-    // best lane is below it is skipped.
-    const std::atomic<double> * floor_score = nullptr;
+    // best lane is below it is skipped. It is a std::atomic<double> that
+    // other threads raise, read here as the bare double it holds, so this
+    // header and the ISA objects need no <atomic>.
+    const double * floor_score = nullptr;
     size_t above_seed = 0;
 };
 // One block's candidates: scores[i] is the score of lane lanes[i] of
