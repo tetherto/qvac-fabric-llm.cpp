@@ -556,6 +556,28 @@ static void xdna_poison_range(void * p, size_t bytes) {
     }
 }
 
+// The pattern in non-temporal 16-byte stores, ordered before whatever follows by the fence.
+static void xdna_poison_range_stream(void * p, size_t bytes) {
+#if defined(__x86_64__) || defined(__i386__)
+    uint32_t *   words = (uint32_t *) p;
+    const size_t n     = bytes / sizeof(uint32_t);
+    size_t       i     = 0;
+    for (; i < n && ((uintptr_t) (words + i) & (sizeof(__m128i) - 1)); i++) {
+        words[i] = XDNA_POISON_F32;
+    }
+    const __m128i pattern = _mm_set1_epi32((int) XDNA_POISON_F32);
+    for (; i + 4 <= n; i += 4) {
+        _mm_stream_si128((__m128i *) (words + i), pattern);
+    }
+    for (; i < n; i++) {
+        words[i] = XDNA_POISON_F32;
+    }
+    _mm_sfence();
+#else
+    xdna_poison_range(p, bytes);
+#endif
+}
+
 static size_t xdna_poison_left(const void * p, size_t bytes) {
     const uint32_t * words = (const uint32_t *) p;
     const size_t     n     = bytes / sizeof(uint32_t);
@@ -581,21 +603,35 @@ static void xdna_cache_writeback(void * p, size_t bytes) {
 #endif
 }
 
+// The words of [offset, offset+bytes) a mark covers, clamped to the buffer: their address, with `bytes` set to their
+// size; null when there are none.
+static uint8_t * xdna_marked_range(xdna_buffer * buf, size_t * bytes, size_t offset) {
+    if (!buf || !buf->data || *bytes == 0 || offset >= buf->bytes) {
+        return nullptr;
+    }
+    *bytes = xdna_markable(std::min(*bytes, buf->bytes - offset));
+    return *bytes == 0 ? nullptr : (uint8_t *) buf->data + offset;
+}
+
 void xdna_buffer_mark(xdna_buffer * buf, size_t bytes, size_t offset) {
-    if (!buf || !buf->data || bytes == 0 || offset >= buf->bytes) {
+    uint8_t * base = xdna_marked_range(buf, &bytes, offset);
+    if (!base) {
         return;
     }
-    if (bytes > buf->bytes - offset) {
-        bytes = buf->bytes - offset;
-    }
-    bytes = xdna_markable(bytes);
-    if (bytes == 0) {
-        return;
-    }
-    uint8_t * base = (uint8_t *) buf->data + offset;
     xdna_poison_range(base, bytes);
     // Written back, not left dirty: our own cache lines could otherwise land
     // on top of what the device writes.
+    xdna_cache_writeback(base, bytes);
+}
+
+void xdna_buffer_mark_bulk(xdna_buffer * buf, size_t bytes, size_t offset) {
+    uint8_t * base = xdna_marked_range(buf, &bytes, offset);
+    if (!base) {
+        return;
+    }
+    xdna_poison_range_stream(base, bytes);
+    // Needed, and no fence replaces it: with an sfence or an mfence alone every fresh process lost chunks to the mark
+    // that never cleared (12 of 12). Why is not traced.
     xdna_cache_writeback(base, bytes);
 }
 
