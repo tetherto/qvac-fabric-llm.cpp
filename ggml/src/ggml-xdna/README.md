@@ -132,6 +132,10 @@ Q8_0 and BF16 files) runs without a model-specific path:
   group up behind the first, before the scheduler allocates the graph; no model
   orders its graph for it. All but the last end on a whole 512 columns and
   every node must lie in one of the backend's buffers.
+- The F32 to F16 casts llama puts before each layer's attention (a model with
+  no KV cache casts K and V) are host glue too (`GGML_XDNA_GLUE_CAST=0` leaves
+  them to the scheduler): left to the CPU backend each was a split of its own,
+  24 extra `graph_compute` calls a pass and 4 to 6 ms of the 15-token pass.
 - The norms, RoPE, the mean pooling and, in the BF16 file, the GEGLU are host
   glue. So is the attention up to ~2300 tokens. The prefill attention kernel
   takes the 20 sliding-window layers (4 query heads over 2 KV heads of 256, a
@@ -469,6 +473,7 @@ report, not for tuning: every one costs more time or energy than the default.
 | `GGML_XDNA_ATTN_LAYER` | a whole attention layer, the q/k/v projections to `l_out`, in one dispatch (the tail and the decode attention still run) |
 | `GGML_XDNA_ATTN_TAIL` | an attention layer's tail - output projection, residual, post-attention norm and FFN - in one dispatch |
 | `GGML_XDNA_GLUE` | the host ops the backend runs inside an NPU chunk (the scheduler splits the graph at each instead) |
+| `GGML_XDNA_GLUE_CAST` | the F32 to F16 casts of an attention's K and V among them (each is a CPU split instead) |
 | `GGML_XDNA_HOST_BO` | the backend's host buffer type: plain CPU buffers |
 | `GGML_XDNA_PGEMM` | the prefill GEMM on the array |
 | `GGML_XDNA_INT8` | the native int8 prefill GEMM |
