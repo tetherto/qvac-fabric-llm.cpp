@@ -11,8 +11,8 @@ should enable it explicitly and link the vector-index target directly.
 ## How The Pieces Fit
 
 The vector index is organized as layers. The storage, search, and persistence
-layers are general vector-index infrastructure; TurboVec is the q2/q4 algorithm
-built on top of them.
+layers are general vector-index infrastructure; TurboVec is the q2/q3/q4
+algorithm built on top of them.
 
 ```mermaid
 flowchart TD
@@ -23,7 +23,7 @@ flowchart TD
     storage --> snapshot["tvim snapshots"]
     snapshot --> mmap["Read-only mmap loading"]
     snapshot --> delta["tvid mutation log and compaction"]
-    storage --> turbovec["TurboVec q2/q4"]
+    storage --> turbovec["TurboVec q2/q3/q4"]
     turbovec --> rotation["Rotation and TQ+ calibration"]
     rotation --> codes["Lloyd-Max codes and bit-plane storage"]
     codes --> lut["LUT scoring and blocked SIMD cache"]
@@ -35,7 +35,7 @@ form the correctness baseline used to validate compressed or approximate paths.
 
 Generic q8 and packed q4 modes reduce memory used by CPU-resident vectors. Each
 vector stores an f32 scale, and search scores f32 queries directly against the
-quantized codes. These modes also provide comparison points for TurboVec q2/q4
+quantized codes. These modes also provide comparison points for TurboVec
 quality and performance.
 
 Exact search scans every live slot. Filtered search restricts that scan to a
@@ -55,14 +55,17 @@ from silently producing a divergent index.
 If compaction replaces the snapshot but cannot confirm its durability or reset
 the delta log, it returns `GGML_VEC_INDEX_E_PARTIAL_COMPACT`.
 
-TurboVec is a separate compressed search mode built on the same index API.
-Vectors and queries are rotated into a quantization-friendly space. TQ+
-calibration and Lloyd-Max codebooks produce q2 or q4 codes stored in bit-plane
-rows. Search builds lookup tables from the rotated query and scores packed
-codes without reconstructing full vectors. A blocked copy of the packed codes
-supports scalar, NEON, and AVX2 scoring. Derived rotation, calibration,
-blocked-code, and IVF state is invalidated or rebuilt after mutations,
-compaction, and snapshot loading.
+TurboVec is a separate compressed search mode built on the same index API: a
+port of upstream [turbovec](https://github.com/ryancodrai/turbovec) 1.1.2 that
+encodes, snapshots and syncs byte for byte as turbovec does (see Persistence
+for the one layout difference on large indexes). Vectors and
+queries are rotated into a quantization-friendly space, optional TQ+
+calibration and Lloyd-Max codebooks produce q2, q3 or q4 codes stored in
+bit-plane rows, and search builds lookup tables from the rotated query to score
+packed codes without reconstructing full vectors. A blocked copy of the packed
+codes supports scalar, NEON, and AVX2 scoring. Derived rotation, blocked-code,
+and IVF state is invalidated or rebuilt after mutations, compaction, and
+snapshot loading.
 
 Each layer carries its own regression coverage: result ordering, architecture
 parity, snapshot corruption, mmap restrictions, delta replay, compaction, stale
@@ -102,24 +105,33 @@ The generic q4/q8 layouts are local to vector-index and are not `ggml-quants`
 block formats. They keep one scale per external vector for random row lookup,
 delete/compact operations, and snapshot round trips.
 
-`ggml_vec_index_create_turbovec_q2` and `ggml_vec_index_create_turbovec_q4`
-create separate TurboQuant q2/q4 modes on 64-bit targets for positive
-dimensions up to 1024 that are multiples of 8. They store Lloyd-Max q2/q4
-codes in Rust-style bit-plane rows with one score-correction scale per vector.
-Vectors and queries use a deterministic dense full-dimension Gaussian QR
-rotation before LUT scoring. The rotation is materialized as a dense `dim x dim`
-matrix on first use, so the current dense implementation rejects larger
-dimensions for new indexes. Snapshots created by earlier releases with larger
-dimensions can still be loaded and rewritten, but add, search, and IVF
-operations return `GGML_VEC_INDEX_E_INVALID_ARG`.
+`ggml_vec_index_create_turbovec(dim, bit_width)` creates a TurboQuant index
+with 2-, 3- or 4-bit codes on 64-bit targets, for positive dimensions up to
+16384 that are multiples of 8 (`ggml_vec_index_create_turbovec_q2` and
+`_q4` are shorthands). Codes are stored in bit-plane rows with one
+score-correction scale per vector; a reconstruction too degenerate to score
+stores scale 0 rather than an inflated one. Vectors and queries use upstream
+turbovec's deterministic rotation: two rounds of a ChaCha8-seeded global
+permutation, sign flip and normalized Walsh-Hadamard transform over the largest
+power-of-two block of `dim`, computed with a fixed operation order and no fused
+multiply-add, so encoded bytes are identical on every target.
+
+TQ+ calibration is explicit. `ggml_vec_index_turbovec_calibrate` fits a
+per-coordinate shift and scale from a sample of vectors and commits it; every
+later add is encoded under it, and rows already stored are re-encoded from
+their codes. Pass a random, representative sample of about 1000 vectors, and
+calibrate before adding when possible: re-encoding stored rows is a second
+quantization. An index that is never calibrated is plain TurboQuant.
 `ggml_vec_index_prepare` is best-effort and does not report allocation status.
-The first non-empty add fits TQ+ per-coordinate calibration when it contains at least
-1000 vectors, then reuses that calibration for later adds. TurboVec snapshots
-use `.tvim` v3 to persist the calibration. Regular snapshot write/load is
-supported; mmap loading and logged mutations are reserved for a later format
-update. Search also keeps a 32-vector blocked copy of the packed codes in memory
-for NEON/AVX2 LUT scoring; this cache is updated after adds and rebuilt after
-compaction and snapshot loading.
+Search keeps a 32-vector blocked copy of the packed codes in memory for
+NEON/AVX2 LUT scoring; this cache is updated after adds and rebuilt after
+compaction, calibration and snapshot loading.
+
+Indexes loaded from a v3 snapshot (written by earlier releases) keep the
+turbovec 0.9 encoding they were written with: a dense Gaussian QR rotation,
+dimensions up to 1024 for add and search, and TQ+ calibration fitted
+automatically on a first add of at least 1000 vectors. They keep writing v3
+and reject calibrate, sync and in-memory snapshots.
 
 Search scores are dot products. The index does not normalize vectors internally.
 For cosine similarity, normalize vectors before insertion and normalize queries
@@ -148,8 +160,8 @@ before search.
   Probing at least the number of built lists searches all lists, so candidate
   coverage matches exact search. IVF state is not persisted in snapshots.
 
-`ggml_vec_index_prepare` is an optional cache warmup for TurboVec q2/q4
-rotation and codebook state; other storage modes ignore it. New callers should
+`ggml_vec_index_prepare` is an optional cache warmup for TurboVec rotation and
+codebook state; other storage modes ignore it. New callers should
 use `ggml_vec_index_build_ivf` when approximate-search preparation is needed.
 
 Higher `nprobe` values search more lists and generally improve recall at higher
@@ -199,14 +211,38 @@ durability could not be confirmed. `GGML_VEC_INDEX_E_PARTIAL_COMPACT` means the
 snapshot was replaced but its durability could not be confirmed, or resetting
 the delta log failed.
 
-TurboVec `.tvim` snapshots are llama.cpp vector-index containers, not Rust
-`turbovec` `.tv` or Rust `IdMapIndex` `.tvim` files. The formats share the
-`TVPI` magic in current fixtures, but their headers and payload layout differ:
-llama.cpp uses a 32-byte vector-index header with storage kind, qparam,
-calibration-byte, id, and checksum sections, while Rust `TurboQuantIndex` `.tv`
-uses its own compact header and has no external-id section. `ggml_vec_index_load`
-intentionally rejects Rust TurboVec files; rebuild the llama.cpp index from
-vectors when interchange is needed.
+TurboVec snapshots use upstream turbovec's v8 container, the `.tvim` files
+turbovec's own `IdMapIndex` writes: a superblock with the codebook and
+calibration, two commit header slots, and one unit per 32-row block. Files are
+interchangeable with turbovec 1.1 and later in both directions; v7 files and
+v8 files in the bit-planes unit layout load too, and positional `.tv` files
+(no ids) are rejected. Row order follows upstream's swap-remove order, so a
+snapshot is byte-identical to the one turbovec writes for the same history,
+with one exception: from 32,768 vectors, at 2 or 4 bits and dimensions that
+are multiples of 32, turbovec on aarch64 and on x86 with AVX-512 VBMI and VNNI
+stores block units in its bit-planes layout, while this writer always uses
+the sequential layout. Both forms load in either implementation.
+Each header slot reserves room for 1024 pending removals, so even a small file
+carries a few hundred KiB of zero padding; the writer leaves it as a file hole
+where the filesystem supports one. v8 carries no checksum over the block
+codes, only over the superblock and headers. Loading validates the codebook,
+calibration and per-vector scales and rejects duplicate ids. TurboVec
+snapshots do not support mmap loading or delta logs.
+
+`ggml_vec_index_to_bytes` and `ggml_vec_index_from_bytes` move the same image
+through memory, and `ggml_vec_index_serialized_size` reports its size.
+
+`ggml_vec_index_sync` saves a TurboVec index incrementally, as turbovec's
+`sync` does. The first sync to a path, and the first after a calibrate, writes
+the whole file and claims it with a random nonce. Later syncs write only the
+appended or changed block units plus one commit header and make them durable
+with a single fsync; removals inside committed blocks ride the header as redo
+ops. Each header names the units its sync wrote and their digest, so a commit
+that reached disk before its data is detected and loading falls back to the
+previous commit: a sync torn at any byte leaves a loadable file. Loading a
+synced file binds the index to it so syncs continue incrementally. A sync
+refuses, with `GGML_VEC_INDEX_E_IO`, a file another writer has advanced; load
+the file to adopt its state. Use one writer per path.
 
 Delta logs are bound to the state of the snapshot they extend. Use one evolving
 writer handle for a given snapshot and delta path pair. If another handle or

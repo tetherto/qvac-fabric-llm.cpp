@@ -398,6 +398,10 @@ void rollback_appended_slots_unlocked(
     if (is_turbovec(*idx)) {
         idx->turbovec_data.resize(base_slot * turbovec_row_bytes(idx->turbovec_bits, dim_sz));
         idx->turbovec_scale.resize(base_slot);
+        // The blocked cache may already cover the appended rows.
+        const size_t n_byte_groups = dim_sz / static_cast<size_t>(8 / idx->turbovec_bits);
+        idx->turbovec_blocked_n_blocks = (base_slot + 31) / 32;
+        idx->turbovec_blocked_data.resize(idx->turbovec_blocked_n_blocks * n_byte_groups * 32);
         // Only a legacy index fits its calibration on the first add; a 1.x
         // calibration comes from an explicit calibrate call and survives.
         if (base_slot == 0 && idx->turbovec_legacy) {
@@ -520,7 +524,9 @@ int ggml_vec_index_add_unlocked(
             max_slots = std::min(max_slots, std::numeric_limits<size_t>::max() / scale_count / sizeof(float));
         }
         size_t current_slots = std::min(idx->slot_to_id.capacity(), idx->slot_active.capacity());
-        if (is_q4(*idx)) {
+        if (is_turbovec(*idx)) {
+            // Codes and scales grow near-exactly; nothing in the f32 store.
+        } else if (is_q4(*idx)) {
             const size_t row_bytes = q4_row_bytes(dim_sz);
             current_slots = std::min(current_slots, idx->q4_data.capacity() / row_bytes);
             current_slots = std::min(current_slots, idx->q4_scale.capacity());
@@ -532,7 +538,10 @@ int ggml_vec_index_add_unlocked(
         }
         const size_t target_slots  = grow_capacity(current_slots, new_slots, max_slots);
 
-        if (is_q4(*idx)) {
+        if (is_turbovec(*idx)) {
+            reserve_mostly_exact(idx->turbovec_data, n_sz * row_elements);
+            reserve_mostly_exact(idx->turbovec_scale, n_sz);
+        } else if (is_q4(*idx)) {
             const size_t row_bytes     = q4_row_bytes(dim_sz);
             const size_t target_values = target_slots * row_bytes;
             if (idx->q4_data.capacity() < target_values) {
@@ -605,7 +614,8 @@ int ggml_vec_index_add_unlocked(
                     scales,
                     idx->dim,
                     idx->turbovec_tqplus_shift,
-                    idx->turbovec_tqplus_scale);
+                    idx->turbovec_tqplus_scale,
+                    idx->n_threads);
             }
         }
 
@@ -685,6 +695,30 @@ int ggml_vec_index_add(
     }
 }
 
+// Upstream turbovec's swap_remove: the last slot's row moves into `slot`
+// and the index shrinks by one, so a TurboVec 1.x index never holds
+// tombstones and its slot order is upstream's row order. Allocation-free.
+static void turbovec_swap_remove(ggml_vec_index & idx, size_t slot) {
+    turbovec_sync_note_remove(idx, slot);
+    const size_t last = idx.slot_to_id.size() - 1;
+    const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim));
+    if (slot != last) {
+        std::memcpy(
+            idx.turbovec_data.data() + slot * row_bytes,
+            idx.turbovec_data.data() + last * row_bytes,
+            row_bytes);
+        idx.turbovec_scale[slot] = idx.turbovec_scale[last];
+        idx.slot_to_id[slot] = idx.slot_to_id[last];
+        idx.id_to_slot[idx.slot_to_id[slot]] = slot;
+    }
+    idx.turbovec_data.resize(last * row_bytes);
+    idx.turbovec_scale.resize(last);
+    idx.slot_to_id.resize(last);
+    idx.slot_active.resize(last);
+    --idx.n_active;
+    turbovec_blocked_swap_remove(idx, slot, last);
+}
+
 int ggml_vec_index_remove_unlocked(
         ggml_vec_index_t * idx,
         uint64_t id,
@@ -712,6 +746,16 @@ int ggml_vec_index_remove_unlocked(
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         remove_state_hash(*idx, slot_state_hash(*idx, slot));
+        if (is_turbovec(*idx) && !idx->turbovec_legacy) {
+            turbovec_swap_remove(*idx, slot);
+            idx->id_to_slot.erase(id);
+            ++idx->generation;
+            invalidate_ivf(*idx);
+            if (!allow_delta_bound) {
+                idx->delta_log_start_allowed = false;
+            }
+            return GGML_VEC_INDEX_OK;
+        }
         idx->slot_active[slot] = 0;
         --idx->n_active;
         idx->id_to_slot.erase(it);
@@ -1248,6 +1292,85 @@ int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id) {
     }
 }
 
+int ggml_vec_index_storage(const ggml_vec_index_t * idx) {
+    if (idx == nullptr) {
+        return GGML_VEC_INDEX_STORAGE_NONE;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        switch (idx->turbovec_bits) {
+            case 2: return GGML_VEC_INDEX_STORAGE_TURBOVEC_Q2;
+            case 3: return GGML_VEC_INDEX_STORAGE_TURBOVEC_Q3;
+            case 4: return GGML_VEC_INDEX_STORAGE_TURBOVEC_Q4;
+            default: break;
+        }
+        return is_q4(*idx) ? GGML_VEC_INDEX_STORAGE_Q4 :
+            is_q8(*idx) ? GGML_VEC_INDEX_STORAGE_Q8 : GGML_VEC_INDEX_STORAGE_F32;
+    } catch (...) {
+        return GGML_VEC_INDEX_STORAGE_NONE;
+    }
+}
+
+int ggml_vec_index_turbovec_is_legacy(const ggml_vec_index_t * idx) {
+    if (idx == nullptr) {
+        return 0;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        return is_turbovec(*idx) && idx->turbovec_legacy ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+int ggml_vec_index_ids(
+        const ggml_vec_index_t * idx,
+        uint64_t * out_ids,
+        size_t capacity,
+        size_t * out_count) {
+    if (idx == nullptr || out_count == nullptr || (capacity != 0 && out_ids == nullptr)) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        *out_count = active_count(*idx);
+        size_t written = 0;
+        for (size_t slot = 0; slot < idx->slot_to_id.size() && written < capacity; ++slot) {
+            if (slot_is_active(*idx, slot)) {
+                out_ids[written++] = idx->slot_to_id[slot];
+            }
+        }
+        return GGML_VEC_INDEX_OK;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_set_threads(ggml_vec_index_t * idx, int n_threads) {
+    if (idx == nullptr || n_threads < 1 || n_threads > kMaxThreads) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        idx->n_threads = n_threads;
+        return GGML_VEC_INDEX_OK;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_threads(const ggml_vec_index_t * idx) {
+    if (idx == nullptr) {
+        return 0;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        return idx->n_threads;
+    } catch (...) {
+        return 0;
+    }
+}
+
 int ggml_vec_index_turbovec_calibrate(ggml_vec_index_t * idx, const float * sample, int n) {
     if (idx == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -1272,7 +1395,7 @@ int ggml_vec_index_turbovec_calibrate(ggml_vec_index_t * idx, const float * samp
         std::vector<float> shift;
         std::vector<float> scale;
         const int status =
-            fit_turbovec_calibration(sample, n, idx->turbovec_bits, idx->dim, shift, scale);
+            fit_turbovec_calibration(sample, n, idx->turbovec_bits, idx->dim, shift, scale, idx->n_threads);
         if (status != GGML_VEC_INDEX_OK) {
             return status;
         }
@@ -1296,12 +1419,14 @@ int ggml_vec_index_turbovec_calibrate(ggml_vec_index_t * idx, const float * samp
                 shift,
                 scale,
                 codes,
-                scales);
+                scales,
+                idx->n_threads);
             repack_turbovec_codes(codes.data(), n_slots, idx->turbovec_bits, idx->dim, blocked, n_blocks);
         }
 
         idx->turbovec_tqplus_shift.swap(shift);
         idx->turbovec_tqplus_scale.swap(scale);
+        ++idx->turbovec_calib_gen;
         if (n_slots != 0) {
             idx->turbovec_data.swap(codes);
             idx->turbovec_scale.swap(scales);
