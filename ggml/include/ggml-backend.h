@@ -104,6 +104,10 @@ extern "C" {
     GGML_API enum ggml_status ggml_backend_graph_compute      (ggml_backend_t backend, struct ggml_cgraph * cgraph);
     GGML_API enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph);
 
+    // backend execution workspace, separate from tensor buffers; backends without one report zero
+    GGML_API size_t ggml_backend_get_work_size      (ggml_backend_t backend);
+    GGML_API size_t ggml_backend_graph_get_work_size(ggml_backend_t backend, const struct ggml_cgraph * cgraph);
+
     // NOTE: will be removed, use device version instead
     GGML_API bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op);
     GGML_API bool ggml_backend_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft);
@@ -370,6 +374,10 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // scheduler-owned host allocations including allocator metadata, excluding tensor buffers and backend workspace
+    GGML_API size_t                     ggml_backend_sched_get_host_size(ggml_backend_sched_t sched);
+    // peak execution workspace over the last graph's splits assigned to this backend, at its configured threads
+    GGML_API size_t                     ggml_backend_sched_get_work_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);

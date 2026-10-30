@@ -499,6 +499,8 @@ llama_test(test-hexagon-dma-reader)
 
 llama_build(test-backend-ops.cpp)
 
+llama_build_and_test(test-backend-memory.cpp)
+
 llama_build_and_test(test-tiled-mulmat.cpp)
 
 # Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different

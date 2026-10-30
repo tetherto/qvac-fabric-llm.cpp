@@ -797,6 +797,23 @@ static __device__ __forceinline__ int ggml_cuda_dp4a_us(const unsigned int a, co
 #endif
 }
 
+#define GGML_CUDA_MAX_GRIDDIM_Y 65535
+#define GGML_CUDA_MAX_GRIDDIM_Z 65535
+
+template <typename F>
+static __device__ __forceinline__ void ggml_cuda_for_each_grid_y(const int64_t count, F && body) {
+    for (int64_t i = blockIdx.y; i < count; i += gridDim.y) {
+        body(i);
+    }
+}
+
+template <typename F>
+static __device__ __forceinline__ void ggml_cuda_for_each_grid_z(const int64_t count, F && body) {
+    for (int64_t i = blockIdx.z; i < count; i += gridDim.z) {
+        body(i);
+    }
+}
+
 static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float v, const float u) {
     acc += v*u;
 }

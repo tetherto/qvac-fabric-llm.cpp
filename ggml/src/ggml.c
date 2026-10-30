@@ -1604,6 +1604,8 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
     return wtype;
 }
 
+size_t ggml_context_overhead(void) { return sizeof(struct ggml_context); }
+
 size_t ggml_tensor_overhead(void) {
     return GGML_OBJECT_SIZE + GGML_TENSOR_SIZE;
 }

@@ -171,6 +171,16 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
     GGML_UNUSED(backend);
 }
 
+static size_t ggml_backend_cpu_get_work_size(ggml_backend_t backend) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    return cpu_ctx->work_size;
+}
+
+static size_t ggml_backend_cpu_graph_get_work_size(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    return ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool).work_size;
+}
+
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
@@ -708,6 +718,15 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_get_work_size") == 0) {
+        return (void *)ggml_backend_cpu_get_work_size;
+    }
+    if (strcmp(name, "ggml_backend_graph_get_work_size") == 0) {
+        return (void *)ggml_backend_cpu_graph_get_work_size;
+    }
+    if (strcmp(name, "ggml_graph_plan") == 0) {
+        return (void *)ggml_graph_plan;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

@@ -473,6 +473,20 @@ enum ggml_status ggml_backend_graph_plan_compute(ggml_backend_t backend, ggml_ba
     return backend->iface.graph_plan_compute(backend, plan);
 }
 
+size_t ggml_backend_get_work_size(ggml_backend_t backend) {
+    typedef size_t (*query_t)(ggml_backend_t);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    query_t query = (query_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_work_size");
+    return query ? query(backend) : 0;
+}
+
+size_t ggml_backend_graph_get_work_size(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
+    typedef size_t (*query_t)(ggml_backend_t, const struct ggml_cgraph *);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    query_t query = (query_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_get_work_size");
+    return query ? query(backend, cgraph) : 0;
+}
+
 enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     enum ggml_status err = ggml_backend_graph_compute_async(backend, cgraph);
     ggml_backend_synchronize(backend);
@@ -875,6 +889,7 @@ struct ggml_backend_sched {
 
     char * context_buffer;
     size_t context_buffer_size;
+    size_t backend_ids_capacity;
 
     bool op_offload;
     bool prefetch_weights;
@@ -2303,6 +2318,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*4;
+    sched->backend_ids_capacity = nodes_size;
     sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
@@ -2600,6 +2616,55 @@ ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     return sched->bufts[backend_index];
+}
+
+static size_t ggml_backend_sched_split_host_size(ggml_backend_sched_t sched) {
+    size_t size = sched->splits_capacity * sizeof(sched->splits[0]);
+    for (int i = 0; i < sched->splits_capacity; ++i) {
+        size += sched->splits[i].inputs_capacity * sizeof(sched->splits[i].inputs[0]);
+    }
+    return size;
+}
+
+static size_t ggml_backend_sched_backend_ids_host_size(ggml_backend_sched_t sched) {
+    return sched->backend_ids_capacity *
+        (sizeof(sched->node_backend_ids[0]) + sizeof(sched->leaf_backend_ids[0]) +
+         sizeof(sched->prev_node_backend_ids[0]) + sizeof(sched->prev_leaf_backend_ids[0]));
+}
+
+static size_t ggml_backend_sched_hash_host_size(ggml_backend_sched_t sched) {
+    size_t size = sched->hash_set.size *
+        (sizeof(sched->hash_set.keys[0]) + sizeof(sched->hv_tensor_backend_ids[0]) +
+         sched->n_backends * sched->n_copies * sizeof(sched->hv_tensor_copies[0]));
+    return size + ggml_bitset_size(sched->hash_set.size) * sizeof(sched->hash_set.used[0]);
+}
+
+size_t ggml_backend_sched_get_host_size(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    size_t size = sizeof(*sched) + sched->context_buffer_size;
+    if (sched->ctx) {
+        size += ggml_context_overhead();
+    }
+    size += ggml_backend_sched_backend_ids_host_size(sched);
+    size += ggml_backend_sched_hash_host_size(sched);
+    size += sched->graph.size * (sizeof(sched->graph.nodes[0]) + sizeof(sched->graph.leafs[0]));
+    size += sched->graph_inputs_capacity * sizeof(sched->graph_inputs[0]);
+    size += sched->moe_cache_entries_capacity * sizeof(sched->moe_cache_entries[0]);
+    size += ggml_backend_sched_split_host_size(sched);
+    return size + ggml_gallocr_get_host_size(sched->galloc);
+}
+
+size_t ggml_backend_sched_get_work_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    const int backend_id = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_id >= 0);
+    size_t size = 0;
+    for (int i = 0; i < sched->n_splits; ++i) {
+        if (sched->splits[i].backend_id == backend_id) {
+            size = std::max(size, ggml_backend_graph_get_work_size(backend, &sched->splits[i].graph));
+        }
+    }
+    return size;
 }
 
 size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
