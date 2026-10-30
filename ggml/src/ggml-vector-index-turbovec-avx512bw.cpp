@@ -16,6 +16,8 @@ namespace ggml_vec_index_detail {
 namespace {
 
 constexpr size_t kBlock = 32;
+// kTurboVecFlushEvery; this ISA object does not include the impl header,
+// whose inline functions it must not instantiate.
 constexpr size_t kFlushEvery = 256;
 
 // Upstream `avx2_batch_flush_to_fa`: one block's u16 accumulators for one

@@ -6,6 +6,7 @@
 // (vec_index_cpu_features); every kernel is bit-identical to its scalar
 // reference.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -15,7 +16,7 @@ namespace ggml_vec_index_detail {
 void turbovec_wht_block_avx2(float * blk, int block, float inv_sqrt_block);
 void turbovec_permute_gather_avx2(
     int mode, const float * src, const uint32_t * perm, const float * signs, float inv, float * dst, size_t n);
-float turbovec_norm_sq_avx(const float * row, int dim);
+float turbovec_norm_sq_avx2(const float * row, int dim);
 double turbovec_quantize_row_avx2(
     const float * rotated,
     const float * shift,
@@ -66,6 +67,69 @@ void turbovec_vnni_lut_sums(
     size_t n_byte_groups,
     size_t bytes_after,
     int32_t * sums);
+// The staged search's lone-query sign scan with its collector's per-block
+// tests fused into the kernel (upstream search_single_query_vnni_blk2 and
+// the HEAP_BUFFERED branch of avx512_post_flush_heap_update). The scores
+// are the `vpermb` scan's, finished in registers; the collector itself
+// (ggml-vector-index-turbovec-staged.cpp Collector) keeps its buffer and
+// threshold logic and gets each block's lanes to visit, compressed. The
+// kernel reads this state before every block and the sink moves it on.
+struct TurboVecVnniScanState {
+    // Once `cut` (a seed or a cut-back set it) only lanes above the
+    // threshold are visited, and a block whose best lane is not is skipped.
+    double threshold = 0.0;
+    bool cut = false;
+    // Lanes above the seed are counted while a seed is active.
+    bool seed_active = false;
+    float seed = 0.0f;
+    // A split query's shared floor, null for a lone range: a block whose
+    // best lane is below it is skipped.
+    const std::atomic<double> * floor_score = nullptr;
+    size_t above_seed = 0;
+};
+// One block's candidates: scores[i] is the score of lane lanes[i] of
+// `block`, `floor` the floor the block was tested against.
+typedef void (*TurboVecVnniScanSink)(
+    void * ctx,
+    size_t block,
+    double floor,
+    const float * scores,
+    const int32_t * lanes,
+    size_t n,
+    TurboVecVnniScanState & state);
+// Blocks [block_begin, block_end) of the sign region at `blocks`; dims
+// 8 * n_byte_groups, n_vectors rows in all (the tail block's padding lanes
+// score -inf).
+void turbovec_vnni_lut_scan_blk2(
+    const uint8_t * split_lut,
+    float scale,
+    float bias,
+    const float * vector_scales,
+    const uint8_t * blocks,
+    size_t block_begin,
+    size_t block_end,
+    size_t n_vectors,
+    size_t n_byte_groups,
+    TurboVecVnniScanState & state,
+    TurboVecVnniScanSink sink,
+    void * ctx);
+// The same scan for a batch of nq queries (upstream search_multi_query_vnni
+// and its dispatch: eight a pass at most, a lone one through the two-block
+// kernel), each with its own state and sink context.
+void turbovec_vnni_lut_scan_batch(
+    const uint8_t * const * split_luts,
+    const float * scales,
+    const float * biases,
+    int nq,
+    const float * vector_scales,
+    const uint8_t * blocks,
+    size_t block_begin,
+    size_t block_end,
+    size_t n_vectors,
+    size_t n_byte_groups,
+    TurboVecVnniScanState * states,
+    TurboVecVnniScanSink sink,
+    void * const * ctxs);
 // The 4-bit permute-dot scan: upstream's weight layout and zero.
 void turbovec_permute_dot_sums_vnni(
     const int8_t * levels16,

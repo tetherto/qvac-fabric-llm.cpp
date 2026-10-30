@@ -150,8 +150,17 @@ if (TARGET ggml-vector-index)
     target_compile_features(test-vector-index PRIVATE cxx_std_17)
     # Golden inputs are rebuilt bit for bit: no fused multiply-adds and no
     # fast-math from the toolchain.
-    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    # Same options as ggml-vector-index (ggml/src/ggml-vector-index/CMakeLists.txt).
+    set(TEST_VECTOR_INDEX_FP_OPTIONS "")
+    if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        set(TEST_VECTOR_INDEX_FP_OPTIONS "/fp:precise")
+        if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            list(APPEND TEST_VECTOR_INDEX_FP_OPTIONS "/clang:-ffp-contract=off")
+        endif()
+    elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         set(TEST_VECTOR_INDEX_FP_OPTIONS -fno-fast-math -ffp-contract=off)
+    elseif (MSVC)
+        set(TEST_VECTOR_INDEX_FP_OPTIONS "/fp:precise")
     endif()
     target_compile_options(test-vector-index PRIVATE ${TEST_VECTOR_INDEX_FP_OPTIONS})
     target_include_directories(test-vector-index PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)

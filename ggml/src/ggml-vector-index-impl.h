@@ -40,6 +40,15 @@
 #define GGML_VEC_INDEX_USE_NEON 0
 #endif
 
+// SSE2 is the x86-64 baseline, so the table quantisation below needs no
+// dispatch.
+#if !GGML_VEC_INDEX_USE_NEON && (defined(__SSE2__) || defined(_M_X64))
+#define GGML_VEC_INDEX_USE_SSE2 1
+#include <emmintrin.h>
+#else
+#define GGML_VEC_INDEX_USE_SSE2 0
+#endif
+
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/file.h>
@@ -235,6 +244,83 @@ inline constexpr int kMaxThreads = 256;
 // them across threads (upstream turbovec's block-parallel threshold).
 inline constexpr size_t kTurboVecParallelMinBlocks = 1024;
 
+// Byte groups a NEON LUT scan sums in u16 before widening into its float
+// accumulators. Every kernel that must match score_turbovec_lut_block bit for
+// bit flushes at the same points, so it is shared here.
+inline constexpr int kTurboVecFlushEvery = 256;
+
+// std::round (half away from zero) without the libm call it is on x86's
+// baseline, where it costs the table builds a call per entry (upstream
+// round_half_away_f32, H65). aarch64 keeps std::round: it is one frinta
+// and vectorises. Below 2^23 the integer conversion is the exact
+// truncation and the fraction is exact in f32; at or above it, and for
+// NaN, a float is already its own rounding. Written as two selects rather
+// than an early return, which is the form quantise_table16 below spells
+// out in SSE2 for the table builds; the scalar form serves the per-weight
+// callers. Checked against the earlier form and std::round over every
+// float: only the sign of a zero result can differ from std::round, which
+// the callers' max(0, ..) or integer cast erases. The cast's operand is
+// zeroed where it would be out of range, so it is always defined.
+inline float round_half_away_f32(float x) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return std::round(x);
+#else
+    const bool in_range = std::fabs(x) < 8388608.0f;
+    const float c = in_range ? x : 0.0f;
+    const float t = static_cast<float>(static_cast<int32_t>(c));
+    const float f = c - t;
+    const float r = t + static_cast<float>(static_cast<int>(f >= 0.5f) - static_cast<int>(f <= -0.5f));
+    return in_range ? r : x;
+#endif
+}
+
+// Sixteen table entries that share one minimum, quantised to u8 (upstream
+// quantise_tables): round_half_away_f32((in[i] - mn) * inv_scale) clamped
+// to [0, max_lut], max_lut at most 255. On x86 the loop is spelled out in
+// SSE2, operation for operation the scalar form above (subps, mulps,
+// andps for fabs, cmpps, cvttps2dq, cvtdq2ps, the two compare masks added
+// as integers, the selects as masks), because GCC left the scalar loop
+// unvectorised on the x86 Ubuntu host where clang vectorised it, at about
+// 2 ns an entry over 4096 sign-table and 8192 exact-table entries at dim
+// 1024. minps(a, b) is a < b ? a : b and maxps(a, b) is a > b ? a : b,
+// NaN and signed zeros included, which are std::min(max_lut, v) and
+// std::max(0.0f, v) exactly; the clamped value is an integer in [0, 255],
+// so the packs to bytes never saturate. aarch64 keeps the scalar loop,
+// which its compiler vectorises around frinta.
+inline void quantise_table16(const float * in, float mn, float inv_scale, float max_lut, uint8_t * out) {
+#if GGML_VEC_INDEX_USE_SSE2
+    const __m128  mn_v     = _mm_set1_ps(mn);
+    const __m128  inv_v    = _mm_set1_ps(inv_scale);
+    const __m128  max_v    = _mm_set1_ps(max_lut);
+    const __m128  zero     = _mm_setzero_ps();
+    const __m128  abs_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7fffffff));
+    const __m128  limit    = _mm_set1_ps(8388608.0f);
+    const __m128  half     = _mm_set1_ps(0.5f);
+    const __m128  neg_half = _mm_set1_ps(-0.5f);
+    __m128i q[4];
+    for (int j = 0; j < 4; ++j) {
+        const __m128 x = _mm_mul_ps(_mm_sub_ps(_mm_loadu_ps(in + 4 * j), mn_v), inv_v);
+        const __m128 in_range = _mm_cmplt_ps(_mm_and_ps(x, abs_mask), limit);
+        const __m128 c = _mm_and_ps(x, in_range);
+        const __m128 t = _mm_cvtepi32_ps(_mm_cvttps_epi32(c));
+        const __m128 f = _mm_sub_ps(c, t);
+        // A compare mask is 0 or -1, so (f <= -0.5) - (f >= 0.5) is the
+        // scalar's (f >= 0.5) - (f <= -0.5).
+        const __m128i adj =
+            _mm_sub_epi32(_mm_castps_si128(_mm_cmple_ps(f, neg_half)), _mm_castps_si128(_mm_cmpge_ps(f, half)));
+        const __m128 r = _mm_add_ps(t, _mm_cvtepi32_ps(adj));
+        const __m128 rounded = _mm_or_ps(_mm_and_ps(in_range, r), _mm_andnot_ps(in_range, x));
+        q[j] = _mm_cvttps_epi32(_mm_max_ps(_mm_min_ps(rounded, max_v), zero));
+    }
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(out),
+        _mm_packus_epi16(_mm_packs_epi32(q[0], q[1]), _mm_packs_epi32(q[2], q[3])));
+#else
+    for (size_t i = 0; i < 16; ++i) {
+        out[i] = static_cast<uint8_t>(std::max(0.0f, std::min(max_lut, round_half_away_f32((in[i] - mn) * inv_scale))));
+    }
+#endif
+}
+
 // One parallel_for task: ctx is the caller's functor.
 using ParallelTaskFn = void (*)(void * ctx, size_t task, size_t worker);
 
@@ -345,13 +431,16 @@ struct ggml_vec_index {
     // True for an index loaded from a v3 snapshot: it keeps the turbovec 0.9
     // QR rotation, codebook and first-add calibration it was written with.
     bool turbovec_legacy = false;
-    // The blocked cache uses upstream's vector-major layout (1.x 4-bit
-    // indexes on hosts that score with permute-dot); fixed at creation.
+    // The blocked cache uses upstream's vector-major layout (1.x indexes on
+    // hosts with the dot-product kernels: 4-bit on aarch64, 2 to 4 bits on
+    // x86); fixed at creation.
     bool turbovec_blocked_vm = false;
     // The blocked cache uses upstream's wider `vm8` unit instead (aarch64
     // with i8mm: 4-bit indexes whose byte-group count is a multiple of
     // eight, and 2-bit ones under TURBOVEC_2BIT_VM8=1); fixed at creation
     // and never persisted, since snapshots are written from sequential rows.
+    // A 4-bit vm8 index keeps `turbovec_blocked_vm` set as well (it scores
+    // with permute-dot); `turbovec_layout` gives vm8 priority.
     bool turbovec_blocked_vm8 = false;
     // Created under upstream's x86 rules (turbovec_x86_rules); fixed at
     // creation. With the vector-major layout, 2- and 3-bit codes score
@@ -658,10 +747,30 @@ void turbovec_force_vm8_2bit_for_test(int mode);
 // small indexes included, so a test reaches the batch kernels.
 void turbovec_force_batches_for_test(int enabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
+// Staged searches so far whose sampled seed left the shortlist short, and
+// staged batch scan tasks run so far.
+int64_t turbovec_seed_short_count_for_test(void);
+int64_t turbovec_batch_scan_count_for_test(void);
 size_t parallel_pool_threads_for_test(void);
 void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums);
 int parallel_pool_selftest_for_test(int n_threads);
 int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * unit, std::vector<uint64_t> * masks);
+// The staged search's 2-bit row rescore against the full scan's block
+// kernel for every lane of every block of a planes index: 1 equal bit for
+// bit, 0 not, -1 when the index rescores by block.
+int turbovec_exact2_row_parity_for_test(const ggml_vec_index_t * idx, const float * query);
+// round_half_away_f32 and quantise_table16 against std::round at their
+// edges: 0 all equal, otherwise the number of the first case that is not.
+int turbovec_rounding_parity_for_test();
+// The staged search's fused AVX-512 sign scan against the block-by-block
+// path over a vector-major sign region: n_q lone top-k searches each way,
+// 1 when every id and score bit agrees, 0 not, -1 when the index or host
+// has no fused scan.
+int turbovec_vnni_fused_scan_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k);
+// The same for the staged batch of n_q queries searched at once: 1 equal,
+// 0 different, below zero the lone test's reasons, -6 when the batch did
+// not run.
+int turbovec_vnni_fused_batch_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
     uint64_t * codes_hash,
@@ -671,10 +780,11 @@ int turbovec_index_hashes_for_test(
 #endif
 // Whether this CPU runs upstream turbovec's dot-product ("vector-major")
 // kernels: aarch64 with dot product, x86 with AVX-512 F/BW/VBMI/VNNI. Those
-// hosts score 4-bit codes with int8 permute-dot arithmetic.
+// hosts score 4-bit codes with int8 permute-dot arithmetic, and x86 also
+// scans 2- and 3-bit codes in the vector-major layout with `vpermb`.
 bool turbovec_cpu_vector_major();
 // The CPU's own dot-product support, which a test override cannot change:
-// gates the SDOT instructions themselves.
+// gates the SDOT and AVX-512 VNNI instructions themselves.
 bool turbovec_cpu_dot_product();
 // Runtime CPU features gating the rotation, encode, layout and checksum
 // kernels, as upstream turbovec gates them with is_x86_feature_detected!.
@@ -889,8 +999,6 @@ bool turbovec_planes_wanted(int bits, int dim, size_t n_vectors);
 void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot);
 void turbovec_planes_reset(ggml_vec_index & idx);
 void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
-// Searches one query (rotated, TQ+-calibrated) in stages into `heap`;
-// returns false when the index is not set up for it.
 // How a staged search is run, following upstream's batch bookkeeping.
 struct TurboVecStagedOpts {
     // The call searches one query: on aarch64 its sign tables cap at 31.
@@ -899,12 +1007,38 @@ struct TurboVecStagedOpts {
     // rescan of the one query in a batch whose sampled seed ran short).
     bool sign_single = false;
     // Set to whether upstream's sampled seed would have left this query's
-    // shortlist short; false when upstream does not seed.
+    // shortlist short and its rescan alone would read other tables (the
+    // aarch64 rules); false when upstream does not seed or rescans with
+    // the same tables (the x86 rules).
     bool * seed_short = nullptr;
     // Threads the one query may split its blocks over (a batch already
     // splits across queries and passes 1). The results do not depend on it.
     int n_threads = 1;
+    // Skip the sampled seed: a batch's rescan of a query whose seed ran
+    // short, which upstream runs unseeded. The results do not depend on it.
+    bool unseeded = false;
+    // The query's shortlist, when the caller scanned the sign region for it
+    // (a batch): sign scores under the centred tables, by slot. The call
+    // then ranks and rescores it and skips the scan.
+    const std::vector<ScoreId> * shortlist = nullptr;
 };
+// The staged search for a batch of queries (rotated, uncalibrated): the sign
+// region is scanned several queries at a time (four with the fused LUT
+// kernel over a lane-blocked region, six with the `vpermb` kernel over a
+// vector-major one), then each query is ranked and rescored as
+// turbovec_staged_search does. Fills heaps[q] like search_one would. False
+// when the batch is better served query by query (filtered, too few
+// queries for the threads, no planes cache, no batch kernel for the sign
+// region's layout on this build).
+bool turbovec_staged_search_batch(
+    const ggml_vec_index & idx,
+    const float * rotated_queries,
+    int n_q,
+    int k,
+    int n_threads,
+    std::vector<std::vector<ScoreId>> & heaps);
+// Searches one query (rotated, TQ+-calibrated) in stages into `heap`;
+// returns false when the index is not set up for it.
 bool turbovec_staged_search(
     const ggml_vec_index & idx,
     const float * query,
@@ -946,7 +1080,6 @@ float dot_turbovec_bits_lut_row(
     const float * scales,
     int bits,
     int dim);
-void quantize_turbovec_q2_row(const float * src, uint8_t * dst, float * scales, int dim);
 void quantize_turbovec_batch(
     const float * src,
     int n,
@@ -1044,31 +1177,6 @@ void turbovec_sync_unbind(ggml_vec_index & idx) noexcept;
 // next sync's redo ops.
 void turbovec_sync_note_remove(ggml_vec_index & idx, size_t slot) noexcept;
 int turbovec_v8_sync(ggml_vec_index & idx, const char * path);
-void decode_turbovec_q2_row(const uint8_t * codes, const float * scales, float * dst, int dim);
-void decode_turbovec_q2_row_calibrated(
-    const uint8_t * codes,
-    const float * scales,
-    const float * tqplus_shift,
-    const float * tqplus_scale,
-    float * dst,
-    int dim);
-void build_turbovec_q2_lut(const float * rotated_query, int dim, std::vector<uint8_t> & lut, float & scale, float & bias);
-float dot_turbovec_q2_lut_row(const uint8_t * lut, float lut_scale, float lut_bias, const uint8_t * codes, const float * scales, int dim);
-float dot_turbovec_q2_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim);
-float dot_turbovec_q2_row(const float * query, const uint8_t * codes, const float * scales, int dim);
-void quantize_turbovec_q4_row(const float * src, uint8_t * dst, float * scales, int dim);
-void decode_turbovec_q4_row(const uint8_t * codes, const float * scales, float * dst, int dim);
-void decode_turbovec_q4_row_calibrated(
-    const uint8_t * codes,
-    const float * scales,
-    const float * tqplus_shift,
-    const float * tqplus_scale,
-    float * dst,
-    int dim);
-void build_turbovec_q4_lut(const float * rotated_query, int dim, std::vector<uint8_t> & lut, float & scale, float & bias);
-float dot_turbovec_q4_lut_row(const uint8_t * lut, float lut_scale, float lut_bias, const uint8_t * codes, const float * scales, int dim);
-float dot_turbovec_q4_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim);
-float dot_turbovec_q4_row(const float * query, const uint8_t * codes, const float * scales, int dim);
 // Patches the blocked cache for a swap-remove of `slot` whose last slot
 // (`last`, already removed from the rows) moved into it.
 void turbovec_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);

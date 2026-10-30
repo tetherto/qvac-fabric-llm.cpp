@@ -153,7 +153,7 @@ void turbovec_wht_block_avx2(float * p, int block, float inv_sqrt_block) {
 
 // Upstream encode.rs `norm_sq_avx`: the eight chains are the eight lanes of
 // one register, multiplied and added as separate instructions.
-float turbovec_norm_sq_avx(const float * row, int dim) {
+float turbovec_norm_sq_avx2(const float * row, int dim) {
     constexpr int chains_n = 8;
     __m256 acc = _mm256_setzero_ps();
     int i = 0;
@@ -275,10 +275,9 @@ double turbovec_quantize_row_avx2(
     return (chains[0] + chains[1]) + (chains[2] + chains[3]);
 }
 
-// Upstream encode.rs `first_invalid_in_chunk_avx2`: an all-clean fast path
-// testing |x| < max_abs eight lanes at a time (NaN, Inf and over-magnitude
-// values all fail), with the exact scalar predicate pinpointing the first
-// invalid element of a flagged group. Returns n when every element is valid.
+// A permute-dot block's scores: fma(sum, scale, bias) * vector_scales[lane]
+// for the first `valid` of 32 lanes, -inf after. The hardware fused
+// multiply-add rounds once, as std::fma does, without a libm call.
 void permute_dot_finish_avx2(
         const int32_t * sums, float scale, float bias, const float * vector_scales, size_t valid, float * out_scores) {
     const __m256 scale_v = _mm256_set1_ps(scale);
@@ -323,6 +322,10 @@ static bool invalid_abs(float x, float max_abs) {
     return magnitude >= max_abs;
 }
 
+// Upstream encode.rs `first_invalid_in_chunk_avx2`: an all-clean fast path
+// testing |x| < max_abs eight lanes at a time (NaN, Inf and over-magnitude
+// values all fail), with the exact scalar predicate pinpointing the first
+// invalid element of a flagged group. Returns n when every element is valid.
 size_t first_invalid_abs_avx2(const float * values, size_t n, float max_abs) {
     const __m256 bound = _mm256_set1_ps(max_abs);
     const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));

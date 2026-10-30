@@ -937,7 +937,8 @@ static bool open_temp_file(const char * path, TempFile & temp) {
                 base.pop_back();
             }
         }
-        temp.path = base + suffix;
+        // The suffix can push a destination just under the limit past it.
+        temp.path = windows_long_path(base + suffix);
 
         int fd = -1;
         const errno_t error = _wsopen_s(&fd, temp.path.c_str(), _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY | _O_NOINHERIT,

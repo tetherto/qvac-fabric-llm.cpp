@@ -64,8 +64,8 @@ if (GGML_VECTOR_INDEX_AVX2_FLAG)
         PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX2_FLAG}")
 endif()
 
-# The TurboVec layout and checksum kernels need SSSE3 and SSE4.2, and the
-# rotation kernels AVX-512 F (with AVX2). Each gets its own object, like the
+# The TurboVec layout kernels need SSSE3, the checksum kernel SSE4.2, and
+# the rotation kernels AVX-512 F (with AVX2). Each gets its own object, like the
 # AVX2 one, and runs only after a runtime CPU check.
 set(GGML_VECTOR_INDEX_SSE42_FLAG "")
 set(GGML_VECTOR_INDEX_SSSE3_FLAG "")

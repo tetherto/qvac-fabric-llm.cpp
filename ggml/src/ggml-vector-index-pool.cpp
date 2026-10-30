@@ -267,17 +267,19 @@ void forget_pool_in_child() {
 }
 #endif
 
-// Done once, before the first pool exists.
-void prepare_pool_process() {
+// Done once, before the first pool exists. False when helpers must not
+// start, so every parallel_for runs on its caller's thread.
+bool prepare_pool_process() {
 #ifdef _WIN32
     // Pin this module: helpers outlive any FreeLibrary that would unmap
     // their code, and the exit-time destructor then has nothing to stop.
     HMODULE self = nullptr;
-    GetModuleHandleExW(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-        reinterpret_cast<LPCWSTR>(&g_pool), &self);
+    return GetModuleHandleExW(
+               GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+               reinterpret_cast<LPCWSTR>(&g_pool), &self) != 0;
 #else
     pthread_atfork(nullptr, nullptr, forget_pool_in_child);
+    return true;
 #endif
 }
 
@@ -289,8 +291,10 @@ Pool * acquire_pool() {
     if (pool != nullptr) {
         return pool;
     }
-    static std::once_flag prepared;
-    std::call_once(prepared, prepare_pool_process);
+    static const bool prepared = prepare_pool_process();
+    if (!prepared) {
+        return nullptr;
+    }
     Pool * fresh = new (std::nothrow) Pool();
     if (fresh == nullptr) {
         return nullptr;
@@ -302,7 +306,8 @@ Pool * acquire_pool() {
     return pool;
 }
 
-// Stops the helpers when the library unloads or the process exits; a
+// Stops the helpers when the library unloads or the process exits (POSIX;
+// on Windows the module is pinned and it only blocks new pool use); a
 // parallel_for after that runs on its caller's thread.
 struct PoolShutdown {
     PoolShutdown() = default;
