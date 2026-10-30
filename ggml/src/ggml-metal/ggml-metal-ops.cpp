@@ -610,6 +610,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_flash_attn_ext(ctx, idx);
             } break;
+        case GGML_OP_FLASH_ATTN_EXT_BACK:
+            {
+                n_fuse = ggml_metal_op_flash_attn_ext_back(ctx, idx);
+            } break;
         case GGML_OP_SET:
             {
                 n_fuse = ggml_metal_op_set(ctx, idx);
@@ -5251,6 +5255,80 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_op_flash_attn_ext_reduce(ctx, op, bid_tmp, bid_dst, nwg);
         }
     }
+
+    return 1;
+}
+
+int ggml_metal_op_flash_attn_ext_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q      = op->src[0];
+    const ggml_tensor * k      = op->src[1];
+    const ggml_tensor * v      = op->src[2];
+    const ggml_tensor * mask   = op->src[3];
+    const ggml_tensor * o      = op->src[4];
+    const ggml_tensor * grad_o = op->src[5];
+    const ggml_tensor * stats  = op->src[6];
+    const ggml_tensor * dst_d  = op;
+
+    ggml_metal_kargs_ext_back_kargs args = {
+        /* .target    =*/ ggml_get_op_params_i32(op, 5),
+        /* .D;        =*/ q->ne[0],
+        /* .n_q;      =*/ q->ne[1],
+        /* .n_kv;     =*/ k->ne[1],
+        /* .n_head    =*/ q->ne[2],
+        /* .n_head_kv =*/ k->ne[2],
+        /* .ne3       =*/ q->ne[3],
+        /* .nbq1      =*/ q->nb[1],
+        /* .nbq2      =*/ q->nb[2],
+        /* .nbq3      =*/ q->nb[3],
+        /* .nbk1      =*/ k->nb[1],
+        /* .nbk2      =*/ k->nb[2],
+        /* .nbk3      =*/ k->nb[3],
+        /* .nbv1      =*/ v->nb[1],
+        /* .nbv2      =*/ v->nb[2],
+        /* .nbv3      =*/ v->nb[3],
+        /* .nem2      =*/ mask ? mask->ne[2] : 1,
+        /* .nem3      =*/ mask ? mask->ne[3] : 1,
+        /* .nbm1      =*/ mask ? mask->nb[1] : 0,
+        /* .nbm2      =*/ mask ? mask->nb[2] : 0,
+        /* .nbm3      =*/ mask ? mask->nb[3] : 0,
+        /* .scale     =*/ ggml_get_op_params_f32(op, 0),
+    };
+
+    const int32_t d_max = args.D <= 64 ? 64 : args.D <= 128 ? 128 : 256;
+
+    auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_back(lib, args.target, d_max, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),      1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(k),      2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(grad_o), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst_d),  4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mask ? mask : q), 5);
+
+    if (args.target == GGML_FLASH_ATTN_EXT_BACK_STATS) {
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(o),     6);
+    }    
+    if (args.target == GGML_FLASH_ATTN_EXT_BACK_DQ || args.target == GGML_FLASH_ATTN_EXT_BACK_DKV) {
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(v),     7);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(stats), 8);
+    }
+
+    const int64_t n_rows = args.target == GGML_FLASH_ATTN_EXT_BACK_DKV ?
+        args.n_kv*args.n_head_kv*args.ne3 :
+        args.n_q*args.n_head*args.ne3;
+
+    const int nsg = pipeline.nsg;
+
+    GGML_ASSERT(nsg > 0 && nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (n_rows + nsg - 1)/nsg, 1, 1, 32, nsg, 1);
 
     return 1;
 }

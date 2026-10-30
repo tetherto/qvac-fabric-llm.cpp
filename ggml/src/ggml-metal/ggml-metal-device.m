@@ -126,6 +126,7 @@ int ggml_metal_pipeline_thread_execution_width(struct ggml_metal_pipeline_with_p
     X(FA_Q5_0,         fa_q5_0)        \
     X(FA_Q5_1,         fa_q5_1)        \
     X(FA_Q8_0,         fa_q8_0)        \
+    X(FA_BACK,         fa_back)        \
     X(FA_TENSOR,       fa_tensor)      \
     X(FA_VEC_F16,      fa_vec_f16)     \
     X(FA_VEC_F32,      fa_vec_f32)     \
@@ -2118,6 +2119,24 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+        case GGML_OP_FLASH_ATTN_EXT_BACK:
+            if (op->src[0]->type != GGML_TYPE_F32 ||
+               (op->src[1]->type != GGML_TYPE_F32 && op->src[1]->type != GGML_TYPE_F16) ||
+               op->src[2]->type != op->src[1]->type) {
+                return false;
+            }
+            if (op->src[3] && (op->src[3]->type != GGML_TYPE_F16 || !ggml_is_contiguous_rows(op->src[3]))) {
+                return false;
+            }
+            if (op->src[0]->ne[0] > 256) {
+                return false;
+            }
+            return ggml_is_contiguous_rows(op->src[0]) &&
+                   ggml_is_contiguous_rows(op->src[1]) &&
+                   ggml_is_contiguous_rows(op->src[2]) &&
+                   ggml_is_contiguous(op->src[4]) &&
+                   ggml_is_contiguous(op->src[5]) &&
+                   (!op->src[6] || ggml_is_contiguous(op->src[6]));
         case GGML_OP_LIGHTNING_INDEXER:
             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK) {
                 return false;

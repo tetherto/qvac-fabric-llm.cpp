@@ -527,6 +527,35 @@ typedef struct {
 } ggml_metal_kargs_flash_attn_ext;
 
 typedef struct {
+    int32_t target;    // ggml_flash_attn_ext_back_target
+    int64_t D;         // head size, hsk == hsv
+    int64_t n_q;       // q rows per head
+    int64_t n_kv;      // kv rows per head
+    int64_t n_head;
+    int64_t n_head_kv; // q head h reads kv head h / (n_head/n_head_kv)
+    int64_t ne3;
+    // q [D, n_q, n_head, ne3], k and v [D, n_kv, n_head_kv, ne3]
+    uint64_t nbq1;
+    uint64_t nbq2;
+    uint64_t nbq3;
+    // k [D, n_kv, n_head_kv, ne3]
+    uint64_t nbk1;
+    uint64_t nbk2;
+    uint64_t nbk3;
+    // v [D, n_kv, n_head_kv, ne3] (same as k)
+    uint64_t nbv1;
+    uint64_t nbv2;
+    uint64_t nbv3;
+    // mask [n_kv, >= n_q, nem2, nem3] F16, broadcast over heads and ne3, zero when absent
+    int64_t  nem2;
+    int64_t  nem3;
+    uint64_t nbm1;
+    uint64_t nbm2;
+    uint64_t nbm3;
+    float   scale;
+} ggml_metal_kargs_ext_back_kargs;
+
+typedef struct {
     int32_t  ne01;
     int32_t  ne02;
     int32_t  ne03;

@@ -2577,6 +2577,41 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     GGML_UNUSED(op);
 }
 
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_back(
+        ggml_metal_library_t lib,
+        int32_t target,
+        int32_t d_max,
+        const struct ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT_BACK);
+
+    char base[256];
+    char name[256];
+
+    constexpr const char * const target_names[] = {
+        "stats",
+        "dq",
+        "dkv",
+    };
+
+    assert(target >= 0 && target < 3);
+    assert((d_max >= 64 && d_max <= 256) && ((d_max % 64) == 0));
+    assert(op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16);
+    
+    const char * const kv_typename = ggml_type_name(op->src[1]->type);
+
+    snprintf(base, 256, "kernel_flash_attn_ext_back_%s_%s_d%d", target_names[target], kv_typename, d_max);
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    res.nsg = 8;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_library_t lib, const ggml_tensor * op, int32_t n_fuse) {
     char base[256];
     char name[256];
