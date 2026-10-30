@@ -759,6 +759,9 @@ int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * 
 // kernel for every lane of every block of a planes index: 1 equal bit for
 // bit, 0 not, -1 when the index rescores by block.
 int turbovec_exact2_row_parity_for_test(const ggml_vec_index_t * idx, const float * query);
+// round_half_away_f32 and quantise_table16 against std::round at their
+// edges: 0 all equal, otherwise the number of the first case that is not.
+int turbovec_rounding_parity_for_test();
 // The staged search's fused AVX-512 sign scan against the block-by-block
 // path over a vector-major sign region: n_q lone top-k searches each way,
 // 1 when every id and score bit agrees, 0 not, -1 when the index or host
