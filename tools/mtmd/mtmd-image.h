@@ -117,6 +117,8 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
 
+clip_image_size mtmd_calc_dynamic_image_size(const clip_image_size & size, int align_size, int min_pixels, int max_pixels);
+
 // resize image to multiple of patch_size*n_merge, while preserving aspect ratio
 // if image_resize_pad is true, the resized image will be padded, otherwise it will be either stretched or center-cropped depending on image_resize_pad
 // this is used by models with native support for dynamic image size, for example: Qwen-VL, Pixtral, Kimi-VL, etc
