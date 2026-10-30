@@ -1227,6 +1227,9 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     if (!use_i8 && !use_bf16) {
         return false;
     }
+    if (use_bf16 && ops->gemm_host.count(op) != 0) {
+        return false;
+    }
     // The stream is always built for the baked M block, so the geometry check
     // is on the block M; op M is tiled into blocks.
     const xdna_gemm_geom geom = xdna_pick_geom(ops, M, K, N, use_i8);
@@ -1260,6 +1263,105 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     }
 
     return true;
+}
+
+// --- bf16 GEMM or host ------------------------------------------------------
+//
+// A projection of the bf16 design that sits between commands of another design
+// (a quantized model's few bf16 weights among its pgemm ones) costs the array
+// two hardware-context switches on top of its own run. EmbeddingGemma 2's
+// per_layer_model_proj, K 512 and N 12288 among pgemm commands, takes 3.0 ms
+// of the array at 15 tokens and 0.4 ms of the host's four threads, 3.3 against
+// 0.75 ms at 132 and 6.1 against 4.4 ms at 912 (16 threads), and the pass is
+// 7.6 ms shorter at 15 tokens with it on the host. A projection among
+// bf16 ones pays no switch and keeps the array.
+
+// One hardware-context switch (probes/attn_probe.cpp --proj).
+static const double GEMM_SWITCH_MS = 2.5;
+// ggml-cpu, bf16 weights against f32 activations: 0.5 TFLOPS on 4 threads,
+// 2.2 to 2.6 on 16.
+static const double GEMM_HOST_FLOPS_PER_THREAD = 1.5e11;
+// A run of the array: ~0.1 ms whatever its size, and ~23 us for a sweep of
+// rows across 512 columns of N (the weights are read again by every sweep).
+static const double GEMM_RUN_FLOOR_MS  = 0.10;
+static const double GEMM_SWEEP_TILE_MS = 0.023;
+static const double GEMM_TILE_N_COLS   = 512.0;
+
+// Sweeps of the kernel the op's blocks run, and how many blocks there are.
+static int gemm_sweeps(const xdna_gemm_tiles & t, int M, int * blocks) {
+    const int sweep  = t.tile_m * t.n_compute_rows;
+    int       sweeps = 0;
+    *blocks          = 0;
+    for (int m0 = 0; m0 < M; m0 += t.M) {
+        sweeps += gemm_run_rows(t, std::min(t.M, M - m0)) / sweep;
+        (*blocks)++;
+    }
+    return sweeps;
+}
+
+static double gemm_device_ms(const xdna_ops * ops, const struct ggml_tensor * node) {
+    const int M = (int) node->src[1]->ne[1];
+    const int K = (int) node->src[1]->ne[0];
+    const int N = (int) node->src[0]->ne[1];
+
+    const xdna_gemm_geom geom = xdna_pick_geom(ops, M, K, N, /* want_i8 */ false);
+    int                  blocks = 0;
+    const int            sweeps = gemm_sweeps(geom.tiles, M, &blocks);
+    const int            k_runs = (K + GEMM_K_RUN - 1) / GEMM_K_RUN;
+    return k_runs * (blocks * GEMM_RUN_FLOOR_MS + sweeps * (N / GEMM_TILE_N_COLS) * GEMM_SWEEP_TILE_MS);
+}
+
+static double gemm_host_ms(const struct ggml_tensor * node) {
+    const double flops = 2.0 * (double) node->src[1]->ne[1] * (double) node->src[1]->ne[0] * (double) node->src[0]->ne[1];
+    return flops / (xdna_chunk_threads() * GEMM_HOST_FLOPS_PER_THREAD) * 1e3;
+}
+
+namespace {
+
+// A graph node the array runs, and whether it is the bf16 GEMM.
+struct npu_command {
+    const struct ggml_tensor * node;
+    bool                       bf16;
+};
+
+}  // namespace
+
+static bool gemm_on_bf16_design(const xdna_ops * ops, const struct ggml_tensor * node) {
+    return node->op == GGML_OP_MUL_MAT && !ops->gemv_group_of.count(node) && !xdna_pgemm_supported(node) &&
+           !xdna_int8_eligible(ops, node) && gemm_supported(ops, node);
+}
+
+static std::vector<npu_command> npu_commands_of(const xdna_ops * ops, const struct ggml_cgraph * cgraph) {
+    std::vector<npu_command> cmds;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (xdna_ops_supported(ops, node)) {
+            cmds.push_back({ node, gemm_on_bf16_design(ops, node) });
+        }
+    }
+    return cmds;
+}
+
+// Switches a command pays: one in from its predecessor's design and one out to
+// its successor's. The commands of a graph repeat with the next one, so the
+// first follows the last.
+static int gemm_switches(const std::vector<npu_command> & cmds, size_t i) {
+    const size_t n = cmds.size();
+    return (!cmds[(i + n - 1) % n].bf16) + (!cmds[(i + 1) % n].bf16);
+}
+
+void xdna_ops_plan_gemm(xdna_ops * ops, const struct ggml_cgraph * cgraph) {
+    ops->gemm_host.clear();
+    if (xdna_env_int("GGML_XDNA_GEMM_HOST", 1) == 0) {
+        return;
+    }
+    const std::vector<npu_command> cmds = npu_commands_of(ops, cgraph);
+    for (size_t i = 0; i < cmds.size(); i++) {
+        const int switches = cmds[i].bf16 ? gemm_switches(cmds, i) : 0;
+        if (switches > 0 && gemm_host_ms(cmds[i].node) < gemm_device_ms(ops, cmds[i].node) + switches * GEMM_SWITCH_MS) {
+            ops->gemm_host.insert(cmds[i].node);
+        }
+    }
 }
 
 // --- public API -------------------------------------------------------------

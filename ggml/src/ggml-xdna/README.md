@@ -105,10 +105,11 @@ Q8_0 and BF16 files) runs without a model-specific path:
 - Its weight projections take the [MUL_MAT](#mul_mat) routes. In the Q8_0
   file they are all on the array: the `Q8_0` weights through the prefill GEMM,
   repacked to the 8-bit form with one extra rounding of the codes, and the
-  `BF16` `per_layer_model_proj` through the bf16 GEMM. In the BF16 file every
-  projection but `output` is on the array: its N is 768, not a multiple of
-  512, and zero-padded to 1024 columns it measured no faster than the host's
-  16 threads and lowered the pooled cosine by 2e-5 to 6e-5.
+  `BF16` `per_layer_model_proj` through the bf16 GEMM, or on the host when that
+  is quicker (below). In the BF16 file every projection but `output` is on the
+  array: its N is 768, not a multiple of 512, and zero-padded to 1024 columns
+  it measured no faster than the host's 16 threads and lowered the pooled
+  cosine by 2e-5 to 6e-5.
 - The prefill GEMM writes its result straight into the `MUL_MAT` node, in
   whole blocks of 128 rows, so the backend's host buffer type reports those
   rows in the node's allocation size (`get_alloc_size`) and no row is copied
@@ -132,6 +133,13 @@ Q8_0 and BF16 files) runs without a model-specific path:
   group up behind the first, before the scheduler allocates the graph; no model
   orders its graph for it. All but the last end on a whole 512 columns and
   every node must lie in one of the backend's buffers.
+- A bf16 projection among pgemm commands (the Q8_0 file's
+  `per_layer_model_proj`, K 512 and N 12288) costs the array two
+  hardware-context switches on top of its own run. When the host's time for it
+  is below the array's plus those switches the backend runs it on the host
+  (`xdna_ops_plan_gemm`): 0.4 against 3.0 ms at 15 tokens, 0.75 against 3.3 at
+  132 and 4.4 against 6.1 at 912. Among bf16 commands, as in the BF16 file, a
+  projection pays no switch and stays on the array.
 - The norms, RoPE, the mean pooling and, in the BF16 file, the GEGLU are host
   glue. So is the attention up to ~2300 tokens. The prefill attention kernel
   takes the 20 sliding-window layers (4 query heads over 2 KV heads of 256, a
@@ -458,6 +466,7 @@ report, not for tuning: every one costs more time or energy than the default.
 | `GGML_XDNA_PGEMM_GLU` | the SwiGLU or GeGLU computed from the gate and up GEMMs on the array |
 | `GGML_XDNA_PGEMM_GLU_A` | the SwiGLU or GeGLU written into the down projection's A |
 | `GGML_XDNA_PGEMM_GROUP` | consecutive projections of one activation (Q, K and V) run as one GEMM, each output into its own node |
+| `GGML_XDNA_GEMM_HOST` | a bf16 projection among pgemm commands runs on the host when that is quicker than the array's run plus the two context switches |
 | `GGML_XDNA_GDN_MM` | the prefill gated delta rule on the array |
 | `GGML_XDNA_GDN_IN` | the prefill GDN's conv input, norms and state copy fed straight into the array |
 | `GGML_XDNA_FA_MM` | the prefill attention on the array: `0` the host, `2` the array whatever the size |

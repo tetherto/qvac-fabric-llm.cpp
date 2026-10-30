@@ -3444,6 +3444,11 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
         }
     }
     xdna_ops_plan_gemv(&ctx->ops, cgraph, &gemv_skip);
+    // a prefill's projections; a token's run on the fused layers or the GEMV
+    ctx->ops.gemm_host.clear();
+    if (g_glue_n_tokens > 1) {
+        xdna_ops_plan_gemm(&ctx->ops, cgraph);
+    }
 
     // The head's norm is the array's when the head takes its input from the
     // rows (every token after the first, when the last layer is a fused one).
