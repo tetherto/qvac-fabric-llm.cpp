@@ -511,8 +511,9 @@ if (GGML_XDNA_BUILD_KERNELS)
 endif()
 
 # Host-only tests of what a device cannot check for itself: which weight
-# conversions the repacker accepts, how many head rows stay exact, and what the
-# mark that tells a lost write from a landed one leaves behind. They
+# conversions the repacker accepts, how many head rows stay exact, what the
+# mark that tells a lost write from a landed one leaves behind, and how the GEMM
+# stream issues its sweeps. They
 # compile the backend sources they test directly and open no device.
 # tests/CMakeLists.txt adds them to ctest: testing is enabled there, after this
 # directory is configured.
@@ -524,6 +525,9 @@ if (GGML_XDNA_BUILD_TESTS)
     # xdna-head.h includes the XRT kernel header
     add_executable(test-xdna-head-rows tests/test-xdna-head-rows.cpp)
     target_link_libraries(test-xdna-head-rows PRIVATE XRT::xrt_coreutil)
+    add_executable(test-xdna-seq tests/test-xdna-seq.cpp xdna-seq.cpp)
+    target_include_directories(test-xdna-seq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    target_link_libraries(test-xdna-seq PRIVATE ggml-base)
     add_executable(test-xdna-mark tests/test-xdna-mark.cpp xdna-runtime.cpp)
     target_include_directories(test-xdna-mark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
     target_link_libraries(test-xdna-mark PRIVATE ggml-base XRT::xrt_coreutil)
