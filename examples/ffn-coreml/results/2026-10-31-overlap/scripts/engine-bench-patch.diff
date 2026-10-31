@@ -1,0 +1,62 @@
+--- run_engine.sh.orig	2026-10-30 16:08:24
++++ run_engine.sh	2026-10-31 11:14:51
+@@ -42,6 +42,18 @@
+     # context checkpoints: both copy state around requests and would skew the timings
+     LLAMA_GDN_DEFERRED=1 $BIN/llama-server -m $Q0 -ngl 99 -fa on --port $PORT --no-cache-prompt -cram 0 -ctxcp 0 --no-webui \
+         -np ${NP:-32} -kvu -c ${CTX:-65536} ${SPEC[@]+"${SPEC[@]}"} > $LOG 2>&1 & ;;
++  fabcml)
++    # qvac-fabric with the Core ML FFN sidecar on both Neural Engines (prefill only; same flags as fab)
++    SPEC=()
++    case $MODE in
++      ar) ;;
++      dflash2) SPEC=(-md $QD -ngld 99 --spec-type draft-dflash --spec-draft-n-max 7) ;;
++      *) unsupported ;;
++    esac
++    # FABCML_ENV: extra environment (for example the half-batch overlap), FABCML_EXTRA: extra server flags
++    env LLAMA_GDN_DEFERRED=1 ${FABCML_ENV:-} FFN_COREML_ASSETS=$CML_ASSETS FFN_COREML_GPU_RESIDENT=1 FFN_COREML_SINGLE_ENCODER=1 \
++    FFN_COREML_CACHE_COMPILED=1 $FABCML_BIN/llama-server-coreml -m $Q0 -ngl 99 -fa on --port $PORT --no-cache-prompt -cram 0 -ctxcp 0 --no-webui \
++        -np ${NP:-32} -kvu -c ${CTX:-65536} ${SPEC[@]+"${SPEC[@]}"} ${FABCML_EXTRA:-} > $LOG 2>&1 & ;;
+   mlx)
+     [ $MODE = ar ] || unsupported
+     $MLX_PY -m mlx_lm.server --model $X --port $PORT --max-tokens 4096 > $LOG 2>&1 & ;;
+@@ -76,7 +88,7 @@
+     [ -d "$SM" ] || { echo "splash prepare failed: $TAG"; tail -3 $RUN/logs/$TAG.prepare.err
+       check $RUN/logs/$TAG.prepare.err 0 1 "server start" "error=splash prepare failed: $(tail -1 $RUN/logs/$TAG.prepare.err | cut -c1-200)"; exit 1; }
+     ( cd $SPLASH_DIR && PYTHONPATH=$SPLASH_DIR exec python/bin/python3 -P -m server.server "$SM" --model mlx-community/Qwen3.8-27B-4bit \
+-        --binary $SPLASH_DIR/engine/splash --port $PORT --kv-format bf16 --max-cache-disk 0 --idle-release off --no-webui ) > $LOG 2>&1 &
++        --binary $SPLASH_DIR/engine/splash --port $PORT --kv-format bf16 --max-cache-disk 0 --idle-release off --no-webui ${SPLASH_EXTRA:-} ) > $LOG 2>&1 &
+     MODEL_ARG=(--model mlx-community/Qwen3.8-27B-4bit) ;;
+   *) echo "unknown engine $ENG"; exit 1 ;;
+ esac
+@@ -121,5 +133,5 @@
+ kill $SPID 2>/dev/null; wait $SPID 2>/dev/null
+ # oMLX renames its process to omlx-server, so match both names
+ pkill -f "sglang.launch_server|omlx serve|omlx-server|mlx_lm.server|splash-[0-9.]+-arm64-macos26/" 2>/dev/null
+-pkill -f "llama-server .*--port $PORT" 2>/dev/null
++pkill -f "llama-server(-coreml)? .*--port $PORT" 2>/dev/null
+ sleep 6
+--- summarize.py.orig	2026-10-30 16:08:24
++++ summarize.py	2026-10-30 16:08:24
+@@ -24,10 +24,10 @@
+ from collections import defaultdict
+ 
+ MACHINE = "mac-m3-ultra"
+-NAMES = {"up": "llama.cpp master", "fab": "qvac-fabric PR stack", "mlx": "mlx-lm", "omlx": "oMLX",
++NAMES = {"up": "llama.cpp master", "fab": "qvac-fabric PR stack", "fabcml": "qvac-fabric + Core ML (2 ANE)", "mlx": "mlx-lm", "omlx": "oMLX",
+          "sglang": "SGLang", "splash": "Splash"}
+-BACKEND = {"up": "metal", "fab": "metal", "mlx": "mlx", "omlx": "mlx", "sglang": "mlx", "splash": "metal"}
+-WEIGHTS = {"up": "Q4_0 GGUF (pure)", "fab": "Q4_0 GGUF (pure)", "mlx": "MLX 4-bit g64", "omlx": "MLX 4-bit g64",
++BACKEND = {"up": "metal", "fab": "metal", "fabcml": "metal+ane", "mlx": "mlx", "omlx": "mlx", "sglang": "mlx", "splash": "metal"}
++WEIGHTS = {"up": "Q4_0 GGUF (pure)", "fab": "Q4_0 GGUF (pure)", "fabcml": "Q4_0 GGUF (pure) + Core ML 8-bit sidecar", "mlx": "MLX 4-bit g64", "omlx": "MLX 4-bit g64",
+            "sglang": "MLX 4-bit g64", "splash": "MLX 4-bit g64"}
+ DRAFT = {("up", "mtp"): "GGUF MTP layer", ("fab", "mtp"): "GGUF MTP layer",
+          ("up", "dflash2"): "DFlash2 Q4_0 GGUF", ("fab", "dflash2"): "DFlash2 Q4_0 GGUF",
+@@ -90,7 +90,7 @@
+             m = re.match(r"""(\w+)=['"](.*)['"]$""", line.strip())
+             if m:
+                 env[m.group(1)] = m.group(2)
+-    keys = {"up": "UP_VER", "fab": "FAB_VER", "mlx": "MLX_VER", "omlx": "OMLX_VER", "sglang": "SGL_VER", "splash": "SPLASH_VER"}
++    keys = {"up": "UP_VER", "fab": "FAB_VER", "fabcml": "FABCML_VER", "mlx": "MLX_VER", "omlx": "OMLX_VER", "sglang": "SGL_VER", "splash": "SPLASH_VER"}
+     return [{"engine": e, "name": NAMES[e], "version": env.get(k), "backend": BACKEND[e], "weights": WEIGHTS[e]} for e, k in keys.items()]
+ 
+ 
