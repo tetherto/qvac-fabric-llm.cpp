@@ -5,6 +5,7 @@
 #include "xdna-attn-mm.h"
 #include "xdna-gdn-mm.h"
 #include "xdna-gemv.h"
+#include "xdna-host-cost.h"
 #include "xdna-norm.h"
 #include "xdna-prof.h"
 #include "xdna-quant.h"
@@ -20,7 +21,10 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <unordered_set>
+#include <vector>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -65,6 +69,15 @@ constexpr int          A_COL0      = 6;              // the two A streams' shim 
 constexpr int          MAX_BLOCKS  = 16;
 // Longest K the gated passes take, and so the f32 row they lay out in one.
 constexpr int          MAX_K       = 4096;
+// What a command costs the pass (probes/pgemm_probe.cpp, one at a time, 10th percentile, idle host): ~105 us at the least, an
+// empty command (62 us) plus filling and draining the array; ~21 us a 1024-column chunk at K 512 for the first block of rows and
+// ~13.6 us for each further one, in proportion to K. The host adds ~30 us around it: the layout of A, the start, the glue batch
+// the command splits. The shapes of the probe fall within 13% of the sum.
+constexpr double       CMD_FLOOR_MS  = 0.105;
+constexpr double       CMD_CHUNK_MS  = 0.021;
+constexpr double       CMD_BLOCK_MS  = 0.0136;
+constexpr double       CMD_HOST_MS   = 0.03;
+constexpr int          CMD_K_UNIT    = 512;
 // C blocks in flight per column, two descriptors a block (target, sink).
 constexpr int          C_RING      = 3;
 // Header word 6, the cores' output mode: plain halves of the accumulator, the
@@ -762,7 +775,7 @@ weights * weights_for(xdna_kernel_pool *                       pool,
 // ggml-xdna.cpp: the BO a host pointer of the backend's buffers lies in
 xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset);
 
-bool xdna_pgemm_supported(const ggml_tensor * op) {
+bool xdna_pgemm_shape_supported(const ggml_tensor * op) {
     if (!op || op->op != GGML_OP_MUL_MAT || xdna_env_int("GGML_XDNA_PGEMM", 1) == 0 || !artifact_present()) {
         return false;
     }
@@ -803,6 +816,38 @@ bool xdna_pgemm_supported(const ggml_tensor * op) {
     }
     const xdna_gemv_geom g = geom_of(w);
     return g.valid() && g.K % KS == 0 && g.n_out() <= 256;
+}
+
+double xdna_pgemm_command_ms(int M, int K, int N) {
+    const int    blocks = a_geom(M, K).n_blk;
+    const int    chunks = (N + CHUNK - 1) / CHUNK;
+    const double k_unit = (double) K / CMD_K_UNIT;
+    return CMD_FLOOR_MS + CMD_HOST_MS + chunks * k_unit * (CMD_CHUNK_MS + (blocks - 1) * CMD_BLOCK_MS);
+}
+
+// The projections a graph's plan (xdna_ops_plan_chunk) leaves to the host, as a snapshot that is replaced whole: a predicate
+// that the scheduler or graph_optimize calls between computes reads the last plan's, never a set that is being written. A node
+// the plan names is the host's however the planners would have grouped it, and always correct there; an address a later graph
+// reuses at worst runs a projection on the host that could have gone to the array.
+using host_plan = std::unordered_set<const ggml_tensor *>;
+
+static std::shared_ptr<const host_plan> g_host_plan;
+
+static bool pgemm_host_planned(const ggml_tensor * op) {
+    const std::shared_ptr<const host_plan> plan = std::atomic_load(&g_host_plan);
+    return plan && plan->count(op) != 0;
+}
+
+void xdna_pgemm_plan_host(const std::vector<const ggml_tensor *> & nodes) {
+    std::atomic_store(&g_host_plan, std::shared_ptr<const host_plan>(std::make_shared<host_plan>(nodes.begin(), nodes.end())));
+}
+
+bool xdna_pgemm_supported(const ggml_tensor * op) {
+    return xdna_pgemm_shape_supported(op) && !pgemm_host_planned(op);
+}
+
+bool xdna_pgemm_host_planned(const ggml_tensor * op) {
+    return xdna_pgemm_shape_supported(op) && pgemm_host_planned(op);
 }
 
 void xdna_pgemm_graph_begin(void) {
@@ -1190,7 +1235,8 @@ bool xdna_pgemm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
 }
 
 size_t xdna_pgemm_out_bytes(const ggml_tensor * op) {
-    if (!xdna_pgemm_supported(op) || op->ne[0] % (2 * NC) != 0) {
+    // by shape, not by the plan: the allocation is made before the graph's plan and must hold a call the array may still make
+    if (!xdna_pgemm_shape_supported(op) || op->ne[0] % (2 * NC) != 0) {
         return 0;
     }
     return ((size_t) ggml_nrows(op) + MBLK - 1) / MBLK * MBLK * op->nb[1];
@@ -1585,27 +1631,35 @@ namespace {
 // whether projection `t` can be one more of a group that starts with `first`;
 // all but the last end on a whole object of 512 columns, where the next one's
 // objects begin, and each ends on a 128 the array writes in place
-bool group_member_ok(const ggml_tensor * first, const ggml_tensor * t, bool last) {
-    return xdna_pgemm_supported(t) && t->src[1] == first->src[1] && t->src[0]->type == first->src[0]->type &&
-           t->src[1]->ne[2] * t->src[1]->ne[3] == 1 && t->ne[0] % (2 * NC) == 0 &&
+bool group_member_ok(const ggml_tensor * first, const ggml_tensor * t, bool last, bool planned) {
+    return (planned ? xdna_pgemm_supported(t) : xdna_pgemm_shape_supported(t)) && t->src[1] == first->src[1] &&
+           t->src[0]->type == first->src[0]->type && t->src[1]->ne[2] * t->src[1]->ne[3] == 1 && t->ne[0] % (2 * NC) == 0 &&
            (last || t->ne[0] % (CHUNK / 2) == 0);
 }
 
-}  // namespace
-
-bool xdna_pgemm_group_supported(struct ggml_tensor * const * mm, int n) {
+bool group_supported(struct ggml_tensor * const * mm, int n, bool planned) {
     if (n < 2 || xdna_env_int("GGML_XDNA_PGEMM_GROUP", 1) == 0) {
         return false;
     }
     int64_t cols = 0;
     for (int i = 0; i < n; i++) {
-        if (!group_member_ok(mm[0], mm[i], i == n - 1)) {
+        if (!group_member_ok(mm[0], mm[i], i == n - 1, planned)) {
             return false;
         }
         cols += mm[i]->ne[0];
     }
     const xdna_gemv_geom g = geom_of(mm[0]->src[0], cols);
     return g.valid() && g.n_out() <= 256;
+}
+
+}  // namespace
+
+bool xdna_pgemm_group_supported(struct ggml_tensor * const * mm, int n) {
+    return group_supported(mm, n, true);
+}
+
+bool xdna_pgemm_group_shape_supported(struct ggml_tensor * const * mm, int n) {
+    return group_supported(mm, n, false);
 }
 
 namespace {

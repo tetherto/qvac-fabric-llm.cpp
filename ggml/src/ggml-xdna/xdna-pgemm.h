@@ -2,6 +2,8 @@
 
 #include <stddef.h>
 
+#include <vector>
+
 // The prefill GEMM (kernels/pgemm.py): a
 // quantized MUL_MAT at prefill batch size on the whole array, every core
 // expanding the decode GEMV's own packed weight tiles into bf16 and running
@@ -12,11 +14,30 @@
 struct ggml_tensor;
 struct xdna_kernel_pool;
 
-// True when `op` is a MUL_MAT this route runs: a weight the decode GEMV packs
-// (or Q8_0, into its 8-bit form),
-// at least 64 activation rows, and the artifact present (GGML_XDNA_PGEMM=0
-// turns the route off).
+// True when `op` is a MUL_MAT of a shape this route can run: a weight the
+// decode GEMV packs (or Q8_0, into its 8-bit form), an activation of any
+// number of rows, and the artifact present (GGML_XDNA_PGEMM=0 turns the route
+// off).
+bool xdna_pgemm_shape_supported(const struct ggml_tensor * op);
+
+// True when `op` is a MUL_MAT this route runs: one of that shape unless the
+// graph's plan leaves it to the host (xdna_pgemm_plan_host). That plan is the
+// last compute's, so what runs outside a compute (graph_optimize, an
+// allocation size) asks xdna_pgemm_shape_supported.
 bool xdna_pgemm_supported(const struct ggml_tensor * op);
+
+// True when `op` is a MUL_MAT this route could run but the plan leaves to the
+// host. The bf16 GEMM must not take it either.
+bool xdna_pgemm_host_planned(const struct ggml_tensor * op);
+
+// The projections of the graph about to compute that the host runs. The plan
+// replaces the last one's; GGML_XDNA_PGEMM_HOST=0 never names any.
+void xdna_pgemm_plan_host(const std::vector<const struct ggml_tensor *> & nodes);
+
+// What a command of M rows of K against N columns costs the pass, in ms: the
+// array's time and the host's share around it. A group of projections of one
+// activation is one command of their summed N.
+double xdna_pgemm_command_ms(int M, int K, int N);
 
 // A graph is starting: the activation layouts kept for the projections that
 // share an input belong to the previous one.
@@ -117,4 +138,6 @@ bool xdna_pgemm_run_pair(struct xdna_kernel_pool *  pool,
 // 512 columns; every node is in one of the backend's buffers. The caller runs
 // the call at the first of them and skips the rest.
 bool xdna_pgemm_group_supported(struct ggml_tensor * const * mm, int n);
+// The same by the shape alone, for graph_optimize, which runs outside any compute: the plan of the previous one does not enter.
+bool xdna_pgemm_group_shape_supported(struct ggml_tensor * const * mm, int n);
 bool xdna_pgemm_run_group(struct xdna_kernel_pool * pool, struct ggml_tensor * const * mm, int n);
