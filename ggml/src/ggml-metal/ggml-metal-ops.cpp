@@ -4450,6 +4450,76 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    // prefill with F16 K/V and head size 256: mul_mm-like layout, 30% faster than the half8x8 kernel at long KV
+    // (GGML_METAL_FA_TB=0 falls back to the half8x8 kernel)
+    static const bool fa_tb_env = !getenv("GGML_METAL_FA_TB") || atoi(getenv("GGML_METAL_FA_TB")) != 0;
+    const bool use_tb = fa_tb_env && !use_sparse && !ggml_metal_op_flash_attn_ext_use_vec(op) &&
+        (use_kv_f16 || op->src[1]->type == GGML_TYPE_F16) &&
+        ne00 == 256 && ne20 == 256 && ne11 % 64 == 0 && ne01 >= 32 && ne02 % ne12 == 0 && ne03 % ne13 == 0 &&
+        nb10_attn == sizeof(ggml_fp16_t) && nb20_attn == sizeof(ggml_fp16_t) &&
+        has_mask && !has_sinks && !has_bias && !has_scap;
+
+    if (use_tb) {
+        const char * name = "kernel_flash_attn_ext_tb_f16_dk256_bk64";
+
+        ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, name);
+        if (!pipeline.pipeline) {
+            ggml_metal_cv_t cv = ggml_metal_cv_init();
+            pipeline = ggml_metal_library_compile_pipeline(lib, name, name, cv);
+            ggml_metal_cv_free(cv);
+        }
+
+        ggml_metal_kargs_flash_attn_ext args = {
+            /*.ne01          =*/ ne01,
+            /*.ne02          =*/ ne02,
+            /*.ne03          =*/ ne03,
+            /*.nb01          =*/ nb01,
+            /*.nb02          =*/ nb02,
+            /*.nb03          =*/ nb03,
+            /*.ne11          =*/ ne11,
+            /*.ne_12_2       =*/ ne12,
+            /*.ne_12_3       =*/ ne13,
+            /*.ns10          =*/ (int32_t) (nb11_attn/nb10_attn),
+            /*.nb11          =*/ nb11_attn,
+            /*.nb12          =*/ nb12_attn,
+            /*.nb13          =*/ nb13_attn,
+            /*.ns20          =*/ (int32_t) (nb21_attn/nb20_attn),
+            /*.nb21          =*/ nb21_attn,
+            /*.nb22          =*/ nb22_attn,
+            /*.nb23          =*/ nb23_attn,
+            /*.ne31          =*/ ne31,
+            /*.ne32          =*/ ne32,
+            /*.ne33          =*/ ne33,
+            /*.nb31          =*/ nb31,
+            /*.nb32          =*/ nb32,
+            /*.nb33          =*/ nb33,
+            /*.ne1           =*/ ne1,
+            /*.ne2           =*/ ne2,
+            /*.ne3           =*/ ne3,
+            /*.scale         =*/ scale,
+            /*.max_bias      =*/ max_bias,
+            /*.m0            =*/ m0,
+            /*.m1            =*/ m1,
+            /*.n_head_log2   =*/ n_head_log2,
+            /*.logit_softcap =*/ logit_softcap,
+        };
+
+        // staged Q (32 rows of half), S (32 x 64 floats) and the per-row rescale factors, padded as in the kernel
+        const size_t smem = 32*(ne00 + 8)*sizeof(ggml_fp16_t) + (32*(64 + 4) + 32)*sizeof(float);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_k,    2);
+        ggml_metal_encoder_set_buffer  (enc, bid_v,    3);
+        ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(smem, 16), 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 31)/32, ne02, ne03, 32, 8, 1);
+
+        return 1;
+    }
+
     if (!use_sparse && !ggml_metal_op_flash_attn_ext_use_vec(op)) {
         // half8x8 kernel
         const int nqptg = OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup
