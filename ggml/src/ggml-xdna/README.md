@@ -38,8 +38,9 @@ runs only the sweeps its rows fill (`tile_m` rows on each of the four compute
 rows); each sweep reads the weights from DDR once.
 
 The device's writes to C are not cache coherent, so the host marks the rows a
-run will write with a pattern before the submit and reads a row chunk only once
-the pattern is gone. C starts one page into its buffer, and a block whose first
+run will write with a pattern before the submit (non-temporal stores, then a
+cache write-back, so no line is fetched only to be overwritten) and reads a row
+chunk only once the pattern is gone. C starts one page into its buffer, and a block whose first
 C line stays marked is run again, up to twice, before the op fails (see Known
 limits).
 
