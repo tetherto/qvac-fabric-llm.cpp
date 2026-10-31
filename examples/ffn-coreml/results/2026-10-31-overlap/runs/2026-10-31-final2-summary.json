@@ -1,0 +1,171 @@
+{
+ "schema": 3,
+ "date": "2026-10-31-final2",
+ "machine": "mac-m3-ultra",
+ "status": "partial",
+ "reason": null,
+ "missing": [
+  "conc:omlx/ar",
+  "conc:sglang/ar",
+  "conc:splash/dflash2",
+  "conc:fab/ar",
+  "conc:up/ar",
+  "conc:mlx/ar",
+  "spec:up/ar",
+  "spec:up/mtp",
+  "spec:up/dflash2",
+  "spec:fab/ar",
+  "spec:fab/mtp",
+  "spec:fab/dflash2",
+  "spec:omlx/ar",
+  "spec:omlx/mtp",
+  "spec:omlx/dflash2",
+  "spec:splash/dflash2",
+  "spec:mlx/ar",
+  "spec:sglang/ar",
+  "concspec:up/mtp",
+  "concspec:up/dflash2",
+  "concspec:fab/mtp",
+  "concspec:fab/dflash2",
+  "concspec:omlx/mtp",
+  "concspec:omlx/dflash2",
+  "depth:up/ar",
+  "depth:fab/ar",
+  "depth:omlx/ar",
+  "depth:mlx/ar",
+  "depth:sglang/ar",
+  "depth:splash/dflash2",
+  "depth:up/dflash2",
+  "depth:fab/dflash2",
+  "depth:omlx/dflash2"
+ ],
+ "started": null,
+ "finished": "Sat Oct 31 13:47:27 CET 2026",
+ "hardware": {
+  "chip": "Apple M3 Ultra",
+  "gpu": "60-core GPU",
+  "memory_gb": 96,
+  "os": "macOS 26.7.1"
+ },
+ "versions": [
+  {
+   "engine": "up",
+   "name": "llama.cpp master",
+   "version": "master @ a34de8618 (2026-10-30)",
+   "backend": "metal",
+   "weights": "Q4_0 GGUF (pure)"
+  },
+  {
+   "engine": "fab",
+   "name": "qvac-fabric PR stack",
+   "version": "temp-11259 @ d3d019a3b + prefill attention kernel",
+   "backend": "metal",
+   "weights": "Q4_0 GGUF (pure)"
+  },
+  {
+   "engine": "fabcml",
+   "name": "qvac-fabric + Core ML (2 ANE)",
+   "version": "Core ML 5120/6144x2 + kernel + overlap",
+   "backend": "metal+ane",
+   "weights": "Q4_0 GGUF (pure) + Core ML 8-bit sidecar"
+  },
+  {
+   "engine": "mlx",
+   "name": "mlx-lm",
+   "version": "mlx-lm 0.32.2, mlx 0.32.4",
+   "backend": "mlx",
+   "weights": "MLX 4-bit g64"
+  },
+  {
+   "engine": "omlx",
+   "name": "oMLX",
+   "version": "0.7.3rc1",
+   "backend": "mlx",
+   "weights": "MLX 4-bit g64"
+  },
+  {
+   "engine": "sglang",
+   "name": "SGLang",
+   "version": "0.5.22",
+   "backend": "mlx",
+   "weights": "MLX 4-bit g64"
+  },
+  {
+   "engine": "splash",
+   "name": "Splash",
+   "version": "1.5.0",
+   "backend": "metal",
+   "weights": "MLX 4-bit g64"
+  }
+ ],
+ "updates": [],
+ "single": [],
+ "conc": [],
+ "spec": [],
+ "depth": [
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "ar",
+   "profile": "standard",
+   "depth": 978,
+   "pp": 519.4,
+   "tg": 38.2,
+   "ttft": 1.883
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "ar",
+   "profile": "standard",
+   "depth": 4535,
+   "pp": 537.6,
+   "tg": 37.5,
+   "ttft": 8.435
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "ar",
+   "profile": "standard",
+   "depth": 20912,
+   "pp": 507.4,
+   "tg": 35.2,
+   "ttft": 41.213
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "ar",
+   "profile": "standard",
+   "depth": 38459,
+   "pp": 454.9,
+   "tg": 33.0,
+   "ttft": 84.538
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "ar",
+   "profile": "standard",
+   "depth": 69938,
+   "pp": 379.1,
+   "tg": 29.5,
+   "ttft": 184.497
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "ar",
+   "profile": "standard",
+   "depth": 123123,
+   "pp": 294.4,
+   "tg": 25.0,
+   "ttft": 418.16
+  }
+ ],
+ "short_outputs": 0,
+ "short_by_label": [],
+ "errors": [],
+ "jobs": {}
+}

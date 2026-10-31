@@ -259,7 +259,7 @@ At 1k tokens this is 6% ahead of Splash (379.6), and level at 4.5k (431.9).
 
 The full held-out gate (23 windows, 65,536 tokens) was rerun on the Q4_0 sidecar with the new kernel; split and plain Metal both use it. It passes every check: ΔNLL +0.00060 (upper bound +0.00092), KL 0.00035, worst window prose +0.00251, exact offload counts, no failed runs. With the old kernel the same gate gave +0.00056 / +0.00089 / 0.00034 / +0.00210. Plain Metal's own NLL per window with the new kernel against the old differs by -0.00001 on average and at most 0.00008, so the kernel does not change quality. The gate's prompts are multiples of 512 tokens, so it does not exercise padding (section 17 checks that). Summaries: `results/2026-10-31/gate-q40-*-summary.txt`.
 
-### 19. Overlapping attention with the ANE FFN (measured, not built)
+### 19. Overlapping attention with the ANE FFN (feasibility)
 
 The ANEs only work during the FFN step, so they are idle while Metal runs attention, DeltaNet and the projections. A profiled 8,192-token prefill with the split (new kernel, `FFN_COREML_PROFILE=1`, 18.97 s, 1,024 Core ML calls) shows the per-layer sequence: Metal works 9.1 ms before each FFN (the CPU waits on it, ANEs idle), then the ANE call takes 9.25 ms while Metal runs its 8,192-channel share (about 7 ms) and then waits. The ANEs are idle 9.36 s of the 18.97 s. On long prompts the Metal step grows with attention: at 123k tokens the average layer takes about 32.6 ms, matching the measured 2.0 s per microbatch.
 
@@ -268,6 +268,28 @@ Contention, measured with the attention microbench, a 17408 x 512 x 5120 F16 mat
 If a second 512-token chunk's Metal work ran during the first chunk's ANE call (two chunks interleaved layer by layer; chunk B's attention at layer L only needs chunk A's KV at layer L), the step per layer becomes the larger of the Metal and ANE work. Estimated from the profile: about -15% per layer at short prompts and about -9% at 123k tokens with the current split; moving more FFN channels to the ANEs (they would no longer wait for Metal) gives about -20% and -15%. The gain is per layer, so the 16 attention layers stay Metal-bound on long prompts. Splash is 5.6% ahead of us at 123k, so this would roughly close or reverse that.
 
 What it needs: two 512-token chunks per graph interleaved per layer in the Qwen graph (a 1,024-token microbatch), asynchronous Core ML predictions joined later through a CPU-signalled `MTLSharedEvent` the Metal command stream waits on, and changes to ggml's Metal encoding so other work can be encoded between the submit and the wait. Several days of work plus validation. Evidence: `results/2026-10-31/overlap/`.
+
+### 20. Overlap built: half-batch prefill (branch `feat/coreml-qwen-3.8-overlap`)
+
+Built in three steps, each checked before the next (evidence: `results/2026-10-31-overlap/`).
+
+1. Asynchronous ANE calls (`FFN_COREML_ASYNC`). The GPU signals a shared Metal event after the FFN input, a serial worker runs both Core ML predictions and signals a second event that the GPU waits on before the join; the Metal backend gained `ggml_backend_metal_shared_event` in its experiment section. Bit-identical quality metrics (KL 0.000255904 / 0.000197586 on a 2048 / 8192-token window, same split NLL) and the same speed (4.565 / 18.924 s against 4.578 / 18.963 s): with one chunk per graph the next layer still needs this FFN.
+2. Half-batch graph (`LLAMA_QWEN35_HALVES`, `src/models/qwen35.cpp`). A prefill microbatch of 513 to 1024 tokens runs as half A (512 tokens) and half B (the rest), interleaved per layer: attn A(l), finish FFN B(l-1), start FFN A(l), attn B(l), finish FFN A(l), start FFN B(l). The Core ML FFN became two graph nodes (start and finish) so B's attention sits between them. With the FFN on Metal (`FFN_COREML_HALVES_METAL`) the graph matches the normal one to floating-point noise: KL 0.0000006 to 0.0000026, NLL within 0.00009. Only the non-deferred gated delta net, one sequence and separate Q/K/V projections are supported; anything else keeps the normal graph.
+3. Core ML halves. Same quality as the 512-token split (KL 0.000253 / 0.000198), prefill 4.565 to 4.096 s at 2048 tokens (-10.3%) and 18.89 to 17.06 s at 8192 (-9.7%). In the server, engine-bench prefill rose 5% to 10% at every prompt length (395.8 / 435.9 / 400.0 / 365.9 / 316.5 / 255.6 to 426.2 / 480.2 / 440.2 / 397.2 / 338.7 / 269.0 tok/s at about 1k to 123k tokens), level with Splash at 123k.
+
+With the overlap the ANEs no longer hold the GPU up, so a sidecar with 5120 Metal channels and 6144 + 6144 on the ANEs was exported ([configs/qwen3.8-27b-64-dual-s5120.json](configs/qwen3.8-27b-64-dual-s5120.json), 11.2 GB, 21 minutes with two parallel exports). With the overlap it took 3.429 s at 2048 tokens and 14.407 s at 8192 (-16% on the 8192-channel split with overlap). Its full held-out gate with the overlap passes: mean NLL change +0.00044 (upper bound +0.00083), KL 0.00046, prose +0.00117 / KL 0.00106, worst window prose-d +0.00211, control KL 0.0000014.
+
+The first sweep with it lost at 1k tokens (359.6 tok/s): a 981-token prompt is a partial 1024-token microbatch, which then ran without overlap, and this split is ANE-bound without it. The half-batch path now takes 513 to 1024 tokens, padding half B or leaving it on Metal below 256 rows. Server completions with and without the half-batch path matched at 681 tokens (B on Metal, log-probabilities within 0.0054) and 916 tokens (B padded, within 0.0026).
+
+Final server sweep, 5120 split with the overlap, new attention kernel, Q4_0 (`runs/2026-10-31-final2`):
+
+| Prompt tokens | ~1k | 4.5k | 21k | 38k | 70k | 123k |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Prefill tok/s | 519.4 | 537.6 | 507.4 | 454.9 | 379.1 | 294.4 |
+| Splash 1.5.0 (2026-10-31 05:07) | 379.6 | 431.9 | 413.8 | 382.9 | 332.2 | 270.9 |
+| Lead | +36.8% | +24.5% | +22.6% | +18.8% | +14.1% | +8.7% |
+
+Time to first token at 123k: 418.2 s (Splash 454.4 s). Decode is unchanged (38.2 to 25.0 tok/s).
 
 ### Unattributed runs
 
@@ -283,7 +305,7 @@ What it needs: two 512-token chunks per graph interleaved per layer in the Qwen 
 
 ## Suggested next steps
 
-1. Overlap a second chunk's Metal work with the current chunk's ANE FFN (section 19): no contention, about 9-15% expected at long prompts and 15-20% at short ones. Needs two chunks per graph and asynchronous Core ML calls.
+1. The overlap (section 20) supports one sequence and the non-deferred gated delta net only; extending it to speculative decoding and multi-request batches is the next step for server use. Splits between 5120 and 4096 Metal channels were not tried.
 2. The split point (8,192 Metal channels) should not depend on prompt length, since the ANEs only work during the FFN step, whose cost does not change with depth; not measured at long prompts.
 3. For `feat/metal-fa-prefill-d256`: run `test-backend-ops -o FLASH_ATTN_EXT`, measure on other Apple GPUs, and consider the same layout for head size 128.
 4. Run a task-level check (for example HumanEval and math word problems, greedy) on d64 against Metal.
