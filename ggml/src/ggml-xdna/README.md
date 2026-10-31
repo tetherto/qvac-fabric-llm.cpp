@@ -37,13 +37,11 @@ whole number of them ends in a run zero-padded out to 512. A block of A rows
 runs only the sweeps its rows fill (`tile_m` rows on each of the four compute
 rows); each sweep reads the weights from DDR once.
 
-The array's writes to C are not cache coherent, so the host marks the rows a
+The device's writes to C are not cache coherent, so the host marks the rows a
 run will write with a pattern before the submit and reads a row chunk only once
-the pattern is gone. The array has been seen, intermittently, to leave the
-first 64 bytes of a block's C unwritten (the first run of a kernel with a
-second command queued behind it; a re-run writes the block in full). The run is
-then started again, up to twice, and only the chunks that did not land are
-read; each event logs a warning. A block still marked after that fails the op.
+the pattern is gone. C starts one page into its buffer, and a block whose first
+C line stays marked is run again, up to twice, before the op fails (see Known
+limits).
 
 ### The fused decode recurrent layer
 
@@ -533,6 +531,24 @@ Diagnostics - nothing is measured unless they are set:
 
 ## Known limits
 
+- **A device write to the first line of a bf16 GEMM block's C has been seen not
+  to land; the cause is not identified.** The 64 bytes at the start of C (row 0,
+  columns 0-15) stay at the host's mark through a driver sync and 1.5 s of cache
+  flushes, the rest of the block is correct, the line is nowhere else in the
+  process, and running the block again writes it in full. It was seen only in
+  processes where another buffer's data ended on the byte C is first written at
+  (13 of 13 processes that lost a line, none of 77 that did not), and it recurs
+  at the same blocks in every pass of such a process. Reproducer:
+  `probes/bo_place_shim.c` (its header has the build and the command) places the
+  buffers' address reservations back to back, and a fresh `llama-embedding` run
+  of a BF16 EmbeddingGemma 2 file on 600 tokens then loses lines in every
+  process. C one page into its buffer loses none under it, with the mappings
+  still touching. So C starts one page in (`GEMM_C_GUARD`), and a block that
+  still fails is run again (`GEMM_RERUNS`; about 18 ms and a warning each time).
+  The int8 GEMM and the conv, decode and attention kernels write at the start of
+  their buffers and have not been tried under the shim. The in-place pgemm
+  output has no loss detection; audits of it found no loss, with and without the
+  shim, but its buffer layout under the shim was not classified.
 - The fused decode layer is written around one geometry - 6144 conv channels,
   1024 `d_out`, 16 value heads of 128, a 262144-float recurrent state - and the
   designs are compiled for it, so another GDN model needs the designs rebuilt

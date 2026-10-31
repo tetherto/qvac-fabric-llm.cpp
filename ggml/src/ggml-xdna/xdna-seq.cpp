@@ -191,7 +191,13 @@ static void emit_bd(xdna_seq * seq, int col, int bd_id, const xdna_bd & bd, uint
 //   - buffer_length is in 4-byte words
 //   - the outer tap dim folds into the queue push repeat_count (stride 0)
 //     or the BD iteration field (stride > 0)
-bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K, int N, uint32_t b_offset) {
+bool xdna_gemm_seq_build(xdna_seq *             seq,
+                         const xdna_gemm_tiles * t,
+                         int                     M,
+                         int                     K,
+                         int                     N,
+                         uint32_t                b_offset,
+                         uint32_t                c_offset) {
     if (!seq || !xdna_gemm_seq_supported(t, M, K, N)) {
         GGML_LOG_ERROR(
             "%s: gemm: unsupported geometry M%d K%d N%d "
@@ -247,7 +253,7 @@ bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K
             {
                 xdna_bd bd;
                 bd.buf_len           = (uint32_t) (mem_tile_m_C * tile_n * n_col_tiles);  // words
-                bd.buf_off           = (uint32_t) ((size_t) col * tile_n * 4 + c_byte);   // bytes into C
+                bd.buf_off           = (uint32_t) ((size_t) col * tile_n * 4 + c_byte + c_offset);  // bytes into C
                 bd.d0_size           = (uint32_t) tile_n;                                 // words
                 bd.d0_stride         = 1;
                 bd.d1_size           = (uint32_t) mem_tile_m_C;                           // elements (rows)
@@ -255,7 +261,7 @@ bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K
                 bd.d2_stride         = n_col_tiles > 1 ? to_words((uint32_t) mem_tile_n, 4) : 1;
                 bd.ax_cache          = 2;
                 const uint32_t bd_id = shim_bd[col]++;
-                emit_bd(seq, col, (int) bd_id, bd, 2, (uint32_t) ((size_t) col * tile_n * 4 + c_byte));
+                emit_bd(seq, col, (int) bd_id, bd, 2, (uint32_t) ((size_t) col * tile_n * 4 + c_byte + c_offset));
                 xdna_seq_issue_token(seq, (uint32_t) col, 0, xdna_dma_dir::S2MM, 0, 0xF);
                 xdna_seq_push_queue(seq, (uint32_t) col, 0, bd_id, xdna_dma_dir::S2MM, 0, true, 0);
             }

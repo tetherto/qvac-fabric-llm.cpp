@@ -676,6 +676,10 @@ static void gemm_pack_a(const float * src, int64_t ld, int mc, int m_rows, int k
     }
 }
 
+// C starts one page into its buffer: a block's first C line was lost only where another buffer's data ended on it
+// (README, F1).
+static const size_t GEMM_C_GUARD = 4096;
+
 // Poison the first mc rows of the C buffer before the run that writes them
 // (see xdna_buffer_mark).
 static void gemm_mark_c(xdna_buffer * bo_c, int mc, int N) {
@@ -683,7 +687,7 @@ static void gemm_mark_c(xdna_buffer * bo_c, int mc, int N) {
 #pragma omp parallel for num_threads(xdna_chunk_threads()) if (mc >= GEMM_TEAM_MIN_ROWS)
     for (int m0 = 0; m0 < mc; m0 += GEMM_ROWS_PER_TASK) {
         const int rows = std::min(GEMM_ROWS_PER_TASK, mc - m0);
-        xdna_buffer_mark(bo_c, rows * row_bytes, m0 * row_bytes);
+        xdna_buffer_mark(bo_c, rows * row_bytes, GEMM_C_GUARD + m0 * row_bytes);
     }
 }
 
@@ -697,11 +701,8 @@ static void gemm_fold_row(const float * c, float * dst, int N, bool accumulate) 
     }
 }
 
-// Read the first mc rows of a finished C block into dst (rows dst_ld floats
-// apart), the first K run of an op by assignment and the others added. `lost`
-// has one flag per GEMM_ROWS_PER_TASK rows: set (the default, when empty) for
-// a chunk still to be read, cleared once it is folded. False while a chunk's
-// write did not land, so a second call folds only the chunks the first missed.
+// Fold the chunks of a finished block's first mc rows that `lost` flags (all when empty) into dst: assigned for an op's
+// first K run, added for the others. False while a chunk did not land.
 static bool gemm_fold_c(xdna_buffer *      bo_c,
                         int                mc,
                         int                N,
@@ -721,7 +722,8 @@ static bool gemm_fold_c(xdna_buffer *      bo_c,
         }
         const int     m0   = ci * GEMM_ROWS_PER_TASK;
         const int     rows = std::min(GEMM_ROWS_PER_TASK, mc - m0);
-        const float * c    = (const float *) xdna_buffer_wait_written(bo_c, rows * row_bytes, m0 * row_bytes);
+        const size_t  off  = GEMM_C_GUARD + m0 * row_bytes;
+        const float * c    = (const float *) xdna_buffer_wait_written(bo_c, rows * row_bytes, off);
         if (!c) {
             continue;
         }
@@ -733,11 +735,8 @@ static bool gemm_fold_c(xdna_buffer *      bo_c,
     return std::find(lost.begin(), lost.end(), 1) == lost.end();
 }
 
-// The array has been seen to leave the first 64 B of a block's C unwritten
-// (the first run of a kernel, a second command queued right behind it). The
-// run is deterministic and its A, B and C are intact, so it is started again
-// and only the chunks that did not land are read; a few attempts, then the
-// run is reported lost as before.
+// A block's first C line has been seen to stay unwritten (README, F1): the block is run again, up to this often, before
+// the op fails.
 static const int GEMM_RERUNS = 2;
 
 static bool gemm_rerun(xdna_ops::pending_run & pr, int mc, int N) {
@@ -780,7 +779,8 @@ static xdna_kernel * gemm_kernel_for(xdna_ops * ops, const xdna_gemm_geom & geom
     }
     xdna_prof::section_timer stream_st("prefill: gemm: stream");
     xdna_seq                 seq;
-    if (!xdna_gemm_seq_build(&seq, &geom.tiles, m_rows, GEMM_K_RUN, N, (uint32_t) k0 * N * sizeof(ggml_bf16_t))) {
+    const uint32_t b_offset = (uint32_t) k0 * N * sizeof(ggml_bf16_t);
+    if (!xdna_gemm_seq_build(&seq, &geom.tiles, m_rows, GEMM_K_RUN, N, b_offset, (uint32_t) GEMM_C_GUARD)) {
         GGML_LOG_ERROR("%s: failed to build GEMM stream M=%d K=%d N=%d\n", "xdna-ops", m_rows, GEMM_K_RUN, N);
         return nullptr;
     }
@@ -902,7 +902,8 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
             xdna_ops::pending_run & pr = banks[bank];
             if (pr.bo_a == nullptr) {
                 pr.bo_a = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) m_rows * GEMM_K_RUN * sizeof(ggml_bf16_t));
-                pr.bo_c = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) m_rows * N * sizeof(float));
+                pr.bo_c = xdna_kernel_pool_acquire_buffer(ops->pool,
+                                                          (size_t) m_rows * N * sizeof(float) + GEMM_C_GUARD);
                 if (!pr.bo_a || !pr.bo_c) {
                     return false;
                 }
