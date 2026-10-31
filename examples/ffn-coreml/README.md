@@ -1,6 +1,6 @@
 # Qwen3.8-27B Core ML prefill sidecar
 
-This preserves the validated 24-layer experiment from `temp-11259` (`be6e387b9f2fda9a6fa0ca59f9607f2b6bb21db2`). It is a standalone, opt-in, single-request benchmark, not server or application integration. Normal builds do not enable the hooks.
+This preserves the validated 24-layer experiment from `temp-11259` (`be6e387b9f2fda9a6fa0ca59f9607f2b6bb21db2`). It is a standalone, opt-in benchmark; `llama-server-coreml` (below) runs it inside `llama-server` for benchmarking, not as production integration. Normal builds do not enable the hooks.
 
 Start with [RESULTS.md](RESULTS.md), the [24-layer preset](configs/qwen3.8-27b-24.json), and the [recorded measurements](results/2026-10-29/summary.json). Run `python3 examples/ffn-coreml/verify_results.py` to verify the committed evidence without loading a model.
 
@@ -56,6 +56,25 @@ build-ffn-coreml/llama-coreml-decoder-bench "$MODEL" "$ASSETS" \
 Use fresh output directories. Mode `metal` is the ordinary-Metal timing reference; `quality-metal` checks the custom boundary with all FFN arithmetic on Metal. `quality` compares full-vocabulary teacher-forced logits against ordinary Metal. A completed quality command can return zero with `screen_pass=0`: inspect every quality row. Require finite metrics, mean KL <= 0.001, perplexity ratio <= 1.01, and exactly `selected_layers * prompt_tokens / 512` offload calls. Decode must have zero offloads.
 
 A full qualification checks code/prose/math at 512 and 2048 tokens, plus build-guide/schema-code at 512, 2048 and 8192 tokens. The recorded suite contains 12 Core ML cases per configuration, plus GPU-only controls. Passing individual layers does not qualify their combination.
+
+## Server, padding and the attention kernel
+
+`-DFFN_COREML_SERVER=ON` (with `-DFFN_COREML_DECODER_EXPERIMENT=ON`) also builds `llama-server-coreml`: plain `llama-server` with the sidecar registered at startup. Set `FFN_COREML_ASSETS` to the sidecar directory and `FFN_COREML_GPU_RESIDENT=1`, then pass the usual `llama-server` flags; the Metal part reads its weights from `-m`. Without `FFN_COREML_ASSETS` it is a plain `llama-server`. The engine-bench comparison ran it with `FFN_COREML_SINGLE_ENCODER=1 FFN_COREML_CACHE_COMPILED=1 LLAMA_GDN_DEFERRED=1` and `-ngl 99 -fa on --no-cache-prompt -cram 0 -ctxcp 0 -kvu`.
+
+The Core ML programs take 512 rows. A partial last microbatch of at least `FFN_COREML_PAD_MIN` rows (default 256) is padded with zero rows to 512 and split as usual; smaller ones stay on Metal. Below about 250 rows padding was slower than Metal alone; at 465 rows (a 977-token prompt) it gave +12.6% prefill.
+
+Long-prompt numbers in the engine-bench report were measured with the Metal prefill attention kernel from branch `feat/metal-fa-prefill-d256` merged in. That kernel is independent of Core ML and benefits plain Metal as well.
+
+## Held-out quality gate
+
+The gate compares the split against ordinary Metal on 23 windows of real text that were never used for calibration or layer selection: 20 of 2048 tokens and 3 of 8192 (C++, Python, documentation, a novel and mathematics, 65,536 tokens). [gate/windows.json](gate/windows.json) lists every window as a slice of a source with its SHA256. Repository sources are read at the recorded commit; the five external texts (Project Gutenberg and Wikipedia wikitext, not committed) must be downloaded into one directory first.
+
+```sh
+python3 examples/ffn-coreml/gate/build_windows.py /path/to/external /tmp/heldout
+examples/ffn-coreml/gate/run_gate.sh build-ffn-coreml/llama-coreml-decoder-bench "$MODEL" "$ASSETS" /tmp/heldout /tmp/gate-out
+```
+
+`run_gate.sh` runs each window in `quality` mode and in `quality-metal` mode (the all-Metal control through the same boundary), then `analyze_gate.py` writes `gate.json`. It passes when the mean NLL change is at most +0.002 nats/token with a 95% bootstrap upper bound at most +0.005, every domain is at most +0.003 with KL at most max(0.003, 2x control), no window exceeds +0.005, the overall KL is at most max(0.002, 2x control), and every run has exact offload counts and finite outputs.
 
 ## Sidecar assets
 
