@@ -59,6 +59,11 @@ static inline int xdna_chunk_threads() {
     return n > 0 ? n : xdna_host_threads();
 }
 
+// The team the glue runs a chunk of `rows` rows on: the decode's below 32, the prompt's from there (ggml-xdna.cpp).
+int xdna_host_team(int64_t rows);
+// The team of the prompt's glue, which a chunk run whole on the host takes.
+int xdna_host_prompt_team(void);
+
 // This thread's number in its OpenMP team; 0 outside one or without OpenMP.
 static inline int xdna_omp_thread() {
 #ifdef GGML_USE_OPENMP

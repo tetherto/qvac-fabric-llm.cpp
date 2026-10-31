@@ -184,6 +184,10 @@ void xdna_ops_plan_gemv(xdna_ops *                                             o
 // that. Call once per prefill graph, after xdna_ops_plan_gemv.
 void xdna_ops_plan_gemm(xdna_ops * ops, const struct ggml_cgraph * cgraph);
 
+// Whether a chunk of a prefill (more than one row) of one block of rows or fewer is quicker run whole on the host than as
+// commands of the array (GGML_XDNA_HOST_CHUNK=0: never). It clears the plan of xdna_ops_plan_gemm.
+bool xdna_ops_plan_chunk(xdna_ops * ops, const struct ggml_cgraph * cgraph);
+
 // Discover the GEMM xclbin and set up the fixed geometry.
 void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool);
 
