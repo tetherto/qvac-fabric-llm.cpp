@@ -3389,6 +3389,10 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
         ctx->ops.fused_gemv = false;
     }
 
+    // The fused sessions' device state goes back into llama's cache before any route reads or rewrites it, a chunk that runs
+    // whole on the host included.
+    xdna_rec_follow_cache(ctx, cgraph);
+
     // A prefill whose commands would cost more than the host's products runs whole on the host; a decode plans nothing.
     if (g_glue_n_tokens > 1 && xdna_ops_plan_chunk(&ctx->ops, cgraph)) {
         return xdna_host_chunk_run(cgraph);
@@ -3401,7 +3405,6 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // layers of a single-token decode; each fires once in the dispatch loop
     // below and replaces its conv/gdn/ffn subgraph with one persistent device
     // run.
-    xdna_rec_follow_cache(ctx, cgraph);
     // A model the fused designs do not cover keeps the per-op route for its
     // recurrent bodies while the projections stay on the array (the GEMV
     // groups the isolation mode plans): rec_serve is what the fused runs are
