@@ -290,16 +290,16 @@ builds, one command at a time on an idle host (10th percentile, M 15):
 | :-- | --: | --: |
 | one 1011-token text | 362 ms | 271 ms |
 | eight texts, 1188 tokens, one batch | 444 ms | 364 ms |
-| one 15-token query | 6.1 ms | 6.5 ms (6.4 to 7.7) |
-| one 41-token text | 12.6 ms | 13.5 ms |
-| one 67-token text | 26.1 ms | 19.3 ms |
+| one 15-token query | 6.2 ms | 6.6 ms (6.3 to 7.7) |
+| one 41-token text | 12.6 ms | 12.7 ms |
+| one 67-token text | 26.0 ms | 19.5 ms |
 
-Those short inputs run whole on the host (above): the pass takes the CPU's own
-bits, within 1.2x its time up to ~41 tokens and below it at ~67, where the
-backend's host attention kernel is 7 ms quicker than ggml-cpu's op
+Those short inputs run whole on the host (above): the pass takes the CPU
+backend's own bits, within 1.1x its time up to ~41 tokens and below it at ~67,
+where the backend's host attention kernel is 7 ms quicker than ggml-cpu's op
 (`GGML_XDNA_HOST_FA=0` brings the pass to the CPU's 26 ms). For a query of 15 to
-41 tokens, `--device none` is up to 1.16x quicker. Measured with
-`GOMP_SPINCOUNT=20000`, the CPU at 16 threads and its wait policy unset.
+41 tokens, `--device none` is up to 1.12x quicker (the BF16 file at 15). Measured
+with `GOMP_SPINCOUNT=20000`, the CPU at 16 threads and its wait policy unset.
 
 The BF16 file is still slower on the array in time and cheaper in energy: one
 912-token text takes 263 ms and 15.4 J per pass against the CPU's 196 ms and
