@@ -1,0 +1,98 @@
+{
+ "windows": 6,
+ "tokens": 18432,
+ "mean_dnll": 0.0009898791111111317,
+ "dnll_upper95": 0.00223837766666668,
+ "ppl_change_percent": 0.09903692031356659,
+ "mean_kl": 0.002277171777777778,
+ "mean_kl_control": 2.625e-06,
+ "kl_limit": 0.002,
+ "problems": [],
+ "per_domain": {
+  "code": {
+   "tokens": 4096,
+   "mean_dnll": -0.001104724500000001,
+   "mean_kl": 0.000502224,
+   "kl_limit": 0.003,
+   "pass": true
+  },
+  "math": {
+   "tokens": 2048,
+   "mean_dnll": 0.0006355170000000854,
+   "mean_kl": 0.000411834,
+   "kl_limit": 0.003,
+   "pass": true
+  },
+  "prose": {
+   "tokens": 12288,
+   "mean_dnll": 0.0017471406666666838,
+   "mean_kl": 0.003179710666666667,
+   "kl_limit": 0.003,
+   "pass": false
+  }
+ },
+ "worst_window": "prose-long",
+ "worst_window_dnll": 0.002866692000000004,
+ "pass_primary": true,
+ "pass_kl_screen": false,
+ "pass_hard": true,
+ "pass_domains": false,
+ "pass_windows": true,
+ "pass": false,
+ "rows": [
+  {
+   "window": "cpp-arg",
+   "tokens": 2048,
+   "dnll": -0.0013705600000000207,
+   "dnll_control": 6.979699999998257e-05,
+   "kl": 0.000596847,
+   "kl_control": 8e-07,
+   "top1": 0.995605469
+  },
+  {
+   "window": "math-fourier",
+   "tokens": 2048,
+   "dnll": 0.0006355170000000854,
+   "dnll_control": -4.686999999892194e-06,
+   "kl": 0.000411834,
+   "kl_control": 4.89e-07,
+   "top1": 0.9921875
+  },
+  {
+   "window": "prose-a",
+   "tokens": 2048,
+   "dnll": -0.0011432089999999784,
+   "dnll_control": 2.3820999999979442e-05,
+   "kl": 0.003006129,
+   "kl_control": 3.633e-06,
+   "top1": 0.979492188
+  },
+  {
+   "window": "prose-d",
+   "tokens": 2048,
+   "dnll": 0.00015928500000006451,
+   "dnll_control": 5.671100000004259e-05,
+   "kl": 0.002992159,
+   "kl_control": 3.513e-06,
+   "top1": 0.980957031
+  },
+  {
+   "window": "prose-long",
+   "tokens": 8192,
+   "dnll": 0.002866692000000004,
+   "dnll_control": 1.8271000000069648e-05,
+   "kl": 0.003269994,
+   "kl_control": 3.714e-06,
+   "top1": 0.977661133
+  },
+  {
+   "window": "py-writer",
+   "tokens": 2048,
+   "dnll": -0.0008388889999999816,
+   "dnll_control": 9.659999999994673e-06,
+   "kl": 0.000407601,
+   "kl_control": 3.34e-07,
+   "top1": 0.999023438
+  }
+ ]
+}

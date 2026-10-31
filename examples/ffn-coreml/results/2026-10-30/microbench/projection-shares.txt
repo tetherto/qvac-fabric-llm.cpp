@@ -1,0 +1,70 @@
+layer=0 ffn=17.087 gdn_ab_proj=0.397 gdn_in_proj=5.979 gdn_out_proj=2.273
+layer=1 ffn=16.579 gdn_ab_proj=0.397 gdn_in_proj=5.428 gdn_out_proj=2.409
+layer=2 ffn=16.574 gdn_ab_proj=0.394 gdn_in_proj=5.619 gdn_out_proj=2.399
+layer=3 attn_out_proj=2.399 attn_qkv_proj=5.293 ffn=18.084
+layer=4 ffn=17.388 gdn_ab_proj=0.398 gdn_in_proj=5.620 gdn_out_proj=2.529
+layer=5 ffn=17.385 gdn_ab_proj=0.391 gdn_in_proj=5.964 gdn_out_proj=2.522
+layer=6 ffn=17.509 gdn_ab_proj=0.386 gdn_in_proj=5.498 gdn_out_proj=2.404
+layer=7 attn_out_proj=2.510 attn_qkv_proj=4.919 ffn=17.237
+layer=8 ffn=16.648 gdn_ab_proj=0.397 gdn_in_proj=5.632 gdn_out_proj=2.526
+layer=9 ffn=16.526 gdn_ab_proj=0.389 gdn_in_proj=5.429 gdn_out_proj=2.527
+layer=10 ffn=16.654 gdn_ab_proj=0.395 gdn_in_proj=5.621 gdn_out_proj=2.523
+layer=11 attn_out_proj=2.526 attn_qkv_proj=5.261 ffn=16.587
+layer=12 ffn=16.526 gdn_ab_proj=0.396 gdn_in_proj=5.642 gdn_out_proj=2.525
+layer=13 ffn=17.211 gdn_ab_proj=0.393 gdn_in_proj=5.427 gdn_out_proj=2.524
+layer=14 ffn=17.159 gdn_ab_proj=0.394 gdn_in_proj=5.420 gdn_out_proj=2.358
+layer=15 attn_out_proj=2.301 attn_qkv_proj=4.826 ffn=16.976
+layer=16 ffn=17.045 gdn_ab_proj=0.392 gdn_in_proj=5.447 gdn_out_proj=2.528
+layer=17 ffn=16.589 gdn_ab_proj=0.387 gdn_in_proj=5.713 gdn_out_proj=2.544
+layer=18 ffn=16.968 gdn_ab_proj=0.394 gdn_in_proj=5.419 gdn_out_proj=2.527
+layer=19 attn_out_proj=2.527 attn_qkv_proj=4.861 ffn=16.665
+layer=20 ffn=18.101 gdn_ab_proj=0.396 gdn_in_proj=5.625 gdn_out_proj=2.529
+layer=21 ffn=17.525 gdn_ab_proj=0.391 gdn_in_proj=5.504 gdn_out_proj=2.398
+layer=22 ffn=17.972 gdn_ab_proj=0.393 gdn_in_proj=5.628 gdn_out_proj=2.413
+layer=23 attn_out_proj=2.399 attn_qkv_proj=4.860 ffn=18.679
+layer=24 ffn=18.772 gdn_ab_proj=0.391 gdn_in_proj=5.952 gdn_out_proj=2.395
+layer=25 ffn=18.659 gdn_ab_proj=0.394 gdn_in_proj=5.959 gdn_out_proj=2.403
+layer=26 ffn=18.660 gdn_ab_proj=0.396 gdn_in_proj=5.961 gdn_out_proj=2.538
+layer=27 attn_out_proj=2.404 attn_qkv_proj=4.745 ffn=17.877
+layer=28 ffn=17.863 gdn_ab_proj=0.396 gdn_in_proj=5.783 gdn_out_proj=2.510
+layer=29 ffn=16.643 gdn_ab_proj=0.394 gdn_in_proj=5.421 gdn_out_proj=2.525
+layer=30 ffn=17.387 gdn_ab_proj=0.398 gdn_in_proj=5.751 gdn_out_proj=2.509
+layer=31 attn_out_proj=2.411 attn_qkv_proj=5.251 ffn=16.645
+layer=32 ffn=16.658 gdn_ab_proj=0.396 gdn_in_proj=5.967 gdn_out_proj=2.526
+layer=33 ffn=16.663 gdn_ab_proj=0.395 gdn_in_proj=5.741 gdn_out_proj=2.523
+layer=34 ffn=17.514 gdn_ab_proj=0.389 gdn_in_proj=6.001 gdn_out_proj=2.524
+layer=35 attn_out_proj=2.401 attn_qkv_proj=5.228 ffn=17.524
+layer=36 ffn=18.100 gdn_ab_proj=0.396 gdn_in_proj=5.625 gdn_out_proj=2.520
+layer=37 ffn=18.098 gdn_ab_proj=0.391 gdn_in_proj=5.553 gdn_out_proj=2.525
+layer=38 ffn=18.095 gdn_ab_proj=0.391 gdn_in_proj=5.638 gdn_out_proj=2.520
+layer=39 attn_out_proj=2.526 attn_qkv_proj=4.858 ffn=18.661
+layer=40 ffn=18.795 gdn_ab_proj=0.395 gdn_in_proj=5.546 gdn_out_proj=2.522
+layer=41 ffn=18.651 gdn_ab_proj=0.390 gdn_in_proj=5.637 gdn_out_proj=2.525
+layer=42 ffn=18.766 gdn_ab_proj=0.397 gdn_in_proj=5.642 gdn_out_proj=2.529
+layer=43 attn_out_proj=2.400 attn_qkv_proj=5.259 ffn=18.094
+layer=44 ffn=16.680 gdn_ab_proj=0.394 gdn_in_proj=5.418 gdn_out_proj=2.530
+layer=45 ffn=17.253 gdn_ab_proj=0.397 gdn_in_proj=5.387 gdn_out_proj=2.521
+layer=46 ffn=16.651 gdn_ab_proj=0.397 gdn_in_proj=5.750 gdn_out_proj=2.526
+layer=47 attn_out_proj=2.523 attn_qkv_proj=4.797 ffn=16.787
+layer=48 ffn=17.965 gdn_ab_proj=0.398 gdn_in_proj=5.953 gdn_out_proj=2.523
+layer=49 ffn=17.970 gdn_ab_proj=0.396 gdn_in_proj=5.715 gdn_out_proj=2.521
+layer=50 ffn=18.697 gdn_ab_proj=0.392 gdn_in_proj=5.744 gdn_out_proj=2.394
+layer=51 attn_out_proj=2.405 attn_qkv_proj=5.253 ffn=18.779
+layer=52 ffn=18.669 gdn_ab_proj=0.397 gdn_in_proj=5.622 gdn_out_proj=2.401
+layer=53 ffn=18.805 gdn_ab_proj=0.394 gdn_in_proj=5.619 gdn_out_proj=2.526
+layer=54 ffn=18.667 gdn_ab_proj=0.395 gdn_in_proj=5.623 gdn_out_proj=2.529
+layer=55 attn_out_proj=2.523 attn_qkv_proj=4.832 ffn=18.645
+layer=56 ffn=18.207 gdn_ab_proj=0.393 gdn_in_proj=5.965 gdn_out_proj=2.406
+layer=57 ffn=18.202 gdn_ab_proj=0.390 gdn_in_proj=5.965 gdn_out_proj=2.404
+layer=58 ffn=17.739 gdn_ab_proj=0.380 gdn_in_proj=5.950 gdn_out_proj=2.416
+layer=59 attn_out_proj=2.519 attn_qkv_proj=5.246 ffn=17.407
+layer=60 ffn=18.247 gdn_ab_proj=0.395 gdn_in_proj=5.960 gdn_out_proj=2.523
+layer=61 ffn=18.654 gdn_ab_proj=0.390 gdn_in_proj=5.975 gdn_out_proj=2.526
+layer=62 ffn=18.667 gdn_ab_proj=0.395 gdn_in_proj=5.954 gdn_out_proj=2.400
+layer=63 attn_out_proj=2.403 attn_qkv_proj=5.251 ffn=17.352
+total attn_out_proj_ms=39.18
+total attn_qkv_proj_ms=80.74
+total ffn_ms=1129.84
+total gdn_ab_proj_ms=18.89
+total gdn_in_proj_ms=273.39
+total gdn_out_proj_ms=119.19

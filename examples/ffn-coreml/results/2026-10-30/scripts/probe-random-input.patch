@@ -1,0 +1,20 @@
+--- /Users/ishan/qwen38-accuracy-20261029/examples/ffn-coreml/ffn-coreml.mm	2026-10-29 07:11:08
++++ probe.mm	2026-10-29 14:55:33
+@@ -12,7 +12,7 @@
+         else { break; }
+         --nargs;
+     }
+-    if ((nargs != 6 && nargs != 8) || (split && nargs != 8)) {
++    if ((nargs != 6 && nargs != 8) ) {
+         fprintf(stderr, "usage: %s model.gguf assets tokens repetitions layer [input.f32 reference.f32] [--ane-only] [--gguf-reference] [--split] [--cpu-only] [--plan]\n", argv[0]);
+         return 1;
+     }
+@@ -57,7 +57,7 @@
+             }
+             metal_ffn bridge;
+             metal_boundary boundary;
+-            if (nargs == 8) {
++            if (nargs == 8 || split) {
+                 bridge.init(argv[1], assets, layer, tokens, false);
+                 ggml_backend_tensor_set(bridge.input, x.data(), 0, x.size() * sizeof(float));
+                 measure("ggml-metal-gguf-resident", tokens, reps, [&]() {

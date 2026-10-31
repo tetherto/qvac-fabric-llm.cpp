@@ -1,0 +1,35 @@
+start Sat Oct 31 09:51:13 CET 2026
+== ANE alone
+ane partition=0 calls=1364 ms_per_call=7.334
+ane partition=1 calls=1364 ms_per_call=7.334
+== attention kv=65536 alone
+kv=65536 nq=512 median_ms=57.818 tflops=14.26 checksum=-491.875211
+== attention kv=65536 with ANE busy
+kv=65536 nq=512 median_ms=57.830 tflops=14.26 checksum=-491.875211
+ane partition=0 calls=5499 ms_per_call=7.275
+ane partition=1 calls=5499 ms_per_call=7.275
+== attention kv=122880 alone
+kv=122880 nq=512 median_ms=111.358 tflops=13.88 checksum=-41.278146
+== attention kv=122880 with ANE busy
+kv=122880 nq=512 median_ms=110.727 tflops=13.96 checksum=-41.278146
+ane partition=0 calls=5498 ms_per_call=7.276
+ane partition=1 calls=5498 ms_per_call=7.276
+== matmul alone
+m=17408 n=512 k=5120 median_ms=5.341 tflops=17.09
+== matmul with ANE busy
+m=17408 n=512 k=5120 median_ms=5.218 tflops=17.49
+m=17408 n=512 k=5120 median_ms=5.236 tflops=17.43
+m=17408 n=512 k=5120 median_ms=5.228 tflops=17.46
+m=17408 n=512 k=5120 median_ms=5.650 tflops=16.15
+m=17408 n=512 k=5120 median_ms=5.197 tflops=17.56
+ane partition=0 calls=2058 ms_per_call=7.289
+ane partition=1 calls=2058 ms_per_call=7.289
+== ANE with attention kv=122880 looping
+ane partition=0 calls=2068 ms_per_call=7.254
+ane partition=1 calls=2068 ms_per_call=7.254
+== ANE with matmul looping
+ane partition=0 calls=1371 ms_per_call=7.299
+ane partition=1 calls=1371 ms_per_call=7.298
+== decoder metal 8192
+== decoder split 8192 profiled
+end Sat Oct 31 09:56:13 CET 2026

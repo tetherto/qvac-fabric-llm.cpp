@@ -1,0 +1,10 @@
+decoder_layer=0 metal_channels=8192 coreml_channels=4608 coreml2_channels=4608 output_scale=1
+request mode=split prompt_tokens=2048 generated=16 repetition=-1 pp_ms=4899.764167 pp_tps=417.979301 ttft_ms=4899.908958 decode_ms=530.701833 decode_tps=28.264459 total_ms=5430.611083 output_tps=2.946261 offload_calls=256 decode_offload_calls=0
+request mode=split prompt_tokens=2048 generated=128 repetition=0 pp_ms=4772.966416 pp_tps=429.083262 ttft_ms=4773.115541 decode_ms=4445.741750 decode_tps=28.566662 total_ms=9218.857583 output_tps=13.884584 offload_calls=256 decode_offload_calls=0
+request mode=split prompt_tokens=2048 generated=128 repetition=1 pp_ms=4769.483459 pp_tps=429.396604 ttft_ms=4769.616459 decode_ms=4449.685583 decode_tps=28.541342 total_ms=9219.302375 output_tps=13.883914 offload_calls=256 decode_offload_calls=0
+request mode=split prompt_tokens=2048 generated=128 repetition=2 pp_ms=4772.210625 pp_tps=429.151218 ttft_ms=4772.361250 decode_ms=4449.656958 decode_tps=28.541526 total_ms=9222.018500 output_tps=13.879825 offload_calls=256 decode_offload_calls=0
+request mode=split prompt_tokens=8192 generated=16 repetition=-1 pp_ms=19970.917292 pp_tps=410.196481 ttft_ms=19971.065667 decode_ms=540.544500 decode_tps=27.749797 total_ms=20511.610542 output_tps=0.780046 offload_calls=1024 decode_offload_calls=0
+request mode=split prompt_tokens=8192 generated=128 repetition=0 pp_ms=20043.120500 pp_tps=408.718792 ttft_ms=20043.270375 decode_ms=4540.852458 decode_tps=27.968317 total_ms=24584.123083 output_tps=5.206612 offload_calls=1024 decode_offload_calls=0
+request mode=split prompt_tokens=8192 generated=128 repetition=1 pp_ms=19982.445333 pp_tps=409.959835 ttft_ms=19982.589583 decode_ms=4536.562500 decode_tps=27.994765 total_ms=24519.152291 output_tps=5.220409 offload_calls=1024 decode_offload_calls=0
+request mode=split prompt_tokens=8192 generated=128 repetition=2 pp_ms=19975.015958 pp_tps=410.112313 ttft_ms=19975.198417 decode_ms=4539.888875 decode_tps=27.974253 total_ms=24515.087583 output_tps=5.221274 offload_calls=1024 decode_offload_calls=0
+output_backing_fallbacks=0

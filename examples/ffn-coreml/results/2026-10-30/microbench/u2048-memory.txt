@@ -1,0 +1,7 @@
+request mode=split prompt_tokens=2048 generated=16 repetition=-1 pp_ms=5349.869334 pp_tps=382.813088 ttft_ms=5350.007834 decode_ms=530.457958 decode_tps=28.277453 total_ms=5880.466250 output_tps=2.720873 offload_calls=64 decode_offload_calls=0
+request mode=split prompt_tokens=2048 generated=128 repetition=0 pp_ms=5909.677375 pp_tps=346.550221 ttft_ms=5909.839584 decode_ms=4462.536667 decode_tps=28.459150 total_ms=10372.376584 output_tps=12.340470 offload_calls=64 decode_offload_calls=0
+request mode=split prompt_tokens=2048 generated=128 repetition=1 pp_ms=5948.000500 pp_tps=344.317389 ttft_ms=5948.170834 decode_ms=4462.924709 decode_tps=28.456675 total_ms=10411.095875 output_tps=12.294575 offload_calls=64 decode_offload_calls=0
+request mode=split prompt_tokens=2048 generated=128 repetition=2 pp_ms=5959.960250 pp_tps=343.626453 ttft_ms=5960.118083 decode_ms=4462.698750 decode_tps=28.458116 total_ms=10422.817250 output_tps=12.280749 offload_calls=64 decode_offload_calls=0
+         58596540416  maximum resident set size
+         52819381656  peak memory footprint
+swapouts during run: 0 pages, pageouts: 101 pages

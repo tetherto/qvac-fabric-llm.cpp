@@ -1,0 +1,21 @@
+cpp-arg          tokens= 2048 dnll=+0.00050 (control +0.00004) kl=0.000157 (control 0.000001) top1=0.9985
+math-fourier     tokens= 2048 dnll=+0.00027 (control -0.00001) kl=0.000097 (control 0.000000) top1=0.9941
+prose-a          tokens= 2048 dnll=-0.00171 (control -0.00004) kl=0.000845 (control 0.000003) top1=0.9888
+prose-d          tokens= 2048 dnll=-0.00069 (control +0.00005) kl=0.000807 (control 0.000003) top1=0.9932
+prose-long       tokens= 8192 dnll=+0.00190 (control +0.00004) kl=0.000904 (control 0.000003) top1=0.9874
+py-writer        tokens= 2048 dnll=-0.00026 (control +0.00002) kl=0.000036 (control 0.000000) top1=0.9985
+{
+ "windows": 6,
+ "tokens": 18432,
+ "mean_dnll": 0.0006349650000000367,
+ "dnll_upper95": 0.0014993336666667073,
+ "ppl_change_percent": 0.0635166632950046,
+ "mean_kl": 0.0006175565555555556,
+ "mean_kl_control": 2.0988888888888885e-06,
+ "kl_limit": 0.001,
+ "problems": [],
+ "pass_primary": true,
+ "pass_kl_screen": true,
+ "pass_hard": true,
+ "pass": true
+}

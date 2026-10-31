@@ -1,0 +1,371 @@
+{
+ "schema": 3,
+ "date": "2026-10-31-x",
+ "machine": "mac-m3-ultra",
+ "status": "partial",
+ "reason": null,
+ "missing": [
+  "conc:omlx/ar",
+  "conc:sglang/ar",
+  "conc:splash/dflash2",
+  "conc:fab/ar",
+  "conc:up/ar",
+  "conc:mlx/ar",
+  "spec:up/ar",
+  "spec:up/mtp",
+  "spec:up/dflash2",
+  "spec:fab/ar",
+  "spec:fab/mtp",
+  "spec:omlx/ar",
+  "spec:omlx/mtp",
+  "spec:omlx/dflash2",
+  "spec:mlx/ar",
+  "spec:sglang/ar",
+  "concspec:up/mtp",
+  "concspec:up/dflash2",
+  "concspec:fab/mtp",
+  "concspec:fab/dflash2",
+  "concspec:omlx/mtp",
+  "concspec:omlx/dflash2",
+  "depth:up/ar",
+  "depth:fab/ar",
+  "depth:omlx/ar",
+  "depth:mlx/ar",
+  "depth:sglang/ar",
+  "depth:up/dflash2",
+  "depth:fab/dflash2",
+  "depth:omlx/dflash2"
+ ],
+ "started": null,
+ "finished": "Sat Oct 31 06:05:30 CET 2026",
+ "hardware": {
+  "chip": "Apple M3 Ultra",
+  "gpu": "60-core GPU",
+  "memory_gb": 96,
+  "os": "macOS 26.7.1"
+ },
+ "versions": [
+  {
+   "engine": "up",
+   "name": "llama.cpp master",
+   "version": "master @ a34de8618 (2026-10-30)",
+   "backend": "metal",
+   "weights": "Q4_0 GGUF (pure)"
+  },
+  {
+   "engine": "fab",
+   "name": "qvac-fabric PR stack",
+   "version": "temp-11259 @ d3d019a3b (2026-10-30)",
+   "backend": "metal",
+   "weights": "Q4_0 GGUF (pure)"
+  },
+  {
+   "engine": "fabcml",
+   "name": "qvac-fabric + Core ML (2 ANE)",
+   "version": "temp-11259 @ d3d019a3b + feat/coreml-qwen-3.8 Core ML server (fbb340d)",
+   "backend": "metal+ane",
+   "weights": "Q4_0 GGUF (pure) + Core ML 8-bit sidecar"
+  },
+  {
+   "engine": "mlx",
+   "name": "mlx-lm",
+   "version": "mlx-lm 0.32.2, mlx 0.32.4",
+   "backend": "mlx",
+   "weights": "MLX 4-bit g64"
+  },
+  {
+   "engine": "omlx",
+   "name": "oMLX",
+   "version": "0.7.3rc1",
+   "backend": "mlx",
+   "weights": "MLX 4-bit g64"
+  },
+  {
+   "engine": "sglang",
+   "name": "SGLang",
+   "version": "0.5.22",
+   "backend": "mlx",
+   "weights": "MLX 4-bit g64"
+  },
+  {
+   "engine": "splash",
+   "name": "Splash",
+   "version": "1.5.0",
+   "backend": "metal",
+   "weights": "MLX 4-bit g64"
+  }
+ ],
+ "updates": [],
+ "single": [],
+ "conc": [
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "dflash2",
+   "profile": "standard",
+   "draft": "",
+   "prompt": 223,
+   "c": 1,
+   "gen": 56.2,
+   "req": 61.0,
+   "ttft": 0.728,
+   "p90": 0.728
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "dflash2",
+   "profile": "standard",
+   "draft": "",
+   "prompt": 243,
+   "c": 8,
+   "gen": 62.4,
+   "req": 8.5,
+   "ttft": 4.766,
+   "p90": 6.309
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "dflash2",
+   "profile": "standard",
+   "draft": "",
+   "prompt": 259,
+   "c": 4,
+   "gen": 55.0,
+   "req": 15.0,
+   "ttft": 2.965,
+   "p90": 2.707
+  }
+ ],
+ "spec": [
+  {
+   "engine": "fab",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "standard",
+   "draft": "DFlash2 Q4_0 GGUF",
+   "mean": 105.19,
+   "runs": 8,
+   "acc": 44.2,
+   "code": 114.3,
+   "rewrite": 165.9,
+   "story": 55.1,
+   "explain": 85.4
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "dflash2",
+   "profile": "standard",
+   "draft": "",
+   "mean": 105.2,
+   "runs": 8,
+   "acc": 44.2,
+   "code": 114.4,
+   "rewrite": 165.8,
+   "story": 55.1,
+   "explain": 85.4
+  },
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "standard",
+   "draft": "DFlash2 bf16, 4-bit at load",
+   "mean": 109.65,
+   "runs": 8,
+   "acc": null,
+   "code": 115.6,
+   "rewrite": 177.1,
+   "story": 59.3,
+   "explain": 86.7
+  }
+ ],
+ "depth": [
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "noane",
+   "depth": 981,
+   "pp": 325.4,
+   "tg": 55.0,
+   "ttft": 3.015
+  },
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "noane",
+   "depth": 4538,
+   "pp": 339.8,
+   "tg": 61.8,
+   "ttft": 13.356
+  },
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "noane",
+   "depth": 20915,
+   "pp": 322.7,
+   "tg": 47.1,
+   "ttft": 64.808
+  },
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "noane",
+   "depth": 38462,
+   "pp": 302.3,
+   "tg": 57.8,
+   "ttft": 127.215
+  },
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "noane",
+   "depth": 69941,
+   "pp": 269.8,
+   "tg": 46.7,
+   "ttft": 259.256
+  },
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "noane",
+   "depth": 123126,
+   "pp": 227.9,
+   "tg": 39.0,
+   "ttft": 540.362
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "dflash2",
+   "profile": "standard",
+   "depth": 980,
+   "pp": 353.9,
+   "tg": 58.5,
+   "ttft": 2.769
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "dflash2",
+   "profile": "standard",
+   "depth": 4537,
+   "pp": 417.5,
+   "tg": 65.3,
+   "ttft": 10.866
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "dflash2",
+   "profile": "standard",
+   "depth": 20914,
+   "pp": 386.7,
+   "tg": 63.2,
+   "ttft": 54.087
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "dflash2",
+   "profile": "standard",
+   "depth": 38461,
+   "pp": 345.2,
+   "tg": 49.6,
+   "ttft": 111.407
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "dflash2",
+   "profile": "standard",
+   "depth": 69940,
+   "pp": 284.8,
+   "tg": 42.8,
+   "ttft": 245.61
+  },
+  {
+   "engine": "fabcml",
+   "backend": "metal+ane",
+   "mode": "dflash2",
+   "profile": "standard",
+   "depth": 123125,
+   "pp": 213.7,
+   "tg": 34.6,
+   "ttft": 576.2
+  },
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "standard",
+   "depth": 979,
+   "pp": 379.6,
+   "tg": 58.4,
+   "ttft": 2.579
+  },
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "standard",
+   "depth": 4536,
+   "pp": 431.9,
+   "tg": 61.7,
+   "ttft": 10.502
+  },
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "standard",
+   "depth": 20913,
+   "pp": 413.8,
+   "tg": 47.1,
+   "ttft": 50.539
+  },
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "standard",
+   "depth": 38460,
+   "pp": 382.9,
+   "tg": 57.8,
+   "ttft": 100.454
+  },
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "standard",
+   "depth": 69939,
+   "pp": 332.2,
+   "tg": 46.5,
+   "ttft": 210.525
+  },
+  {
+   "engine": "splash",
+   "backend": "metal",
+   "mode": "dflash2",
+   "profile": "standard",
+   "depth": 123124,
+   "pp": 270.9,
+   "tg": 39.0,
+   "ttft": 454.42
+  }
+ ],
+ "short_outputs": 0,
+ "short_by_label": [],
+ "errors": [],
+ "jobs": {}
+}

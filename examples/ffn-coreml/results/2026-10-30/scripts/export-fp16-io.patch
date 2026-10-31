@@ -1,0 +1,30 @@
+--- /Users/ishan/qwen38-accuracy-20261029/examples/ffn-coreml/export_ffn.py	2026-10-29 07:11:08
++++ export_ffn_fp16.py	2026-10-30 14:16:01
+@@ -8,10 +8,11 @@
+ import sys
+ 
+ import coremltools as ct
++from coremltools.converters.mil.mil import types
+ from coremltools.converters.mil import Builder as mb
+ import numpy as np
+ 
+-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
++sys.path.insert(0, str(Path(__file__).resolve().parents[0] / "gguf-py"))
+ from gguf import GGUFReader
+ from gguf.quants import dequantize
+ 
+@@ -74,11 +75,11 @@
+     for tokens in args.tokens:
+         def silu(gate):
+             if args.activation == "tanh":
+-                half = mb.mul(x=gate, y=0.5)
+-                return mb.mul(x=half, y=mb.add(x=mb.tanh(x=half), y=1.0))
++                half = mb.mul(x=gate, y=np.float16(0.5))
++                return mb.mul(x=half, y=mb.add(x=mb.tanh(x=half), y=np.float16(1.0)))
+             return mb.mul(x=gate, y=mb.sigmoid(x=gate))
+ 
+-        @mb.program(input_specs=[mb.TensorSpec(shape=(tokens, hidden))], opset_version=ct.target.macOS15)
++        @mb.program(input_specs=[mb.TensorSpec(shape=(tokens, hidden), dtype=types.fp16)], opset_version=ct.target.macOS15)
+         def program(x):
+             if args.layout == "linear":
+                 up = mb.matmul(x=x, y=weights["up"], transpose_y=True)

@@ -1,0 +1,314 @@
+diff --git a/examples/ffn-coreml/decoder-coreml.mm b/examples/ffn-coreml/decoder-coreml.mm
+index bbb32d4e6..465e96cc7 100644
+--- a/examples/ffn-coreml/decoder-coreml.mm
++++ b/examples/ffn-coreml/decoder-coreml.mm
+@@ -12,6 +12,8 @@
+ static bool profile_enabled = false;
+ static bool direct_input = false;
+ static bool gpu_resident = false;
++// tokens per prefill microbatch and per Core ML call
++static int ubatch = 512;
+ 
+ struct stage_profile {
+     double ms[10] = {};
+@@ -32,7 +34,7 @@ struct stage_profile {
+ 
+ static MLMultiArray * decoder_output(id<MLFeatureProvider> result) {
+     MLMultiArray * y = [result featureValueForName:@"y"].multiArrayValue;
+-    require(y && y.dataType == MLMultiArrayDataTypeFloat32 && y.shape.count == 2 && y.shape[0].intValue == 512 && y.shape[1].intValue == 5120, "unexpected decoder FFN output");
++    require(y && y.dataType == MLMultiArrayDataTypeFloat32 && y.shape.count == 2 && y.shape[0].intValue == ubatch && y.shape[1].intValue == 5120, "unexpected decoder FFN output");
+     return y;
+ }
+ 
+@@ -118,7 +120,7 @@ struct decoder_ffn {
+         const float * values2 = y2 ? static_cast<const float *>(y2.dataPointer) : nullptr;
+         size_t row_stride = y.strides[0].unsignedLongLongValue, column_stride = y.strides[1].unsignedLongLongValue;
+         size_t row_stride2 = y2 ? y2.strides[0].unsignedLongLongValue : 0, column_stride2 = y2 ? y2.strides[1].unsignedLongLongValue : 0;
+-        for (int t = 0; t < 512; ++t) {
++        for (int t = 0; t < ubatch; ++t) {
+             for (int h = 0; h < 5120; ++h) {
+                 float value = values[t * row_stride + h * column_stride];
+                 if (values2) { value += values2[t * row_stride2 + h * column_stride2]; }
+@@ -136,7 +138,7 @@ struct decoder_ffn {
+         const float * values = static_cast<const float *>(y.dataPointer);
+         float * out = static_cast<float *>(target->data);
+         size_t row_stride = y.strides[0].unsignedLongLongValue, column_stride = y.strides[1].unsignedLongLongValue;
+-        for (int t = 0; t < 512; ++t) {
++        for (int t = 0; t < ubatch; ++t) {
+             for (int h = 0; h < 5120; ++h) { out[t * 5120 + h] = values[t * row_stride + h * column_stride]; }
+         }
+     }
+@@ -199,11 +201,11 @@ struct decoder_ffn {
+ 
+     void init(const std::string & gguf, const std::string & assets, int layer, bool reference_only) {
+         full_metal = reference_only;
+-        x.resize(5120 * 512);
++        x.resize(size_t(5120) * ubatch);
+         partial.resize(x.size());
+         residual.resize(x.size());
+         if (full_metal) {
+-            prefix.init(gguf, assets, layer, 512, false, 0, true, direct_input);
++            prefix.init(gguf, assets, layer, ubatch, false, 0, true, direct_input);
+             std::vector<float> warm(x.size());
+             profile.begin();
+             execute(warm.data());
+@@ -211,17 +213,18 @@ struct decoder_ffn {
+             return;
+         }
+         NSError * failure = nil;
+-        model = decoder_load(assets, "ffn-512", layer, compiled);
++        const std::string base = "ffn-" + std::to_string(ubatch), base2 = base + "-1";
++        model = decoder_load(assets, base.c_str(), layer, compiled);
+         NSDictionary * metadata = model.modelDescription.metadata[MLModelCreatorDefinedKey];
+         int gpu_channels = [metadata[@"channel_start"] intValue];
+         int ane_channels = [metadata[@"channel_count"] intValue];
+         int ane2_channels = 0;
+         double scale = [metadata[@"output_scale"] doubleValue];
+         NSFileManager * files = [NSFileManager defaultManager];
+-        NSString * second = [NSString stringWithFormat:@"%s/ffn-512-1", assets.c_str()];
++        NSString * second = [NSString stringWithFormat:@"%s/%s", assets.c_str(), base2.c_str()];
+         if ([files fileExistsAtPath:[second stringByAppendingString:@".mlpackage"]] ||
+             (std::getenv("FFN_COREML_CACHE_COMPILED") && [files fileExistsAtPath:[[second stringByAppendingString:@".mlmodelc"] stringByResolvingSymlinksInPath]])) {
+-            model2 = decoder_load(assets, "ffn-512-1", layer, compiled2);
++            model2 = decoder_load(assets, base2.c_str(), layer, compiled2);
+             NSDictionary * metadata2 = model2.modelDescription.metadata[MLModelCreatorDefinedKey];
+             ane2_channels = [metadata2[@"channel_count"] intValue];
+             require([metadata2[@"source_layer"] intValue] == layer && [metadata2[@"channel_start"] intValue] == gpu_channels + ane_channels &&
+@@ -230,11 +233,11 @@ struct decoder_ffn {
+         require([metadata[@"source_layer"] intValue] == layer && gpu_channels > 0 && gpu_channels % 256 == 0 && ane_channels > 0 && gpu_channels + ane_channels + ane2_channels == 17408, "wrong integrated FFN package");
+         require(scale == 1 || scale == 16, "unsupported integrated output scale");
+         inverse_scale = 1.0 / scale;
+-        prefix.init(gguf, assets, layer, 512, false, gpu_channels, true, direct_input);
++        prefix.init(gguf, assets, layer, ubatch, false, gpu_channels, true, direct_input);
+         if (direct_input) {
+-            input = [[MLMultiArray alloc] initWithDataPointer:prefix.input->data shape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
++            input = [[MLMultiArray alloc] initWithDataPointer:prefix.input->data shape:@[@(ubatch), @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
+         } else {
+-            input = [[MLMultiArray alloc] initWithShape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 error:&failure];
++            input = [[MLMultiArray alloc] initWithShape:@[@(ubatch), @5120] dataType:MLMultiArrayDataTypeFloat32 error:&failure];
+         }
+         require(input, "integrated FFN input allocation failed");
+         features = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": input} error:&failure];
+@@ -243,12 +246,12 @@ struct decoder_ffn {
+         // on by default for the resident path; FFN_COREML_OUTPUT_BACKING=0 keeps the CPU copy
+         const char * backing_env = std::getenv("FFN_COREML_OUTPUT_BACKING");
+         backed = gpu_resident && scale == 1 && !(backing_env && strcmp(backing_env, "0") == 0);
+-        join.init(prefix.backend, 5120, 512, backed && model2);
++        join.init(prefix.backend, 5120, ubatch, backed && model2);
+         if (backed) {
+             auto backing = [&](ggml_tensor * target) {
+                 require(ggml_backend_metal_tensor_is_shared(target), "output backing requires shared Metal storage");
+                 NSError * failure = nil;
+-                MLMultiArray * array = [[MLMultiArray alloc] initWithDataPointer:target->data shape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
++                MLMultiArray * array = [[MLMultiArray alloc] initWithDataPointer:target->data shape:@[@(ubatch), @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
+                 require(array, "output backing allocation failed");
+                 MLPredictionOptions * result = [[MLPredictionOptions alloc] init];
+                 result.outputBackings = @{@"y": array};
+@@ -291,7 +294,7 @@ static void decoder_compute(ggml_tensor * dst, const ggml_tensor * src, const gg
+             require(residual->type == GGML_TYPE_F32 && residual->nb[0] == sizeof(float), "unexpected residual layout");
+             float * input_data = direct_input ? static_cast<float *>(runtime.prefix.input->data) : runtime.x.data();
+             float * residual_data = direct_input ? static_cast<float *>(runtime.prefix.residual->data) : runtime.residual.data();
+-            for (int t = 0; t < 512; ++t) {
++            for (int t = 0; t < ubatch; ++t) {
+                 memcpy(input_data + t * 5120, static_cast<const char *>(src->data) + t * src->nb[1], 5120 * sizeof(float));
+                 memcpy(residual_data + t * 5120, static_cast<const char *>(residual->data) + t * residual->nb[1], 5120 * sizeof(float));
+             }
+@@ -332,7 +335,7 @@ static bool decoder_resident_compute(ggml_backend_t backend, ggml_tensor * dst,
+                 require(ggml_backend_metal_tensor_is_shared(src), "Core ML input must use shared Metal storage");
+                 if (runtime.input.dataPointer != src->data) {
+                     NSError * failure = nil;
+-                    runtime.input = [[MLMultiArray alloc] initWithDataPointer:src->data shape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
++                    runtime.input = [[MLMultiArray alloc] initWithDataPointer:src->data shape:@[@(ubatch), @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
+                     require(runtime.input, "resident Core ML input binding failed");
+                     runtime.features = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": runtime.input} error:&failure];
+                     require(runtime.features, "resident Core ML provider failed");
+@@ -361,7 +364,7 @@ static bool decoder_resident_compute(ggml_backend_t backend, ggml_tensor * dst,
+ static ggml_tensor * decoder_build(ggml_context * ctx, ggml_tensor * input, ggml_tensor * residual, int layer, void * userdata) {
+     auto & state = *static_cast<decoder_state *>(userdata);
+     auto found = state.layers.find(layer);
+-    if (found == state.layers.end() || input->type != GGML_TYPE_F32 || input->ne[0] != 5120 || input->ne[1] != 512 || input->ne[2] != 1 || input->ne[3] != 1) { return nullptr; }
++    if (found == state.layers.end() || input->type != GGML_TYPE_F32 || input->ne[0] != 5120 || input->ne[1] != ubatch || input->ne[2] != 1 || input->ne[3] != 1) { return nullptr; }
+     return ggml_map_custom2(ctx, input, residual, decoder_compute, 1, found->second.get());
+ }
+ 
+@@ -369,7 +372,7 @@ static llama_context * make_context(llama_model * model, int context, decoder_st
+     llama_ffn_coreml_set_builder(split ? decoder_build : nullptr, split ? &state : nullptr);
+     auto cp = llama_context_default_params();
+     cp.n_ctx = context;
+-    cp.n_batch = cp.n_ubatch = 512;
++    cp.n_batch = cp.n_ubatch = ubatch;
+     cp.n_threads = 20;
+     cp.n_threads_batch = state.batch_threads;
+     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+@@ -416,8 +419,8 @@ static void request(llama_context * ctx, decoder_state & state, const std::vecto
+     uint64_t before = state.calls();
+     for (auto & entry : state.layers) { entry.second->profile = {}; }
+     auto start = std::chrono::steady_clock::now();
+-    for (int offset = 0; offset < length; offset += 512) {
+-        int n = std::min(512, length - offset);
++    for (int offset = 0; offset < length; offset += ubatch) {
++        int n = std::min(ubatch, length - offset);
+         require(llama_decode(ctx, llama_batch_get_one(const_cast<llama_token *>(prompt.data()) + offset, n)) == 0, "prompt evaluation failed");
+     }
+     llama_synchronize(ctx);
+@@ -440,7 +443,7 @@ static void request(llama_context * ctx, decoder_state & state, const std::vecto
+     double transition_ms = 0;
+     if (const char * value = std::getenv("FFN_COREML_DECODE_PLAN")) {
+         const int reserve_tokens = std::stoi(value);
+-        require(reserve_tokens == 1 || reserve_tokens == 512, "decode plan must use 1 or 512 tokens");
++        require(reserve_tokens == 1 || reserve_tokens == ubatch, "decode plan must use 1 token or the microbatch size");
+         llama_ffn_coreml_set_builder(nullptr, nullptr);
+         auto * graph = llama_graph_reserve(ctx, reserve_tokens, 1, reserve_tokens);
+         llama_ffn_coreml_set_builder(mode == "split" || mode == "hook-metal" ? decoder_build : nullptr, &state);
+@@ -473,7 +476,7 @@ static void request(llama_context * ctx, decoder_state & state, const std::vecto
+     }
+     uint64_t decode_calls = state.calls() - after_prompt;
+     require(decode_calls == 0, "Core ML unexpectedly ran during token decoding");
+-    uint64_t expected = (mode == "split" || mode == "hook-metal") ? state.layers.size() * (length / 512) : 0;
++    uint64_t expected = (mode == "split" || mode == "hook-metal") ? state.layers.size() * (length / ubatch) : 0;
+     require(after_prompt - before == expected, "unexpected number of integrated FFN calls");
+     printf("request mode=%s prompt_tokens=%d generated=%d repetition=%d pp_ms=%.6f pp_tps=%.6f ttft_ms=%.6f decode_ms=%.6f decode_tps=%.6f total_ms=%.6f output_tps=%.6f offload_calls=%llu decode_offload_calls=%llu\n",
+            mode.c_str(), length, generated, repetition, pp_ms, length * 1000.0 / pp_ms, ttft_ms, decode_ms,
+@@ -501,11 +504,11 @@ static void quality(llama_model * model, decoder_state & state, const std::vecto
+     auto * split = make_context(model, length + 64, state, true);
+     double kl_sum = 0, kl_max = 0, nll_metal = 0, nll_split = 0;
+     int agreement = 0;
+-    std::vector<float> reference(size_t(512) * vocab);
+-    std::vector<int8_t> logits(512, 1);
++    std::vector<float> reference(size_t(ubatch) * vocab);
++    std::vector<int8_t> logits(ubatch, 1);
+     uint64_t before = state.calls();
+-    for (int offset = 0; offset < length; offset += 512) {
+-        int n = std::min(512, length - offset);
++    for (int offset = 0; offset < length; offset += ubatch) {
++        int n = std::min(ubatch, length - offset);
+         auto batch = llama_batch_get_one(const_cast<llama_token *>(prompt.data()) + offset, n);
+         batch.logits = logits.data();
+         llama_ffn_coreml_set_builder(nullptr, nullptr);
+@@ -539,7 +542,7 @@ static void quality(llama_model * model, decoder_state & state, const std::vecto
+             nll_split += lb - b[label];
+         }
+     }
+-    require(state.calls() - before == state.layers.size() * (length / 512), "quality did not use intended offload layers");
++    require(state.calls() - before == state.layers.size() * (length / ubatch), "quality did not use intended offload layers");
+     bool screen_pass = kl_sum / length <= 0.001 && std::exp((nll_split - nll_metal) / length) <= 1.01;
+     printf("quality prompt_tokens=%d mean_kl=%.9f max_kl=%.9f top1_agreement=%.9f metal_nll=%.9f split_nll=%.9f metal_ppl=%.9f split_ppl=%.9f offload_calls=%llu screen_pass=%d reference_custom=%d\n",
+            length, kl_sum / length, kl_max, double(agreement) / length, nll_metal / length, nll_split / length,
+@@ -558,6 +561,11 @@ int main(int argc, char ** argv) {
+     @autoreleasepool {
+         try {
+             gpu_resident = std::getenv("FFN_COREML_GPU_RESIDENT") != nullptr;
++            if (const char * value = std::getenv("FFN_COREML_UBATCH")) {
++                ubatch = std::stoi(value);
++                require(ubatch == 512 || ubatch == 1024 || ubatch == 2048, "microbatch must be 512, 1024 or 2048 tokens");
++            }
++            printf("ubatch=%d\n", ubatch);
+             if (gpu_resident) { ggml_backend_metal_set_custom2(decoder_compute, decoder_resident_compute); }
+             printf("gpu_resident=%d\n", int(gpu_resident));
+             if (gpu_resident) { printf("resident_profile_stages=producer_wait,bind,prefix_submit,input_bind,predict,output_convert,unused,join_input,join_submit,unused\n"); }
+@@ -574,7 +582,7 @@ int main(int argc, char ** argv) {
+             std::string item;
+             while (std::getline(list, item, ',')) {
+                 int n = std::stoi(item);
+-                require(n >= 512 && n <= 8192 && n % 512 == 0, "prompt length must be a multiple of 512 in 512..8192");
++                require(n >= ubatch && n <= 8192 && n % ubatch == 0, "prompt length must be a multiple of the microbatch size, up to 8192");
+                 lengths.push_back(n);
+             }
+             require(!lengths.empty(), "no prompt lengths");
+diff --git a/examples/ffn-coreml/export_ffn.py b/examples/ffn-coreml/export_ffn.py
+index 8a7f7810d..862a69c17 100644
+--- a/examples/ffn-coreml/export_ffn.py
++++ b/examples/ffn-coreml/export_ffn.py
+@@ -30,8 +30,8 @@ def main():
+     parser.add_argument("--channel-start", type=int, default=0)
+     parser.add_argument("--channel-count", type=int)
+     args = parser.parse_args()
+-    if args.layer < 0 or not 1 <= args.chunk <= 8192 or any(t < 1 or t > 512 for t in args.tokens):
+-        parser.error("require layer >= 0, chunk in 1..8192 and tokens in 1..512")
++    if args.layer < 0 or not 1 <= args.chunk <= 8192 or any(t < 1 or t > 2048 for t in args.tokens):
++        parser.error("require layer >= 0, chunk in 1..8192 and tokens in 1..2048")
+     args.output.mkdir(parents=True, exist_ok=True)
+     reader = GGUFReader(str(args.gguf), "r")
+     tensors = {t.name: t for t in reader.tensors}
+diff --git a/examples/ffn-coreml/export_sidecar.py b/examples/ffn-coreml/export_sidecar.py
+index 88ae79688..2fdc4134f 100644
+--- a/examples/ffn-coreml/export_sidecar.py
++++ b/examples/ffn-coreml/export_sidecar.py
+@@ -12,8 +12,7 @@ import tempfile
+ 
+ 
+ TOOLS = Path(__file__).resolve().parent
+-TOKENS = 512
+-PACKAGE_NAMES = ("ffn-512", "ffn-512-1")
++TOKENS = (512, 1024, 2048)
+ MANIFEST_NAMES = ("manifest.json", "manifest-1.json")
+ 
+ 
+@@ -24,8 +23,8 @@ def read_preset(path: Path) -> dict:
+         raise ValueError("layers must be a sorted list of distinct layer ids")
+     if any(not isinstance(layer, int) or not 0 <= layer < preset.get("model_layers", 0) for layer in layers):
+         raise ValueError("layer ids must be within model_layers")
+-    if preset.get("tokens") != TOKENS:
+-        raise ValueError(f"tokens must be {TOKENS}")
++    if preset.get("tokens") not in TOKENS:
++        raise ValueError(f"tokens must be one of {TOKENS}")
+     intermediate, start, count = preset.get("intermediate"), preset.get("channel_start"), preset.get("channel_count")
+     if not all(isinstance(v, int) for v in (intermediate, start, count)) or start <= 0 or count <= 0 or start + count != intermediate:
+         raise ValueError("channel_start + channel_count must equal intermediate")
+@@ -48,7 +47,8 @@ def read_preset(path: Path) -> dict:
+ def partitions(preset: dict) -> list:
+     parts = preset.get("ane_partitions", 1)
+     size = preset["channel_count"] // parts
+-    return [(PACKAGE_NAMES[i], MANIFEST_NAMES[i], preset["channel_start"] + i * size, size) for i in range(parts)]
++    names = (f"ffn-{preset['tokens']}", f"ffn-{preset['tokens']}-1")
++    return [(names[i], MANIFEST_NAMES[i], preset["channel_start"] + i * size, size) for i in range(parts)]
+ 
+ 
+ def sha256(path: Path) -> str:
+@@ -81,15 +81,15 @@ def export(gguf: Path, preset_path: Path, destination: Path, workers: int, verif
+             output.mkdir()
+             for name, manifest, start, count in partitions(preset):
+                 fp16 = staging / "fp16"
+-                run("export_ffn.py", [str(gguf), str(fp16), "--layer", str(layer), "--tokens", str(TOKENS), "--chunk", str(preset["chunk"]),
++                run("export_ffn.py", [str(gguf), str(fp16), "--layer", str(layer), "--tokens", str(preset["tokens"]), "--chunk", str(preset["chunk"]),
+                                       "--activation", preset["activation"], "--output-scale", str(preset["output_scale"]),
+                                       "--channel-start", str(start), "--channel-count", str(count), "--no-reference-files"])
+                 source = fp16
+                 if layer not in preset.get("fp16_layers", []):
+                     source = staging / "palette"
+-                    run("palettize_ffn.py", [str(fp16), str(source), "--bits", str(preset["palette_bits"]), "--tokens", str(TOKENS),
++                    run("palettize_ffn.py", [str(fp16), str(source), "--bits", str(preset["palette_bits"]), "--tokens", str(preset["tokens"]),
+                                              "--workers", str(workers), "--group-size", str(preset.get("palette_group_size", 0)), "--no-reference-files"])
+-                (source / f"ffn-{TOKENS}.mlpackage").rename(output / f"{name}.mlpackage")
++                (source / f"ffn-{preset['tokens']}.mlpackage").rename(output / f"{name}.mlpackage")
+                 (source / "manifest.json").rename(output / manifest)
+                 packages.append(dict(layer=layer, package=f"layer{layer}/{name}.mlpackage", channel_start=start, channel_count=count,
+                                      manifest_sha256=sha256(output / manifest)))
+diff --git a/examples/ffn-coreml/palettize_ffn.py b/examples/ffn-coreml/palettize_ffn.py
+index df419b04d..3deb00e83 100644
+--- a/examples/ffn-coreml/palettize_ffn.py
++++ b/examples/ffn-coreml/palettize_ffn.py
+@@ -41,8 +41,8 @@ def main():
+     parser.add_argument("--no-reference-files", action="store_true")
+     parser.add_argument("--skip-ops", nargs="*", default=[], help="Keep the named weight operations in FP16")
+     args = parser.parse_args()
+-    if not 1 <= args.tokens <= 512 or not 1 <= args.workers <= 20 or args.group_size not in (0, 16, 32):
+-        parser.error("require tokens in 1..512, workers in 1..20 and group-size in 0,16,32")
++    if not 1 <= args.tokens <= 2048 or not 1 <= args.workers <= 20 or args.group_size not in (0, 16, 32):
++        parser.error("require tokens in 1..2048, workers in 1..20 and group-size in 0,16,32")
+     if args.destination.exists():
+         parser.error("destination already exists")
+     package = args.source / f"ffn-{args.tokens}.mlpackage"
+diff --git a/examples/ffn-coreml/test_export_sidecar.py b/examples/ffn-coreml/test_export_sidecar.py
+index a2b2383dd..73b0c3bf7 100644
+--- a/examples/ffn-coreml/test_export_sidecar.py
++++ b/examples/ffn-coreml/test_export_sidecar.py
+@@ -31,6 +31,8 @@ class TestPresetContract(unittest.TestCase):
+         dual = export_sidecar.read_preset(CONFIGS / "qwen3.8-27b-64-dual.json")
+         self.assertEqual(export_sidecar.partitions(dual), [("ffn-512", "manifest.json", 8192, 4608), ("ffn-512-1", "manifest-1.json", 12800, 4608)])
+         self.assertEqual(dual["layers"], list(range(64)))
++        wide = self.check(preset(tokens=2048))
++        self.assertEqual([r[0] for r in export_sidecar.partitions(wide)], ["ffn-2048", "ffn-2048-1"])
+ 
+     def test_partitions_cover_suffix(self):
+         for parts in (1, 2):

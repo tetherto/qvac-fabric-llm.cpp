@@ -1,0 +1,48 @@
+cpp-arg          tokens= 2048 dnll=+0.00022 (control +0.00004) kl=0.000172 (control 0.000001) top1=0.9980
+math-fourier     tokens= 2048 dnll=+0.00022 (control -0.00001) kl=0.000102 (control 0.000000) top1=0.9956
+prose-a          tokens= 2048 dnll=-0.00226 (control -0.00003) kl=0.000883 (control 0.000003) top1=0.9883
+prose-d          tokens= 2048 dnll=-0.00078 (control -0.00002) kl=0.000871 (control 0.000003) top1=0.9922
+prose-long       tokens= 8192 dnll=+0.00182 (control +0.00002) kl=0.000967 (control 0.000003) top1=0.9861
+py-writer        tokens= 2048 dnll=-0.00007 (control +0.00001) kl=0.000044 (control 0.000000) top1=0.9980
+{
+ "windows": 6,
+ "tokens": 18432,
+ "mean_dnll": 0.0005109693333333763,
+ "dnll_upper95": 0.0014298353333333771,
+ "ppl_change_percent": 0.05110999004007688,
+ "mean_kl": 0.0006600765555555557,
+ "mean_kl_control": 2.4163333333333335e-06,
+ "kl_limit": 0.002,
+ "problems": [],
+ "per_domain": {
+  "code": {
+   "tokens": 4096,
+   "mean_dnll": 7.585150000000151e-05,
+   "mean_kl": 0.000107974,
+   "kl_limit": 0.003,
+   "pass": true
+  },
+  "math": {
+   "tokens": 2048,
+   "mean_dnll": 0.00022246900000011394,
+   "mean_kl": 0.000101525,
+   "kl_limit": 0.003,
+   "pass": true
+  },
+  "prose": {
+   "tokens": 12288,
+   "mean_dnll": 0.000704092000000045,
+   "mean_kl": 0.0009372026666666667,
+   "kl_limit": 0.003,
+   "pass": true
+  }
+ },
+ "worst_window": "prose-long",
+ "worst_window_dnll": 0.0018156110000000503,
+ "pass_primary": true,
+ "pass_kl_screen": true,
+ "pass_hard": true,
+ "pass_domains": true,
+ "pass_windows": true,
+ "pass": true
+}

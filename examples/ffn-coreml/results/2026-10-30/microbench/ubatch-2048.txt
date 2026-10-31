@@ -1,0 +1,10 @@
+# Plain Metal prefill vs microbatch size (llama-bench, flash attention, 3 repetitions), M3 Ultra 2026-10-30
+n_ubatch=512  pp2048 301.37 t/s  pp8192 291.96 t/s
+n_ubatch=1024 pp2048 309.90 t/s  pp8192 300.38 t/s
+n_ubatch=2048 pp2048 313.90 t/s  pp8192 304.81 t/s
+#
+# Layer 47 FFN slices on both ANEs concurrently, output backings, median of 30 (scripts/pairbench.mm)
+tokens=512  concurrent_pair_ms=7.708 per_512_tokens_ms=7.708
+tokens=2048 concurrent_pair_ms=28.379 per_512_tokens_ms=7.095
+tokens=512  concurrent_pair_ms=7.670 per_512_tokens_ms=7.670
+tokens=2048 concurrent_pair_ms=28.350 per_512_tokens_ms=7.087

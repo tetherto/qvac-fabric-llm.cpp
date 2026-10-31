@@ -1,0 +1,20 @@
+reference=metal-gguf
+backend=ggml-metal-gguf tokens=512 mean_ms=17.332481 median_ms=17.314208 tokens_per_second=29539.914 idle_ms=0
+backend=ggml-metal-gguf-resident tokens=512 mean_ms=17.113283 median_ms=17.087292 tokens_per_second=29918.280 idle_ms=0
+accuracy=resident-metal-vs-gguf cosine=1.000000000 relative_l2=0.000000000 max_abs=0.000000000
+accuracy_pass=resident-metal-vs-gguf value=1
+compute_configuration=coreml-cpu-ane
+memory=coreml-cpu-ane stage=before_load footprint_mib=597.845 resident_mib=387.391
+split_channels gpu=11264 ane=6144
+backend=split-metal-full-co-resident tokens=512 mean_ms=17.020779 median_ms=16.956334 tokens_per_second=30080.879 idle_ms=0
+accuracy=metal-co-resident-vs-reference cosine=1.000000000 relative_l2=0.000000000 max_abs=0.000000000
+accuracy_pass=metal-co-resident-vs-reference value=1
+backend=split-metal-prefix tokens=512 mean_ms=11.179188 median_ms=11.134750 tokens_per_second=45799.393 idle_ms=0
+backend=split-coreml-suffix tokens=512 mean_ms=9.845423 median_ms=9.852000 tokens_per_second=52003.861 idle_ms=0
+backend=split-serial tokens=512 mean_ms=23.434698 median_ms=23.385500 tokens_per_second=21847.945 idle_ms=0
+accuracy=split-serial cosine=0.999958212 relative_l2=0.009142146 max_abs=0.083998024
+accuracy_pass=split-serial value=1
+backend=split-parallel tokens=512 mean_ms=11.902056 median_ms=11.838416 tokens_per_second=43017.777 idle_ms=0
+accuracy=split-parallel cosine=0.999958212 relative_l2=0.009142146 max_abs=0.083998024
+accuracy_pass=split-parallel value=1
+concurrency_identity=1

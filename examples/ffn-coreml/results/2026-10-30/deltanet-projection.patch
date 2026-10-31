@@ -1,0 +1,522 @@
+diff --git a/examples/ffn-coreml/decoder-coreml.mm b/examples/ffn-coreml/decoder-coreml.mm
+index 72bf7112f..1c0edecce 100644
+--- a/examples/ffn-coreml/decoder-coreml.mm
++++ b/examples/ffn-coreml/decoder-coreml.mm
+@@ -67,6 +67,13 @@ static MLModel * decoder_load(const std::string & assets, const char * name, int
+     return model;
+ }
+ 
++static bool decoder_has_model(const std::string & assets, const char * name) {
++    NSFileManager * files = [NSFileManager defaultManager];
++    NSString * base = [NSString stringWithFormat:@"%s/%s", assets.c_str(), name];
++    return [files fileExistsAtPath:[base stringByAppendingString:@".mlpackage"]] ||
++           (std::getenv("FFN_COREML_CACHE_COMPILED") && [files fileExistsAtPath:[[base stringByAppendingString:@".mlmodelc"] stringByResolvingSymlinksInPath]]);
++}
++
+ struct decoder_ffn {
+     temporary_model compiled{nil};
+     temporary_model compiled2{nil};
+@@ -174,10 +181,7 @@ struct decoder_ffn {
+         int ane_channels = [metadata[@"channel_count"] intValue];
+         int ane2_channels = 0;
+         double scale = [metadata[@"output_scale"] doubleValue];
+-        NSFileManager * files = [NSFileManager defaultManager];
+-        NSString * second = [NSString stringWithFormat:@"%s/ffn-512-1", assets.c_str()];
+-        if ([files fileExistsAtPath:[second stringByAppendingString:@".mlpackage"]] ||
+-            (std::getenv("FFN_COREML_CACHE_COMPILED") && [files fileExistsAtPath:[[second stringByAppendingString:@".mlmodelc"] stringByResolvingSymlinksInPath]])) {
++        if (decoder_has_model(assets, "ffn-512-1")) {
+             model2 = decoder_load(assets, "ffn-512-1", layer, compiled2);
+             NSDictionary * metadata2 = model2.modelDescription.metadata[MLModelCreatorDefinedKey];
+             ane2_channels = [metadata2[@"channel_count"] intValue];
+@@ -205,19 +209,181 @@ struct decoder_ffn {
+     }
+ };
+ 
++// placeholder input/output for the projection graphs, rebound to scheduler tensors before every call
++struct decoder_proj_io {
++    ggml_context * ctx = nullptr;
++    ggml_backend_buffer_t buffer = nullptr;
++    ggml_tensor * x = nullptr;
++    ggml_tensor * out = nullptr;
++
++    ~decoder_proj_io() {
++        ggml_backend_buffer_free(buffer);
++        ggml_free(ctx);
++    }
++
++    void ensure(int64_t rows) {
++        if (out) { require(ggml_nelements(out) == rows * 512, "projection rows differ between layers"); return; }
++        ctx = ggml_init({ggml_tensor_overhead() * 2, nullptr, true});
++        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, 512);
++        out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rows * 512);
++        buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(ggml_backend_dev_by_name("MTL0")));
++        require(buffer, "could not allocate projection placeholders");
++    }
++};
++
++// DeltaNet input projections [attn_qkv; attn_gate]: Metal computes qkv rows [0, gpu_rows), Core ML the remaining rows
++struct decoder_proj {
++    temporary_model compiled{nil};
++    temporary_model compiled2{nil};
++    MLModel * model = nil;
++    MLModel * model2 = nil;
++    MLMultiArray * input = nil;
++    MLDictionaryFeatureProvider * features = nil;
++    ggml_context * weight_ctx = nullptr;
++    ggml_context * graph_ctx = nullptr;
++    ggml_backend_buffer_t weights = nullptr;
++    ggml_gallocr_t alloc = nullptr;
++    ggml_cgraph * graph = nullptr;
++    decoder_proj_io * io = nullptr;
++    std::vector<ggml_tensor *> out_views;
++    int64_t qkv_rows = 0, z_rows = 0, gpu_rows = 0;
++    int64_t start[2] = {}, count[2] = {};
++    bool full_metal = false;
++    uint64_t calls = 0;
++    std::string error;
++
++    ~decoder_proj() {
++        ggml_gallocr_free(alloc);
++        ggml_backend_buffer_free(weights);
++        ggml_free(graph_ctx);
++        ggml_free(weight_ctx);
++    }
++
++    void read_slice(const std::string & gguf, gguf_context * header, ggml_tensor * source, ggml_tensor * target) {
++        std::vector<char> bytes(ggml_nbytes(target));
++        size_t offset = gguf_get_data_offset(header) + gguf_get_tensor_offset(header, gguf_find_tensor(header, source->name));
++        read_at(gguf, offset, bytes.data(), bytes.size());
++        ggml_backend_tensor_set(target, bytes.data(), 0, bytes.size());
++    }
++
++    void init(const std::string & gguf, const std::string & assets, int layer, bool reference_only, decoder_proj_io & shared) {
++        full_metal = reference_only;
++        io = &shared;
++        ggml_context * meta = nullptr;
++        gguf_context * header = gguf_init_from_file(gguf.c_str(), {true, &meta});
++        require(header && meta, "could not read GGUF header");
++        auto * qkv = ggml_get_tensor(meta, ("blk." + std::to_string(layer) + ".attn_qkv.weight").c_str());
++        auto * gate = ggml_get_tensor(meta, ("blk." + std::to_string(layer) + ".attn_gate.weight").c_str());
++        require(qkv && gate && qkv->ne[0] == 5120 && gate->ne[0] == 5120, "missing DeltaNet input projections");
++        qkv_rows = qkv->ne[1];
++        z_rows = gate->ne[1];
++        gpu_rows = qkv_rows;
++        if (!full_metal) {
++            model = decoder_load(assets, "proj-512", layer, compiled);
++            NSDictionary * metadata = model.modelDescription.metadata[MLModelCreatorDefinedKey];
++            start[0] = [metadata[@"row_start"] longLongValue];
++            count[0] = [metadata[@"row_count"] longLongValue];
++            require([metadata[@"source_layer"] intValue] == layer, "projection package is for a different layer");
++            if (decoder_has_model(assets, "proj-512-1")) {
++                model2 = decoder_load(assets, "proj-512-1", layer, compiled2);
++                NSDictionary * metadata2 = model2.modelDescription.metadata[MLModelCreatorDefinedKey];
++                start[1] = [metadata2[@"row_start"] longLongValue];
++                count[1] = [metadata2[@"row_count"] longLongValue];
++                require([metadata2[@"source_layer"] intValue] == layer && start[1] == start[0] + count[0], "second projection package must follow the first");
++            }
++            gpu_rows = start[0];
++            require(gpu_rows > 0 && gpu_rows <= qkv_rows && count[0] > 0 && start[0] + count[0] + count[1] == qkv_rows + z_rows, "projection packages must cover the rows after the Metal part");
++        }
++        shared.ensure(qkv_rows + z_rows);
++        weight_ctx = ggml_init({ggml_tensor_overhead() * 2, nullptr, true});
++        auto * w_qkv = ggml_new_tensor_2d(weight_ctx, qkv->type, 5120, gpu_rows);
++        auto * w_z = full_metal ? ggml_new_tensor_2d(weight_ctx, gate->type, 5120, z_rows) : nullptr;
++        auto buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_name("MTL0"));
++        weights = ggml_backend_alloc_ctx_tensors_from_buft(weight_ctx, buft);
++        require(weights, "could not allocate projection weights");
++        ggml_backend_buffer_set_usage(weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        read_slice(gguf, header, qkv, w_qkv);
++        if (w_z) { read_slice(gguf, header, gate, w_z); }
++        gguf_free(header);
++        ggml_free(meta);
++        graph_ctx = ggml_init({ggml_tensor_overhead() * 16 + ggml_graph_overhead_custom(16, false), nullptr, true});
++        graph = ggml_new_graph_custom(graph_ctx, 16, false);
++        auto * qkv_view = ggml_view_2d(graph_ctx, shared.out, gpu_rows, 512, qkv_rows * sizeof(float), 0);
++        ggml_build_forward_expand(graph, ggml_cpy(graph_ctx, ggml_mul_mat(graph_ctx, w_qkv, shared.x), qkv_view));
++        if (w_z) {
++            auto * z_view = ggml_view_2d(graph_ctx, shared.out, z_rows, 512, z_rows * sizeof(float), qkv_rows * 512 * sizeof(float));
++            ggml_build_forward_expand(graph, ggml_cpy(graph_ctx, ggml_mul_mat(graph_ctx, w_z, shared.x), z_view));
++        }
++        alloc = ggml_gallocr_new(buft);
++        require(ggml_gallocr_alloc_graph(alloc, graph), "could not allocate projection graph");
++        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++            auto * node = ggml_graph_node(graph, i);
++            for (int j = -1; j < GGML_MAX_SRC; ++j) {
++                auto * t = j < 0 ? node : node->src[j];
++                if (t && t->view_src == shared.out && std::find(out_views.begin(), out_views.end(), t) == out_views.end()) { out_views.push_back(t); }
++            }
++        }
++        printf("decoder_proj_layer=%d metal_rows=%lld coreml_rows=%lld+%lld\n", layer, (long long) gpu_rows, (long long) count[0], (long long) count[1]);
++    }
++
++    void predict(float * dst) {
++        __block id<MLFeatureProvider> second = nil;
++        __block NSError * second_failure = nil;
++        dispatch_group_t group = dispatch_group_create();
++        if (model2) {
++            MLModel * other = model2;
++            MLDictionaryFeatureProvider * inputs = features;
++            dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
++                @autoreleasepool {
++                    NSError * failure = nil;
++                    second = [other predictionFromFeatures:inputs error:&failure];
++                    second_failure = failure;
++                }
++            });
++        }
++        NSError * failure = nil;
++        id<MLFeatureProvider> result = [model predictionFromFeatures:features error:&failure];
++        dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
++        require(result, failure ? failure.localizedDescription.UTF8String : "projection prediction failed");
++        require(!model2 || second, second_failure ? second_failure.localizedDescription.UTF8String : "second projection prediction failed");
++        id<MLFeatureProvider> results[2] = {result, second};
++        for (int p = 0; p < (model2 ? 2 : 1); ++p) {
++            MLMultiArray * y = [results[p] featureValueForName:@"y"].multiArrayValue;
++            require(y && y.dataType == MLMultiArrayDataTypeFloat32 && y.shape.count == 2 && y.shape[0].intValue == 512 && y.shape[1].longLongValue == count[p], "unexpected projection output");
++            const float * values = static_cast<const float *>(y.dataPointer);
++            size_t row_stride = y.strides[0].unsignedLongLongValue, column_stride = y.strides[1].unsignedLongLongValue;
++            for (int t = 0; t < 512; ++t) {
++                for (int64_t c = 0; c < count[p]; ++c) {
++                    const float value = values[t * row_stride + c * column_stride];
++                    if (!std::isfinite(value)) { throw std::runtime_error("non-finite projection output"); }
++                    const int64_t row = start[p] + c;
++                    if (row < qkv_rows) { dst[t * qkv_rows + row] = value; } else { dst[qkv_rows * 512 + t * z_rows + row - qkv_rows] = value; }
++                }
++            }
++        }
++    }
++};
++
+ struct decoder_state {
+     std::map<int, std::unique_ptr<decoder_ffn>> layers;
++    std::map<int, std::unique_ptr<decoder_proj>> projs;
++    decoder_proj_io proj_io;
+     bool metal_reference = false;
+     int batch_threads = 20;
+ 
+     uint64_t calls() const {
+         uint64_t count = 0;
+         for (const auto & entry : layers) { count += entry.second->calls; }
++        for (const auto & entry : projs) { count += entry.second->calls; }
+         return count;
+     }
+ 
++    // offload calls expected per 512-token chunk
++    uint64_t offloads() const { return layers.size() + projs.size(); }
++
+     void check() const {
+         for (const auto & entry : layers) { require(entry.second->error.empty(), entry.second->error); }
++        for (const auto & entry : projs) { require(entry.second->error.empty(), entry.second->error); }
+     }
+ };
+ 
+@@ -306,8 +472,65 @@ static ggml_tensor * decoder_build(ggml_context * ctx, ggml_tensor * input, ggml
+     return ggml_map_custom2(ctx, input, residual, decoder_compute, 1, found->second.get());
+ }
+ 
++static void decoder_proj_compute(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    if (ith != 0) { return; }
++    static_cast<decoder_proj *>(userdata)->error = "projection offload requires FFN_COREML_GPU_RESIDENT";
++    std::fill_n(static_cast<float *>(dst->data), ggml_nelements(dst), NAN);
++}
++
++static bool decoder_proj_resident(ggml_backend_t backend, ggml_tensor * dst, void * userdata) {
++    auto & runtime = *static_cast<decoder_proj *>(userdata);
++    @autoreleasepool {
++        try {
++            const auto * src = dst->src[0];
++            require(src->data != dst->data && ggml_is_contiguous(dst), "unexpected projection layout");
++            if (!runtime.full_metal) { ggml_backend_synchronize(backend); }
++            bind_resident_tensor(runtime.io->x, src);
++            bind_resident_tensor(runtime.io->out, dst);
++            for (auto * view : runtime.out_views) {
++                view->buffer = dst->buffer;
++                view->data = static_cast<char *>(dst->data) + view->view_offs;
++            }
++            require(ggml_backend_graph_compute_async(backend, runtime.graph) == GGML_STATUS_SUCCESS, "projection Metal part failed");
++            if (!runtime.full_metal) {
++                require(ggml_backend_metal_tensor_is_shared(src) && ggml_backend_metal_tensor_is_shared(dst), "projection tensors must use shared Metal storage");
++                if (runtime.input.dataPointer != src->data) {
++                    NSError * failure = nil;
++                    runtime.input = [[MLMultiArray alloc] initWithDataPointer:src->data shape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
++                    require(runtime.input, "projection input binding failed");
++                    runtime.features = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": runtime.input} error:&failure];
++                    require(runtime.features, "projection provider failed");
++                }
++                // Metal writes qkv rows [0, gpu_rows); the CPU writes only the remaining rows
++                runtime.predict(static_cast<float *>(dst->data));
++            }
++            ++runtime.calls;
++            return true;
++        } catch (const std::exception & failure) {
++            runtime.error = failure.what();
++            ggml_backend_synchronize(backend);
++            fprintf(stderr, "resident projection failed: %s\n", failure.what());
++            return false;
++        }
++    }
++}
++
++static ggml_tensor * decoder_proj_build(ggml_context * ctx, ggml_tensor * input, int64_t qkv_rows, int64_t z_rows, int layer, void * userdata) {
++    auto & state = *static_cast<decoder_state *>(userdata);
++    auto found = state.projs.find(layer);
++    if (found == state.projs.end() || input->type != GGML_TYPE_F32 || input->ne[0] != 5120 || input->ne[1] != 512 || input->ne[2] != 1 || input->ne[3] != 1) { return nullptr; }
++    if (qkv_rows != found->second->qkv_rows || z_rows != found->second->z_rows) { return nullptr; }
++    ggml_tensor * args[] = {input};
++    return ggml_custom_4d(ctx, GGML_TYPE_F32, (qkv_rows + z_rows) * 512, 1, 1, 1, args, 1, decoder_proj_compute, 1, found->second.get());
++}
++
++static void set_builders(decoder_state * state) {
++    llama_ffn_coreml_set_builder(state ? decoder_build : nullptr, state);
++    llama_proj_coreml_set_builder(state ? decoder_proj_build : nullptr, state);
++}
++
+ static llama_context * make_context(llama_model * model, int context, decoder_state & state, bool split) {
+-    llama_ffn_coreml_set_builder(split ? decoder_build : nullptr, split ? &state : nullptr);
++    set_builders(split ? &state : nullptr);
+     auto cp = llama_context_default_params();
+     cp.n_ctx = context;
+     cp.n_batch = cp.n_ubatch = 512;
+@@ -382,9 +605,9 @@ static void request(llama_context * ctx, decoder_state & state, const std::vecto
+     if (const char * value = std::getenv("FFN_COREML_DECODE_PLAN")) {
+         const int reserve_tokens = std::stoi(value);
+         require(reserve_tokens == 1 || reserve_tokens == 512, "decode plan must use 1 or 512 tokens");
+-        llama_ffn_coreml_set_builder(nullptr, nullptr);
++        set_builders(nullptr);
+         auto * graph = llama_graph_reserve(ctx, reserve_tokens, 1, reserve_tokens);
+-        llama_ffn_coreml_set_builder(mode == "split" || mode == "hook-metal" ? decoder_build : nullptr, &state);
++        set_builders(mode == "split" || mode == "hook-metal" ? &state : nullptr);
+         require(graph, "could not reserve decode allocation plan");
+         transition_ms = milliseconds(decode_start);
+     }
+@@ -414,7 +637,7 @@ static void request(llama_context * ctx, decoder_state & state, const std::vecto
+     }
+     uint64_t decode_calls = state.calls() - after_prompt;
+     require(decode_calls == 0, "Core ML unexpectedly ran during token decoding");
+-    uint64_t expected = (mode == "split" || mode == "hook-metal") ? state.layers.size() * (length / 512) : 0;
++    uint64_t expected = (mode == "split" || mode == "hook-metal") ? state.offloads() * (length / 512) : 0;
+     require(after_prompt - before == expected, "unexpected number of integrated FFN calls");
+     printf("request mode=%s prompt_tokens=%d generated=%d repetition=%d pp_ms=%.6f pp_tps=%.6f ttft_ms=%.6f decode_ms=%.6f decode_tps=%.6f total_ms=%.6f output_tps=%.6f offload_calls=%llu decode_offload_calls=%llu\n",
+            mode.c_str(), length, generated, repetition, pp_ms, length * 1000.0 / pp_ms, ttft_ms, decode_ms,
+@@ -449,11 +672,11 @@ static void quality(llama_model * model, decoder_state & state, const std::vecto
+         int n = std::min(512, length - offset);
+         auto batch = llama_batch_get_one(const_cast<llama_token *>(prompt.data()) + offset, n);
+         batch.logits = logits.data();
+-        llama_ffn_coreml_set_builder(nullptr, nullptr);
++        set_builders(nullptr);
+         require(llama_decode(baseline, batch) == 0, "quality baseline failed");
+         llama_synchronize(baseline);
+         memcpy(reference.data(), llama_get_logits(baseline), size_t(n) * vocab * sizeof(float));
+-        llama_ffn_coreml_set_builder(decoder_build, &state);
++        set_builders(&state);
+         require(llama_decode(split, batch) == 0, "quality split failed");
+         llama_synchronize(split);
+         state.check();
+@@ -480,7 +703,7 @@ static void quality(llama_model * model, decoder_state & state, const std::vecto
+             nll_split += lb - b[label];
+         }
+     }
+-    require(state.calls() - before == state.layers.size() * (length / 512), "quality did not use intended offload layers");
++    require(state.calls() - before == state.offloads() * (length / 512), "quality did not use intended offload layers");
+     bool screen_pass = kl_sum / length <= 0.001 && std::exp((nll_split - nll_metal) / length) <= 1.01;
+     printf("quality prompt_tokens=%d mean_kl=%.9f max_kl=%.9f top1_agreement=%.9f metal_nll=%.9f split_nll=%.9f metal_ppl=%.9f split_ppl=%.9f offload_calls=%llu screen_pass=%d reference_custom=%d\n",
+            length, kl_sum / length, kl_max, double(agreement) / length, nll_metal / length, nll_split / length,
+@@ -488,7 +711,7 @@ static void quality(llama_model * model, decoder_state & state, const std::vecto
+     fflush(stdout);
+     llama_free(split);
+     llama_free(baseline);
+-    llama_ffn_coreml_set_builder(nullptr, nullptr);
++    set_builders(nullptr);
+ }
+ 
+ int main(int argc, char ** argv) {
+@@ -499,7 +722,10 @@ int main(int argc, char ** argv) {
+     @autoreleasepool {
+         try {
+             gpu_resident = std::getenv("FFN_COREML_GPU_RESIDENT") != nullptr;
+-            if (gpu_resident) { ggml_backend_metal_set_custom2(decoder_compute, decoder_resident_compute); }
++            if (gpu_resident) {
++                ggml_backend_metal_set_custom2(decoder_compute, decoder_resident_compute);
++                ggml_backend_metal_set_custom(decoder_proj_compute, decoder_proj_resident);
++            }
+             printf("gpu_resident=%d\n", int(gpu_resident));
+             if (gpu_resident) { printf("resident_profile_stages=producer_wait,bind,prefix_submit,input_bind,predict,output_convert,unused,join_input,join_submit,unused\n"); }
+             direct_input = std::getenv("FFN_COREML_DIRECT_INPUT") != nullptr;
+@@ -535,11 +761,18 @@ int main(int argc, char ** argv) {
+                 int layer;
+                 while (selected >> layer) {
+                     require(layer >= 0 && layer < 64 && !state.layers.count(layer), "invalid selected layer");
++                    const auto assets = (std::filesystem::path(argv[2]) / ("layer" + std::to_string(layer))).string();
+                     auto runtime = std::make_unique<decoder_ffn>();
+-                    runtime->init(argv[1], (std::filesystem::path(argv[2]) / ("layer" + std::to_string(layer))).string(), layer, state.metal_reference);
++                    runtime->init(argv[1], assets, layer, state.metal_reference);
+                     state.layers.emplace(layer, std::move(runtime));
++                    if (decoder_has_model(assets, "proj-512")) {
++                        auto proj = std::make_unique<decoder_proj>();
++                        proj->init(argv[1], assets, layer, state.metal_reference, state.proj_io);
++                        state.projs.emplace(layer, std::move(proj));
++                    }
+                 }
+                 require(!state.layers.empty(), "no qualified layers");
++                require(gpu_resident || state.projs.empty(), "projection offload requires FFN_COREML_GPU_RESIDENT");
+             }
+             auto * device = ggml_backend_dev_by_name("MTL0");
+             require(device, "MTL0 unavailable");
+@@ -560,11 +793,15 @@ int main(int argc, char ** argv) {
+                 request(ctx, state, prompt, length, std::min(generated, 16), mode, -1, vocab, output);
+                 for (int rep = 0; rep < reps; ++rep) { request(ctx, state, prompt, length, generated, mode, rep, vocab, output); }
+                 llama_free(ctx);
+-                llama_ffn_coreml_set_builder(nullptr, nullptr);
++                set_builders(nullptr);
+             }
+             llama_model_free(model);
+             state.layers.clear();
+-            if (gpu_resident) { ggml_backend_metal_set_custom2(nullptr, nullptr); }
++            state.projs.clear();
++            if (gpu_resident) {
++                ggml_backend_metal_set_custom2(nullptr, nullptr);
++                ggml_backend_metal_set_custom(nullptr, nullptr);
++            }
+             llama_backend_free();
+         } catch (const std::exception & failure) {
+             fprintf(stderr, "%s\n", failure.what());
+diff --git a/examples/ffn-coreml/ffn-coreml-hook.h b/examples/ffn-coreml/ffn-coreml-hook.h
+index 4d4a33101..b668342fa 100644
+--- a/examples/ffn-coreml/ffn-coreml-hook.h
++++ b/examples/ffn-coreml/ffn-coreml-hook.h
+@@ -10,6 +10,11 @@ typedef struct ggml_tensor * (*llama_ffn_coreml_builder)(struct ggml_context *,
+ 
+ LLAMA_API void llama_ffn_coreml_set_builder(llama_ffn_coreml_builder builder, void * userdata);
+ 
++// returns one F32 tensor holding [qkv_rows x tokens] then [z_rows x tokens], or NULL for the normal matmuls
++typedef struct ggml_tensor * (*llama_proj_coreml_builder)(struct ggml_context *, struct ggml_tensor *, int64_t, int64_t, int, void *);
++
++LLAMA_API void llama_proj_coreml_set_builder(llama_proj_coreml_builder builder, void * userdata);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ggml/include/ggml-metal.h b/ggml/include/ggml-metal.h
+index ee2c596f6..719267741 100644
+--- a/ggml/include/ggml-metal.h
++++ b/ggml/include/ggml-metal.h
+@@ -59,6 +59,7 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
+ #ifdef GGML_METAL_FFN_EXPERIMENT
+ typedef bool (*ggml_metal_custom2_execute)(ggml_backend_t backend, struct ggml_tensor * tensor, void * userdata);
+ GGML_BACKEND_API void ggml_backend_metal_set_custom2(ggml_custom2_op_t tag, ggml_metal_custom2_execute execute);
++GGML_BACKEND_API void ggml_backend_metal_set_custom(ggml_custom_op_t tag, ggml_metal_custom2_execute execute);
+ GGML_BACKEND_API bool ggml_backend_metal_tensor_is_shared(const struct ggml_tensor * tensor);
+ #endif
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index e600163af..c27355fc6 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -544,22 +544,41 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
+ #ifdef GGML_METAL_FFN_EXPERIMENT
+ static ggml_custom2_op_t custom2_tag = nullptr;
+ static ggml_metal_custom2_execute custom2_execute = nullptr;
++static ggml_custom_op_t custom_tag = nullptr;
++static ggml_metal_custom2_execute custom_execute = nullptr;
+ 
+ void ggml_backend_metal_set_custom2(ggml_custom2_op_t tag, ggml_metal_custom2_execute execute) {
+     custom2_tag = tag;
+     custom2_execute = execute;
+ }
+ 
++void ggml_backend_metal_set_custom(ggml_custom_op_t tag, ggml_metal_custom2_execute execute) {
++    custom_tag = tag;
++    custom_execute = execute;
++}
++
+ bool ggml_backend_metal_tensor_is_shared(const ggml_tensor * tensor) {
+     auto * buffer = tensor->buffer;
+     return buffer && ggml_backend_buffer_is_metal(buffer) && ggml_metal_buffer_is_shared((ggml_metal_buffer_t) buffer->context);
+ }
+ 
++static ggml_metal_custom2_execute ggml_backend_metal_custom_executor(const ggml_tensor * tensor, void ** userdata) {
++    if (tensor->op == GGML_OP_MAP_CUSTOM2 && custom2_tag && custom2_execute) {
++        ggml_map_custom2_op_params params;
++        memcpy(&params, tensor->op_params, sizeof(params));
++        if (params.fun == custom2_tag) { *userdata = params.userdata; return custom2_execute; }
++    }
++    if (tensor->op == GGML_OP_CUSTOM && custom_tag && custom_execute) {
++        ggml_custom_op_params params;
++        memcpy(&params, tensor->op_params, sizeof(params));
++        if (params.fun == custom_tag) { *userdata = params.userdata; return custom_execute; }
++    }
++    return nullptr;
++}
++
+ static bool ggml_backend_metal_custom2_matches(const ggml_tensor * tensor) {
+-    if (!custom2_tag || !custom2_execute || tensor->op != GGML_OP_MAP_CUSTOM2) { return false; }
+-    ggml_map_custom2_op_params params;
+-    memcpy(&params, tensor->op_params, sizeof(params));
+-    return params.fun == custom2_tag;
++    void * userdata = nullptr;
++    return ggml_backend_metal_custom_executor(tensor, &userdata) != nullptr;
+ }
+ #endif
+ 
+@@ -587,15 +606,15 @@ static enum ggml_status ggml_backend_metal_graph_compute_impl(ggml_backend_t bac
+     int first = 0;
+     for (int i = 0; i < cgraph->n_nodes; ++i) {
+         ggml_tensor * node = cgraph->nodes[i];
+-        if (!ggml_backend_metal_custom2_matches(node)) { continue; }
++        void * userdata = nullptr;
++        auto execute = ggml_backend_metal_custom_executor(node, &userdata);
++        if (!execute) { continue; }
+         if (first < i) {
+             auto before = ggml_graph_view(cgraph, first, i);
+             const auto status = ggml_metal_graph_compute(ctx, &before);
+             if (status != GGML_STATUS_SUCCESS) { return status; }
+         }
+-        ggml_map_custom2_op_params params;
+-        memcpy(&params, node->op_params, sizeof(params));
+-        if (!custom2_execute(backend, node, params.userdata)) { return GGML_STATUS_FAILED; }
++        if (!execute(backend, node, userdata)) { return GGML_STATUS_FAILED; }
+         first = i + 1;
+     }
+     if (first != 0) {
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 850f05c22..c4ce8894a 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -11,6 +11,14 @@ void llama_ffn_coreml_set_builder(llama_ffn_coreml_builder builder, void * userd
+     qwen35_coreml_builder = builder;
+     qwen35_coreml_userdata = userdata;
+ }
++
++static llama_proj_coreml_builder qwen35_proj_builder = nullptr;
++static void * qwen35_proj_userdata = nullptr;
++
++void llama_proj_coreml_set_builder(llama_proj_coreml_builder builder, void * userdata) {
++    qwen35_proj_builder = builder;
++    qwen35_proj_userdata = userdata;
++}
+ #endif
+ 
+ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
+@@ -245,6 +253,22 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
+     const int64_t n_seqs       = ubatch.n_seqs;
+     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+ 
++#ifdef LLAMA_FFN_COREML_EXPERIMENT
++    const int64_t qkv_rows = model.layers[il].wqkv->ne[1];
++    const int64_t z_rows   = model.layers[il].wqkv_gate->ne[1];
++    ggml_tensor * fused = qwen35_proj_builder ? qwen35_proj_builder(ctx0, input, qkv_rows, z_rows, il, qwen35_proj_userdata) : nullptr;
++    if (fused) {
++        const int64_t n_tokens = input->ne[1];
++        const size_t  size     = ggml_element_size(fused);
++        ggml_tensor * qkv_fused = ggml_view_2d(ctx0, fused, qkv_rows, n_tokens, qkv_rows * size, 0);
++        qkv_fused = ggml_reshape_3d(ctx0, qkv_fused, qkv_rows, n_seq_tokens, n_seqs);
++        cb(qkv_fused, "linear_attn_qkv_mixed", il);
++        ggml_tensor * z_fused = ggml_view_2d(ctx0, fused, z_rows, n_tokens, z_rows * size, qkv_rows * n_tokens * size);
++        cb(z_fused, "z", il);
++        return { qkv_fused, z_fused };
++    }
++#endif
++
+     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
+     cb(qkv_mixed, "linear_attn_qkv_mixed", il);

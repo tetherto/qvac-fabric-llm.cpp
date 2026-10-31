@@ -1,0 +1,16 @@
+# Per-call latency while cycling through N loaded Core ML programs (synthetic 5120->512 conv, FP16, 512 tokens).
+# Measured on M3 Ultra, 2026-10-30, with scripts/residency.mm and scripts/make_models.py. Rounds 3..6 timed.
+mode=separate n=64 per_call_median_ms=1.135 p90_ms=1.289
+mode=separate n=128 per_call_median_ms=1.149 p90_ms=1.165
+mode=separate n=160 per_call_median_ms=1.244 p90_ms=7.345
+mode=separate n=192 per_call_median_ms=1.320 p90_ms=7.358
+mode=separate n=256 per_call_median_ms=6.175 p90_ms=7.395
+mode=multi n=64 per_call_median_ms=1.159 p90_ms=1.227
+mode=multi n=128 per_call_median_ms=1.158 p90_ms=1.173
+# multi n=160/192/256: loading function f128 failed: "MLModelConfiguration's .functionName property must be nil unless the model type is ML Program."
+# separate n>=160 logged 454 "ANE model load has failed for on-device compiled macho. Must re-compile the E5 bundle." messages.
+#
+# Same effect inside the decoder (FFN Core ML predict per call, layers 28-63, 2048-token prompt):
+# d36  (72 programs)  8.99 ms
+# d64  (128 programs) 9.56 ms
+# d64p (224 programs) 24.91 ms

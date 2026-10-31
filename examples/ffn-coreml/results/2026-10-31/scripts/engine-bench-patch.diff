@@ -1,0 +1,34 @@
+44a45,55
+>   fabcml)
+>     # qvac-fabric with the Core ML FFN sidecar on both Neural Engines (prefill only; same flags as fab)
+>     SPEC=()
+>     case $MODE in
+>       ar) ;;
+>       dflash2) SPEC=(-md $QD -ngld 99 --spec-type draft-dflash --spec-draft-n-max 7) ;;
+>       *) unsupported ;;
+>     esac
+>     FFN_COREML_ASSETS=$CML_ASSETS FFN_COREML_GPU_RESIDENT=1 FFN_COREML_SINGLE_ENCODER=1 FFN_COREML_CACHE_COMPILED=1 \
+>     LLAMA_GDN_DEFERRED=1 $FABCML_BIN/llama-server-coreml -m $Q0 -ngl 99 -fa on --port $PORT --no-cache-prompt -cram 0 -ctxcp 0 --no-webui \
+>         -np ${NP:-32} -kvu -c ${CTX:-65536} ${SPEC[@]+"${SPEC[@]}"} > $LOG 2>&1 & ;;
+79c90
+<         --binary $SPLASH_DIR/engine/splash --port $PORT --kv-format bf16 --max-cache-disk 0 --idle-release off --no-webui ) > $LOG 2>&1 &
+---
+>         --binary $SPLASH_DIR/engine/splash --port $PORT --kv-format bf16 --max-cache-disk 0 --idle-release off --no-webui ${SPLASH_EXTRA:-} ) > $LOG 2>&1 &
+124c135
+< pkill -f "llama-server .*--port $PORT" 2>/dev/null
+---
+> pkill -f "llama-server(-coreml)? .*--port $PORT" 2>/dev/null
+27c27
+< NAMES = {"up": "llama.cpp master", "fab": "qvac-fabric PR stack", "mlx": "mlx-lm", "omlx": "oMLX",
+---
+> NAMES = {"up": "llama.cpp master", "fab": "qvac-fabric PR stack", "fabcml": "qvac-fabric + Core ML (2 ANE)", "mlx": "mlx-lm", "omlx": "oMLX",
+29,30c29,30
+< BACKEND = {"up": "metal", "fab": "metal", "mlx": "mlx", "omlx": "mlx", "sglang": "mlx", "splash": "metal"}
+< WEIGHTS = {"up": "Q4_0 GGUF (pure)", "fab": "Q4_0 GGUF (pure)", "mlx": "MLX 4-bit g64", "omlx": "MLX 4-bit g64",
+---
+> BACKEND = {"up": "metal", "fab": "metal", "fabcml": "metal+ane", "mlx": "mlx", "omlx": "mlx", "sglang": "mlx", "splash": "metal"}
+> WEIGHTS = {"up": "Q4_0 GGUF (pure)", "fab": "Q4_0 GGUF (pure)", "fabcml": "Q4_0 GGUF (pure) + Core ML 8-bit sidecar", "mlx": "MLX 4-bit g64", "omlx": "MLX 4-bit g64",
+93c93
+<     keys = {"up": "UP_VER", "fab": "FAB_VER", "mlx": "MLX_VER", "omlx": "OMLX_VER", "sglang": "SGL_VER", "splash": "SPLASH_VER"}
+---
+>     keys = {"up": "UP_VER", "fab": "FAB_VER", "fabcml": "FABCML_VER", "mlx": "MLX_VER", "omlx": "OMLX_VER", "sglang": "SGL_VER", "splash": "SPLASH_VER"}

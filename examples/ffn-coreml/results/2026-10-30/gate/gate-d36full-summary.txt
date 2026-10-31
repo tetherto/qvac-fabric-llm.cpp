@@ -1,0 +1,70 @@
+cpp-arg          tokens= 2048 dnll=+0.00050 (control +0.00004) kl=0.000157 (control 0.000001) top1=0.9985
+cpp-backend      tokens= 2048 dnll=+0.00036 (control +0.00002) kl=0.000064 (control 0.000000) top1=0.9980
+cpp-graph        tokens= 2048 dnll=+0.00021 (control +0.00002) kl=0.000042 (control 0.000000) top1=0.9990
+cpp-long         tokens= 8192 dnll=-0.00003 (control -0.00001) kl=0.000057 (control 0.000000) top1=0.9984
+cpp-vocab        tokens= 2048 dnll=+0.00053 (control -0.00001) kl=0.000099 (control 0.000000) top1=0.9966
+doc-autoparser   tokens= 2048 dnll=+0.00017 (control +0.00000) kl=0.000051 (control 0.000000) top1=0.9980
+doc-openvino     tokens= 2048 dnll=-0.00034 (control -0.00000) kl=0.000061 (control 0.000000) top1=0.9976
+doc-sycl         tokens= 2048 dnll=-0.00015 (control -0.00000) kl=0.000100 (control 0.000000) top1=0.9966
+math-bayes       tokens= 2048 dnll=-0.00014 (control +0.00001) kl=0.000095 (control 0.000000) top1=0.9937
+math-eigen       tokens= 2048 dnll=+0.00027 (control -0.00000) kl=0.000065 (control 0.000000) top1=0.9951
+math-fourier     tokens= 2048 dnll=+0.00027 (control -0.00001) kl=0.000097 (control 0.000000) top1=0.9941
+math-ftc         tokens= 2048 dnll=+0.00021 (control -0.00001) kl=0.000054 (control 0.000000) top1=0.9951
+math-long        tokens= 8192 dnll=+0.00014 (control +0.00001) kl=0.000030 (control 0.000000) top1=0.9980
+prose-a          tokens= 2048 dnll=-0.00171 (control -0.00004) kl=0.000845 (control 0.000003) top1=0.9888
+prose-b          tokens= 2048 dnll=-0.00025 (control +0.00000) kl=0.000624 (control 0.000002) top1=0.9873
+prose-c          tokens= 2048 dnll=+0.00060 (control +0.00005) kl=0.000701 (control 0.000003) top1=0.9897
+prose-d          tokens= 2048 dnll=-0.00069 (control +0.00005) kl=0.000807 (control 0.000003) top1=0.9932
+prose-long       tokens= 8192 dnll=+0.00190 (control +0.00004) kl=0.000904 (control 0.000003) top1=0.9874
+py-base-a        tokens= 2048 dnll=-0.00011 (control +0.00003) kl=0.000047 (control 0.000000) top1=0.9995
+py-quants        tokens= 2048 dnll=+0.00035 (control -0.00002) kl=0.000041 (control 0.000000) top1=0.9990
+py-writer        tokens= 2048 dnll=-0.00026 (control +0.00002) kl=0.000036 (control 0.000000) top1=0.9985
+{
+ "windows": 21,
+ "tokens": 61440,
+ "mean_dnll": 0.0002620328333333366,
+ "dnll_upper95": 0.0007338813030303098,
+ "ppl_change_percent": 0.02620671669348873,
+ "mean_kl": 0.00026498166666666666,
+ "mean_kl_control": 9.467333333333333e-07,
+ "kl_limit": 0.002,
+ "problems": [],
+ "per_domain": {
+  "code": {
+   "tokens": 22528,
+   "mean_dnll": 0.00013280272727272442,
+   "mean_kl": 6.499281818181817e-05,
+   "kl_limit": 0.003,
+   "pass": true
+  },
+  "docs": {
+   "tokens": 6144,
+   "mean_dnll": -0.0001043916666666848,
+   "mean_kl": 7.062033333333333e-05,
+   "kl_limit": 0.003,
+   "pass": true
+  },
+  "math": {
+   "tokens": 16384,
+   "mean_dnll": 0.0001450823749999941,
+   "mean_kl": 5.38725e-05,
+   "kl_limit": 0.003,
+   "pass": true
+  },
+  "prose": {
+   "tokens": 16384,
+   "mean_dnll": 0.0006940838750000289,
+   "mean_kl": 0.000823961,
+   "kl_limit": 0.003,
+   "pass": true
+  }
+ },
+ "worst_window": "prose-long",
+ "worst_window_dnll": 0.0019008350000000451,
+ "pass_primary": true,
+ "pass_kl_screen": true,
+ "pass_hard": true,
+ "pass_domains": true,
+ "pass_windows": true,
+ "pass": true
+}

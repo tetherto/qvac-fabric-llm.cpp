@@ -1,0 +1,10 @@
+ubatch=2048
+request mode=metal prompt_tokens=2048 generated=16 repetition=-1 pp_ms=6518.897417 pp_tps=314.163557 ttft_ms=6519.021958 decode_ms=537.803292 decode_tps=27.891239 total_ms=7056.825542 output_tps=2.267308 offload_calls=0 decode_offload_calls=0
+request mode=metal prompt_tokens=2048 generated=128 repetition=0 pp_ms=6517.180458 pp_tps=314.246324 ttft_ms=6517.305833 decode_ms=4465.280459 decode_tps=28.441663 total_ms=10982.587291 output_tps=11.654813 offload_calls=0 decode_offload_calls=0
+request mode=metal prompt_tokens=2048 generated=128 repetition=1 pp_ms=6509.131375 pp_tps=314.634915 ttft_ms=6509.267542 decode_ms=4461.344542 decode_tps=28.466755 total_ms=10970.612333 output_tps=11.667535 offload_calls=0 decode_offload_calls=0
+request mode=metal prompt_tokens=2048 generated=128 repetition=2 pp_ms=6508.454041 pp_tps=314.667659 ttft_ms=6508.587750 decode_ms=4472.804667 decode_tps=28.393818 total_ms=10981.392666 output_tps=11.656081 offload_calls=0 decode_offload_calls=0
+request mode=metal prompt_tokens=8192 generated=16 repetition=-1 pp_ms=26863.712833 pp_tps=304.946678 ttft_ms=26863.854292 decode_ms=547.401916 decode_tps=27.402169 total_ms=27411.256583 output_tps=0.583702 offload_calls=0 decode_offload_calls=0
+request mode=metal prompt_tokens=8192 generated=128 repetition=0 pp_ms=26889.724875 pp_tps=304.651685 ttft_ms=26889.857250 decode_ms=4554.550625 decode_tps=27.884200 total_ms=31444.408459 output_tps=4.070676 offload_calls=0 decode_offload_calls=0
+request mode=metal prompt_tokens=8192 generated=128 repetition=1 pp_ms=26856.890792 pp_tps=305.024139 ttft_ms=26857.032667 decode_ms=4550.338500 decode_tps=27.910012 total_ms=31407.371583 output_tps=4.075476 offload_calls=0 decode_offload_calls=0
+request mode=metal prompt_tokens=8192 generated=128 repetition=2 pp_ms=26888.968708 pp_tps=304.660253 ttft_ms=26889.101666 decode_ms=4557.465625 decode_tps=27.866365 total_ms=31446.567833 output_tps=4.070397 offload_calls=0 decode_offload_calls=0
+output_backing_fallbacks=0

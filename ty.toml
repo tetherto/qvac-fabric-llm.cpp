@@ -31,13 +31,14 @@ include = [
 unsupported-operator = "ignore"
 not-subscriptable = "ignore"
 
-# The exporter uses its separate, pinned Core ML environment.
+# The exporter and the recorded experiment scripts use the separate, pinned Core ML environment.
 [[overrides]]
 include = [
     "./examples/embedding-coreml/export_coreml.py",
     "./examples/ffn-coreml/export_ffn.py",
     "./examples/ffn-coreml/export_sidecar.py",
     "./examples/ffn-coreml/palettize_ffn.py",
+    "./examples/ffn-coreml/results/**",
 ]
 
 [overrides.rules]

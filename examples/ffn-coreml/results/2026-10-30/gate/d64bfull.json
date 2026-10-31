@@ -1,0 +1,258 @@
+{
+ "windows": 23,
+ "tokens": 65536,
+ "mean_dnll": 0.00026390271874999604,
+ "dnll_upper95": 0.0008161167586207111,
+ "ppl_change_percent": 0.02639375441360059,
+ "mean_kl": 0.00041962221875,
+ "mean_kl_control": 1.4191562499999998e-06,
+ "kl_limit": 0.002,
+ "problems": [],
+ "per_domain": {
+  "code": {
+   "tokens": 22528,
+   "mean_dnll": -0.00013880945454547685,
+   "mean_kl": 0.00020687936363636357,
+   "kl_limit": 0.003,
+   "pass": true
+  },
+  "docs": {
+   "tokens": 10240,
+   "mean_dnll": 0.00040275380000001084,
+   "mean_kl": 0.0002963184,
+   "kl_limit": 0.003,
+   "pass": true
+  },
+  "math": {
+   "tokens": 16384,
+   "mean_dnll": -9.143750000001338e-05,
+   "mean_kl": 0.000128022,
+   "kl_limit": 0.003,
+   "pass": true
+  },
+  "prose": {
+   "tokens": 16384,
+   "mean_dnll": 0.0010861902500000215,
+   "mean_kl": 0.00108080875,
+   "kl_limit": 0.003,
+   "pass": true
+  }
+ },
+ "worst_window": "doc-cli",
+ "worst_window_dnll": 0.002248401000000011,
+ "pass_primary": true,
+ "pass_kl_screen": true,
+ "pass_hard": true,
+ "pass_domains": true,
+ "pass_windows": true,
+ "pass": true,
+ "rows": [
+  {
+   "window": "cpp-arg",
+   "tokens": 2048,
+   "dnll": -0.0006491130000000345,
+   "dnll_control": 2.5665000000008042e-05,
+   "kl": 0.000284112,
+   "kl_control": 7.82e-07,
+   "top1": 0.999511719
+  },
+  {
+   "window": "cpp-backend",
+   "tokens": 2048,
+   "dnll": 0.00012702800000008452,
+   "dnll_control": 7.830000000597082e-07,
+   "kl": 0.000173441,
+   "kl_control": 3.92e-07,
+   "top1": 0.997558594
+  },
+  {
+   "window": "cpp-graph",
+   "tokens": 2048,
+   "dnll": -0.00020804800000001622,
+   "dnll_control": 6.575999999980375e-06,
+   "kl": 0.000190514,
+   "kl_control": 6.05e-07,
+   "top1": 0.998046875
+  },
+  {
+   "window": "cpp-long",
+   "tokens": 8192,
+   "dnll": 9.577699999996359e-05,
+   "dnll_control": -5.0300000000724765e-06,
+   "kl": 0.000176015,
+   "kl_control": 5.82e-07,
+   "top1": 0.997070312
+  },
+  {
+   "window": "cpp-vocab",
+   "tokens": 2048,
+   "dnll": 0.0009777449999999188,
+   "dnll_control": 1.7708999999976882e-05,
+   "kl": 0.000369047,
+   "kl_control": 7.51e-07,
+   "top1": 0.995605469
+  },
+  {
+   "window": "doc-autoparser",
+   "tokens": 2048,
+   "dnll": -0.000303948999999859,
+   "dnll_control": -1.8536999999874126e-05,
+   "kl": 0.000189558,
+   "kl_control": 5.17e-07,
+   "top1": 0.993652344
+  },
+  {
+   "window": "doc-cli",
+   "tokens": 2048,
+   "dnll": 0.002248401000000011,
+   "dnll_control": 2.400899999999151e-05,
+   "kl": 0.000450348,
+   "kl_control": 1.338e-06,
+   "top1": 0.9921875
+  },
+  {
+   "window": "doc-completion",
+   "tokens": 2048,
+   "dnll": 0.0005258320000000039,
+   "dnll_control": 4.012000000108706e-06,
+   "kl": 0.00049753,
+   "kl_control": 1.833e-06,
+   "top1": 0.990722656
+  },
+  {
+   "window": "doc-openvino",
+   "tokens": 2048,
+   "dnll": -0.00028632400000006,
+   "dnll_control": 3.777699999996109e-05,
+   "kl": 0.000131679,
+   "kl_control": 2.685e-06,
+   "top1": 0.997558594
+  },
+  {
+   "window": "doc-sycl",
+   "tokens": 2048,
+   "dnll": -0.00017019100000004173,
+   "dnll_control": -9.719000000130151e-06,
+   "kl": 0.000212477,
+   "kl_control": 9.11e-07,
+   "top1": 0.994628906
+  },
+  {
+   "window": "math-bayes",
+   "tokens": 2048,
+   "dnll": -0.0004287410000001213,
+   "dnll_control": 1.2219999998563935e-06,
+   "kl": 0.000145973,
+   "kl_control": 4.97e-07,
+   "top1": 0.994140625
+  },
+  {
+   "window": "math-eigen",
+   "tokens": 2048,
+   "dnll": 0.00024551999999999907,
+   "dnll_control": 6.7659999998248566e-06,
+   "kl": 0.000132265,
+   "kl_control": 3.89e-07,
+   "top1": 0.995605469
+  },
+  {
+   "window": "math-fourier",
+   "tokens": 2048,
+   "dnll": 0.00011814500000006944,
+   "dnll_control": -2.5150000000362382e-06,
+   "kl": 0.000134843,
+   "kl_control": 5.1e-07,
+   "top1": 0.994140625
+  },
+  {
+   "window": "math-ftc",
+   "tokens": 2048,
+   "dnll": -4.348799999998043e-05,
+   "dnll_control": 1.1319999999592767e-06,
+   "kl": 9.5183e-05,
+   "kl_control": 3.12e-07,
+   "top1": 0.996582031
+  },
+  {
+   "window": "math-long",
+   "tokens": 8192,
+   "dnll": -0.00015573400000001847,
+   "dnll_control": 1.0481999999978342e-05,
+   "kl": 0.000128978,
+   "kl_control": 6.12e-07,
+   "top1": 0.996459961
+  },
+  {
+   "window": "prose-a",
+   "tokens": 2048,
+   "dnll": -0.002092093000000017,
+   "dnll_control": -3.250000000232234e-07,
+   "kl": 0.001101039,
+   "kl_control": 3.617e-06,
+   "top1": 0.986328125
+  },
+  {
+   "window": "prose-b",
+   "tokens": 2048,
+   "dnll": -0.00021768600000005023,
+   "dnll_control": 1.079800000014508e-05,
+   "kl": 0.000783237,
+   "kl_control": 2.515e-06,
+   "top1": 0.985351562
+  },
+  {
+   "window": "prose-c",
+   "tokens": 2048,
+   "dnll": 0.0015051280000000222,
+   "dnll_control": -7.764399999998783e-05,
+   "kl": 0.000909985,
+   "kl_control": 3.052e-06,
+   "top1": 0.988769531
+  },
+  {
+   "window": "prose-d",
+   "tokens": 2048,
+   "dnll": 0.0008285770000000525,
+   "dnll_control": 5.600899999991249e-05,
+   "kl": 0.001097333,
+   "kl_control": 3.473e-06,
+   "top1": 0.989257812
+  },
+  {
+   "window": "prose-long",
+   "tokens": 8192,
+   "dnll": 0.002166399000000041,
+   "dnll_control": -5.60599999999134e-06,
+   "kl": 0.001188719,
+   "kl_control": 3.793e-06,
+   "top1": 0.986694336
+  },
+  {
+   "window": "py-base-a",
+   "tokens": 2048,
+   "dnll": -0.0005344280000000312,
+   "dnll_control": 9.330000000029592e-06,
+   "kl": 0.000158728,
+   "kl_control": 5.28e-07,
+   "top1": 0.997558594
+  },
+  {
+   "window": "py-quants",
+   "tokens": 2048,
+   "dnll": -0.0001788510000000354,
+   "dnll_control": 3.82099999995944e-06,
+   "kl": 0.000143628,
+   "kl_control": 4.5e-07,
+   "top1": 0.996582031
+  },
+  {
+   "window": "py-writer",
+   "tokens": 2048,
+   "dnll": -0.0014443449999999858,
+   "dnll_control": -3.570599999999646e-05,
+   "kl": 0.000252143,
+   "kl_control": 3.08e-07,
+   "top1": 0.999023438
+  }
+ ]
+}

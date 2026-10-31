@@ -1,0 +1,36 @@
+cpp-arg          tokens= 2048 dnll=+0.00038 (control +0.00004) kl=0.000124 (control 0.000000) top1=0.9995
+cpp-backend      tokens= 2048 dnll=+0.00018 (control -0.00000) kl=0.000050 (control 0.000000) top1=0.9995
+cpp-graph        tokens= 2048 dnll=+0.00018 (control +0.00000) kl=0.000035 (control 0.000000) top1=0.9995
+cpp-long         tokens= 8192 dnll=+0.00004 (control +0.00001) kl=0.000047 (control 0.000000) top1=0.9985
+cpp-vocab        tokens= 2048 dnll=+0.00053 (control +0.00003) kl=0.000093 (control 0.000000) top1=0.9971
+doc-autoparser   tokens= 2048 dnll=+0.00037 (control -0.00001) kl=0.000041 (control 0.000000) top1=0.9985
+doc-openvino     tokens= 2048 dnll=-0.00024 (control +0.00001) kl=0.000057 (control 0.000000) top1=0.9976
+doc-sycl         tokens= 2048 dnll=-0.00017 (control +0.00001) kl=0.000082 (control 0.000000) top1=0.9971
+math-bayes       tokens= 2048 dnll=-0.00016 (control -0.00001) kl=0.000086 (control 0.000000) top1=0.9941
+math-eigen       tokens= 2048 dnll=+0.00037 (control -0.00001) kl=0.000053 (control 0.000000) top1=0.9961
+math-fourier     tokens= 2048 dnll=+0.00034 (control -0.00002) kl=0.000083 (control 0.000000) top1=0.9941
+math-ftc         tokens= 2048 dnll=+0.00010 (control +0.00001) kl=0.000045 (control 0.000000) top1=0.9971
+math-long        tokens= 8192 dnll=+0.00016 (control +0.00000) kl=0.000025 (control 0.000000) top1=0.9984
+prose-a          tokens= 2048 dnll=-0.00201 (control -0.00005) kl=0.000638 (control 0.000002) top1=0.9897
+prose-b          tokens= 2048 dnll=-0.00002 (control -0.00004) kl=0.000449 (control 0.000001) top1=0.9927
+prose-c          tokens= 2048 dnll=-0.00011 (control +0.00000) kl=0.000527 (control 0.000002) top1=0.9897
+prose-d          tokens= 2048 dnll=-0.00058 (control +0.00006) kl=0.000604 (control 0.000002) top1=0.9937
+prose-long       tokens= 8192 dnll=+0.00163 (control +0.00003) kl=0.000662 (control 0.000002) top1=0.9889
+py-base-a        tokens= 2048 dnll=+0.00017 (control -0.00001) kl=0.000034 (control 0.000000) top1=0.9995
+py-quants        tokens= 2048 dnll=+0.00018 (control -0.00001) kl=0.000029 (control 0.000000) top1=0.9990
+py-writer        tokens= 2048 dnll=-0.00037 (control +0.00000) kl=0.000030 (control 0.000000) top1=0.9990
+{
+ "windows": 21,
+ "tokens": 61440,
+ "mean_dnll": 0.00021536963333334454,
+ "dnll_upper95": 0.0006183354444444719,
+ "ppl_change_percent": 0.021539282703786355,
+ "mean_kl": 0.00019979613333333336,
+ "mean_kl_control": 6.531e-07,
+ "kl_limit": 0.001,
+ "problems": [],
+ "pass_primary": true,
+ "pass_kl_screen": true,
+ "pass_hard": true,
+ "pass": true
+}

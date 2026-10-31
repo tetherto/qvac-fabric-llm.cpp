@@ -1,0 +1,7 @@
+# One 4608-channel FFN slice (layer 47, 8-bit palette), output backings on, median of 40 calls, M3 Ultra 2026-10-30.
+# scripts/iobench.mm; FP16 package from scripts/export-fp16-io.patch.
+io=fp32 single_ms=7.565 concurrent_pair_ms=14.732
+io=fp16 single_ms=7.171 concurrent_pair_ms=14.149
+io=fp32 single_ms=7.564 concurrent_pair_ms=14.721
+io=fp16 single_ms=7.163 concurrent_pair_ms=14.111
+# concurrent_pair loads the same compiled model twice; those calls serialize (two different models run in parallel, see dual.mm).
