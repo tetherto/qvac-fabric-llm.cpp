@@ -582,6 +582,8 @@ struct gemm_case {
     enum ggml_type          wtype;
     int64_t                 M;
     std::vector<gemm_shape> shapes;
+    bool                    pgemm_host_on  = false;  // the host rule for pgemm commands, off for the other cases
+    bool                    gemm_host_off  = false;  // GGML_XDNA_GEMM_HOST=0
 };
 
 // An N x K Q4_K projection of M tokens followed by a tensor of its own to guard,
@@ -601,6 +603,139 @@ static norm_graph build_projection(ggml_backend_t be, int64_t K, int64_t N, int6
     g.checked = { out };
     g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, be);
     return g;
+}
+
+struct route_case {
+    const char *   name;
+    enum ggml_type wtype;
+    int64_t        M, K, N;
+    int            count;  // projections of one activation: one command of the array
+    bool           on_array;
+    bool           per_op_decode = false;  // GGML_XDNA_FUSED_LAYER=0: a row of a decode takes the per-op route
+};
+
+// The product of the case on the NPU against the CPU backend's: exactly the CPU's bits when the host ran it, within `tol` of
+// them, and not exactly, when the array did (it rounds the activations to bf16).
+static bool route_matches(const std::vector<float> & want, const std::vector<float> & got, bool on_array, double tol, double * e) {
+    *e = nmse(want, got);
+    return on_array ? *e > 0.0 && *e < tol : *e == 0.0;
+}
+
+// The host's prefill rule for the commands of the array: one of 2 to 128 rows goes to the host when the host's products of
+// everything the command carries (the projections of one activation) are quicker than the command, in the CPU backend's own
+// bits whatever the weight type (the bf16 GEMM does not take it either); more rows, or a command the host does not beat, is
+// the array's. One row is a decode's, which the rule leaves alone. The chunk rule is off here; the graphs stay allocated to
+// the end because the packed weights are keyed by the tensors' addresses, which a freed one hands on.
+static bool test_pgemm_host_rule(ggml_backend_t npu, ggml_backend_t cpu, double tol) {
+    setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
+    const route_case cases[] = {
+        { "Q8_0, 15 rows: the host",                         GGML_TYPE_Q8_0, 15,  1024, 1024, 1, false },
+        { "Q4_K, 15 rows: the host",                         GGML_TYPE_Q4_K, 15,  1024, 1024, 1, false },
+        { "Q8_0, one block, a large product: array",         GGML_TYPE_Q8_0, 128, 1024, 4096, 1, true },
+        { "Q8_0, 129 rows, a small product: array",          GGML_TYPE_Q8_0, 129, 512,  512,  1, true },
+        { "Q8_0, 128 rows, one projection: the host",        GGML_TYPE_Q8_0, 128, 512,  1024, 1, false },
+        { "Q8_0, 128 rows, three of one activation: array",  GGML_TYPE_Q8_0, 128, 512,  1024, 3, true },
+        { "Q8_0, one row of a decode: not the rule's",       GGML_TYPE_Q8_0, 1,   1024, 1024, 1, true, true },
+    };
+    std::vector<norm_graph> graphs;
+    bool                    passed = true;
+    for (const route_case & c : cases) {
+        graphs.push_back(build_gemms(cpu, c.wtype, c.M, std::vector<gemm_shape>(c.count, gemm_shape{ c.K, c.N })));
+        norm_graph &                    g = graphs.back();
+        std::vector<std::vector<float>> want, got;
+        if (c.per_op_decode) {
+            setenv("GGML_XDNA_FUSED_LAYER", "0", 1);
+        }
+        const bool computed = run(g, cpu, want) && run(g, npu, got);
+        unsetenv("GGML_XDNA_FUSED_LAYER");
+        if (!computed) {
+            std::printf("test-xdna-graph: compute failed\n");
+            return false;
+        }
+        for (size_t i = 0; i < g.checked.size(); i++) {
+            double     e;
+            const bool ok = ggml_backend_supports_op(npu, g.checked[i]) && route_matches(want[i], got[i], c.on_array, tol, &e);
+            passed        = passed && ok;
+            std::printf("MUL_MAT host rule, %-50s nmse %.3g %s\n", c.name, e, ok ? "ok" : "FAIL");
+        }
+    }
+    for (norm_graph & g : graphs) {
+        ggml_backend_buffer_free(g.buf);
+        ggml_free(g.ctx);
+    }
+    unsetenv("GGML_XDNA_HOST_CHUNK");
+    return passed;
+}
+
+// `layers` of x = x + down(gelu(up(norm(x)))) over M rows of K, the hidden size N: every projection reads an activation of its own,
+// so each is a command of the array.
+static norm_graph build_chain(ggml_backend_t cpu, enum ggml_type wtype, int64_t M, int64_t K, int64_t N, int layers) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * (size_t) (8 * layers + 8) + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    g.inputs.push_back(x);
+    for (int l = 0; l < layers; l++) {
+        ggml_tensor * up   = ggml_new_tensor_2d(g.ctx, wtype, K, N);
+        ggml_tensor * down = ggml_new_tensor_2d(g.ctx, wtype, N, K);
+        g.inputs.push_back(up);
+        g.inputs.push_back(down);
+        ggml_tensor * h = ggml_gelu(g.ctx, ggml_mul_mat(g.ctx, up, ggml_rms_norm(g.ctx, x, 1e-6f)));
+        x               = ggml_add(g.ctx, ggml_mul_mat(g.ctx, down, h), x);
+    }
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, x);
+    g.checked = { x };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+// A prefill chunk of one block of rows or fewer is run whole on the host when the host's products cost less than its commands
+// (one CPU graph: the CPU backend's own bits), and keeps its commands when they cost less; GGML_XDNA_HOST_CHUNK=0 and
+// GGML_XDNA_PGEMM_HOST=0 leave every projection to the array.
+static bool test_host_chunk_rule(ggml_backend_t npu, ggml_backend_t cpu, double tol) {
+    struct chunk_case {
+        const char *   name;
+        enum ggml_type wtype;
+        int64_t        M, K, N;
+        bool           off_switches;
+        bool           on_array;
+    };
+    const chunk_case cases[] = {
+        { "15 rows of Q8_0: the host",                    GGML_TYPE_Q8_0, 15,  512,  1024, false, false },
+        { "41 rows of Q8_0: the host",                    GGML_TYPE_Q8_0, 41,  512,  2048, false, false },
+        { "15 rows of BF16: the host",                    GGML_TYPE_BF16, 15,  512,  1024, false, false },
+        { "128 rows of large Q8_0 products: the array",   GGML_TYPE_Q8_0, 128, 1024, 4096, false, true },
+        { "15 rows of Q8_0, rules off: the array",        GGML_TYPE_Q8_0, 15,  512,  1024, true,  true },
+        { "15 rows of BF16, rules off: the array",        GGML_TYPE_BF16, 15,  512,  1024, true,  true },
+    };
+    std::vector<norm_graph> graphs;
+    bool                    passed = true;
+    for (const chunk_case & c : cases) {
+        if (c.off_switches) {
+            setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
+            setenv("GGML_XDNA_PGEMM_HOST", "0", 1);
+        }
+        graphs.push_back(build_chain(cpu, c.wtype, c.M, c.K, c.N, 3));
+        norm_graph &                    g = graphs.back();
+        std::vector<std::vector<float>> want, got;
+        const bool                      computed = run(g, cpu, want) && run(g, npu, got);
+        unsetenv("GGML_XDNA_HOST_CHUNK");
+        unsetenv("GGML_XDNA_PGEMM_HOST");
+        if (!computed) {
+            std::printf("test-xdna-graph: compute failed\n");
+            return false;
+        }
+        double     e;
+        const bool ok = route_matches(want[0], got[0], c.on_array, tol, &e);
+        passed        = passed && ok;
+        std::printf("chunk host rule, %-46s nmse %.3g %s\n", c.name, e, ok ? "ok" : "FAIL");
+    }
+    for (norm_graph & g : graphs) {
+        ggml_backend_buffer_free(g.buf);
+        ggml_free(g.ctx);
+    }
+    return passed;
 }
 
 static bool test_output_in_place(ggml_backend_t npu, ggml_backend_t cpu, int64_t M, double tol) {
@@ -939,6 +1074,72 @@ static bool test_group_order(ggml_backend_t npu, ggml_backend_t cpu, between wha
     return passed;
 }
 
+// The conv input of a gated delta net layer over M rows: the projection's output, transposed and concatenated behind the
+// cached rows, then the SSM_CONV by its taps. A chunk the host runs whole takes the concat and the conv on the backend's own
+// kernels, which sum as ggml-cpu's do.
+static norm_graph build_conv_input(ggml_backend_t cpu, int64_t M, int64_t K, int64_t channels, int64_t taps) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * w     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, K, channels);
+    ggml_tensor * state = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, taps - 1, channels);
+    ggml_tensor * taps_w = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, taps, channels);
+    g.inputs            = { x, w, state, taps_w };
+    ggml_tensor * qkv   = ggml_mul_mat(g.ctx, w, x);
+    ggml_tensor * input = ggml_concat(g.ctx, state, ggml_transpose(g.ctx, qkv), 0);
+    ggml_tensor * out   = ggml_ssm_conv(g.ctx, input, taps_w);
+    g.gf                = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+static bool test_host_chunk_conv_kernels(ggml_backend_t npu, ggml_backend_t cpu) {
+    norm_graph g = build_conv_input(cpu, 15, 512, 1024, 4);
+    std::vector<std::vector<float>> want, got;
+    if (!run(g, cpu, want) || !run(g, npu, got)) {
+        std::printf("test-xdna-graph: compute failed\n");
+        return false;
+    }
+    const double e  = nmse(want[0], got[0]);
+    const bool   ok = e == 0.0;
+    std::printf("chunk host rule, conv input of 15 rows on the backend's concat and SSM_CONV      nmse %.3g %s\n", e,
+                ok ? "ok" : "FAIL");
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
+    return ok;
+}
+
+// graph_optimize groups by shape. The plan of the compute before it, which left these projections to the host, does not keep it
+// from moving them together: the graph computes alone first (its nodes are in the NPU's buffers), then the scheduler splits it.
+static bool test_group_order_after_host_plan(ggml_backend_t npu, ggml_backend_t cpu) {
+    setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
+    setenv("GGML_XDNA_PGEMM_HOST", "1", 1);
+    const std::vector<int64_t> ns     = { 1024, 512, 512 };
+    ordered_graph              want_g = build_ordered(cpu, cpu, ns, 15, between::nothing, GGML_TYPE_Q8_0);
+    ordered_graph              got_g  = build_ordered(npu, npu, ns, 15, between::nothing, GGML_TYPE_Q8_0);
+    set_inputs(want_g.inputs, 1234);
+    set_inputs(got_g.inputs, 1234);
+    bool ok = ggml_backend_graph_compute(cpu, want_g.gf) == GGML_STATUS_SUCCESS &&
+              ggml_backend_graph_compute(npu, got_g.gf) == GGML_STATUS_SUCCESS;
+    const double          e           = ok ? nmse(get_f32(want_g.out), get_f32(got_g.out)) : INFINITY;
+    ggml_backend_t        backends[2] = { npu, cpu };
+    ggml_backend_sched_t  sched       = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    ok                                = ok && ggml_backend_sched_alloc_graph(sched, got_g.gf);
+    const bool moved                  = projections_adjacent(got_g);
+    const bool passed                 = ok && e == 0.0 && moved;
+    std::printf("MUL_MAT Q K V after a compute that left them to the host: nmse %.3g, projections %s %s\n", e,
+                moved ? "moved together" : "left apart", passed ? "ok" : "FAIL");
+    ggml_backend_sched_free(sched);
+    free_ordered(want_g);
+    free_ordered(got_g);
+    unsetenv("GGML_XDNA_HOST_CHUNK");
+    unsetenv("GGML_XDNA_PGEMM_HOST");
+    return passed;
+}
+
 int main(void) {
     ggml_backend_load_all();
     ggml_backend_dev_t dev = xdna_device();
@@ -957,6 +1158,10 @@ int main(void) {
     // Q8_K on the CPU, which leaves them 1-2e-4 apart
     const double tol    = 1e-3;
     bool         passed = true;
+
+    // the route cases below are about the array at small sizes; the host routing has its own at the end
+    setenv("GGML_XDNA_PGEMM_HOST", "0", 1);
+    setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
     for (bool side_reader : { false, true }) {
         norm_graph                      g = build(cpu, side_reader, 1024, 1024, 128);
         std::vector<std::vector<float>> want, got;
@@ -1092,15 +1297,38 @@ int main(void) {
           { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_HOST }, { 512, 1024, GGML_TYPE_Q4_K } } },
         { "among pgemm, mid",   GGML_TYPE_BF16, 132,
           { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_HOST }, { 512, 1024, GGML_TYPE_Q4_K } } },
-        { "among pgemm, large", GGML_TYPE_BF16, 2560,
+        { "among pgemm, large", GGML_TYPE_BF16, 8192,
           { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_ARRAY }, { 512, 1024, GGML_TYPE_Q4_K } } },
         { "among bf16",         GGML_TYPE_BF16, 15,
           { { 512, 1024 }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_ARRAY }, { 512, 1024 } } },
+        // GGML_XDNA_GEMM_HOST=0 leaves the small projection to the array, switches or not
+        { "among pgemm, rule off", GGML_TYPE_BF16, 15,
+          { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_ARRAY }, { 512, 1024, GGML_TYPE_Q4_K } },
+          false, true },
+        // the model decides both: neighbours with work stay on the array and the bf16 projection among them goes to the host;
+        // small neighbours go to the host and leave the bf16 one no switch to pay
+        { "among large pgemm, model", GGML_TYPE_BF16, 15,
+          { { 2048, 4096, GGML_TYPE_Q8_0, GEMM_ROUTE_ARRAY }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_HOST },
+            { 2048, 4096, GGML_TYPE_Q8_0, GEMM_ROUTE_ARRAY } },
+          true },
+        { "among small pgemm, model", GGML_TYPE_BF16, 15,
+          { { 512, 1024, GGML_TYPE_Q4_K, GEMM_ROUTE_HOST }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_ARRAY },
+            { 512, 1024, GGML_TYPE_Q4_K, GEMM_ROUTE_HOST } },
+          true },
     };
     for (const gemm_case & c : gemm_cases) {
         norm_graph                      g = build_gemms(cpu, c.wtype, c.M, c.shapes);
         std::vector<std::vector<float>> want, got;
-        if (!run(g, cpu, want) || !run(g, npu, got)) {
+        if (c.pgemm_host_on) {
+            unsetenv("GGML_XDNA_PGEMM_HOST");
+        }
+        if (c.gemm_host_off) {
+            setenv("GGML_XDNA_GEMM_HOST", "0", 1);
+        }
+        const bool computed = run(g, cpu, want) && run(g, npu, got);
+        setenv("GGML_XDNA_PGEMM_HOST", "0", 1);
+        unsetenv("GGML_XDNA_GEMM_HOST");
+        if (!computed) {
             std::printf("test-xdna-graph: compute failed\n");
             return 1;
         }
@@ -1167,6 +1395,16 @@ int main(void) {
             }
         }
     }
+
+    // a new backend context drops the weights the earlier cases packed
+    ggml_backend_free(npu);
+    npu = ggml_backend_dev_init(dev, nullptr);
+    unsetenv("GGML_XDNA_PGEMM_HOST");
+    unsetenv("GGML_XDNA_HOST_CHUNK");
+    passed = npu != nullptr && test_pgemm_host_rule(npu, cpu, tol) && passed;
+    passed = npu != nullptr && test_host_chunk_rule(npu, cpu, tol) && passed;
+    passed = npu != nullptr && test_host_chunk_conv_kernels(npu, cpu) && passed;
+    passed = npu != nullptr && test_group_order_after_host_plan(npu, cpu) && passed;
 
     ggml_backend_free(npu);
     ggml_backend_free(cpu);

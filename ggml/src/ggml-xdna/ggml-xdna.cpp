@@ -392,6 +392,16 @@ static int xdna_glue_threads(bool prompt) {
     return prompt ? n_big : n_small;
 }
 
+static constexpr int XDNA_PROMPT_ROWS = 32;
+
+int xdna_host_team(int64_t rows) {
+    return xdna_glue_threads(rows >= XDNA_PROMPT_ROWS);
+}
+
+int xdna_host_prompt_team(void) {
+    return xdna_glue_threads(true);
+}
+
 // A decode's vocabulary projection on the host: on the 0.8B, 12 threads ran
 // 0.4% slower than 16 at 2.6% less energy a token.
 static constexpr int XDNA_HEAD_THREADS = 12;
@@ -615,6 +625,65 @@ static bool xdna_glue_flush(xdna_ops * ops, std::vector<struct ggml_tensor *> & 
     }
     batch.clear();
     return true;
+}
+
+// A chunk the plan (xdna_ops_plan_chunk) found quicker on the host runs as CPU graphs on the prompt's team, the ops the
+// backend's own kernels take on their own between them: the batches of the glue are cut at the commands of the array, which
+// this chunk has none of.
+static bool xdna_host_chunk_compute(ggml_backend_t cpu, struct ggml_cgraph * cgraph, int begin, int end) {
+    if (begin >= end) {
+        return true;
+    }
+    struct ggml_cgraph view = ggml_graph_view(cgraph, begin, end);
+    xdna_prof::section_timer st("host chunk");
+    return ggml_backend_graph_compute(cpu, &view) == GGML_STATUS_SUCCESS;
+}
+
+// The ops of a chunk the backend runs with its own kernel in place of ggml-cpu's, as its glue does: ggml-cpu's concat of the
+// GDN's conv input and its SSM_CONV are what the glue's own kernels exist for (the concat alone is half of a long prefill).
+static bool xdna_host_chunk_kernel_of(const struct ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+            return xdna_host_attn_supported(node);
+        case GGML_OP_CONCAT:
+        case GGML_OP_SSM_CONV:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Runs `node` on its own kernel; false when that declines, with nothing run.
+static bool xdna_host_chunk_kernel_run(struct ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+            return xdna_attn_fast(node);
+        case GGML_OP_CONCAT:
+            return xdna_concat_fast(node);
+        default:
+            return xdna_ssm_conv_fast(node);
+    }
+}
+
+static enum ggml_status xdna_host_chunk_run(struct ggml_cgraph * cgraph) {
+    ggml_backend_t cpu = xdna_glue_cpu();
+    if (cpu == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
+    // the kernels' regions take the chunk's team: regions of two sizes make the OpenMP runtime rebuild its team at every switch
+    g_xdna_chunk_threads.store(xdna_host_prompt_team(), std::memory_order_relaxed);
+    ggml_backend_cpu_set_n_threads(cpu, xdna_host_prompt_team());
+    int begin = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (!xdna_host_chunk_kernel_of(cgraph->nodes[i])) {
+            continue;
+        }
+        if (!xdna_host_chunk_compute(cpu, cgraph, begin, i)) {
+            return GGML_STATUS_FAILED;
+        }
+        begin = xdna_host_chunk_kernel_run(cgraph->nodes[i]) ? i + 1 : i;
+    }
+    return xdna_host_chunk_compute(cpu, cgraph, begin, cgraph->n_nodes) ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
 }
 
 // ---------------------------------------------------------------------------
@@ -3313,6 +3382,14 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
         ctx->ops.fused_gemv = false;
     }
 
+    // A prefill whose commands would cost more than the host's products runs whole on the host; a decode plans nothing.
+    if (g_glue_n_tokens > 1 && xdna_ops_plan_chunk(&ctx->ops, cgraph)) {
+        return xdna_host_chunk_run(cgraph);
+    }
+    if (g_glue_n_tokens <= 1) {
+        xdna_pgemm_plan_host({});
+    }
+
     // Fused decode linear layers: scan this chunk for complete recurrent
     // layers of a single-token decode; each fires once in the dispatch loop
     // below and replaces its conv/gdn/ffn subgraph with one persistent device
@@ -4714,7 +4791,7 @@ static std::vector<int> xdna_group_from(const xdna_ops * ops, const struct ggml_
     std::vector<struct ggml_tensor *> mm    = { graph->nodes[candidates[first]] };
     for (size_t k = first + 1; k < candidates.size(); k++) {
         mm.push_back(graph->nodes[candidates[k]]);
-        if (!(xdna_pgemm_group_supported(mm.data(), (int) mm.size()) ||
+        if (!(xdna_pgemm_group_shape_supported(mm.data(), (int) mm.size()) ||
               xdna_ops_gemm_group_supported(ops, mm.data(), (int) mm.size())) ||
             !xdna_can_move_up(graph, pos, group[0], candidates[k])) {
             break;
