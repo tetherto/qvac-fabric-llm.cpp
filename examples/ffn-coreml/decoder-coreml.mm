@@ -3,15 +3,44 @@
 #include "ggml-metal.h"
 #include "llama-ext.h"
 
+#import <Metal/Metal.h>
+
 #include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 
 static bool profile_enabled = false;
 static bool direct_input = false;
 static bool gpu_resident = false;
+
+// FFN_COREML_ASYNC: the resident path hands each ANE call to a serial worker instead of blocking the graph thread.
+// The GPU signals ane_ready when the FFN input is written; the worker waits for it, predicts, then signals ane_done,
+// which the GPU waits for before the join. Both counters advance together, one value per call.
+struct ane_async {
+    bool enabled = false;
+    id<MTLSharedEvent> ready = nil;
+    id<MTLSharedEvent> done = nil;
+    dispatch_queue_t queue = nil;
+    uint64_t seq = 0;
+
+    static ane_async & get() {
+        static ane_async state = [] {
+            ane_async s;
+            s.enabled = std::getenv("FFN_COREML_ASYNC") != nullptr;
+            if (s.enabled) {
+                id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+                s.ready = [device newSharedEvent];
+                s.done = [device newSharedEvent];
+                s.queue = dispatch_queue_create("ffn-coreml-ane", DISPATCH_QUEUE_SERIAL);
+            }
+            return s;
+        }();
+        return state;
+    }
+};
 
 struct stage_profile {
     double ms[10] = {};
@@ -67,7 +96,20 @@ static MLModel * decoder_load(const std::string & assets, const char * name, int
     return model;
 }
 
+struct decoder_ffn;
+
+// custom op userdata: stage -1 runs the whole FFN, 0 starts it and 1 finishes it (two-half microbatches)
+struct ffn_call {
+    decoder_ffn * runtime;
+    int stage;
+};
+
 struct decoder_ffn {
+    ffn_call call[3] = {{this, -1}, {this, 0}, {this, 1}};
+    // async value of the started call, finished by the next stage 1 call
+    uint64_t pending = 0;
+    // Core ML inputs bound to the Metal buffers they were created for
+    std::map<const void *, MLDictionaryFeatureProvider *> inputs;
     temporary_model compiled{nil};
     temporary_model compiled2{nil};
     MLModel * model = nil;
@@ -88,6 +130,12 @@ struct decoder_ffn {
     uint64_t backing_fallbacks = 0;
     stage_profile profile;
     std::string error;
+    std::mutex error_lock;
+
+    void fail(const std::string & message) {
+        std::lock_guard<std::mutex> lock(error_lock);
+        if (error.empty()) { error = message; }
+    }
 
     void predict(bool resident = false) {
         if (!direct_input && !resident) { memcpy(input.dataPointer, x.data(), x.size() * sizeof(float)); }
@@ -141,13 +189,12 @@ struct decoder_ffn {
         }
     }
 
-    void predict_backed() {
+    void predict_backed(MLDictionaryFeatureProvider * inputs, bool timed = true) {
         __block id<MLFeatureProvider> second = nil;
         __block NSError * second_failure = nil;
         dispatch_group_t group = dispatch_group_create();
         if (model2) {
             MLModel * other = model2;
-            MLDictionaryFeatureProvider * inputs = features;
             MLPredictionOptions * other_options = options2;
             dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
                 @autoreleasepool {
@@ -158,9 +205,9 @@ struct decoder_ffn {
             });
         }
         NSError * failure = nil;
-        id<MLFeatureProvider> result = [model predictionFromFeatures:features options:options error:&failure];
+        id<MLFeatureProvider> result = [model predictionFromFeatures:inputs options:options error:&failure];
         dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
-        profile.end(4);
+        if (timed) { profile.end(4); }
         require(result, failure ? failure.localizedDescription.UTF8String : "Core ML prediction failed");
         require(!model2 || second, second_failure ? second_failure.localizedDescription.UTF8String : "second Core ML prediction failed");
         adopt(result, join.ane);
@@ -276,13 +323,16 @@ struct decoder_state {
     }
 
     void check() const {
-        for (const auto & entry : layers) { require(entry.second->error.empty(), entry.second->error); }
+        for (const auto & entry : layers) {
+            std::lock_guard<std::mutex> lock(entry.second->error_lock);
+            require(entry.second->error.empty(), entry.second->error);
+        }
     }
 };
 
 static void decoder_compute(ggml_tensor * dst, const ggml_tensor * src, const ggml_tensor * residual, int ith, int nth, void * userdata) {
     if (ith != 0) { return; }
-    auto & runtime = *static_cast<decoder_ffn *>(userdata);
+    auto & runtime = *static_cast<ffn_call *>(userdata)->runtime;
     runtime.profile.begin();
     auto callback_start = runtime.profile.last;
     @autoreleasepool {
@@ -311,8 +361,54 @@ static void bind_resident_tensor(ggml_tensor * target, const ggml_tensor * sourc
     target->data = source->data;
 }
 
+// signal that the FFN input is written, queue the Metal share, and hand the ANE call to the worker
+static void ane_start(ggml_backend_t backend, decoder_ffn & runtime, const ggml_tensor * src, const ggml_tensor * residual) {
+    auto & async = ane_async::get();
+    require(async.enabled && runtime.backed && !runtime.full_metal, "split FFN calls need FFN_COREML_ASYNC and output backing");
+    require(ggml_backend_metal_tensor_is_shared(src), "Core ML input must use shared Metal storage");
+    const uint64_t value = ++async.seq;
+    runtime.pending = value;
+    ggml_backend_metal_shared_event(backend, (__bridge void *) async.ready, value, false);
+    bind_resident_tensor(runtime.prefix.input, src);
+    bind_resident_tensor(runtime.prefix.residual, residual);
+    require(ggml_backend_graph_compute_async(backend, runtime.prefix.graph) == GGML_STATUS_SUCCESS, "resident Metal prefix failed");
+    __strong MLDictionaryFeatureProvider * & inputs = runtime.inputs[src->data];
+    if (!inputs) {
+        NSError * failure = nil;
+        MLMultiArray * x = [[MLMultiArray alloc] initWithDataPointer:src->data shape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
+        require(x, "resident Core ML input binding failed");
+        inputs = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": x} error:&failure];
+        require(inputs, "resident Core ML provider failed");
+    }
+    decoder_ffn * worker = &runtime;
+    MLDictionaryFeatureProvider * features = inputs;
+    id<MTLSharedEvent> ready = async.ready, done = async.done;
+    dispatch_async(async.queue, ^{
+        @autoreleasepool {
+            if (![ready waitUntilSignaledValue:value timeoutMS:60000]) {
+                worker->fail("timed out waiting for the FFN input");
+            } else {
+                try { worker->predict_backed(features, false); } catch (const std::exception & failure) { worker->fail(failure.what()); }
+            }
+            done.signaledValue = value;
+        }
+    });
+}
+
+// make the GPU wait for the ANE call, then add the three parts into dst
+static void ane_finish(ggml_backend_t backend, decoder_ffn & runtime, ggml_tensor * dst) {
+    require(runtime.pending != 0, "FFN finish without a started call");
+    ggml_backend_metal_shared_event(backend, (__bridge void *) ane_async::get().done, runtime.pending, true);
+    runtime.pending = 0;
+    bind_resident_tensor(runtime.join.gpu, runtime.prefix.output);
+    bind_resident_tensor(runtime.join.output, dst);
+    require(ggml_backend_graph_compute_async(backend, runtime.join.graph) == GGML_STATUS_SUCCESS, "resident Metal join failed");
+    ++runtime.calls;
+}
+
 static bool decoder_resident_compute(ggml_backend_t backend, ggml_tensor * dst, void * userdata) {
-    auto & runtime = *static_cast<decoder_ffn *>(userdata);
+    auto & call = *static_cast<ffn_call *>(userdata);
+    auto & runtime = *call.runtime;
     runtime.profile.begin();
     const auto start = runtime.profile.last;
     @autoreleasepool {
@@ -320,6 +416,14 @@ static bool decoder_resident_compute(ggml_backend_t backend, ggml_tensor * dst, 
             const auto * src = dst->src[0];
             const auto * residual = dst->src[1];
             require(src->data != dst->data && residual->data != dst->data, "resident FFN output aliases input");
+            auto & async = ane_async::get();
+            if (call.stage == 0) { ane_start(backend, runtime, src, residual); return true; }
+            if (call.stage == 1) { ane_finish(backend, runtime, dst); return true; }
+            if (async.enabled && runtime.backed && !runtime.full_metal) {
+                ane_start(backend, runtime, src, residual);
+                ane_finish(backend, runtime, dst);
+                return true;
+            }
             if (!runtime.full_metal) { ggml_backend_synchronize(backend); }
             runtime.profile.end(0);
             bind_resident_tensor(runtime.prefix.input, src);
@@ -337,7 +441,7 @@ static bool decoder_resident_compute(ggml_backend_t backend, ggml_tensor * dst, 
                     runtime.features = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": runtime.input} error:&failure];
                     require(runtime.features, "resident Core ML provider failed");
                 }
-                if (runtime.backed) { runtime.predict_backed(); } else { runtime.predict(true); }
+                if (runtime.backed) { runtime.predict_backed(runtime.features); } else { runtime.predict(true); }
                 runtime.profile.end(5);
                 bind_resident_tensor(runtime.join.gpu, runtime.prefix.output);
                 bind_resident_tensor(runtime.join.output, dst);
@@ -366,17 +470,61 @@ static ggml_tensor * decoder_build(ggml_context * ctx, ggml_tensor * input, ggml
     // Core ML programs; smaller ones stay on Metal
     static const int pad_min = std::getenv("FFN_COREML_PAD_MIN") ? std::atoi(std::getenv("FFN_COREML_PAD_MIN")) : 256;
     const int rows = input->ne[1];
-    if (rows == 512) { return ggml_map_custom2(ctx, input, residual, decoder_compute, 1, found->second.get()); }
-    if (rows > 512 || rows < pad_min || !gpu_resident) { return nullptr; }
-    auto * padded = ggml_map_custom2(ctx, ggml_pad(ctx, input, 0, 512 - rows, 0, 0), ggml_pad(ctx, residual, 0, 512 - rows, 0, 0), decoder_compute, 1, found->second.get());
-    return ggml_view_2d(ctx, padded, 5120, rows, padded->nb[1], 0);
+    if (rows == 512) { return ggml_map_custom2(ctx, input, residual, decoder_compute, 1, &found->second->call[0]); }
+    if (!gpu_resident || rows > 1024 || (rows < 512 && rows < pad_min)) { return nullptr; }
+    auto padded_call = [&](ggml_tensor * x, ggml_tensor * r) {
+        const int n = x->ne[1];
+        auto * out = ggml_map_custom2(ctx, ggml_pad(ctx, x, 0, 512 - n, 0, 0), ggml_pad(ctx, r, 0, 512 - n, 0, 0), decoder_compute, 1, &found->second->call[0]);
+        return ggml_view_2d(ctx, out, 5120, n, out->nb[1], 0);
+    };
+    if (rows < 512) { return padded_call(input, residual); }
+    // 513..1023 rows (a partial 1024-token microbatch): one full call and one padded call
+    auto rows_of = [&](ggml_tensor * x, int first, int n) { return ggml_view_2d(ctx, x, 5120, n, x->nb[1], first * x->nb[1]); };
+    auto * head = ggml_map_custom2(ctx, rows_of(input, 0, 512), rows_of(residual, 0, 512), decoder_compute, 1, &found->second->call[0]);
+    return ggml_concat(ctx, head, padded_call(rows_of(input, 512, rows - 512), rows_of(residual, 512, rows - 512)), 1);
+}
+
+// two-half microbatches (LLAMA_QWEN35_HALVES): stage 0 starts a half's FFN, stage 1 finishes it.
+// FFN_COREML_HALVES_METAL keeps the FFN on Metal to check the half-batch graph against the normal one
+static ggml_tensor * decoder_split_build(ggml_context * ctx, ggml_tensor * input, ggml_tensor * residual, int layer, int stage, void * userdata) {
+    static const bool metal = std::getenv("FFN_COREML_HALVES_METAL") != nullptr;
+    auto & state = *static_cast<decoder_state *>(userdata);
+    auto found = state.layers.find(layer);
+    if (metal || found == state.layers.end() || !gpu_resident || !ane_async::get().enabled || !found->second->backed) { return nullptr; }
+    if (stage == 1) {
+        // a half that started on Metal finishes there too
+        return input->op == GGML_OP_MAP_CUSTOM2 ? ggml_map_custom2(ctx, input, input, decoder_compute, 1, &found->second->call[2]) : nullptr;
+    }
+    // a short second half is padded to the 512 rows of the Core ML programs, or stays on Metal below FFN_COREML_PAD_MIN
+    static const int pad_min = std::getenv("FFN_COREML_PAD_MIN") ? std::atoi(std::getenv("FFN_COREML_PAD_MIN")) : 256;
+    const int rows = input->ne[1];
+    require(input->type == GGML_TYPE_F32 && input->ne[0] == 5120 && rows <= 512, "split FFN half must be at most 512 x 5120");
+    if (rows < pad_min) { return nullptr; }
+    if (rows < 512) {
+        input = ggml_pad(ctx, input, 0, 512 - rows, 0, 0);
+        residual = ggml_pad(ctx, residual, 0, 512 - rows, 0, 0);
+    }
+    return ggml_map_custom2(ctx, input, residual, decoder_compute, 1, &found->second->call[1]);
+}
+
+static void set_builders(bool split, decoder_state * state) {
+    static const bool halves = std::getenv("LLAMA_QWEN35_HALVES") != nullptr;
+    llama_ffn_coreml_set_builder(split ? decoder_build : nullptr, split ? state : nullptr);
+    // the all-Metal reference (quality-metal) keeps the normal graph
+    llama_ffn_coreml_set_split_builder(split && halves && !state->metal_reference ? decoder_split_build : nullptr, split ? state : nullptr);
+}
+
+// prompt tokens per llama_decode call and microbatch (FFN_COREML_UBATCH, 512 or 1024)
+static int chunk_tokens() {
+    static const int chunk = std::getenv("FFN_COREML_UBATCH") ? std::atoi(std::getenv("FFN_COREML_UBATCH")) : 512;
+    return chunk;
 }
 
 static llama_context * make_context(llama_model * model, int context, decoder_state & state, bool split) {
-    llama_ffn_coreml_set_builder(split ? decoder_build : nullptr, split ? &state : nullptr);
+    set_builders(split, &state);
     auto cp = llama_context_default_params();
     cp.n_ctx = context;
-    cp.n_batch = cp.n_ubatch = 512;
+    cp.n_batch = cp.n_ubatch = chunk_tokens();
     cp.n_threads = 20;
     cp.n_threads_batch = state.batch_threads;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -423,8 +571,8 @@ static void request(llama_context * ctx, decoder_state & state, const std::vecto
     uint64_t before = state.calls();
     for (auto & entry : state.layers) { entry.second->profile = {}; }
     auto start = std::chrono::steady_clock::now();
-    for (int offset = 0; offset < length; offset += 512) {
-        int n = std::min(512, length - offset);
+    for (int offset = 0; offset < length; offset += chunk_tokens()) {
+        int n = std::min(chunk_tokens(), length - offset);
         require(llama_decode(ctx, llama_batch_get_one(const_cast<llama_token *>(prompt.data()) + offset, n)) == 0, "prompt evaluation failed");
     }
     llama_synchronize(ctx);
@@ -448,9 +596,9 @@ static void request(llama_context * ctx, decoder_state & state, const std::vecto
     if (const char * value = std::getenv("FFN_COREML_DECODE_PLAN")) {
         const int reserve_tokens = std::stoi(value);
         require(reserve_tokens == 1 || reserve_tokens == 512, "decode plan must use 1 or 512 tokens");
-        llama_ffn_coreml_set_builder(nullptr, nullptr);
+        set_builders(false, nullptr);
         auto * graph = llama_graph_reserve(ctx, reserve_tokens, 1, reserve_tokens);
-        llama_ffn_coreml_set_builder(mode == "split" || mode == "hook-metal" ? decoder_build : nullptr, &state);
+        set_builders(mode == "split" || mode == "hook-metal", &state);
         require(graph, "could not reserve decode allocation plan");
         transition_ms = milliseconds(decode_start);
     }
@@ -480,7 +628,7 @@ static void request(llama_context * ctx, decoder_state & state, const std::vecto
     }
     uint64_t decode_calls = state.calls() - after_prompt;
     require(decode_calls == 0, "Core ML unexpectedly ran during token decoding");
-    uint64_t expected = (mode == "split" || mode == "hook-metal") ? state.layers.size() * (length / 512) : 0;
+    uint64_t expected = (mode == "split" || mode == "hook-metal") && !std::getenv("FFN_COREML_HALVES_METAL") ? state.layers.size() * (length / 512) : 0;
     require(after_prompt - before == expected, "unexpected number of integrated FFN calls");
     printf("request mode=%s prompt_tokens=%d generated=%d repetition=%d pp_ms=%.6f pp_tps=%.6f ttft_ms=%.6f decode_ms=%.6f decode_tps=%.6f total_ms=%.6f output_tps=%.6f offload_calls=%llu decode_offload_calls=%llu\n",
            mode.c_str(), length, generated, repetition, pp_ms, length * 1000.0 / pp_ms, ttft_ms, decode_ms,
@@ -508,18 +656,18 @@ static void quality(llama_model * model, decoder_state & state, const std::vecto
     auto * split = make_context(model, length + 64, state, true);
     double kl_sum = 0, kl_max = 0, nll_metal = 0, nll_split = 0;
     int agreement = 0;
-    std::vector<float> reference(size_t(512) * vocab);
-    std::vector<int8_t> logits(512, 1);
+    std::vector<float> reference(size_t(chunk_tokens()) * vocab);
+    std::vector<int8_t> logits(chunk_tokens(), 1);
     uint64_t before = state.calls();
-    for (int offset = 0; offset < length; offset += 512) {
-        int n = std::min(512, length - offset);
+    for (int offset = 0; offset < length; offset += chunk_tokens()) {
+        int n = std::min(chunk_tokens(), length - offset);
         auto batch = llama_batch_get_one(const_cast<llama_token *>(prompt.data()) + offset, n);
         batch.logits = logits.data();
-        llama_ffn_coreml_set_builder(nullptr, nullptr);
+        set_builders(false, nullptr);
         require(llama_decode(baseline, batch) == 0, "quality baseline failed");
         llama_synchronize(baseline);
         memcpy(reference.data(), llama_get_logits(baseline), size_t(n) * vocab * sizeof(float));
-        llama_ffn_coreml_set_builder(decoder_build, &state);
+        set_builders(true, &state);
         require(llama_decode(split, batch) == 0, "quality split failed");
         llama_synchronize(split);
         state.check();
@@ -546,7 +694,7 @@ static void quality(llama_model * model, decoder_state & state, const std::vecto
             nll_split += lb - b[label];
         }
     }
-    require(state.calls() - before == state.layers.size() * (length / 512), "quality did not use intended offload layers");
+    require(std::getenv("FFN_COREML_HALVES_METAL") || state.calls() - before == state.layers.size() * (length / 512), "quality did not use intended offload layers");
     bool screen_pass = kl_sum / length <= 0.001 && std::exp((nll_split - nll_metal) / length) <= 1.01;
     printf("quality prompt_tokens=%d mean_kl=%.9f max_kl=%.9f top1_agreement=%.9f metal_nll=%.9f split_nll=%.9f metal_ppl=%.9f split_ppl=%.9f offload_calls=%llu screen_pass=%d reference_custom=%d\n",
            length, kl_sum / length, kl_max, double(agreement) / length, nll_metal / length, nll_split / length,
@@ -554,7 +702,7 @@ static void quality(llama_model * model, decoder_state & state, const std::vecto
     fflush(stdout);
     llama_free(split);
     llama_free(baseline);
-    llama_ffn_coreml_set_builder(nullptr, nullptr);
+    set_builders(false, nullptr);
 }
 
 int main(int argc, char ** argv) {
@@ -581,7 +729,7 @@ int main(int argc, char ** argv) {
             std::string item;
             while (std::getline(list, item, ',')) {
                 int n = std::stoi(item);
-                require(n >= 512 && n <= 8192 && n % 512 == 0, "prompt length must be a multiple of 512 in 512..8192");
+                require(n >= 512 && n <= 8192 && n % chunk_tokens() == 0, "prompt length must be a multiple of the microbatch in 512..8192");
                 lengths.push_back(n);
             }
             require(!lengths.empty(), "no prompt lengths");
@@ -626,7 +774,7 @@ int main(int argc, char ** argv) {
                 request(ctx, state, prompt, length, std::min(generated, 16), mode, -1, vocab, output);
                 for (int rep = 0; rep < reps; ++rep) { request(ctx, state, prompt, length, generated, mode, rep, vocab, output); }
                 llama_free(ctx);
-                llama_ffn_coreml_set_builder(nullptr, nullptr);
+                set_builders(false, nullptr);
             }
             llama_model_free(model);
             uint64_t fallbacks = 0;

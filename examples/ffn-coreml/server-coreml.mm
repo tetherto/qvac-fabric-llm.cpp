@@ -38,6 +38,7 @@ int main(int argc, char ** argv) {
             }
             require(!state.layers.empty(), "no layers in layers.txt");
             llama_ffn_coreml_set_builder(decoder_build, &state);
+            if (std::getenv("LLAMA_QWEN35_HALVES")) { llama_ffn_coreml_set_split_builder(decoder_split_build, &state); }
             fprintf(stderr, "ffn_coreml: %zu layers from %s\n", state.layers.size(), assets);
         } catch (const std::exception & failure) {
             fprintf(stderr, "ffn_coreml: %s\n", failure.what());
