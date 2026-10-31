@@ -29,6 +29,10 @@ void             ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph 
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev);
 void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
 
+#ifdef GGML_METAL_FFN_EXPERIMENT
+void ggml_metal_shared_event(ggml_metal_t ctx, void * event, uint64_t value, bool wait);
+#endif
+
 ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx);
 
 void ggml_metal_set_n_cb            (ggml_metal_t ctx, int n_cb);
