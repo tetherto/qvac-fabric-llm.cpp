@@ -22,6 +22,8 @@ struct stream_ops {
     int                   shim_pushes_before_first_tct = 0;
     std::vector<uint32_t> patch_offsets;                    // the DDR patches' offsets, in stream order
     std::map<int, std::set<uint32_t>> ids_before_first_tct; // shim column -> BD ids written before the first wait
+    int                   shim_pushes = 0;
+    std::vector<int>      shim_pushes_at_tct;               // shim pushes issued when each wait was reached
     int                   max_id = -1;
     size_t                words  = 0;
 };
@@ -58,10 +60,12 @@ void read_op(const std::vector<uint32_t> & w, size_t at, stream_ops & out) {
     const bool     before = out.tcts == 0;
     if (opcode == xdna_txn::OP_TCT) {
         out.tcts++;
+        out.shim_pushes_at_tct.push_back(out.shim_pushes);
     } else if (opcode == xdna_txn::OP_DDR_PATCH) {
         out.patch_offsets.push_back(w[at + 10]);
-    } else if (opcode == xdna_txn::OP_WRITE && reg_row(w[at + 2]) == SHIM_ROW && before) {
-        out.shim_pushes_before_first_tct++;
+    } else if (opcode == xdna_txn::OP_WRITE && reg_row(w[at + 2]) == SHIM_ROW) {
+        out.shim_pushes++;
+        out.shim_pushes_before_first_tct += before ? 1 : 0;
     } else if (opcode == xdna_txn::OP_BLOCKWRITE) {
         const uint32_t reg = w[at + 2] & 0xFFFFF;
         const int      id  = (int) ((reg - xdna_txn::SHIM_BD_BASE) / xdna_txn::SHIM_BD_STRIDE);
@@ -104,6 +108,19 @@ int count_ids(const stream_ops & s) {
     return dup;
 }
 
+// Every wait of sweep k is reached with min(k + window, SWEEPS) sweeps issued: never more in flight than the
+// window, which keeps the ids of sweeps in flight apart, and never fewer.
+bool waits_keep_window(const stream_ops & s, int window) {
+    const int pushes_per_sweep = COLS + A_SHIMS + COLS;
+    for (size_t t = 0; t < s.shim_pushes_at_tct.size(); t++) {
+        const int sweep = (int) t / COLS;
+        if (s.shim_pushes_at_tct[t] != std::min(sweep + window, SWEEPS) * pushes_per_sweep) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int check_window(int window, const stream_ops & base) {
     stream_ops s;
     char       what[96];
@@ -119,6 +136,9 @@ int check_window(int window, const stream_ops & base) {
     failures += check(s.patch_offsets == base.patch_offsets && s.words == base.words, what);
     std::snprintf(what, sizeof(what), "window %d: ids below %d, none shared by sweeps in flight", window, BD_IDS);
     failures += check(s.max_id < BD_IDS && count_ids(s) == window * (COLS * 2 + A_SHIMS), what);
+    std::snprintf(what, sizeof(what), "window %d: every wait keeps %d sweeps in flight, and window %d's do not", window,
+                  window, window + 1);
+    failures += check(waits_keep_window(s, window) && (window == SWEEPS || !waits_keep_window(s, window + 1)), what);
     return failures;
 }
 
