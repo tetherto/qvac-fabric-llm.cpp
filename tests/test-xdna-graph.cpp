@@ -623,12 +623,29 @@ static bool route_matches(const std::vector<float> & want, const std::vector<flo
     return on_array ? *e > 0.0 && *e < tol : *e == 0.0;
 }
 
+typedef int (*host_chunk_count_fn)(void);
+
+// The backend's count of the chunks it ran whole on the host, so a rule that never fires cannot pass on bits alone: the per-group
+// rule leaves the same projections to the host and the same bits show.
+static host_chunk_count_fn host_chunk_counter(ggml_backend_t npu) {
+    auto count = (host_chunk_count_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_host_chunk_count");
+    if (!count) {
+        std::printf("test-xdna-graph: the backend has no host chunk count\n");
+    }
+    return count;
+}
+
 // The host's prefill rule for the commands of the array: one of 2 to 128 rows goes to the host when the host's products of
 // everything the command carries (the projections of one activation) are quicker than the command, in the CPU backend's own
 // bits whatever the weight type (the bf16 GEMM does not take it either); more rows, or a command the host does not beat, is
 // the array's. One row is a decode's, which the rule leaves alone. The chunk rule is off here; the graphs stay allocated to
 // the end because the packed weights are keyed by the tensors' addresses, which a freed one hands on.
 static bool test_pgemm_host_rule(ggml_backend_t npu, ggml_backend_t cpu, double tol) {
+    const host_chunk_count_fn chunks = host_chunk_counter(npu);
+    if (!chunks) {
+        return false;
+    }
     setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
     const route_case cases[] = {
         { "Q8_0, 15 rows: the host",                         GGML_TYPE_Q8_0, 15,  1024, 1024, 1, false },
@@ -648,7 +665,9 @@ static bool test_pgemm_host_rule(ggml_backend_t npu, ggml_backend_t cpu, double 
         if (c.per_op_decode) {
             setenv("GGML_XDNA_FUSED_LAYER", "0", 1);
         }
-        const bool computed = run(g, cpu, want) && run(g, npu, got);
+        const int  chunks_before = chunks();
+        const bool computed      = run(g, cpu, want) && run(g, npu, got);
+        const int  chunks_fired  = chunks() - chunks_before;
         unsetenv("GGML_XDNA_FUSED_LAYER");
         if (!computed) {
             std::printf("test-xdna-graph: compute failed\n");
@@ -656,7 +675,8 @@ static bool test_pgemm_host_rule(ggml_backend_t npu, ggml_backend_t cpu, double 
         }
         for (size_t i = 0; i < g.checked.size(); i++) {
             double     e;
-            const bool ok = ggml_backend_supports_op(npu, g.checked[i]) && route_matches(want[i], got[i], c.on_array, tol, &e);
+            const bool ok = ggml_backend_supports_op(npu, g.checked[i]) && route_matches(want[i], got[i], c.on_array, tol, &e) &&
+                            chunks_fired == 0;
             passed        = passed && ok;
             std::printf("MUL_MAT host rule, %-50s nmse %.3g %s\n", c.name, e, ok ? "ok" : "FAIL");
         }
@@ -696,6 +716,10 @@ static norm_graph build_chain(ggml_backend_t cpu, enum ggml_type wtype, int64_t 
 // (one CPU graph: the CPU backend's own bits), and keeps its commands when they cost less; GGML_XDNA_HOST_CHUNK=0 and
 // GGML_XDNA_PGEMM_HOST=0 leave every projection to the array.
 static bool test_host_chunk_rule(ggml_backend_t npu, ggml_backend_t cpu, double tol) {
+    const host_chunk_count_fn chunks = host_chunk_counter(npu);
+    if (!chunks) {
+        return false;
+    }
     struct chunk_case {
         const char *   name;
         enum ggml_type wtype;
@@ -721,7 +745,9 @@ static bool test_host_chunk_rule(ggml_backend_t npu, ggml_backend_t cpu, double 
         graphs.push_back(build_chain(cpu, c.wtype, c.M, c.K, c.N, 3));
         norm_graph &                    g = graphs.back();
         std::vector<std::vector<float>> want, got;
+        const int                       before   = chunks();
         const bool                      computed = run(g, cpu, want) && run(g, npu, got);
+        const int                       fired    = chunks() - before;
         unsetenv("GGML_XDNA_HOST_CHUNK");
         unsetenv("GGML_XDNA_PGEMM_HOST");
         if (!computed) {
@@ -729,9 +755,9 @@ static bool test_host_chunk_rule(ggml_backend_t npu, ggml_backend_t cpu, double 
             return false;
         }
         double     e;
-        const bool ok = route_matches(want[0], got[0], c.on_array, tol, &e);
+        const bool ok = route_matches(want[0], got[0], c.on_array, tol, &e) && fired == (c.on_array ? 0 : 1);
         passed        = passed && ok;
-        std::printf("chunk host rule, %-46s nmse %.3g %s\n", c.name, e, ok ? "ok" : "FAIL");
+        std::printf("chunk host rule, %-46s nmse %.3g, %d host chunks %s\n", c.name, e, fired, ok ? "ok" : "FAIL");
     }
     for (norm_graph & g : graphs) {
         ggml_backend_buffer_free(g.buf);
@@ -1184,16 +1210,22 @@ static norm_graph build_conv_input(ggml_backend_t cpu, int64_t M, int64_t K, int
 }
 
 static bool test_host_chunk_conv_kernels(ggml_backend_t npu, ggml_backend_t cpu) {
+    const host_chunk_count_fn chunks = host_chunk_counter(npu);
+    if (!chunks) {
+        return false;
+    }
     norm_graph g = build_conv_input(cpu, 15, 512, 1024, 4);
     std::vector<std::vector<float>> want, got;
+    const int                       before = chunks();
     if (!run(g, cpu, want) || !run(g, npu, got)) {
         std::printf("test-xdna-graph: compute failed\n");
         return false;
     }
-    const double e  = nmse(want[0], got[0]);
-    const bool   ok = e == 0.0;
-    std::printf("chunk host rule, conv input of 15 rows on the backend's concat and SSM_CONV      nmse %.3g %s\n", e,
-                ok ? "ok" : "FAIL");
+    const int    fired = chunks() - before;
+    const double e     = nmse(want[0], got[0]);
+    const bool   ok    = e == 0.0 && fired == 1;
+    std::printf("chunk host rule, conv input of 15 rows on the backend's concat and SSM_CONV      nmse %.3g, %d host chunks %s\n", e,
+                fired, ok ? "ok" : "FAIL");
     ggml_backend_buffer_free(g.buf);
     ggml_free(g.ctx);
     return ok;

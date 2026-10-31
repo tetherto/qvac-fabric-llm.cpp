@@ -664,11 +664,19 @@ static bool xdna_host_chunk_kernel_run(struct ggml_tensor * node) {
     }
 }
 
+// Test hook (ggml_backend_xdna_test_host_chunk_count): the chunks that ran whole on the host.
+static std::atomic<int> g_host_chunks{ 0 };
+
+static int xdna_test_host_chunk_count(void) {
+    return g_host_chunks;
+}
+
 static enum ggml_status xdna_host_chunk_run(struct ggml_cgraph * cgraph) {
     ggml_backend_t cpu = xdna_glue_cpu();
     if (cpu == nullptr) {
         return GGML_STATUS_FAILED;
     }
+    g_host_chunks++;
     // the kernels' regions take the chunk's team: regions of two sizes make the OpenMP runtime rebuild its team at every switch
     g_xdna_chunk_threads.store(xdna_host_prompt_team(), std::memory_order_relaxed);
     ggml_backend_cpu_set_n_threads(cpu, xdna_host_prompt_team());
@@ -5321,6 +5329,9 @@ static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const c
     }
     if (std::strcmp(name, "ggml_backend_xdna_test_gemm_count") == 0) {
         return (void *) xdna_ops_test_gemm_count;
+    }
+    if (std::strcmp(name, "ggml_backend_xdna_test_host_chunk_count") == 0) {
+        return (void *) xdna_test_host_chunk_count;
     }
     return NULL;
 }
