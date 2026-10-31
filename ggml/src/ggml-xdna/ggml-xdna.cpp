@@ -4714,7 +4714,7 @@ static std::vector<int> xdna_group_from(const xdna_ops * ops, const struct ggml_
     for (size_t k = first + 1; k < candidates.size(); k++) {
         mm.push_back(graph->nodes[candidates[k]]);
         if (!(xdna_pgemm_group_supported(mm.data(), (int) mm.size()) ||
-              xdna_ops_gemm_group_supported(ops, mm.data(), (int) mm.size())) ||
+              xdna_ops_gemm_group_shape_supported(ops, mm.data(), (int) mm.size())) ||
             !xdna_can_move_up(graph, pos, group[0], candidates[k])) {
             break;
         }
@@ -5241,6 +5241,9 @@ static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const c
     }
     if (std::strcmp(name, "ggml_backend_xdna_test_rerun_count") == 0) {
         return (void *) xdna_ops_test_rerun_count;
+    }
+    if (std::strcmp(name, "ggml_backend_xdna_test_gemm_count") == 0) {
+        return (void *) xdna_ops_test_gemm_count;
     }
     return NULL;
 }

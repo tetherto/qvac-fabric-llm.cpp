@@ -298,13 +298,13 @@ static void gemm_pack_weight(const struct ggml_tensor * src0, int K, int N, int 
     }
 }
 
-// Tells the set of weights packed side by side from the first one alone.
-static size_t gemm_weights_tag(struct ggml_tensor * const * nodes, int n) {
-    size_t tag = 0;
+// The weights packed beside the first one, and their columns.
+static std::vector<std::pair<const void *, int64_t>> gemm_weights_rest(struct ggml_tensor * const * nodes, int n) {
+    std::vector<std::pair<const void *, int64_t>> rest;
     for (int i = 1; i < n; i++) {
-        tag = tag * 1000003 + std::hash<const void *>{}(nodes[i]->src[0]->data) + (size_t) nodes[i]->src[0]->ne[1];
+        rest.emplace_back(nodes[i]->src[0]->data, nodes[i]->src[0]->ne[1]);
     }
-    return tag;
+    return rest;
 }
 
 // The columns of the projections of `nodes`, one after the other.
@@ -322,7 +322,7 @@ static void gemm_pack_weights(struct ggml_tensor * const * nodes, int n, int K, 
 // first use. Weights are immutable, so the transpose + bf16 conversion runs
 // once.
 static xdna_buffer * gemm_weight_bo(xdna_ops * ops, struct ggml_tensor * const * nodes, int n, int K, int N) {
-    const xdna_ops::weight_key key = { nodes[0]->src[0]->data, K, N, gemm_weights_tag(nodes, n) };
+    const xdna_ops::weight_key key = { nodes[0]->src[0]->data, K, N, gemm_weights_rest(nodes, n) };
     {
         std::lock_guard<std::mutex> lock(ops->weight_mutex);
         auto                        it = ops->weight_bo.find(key);
@@ -788,6 +788,8 @@ static const int GEMM_RERUNS = 2;
 static std::atomic<int> g_test_lose_blocks{ 0 };
 static std::atomic<int> g_test_lose_times{ 0 };
 static std::atomic<int> g_gemm_reruns{ 0 };
+// Test hook (xdna_ops_test_gemm_count): bf16 GEMM calls, one a group or a lone projection.
+static std::atomic<int> g_gemm_calls{ 0 };
 
 void xdna_ops_test_lose_c_lines(int blocks, int times) {
     g_test_lose_times  = times;
@@ -796,6 +798,10 @@ void xdna_ops_test_lose_c_lines(int blocks, int times) {
 
 int xdna_ops_test_rerun_count(void) {
     return g_gemm_reruns;
+}
+
+int xdna_ops_test_gemm_count(void) {
+    return g_gemm_calls;
 }
 
 static int gemm_injected_losses() {
@@ -924,6 +930,7 @@ static std::vector<xdna_ops::pending_out> gemm_outs_of(struct ggml_tensor * cons
 // C readback overlaps the GEMM. The last few runs are finished in
 // xdna_ops_finalize().
 static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * const * nodes, int n_nodes) {
+    g_gemm_calls++;
     const struct ggml_tensor * src1 = nodes[0]->src[1];
 
     const int M = (int) src1->ne[1];
@@ -1317,58 +1324,28 @@ void xdna_ops_plan_gemv(xdna_ops *                                             o
     }
 }
 
-static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
-    if (op->op != GGML_OP_MUL_MAT) {
-        return false;
-    }
+static bool gemm_quantized_type(enum ggml_type t) {
+    return t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K;
+}
 
+static bool gemm_bf16_type(enum ggml_type t) {
+    return t == GGML_TYPE_BF16 || t == GGML_TYPE_F16 || t == GGML_TYPE_Q4_K;
+}
+
+// Native int8 prefill route for quantized weights when the artifact exists.
+static bool gemm_uses_i8(const xdna_ops * ops, const struct ggml_tensor * op) {
+    return gemm_quantized_type(op->src[0]->type) && op->src[1]->ne[1] >= GEMM_M_BIG_MIN && !ops->i8_xclbin.empty();
+}
+
+// The GEMM's checks of shape, type and geometry on a route, none of a
+// compute's plans.
+static bool gemm_shape_supported(const xdna_ops * ops, const struct ggml_tensor * op, bool use_i8) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
-    if (!src0 || !src1) {
-        return false;
-    }
-
-    const int K = (int) src1->ne[0];
-    const int N = (int) src0->ne[1];
-    const int M = (int) src1->ne[1];
-
-    // Decode shapes with a GEMV artifact take that route regardless of the
-    // GEMM geometry - but only when a GEMV dispatch is actually planned for
-    // them, which is what ops->fused_gemv decides (xdna_ops_plan_gemv). Without
-    // one, the op is carried by the bf16 GEMM below, and that GEMM packs
-    // BF16/F16/Q4_K only: a Q5_K/Q6_K weight claimed here would run the GEMM
-    // against the zero-filled weight buffer gemm_weight_bo leaves behind, so
-    // the projection would read as exactly zero. Hence the planner's split
-    // too: a geometry the fused split cannot carry is not grouped either.
-    if (ops->fused_gemv && xdna_gemv_geom_for(op, nullptr, XDNA_GEMV_SPLIT_FUSED).valid()) {
-        return true;
-    }
-    // Quantized prefill weights: the whole-array GEMM on the decode's tile format.
-    if (xdna_pgemm_supported(op)) {
-        return true;
-    }
-
-    if (ops->gemm_xclbin_decode.empty()) {
-        return false;
-    }
-    if (M <= 0) {
-        return false;
-    }
-    const bool prefill_m = M >= GEMM_M_BIG_MIN;
-    const bool is_q      = src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K;
-    // Native int8 prefill route for quantized weights when the artifact exists.
-    const bool use_i8    = is_q && prefill_m && !ops->i8_xclbin.empty();
-    // bf16 route: BF16/F16 at any M, Q4_K falls back to bf16 when the int8
-    // artifact is absent or for decode-sized batches. Q5_K/Q6_K have no bf16
-    // dequant path here, so only the int8 prefill route covers them.
-    const bool use_bf16 =
-        !use_i8 && (src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_Q4_K);
-    if (!use_i8 && !use_bf16) {
-        return false;
-    }
-    if (use_bf16 && ops->gemm_host.count(op) != 0) {
-        return false;
-    }
+    const int                  K    = (int) src1->ne[0];
+    const int                  N    = (int) src0->ne[1];
+    const int                  M    = (int) src1->ne[1];
+    const bool                 is_q = gemm_quantized_type(src0->type);
     // The stream is always built for the baked M block, so the geometry check
     // is on the block M; op M is tiled into blocks.
     const xdna_gemm_geom geom = xdna_pick_geom(ops, M, K, N, use_i8);
@@ -1402,6 +1379,66 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     }
 
     return true;
+}
+
+static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
+    if (op->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * src1 = op->src[1];
+    if (!src0 || !src1) {
+        return false;
+    }
+
+    const int M = (int) src1->ne[1];
+
+    // Decode shapes with a GEMV artifact take that route regardless of the
+    // GEMM geometry - but only when a GEMV dispatch is actually planned for
+    // them, which is what ops->fused_gemv decides (xdna_ops_plan_gemv). Without
+    // one, the op is carried by the bf16 GEMM below, and that GEMM packs
+    // BF16/F16/Q4_K only: a Q5_K/Q6_K weight claimed here would run the GEMM
+    // against the zero-filled weight buffer gemm_weight_bo leaves behind, so
+    // the projection would read as exactly zero. Hence the planner's split
+    // too: a geometry the fused split cannot carry is not grouped either.
+    if (ops->fused_gemv && xdna_gemv_geom_for(op, nullptr, XDNA_GEMV_SPLIT_FUSED).valid()) {
+        return true;
+    }
+    // Quantized prefill weights: the whole-array GEMM on the decode's tile format.
+    if (xdna_pgemm_supported(op)) {
+        return true;
+    }
+
+    if (ops->gemm_xclbin_decode.empty()) {
+        return false;
+    }
+    if (M <= 0) {
+        return false;
+    }
+    const bool use_i8 = gemm_uses_i8(ops, op);
+    // bf16 route: BF16/F16 at any M, Q4_K falls back to bf16 when the int8
+    // artifact is absent or for decode-sized batches. Q5_K/Q6_K have no bf16
+    // dequant path here, so only the int8 prefill route covers them.
+    const bool use_bf16 = !use_i8 && gemm_bf16_type(src0->type);
+    if (!use_i8 && !use_bf16) {
+        return false;
+    }
+    if (use_bf16 && ops->gemm_host.count(op) != 0) {
+        return false;
+    }
+    return gemm_shape_supported(ops, op, use_i8);
+}
+
+// The bf16 GEMM takes `node` by its shape alone. graph_optimize asks this
+// outside any compute; the compute groups again with its own plans.
+static bool gemm_bf16_shape_supported(const xdna_ops * ops, const struct ggml_tensor * node) {
+    if (node->op != GGML_OP_MUL_MAT || !node->src[0] || !node->src[1] || ops->gemm_xclbin_decode.empty() ||
+        node->src[1]->ne[1] <= 0) {
+        return false;
+    }
+    return !xdna_pgemm_supported(node) && !gemm_uses_i8(ops, node) && gemm_bf16_type(node->src[0]->type) &&
+           gemm_shape_supported(ops, node, false);
 }
 
 // --- bf16 GEMM or host ------------------------------------------------------
@@ -1511,26 +1548,36 @@ void xdna_ops_plan_gemm(xdna_ops * ops, const struct ggml_cgraph * cgraph) {
 // 512 columns, and the host pays one A layout, one pipeline fill and one drain
 // for the group instead of one for each projection.
 
-static bool gemm_group_member_ok(const xdna_ops * ops, const struct ggml_tensor * first, const struct ggml_tensor * t) {
-    return gemm_on_bf16_design(ops, t) && t->src[1] == first->src[1] && t->src[1]->ne[2] * t->src[1]->ne[3] == 1;
-}
+typedef bool (*gemm_member_fn)(const xdna_ops * ops, const struct ggml_tensor * node);
 
-// --- public API -------------------------------------------------------------
-
-bool xdna_ops_gemm_group_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n) {
-    if (n < 2 || xdna_env_int("GGML_XDNA_GEMM_GROUP", 1) == 0) {
-        return false;
-    }
+static bool gemm_group_members_ok(const xdna_ops * ops, struct ggml_tensor * const * mm, int n, gemm_member_fn member) {
     for (int i = 0; i < n; i++) {
-        if (!gemm_group_member_ok(ops, mm[0], mm[i])) {
+        if (!member(ops, mm[i]) || mm[i]->src[1] != mm[0]->src[1] || mm[i]->src[1]->ne[2] * mm[i]->src[1]->ne[3] != 1) {
             return false;
         }
+    }
+    return true;
+}
+
+static bool gemm_group_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n, gemm_member_fn member) {
+    if (n < 2 || xdna_env_int("GGML_XDNA_GEMM_GROUP", 1) == 0 || !gemm_group_members_ok(ops, mm, n, member)) {
+        return false;
     }
     const int            M    = (int) mm[0]->src[1]->ne[1];
     const int            K    = (int) mm[0]->src[1]->ne[0];
     const int            N    = gemm_group_cols(mm, n);
     const xdna_gemm_geom geom = xdna_pick_geom(ops, M, K, N, /* want_i8 */ false);
     return N <= GEMM_N_MAX && geom.xclbin && xdna_gemm_seq_supported(&geom.tiles, geom.tiles.M, K, N);
+}
+
+// --- public API -------------------------------------------------------------
+
+bool xdna_ops_gemm_group_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n) {
+    return gemm_group_supported(ops, mm, n, gemm_on_bf16_design);
+}
+
+bool xdna_ops_gemm_group_shape_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n) {
+    return gemm_group_supported(ops, mm, n, gemm_bf16_shape_supported);
 }
 
 bool xdna_ops_compute_group(xdna_ops * ops, struct ggml_tensor * const * mm, int n) {

@@ -15,6 +15,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 struct ggml_tensor;
@@ -55,15 +56,17 @@ struct xdna_ops {
     // number of GEMM_K_RUN runs). Weights are immutable, so the pack
     // (transpose + bf16 conversion) is done once per tensor and reused;
     // kernels point into it via B offsets. Projections run as one GEMM are
-    // packed side by side along N; `tag` tells their set from the first
-    // weight's alone (0 for one weight).
+    // packed side by side along N; `rest` lists the weights after the first
+    // and their columns (empty for one weight).
     struct weight_key {
-        const void * data = nullptr;
-        int          K    = 0;
-        int          N    = 0;
-        size_t       tag  = 0;
+        const void *                                  data = nullptr;
+        int                                           K    = 0;
+        int                                           N    = 0;
+        std::vector<std::pair<const void *, int64_t>> rest;
 
-        bool operator==(const weight_key & o) const { return data == o.data && K == o.K && N == o.N && tag == o.tag; }
+        bool operator==(const weight_key & o) const {
+            return data == o.data && K == o.K && N == o.N && rest == o.rest;
+        }
     };
 
     struct weight_hash {
@@ -71,7 +74,6 @@ struct xdna_ops {
             size_t h = std::hash<const void *>{}(k.data);
             h        = h * 31 + (size_t) k.K;
             h        = h * 31 + (size_t) k.N;
-            h        = h * 31 + k.tag;
             return h;
         }
     };
@@ -200,6 +202,10 @@ bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op);
 // own node.
 bool xdna_ops_gemm_group_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n);
 
+// The same by shape, type and geometry alone, none of a compute's plans:
+// graph_optimize runs outside any compute, which groups again with its plans.
+bool xdna_ops_gemm_group_shape_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n);
+
 // Submit the projections of a supported group as one GEMM; xdna_ops_finalize
 // writes every output. False on failure, with nothing pending.
 bool xdna_ops_compute_group(xdna_ops * ops, struct ggml_tensor * const * mm, int n);
@@ -217,3 +223,4 @@ bool xdna_ops_finalize(xdna_ops * ops);
 // line poisoned again `times` times each, as a write that did not land would leave it; the re-runs so far.
 void xdna_ops_test_lose_c_lines(int blocks, int times);
 int  xdna_ops_test_rerun_count(void);
+int  xdna_ops_test_gemm_count(void);

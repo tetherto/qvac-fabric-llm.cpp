@@ -791,10 +791,19 @@ static bool test_group(ggml_backend_t npu, ggml_backend_t cpu, const std::vector
     return passed;
 }
 
+typedef int (*gemm_count_fn)(void);
+
 // The outputs of a group of bf16 projections with the group on and off (GGML_XDNA_GEMM_GROUP=0):
 // each column of C depends on its own weights and the activation only, so the two are the same bits,
-// and a slice put in the wrong node or at the wrong column shows
+// and a slice put in the wrong node or at the wrong column shows. The group is one bf16 GEMM call,
+// one by one is a call each.
 static bool test_group_matches_one_by_one(ggml_backend_t npu, const std::vector<int64_t> & ns, int64_t M) {
+    auto calls = (gemm_count_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_gemm_count");
+    if (!calls) {
+        std::printf("test-xdna-graph: the backend has no GEMM call count\n");
+        return false;
+    }
     ggml_tensor *                   guard_a = nullptr;
     ggml_tensor *                   guard_b = nullptr;
     norm_graph                      grouped = build_group(npu, ns, M, &guard_a, GGML_TYPE_BF16);
@@ -802,21 +811,25 @@ static bool test_group_matches_one_by_one(ggml_backend_t npu, const std::vector<
     set_inputs(grouped, 1234);
     set_inputs(single, 1234);
     setenv("GGML_XDNA_GEMM_GROUP", "1", 1);
-    bool ok = ggml_backend_graph_compute(npu, grouped.gf) == GGML_STATUS_SUCCESS;
+    const int before = calls();
+    bool      ok     = ggml_backend_graph_compute(npu, grouped.gf) == GGML_STATUS_SUCCESS;
+    const int group  = calls() - before;
     setenv("GGML_XDNA_GEMM_GROUP", "0", 1);
-    ok = ok && ggml_backend_graph_compute(npu, single.gf) == GGML_STATUS_SUCCESS;
+    ok               = ok && ggml_backend_graph_compute(npu, single.gf) == GGML_STATUS_SUCCESS;
+    const int alone  = calls() - before - group;
     unsetenv("GGML_XDNA_GEMM_GROUP");
     bool same = ok;
     for (size_t i = 0; ok && i < grouped.checked.size(); i++) {
         same = same && get_f32(grouped.checked[i]) == get_f32(single.checked[i]);
     }
-    std::printf("MUL_MAT BF16 group of %zu, M %-4lld one by one: %s %s\n", ns.size(), (long long) M,
-                same ? "bit-identical" : "DIFFERENT", same ? "ok" : "FAIL");
+    const bool runs = group == 1 && alone == (int) ns.size();
+    std::printf("MUL_MAT BF16 group of %zu, M %-4lld one by one: %s, GEMM calls %d and %d %s\n", ns.size(),
+                (long long) M, same ? "bit-identical" : "DIFFERENT", group, alone, same && runs ? "ok" : "FAIL");
     ggml_backend_buffer_free(grouped.buf);
     ggml_backend_buffer_free(single.buf);
     ggml_free(grouped.ctx);
     ggml_free(single.ctx);
-    return same;
+    return same && runs;
 }
 
 // x (K x M) through Q8_0 projections of `ns[i]` rows each, an RMS_NORM after every one and the
