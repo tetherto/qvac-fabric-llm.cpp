@@ -14,6 +14,7 @@
 #include "xdna-util.h"
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -783,6 +784,27 @@ static bool gemm_fold_c(xdna_buffer *                   bo_c,
 // the op fails.
 static const int GEMM_RERUNS = 2;
 
+// Test hook (xdna_ops_test_lose_c_lines): the next folded blocks lose their first C line this many times each.
+static std::atomic<int> g_test_lose_blocks{ 0 };
+static std::atomic<int> g_test_lose_times{ 0 };
+static std::atomic<int> g_gemm_reruns{ 0 };
+
+void xdna_ops_test_lose_c_lines(int blocks, int times) {
+    g_test_lose_times  = times;
+    g_test_lose_blocks = blocks;
+}
+
+int xdna_ops_test_rerun_count(void) {
+    return g_gemm_reruns;
+}
+
+static int gemm_injected_losses() {
+    int blocks = g_test_lose_blocks.load();
+    while (blocks > 0 && !g_test_lose_blocks.compare_exchange_weak(blocks, blocks - 1)) {
+    }
+    return blocks > 0 ? g_test_lose_times.load() : 0;
+}
+
 static bool gemm_rerun(xdna_ops::pending_run & pr, int mc, int N) {
     gemm_mark_c(pr.bo_c, mc, N);
     xdna_buffer * args[3] = { pr.bo_a, pr.bo_w, pr.bo_c };
@@ -798,18 +820,25 @@ static bool gemm_fold_run(const xdna_ops::pending_op & op, xdna_ops::pending_run
         const int64_t ld = out.node->nb[1] / sizeof(float);
         slices.push_back({ (float *) out.node->data + (size_t) (op.m_off + mb.m0) * ld, ld, out.n0, out.n });
     }
+    const int         inj = gemm_injected_losses();
     std::vector<char> lost;
-    for (int attempt = 0; !gemm_fold_c(pr.bo_c, mc, op.N, slices, pr.accumulate, lost); attempt++) {
+    for (int attempt = 0;; attempt++) {
+        if (attempt < inj) {
+            xdna_buffer_mark(pr.bo_c, 64, GEMM_C_GUARD);
+        }
+        if (gemm_fold_c(pr.bo_c, mc, op.N, slices, pr.accumulate, lost)) {
+            return true;
+        }
         if (attempt == GEMM_RERUNS) {
             return false;
         }
         GGML_LOG_WARN("%s: %zu of %zu row chunks of a GEMM block did not land; running the block again\n", "xdna-ops",
                       (size_t) std::count(lost.begin(), lost.end(), 1), lost.size());
+        g_gemm_reruns++;
         if (!gemm_rerun(pr, mc, op.N)) {
             return false;
         }
     }
-    return true;
 }
 
 // The kernel for a run of m_rows rows at weight row k0: the stream is built on

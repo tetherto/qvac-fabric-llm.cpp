@@ -212,3 +212,8 @@ bool xdna_ops_compute(xdna_ops * ops, struct ggml_tensor * node);
 // Wait all pending submissions, read C back, accumulate K-blocks, write dst,
 // and release buffers. Safe to call when nothing is pending.
 bool xdna_ops_finalize(xdna_ops * ops);
+
+// Test hooks, reached through the registry's proc addresses: the next `blocks` folded bf16 GEMM blocks have their first C
+// line poisoned again `times` times each, as a write that did not land would leave it; the re-runs so far.
+void xdna_ops_test_lose_c_lines(int blocks, int times);
+int  xdna_ops_test_rerun_count(void);
