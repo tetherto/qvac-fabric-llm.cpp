@@ -715,7 +715,7 @@ static void gemm_mark_c(xdna_buffer * bo_c, int mc, int N) {
 #pragma omp parallel for num_threads(xdna_chunk_threads()) if (mc >= GEMM_TEAM_MIN_ROWS)
     for (int m0 = 0; m0 < mc; m0 += GEMM_ROWS_PER_TASK) {
         const int rows = std::min(GEMM_ROWS_PER_TASK, mc - m0);
-        xdna_buffer_mark(bo_c, rows * row_bytes, GEMM_C_GUARD + m0 * row_bytes);
+        xdna_buffer_mark_bulk(bo_c, rows * row_bytes, GEMM_C_GUARD + m0 * row_bytes);
     }
 }
 
