@@ -361,8 +361,15 @@ static bool decoder_resident_compute(ggml_backend_t backend, ggml_tensor * dst, 
 static ggml_tensor * decoder_build(ggml_context * ctx, ggml_tensor * input, ggml_tensor * residual, int layer, void * userdata) {
     auto & state = *static_cast<decoder_state *>(userdata);
     auto found = state.layers.find(layer);
-    if (found == state.layers.end() || input->type != GGML_TYPE_F32 || input->ne[0] != 5120 || input->ne[1] != 512 || input->ne[2] != 1 || input->ne[3] != 1) { return nullptr; }
-    return ggml_map_custom2(ctx, input, residual, decoder_compute, 1, found->second.get());
+    if (found == state.layers.end() || input->type != GGML_TYPE_F32 || input->ne[0] != 5120 || input->ne[2] != 1 || input->ne[3] != 1) { return nullptr; }
+    // a partial microbatch of at least FFN_COREML_PAD_MIN rows is padded with zero rows to the 512 rows of the
+    // Core ML programs; smaller ones stay on Metal
+    static const int pad_min = std::getenv("FFN_COREML_PAD_MIN") ? std::atoi(std::getenv("FFN_COREML_PAD_MIN")) : 256;
+    const int rows = input->ne[1];
+    if (rows == 512) { return ggml_map_custom2(ctx, input, residual, decoder_compute, 1, found->second.get()); }
+    if (rows > 512 || rows < pad_min || !gpu_resident) { return nullptr; }
+    auto * padded = ggml_map_custom2(ctx, ggml_pad(ctx, input, 0, 512 - rows, 0, 0), ggml_pad(ctx, residual, 0, 512 - rows, 0, 0), decoder_compute, 1, found->second.get());
+    return ggml_view_2d(ctx, padded, 5120, rows, padded->nb[1], 0);
 }
 
 static llama_context * make_context(llama_model * model, int context, decoder_state & state, bool split) {
