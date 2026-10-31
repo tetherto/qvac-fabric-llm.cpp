@@ -6,6 +6,7 @@
 #include "xdna-conv-prefill.h"
 #include "xdna-gdn-mm.h"
 #include "xdna-gemv.h"
+#include "xdna-host-cost.h"
 #include "xdna-norm.h"
 #include "xdna-pgemm.h"
 #include "xdna-prof.h"
@@ -22,6 +23,8 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // --- GEMM internals (static) ------------------------------------------------
@@ -1409,6 +1412,10 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     if (xdna_pgemm_supported(op)) {
         return true;
     }
+    // The plan leaves it to the host: not the bf16 GEMM below either, which would pack the weight.
+    if (xdna_pgemm_host_planned(op)) {
+        return false;
+    }
 
     if (ops->gemm_xclbin_decode.empty()) {
         return false;
@@ -1437,7 +1444,7 @@ static bool gemm_bf16_shape_supported(const xdna_ops * ops, const struct ggml_te
         node->src[1]->ne[1] <= 0) {
         return false;
     }
-    return !xdna_pgemm_supported(node) && !gemm_uses_i8(ops, node) && gemm_bf16_type(node->src[0]->type) &&
+    return !xdna_pgemm_shape_supported(node) && !gemm_uses_i8(ops, node) && gemm_bf16_type(node->src[0]->type) &&
            gemm_shape_supported(ops, node, false);
 }
 
@@ -1447,16 +1454,13 @@ static bool gemm_bf16_shape_supported(const xdna_ops * ops, const struct ggml_te
 // (a quantized model's few bf16 weights among its pgemm ones) costs the array
 // two hardware-context switches on top of its own run. EmbeddingGemma 2's
 // per_layer_model_proj, K 512 and N 12288 among pgemm commands, takes 3.0 ms
-// of the array at 15 tokens and 0.4 ms of the host's four threads, 3.3 against
-// 0.75 ms at 132 and 6.1 against 4.4 ms at 912 (16 threads), and the pass is
-// 7.6 ms shorter at 15 tokens with it on the host. A projection among
-// bf16 ones pays no switch and keeps the array.
+// of the array at 15 tokens and 0.43 ms of the host's four threads, 0.16 on
+// sixteen; at 132 rows 3.3 against 1.6 (four) and 0.61 ms (sixteen). A
+// projection among bf16 ones pays no switch and keeps the array. The host's
+// time is xdna-host-cost.h's.
 
 // One hardware-context switch (probes/attn_probe.cpp --proj).
 static const double GEMM_SWITCH_MS = 2.5;
-// ggml-cpu, bf16 weights against f32 activations: 0.5 TFLOPS on 4 threads,
-// 2.2 to 2.6 on 16.
-static const double GEMM_HOST_FLOPS_PER_THREAD = 1.5e11;
 // A run of the array: ~0.1 ms whatever its size, and ~23 us for a sweep of
 // rows across 512 columns of N (the weights are read again by every sweep).
 static const double GEMM_RUN_FLOOR_MS  = 0.10;
@@ -1475,11 +1479,7 @@ static int gemm_sweeps(const xdna_gemm_tiles & t, int M, int * blocks) {
     return sweeps;
 }
 
-static double gemm_device_ms(const xdna_ops * ops, const struct ggml_tensor * node) {
-    const int M = (int) node->src[1]->ne[1];
-    const int K = (int) node->src[1]->ne[0];
-    const int N = (int) node->src[0]->ne[1];
-
+static double gemm_device_ms(const xdna_ops * ops, int M, int K, int N) {
     const xdna_gemm_geom geom = xdna_pick_geom(ops, M, K, N, /* want_i8 */ false);
     int                  blocks = 0;
     const int            sweeps = gemm_sweeps(geom.tiles, M, &blocks);
@@ -1487,9 +1487,11 @@ static double gemm_device_ms(const xdna_ops * ops, const struct ggml_tensor * no
     return k_runs * (blocks * GEMM_RUN_FLOOR_MS + sweeps * (N / GEMM_TILE_N_COLS) * GEMM_SWEEP_TILE_MS);
 }
 
+// The host's time for `node` on the chunk's team; infinite when no fit covers its weight type, which keeps it on the array.
 static double gemm_host_ms(const struct ggml_tensor * node) {
-    const double flops = 2.0 * (double) node->src[1]->ne[1] * (double) node->src[1]->ne[0] * (double) node->src[0]->ne[1];
-    return flops / (xdna_chunk_threads() * GEMM_HOST_FLOPS_PER_THREAD) * 1e3;
+    const double ms = xdna_host_mul_mat_ms(node->src[0]->type, xdna_chunk_threads(), node->src[1]->ne[1], node->src[1]->ne[0],
+                                           node->src[0]->ne[1]);
+    return ms >= 0.0 ? ms : INFINITY;
 }
 
 namespace {
@@ -1503,7 +1505,7 @@ struct npu_command {
 }  // namespace
 
 static bool gemm_on_bf16_design(const xdna_ops * ops, const struct ggml_tensor * node) {
-    return node->op == GGML_OP_MUL_MAT && !ops->gemv_group_of.count(node) && !xdna_pgemm_supported(node) &&
+    return node->op == GGML_OP_MUL_MAT && !ops->gemv_group_of.count(node) && !xdna_pgemm_shape_supported(node) &&
            !xdna_int8_eligible(ops, node) && gemm_supported(ops, node);
 }
 
@@ -1518,26 +1520,244 @@ static std::vector<npu_command> npu_commands_of(const xdna_ops * ops, const stru
     return cmds;
 }
 
-// Switches a command pays: one in from its predecessor's design and one out to
-// its successor's. The commands of a graph repeat with the next one, so the
-// first follows the last.
-static int gemm_switches(const std::vector<npu_command> & cmds, size_t i) {
+// Switches a run of bf16 commands, cmds[first, last), pays: one in from the command before it and one out to the one after, which
+// are another design's. The commands of a graph repeat with the next one, so the first follows the last; a graph of bf16
+// commands only pays none.
+static int gemm_run_switches(const std::vector<npu_command> & cmds, size_t first, size_t last) {
     const size_t n = cmds.size();
-    return (!cmds[(i + n - 1) % n].bf16) + (!cmds[(i + 1) % n].bf16);
+    if (last - first == n) {
+        return 0;
+    }
+    return (!cmds[(first + n - 1) % n].bf16) + (!cmds[last % n].bf16);
 }
 
+// The host's time and the array's for the run, switches apart.
+static void gemm_run_costs(const xdna_ops * ops, const std::vector<npu_command> & cmds, size_t first, size_t last, double * host_ms,
+                           double * device_ms) {
+    *host_ms = *device_ms = 0.0;
+    for (size_t i = first; i < last; i++) {
+        const struct ggml_tensor * node = cmds[i].node;
+        *host_ms += gemm_host_ms(node);
+        *device_ms += gemm_device_ms(ops, (int) node->src[1]->ne[1], (int) node->src[1]->ne[0], (int) node->src[0]->ne[1]);
+    }
+}
+
+// A run of bf16 commands among another design's goes whole to the host or stays whole: moving one of two neighbours would
+// leave the other to pay the switches.
 void xdna_ops_plan_gemm(xdna_ops * ops, const struct ggml_cgraph * cgraph) {
     ops->gemm_host.clear();
     if (xdna_env_int("GGML_XDNA_GEMM_HOST", 1) == 0) {
         return;
     }
     const std::vector<npu_command> cmds = npu_commands_of(ops, cgraph);
-    for (size_t i = 0; i < cmds.size(); i++) {
-        const int switches = cmds[i].bf16 ? gemm_switches(cmds, i) : 0;
-        if (switches > 0 && gemm_host_ms(cmds[i].node) < gemm_device_ms(ops, cmds[i].node) + switches * GEMM_SWITCH_MS) {
-            ops->gemm_host.insert(cmds[i].node);
+    for (size_t first = 0; first < cmds.size();) {
+        if (!cmds[first].bf16) {
+            first++;
+            continue;
+        }
+        size_t last = first;
+        while (last < cmds.size() && cmds[last].bf16) {
+            last++;
+        }
+        const int switches = gemm_run_switches(cmds, first, last);
+        double    host_ms, device_ms;
+        gemm_run_costs(ops, cmds, first, last, &host_ms, &device_ms);
+        if (switches > 0 && host_ms < device_ms + switches * GEMM_SWITCH_MS) {
+            for (size_t i = first; i < last; i++) {
+                ops->gemm_host.insert(cmds[i].node);
+            }
+        }
+        first = last;
+    }
+}
+
+// --- the chunk on the host or on the array ------------------------------------
+//
+// Every command of the array costs its floor whatever it computes, and a layer is a serial chain of commands with host ops
+// between them, so none of the floors hides behind another. The plan of a prefill graph (xdna_ops_plan_chunk) puts the
+// projections of one activation, which the array runs as one command, against what the host takes for the same products
+// (xdna-host-cost.h). It decides at two levels:
+//  - A chunk whose host products cost less than its commands goes whole to the host: one CPU graph on the prompt's team, with
+//    none of the batch splits the commands cause. Within one block of rows the host only has to be quicker; above it, quicker
+//    by more than the fits' largest error. Its rows must be within every weight type's fit. The array's side is the sum over
+//    the commands of xdna_pgemm_command_ms, a run of bf16 projections at the cheaper of the array and the host as
+//    xdna_ops_plan_gemm will place it. A chunk with other array work (the attention, the gated delta net, a weight type the
+//    cost model does not cover) is not estimated.
+//  - A chunk that keeps array work leaves to the host each pgemm command of 2 to 128 rows whose products the host does quicker.
+// Decode (one row) is neither: its projections are the GEMV's, and a graph of one row never plans.
+
+// One block of rows: the array's command costs the same whatever rows of it are real, so up to it the measured floor is the
+// command's whole cost.
+static constexpr int64_t CHUNK_BLOCK_ROWS    = 128;
+static constexpr int64_t CHUNK_HOST_MIN_ROWS = 2;
+
+namespace {
+
+enum class mm_kind { host, pgemm, bf16, other };
+
+// One command of the array: the projections of one activation.
+struct array_group {
+    int64_t                          M = 0, K = 0, N = 0;
+    bool                             bf16     = false;
+    double                           host_ms  = 0.0;  // on the prompt's team
+    int64_t                          fit_rows = 0;    // the most rows every weight type's host fit covers
+    std::vector<const ggml_tensor *> nodes;
+};
+
+}  // namespace
+
+static mm_kind chunk_mm_kind(const xdna_ops * ops, const struct ggml_tensor * node) {
+    if (node->src[1]->ne[1] <= 1) {
+        return xdna_ops_supported(ops, node) ? mm_kind::other : mm_kind::host;
+    }
+    if (xdna_pgemm_shape_supported(node)) {
+        return mm_kind::pgemm;
+    }
+    if (!gemm_supported(ops, node)) {
+        return mm_kind::host;
+    }
+    const enum ggml_type t = node->src[0]->type;
+    return (t == GGML_TYPE_BF16 || t == GGML_TYPE_F16) && !xdna_int8_eligible(ops, node) ? mm_kind::bf16 : mm_kind::other;
+}
+
+static double node_host_ms(const struct ggml_tensor * node, int team) {
+    return xdna_host_mul_mat_ms(node->src[0]->type, team, ggml_nrows(node->src[1]), node->src[1]->ne[0], node->src[0]->ne[1]);
+}
+
+using group_key = std::pair<const struct ggml_tensor *, bool>;
+
+// False when the node is array work the estimate does not cover.
+static bool chunk_add_node(const xdna_ops * ops, const struct ggml_tensor * node, std::vector<array_group> & groups,
+                           std::map<group_key, size_t> & by_act) {
+    if (node->op != GGML_OP_MUL_MAT) {
+        const bool array_op = node->op == GGML_OP_GATED_DELTA_NET || node->op == GGML_OP_SSM_CONV || node->op == GGML_OP_FLASH_ATTN_EXT;
+        return !array_op || !xdna_ops_supported(ops, node);
+    }
+    const mm_kind kind = chunk_mm_kind(ops, node);
+    if (kind == mm_kind::other) {
+        return false;
+    }
+    if (kind == mm_kind::host) {
+        return true;
+    }
+    const double host = node_host_ms(node, xdna_host_prompt_team());
+    if (host < 0.0) {
+        return false;
+    }
+    const group_key key = { node->src[1], kind == mm_kind::bf16 };
+    auto            it  = by_act.find(key);
+    const int64_t fit_rows = xdna_host_fit_max_rows(node->src[0]->type);
+    if (it == by_act.end()) {
+        it = by_act.emplace(key, groups.size()).first;
+        groups.push_back({ node->src[1]->ne[1], node->src[1]->ne[0], 0, kind == mm_kind::bf16, 0.0, fit_rows, {} });
+    }
+    array_group & g = groups[it->second];
+    g.N += node->src[0]->ne[1];
+    g.host_ms += host;
+    g.fit_rows = std::min(g.fit_rows, fit_rows);
+    g.nodes.push_back(node);
+    return true;
+}
+
+// Fills the groups in graph order; false when the chunk has array work the estimate does not cover.
+static bool chunk_collect(const xdna_ops * ops, const struct ggml_cgraph * cgraph, std::vector<array_group> & groups) {
+    std::map<group_key, size_t> by_act;
+    bool                        covered = true;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        covered = chunk_add_node(ops, cgraph->nodes[i], groups, by_act) && covered;
+    }
+    return covered && !groups.empty();
+}
+
+static bool chunk_within_fits(const std::vector<array_group> & groups) {
+    for (const array_group & g : groups) {
+        if (g.M > g.fit_rows) {
+            return false;
         }
     }
+    return true;
+}
+
+// The share of the array's time the host must beat it by: none within one block, where every command's cost is its measured
+// floor, and the fits' largest error above it.
+static double chunk_host_margin(const std::vector<array_group> & groups) {
+    for (const array_group & g : groups) {
+        if (g.M > CHUNK_BLOCK_ROWS) {
+            return XDNA_HOST_FIT_MAX_ERROR;
+        }
+    }
+    return 0.0;
+}
+
+// The array's time for the groups: the pgemm commands, and each run of bf16 ones at the cheaper of the array and the host.
+static double groups_array_ms(const xdna_ops * ops, const std::vector<array_group> & groups) {
+    const size_t n     = groups.size();
+    double       total = 0.0;
+    for (size_t first = 0; first < n;) {
+        if (!groups[first].bf16) {
+            total += xdna_pgemm_command_ms((int) groups[first].M, (int) groups[first].K, (int) groups[first].N);
+            first++;
+            continue;
+        }
+        size_t last = first;
+        double device = 0.0, host = 0.0;
+        for (; last < n && groups[last].bf16; last++) {
+            device += gemm_device_ms(ops, (int) groups[last].M, (int) groups[last].K, (int) groups[last].N);
+            host += groups[last].host_ms;
+        }
+        const int switches = last - first == n ? 0 : (!groups[(first + n - 1) % n].bf16) + (!groups[last % n].bf16);
+        total += switches > 0 ? std::min(device + switches * GEMM_SWITCH_MS, host) : device;
+        first = last;
+    }
+    return total;
+}
+
+static double groups_host_ms(const std::vector<array_group> & groups) {
+    double total = 0.0;
+    for (const array_group & g : groups) {
+        total += g.host_ms;
+    }
+    return total;
+}
+
+// The nodes of the pgemm commands of 2 to 128 rows whose products the host does quicker, on the team the glue gives them.
+static std::vector<const struct ggml_tensor *> groups_host_nodes(const std::vector<array_group> & groups) {
+    std::vector<const struct ggml_tensor *> nodes;
+    if (xdna_env_int("GGML_XDNA_PGEMM_HOST", 1) == 0) {
+        return nodes;
+    }
+    const int team = xdna_host_team();
+    for (const array_group & g : groups) {
+        if (g.bf16 || g.M < CHUNK_HOST_MIN_ROWS || g.M > CHUNK_BLOCK_ROWS) {
+            continue;
+        }
+        double host = 0.0;
+        for (const struct ggml_tensor * node : g.nodes) {
+            host += node_host_ms(node, team);
+        }
+        if (host < xdna_pgemm_command_ms((int) g.M, (int) g.K, (int) g.N)) {
+            nodes.insert(nodes.end(), g.nodes.begin(), g.nodes.end());
+        }
+    }
+    return nodes;
+}
+
+bool xdna_ops_plan_chunk(xdna_ops * ops, const struct ggml_cgraph * cgraph) {
+    ops->gemm_host.clear();
+    xdna_pgemm_plan_host({});
+    std::vector<array_group> groups;
+    const bool               covered = chunk_collect(ops, cgraph, groups);
+    if (xdna_env_int("GGML_XDNA_HOST_CHUNK", 1) != 0 && covered && chunk_within_fits(groups)) {
+        const double host_ms = groups_host_ms(groups), array_ms = groups_array_ms(ops, groups);
+        const double margin  = chunk_host_margin(groups);
+        GGML_LOG_DEBUG("%s: chunk of %zu array commands: host %.2f ms, array %.2f ms, margin %.2f\n", "ggml-xdna", groups.size(),
+                       host_ms, array_ms, margin);
+        if (host_ms < array_ms * (1.0 - margin)) {
+            return true;
+        }
+    }
+    xdna_pgemm_plan_host(groups_host_nodes(groups));
+    return false;
 }
 
 // --- bf16 GEMM groups -------------------------------------------------------
