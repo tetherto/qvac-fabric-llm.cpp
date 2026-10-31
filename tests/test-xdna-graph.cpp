@@ -30,6 +30,8 @@
 // of one run, of several and one that ends in a partial run; and, in one
 // graph, projections of different K and N one after the other (the cores hang
 // when consecutive runs differ in their K-loop count).
+// A bf16 block whose first C line the device leaves unwritten is run again, and the op
+// fails once it has been lost more often than the re-runs allow.
 //
 // A prefill projection of a row count that is not a whole 128-row block, its
 // tensors in the backend's own buffers: the array writes the output in place,
@@ -703,6 +705,54 @@ static bool test_group_order(ggml_backend_t npu, ggml_backend_t cpu, between wha
     return passed;
 }
 
+// A K of two runs (the second accumulates) on M rows of several blocks, so the folds of gemm_compute and of finalize
+// both meet a block whose first C line is marked unwritten `times` times; `reruns` is what the backend must report,
+// or -1 for one per fold (at least the two K runs of two blocks).
+typedef void (*lose_c_lines_fn)(int blocks, int times);
+typedef int (*rerun_count_fn)(void);
+
+struct lost_line_case {
+    int  blocks;
+    int  times;
+    bool op_ok;
+    int  reruns;
+};
+
+static bool test_lost_c_line(ggml_backend_t npu, ggml_backend_t cpu, ggml_backend_reg_t reg, double tol) {
+    auto lose  = (lose_c_lines_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_lose_c_lines");
+    auto count = (rerun_count_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_rerun_count");
+    if (!lose || !count) {
+        std::printf("test-xdna-graph: the backend has no lost-line hook\n");
+        return false;
+    }
+    const lost_line_case cases[] = {
+        { 0, 0, true,  0 },  // nothing lost
+        { 99, 1, true, -1 },  // every fold of the op loses its first line once
+        { 1, 2, true,  2 },  // one block twice, the most the re-runs cover
+        { 1, 3, false, 2 },  // one block three times: the op fails
+        { 0, 0, true,  0 },  // and the backend works again
+    };
+    norm_graph                      g = build_gemms(cpu, GGML_TYPE_BF16, 600, { { 1024, 512 } });
+    std::vector<std::vector<float>> want, got;
+    bool                            passed = run(g, cpu, want);
+    for (const lost_line_case & c : cases) {
+        const int before = count();
+        lose(c.blocks, c.times);
+        const bool ok = run(g, npu, got);
+        lose(0, 0);
+        const int    reruns = count() - before;
+        const double e      = ok ? nmse(want[0], got[0]) : INFINITY;
+        const bool   count  = c.reruns < 0 ? reruns >= 4 : reruns == c.reruns;
+        const bool   good   = ok == c.op_ok && count && (!c.op_ok || e < tol);
+        passed              = passed && good;
+        std::printf("MUL_MAT BF16 M600 K1024 first C line lost x%d on %d blocks: op %s, %d re-runs, nmse %.3g %s\n",
+                    c.times, c.blocks, ok ? "ok" : "failed", reruns, e, good ? "ok" : "FAIL");
+    }
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
+    return passed;
+}
+
 int main(void) {
     ggml_backend_load_all();
     ggml_backend_dev_t dev = xdna_device();
@@ -822,6 +872,8 @@ int main(void) {
         ggml_backend_buffer_free(g.buf);
         ggml_free(g.ctx);
     }
+
+    passed = test_lost_c_line(npu, cpu, ggml_backend_dev_backend_reg(dev), tol) && passed;
 
     for (int64_t M : { 100, 129, 300 }) {
         passed = test_output_in_place(npu, cpu, M, tol) && passed;

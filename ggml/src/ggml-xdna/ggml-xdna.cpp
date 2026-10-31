@@ -5184,7 +5184,12 @@ static ggml_backend_dev_t ggml_backend_xdna_reg_get_device(ggml_backend_reg_t re
 
 static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
+    if (std::strcmp(name, "ggml_backend_xdna_test_lose_c_lines") == 0) {
+        return (void *) xdna_ops_test_lose_c_lines;
+    }
+    if (std::strcmp(name, "ggml_backend_xdna_test_rerun_count") == 0) {
+        return (void *) xdna_ops_test_rerun_count;
+    }
     return NULL;
 }
 
