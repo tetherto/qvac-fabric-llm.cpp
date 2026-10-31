@@ -630,8 +630,8 @@ void xdna_buffer_mark_bulk(xdna_buffer * buf, size_t bytes, size_t offset) {
         return;
     }
     xdna_poison_range_stream(base, bytes);
-    // A line that was already cached takes a streaming store like any other and stays dirty: the write-back puts the
-    // pattern in memory and drops it.
+    // Needed, and no fence replaces it: with an sfence or an mfence alone every fresh process lost chunks to the mark
+    // that never cleared (12 of 12). Why is not traced.
     xdna_cache_writeback(base, bytes);
 }
 
