@@ -178,9 +178,16 @@ Q8_0 and BF16 files) runs without a model-specific path:
 Run it with the whole input in one ubatch, which non-causal attention needs:
 
 ```sh
-OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-embedding -m embeddinggemma-2-Q8_0.gguf \
+GOMP_SPINCOUNT=20000 ./build/bin/llama-embedding -m embeddinggemma-2-Q8_0.gguf \
     --device XDNA0 -ngl 99 -fa on --poll 0 -c 2048 -b 2048 -ub 2048 -p "..."
 ```
+
+A pass runs host glue between its array commands, a few nodes at a time, so
+its threads should spin briefly at each barrier rather than sleep.
+`OMP_WAIT_POLICY=PASSIVE`, the decode setting below, sleeps them and made a
+912-token pass 161 ms against 146 ms (libgomp). libgomp's default spins ~3 ms,
+which is as fast but drew more power; `GOMP_SPINCOUNT=20000` (~0.2 ms) used
+the least energy at 912 tokens and in the BF16 file.
 
 Against the CPU backend on a Ryzen AI MAX+ 395, the pooled embeddings agree
 to a cosine of at least 0.9992 (Q8_0) and 0.9996 (BF16). Every layer's output
