@@ -1,5 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#ifdef LLAMA_FFN_COREML_EXPERIMENT
+#include "llama-kv-cache.h"
+#endif
 
 #ifdef LLAMA_FFN_COREML_EXPERIMENT
 #include "ffn-coreml-hook.h"
@@ -10,6 +13,14 @@ static void * qwen35_coreml_userdata = nullptr;
 void llama_ffn_coreml_set_builder(llama_ffn_coreml_builder builder, void * userdata) {
     qwen35_coreml_builder = builder;
     qwen35_coreml_userdata = userdata;
+}
+
+static llama_ffn_coreml_split_builder qwen35_coreml_split_builder = nullptr;
+static void * qwen35_coreml_split_userdata = nullptr;
+
+void llama_ffn_coreml_set_split_builder(llama_ffn_coreml_split_builder builder, void * userdata) {
+    qwen35_coreml_split_builder = builder;
+    qwen35_coreml_split_userdata = userdata;
 }
 #endif
 
@@ -163,8 +174,29 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    bool halves = false;
+#ifdef LLAMA_FFN_COREML_EXPERIMENT
+    // LLAMA_QWEN35_HALVES: run a prefill microbatch of 513..1024 tokens as two interleaved halves (512 and the rest), so that
+    // one half's attention can run while the other half's FFN is on the Neural Engines
+    {
+        const auto * inp_attn = inp->get_attn();
+        const auto * inp_rs   = inp->get_recr();
+        halves = std::getenv("LLAMA_QWEN35_HALVES") != nullptr && qwen35_coreml_split_builder && n_tokens > 512 && n_tokens <= 1024 && ubatch.n_seqs == 1 &&
+            !inp_rs->rec_idx && cparams.n_rs_seq == 0 && !cparams.embeddings_nextn_masked &&
+            !inp_attn->self_k_rot && !inp_attn->self_v_rot && ggml_n_dims(inp_attn->get_v_idxs()) == 1 &&
+            (!loras || loras->empty());
+        // the half attention builder takes separate Q/K/V projections
+        for (int il = 0; halves && il < n_layer; ++il) {
+            halves = hparams.is_recr(il) || !model.layers[il].wqkv;
+        }
+        if (halves) {
+            inpL = build_halves(inp, inpL, inp_pos, sections);
+        }
+    }
+#endif
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = 0; !halves && il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -500,6 +532,234 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     return cur;
 }
+
+#ifdef LLAMA_FFN_COREML_EXPERIMENT
+// Layer order for halves A and B, so that the GPU always has one half's attention to run while the other half's
+// FFN is on the Neural Engines:
+//   attn A(l), finish FFN B(l-1), start FFN A(l), attn B(l), finish FFN A(l), start FFN B(l), attn A(l+1), ...
+// B's attention sees A's K/V of the same layer through the cache, and B's DeltaNet continues from A's state.
+ggml_tensor * llama_model_qwen35::graph::build_halves(
+        llm_graph_input_mem_hybrid * inp,
+        ggml_tensor *                inpL,
+        ggml_tensor *                inp_pos,
+        int *                        sections) {
+    // half A is the first 512 tokens, half B the rest
+    const int64_t rows[2] = { 512, n_tokens - 512 };
+
+    ggml_tensor * x[2];
+    ggml_tensor * pos[2];
+    for (int h = 0; h < 2; ++h) {
+        x[h] = ggml_view_2d(ctx0, inpL, inpL->ne[0], rows[h], inpL->nb[1], h * 512 * inpL->nb[1]);
+        // M-RoPE positions are 4 sections of n_tokens each
+        pos[h] = ggml_cont(ctx0, ggml_view_2d(ctx0, inp_pos, rows[h], inp_pos->ne[0] / n_tokens,
+                    n_tokens * ggml_element_size(inp_pos), h * 512 * ggml_element_size(inp_pos)));
+        pos[h] = ggml_reshape_1d(ctx0, pos[h], ggml_nelements(pos[h]));
+    }
+
+    auto attention = [&](int h, int il) {
+        ggml_tensor * cur = build_norm(x[h], model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+        cur = hparams.is_recr(il)
+            ? build_half_attn_linear(inp->get_recr(), cur, h, il)
+            : build_half_attn(inp->get_attn(), cur, pos[h], sections, h, il);
+        ggml_tensor * residual = ggml_add(ctx0, cur, x[h]);
+        ggml_tensor * normed = build_norm(residual, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+        return std::make_pair(normed, residual);
+    };
+    // when the split builder returns nullptr the FFN runs on Metal in the "start" step and "finish" passes it through
+    auto start = [&](std::pair<ggml_tensor *, ggml_tensor *> in, int il) {
+        ggml_tensor * out = qwen35_coreml_split_builder(ctx0, in.first, in.second, il, 0, qwen35_coreml_split_userdata);
+        if (!out) {
+            out = ggml_add(ctx0, build_layer_ffn(in.first, il), in.second);
+        }
+        ggml_build_forward_expand(gf, out);
+        return out;
+    };
+    // a half shorter than 512 rows may come back padded; keep its real rows
+    auto finish = [&](ggml_tensor * handle, int il, int64_t n) {
+        ggml_tensor * out = qwen35_coreml_split_builder(ctx0, handle, nullptr, il, 1, qwen35_coreml_split_userdata);
+        if (!out) {
+            out = handle;
+        }
+        if (out->ne[1] != n) {
+            out = ggml_view_2d(ctx0, out, out->ne[0], n, out->nb[1], 0);
+        }
+        ggml_build_forward_expand(gf, out);
+        return out;
+    };
+
+    ggml_tensor * pending = nullptr;
+    int pending_il = -1;
+    for (int il = 0; il < n_layer; ++il) {
+        auto a = attention(0, il);
+        ggml_build_forward_expand(gf, a.first);
+        if (pending) {
+            x[1] = finish(pending, pending_il, rows[1]);
+        }
+        ggml_tensor * started = start(a, il);
+        auto b = attention(1, il);
+        ggml_build_forward_expand(gf, b.first);
+        x[0] = finish(started, il, rows[0]);
+        pending = start(b, il);
+        pending_il = il;
+    }
+    x[1] = finish(pending, pending_il, rows[1]);
+
+    return ggml_concat(ctx0, x[0], x[1], 1);
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_half_attn(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             cur,
+        ggml_tensor *             pos,
+        int *                     sections,
+        int                       h,
+        int                       il) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    const int64_t half = cur->ne[1];
+
+    auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[il], cur,
+            n_embd_head * 2, n_head,
+            n_embd_head,     n_head_kv,
+            n_embd_head,     n_head_kv,
+            il, false);
+
+    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, half,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+    Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, half);
+    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+
+    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, half,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+        ggml_element_size(Qcur_full) * n_embd_head);
+    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, half);
+
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, half);
+
+    Qcur = ggml_rope_multi(ctx0, Qcur, pos, nullptr, n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    Kcur = ggml_rope_multi(ctx0, Kcur, pos, nullptr, n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+
+    ggml_build_forward_expand(gf, Qcur);
+    ggml_build_forward_expand(gf, Vcur);
+    ggml_build_forward_expand(gf, Kcur);
+
+    const auto * mctx_cur = inp->mctx;
+    ggml_tensor * k_idxs = inp->get_k_idxs();
+    ggml_tensor * v_idxs = inp->get_v_idxs();
+    k_idxs = ggml_view_1d(ctx0, k_idxs, half, h * 512 * ggml_element_size(k_idxs));
+    v_idxs = ggml_view_1d(ctx0, v_idxs, half, h * 512 * ggml_element_size(v_idxs));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, k_idxs, il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, v_idxs, il));
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+    kq_mask = ggml_view_4d(ctx0, kq_mask, k->ne[2], half, kq_mask->ne[2], kq_mask->ne[3],
+            kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], h * 512 * kq_mask->nb[1]);
+    if (k->ne[2] != inp->get_kq_mask()->ne[0]) {
+        kq_mask = ggml_cont(ctx0, kq_mask);
+    }
+
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+    cur = build_attn_mha(Qcur, k, v, nullptr, kq_mask, nullptr, nullptr, 0, kq_scale, il);
+
+    cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+    return build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_half_attn_linear(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        cur,
+        int                  h,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+
+    const int64_t d_inner     = hparams.ssm_d_inner;
+    const int64_t head_k_dim  = hparams.ssm_d_state;
+    const int64_t num_k_heads = hparams.ssm_n_group;
+    const int64_t num_v_heads = hparams.ssm_dt_rank;
+    const int64_t head_v_dim  = d_inner / num_v_heads;
+    const int64_t half        = cur->ne[1];
+
+    ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
+    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, cur, model.layers[il].wqkv_gate_s);
+
+    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    beta = ggml_sigmoid(ctx0, ggml_reshape_4d(ctx0, beta, 1, num_v_heads, half, 1));
+
+    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, half, 1);
+    ggml_tensor * gate = ggml_mul(ctx0, ggml_softplus(ctx0, ggml_add(ctx0, alpha, model.layers[il].ssm_dt)), model.layers[il].ssm_a);
+    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, half, 1);
+
+    ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+    ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+
+    ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
+    const int64_t conv_kernel_size = conv_kernel->ne[0];
+    const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
+
+    // the first half starts from the cached conv window, the second from the first half's last columns
+    ggml_tensor * window = h == 0
+        ? ggml_reshape_3d(ctx0, build_rs(inp, conv_states_all, hparams.n_embd_r(), 1), conv_kernel_size - 1, conv_channels, 1)
+        : half_conv_tail;
+    ggml_tensor * conv_input = ggml_concat(ctx0, window,
+            ggml_transpose(ctx0, ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], half, 1)), 0);
+    half_conv_tail = ggml_cont(ctx0, ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, 1,
+            conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, half)));
+    if (h == 1) {
+        const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, half_conv_tail,
+                ggml_view_2d(ctx0, conv_states_all, row_count, 1, conv_states_all->nb[1],
+                    mctx_cur->get_head() * ggml_row_size(conv_states_all->type, row_count))));
+    }
+
+    ggml_tensor * conv_out = ggml_silu(ctx0, ggml_ssm_conv(ctx0, conv_input, conv_kernel));
+
+    ggml_tensor * state = h == 0 ? build_rs_ssm(inp, ssm_states_all, 1) : ggml_cont(ctx0, half_ssm_state);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, 1);
+
+    const int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
+    const size_t  nb1_qkv = ggml_row_size(conv_out->type, qkv_dim);
+
+    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_out, head_k_dim, num_k_heads, half, 1,
+            ggml_row_size(conv_out->type, head_k_dim), nb1_qkv, nb1_qkv * half, 0);
+    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_out, head_k_dim, num_k_heads, half, 1,
+            ggml_row_size(conv_out->type, head_k_dim), nb1_qkv, nb1_qkv * half,
+            head_k_dim * num_k_heads * ggml_element_size(conv_out));
+    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_out, head_v_dim, num_v_heads, half, 1,
+            ggml_row_size(conv_out->type, head_v_dim), nb1_qkv, nb1_qkv * half,
+            ggml_row_size(conv_out->type, 2 * head_k_dim * num_k_heads));
+
+    q_conv = build_gdn_l2_norm(ctx0, q_conv, hparams.f_norm_rms_eps);
+    k_conv = build_gdn_l2_norm(ctx0, k_conv, hparams.f_norm_rms_eps);
+
+    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+        q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, half, 1);
+        k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, half, 1);
+    }
+
+    auto [output, new_state] = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
+    if (h == 0) {
+        half_ssm_state = new_state;
+    } else {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state,
+                ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), 1, ssm_states_all->nb[1],
+                    mctx_cur->get_head() * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    }
+
+    ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, half, 1);
+    ggml_tensor * out = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+    out = ggml_reshape_2d(ctx0, out, head_v_dim * num_v_heads, half);
+    return build_lora_mm(model.layers[il].ssm_out, out, model.layers[il].ssm_out_s);
+}
+#endif
 
 ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     // Qwen3.5 does not use MoE FFN
