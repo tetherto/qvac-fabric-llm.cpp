@@ -726,6 +726,29 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
     }
 }
 
+#ifdef GGML_METAL_FFN_EXPERIMENT
+void ggml_metal_shared_event(ggml_metal_t ctx, void * event, uint64_t value, bool wait) {
+    @autoreleasepool {
+        id<MTLSharedEvent> ev = (id<MTLSharedEvent>) event;
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+
+        if (wait) {
+            [cmd_buf encodeWaitForEvent:ev value:value];
+        } else {
+            [cmd_buf encodeSignalEvent:ev value:value];
+        }
+
+        [cmd_buf commit];
+
+        [ctx->cmd_bufs_ext addObject:cmd_buf];
+        ctx->cmd_buf_last = cmd_buf;
+
+        [cmd_buf retain];
+    }
+}
+#endif
+
 ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
     return ctx->ev_cpy;
 }

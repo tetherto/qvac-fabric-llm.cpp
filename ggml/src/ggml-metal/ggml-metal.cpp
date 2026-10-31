@@ -555,6 +555,10 @@ bool ggml_backend_metal_tensor_is_shared(const ggml_tensor * tensor) {
     return buffer && ggml_backend_buffer_is_metal(buffer) && ggml_metal_buffer_is_shared((ggml_metal_buffer_t) buffer->context);
 }
 
+void ggml_backend_metal_shared_event(ggml_backend_t backend, void * event, uint64_t value, bool wait) {
+    ggml_metal_shared_event((ggml_metal_t) backend->context, event, value, wait);
+}
+
 static bool ggml_backend_metal_custom2_matches(const ggml_tensor * tensor) {
     if (!custom2_tag || !custom2_execute || tensor->op != GGML_OP_MAP_CUSTOM2) { return false; }
     ggml_map_custom2_op_params params;
