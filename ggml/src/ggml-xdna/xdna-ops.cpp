@@ -233,6 +233,10 @@ static xdna_gemm_geom xdna_pick_geom(const xdna_ops * ops, int M, int K, int N, 
 // the projections this route carries, so those run unpadded.
 static const int GEMM_K_RUN = 512;
 
+// Sweeps of a run the stream has in flight at once: the command processor issues the next sweep's descriptors while the
+// array works on the previous one's (the stream waits a sweep's tokens only to reuse its descriptor ids).
+static const int GEMM_SWEEP_WINDOW = 2;
+
 // Rows of the packed weight: K up to a whole number of runs.
 static int gemm_k_rows(int K) {
     return (K + GEMM_K_RUN - 1) / GEMM_K_RUN * GEMM_K_RUN;
@@ -862,7 +866,8 @@ static xdna_kernel * gemm_kernel_for(xdna_ops * ops, const xdna_gemm_geom & geom
     xdna_prof::section_timer stream_st("prefill: gemm: stream");
     xdna_seq                 seq;
     const uint32_t b_offset = (uint32_t) k0 * N * sizeof(ggml_bf16_t);
-    if (!xdna_gemm_seq_build(&seq, &geom.tiles, m_rows, GEMM_K_RUN, N, b_offset, (uint32_t) GEMM_C_GUARD)) {
+    if (!xdna_gemm_seq_build(&seq, &geom.tiles, m_rows, GEMM_K_RUN, N, b_offset, (uint32_t) GEMM_C_GUARD,
+                             GEMM_SWEEP_WINDOW)) {
         GGML_LOG_ERROR("%s: failed to build GEMM stream M=%d K=%d N=%d\n", "xdna-ops", m_rows, GEMM_K_RUN, N);
         return nullptr;
     }

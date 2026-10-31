@@ -35,7 +35,10 @@ and a run whose count differs from the previous run's on the same hardware
 context hangs the context, so every run has the same width: a `K` that is not a
 whole number of them ends in a run zero-padded out to 512. A block of A rows
 runs only the sweeps its rows fill (`tile_m` rows on each of the four compute
-rows); each sweep reads the weights from DDR once.
+rows); each sweep reads the weights from DDR once. The stream issues the next
+sweep's descriptors before it waits for the previous sweep's output (two sweeps
+in flight, `GEMM_SWEEP_WINDOW`); blocks of three or more sweeps run faster for
+it, one and two sweeps are unchanged.
 
 The device's writes to C are not cache coherent, so the host marks the rows a
 run will write with a pattern before the submit (non-temporal stores, then a
