@@ -125,8 +125,8 @@ and the cheaper side runs. Both sides come from one model:
   runs graphs of many different cold weights in order, as a pass reads them,
   with `GOMP_SPINCOUNT=20000`, the wait policy of the run line (a passive wait
   roughly doubles every figure). The mean error over the measured shapes is 4
-  to 12%, the largest 16 to 39%. A weight type the model does not cover keeps
-  its array route.
+  to 12%, the largest 16 to 39%. A weight type the model does not cover (F16
+  among them) keeps its array route.
 - The projections of one activation (a layer's Q, K and V, its gate and up, a
   recurrent layer's alpha and beta) are one command of the array, and are
   costed as one, against the sum of the host's products.

@@ -11,7 +11,8 @@
 // whose terms are the dispatch and barrier, the weight read from memory, the arithmetic, the activation's conversion to the
 // type the weight's dot product takes, and the result's write. The mean error over the measured shapes (K 256 to 2048, N 16 to
 // 12288, 15 to 2560 rows for Q8_0 and BF16, 15 to 128 for the K-quants) is 4 to 12%, the largest 16 to 39%. A team of 8 or more
-// threads takes the 16-thread fit, a smaller one the 4-thread fit.
+// threads takes the 16-thread fit, a smaller one the 4-thread fit. F16 and the other types have no fit: a projection of one keeps
+// its array route (the model's host time is negative for it).
 struct xdna_host_fit {
     double a_ms, per_byte, per_flop, per_mk, per_mn;
 };
