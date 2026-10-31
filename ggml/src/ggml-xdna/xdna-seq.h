@@ -275,7 +275,7 @@ bool xdna_gemm_seq_supported(const xdna_gemm_tiles * tiles, int M, int K, int N)
 // `b_offset` (bytes) shifts the B base address, so a K-block can point into a
 // persistent full-weight buffer; `c_offset` does the same for C. `sweep_window`
 // sweeps of the block are issued before the first one's tokens are waited (1:
-// each sweep is waited before the next is issued; at most 5, the BD ids a shim has).
+// each sweep is waited before the next is issued; at most 4, the widest measured).
 bool xdna_gemm_seq_build(xdna_seq *             seq,
                          const xdna_gemm_tiles * tiles,
                          int                     M,

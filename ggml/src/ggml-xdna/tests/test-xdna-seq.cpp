@@ -134,6 +134,11 @@ int check_clamps() {
     failures += check(read_stream(SWEEPS * 128, 1, one) && read_stream(SWEEPS * 128, 99, wide) &&
                           wide.max_id < BD_IDS && wide.tcts == SWEEPS * COLS,
                       "a window past the block or the ids is clamped");
+    stream_ops four, five;
+    failures += check(read_stream(SWEEPS * 2 * 128, 4, four) && read_stream(SWEEPS * 2 * 128, 5, five) &&
+                          four.shim_pushes_before_first_tct == five.shim_pushes_before_first_tct &&
+                          four.patch_offsets == five.patch_offsets && four.words == five.words,
+                      "a window past the widest measured (4) is clamped to it");
     return failures;
 }
 

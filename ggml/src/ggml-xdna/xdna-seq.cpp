@@ -189,6 +189,8 @@ static void emit_bd(xdna_seq * seq, int col, int bd_id, const xdna_bd & bd, uint
 // BD ids a sweep takes on a shim: C, B and, on the shims that feed A, A. A shim has 16 ids, so this many sweeps fit.
 static constexpr int BDS_PER_SWEEP   = 3;
 static constexpr int BD_IDS_PER_SHIM = 16;
+// The widest sweep window measured on the device (window 4 at 912 tokens); the ids alone would allow 5.
+static constexpr int MAX_SWEEP_WINDOW = 4;
 
 // Wait for the C output token of every column: a sweep has been written.
 static void wait_sweep_tokens(xdna_seq * seq, int n_cols) {
@@ -257,7 +259,8 @@ bool xdna_gemm_seq_build(xdna_seq *             seq,
     // ids are free again once its C tokens are waited (the C completion implies
     // A/B were consumed). `window` sweeps are issued before the first wait, each
     // on its own ids, so issuing one overlaps the previous one's compute.
-    const int window = std::max(1, std::min({ sweep_window, n_sweeps, BD_IDS_PER_SHIM / BDS_PER_SWEEP }));
+    const int window =
+        std::max(1, std::min({ sweep_window, n_sweeps, BD_IDS_PER_SHIM / BDS_PER_SWEEP, MAX_SWEEP_WINDOW }));
     for (int sweep = 0; sweep < n_sweeps; sweep++) {
         if (sweep >= window) {
             wait_sweep_tokens(seq, n_cols);
