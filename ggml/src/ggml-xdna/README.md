@@ -295,12 +295,15 @@ builds, one command at a time on an idle host (10th percentile, M 15):
 | one 41-token text | 12.6 ms | 12.7 ms |
 | one 67-token text | 26.0 ms | 19.5 ms |
 
-Those short inputs run whole on the host (above): the pass takes the CPU
-backend's own bits, within 1.1x its time up to ~41 tokens and below it at ~67,
-where the backend's host attention kernel is 7 ms quicker than ggml-cpu's op
-(`GGML_XDNA_HOST_FA=0` brings the pass to the CPU's 26 ms). For a query of 15 to
-41 tokens, `--device none` is up to 1.12x quicker (the BF16 file at 15). Measured
-with `GOMP_SPINCOUNT=20000`, the CPU at 16 threads and its wait policy unset.
+Those short inputs run whole on the host (above). The pass gives the CPU
+backend's products, not its bits: the attention runs on the backend's own
+kernel, which matches ggml-cpu's to an NMSE of 1e-12 to 1e-6 (above), so the
+chunk's output differs from the CPU's wherever a model has attention. It takes
+within 1.1x the CPU's time up to ~41 tokens and less at ~67, where that kernel
+is 7 ms quicker than ggml-cpu's op (`GGML_XDNA_HOST_FA=0` brings the pass to the
+CPU's 26 ms). For a query of 15 to 41 tokens, `--device none` is up to 1.12x
+quicker (the BF16 file at 15). Measured with `GOMP_SPINCOUNT=20000`, the CPU at
+16 threads and its wait policy unset.
 
 The BF16 file is still slower on the array in time and cheaper in energy: one
 912-token text takes 263 ms and 15.4 J per pass against the CPU's 196 ms and
