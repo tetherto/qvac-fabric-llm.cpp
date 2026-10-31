@@ -146,10 +146,11 @@ Q8_0 and BF16 files) runs without a model-specific path:
   every GEMM, so at 912 tokens one of 2048 columns took 1.1 ms where the three
   of 1024, 512 and 512 took 0.67, 0.5 and 0.5, and one of 4096 took 2.15 ms
   where two of 2048 took 2.3.
-- The F32 to F16 casts llama puts before each layer's attention (a model with
-  no KV cache casts K and V) are host glue too (`GGML_XDNA_GLUE_CAST=0` leaves
-  them to the scheduler): left to the CPU backend each was a split of its own,
-  24 extra `graph_compute` calls a pass and 4 to 6 ms of the 15-token pass.
+- An F32 to F16 cast is host glue too (`GGML_XDNA_GLUE_CAST=0` leaves it to
+  the scheduler), as are casts to F32. llama casts K and V that way before
+  each layer's attention in a model with no KV cache; left to the CPU backend
+  each cast was a split of its own, 24 extra `graph_compute` calls a pass and
+  4 to 6 ms of the 15-token pass.
 - A bf16 projection among pgemm commands (the Q8_0 file's
   `per_layer_model_proj`, K 512 and N 12288) costs the array two
   hardware-context switches on top of its own run. When the host's time for it
@@ -511,7 +512,7 @@ report, not for tuning: every one costs more time or energy than the default.
 | `GGML_XDNA_ATTN_LAYER` | a whole attention layer, the q/k/v projections to `l_out`, in one dispatch (the tail and the decode attention still run) |
 | `GGML_XDNA_ATTN_TAIL` | an attention layer's tail - output projection, residual, post-attention norm and FFN - in one dispatch |
 | `GGML_XDNA_GLUE` | the host ops the backend runs inside an NPU chunk (the scheduler splits the graph at each instead) |
-| `GGML_XDNA_GLUE_CAST` | the F32 to F16 casts of an attention's K and V among them (each is a CPU split instead) |
+| `GGML_XDNA_GLUE_CAST` | the F32 to F16 casts among them, such as an attention's K and V (each is a CPU split instead) |
 | `GGML_XDNA_HOST_BO` | the backend's host buffer type: plain CPU buffers |
 | `GGML_XDNA_PGEMM` | the prefill GEMM on the array |
 | `GGML_XDNA_INT8` | the native int8 prefill GEMM |

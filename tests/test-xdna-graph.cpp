@@ -954,6 +954,30 @@ struct lost_line_case {
     int  reruns;
 };
 
+// A cast to F16 is claimed from F32 only, and GGML_XDNA_GLUE_CAST=0 leaves it to the scheduler; a cast to F32
+// takes the plain F32 rule whatever its source, with the switch on or off.
+static bool test_cast_claims(ggml_backend_t npu, ggml_backend_t cpu) {
+    ggml_init_params      ip     = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_context *        ctx    = ggml_init(ip);
+    ggml_tensor *         f32    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 8);
+    ggml_tensor *         f16    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 8);
+    ggml_tensor *         to_f16 = ggml_cast(ctx, f32, GGML_TYPE_F16);
+    ggml_tensor *         to_f32 = ggml_cast(ctx, f16, GGML_TYPE_F32);
+    ggml_backend_buffer_t buf    = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    const bool            on16   = ggml_backend_supports_op(npu, to_f16);
+    const bool            on32   = ggml_backend_supports_op(npu, to_f32);
+    setenv("GGML_XDNA_GLUE_CAST", "0", 1);
+    const bool off16 = ggml_backend_supports_op(npu, to_f16);
+    const bool off32 = ggml_backend_supports_op(npu, to_f32);
+    unsetenv("GGML_XDNA_GLUE_CAST");
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    const bool ok = on16 && on32 && !off16 && off32;
+    std::printf("CPY casts claimed: to F16 %d, to F32 %d; GLUE_CAST=0: to F16 %d, to F32 %d %s\n", on16, on32, off16,
+                off32, ok ? "ok" : "FAIL");
+    return ok;
+}
+
 static bool test_lost_c_line(ggml_backend_t npu, ggml_backend_t cpu, ggml_backend_reg_t reg, double tol) {
     auto lose  = (lose_c_lines_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_lose_c_lines");
     auto count = (rerun_count_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_rerun_count");
@@ -1168,6 +1192,7 @@ int main(void) {
     }
 
     passed = test_lost_c_line(npu, cpu, ggml_backend_dev_backend_reg(dev), tol) && passed;
+    passed = test_cast_claims(npu, cpu) && passed;
 
     // a call runs the 128-row blocks its rows fill: one up to 128 rows, an odd count at 300 and 520, and 2100
     // rows are 17 blocks, a 16-block slab and a last one of one block
