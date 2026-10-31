@@ -59,8 +59,9 @@ static inline int xdna_chunk_threads() {
     return n > 0 ? n : xdna_host_threads();
 }
 
-// The team the glue runs a chunk of `rows` rows on: the decode's below 32, the prompt's from there (ggml-xdna.cpp).
-int xdna_host_team(int64_t rows);
+// The team the glue runs the chunk being computed on: the decode's below 32 tokens a sequence, the prompt's from there
+// (ggml-xdna.cpp).
+int xdna_host_team(void);
 // The team of the prompt's glue, which a chunk run whole on the host takes.
 int xdna_host_prompt_team(void);
 

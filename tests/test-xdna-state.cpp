@@ -75,6 +75,7 @@ struct trace {
 };
 
 constexpr int FOLLOW_STEPS = 8;
+constexpr int N_SEQS       = 4;
 
 static std::vector<llama_token> tokenize(const llama_vocab * v, const std::string & text, bool first) {
     std::vector<llama_token> t(256);
@@ -82,10 +83,11 @@ static std::vector<llama_token> tokenize(const llama_vocab * v, const std::strin
     return t;
 }
 
-static void snapshot(llama_context * ctx, int nv, int n_outputs, trace & tr) {
+// The logits of the batch's tokens `at` (indices into the batch), joined; -1 is the last.
+static void snapshot(llama_context * ctx, int nv, const std::vector<int> & at, trace & tr) {
     std::vector<float> all;
-    for (int i = 0; i < n_outputs; i++) {
-        const float * l = llama_get_logits_ith(ctx, n_outputs == 1 ? -1 : i);
+    for (int i : at) {
+        const float * l = llama_get_logits_ith(ctx, i);
         all.insert(all.end(), l, l + nv);
     }
     tr.logits.push_back(std::move(all));
@@ -96,7 +98,7 @@ static bool decode_prompt(llama_context * ctx, std::vector<llama_token> & p, int
     const int before = chunks ? chunks() : 0;
     const bool ok    = llama_decode(ctx, llama_batch_get_one(p.data(), (int) p.size())) == 0;
     tr.prompt_chunks += chunks ? chunks() - before : 0;
-    snapshot(ctx, nv, 1, tr);
+    snapshot(ctx, nv, { -1 }, tr);
     return ok;
 }
 
@@ -111,7 +113,7 @@ static bool decode_steps(llama_context * ctx, int nv, int n, trace & tr, const s
         if (llama_decode(ctx, llama_batch_get_one(&t, 1)) != 0) {
             return false;
         }
-        snapshot(ctx, nv, 1, tr);
+        snapshot(ctx, nv, { -1 }, tr);
     }
     return true;
 }
@@ -133,6 +135,75 @@ static trace follow_up(llama_model * model, const llama_vocab * v, int nv, const
     llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
     decode_prompt(ctx, other, nv, tr, chunks);
     decode_steps(ctx, nv, FOLLOW_STEPS, tr, forced, k);
+    llama_free(ctx);
+    return tr;
+}
+
+// N_SEQS sequences prefilled in one batch, then decoded together a token a step: the step's graph has N_SEQS rows and one token
+// a sequence, which is a decode.
+static trace four_sequences(llama_model * model, const llama_vocab * v, int nv, const std::vector<llama_token> * forced,
+                            const host_chunk_count_fn chunks) {
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx                = 1024;
+    cp.n_seq_max            = N_SEQS;
+    llama_context *          ctx = llama_init_from_model(model, cp);
+    const char *             texts[N_SEQS] = { "The first sequence is about a quiet river.", "A second one speaks of the array and the host.",
+                                               "Third, a short note on recurrent state.", "The fourth is a question about caches." };
+    std::vector<llama_token> prompts[N_SEQS];
+    llama_batch              prefill = llama_batch_init(256, 0, 1);
+    for (int s = 0; s < N_SEQS; s++) {
+        prompts[s] = tokenize(v, texts[s], true);
+        for (size_t i = 0; i < prompts[s].size(); i++) {
+            const int at           = prefill.n_tokens++;
+            prefill.token[at]      = prompts[s][i];
+            prefill.pos[at]        = (llama_pos) i;
+            prefill.n_seq_id[at]   = 1;
+            prefill.seq_id[at][0]  = s;
+            prefill.logits[at]     = i + 1 == prompts[s].size();
+        }
+    }
+    trace tr;
+    llama_decode(ctx, prefill);
+    std::vector<int> last_of;
+    for (int i = 0; i < prefill.n_tokens; i++) {
+        if (prefill.logits[i]) {
+            last_of.push_back(i);
+        }
+    }
+    snapshot(ctx, nv, last_of, tr);
+    llama_batch_free(prefill);
+    size_t next = 0;
+    for (int step = 0; step < FOLLOW_STEPS; step++) {
+        llama_batch b = llama_batch_init(N_SEQS, 0, 1);
+        for (int s = 0; s < N_SEQS; s++) {
+            const float * l = llama_get_logits_ith(ctx, last_of[s]);
+            llama_token   t = 0;
+            if (forced) {
+                t = (*forced)[next];
+            } else {
+                for (llama_token c = 1; c < nv; c++) {
+                    t = l[c] > l[t] ? c : t;
+                }
+                tr.tokens.push_back(t);
+            }
+            next++;
+            const int at          = b.n_tokens++;
+            b.token[at]           = t;
+            b.pos[at]             = (llama_pos) (prompts[s].size() + step);
+            b.n_seq_id[at]        = 1;
+            b.seq_id[at][0]       = s;
+            b.logits[at]          = true;
+        }
+        const int before = chunks ? chunks() : 0;
+        llama_decode(ctx, b);
+        tr.decode_chunks += chunks ? chunks() - before : 0;
+        last_of.clear();
+        for (int s = 0; s < N_SEQS; s++) {
+            last_of.push_back(s);
+        }
+        snapshot(ctx, nv, last_of, tr);
+        llama_batch_free(b);
+    }
     llama_free(ctx);
     return tr;
 }
@@ -177,6 +248,16 @@ static bool check_follow_up(llama_model * model, const llama_vocab * v, int nv, 
     const bool fired = !chunks || got.prompt_chunks == 3;
     std::printf("host chunks in the prompts: %d%s\n", got.prompt_chunks, chunks ? "" : " (no counter)");
     return ok && fired && want.prompt_chunks == 0;
+}
+
+static bool check_four_sequences(llama_model * model, const llama_vocab * v, int nv, const host_chunk_count_fn chunks) {
+    setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
+    const trace want = four_sequences(model, v, nv, nullptr, chunks);
+    unsetenv("GGML_XDNA_HOST_CHUNK");
+    const trace got = four_sequences(model, v, nv, &want.tokens, chunks);
+    const bool  ok  = same_logits("four sequences, a decode step each", want, got);
+    std::printf("host chunks in the decode steps: %d\n", got.decode_chunks);
+    return ok && got.decode_chunks == 0;
 }
 
 int main(int argc, char ** argv) {
@@ -250,6 +331,7 @@ int main(int argc, char ** argv) {
     bool                      ok     = want == got;
     if (getenv("ON_CPU") == nullptr) {
         ok = check_follow_up(model, v, nv, chunks) && ok;
+        ok = check_four_sequences(model, v, nv, chunks) && ok;
     }
     std::printf("test-xdna-state: %s\n", ok ? "passed" : "FAILED");
     llama_model_free(model);

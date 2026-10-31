@@ -1710,13 +1710,14 @@ static std::vector<const struct ggml_tensor *> groups_host_nodes(const std::vect
     if (xdna_env_int("GGML_XDNA_PGEMM_HOST", 1) == 0) {
         return nodes;
     }
+    const int team = xdna_host_team();
     for (const array_group & g : groups) {
         if (g.bf16 || g.M < CHUNK_HOST_MIN_ROWS || g.M > CHUNK_HOST_MAX_ROWS) {
             continue;
         }
         double host = 0.0;
         for (const struct ggml_tensor * node : g.nodes) {
-            host += node_host_ms(node, xdna_host_team(g.M));
+            host += node_host_ms(node, team);
         }
         if (host < xdna_pgemm_command_ms((int) g.M, (int) g.K, (int) g.N)) {
             nodes.insert(nodes.end(), g.nodes.begin(), g.nodes.end());

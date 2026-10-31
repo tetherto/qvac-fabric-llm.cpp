@@ -391,11 +391,8 @@ static int xdna_glue_threads(bool prompt) {
     return prompt ? n_big : n_small;
 }
 
-static constexpr int XDNA_PROMPT_ROWS = 32;
-
-int xdna_host_team(int64_t rows) {
-    return xdna_glue_threads(rows >= XDNA_PROMPT_ROWS);
-}
+// Tokens per sequence from which the glue runs a chunk on its prompt team.
+static constexpr int XDNA_PROMPT_TOKENS = 32;
 
 int xdna_host_prompt_team(void) {
     return xdna_glue_threads(true);
@@ -448,6 +445,11 @@ static void xdna_glue_set_n_tokens(const struct ggml_cgraph * cgraph) {
     }
     g_glue_n_tokens     = total;
     g_glue_n_seq_tokens = per_seq > 0 ? per_seq : (stream > 0 ? std::min(stream, total) : total);
+}
+
+// The team the glue gives this chunk's ops: chosen by tokens per sequence, as the glue's own are.
+int xdna_host_team(void) {
+    return xdna_glue_threads(g_glue_n_seq_tokens >= XDNA_PROMPT_TOKENS);
 }
 
 // Lazily created CPU backend + a scratch cgraph for the host-fallback compute.
@@ -532,7 +534,7 @@ static bool xdna_glue_host_run(xdna_ops * ops, const struct ggml_tensor * node) 
     if (xdna_attn_fast(const_cast<struct ggml_tensor *>(node))) {
         return true;
     }
-    ggml_backend_cpu_set_n_threads(cpu, xdna_glue_n_threads(g_glue_n_seq_tokens >= 32, xdna_vocab_mm(node)));
+    ggml_backend_cpu_set_n_threads(cpu, xdna_glue_n_threads(g_glue_n_seq_tokens >= XDNA_PROMPT_TOKENS, xdna_vocab_mm(node)));
     cg->n_nodes  = 1;
     cg->n_leafs  = 0;
     cg->nodes[0] = const_cast<struct ggml_tensor *>(node);
@@ -551,7 +553,7 @@ static bool xdna_glue_host_run(xdna_ops * ops, const struct ggml_tensor * node) 
 
 // An op the glue runs on its own, in order, rather than inside the CPU graph of its batch.
 static bool xdna_glue_runs_alone(const struct ggml_tensor * t) {
-    const bool fast_prompt_op = g_glue_n_seq_tokens >= 32 && ((t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID) ||
+    const bool fast_prompt_op = g_glue_n_seq_tokens >= XDNA_PROMPT_TOKENS && ((t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID) ||
                                                               g_norm_mul.count(t));
     return fast_prompt_op || (t->op == GGML_OP_FLASH_ATTN_EXT && xdna_host_attn_supported(t));
 }
@@ -584,16 +586,16 @@ static bool xdna_glue_flush(xdna_ops * ops, std::vector<struct ggml_tensor *> & 
         batch.clear();
         return false;
     }
-    ggml_backend_cpu_set_n_threads(cpu, xdna_glue_n_threads(g_glue_n_seq_tokens >= 32, xdna_glue_has_vocab_mm(batch)));
+    ggml_backend_cpu_set_n_threads(cpu, xdna_glue_n_threads(g_glue_n_seq_tokens >= XDNA_PROMPT_TOKENS, xdna_glue_has_vocab_mm(batch)));
     size_t off = 0;
     while (off < batch.size()) {
         // a prompt's ops this backend runs faster itself go on their own, in
         // order: the CPU graph takes the run of others before them
-        if (g_glue_n_seq_tokens >= 32 && xdna_sigmoid_fast(batch[off])) {
+        if (g_glue_n_seq_tokens >= XDNA_PROMPT_TOKENS && xdna_sigmoid_fast(batch[off])) {
             off++;
             continue;
         }
-        if (g_glue_n_seq_tokens >= 32 && off + 1 < batch.size() && xdna_norm_mul_fast(batch[off], batch[off + 1])) {
+        if (g_glue_n_seq_tokens >= XDNA_PROMPT_TOKENS && off + 1 < batch.size() && xdna_norm_mul_fast(batch[off], batch[off + 1])) {
             off += 2;
             continue;
         }
@@ -3347,7 +3349,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
 
     // Size the host-fallback pool for this chunk (xdna_glue_threads).
     xdna_glue_set_n_tokens(cgraph);
-    g_xdna_chunk_threads.store(xdna_glue_n_threads(g_glue_n_seq_tokens >= 32, false), std::memory_order_relaxed);
+    g_xdna_chunk_threads.store(xdna_glue_n_threads(g_glue_n_seq_tokens >= XDNA_PROMPT_TOKENS, false), std::memory_order_relaxed);
     // the prefill GEMM's activation layouts belong to the graph that laid them
     // out, so every graph starts a new one, whatever its token count
     xdna_pgemm_graph_begin();
@@ -3393,11 +3395,12 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // whole on the host included.
     xdna_rec_follow_cache(ctx, cgraph);
 
-    // A prefill whose commands would cost more than the host's products runs whole on the host; a decode plans nothing.
-    if (g_glue_n_tokens > 1 && xdna_ops_plan_chunk(&ctx->ops, cgraph)) {
+    // A prefill whose commands would cost more than the host's products runs whole on the host. A decode, one token a sequence
+    // however many sequences share the graph, plans nothing.
+    if (g_glue_n_seq_tokens > 1 && xdna_ops_plan_chunk(&ctx->ops, cgraph)) {
         return xdna_host_chunk_run(cgraph);
     }
-    if (g_glue_n_tokens <= 1) {
+    if (g_glue_n_seq_tokens <= 1) {
         xdna_pgemm_plan_host({});
     }
 

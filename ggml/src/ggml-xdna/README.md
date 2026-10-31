@@ -131,8 +131,9 @@ and the cheaper side runs. Both sides come from one model:
   recurrent layer's alpha and beta) are one command of the array, and are
   costed as one, against the sum of the host's products.
 
-Three decisions follow, all for prefill: a graph of one row never plans, since
-its projections are the decode GEMV's.
+Three decisions follow, all for prefill. A decode never plans, whatever the
+rows: one token a sequence is the decode GEMV's, however many sequences share
+the graph (a step of four sequences has four rows and plans nothing).
 
 - A chunk of up to 128 rows whose array commands cost more than the host's
   products runs whole on the host, as CPU graphs on `GGML_XDNA_GLUE_THREADS_BIG`
@@ -154,8 +155,8 @@ its projections are the decode GEMV's.
   against 632 and 64 rows 1294 against 1222.
 - A chunk that keeps array work leaves to the host each pgemm command of 2 to
   128 rows whose products the host does quicker on the glue's team
-  (`GGML_XDNA_GLUE_THREADS` below 32 rows, `GGML_XDNA_GLUE_THREADS_BIG` from
-  32; `GGML_XDNA_PGEMM_HOST=0` leaves them on the array).
+  (`GGML_XDNA_GLUE_THREADS` below 32 tokens a sequence, `GGML_XDNA_GLUE_THREADS_BIG`
+  from 32; `GGML_XDNA_PGEMM_HOST=0` leaves them on the array).
 - A run of bf16 projections among pgemm commands goes whole to the host or stays
   whole, whichever is cheaper counting its two switches: the Q8_0 file's
   `per_layer_model_proj` (K 512, N 12288) takes 3.0 ms of the array at 15 tokens
