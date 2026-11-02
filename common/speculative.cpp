@@ -1313,7 +1313,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
-        const bool pad_step = is_dflash2 && params.p_min > 0.0f && common_speculative_pad_step();
+        const bool pad_step = params.p_min > 0.0f && common_speculative_pad_step();
         std::vector<int32_t> n_cut(n_seq, -1); // pad_step: confident tokens of each sequence
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1380,7 +1380,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const int32_t idx = beg + i;
 
                     if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
-                        break;
+                        if (!pad_step) {
+                            break;
+                        }
+                        if (n_cut[seq_id] < 0) {
+                            n_cut[seq_id] = (int32_t) result.size();
+                        }
                     }
 
                     common_sampler_sample(smpl, ctx_dft, idx, true);
@@ -1415,13 +1420,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const llama_token id = cur_p->data[0].id;
 
                     if (cur_p->data[0].p < params.p_min) {
-                        break;
+                        if (!pad_step) {
+                            break;
+                        }
+                        if (n_cut[seq_id] < 0) {
+                            n_cut[seq_id] = (int32_t) result.size();
+                        }
                     }
 
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
                 }
+            }
+
+            if (pad_step) {
+                if (n_cut[seq_id] < 0) {
+                    n_cut[seq_id] = (int32_t) result.size();
+                }
+                continue;
             }
 
             if (result.size() < (size_t) params.n_min) {
