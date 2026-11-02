@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-coreml-ffn-impl.h"
 #include "llama-memory-recurrent.h"
 #ifdef LLAMA_FFN_COREML_EXPERIMENT
 #include "llama-kv-cache.h"
@@ -243,20 +244,28 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
-#ifdef LLAMA_FFN_COREML_EXPERIMENT
         const auto & layer = model.layers[il];
-        ggml_tensor * offloaded = qwen35_coreml_graph_builder && !layer.ffn_gate_s && !layer.ffn_up_s && !layer.ffn_down_s
-            ? qwen35_coreml_graph_builder(ctx0, gf, attn_post_norm, ffn_residual, layer.ffn_gate, layer.ffn_up, layer.ffn_down, il, qwen35_coreml_graph_userdata)
+        ggml_tensor * library_ffn = (!loras || loras->empty()) && !hdmd && !layer.ffn_gate_s && !layer.ffn_up_s && !layer.ffn_down_s
+            ? llama_coreml_ffn_build(coreml_ffn, ctx0, gf, attn_post_norm, ffn_residual,
+                    layer.ffn_gate, layer.ffn_up, layer.ffn_down, il)
             : nullptr;
-        if (!offloaded && qwen35_coreml_builder) {
-            offloaded = qwen35_coreml_builder(ctx0, attn_post_norm, ffn_residual, il, qwen35_coreml_userdata);
-        }
-        if (offloaded) { cur = offloaded; } else
+        if (library_ffn) {
+            cur = library_ffn;
+        } else {
+#ifdef LLAMA_FFN_COREML_EXPERIMENT
+            ggml_tensor * offloaded = (!loras || loras->empty()) && !hdmd && qwen35_coreml_graph_builder && !layer.ffn_gate_s && !layer.ffn_up_s && !layer.ffn_down_s
+                ? qwen35_coreml_graph_builder(ctx0, gf, attn_post_norm, ffn_residual, layer.ffn_gate, layer.ffn_up, layer.ffn_down, il, qwen35_coreml_graph_userdata)
+                : nullptr;
+            if (!offloaded && (!loras || loras->empty()) && !hdmd && qwen35_coreml_builder) {
+                offloaded = qwen35_coreml_builder(ctx0, attn_post_norm, ffn_residual, il, qwen35_coreml_userdata);
+            }
+            if (offloaded) { cur = offloaded; } else
 #endif
-        {
-            cur = build_layer_ffn(attn_post_norm, il);
-            cb(cur, "ffn_out", il);
-            cur = ggml_add(ctx0, cur, ffn_residual);
+            {
+                cur = build_layer_ffn(attn_post_norm, il);
+                cb(cur, "ffn_out", il);
+                cur = ggml_add(ctx0, cur, ffn_residual);
+            }
         }
         cb(cur, "post_ffn", il);
 

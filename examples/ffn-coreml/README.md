@@ -1,5 +1,45 @@
 # Qwen3.8-27B Core ML prefill sidecar
 
+## Library integration
+
+Build `libllama` with `-DLLAMA_COREML_FFN=ON -DGGML_METAL=ON` to use the in-graph FFN sidecar from a native application or addon. This is separate from the EmbeddingGemma `LLAMA_COREML` option. It works with examples, tools and common utilities disabled. Each context must own its scheduler. The installed header is `llama-coreml-ffn.h`; the ordinary build keeps the API and reports the feature unavailable.
+
+The runtime, exporter and templates now live in `src/`. CMake embeds both templates in the Apple library. Applications provide a writable cache directory, with no Python exporter, template directory or FFN environment variables. The disk model source is recorded by `llama_model_load_from_file`; buffer-backed and split-file models are rejected. The source GGUF must remain unchanged and available while configuring the sidecar.
+
+```cpp
+#include "llama-coreml-ffn.h"
+
+// ctx is a normal Metal context for a Qwen3.8-27B GGUF.
+auto params = llama_coreml_ffn_default_params();
+params.cache_dir = "/application/writable/cache/coreml-ffn";
+char error[512];
+if (!llama_set_coreml_ffn(ctx, &params, error, sizeof(error))) {
+    // Report error; ctx retains its previous configuration.
+}
+// llama_decode(ctx, batch) now builds the sidecar into eligible FFNs.
+// Disable after synchronizing through the configuration API:
+llama_set_coreml_ffn(ctx, nullptr, error, sizeof(error));
+```
+
+The initial implementation supports the 64-layer, 5120-hidden, 17408-FFN Qwen3.8-27B shape with all FFN weights on `MTL0`, no external weight scales, Hadamard transforms or per-weight precision overrides. Defaults are 8192 Metal channels, two 4608-channel Core ML programs and a minimum of 256 rows. The other bundled width is 6144 channels; each package must use one of these widths. Single-token decode and smaller batches keep the normal FFN. LoRA adapters, training and eval callbacks also keep the normal FFN; configuration rejects training and eval callbacks. This is a model-specific sidecar, not a general ggml Core ML backend.
+
+Each context owns its models, serial worker, events and pending calls. Two contexts may be used independently; calls on one context must follow the existing caller-side synchronization contract. Configuration waits for outstanding graph work, invalidates graphs containing old runtime pointers, and replaces the old sidecar only after successful setup. Cache entries are shared on disk, and concurrent compilation uses separate staging paths. Compiled weights are keyed by the source path, size and modification time, the template program and layout, and the channel range. Do not modify the GGUF while configuring it.
+
+Each chunk starts a prediction with shared Metal input/output buffers. An identity custom op holds the input alive and inserts the GPU wait, then ordinary graph nodes add the Core ML partials. There are no hidden join graphs or cached bindings to scheduler allocations. Prediction errors are checked before encode/decode returns success; an error fails the request, whose sidecar must be disabled and KV state discarded before retrying.
+
+A small application using only the public library API is built as `llama-coreml-ffn` when examples are enabled:
+
+```sh
+cmake -S . -B build-coreml -DLLAMA_COREML_FFN=ON -DGGML_METAL=ON
+cmake --build build-coreml --target llama-coreml-ffn -j 8
+build-coreml/bin/llama-coreml-ffn model.gguf /application/writable/cache "Your prompt"
+```
+
+`test-coreml-ffn`, `test-coreml-ffn-export` and `test-metal-custom` cover the public error contracts, template and quantization layout, cache invalidation, and asynchronous Metal custom ops with independent workers. The library refactor still needs a full-model quality and throughput run against the experiment on the target Mac before release. The measurements below describe the original experiment, not new measurements of the library integration.
+
+## Original experiment
+
+
 Opt-in Core ML sidecar for Qwen3.8-27B prefill on Apple Silicon: part of each prefill FFN runs on the Neural Engines while Metal runs the rest. Normal builds do not enable the hooks; build from `examples/ffn-coreml` (below).
 
 The recommended setup is the in-graph sidecar with load-time export, see [Load-time export and the in-graph sidecar](#load-time-export-and-the-in-graph-sidecar): no conversion step, any microbatch size, multi-sequence batches and speculative decoding. The other sections document the asset-based runtime it grew from, a 24-layer experiment from `temp-11259` (`be6e387b9`). The recorded runs and experiment notes are on branch `feat/coreml-qwen-3.8` (`examples/ffn-coreml/results`, `RESULTS.md`, `EXPERIMENTS.md`).
@@ -75,7 +115,7 @@ Because the Neural Engines no longer hold the GPU up, the overlap pairs with a l
 
 ## Load-time export and the in-graph sidecar
 
-`FFN_COREML_OTF=<Metal channels>x<packages>` (for example `8192x2`) builds the Core ML side from the GGUF when the model loads, so there is no conversion step and no assets folder. A weight-free int8 template per channel count ([templates](templates), made by `make_template.py` with coremltools) holds the program. For each layer and package the runtime dequantizes the FFN weights from the GGUF, quantizes them per channel to int8 the way coremltools does (the `weight.bin` is byte-identical to a coremltools export), writes the package, compiles it and caches the compiled model under `FFN_COREML_CACHE` (default `~/Library/Caches/ffn-coreml`). The cache key is the GGUF path, size and modification time and the template. Set `FFN_COREML_TEMPLATES` to the templates folder. On M3 Ultra with the Q4_0 GGUF, a cold start of the 128 programs takes 92 s (export 24.5 s, compile 2.6 s, load 60 s); a cached start takes 3-7 s. `llama-server-coreml` takes `FFN_COREML_OTF` in place of `FFN_COREML_ASSETS`.
+`FFN_COREML_OTF=<Metal channels>x<packages>` (for example `8192x2`) builds the Core ML side from the GGUF when the model loads, so there is no conversion step and no assets folder. A weight-free int8 template per channel count ([templates](../../src/llama-coreml-ffn-templates), made by `make_template.py` with coremltools) holds the program. For each layer and package the runtime dequantizes the FFN weights from the GGUF, quantizes them per channel to int8 the way coremltools does (the `weight.bin` is byte-identical to a coremltools export), writes the package, compiles it and caches the compiled model under `FFN_COREML_CACHE` (default `~/Library/Caches/ffn-coreml`). The cache key is the GGUF path, size and modification time and the template. Set `FFN_COREML_TEMPLATES` to the templates folder. On M3 Ultra with the Q4_0 GGUF, a cold start of the 128 programs takes 92 s (export 24.5 s, compile 2.6 s, load 60 s); a cached start takes 3-7 s. `llama-server-coreml` takes `FFN_COREML_OTF` in place of `FFN_COREML_ASSETS`.
 
 `FFN_COREML_INGRAPH=1` (with `FFN_COREML_GPU_RESIDENT=1 FFN_COREML_ASYNC=1`) puts the sidecar into the model graph. The Metal share of each FFN runs as ordinary graph nodes on views of the model's own weights, so there is no weight copy and there are no per-layer prefix and join graphs. Two custom nodes, run by the Metal backend (`ggml_backend_metal_set_custom`), bracket it: start signals the serial worker to run the Neural Engine share on the node's input, finish waits for it and adds the partial outputs. The GPU runs the Metal share while the Neural Engines work. A microbatch of more than 512 rows goes to the Neural Engines in 512-row calls; a last chunk of at least `FFN_COREML_PAD_MIN` rows is padded, a smaller one has its Neural Engine share computed on Metal. Any microbatch size, multi-sequence batches and speculative decoding take this path, which the half-batch overlap does not.
 
@@ -94,7 +134,7 @@ cmake -S examples/ffn-coreml -B build-ffn-coreml -DCMAKE_BUILD_TYPE=Release -DGG
   -DFFN_COREML_DECODER_EXPERIMENT=ON -DFFN_COREML_SERVER=ON
 cmake --build build-ffn-coreml --target llama-server-coreml -j 8
 
-FFN_COREML_OTF=8192x2 FFN_COREML_TEMPLATES=examples/ffn-coreml/templates FFN_COREML_INGRAPH=1 \
+FFN_COREML_OTF=8192x2 FFN_COREML_TEMPLATES=src/llama-coreml-ffn-templates FFN_COREML_INGRAPH=1 \
 FFN_COREML_GPU_RESIDENT=1 FFN_COREML_ASYNC=1 FFN_COREML_SINGLE_ENCODER=1 \
   build-ffn-coreml/llama-server-coreml -m Qwen3.8-27B-Q4_0.gguf -ngl 99 -fa on -ub 2048
 ```

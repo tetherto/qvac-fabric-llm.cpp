@@ -726,7 +726,7 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
     }
 }
 
-#ifdef GGML_METAL_FFN_EXPERIMENT
+#if defined(GGML_METAL_FFN_EXPERIMENT) || defined(GGML_METAL_CUSTOM_OPS)
 void ggml_metal_shared_event(ggml_metal_t ctx, void * event, uint64_t value, bool wait) {
     @autoreleasepool {
         id<MTLSharedEvent> ev = (id<MTLSharedEvent>) event;
@@ -837,3 +837,5 @@ bool ggml_metal_supports_family(ggml_metal_t ctx, int family) {
 void ggml_metal_capture_next_compute(ggml_metal_t ctx) {
     ctx->capture_compute = 1;
 }
+
+int ggml_metal_get_n_cb(ggml_metal_t ctx) { return ctx->n_cb; }
