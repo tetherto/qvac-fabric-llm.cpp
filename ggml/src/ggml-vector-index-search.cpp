@@ -689,7 +689,8 @@ void search_one(
     int n_threads = 1,
     bool single_query = false,
     bool * staged_seed_short = nullptr,
-    bool staged_sign_single = false) {
+    bool staged_sign_single = false,
+    bool staged_unseeded = false) {
 
     const size_t n_slots = idx.slot_to_id.size();
     if (staged_seed_short != nullptr) {
@@ -752,6 +753,7 @@ void search_one(
             opts.sign_single = staged_sign_single;
             opts.seed_short = staged_seed_short;
             opts.n_threads = n_threads;
+            opts.unseeded = staged_unseeded;
             if (turbovec_staged_search(
                     idx, score_query, tqplus_bias, k, staged_mask.empty() ? nullptr : staged_mask.data(), opts,
                     heap)) {
@@ -1683,7 +1685,8 @@ static int ggml_vec_index_search_impl(
         // shortlist. Several short queries keep the batch tables, as their
         // first pass here already did, and so does the x86 rules' lone one
         // (the staged search then reports no short query). The rescan runs
-        // alone, so it may split its blocks.
+        // alone, so it may split its blocks, and unseeded, as upstream's: a
+        // seeded one could come back short and scan a fourth time.
         if (std::count(seed_short.begin(), seed_short.end(), uint8_t{ 1 }) == 1) {
             const size_t q = static_cast<size_t>(std::find(seed_short.begin(), seed_short.end(), uint8_t{ 1 }) - seed_short.begin());
             Scratch & sc = scratch[0];
@@ -1704,6 +1707,7 @@ static int ggml_vec_index_search_impl(
                 idx->n_threads,
                 false,
                 nullptr,
+                true,
                 true);
         }
     } catch (const std::bad_alloc &) {

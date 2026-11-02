@@ -6699,7 +6699,9 @@ void check_turbovec_1x_staged(int x86_rules) {
                 const int64_t short_before = turbovec_seed_short_count_for_test();
                 CHECK(ggml_vec_index_search(tv, queries.data(), 3, short_k, scores.data(), out.data()) ==
                       GGML_VEC_INDEX_OK);
-                CHECK(turbovec_seed_short_count_for_test() > short_before);
+                // Query 0 runs short once: its rescan is unseeded, so it
+                // cannot come back short and scan again.
+                CHECK(turbovec_seed_short_count_for_test() == short_before + 1);
                 CHECK(out == want_ids);
                 CHECK(scores == want_scores);
             }
@@ -6806,12 +6808,6 @@ void check_turbovec_rounding_helpers() {
     CHECK(turbovec_rounding_parity_for_test() == 0);
 }
 
-// Upstream's x86 2- and 3-bit search (the `vpermb` scan over vector-major
-// codes, exact u32 table sums, then sum * scale + bias unfused): lone
-// queries, every batch width and tail, filters, block groups split across
-// threads and after swap-removes, all equal to the slow reference bit for
-// bit. Scores no fixture records, since upstream generates its fixtures on
-// aarch64; the reference is the formula upstream's kernel computes.
 // The 2-bit row rescore (upstream legacy_score) equals the full scan's
 // block kernel for every lane of every block, under both rule sets,
 // calibrated or not, and in the vm8 layout. An x86 host's sequential
@@ -6868,6 +6864,12 @@ void check_turbovec_1x_exact2_rows(int x86_rules) {
     turbovec_force_x86_rules_for_test(0);
 }
 
+// Upstream's x86 2- and 3-bit search (the `vpermb` scan over vector-major
+// codes, exact u32 table sums, then sum * scale + bias unfused): lone
+// queries, every batch width and tail, filters, block groups split across
+// threads and after swap-removes, all equal to the slow reference bit for
+// bit. Scores no fixture records, since upstream generates its fixtures on
+// aarch64; the reference is the formula upstream's kernel computes.
 void check_turbovec_1x_vpermb() {
     // The aarch64-rule indexes below are sequential, whatever the 2-bit
     // vm8 opt-in in the environment says.
@@ -6956,13 +6958,6 @@ void check_turbovec_1x_vpermb() {
 #endif
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
-// Every search returns the same ids and score bits at any thread count:
-// lone queries (which split their blocks), batches (split across queries),
-// wide and narrow filters, staged and full scans, and k large enough for
-// the ranking to split too. Under the x86 rules the staged batch is the
-// `vpermb` scan six queries at a time: seven queries make a full batch and
-// a lone tail, and at one or two threads the batch runs, at more it does
-// not, so the batch is also checked against the queries one at a time.
 // The lone staged search's fused AVX-512 sign scan (x86 rules, vector-major
 // sign region) against the same search with the kernel off: seeded (1024
 // blocks or more) and not, a tail block, k values that cut the collector
@@ -7090,6 +7085,13 @@ void check_turbovec_1x_vnni_fused_batch() {
     turbovec_force_x86_rules_for_test(0);
 }
 
+// Every search returns the same ids and score bits at any thread count:
+// lone queries (which split their blocks), batches (split across queries),
+// wide and narrow filters, staged and full scans, and k large enough for
+// the ranking to split too. Under the x86 rules the staged batch is the
+// `vpermb` scan six queries at a time: seven queries make a full batch and
+// a lone tail, and at one or two threads the batch runs, at more it does
+// not, so the batch is also checked against the queries one at a time.
 void check_turbovec_1x_thread_invariance(int x86_rules) {
     turbovec_force_x86_rules_for_test(x86_rules);
     constexpr int dim = 64;
