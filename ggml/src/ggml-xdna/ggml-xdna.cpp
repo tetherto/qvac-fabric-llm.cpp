@@ -1088,10 +1088,12 @@ static void xdna_tail_scan(const ggml_cgraph * cgraph, std::vector<xdna_tail_pla
             ggml_nelements(act) != act->ne[0] || !ggml_is_contiguous(act)) {
             continue;  // single-token decode only
         }
-        if (p.n_resid->src[0] == p.n_o) {
-            p.n_hres = p.n_resid->src[1];
-        } else if (p.n_resid->src[1] == p.n_o) {
-            p.n_hres = p.n_resid->src[0];
+        ggml_tensor * a = xdna_skip_row_crop(p.n_resid->src[0]);
+        ggml_tensor * b = xdna_skip_row_crop(p.n_resid->src[1]);
+        if (a == p.n_o) {
+            p.n_hres = b;
+        } else if (b == p.n_o) {
+            p.n_hres = a;
         }
         if (!p.n_hres || p.n_hres->type != GGML_TYPE_F32 || ggml_nelements(p.n_hres) != p.n_o->ne[0] ||
             p.n_lout->type != GGML_TYPE_F32 || p.n_resid->type != GGML_TYPE_F32) {

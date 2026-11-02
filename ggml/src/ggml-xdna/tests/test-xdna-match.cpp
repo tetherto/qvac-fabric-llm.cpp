@@ -10,6 +10,8 @@ static constexpr int64_t CONV_HISTORY  = 3;     // the cached inputs of its kern
 static constexpr int64_t STATE_FLOATS  = CONV_HISTORY * CONV_CHANNELS;
 static constexpr int64_t N_CELLS       = 4;     // recurrent cache cells
 static constexpr int64_t N_RS          = 2;     // the ubatch's sequence and one extra cell
+static constexpr int64_t D_ATTN        = 2048;  // a Qwen3.5 attention layer's output projection input
+static constexpr int64_t D_MODEL       = 1024;  // its residual width
 static constexpr int     MAX_TENSORS   = 32;
 
 struct match_case {
@@ -47,10 +49,35 @@ static int check_state_gather(ggml_context * ctx) {
     return count_failures(cases);
 }
 
+// The last layer crops the attention output and its residual to the output rows before they are added.
+static int check_row_crop(ggml_context * ctx) {
+    ggml_tensor * w_o    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D_ATTN, D_MODEL);
+    ggml_tensor * act    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D_ATTN, 1);
+    ggml_tensor * out    = ggml_mul_mat(ctx, w_o, act);
+    ggml_tensor * inp    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D_MODEL, 1);
+    ggml_tensor * ids    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * out_c  = ggml_get_rows(ctx, out, ids);
+    ggml_tensor * inp_c  = ggml_get_rows(ctx, inp, ids);
+    ggml_tensor * resid  = ggml_add(ctx, out_c, inp_c);
+    ggml_tensor * batch  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D_MODEL, 2);
+    ggml_tensor * pick   = ggml_get_rows(ctx, batch, ids);
+    ggml_tensor * ids2   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+    ggml_tensor * repeat = ggml_get_rows(ctx, inp, ids2);
+
+    const match_case cases[] = {
+        { "the cropped attention output is the output", xdna_skip_row_crop(out_c), out },
+        { "the cropped residual is the residual", xdna_skip_row_crop(inp_c), inp },
+        { "one row of a two-row batch is a real crop", xdna_skip_row_crop(pick), pick },
+        { "two rows of a one-row tensor are not a crop", xdna_skip_row_crop(repeat), repeat },
+        { "an add is itself", xdna_skip_row_crop(resid), resid },
+    };
+    return count_failures(cases);
+}
+
 int main(void) {
     const ggml_init_params params = { ggml_tensor_overhead() * MAX_TENSORS, nullptr, true };
     ggml_context *         ctx    = ggml_init(params);
-    const int              failures = check_state_gather(ctx);
+    const int              failures = check_state_gather(ctx) + check_row_crop(ctx);
     ggml_free(ctx);
     if (failures) {
         std::printf("test-xdna-match: %d failures\n", failures);
