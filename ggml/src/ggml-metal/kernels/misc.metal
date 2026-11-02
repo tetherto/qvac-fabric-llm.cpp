@@ -388,12 +388,12 @@ kernel void kernel_snake(
         uint         tpitg [[thread_position_in_threadgroup]],
         uint         ntg   [[threads_per_threadgroup]]) {
 
-    const int idx = tgpig * ntg + tpitg;
-    if (idx >= args.T * args.C) {
+    const uint64_t idx = (uint64_t) tgpig * ntg + tpitg;
+    if (idx >= (uint64_t) args.ne) {
         return;
     }
 
-    const int   c  = idx / args.T;  // x is [T, C], a / inv_b collapse to [1, C]
+    const uint64_t c  = idx / (uint64_t) args.T;  // x is [T, C], a / inv_b collapse to [1, C]
     const float xi = float(x[idx]);
     const float si = sin(a[c] * xi);
     dst[idx] = T(xi + si * si * inv_b[c]);
@@ -410,6 +410,7 @@ kernel void kernel_fwht(
         constant ggml_metal_kargs_fwht & args,
         device const src_t * src,
         device float * dst,
+        device const float * signs,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort sgitg[[simdgroup_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -425,6 +426,8 @@ kernel void kernel_fwht(
     if (r >= args.nrows) {
         return;
     }
+    signs += args.n_blk > 0 ? (r % args.n_blk) * N : 0;
+
 
     src += r * N;
     dst += r * N;
@@ -433,7 +436,8 @@ kernel void kernel_fwht(
 
     float reg[NE];
     for (int i = 0; i < NE; i++) {
-        reg[i] = float(src[i*NW + lane])*scale;
+        const float s = args.n_blk > 0 ? signs[i*NW + lane] : 1.0f;
+        reg[i] = float(src[i*NW + lane])*s*scale;
     }
     for (int i = 1; i < NW; i *= 2) {
         for (int j = 0; j < NE; j++) {
@@ -460,42 +464,11 @@ kernel void kernel_fwht(
     }
 }
 
-// Wide blocks: one row per threadgroup instead of per simdgroup, so each thread keeps
-// N/NT values rather than N/32. Butterflies below the simdgroup width still shuffle;
-// those up to NT go through threadgroup memory; the rest stay in registers.
-// TODO: try avoiding branch https://github.com/ggml-org/llama.cpp/pull/29094#discussion_r4049563223
-// TODO: try to unroll loops
-template<int N, int NT, typename src_t>
-kernel void kernel_fwht_tg(
-        constant ggml_metal_kargs_fwht & args,
-        device const src_t * src,
-        device float * dst,
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort3  ntg[[threads_per_threadgroup]]) {
-
+// in-register FWHT of an N-block spread over NT threads (NE = N/NT values each, element i*NT + tid)
+template<int N, int NT>
+static inline void fwht_tg_butterfly(thread float * reg, threadgroup float * shmem, int tid) {
     constexpr int NW = N_SIMDWIDTH;
     constexpr int NE = N / NT;
-
-    threadgroup float shmem[N];
-
-    const float scale = 1.0f / sqrt((float) N);
-
-    const int64_t r = tgpig.x;
-    if (r >= args.nrows) {
-        return;
-    }
-
-    src += r * N;
-    dst += r * N;
-
-    const int tid = sgitg * NW + tiisg;
-
-    float reg[NE];
-    for (int i = 0; i < NE; i++) {
-        reg[i] = float(src[i*NT + tid])*scale;
-    }
 
     for (int i = 1; i < NW; i *= 2) {
         for (int j = 0; j < NE; j++) {
@@ -529,34 +502,224 @@ kernel void kernel_fwht_tg(
             }
         }
     }
+}
+
+// Wide blocks: one row per threadgroup instead of per simdgroup, so each thread keeps
+// N/NT values rather than N/32. Butterflies below the simdgroup width still shuffle;
+// those up to NT go through threadgroup memory; the rest stay in registers.
+// TODO: try avoiding branch https://github.com/ggml-org/llama.cpp/pull/29094#discussion_r4049563223
+// TODO: try to unroll loops
+template<int N, int NT, typename src_t>
+kernel void kernel_fwht_tg(
+        constant ggml_metal_kargs_fwht & args,
+        device const src_t * src,
+        device float * dst,
+        device const float * signs,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+
+    constexpr int NW = N_SIMDWIDTH;
+    constexpr int NE = N / NT;
+
+    threadgroup float shmem[N];
+
+    const float scale = 1.0f / sqrt((float) N);
+
+    const int64_t r = tgpig.x;
+    if (r >= args.nrows) {
+        return;
+    }
+    signs += args.n_blk > 0 ? (r % args.n_blk) * N : 0;
+
+
+    src += r * N;
+    dst += r * N;
+
+    const int tid = sgitg * NW + tiisg;
+
+    float reg[NE];
+    for (int i = 0; i < NE; i++) {
+        const float s = args.n_blk > 0 ? signs[i*NT + tid] : 1.0f;
+        reg[i] = float(src[i*NT + tid])*s*scale;
+    }
+
+    fwht_tg_butterfly<N, NT>(reg, shmem, tid);
 
     for (int i = 0; i < NE; i++) {
         dst[i*NT + tid] = reg[i];
     }
 }
 
+// RMS_NORM + MUL (weight) + signed FWHT: one threadgroup per FWHT block of a row; each recomputes the row sum, so a
+// single decode row still spreads over n_blk threadgroups
+template<int N, int NT>
+kernel void kernel_rms_norm_mul_fwht(
+        constant ggml_metal_kargs_rms_norm_fwht & args,
+        device const float * src,
+        device const float * weight,
+        device const float * signs,
+        device       float * dst,
+        device       float * dst_norm,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+
+    constexpr int NW  = N_SIMDWIDTH;
+    constexpr int NE  = N / NT;
+    constexpr int NSG = NT / NW;
+
+    threadgroup float shmem[N];
+
+    const int64_t r = tgpig.x / args.n_blk;
+    const int     b = tgpig.x % args.n_blk;
+
+    const int tid = sgitg * NW + tiisg;
+
+    device const float * x = src + r*args.ne00;
+
+    // float4 loads keep the per-thread chain of dependent loads short (ne00 is a multiple of N; the fusion check aligns rows)
+    device const float4 * x4 = (device const float4 *) x;
+
+    float sumf = 0.0f;
+    for (int i = tid; i < args.ne00/4; i += NT) {
+        sumf += dot(x4[i], x4[i]);
+    }
+    sumf = simd_sum(sumf);
+
+    if (tiisg == 0) {
+        shmem[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = simd_sum(tiisg < NSG ? shmem[tiisg] : 0.0f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float rms   = 1.0f/sqrt(sumf/args.ne00 + args.eps);
+    const float scale = 1.0f/sqrt((float) N);
+
+    const int64_t offs = r*args.ne00 + b*N;
+
+    float reg[NE];
+    for (int i = 0; i < NE; i++) {
+        const int j = b*N + i*NT + tid;
+        const float y = (x[j]*rms)*weight[j];
+        if (args.write_norm) {
+            dst_norm[offs + i*NT + tid] = y;
+        }
+        reg[i] = y*signs[j]*scale;
+    }
+
+    fwht_tg_butterfly<N, NT>(reg, shmem, tid);
+
+    for (int i = 0; i < NE; i++) {
+        dst[offs + i*NT + tid] = reg[i];
+    }
+}
+
+// element f of a contiguous CONT output: the f-th element of the CONT source view in its own shape
+static inline float fwht_gather_load(constant ggml_metal_kargs_fwht_gather & args, device const char * src, int f) {
+    const int i0 = f % args.ne0;
+    const int i1 = (f / args.ne0) % args.ne1;
+    const int i2 = (f / args.ne0 / args.ne1) % args.ne2;
+    const int i3 =  f / args.ne0 / args.ne1 / args.ne2;
+
+    return *(device const float *) (src + i0*args.nb0 + i1*args.nb1 + i2*args.nb2 + i3*args.nb3);
+}
+
+// CONT + signed FWHT: kernel_fwht_tg with its input loaded through the CONT source view instead of the CONT output
+template<int N, int NT>
+kernel void kernel_fwht_gather(
+        constant ggml_metal_kargs_fwht_gather & args,
+        device const char  * src,
+        device       float * dst,
+        device const float * signs,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+
+    constexpr int NW = N_SIMDWIDTH;
+    constexpr int NE = N / NT;
+
+    threadgroup float shmem[N];
+
+    const float scale = 1.0f / sqrt((float) N);
+
+    const int r   = tgpig.x;
+    const int tid = sgitg * NW + tiisg;
+
+    signs += (r % args.n_blk) * N;
+    dst   += r * N;
+
+    float reg[NE];
+    for (int i = 0; i < NE; i++) {
+        reg[i] = fwht_gather_load(args, src, r*N + i*NT + tid)*signs[i*NT + tid]*scale;
+    }
+
+    fwht_tg_butterfly<N, NT>(reg, shmem, tid);
+
+    for (int i = 0; i < NE; i++) {
+        dst[i*NT + tid] = reg[i];
+    }
+}
+
+typedef decltype(kernel_fwht_gather<1024, GGML_METAL_FWHT_TG_NT>) kernel_fwht_gather_t;
+
+template [[host_name("kernel_fwht_gather_f32_512")]]        kernel kernel_fwht_gather_t kernel_fwht_gather<512,  GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_fwht_gather_f32_1024")]]       kernel kernel_fwht_gather_t kernel_fwht_gather<1024, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_fwht_gather_f32_2048")]]       kernel kernel_fwht_gather_t kernel_fwht_gather<2048, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_fwht_gather_f32_4096")]]       kernel kernel_fwht_gather_t kernel_fwht_gather<4096, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_fwht_gather_f32_8192")]]       kernel kernel_fwht_gather_t kernel_fwht_gather<8192, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_fwht_gather_f32_512_nt128")]]  kernel kernel_fwht_gather_t kernel_fwht_gather<512,  GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_fwht_gather_f32_1024_nt128")]] kernel kernel_fwht_gather_t kernel_fwht_gather<1024, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_fwht_gather_f32_2048_nt128")]] kernel kernel_fwht_gather_t kernel_fwht_gather<2048, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_fwht_gather_f32_4096_nt128")]] kernel kernel_fwht_gather_t kernel_fwht_gather<4096, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_fwht_gather_f32_8192_nt128")]] kernel kernel_fwht_gather_t kernel_fwht_gather<8192, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+
+typedef decltype(kernel_rms_norm_mul_fwht<1024, GGML_METAL_FWHT_TG_NT>) kernel_rms_norm_mul_fwht_t;
+
+template [[host_name("kernel_rms_norm_mul_fwht_f32_512")]]        kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<512,  GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_1024")]]       kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<1024, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_2048")]]       kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<2048, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_4096")]]       kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<4096, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_8192")]]       kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<8192, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_512_nt128")]]  kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<512,  GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_1024_nt128")]] kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<1024, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_2048_nt128")]] kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<2048, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_4096_nt128")]] kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<4096, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_8192_nt128")]] kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<8192, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+
 typedef decltype(kernel_fwht<64, float>) kernel_fwht_f32_t;
 typedef decltype(kernel_fwht<64, half>)  kernel_fwht_f16_t;
 
-template [[host_name("kernel_fwht_f32_64")]]  kernel kernel_fwht_f32_t kernel_fwht<64,  float>;
-template [[host_name("kernel_fwht_f32_128")]] kernel kernel_fwht_f32_t kernel_fwht<128, float>;
-template [[host_name("kernel_fwht_f32_256")]] kernel kernel_fwht_f32_t kernel_fwht<256, float>;
+template [[host_name("kernel_fwht_f32_64")]]         kernel kernel_fwht_f32_t kernel_fwht<64,   float>;
+template [[host_name("kernel_fwht_f32_128")]]        kernel kernel_fwht_f32_t kernel_fwht<128,  float>;
+template [[host_name("kernel_fwht_f32_256")]]        kernel kernel_fwht_f32_t kernel_fwht<256,  float>;
+template [[host_name("kernel_fwht_f32_512")]]        kernel kernel_fwht_f32_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_1024")]]       kernel kernel_fwht_f32_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_2048")]]       kernel kernel_fwht_f32_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_4096")]]       kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_8192")]]       kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_512_nt128")]]  kernel kernel_fwht_f32_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
+template [[host_name("kernel_fwht_f32_1024_nt128")]] kernel kernel_fwht_f32_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
+template [[host_name("kernel_fwht_f32_2048_nt128")]] kernel kernel_fwht_f32_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
+template [[host_name("kernel_fwht_f32_4096_nt128")]] kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
+template [[host_name("kernel_fwht_f32_8192_nt128")]] kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
 
-template [[host_name("kernel_fwht_f16_64")]]  kernel kernel_fwht_f16_t kernel_fwht<64,  half>;
-template [[host_name("kernel_fwht_f16_128")]] kernel kernel_fwht_f16_t kernel_fwht<128, half>;
-template [[host_name("kernel_fwht_f16_256")]] kernel kernel_fwht_f16_t kernel_fwht<256, half>;
-
-template [[host_name("kernel_fwht_f32_512")]]  kernel kernel_fwht_f32_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_1024")]] kernel kernel_fwht_f32_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_2048")]] kernel kernel_fwht_f32_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_4096")]] kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_8192")]] kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, float>;
-
-template [[host_name("kernel_fwht_f16_512")]]  kernel kernel_fwht_f16_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, half>;
-template [[host_name("kernel_fwht_f16_1024")]] kernel kernel_fwht_f16_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, half>;
-template [[host_name("kernel_fwht_f16_2048")]] kernel kernel_fwht_f16_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, half>;
-template [[host_name("kernel_fwht_f16_4096")]] kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, half>;
-template [[host_name("kernel_fwht_f16_8192")]] kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_64")]]         kernel kernel_fwht_f16_t kernel_fwht<64,   half>;
+template [[host_name("kernel_fwht_f16_128")]]        kernel kernel_fwht_f16_t kernel_fwht<128,  half>;
+template [[host_name("kernel_fwht_f16_256")]]        kernel kernel_fwht_f16_t kernel_fwht<256,  half>;
+template [[host_name("kernel_fwht_f16_512")]]        kernel kernel_fwht_f16_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_1024")]]       kernel kernel_fwht_f16_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_2048")]]       kernel kernel_fwht_f16_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_4096")]]       kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_8192")]]       kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_512_nt128")]]  kernel kernel_fwht_f16_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
+template [[host_name("kernel_fwht_f16_1024_nt128")]] kernel kernel_fwht_f16_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
+template [[host_name("kernel_fwht_f16_2048_nt128")]] kernel kernel_fwht_f16_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
+template [[host_name("kernel_fwht_f16_4096_nt128")]] kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
+template [[host_name("kernel_fwht_f16_8192_nt128")]] kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
 
 constant int FC_dsv4_hc_n_hc [[function_constant(FC_DSV4_HC + 0)]];
 
@@ -770,5 +933,256 @@ kernel void kernel_dsv4_hc_post_f32(
 
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
+    }
+}
+
+
+// gate and output slots of the LSTM cell and the transducer step control, in ggml's order
+constant uint LSTM_GATE_INPUT  = 0;
+constant uint LSTM_GATE_FORGET = 1;
+constant uint LSTM_GATE_CELL   = 2;
+constant uint LSTM_GATE_OUTPUT = 3;
+constant uint LSTM_N_GATES     = 4;
+constant uint LSTM_OUT_H       = 0;
+constant uint LSTM_OUT_C       = 1;
+constant uint LSTM_N_OUTS      = 2;
+constant uint TDT_STEP_IN_T      = 0;
+constant uint TDT_STEP_IN_S      = 1;
+constant uint TDT_STEP_IN_N      = 2;
+constant uint TDT_STEP_OUT_T     = 0;
+constant uint TDT_STEP_OUT_S     = 1;
+constant uint TDT_STEP_OUT_N     = 2;
+constant uint TDT_STEP_OUT_UPD   = 3;
+constant uint TDT_STEP_OUT_HOLD  = 4;
+constant uint TDT_STEP_OUT_FRAME = 5;
+constant uint TDT_STEP_OUT_TOKEN = 6;
+constant uint TDT_STEP_OUT_DUR   = 7;
+
+static inline void lstm_cell_pair_f32(
+        device const float * g, float c_prev, uint H, uint j,
+        thread float & h_new, thread float & c_new) {
+    const float gi = 1 / (1 + exp(-g[LSTM_GATE_INPUT  * H + j]));
+    const float gf = 1 / (1 + exp(-g[LSTM_GATE_FORGET * H + j]));
+    const float gg = precise::tanh(g[LSTM_GATE_CELL   * H + j]);
+    const float go = 1 / (1 + exp(-g[LSTM_GATE_OUTPUT * H + j]));
+
+    // Metal compiles with fast math; the barrier stops the two products from
+    // contracting into an FMA, which the decomposed mul/mul/add graph cannot do.
+    {
+        #pragma clang fp contract(off)
+        c_new = gf * c_prev + gi * gg;
+    }
+
+    h_new = go * precise::tanh(c_new);
+}
+
+kernel void kernel_lstm_cell_f32(
+        constant ggml_metal_kargs_lstm_cell & args,
+        device const float * gates,  // [4H, N]
+        device const float * c_prev, // [H, N]
+        device       float * dst,    // [2H, N]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const uint H        = (uint) args.H;
+    const uint prev_row = (uint) args.prev_row;
+    const uint total    = H * (uint) args.N;
+
+    const uint stride = ntg.x * tgpg.x;
+    for (uint k = tgpig.x * ntg.x + tpitg.x; k < total; k += stride) {
+        const uint n = k / H;
+        const uint j = k - n * H;
+
+        float h_new;
+        float c_new;
+        lstm_cell_pair_f32(gates + n * LSTM_N_GATES * H, c_prev[n * prev_row + j], H, j,
+                           h_new, c_new);
+
+        device float * out = dst + n * LSTM_N_OUTS * H;
+
+        out[LSTM_OUT_H * H + j] = h_new;
+        out[LSTM_OUT_C * H + j] = c_new;
+    }
+}
+
+kernel void kernel_lstm_cell_masked_f32(
+        constant ggml_metal_kargs_lstm_cell & args,
+        device const float * gates,   // [4H, N]
+        device const float * hc_prev, // [2H, N]
+        device const int   * mask,    // [N] or [1]
+        device       float * dst,     // [2H, N]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const uint H        = (uint) args.H;
+    const uint prev_row = (uint) args.prev_row;
+    const uint c_base   = (uint) args.c_base;
+    const uint m_stride = (uint) args.mask_stride;
+    const uint total    = H * (uint) args.N;
+
+    const uint stride = ntg.x * tgpg.x;
+    for (uint k = tgpig.x * ntg.x + tpitg.x; k < total; k += stride) {
+        const uint n = k / H;
+        const uint j = k - n * H;
+
+        device const float * p   = hc_prev + n * prev_row;
+        device       float * out = dst     + n * LSTM_N_OUTS * H;
+
+        if (mask[n * m_stride] == 0) {
+            out[LSTM_OUT_H * H + j] = p[j];
+            out[LSTM_OUT_C * H + j] = p[c_base + j];
+            continue;
+        }
+
+        float h_new;
+        float c_new;
+        lstm_cell_pair_f32(gates + n * LSTM_N_GATES * H, p[c_base + j], H, j, h_new, c_new);
+
+        out[LSTM_OUT_H * H + j] = h_new;
+        out[LSTM_OUT_C * H + j] = c_new;
+    }
+}
+
+kernel void kernel_tdt_step_i32(
+        constant ggml_metal_kargs_tdt_step & args,
+        device const int * token,
+        device const int * dur_idx,
+        device const int * state,
+        device const int * dur_table,
+        device       int * dst) {
+    const int t = state[TDT_STEP_IN_T];
+    const int s = state[TDT_STEP_IN_S];
+    const int n = state[TDT_STEP_IN_N];
+
+    int t_next = t;
+    int s_next = s;
+    int update = 0;
+
+    if (t < n) {
+        const int raw = dur_idx[0];
+        const int di  = raw < 0 ? 0 : (raw < args.n_dur ? raw : args.n_dur - 1);
+        const int dur = args.rnnt ? 0 : dur_table[di];
+        const int adv = args.rnnt ? 1 : (dur > 1 ? dur : 1);
+
+        if (token[0] == args.blank_id) {
+            t_next = t + adv;
+            s_next = 0;
+        } else {
+            update = 1;
+            s_next = s + 1;
+            if ((args.rnnt == 0 && dur > 0) || s_next >= args.max_symbols) {
+                t_next = t + adv;
+                s_next = 0;
+            }
+        }
+    }
+
+    int frame = t_next > n - 1 ? n - 1 : t_next;
+    if (frame < 0) {
+        frame = 0;
+    }
+
+    dst[TDT_STEP_OUT_T]     = t_next;
+    dst[TDT_STEP_OUT_S]     = s_next;
+    dst[TDT_STEP_OUT_N]     = n;
+    dst[TDT_STEP_OUT_UPD]   = update;
+    dst[TDT_STEP_OUT_HOLD]  = 1 - update;
+    dst[TDT_STEP_OUT_FRAME] = frame;
+    dst[TDT_STEP_OUT_TOKEN] = token[0];
+    dst[TDT_STEP_OUT_DUR]   = dur_idx[0];
+}
+
+kernel void kernel_scale_residual_f32(
+    constant   ggml_metal_kargs_scale_residual & args,
+    device  const float * x,
+    device  const float * bias,
+    device  const float * gamma,
+    device  const float * residual,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (c >= args.C || batch >= args.B) return;
+
+    const int L = args.L;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const int srt = args.srt, src = args.src;
+    const float bv = bias[c];
+    const float gv = gamma[c];
+    const size_t batch_offset = (size_t) batch * L * args.C;
+
+    device const float * x_c = x        + batch_offset + (size_t) c * sxc;
+    device const float * r_c = residual + batch_offset + (size_t) c * src;
+    device       float * y_c = y        + batch_offset + (size_t) c * syc;
+
+    for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
+        y_c[(size_t) t * syt] = r_c[(size_t) t * srt] + (x_c[(size_t) t * sxt] + bv) * gv;
+    }
+}
+
+kernel void kernel_bias_gelu_f32(
+    constant   ggml_metal_kargs_bias_gelu & args,
+    device  const float * x,
+    device  const float * bias,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (c >= args.C || batch >= args.B) return;
+
+    const int L = args.L;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const float bv = bias[c];
+    const size_t batch_offset = (size_t) batch * L * args.C;
+
+    device const float * x_c = x + batch_offset + (size_t) c * sxc;
+    device       float * y_c = y + batch_offset + (size_t) c * syc;
+
+    // Use the same erf_approx template as kernel_gelu_erf_f32 above
+    // (Abramowitz & Stegun 7.1.26 / Hastings approximation) so the fused
+    // bias_gelu output is bit-identical to the unfused add + gelu_erf path.
+    for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
+        const float v = x_c[(size_t) t * sxt] + bv;
+        y_c[(size_t) t * syt] = 0.5f * v * (1.0f + erf_approx<float>(v * SQRT_2_INV));
+    }
+}
+
+kernel void kernel_pad_replicate_1d_f32(
+    constant   ggml_metal_kargs_pad_replicate_1d & args,
+    device  const float * x,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    if (c >= args.C) return;
+
+    const int L_in  = args.L_in;
+    const int L_out = args.L_out;
+    const int pad   = args.pad_left;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+
+    device const float * x_c = x + (size_t) c * sxc;
+    device       float * y_c = y + (size_t) c * syc;
+
+    for (int t = (int) tpitg.x; t < L_out; t += (int) ntg.x) {
+        int src_t = t - pad;
+        if (src_t < 0)      src_t = 0;
+        if (src_t >= L_in)  src_t = L_in - 1;
+        y_c[(size_t) t * syt] = x_c[(size_t) src_t * sxt];
     }
 }

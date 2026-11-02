@@ -327,6 +327,9 @@ on 4 physical NPUs, or `--devices 'HTP0[0-1:0],HTP1[0-1:1]'` on 2 physical NPUs 
 - `GGML_HEXAGON_HOSTBUF=1` (default: 0, disabled)
   Enables allocating host buffers for debugging. By default, host buffers are disabled.
 
+- `GGML_HEXAGON_BF16=1` (default: 1, enabled)
+  Enables eligible BF16 matrix weights through cached F16 mirrors, using F16 range and precision. Each mirror adds one F16 copy of the weight plus alignment. Set to `0` to disable this path and its extra allocations; BF16 matrix multiplication then falls back to CPU. Configurable via `--hex-bf16` in `run.py`.
+
 - `GGML_HEXAGON_DMA64=0` (default: enabled on v81+)
   Disables 64-bit DMA for model weights. Set to `1` to enable it explicitly on a supported architecture.
 

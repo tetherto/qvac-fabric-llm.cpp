@@ -45,6 +45,26 @@ static __device__ __forceinline__ void cp_async_cg_16(const unsigned int dst, co
 #endif // CP_ASYNC_AVAILABLE
 }
 
+// Closes the current group of asynchronous copies issued by this thread.
+static __device__ __forceinline__ void cp_async_commit_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.commit_group;");
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+// Makes each thread wait until at most n of its committed groups are still pending.
+// Like cp_async_wait_all this does NOT synchronize between threads.
+template <int n>
+static __device__ __forceinline__ void cp_async_wait_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.wait_group %0;" : : "n"(n));
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
 // Makes each thread wait until its asynchronous data copies are done.
 // This does NOT provide any additional synchronization.
 // In particular, when copying data with multiple warps a call to __syncthreads will be needed.

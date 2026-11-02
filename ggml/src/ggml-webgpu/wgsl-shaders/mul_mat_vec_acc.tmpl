@@ -24,7 +24,11 @@ fn sbyte_of(v: u32, b: u32) -> i32 {
 #define SRC1_TYPE vec4<SRC1_INNER_TYPE>
 
 fn inner_dot(src0_val: SRC0_TYPE, src1_val: SRC1_TYPE) -> f32 {
+#ifdef PREC_F32
+    return dot(vec4<f32>(src0_val), vec4<f32>(src1_val));
+#else
     return f32(dot(SRC1_TYPE(src0_val), src1_val));
+#endif
 }
 #endif // VEC
 

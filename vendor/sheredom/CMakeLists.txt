@@ -3,4 +3,6 @@
 add_library(sheredom INTERFACE)
 add_library(vendor::sheredom ALIAS sheredom)
 
-target_include_directories(sheredom INTERFACE ..)
+target_include_directories(sheredom INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>
+    $<INSTALL_INTERFACE:${LLAMA_INCLUDE_INSTALL_DIR}>)

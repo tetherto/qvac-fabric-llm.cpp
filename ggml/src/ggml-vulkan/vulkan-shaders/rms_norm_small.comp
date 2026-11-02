@@ -1,0 +1,85 @@
+#version 450
+
+// RMS norm for short rows (ne00 <= 256): one subgroup per row instead of one 512-thread workgroup
+// per row. rms_norm.comp leaves 3/4 of its lanes idle on a 128-wide row and pays a shared-memory
+// reduction with a barrier per step; the GDN head norms ((128,48,n) gated, (128,16,n) q/k l2) are
+// that shape. Same push constants and do_multiply semantics as rms_norm.comp (broadcast weight
+// through src1_idx / fastmod), contiguous destination. Rows are the flattened (i01, i02, i03) and a
+// subgroup strides over them, so any workgroup count and subgroup size covers every row.
+
+#include "generic_binary_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+#define BLOCK_SIZE 256
+
+layout (constant_id = 1) const bool do_multiply = false;
+// RMS_NORM + MUL + MUL (the gated norm, normalised * gamma * gate): the second multiplier is
+// contiguous and the same shape as the destination, so it shares the destination index
+layout (constant_id = 2) const bool do_multiply2 = false;
+// RMS_NORM + SCALE (the GDN q/k l2 norm): multiply by p.param2 on the store. The normalised value
+// is rounded to f32 first, the same two roundings as the separate SCALE op.
+layout (constant_id = 3) const bool do_post_scale = false;
+
+layout (binding = 3) readonly buffer C {float data_c[];};
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint ncols  = p.ne00;
+    const uint nrows  = p.ne01 * p.ne02 * p.ne03;
+    const uint lane   = gl_SubgroupInvocationID;
+    const uint sgsize = gl_SubgroupSize;
+    const uint stride = gl_NumWorkGroups.x * gl_NumSubgroups;
+
+    for (uint r = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID; r < nrows; r += stride) {
+        const uint row     = r % p.ne01;
+        const uint channel = (r / p.ne01) % p.ne02;
+        const uint samp    = r / (p.ne01 * p.ne02);
+
+        const uint a_offset = samp*p.nb03 + channel*p.nb02 + row*p.nb01 + get_aoffset();
+        const uint b_offset = src1_idx(0, row, channel, samp) + get_boffset();
+        const uint d_row    = ((samp*p.ne02 + channel)*p.ne01 + row)*ncols;
+        const uint d_offset = d_row + get_doffset();
+
+        FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
+        for (uint col = lane; col < ncols; col += sgsize) {
+            const FLOAT_TYPE xi = FLOAT_TYPE(data_a[a_offset + col]);
+            sum += xi * xi;
+        }
+        sum = subgroupAdd(sum);
+
+        const FLOAT_TYPE mean  = sum / FLOAT_TYPE(ncols);
+        const FLOAT_TYPE scale = inversesqrt(mean + FLOAT_TYPE(p.param1));
+
+        if (do_multiply2) {
+            for (uint col = lane; col < ncols; col += sgsize) {
+                const FLOAT_TYPE g = FLOAT_TYPE(data_b[b_offset + (ncols > p.ne10 ? fastmod(col, p.ne10) : col)]);
+                const FLOAT_TYPE y = scale * FLOAT_TYPE(data_a[a_offset + col]) * g;
+                data_d[d_offset + col] = D_TYPE(y * FLOAT_TYPE(data_c[d_row + col]));
+            }
+        } else if (do_multiply) {
+            if (ncols > p.ne10) {
+                for (uint col = lane; col < ncols; col += sgsize) {
+                    data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
+                }
+            } else {
+                for (uint col = lane; col < ncols; col += sgsize) {
+                    data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
+                }
+            }
+        } else if (do_post_scale) {
+            for (uint col = lane; col < ncols; col += sgsize) {
+                const float y = float(scale * FLOAT_TYPE(data_a[a_offset + col]));
+                data_d[d_offset + col] = D_TYPE(y * p.param2);
+            }
+        } else {
+            for (uint col = lane; col < ncols; col += sgsize) {
+                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+            }
+        }
+    }
+}

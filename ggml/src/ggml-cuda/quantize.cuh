@@ -16,9 +16,11 @@ typedef void (*quantize_cuda_t)(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// layout: see ggml_cuda_q8_1_layout_for() in common.cuh. The caller must pass the same layout the
+// consuming mat-vec kernel expects for (type_src0, ncols_dst, ids).
 void quantize_row_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,
-        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        ggml_cuda_q8_1_layout layout, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
 void quantize_mmq_q8_1_cuda(
@@ -68,3 +70,22 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int64_t         nrows_dst,
                                     int             n_expert_used,
                                     cudaStream_t    stream);
+
+#ifdef GGML_CUDA_CUTLASS
+void quantize_cutlass_nvfp4_cuda(
+        const float * x, void * vy, uint8_t * block_scales, float * row_scales, bool use_aligned_float8,
+        int64_t n_cols, int64_t n_cols_padded, int64_t stride_row, int64_t n_rows, cudaStream_t stream);
+
+void quantize_cutlass_nvfp4_swiglu_bf16_cuda(const nv_bfloat16 * gate,
+                                             const nv_bfloat16 * up,
+                                             const float *       gate_scale,
+                                             const float *       up_scale,
+                                             float *             glu,
+                                             void *              vy,
+                                             uint8_t *           block_scales,
+                                             float *             row_scales,
+                                             int64_t             n_cols,
+                                             int64_t             n_cols_padded,
+                                             int64_t             n_rows,
+                                             cudaStream_t        stream);
+#endif

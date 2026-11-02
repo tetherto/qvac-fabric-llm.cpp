@@ -1,0 +1,33 @@
+#version 450
+
+#include "types.glsl"
+
+// Channel shuffle (G groups) along ne2 (PyTorch): output plane c' copies input
+// plane (c'%G)*(C/G) + c'/G.  One thread per dst element (gather).
+layout (push_constant) uniform parameter
+{
+    uint ne;   // total dst elements
+    uint FT;   // ne0*ne1 (plane size)
+    uint C;    // ne2 (channels)
+    uint G;    // groups
+} p;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const uint pl = idx / p.FT;        // output plane = c' + C*b
+    const uint ft = idx - pl * p.FT;
+    const uint c  = pl % p.C;
+    const uint b  = pl / p.C;
+    const uint ic = (c % p.G) * (p.C / p.G) + c / p.G;
+
+    data_d[idx] = D_TYPE(data_a[(ic + p.C * b) * p.FT + ft]);
+}

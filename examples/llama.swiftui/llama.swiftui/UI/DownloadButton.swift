@@ -1,3 +1,4 @@
+#if false
 import SwiftUI
 
 struct DownloadButton: View {
@@ -113,12 +114,13 @@ struct DownloadButton: View {
         }
     }
 }
+#endif
 
-// #Preview {
-//    DownloadButton(
-//        llamaState: LlamaState(),
-//        modelName: "TheBloke / TinyLlama-1.1B-1T-OpenOrca-GGUF (Q4_0)",
-//        modelUrl: "https://huggingface.co/TheBloke/TinyLlama-1.1B-1T-OpenOrca-GGUF/resolve/main/tinyllama-1.1b-1t-openorca.Q4_0.gguf?download=true",
-//        filename: "tinyllama-1.1b-1t-openorca.Q4_0.gguf"
-//    )
-// }
+import SwiftUI
+
+@available(*, deprecated, message: "Use ModelAvailableRow and ModelDownloadedRow instead.")
+struct DownloadButton: View {
+    var body: some View {
+        EmptyView()
+    }
+}
