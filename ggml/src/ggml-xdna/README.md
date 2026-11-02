@@ -408,6 +408,7 @@ Diagnostics - nothing is measured unless they are set:
 | `xdna-gdn-mm.h/.cpp` | the prefill gated delta rule on the array, and the GDN input it is fed |
 | `xdna-conv-prefill.h/.cpp` | SSM_CONV prefill runner (opt-in) |
 | `xdna-norm.h` | the host RMS_NORM, rounded as ggml's CPU op rounds it |
+| `xdna-match.h` | how the graph planners recognise the nodes llama builds around a layer |
 | `xdna-prof.h` | the profiler behind `GGML_XDNA_PROF` |
 | `kernels/*.py` | IRON/MLIR-AIE designs: the array configuration, the fifos and the runtime sequence |
 | `kernels/*.cc` | the device C++ those designs compile in |
