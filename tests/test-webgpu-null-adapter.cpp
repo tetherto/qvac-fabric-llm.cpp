@@ -11,12 +11,15 @@
 // backend must refuse it: every WebGPU device that registers has to compute,
 // and with no usable GPU at all none may register and the CPU must remain the
 // best backend (the --expect-no-device form, run with the Vulkan drivers
-// hidden from the process).
+// hidden from the process). Hiding the Vulkan drivers does not disable CUDA,
+// Metal or any other GPU backend, so that form unloads every backend other
+// than the CPU and WebGPU before asking which backend is best.
 
 static const int64_t elements        = 64;
 static const float   addend_a        = 1.0f;
 static const float   addend_b        = 2.0f;
 static const char *  webgpu_reg_name = "WebGPU";
+static const char *  cpu_reg_name    = "CPU";
 static const char *  expect_no_device_flag = "--expect-no-device";
 
 struct add_graph {
@@ -90,6 +93,33 @@ static bool best_backend_is_cpu() {
     return cpu;
 }
 
+static bool is_cpu_or_webgpu(ggml_backend_reg_t reg) {
+    const char * name = ggml_backend_reg_name(reg);
+    return strcmp(name, cpu_reg_name) == 0 || strcmp(name, webgpu_reg_name) == 0;
+}
+
+static std::vector<ggml_backend_reg_t> backends_other_than_cpu_and_webgpu() {
+    std::vector<ggml_backend_reg_t> others;
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        if (!is_cpu_or_webgpu(reg)) {
+            others.push_back(reg);
+        }
+    }
+    return others;
+}
+
+static void unload_backends(const std::vector<ggml_backend_reg_t> & regs) {
+    for (ggml_backend_reg_t reg : regs) {
+        fprintf(stderr, "  unloading %s: only the CPU and WebGPU registrations take part\n", ggml_backend_reg_name(reg));
+        ggml_backend_unload(reg);
+    }
+}
+
+static void keep_only_cpu_and_webgpu() {
+    unload_backends(backends_other_than_cpu_and_webgpu());
+}
+
 static int check_no_device(ggml_backend_reg_t reg) {
     int failures = 0;
     if (ggml_backend_reg_dev_count(reg) != 0) {
@@ -113,6 +143,7 @@ int main(int argc, char ** argv) {
     }
     int failures = count_devices_that_do_not_compute(reg);
     if (expect_no_device) {
+        keep_only_cpu_and_webgpu();
         failures += check_no_device(reg);
     }
     return failures == 0 ? 0 : 1;
