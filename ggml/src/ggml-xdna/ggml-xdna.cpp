@@ -4631,9 +4631,11 @@ static ggml_backend_buffer_type_t xdna_host_buffer_type(void) {
         /* .iface   = */ {
                           /* .get_name       = */ xdna_hbt_name,
                           /* .alloc_buffer   = */ xdna_hbt_alloc,
+                          /* .alloc_buffer_n = */ nullptr,
                           /* .get_alignment  = */ xdna_hbt_alignment,
                           /* .get_max_size   = */ nullptr,
                           /* .get_alloc_size = */ nullptr,
+                          /* .get_alloc_size_n = */ nullptr,
                           /* .is_host        = */ xdna_hbt_is_host,
                           },
         /* .device  = */
