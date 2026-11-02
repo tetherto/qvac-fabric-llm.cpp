@@ -54,9 +54,6 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
     return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 32;
 }
 
-// the most src1 rows of the few-row MMA kernels
-static constexpr int64_t GGML_METAL_MMA_ROWS_MAX = 16;
-
 // src1 rows per 8x8 simdgroup matrix tile of the few-row MMA kernels
 static constexpr int64_t GGML_METAL_MMA_TILE_ROWS = 8;
 
@@ -148,6 +145,24 @@ static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
     }
 }
 
+// the most src1 rows of the few-row MMA kernels; rows past the 16 of one threadgroup run as more threadgroups. Measured on
+// an M3 Ultra over the FFN mat-muls of Qwen3.8-27B (gate/up 17408x5120, down 5120x17408), where they beat mul_mm; Q6_K and
+// the types not measured keep 16
+static int64_t ggml_metal_mul_mv_mma_rows_max(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+            return 64;
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q5_K:
+            return 48;
+        default:
+            return 16;
+    }
+}
+
 bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -156,7 +171,7 @@ bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
     const bool batch_ok = src1->ne[2] <= INT16_MAX && src1->ne[2]/src0->ne[2] <= INT16_MAX && src1->ne[3]/src0->ne[3] <= INT16_MAX;
 
     return ggml_metal_mul_mat_mma_type_ok(op) && batch_ok &&
-        src1->type == GGML_TYPE_F32 && src1->ne[1] >= ggml_metal_mul_mv_mma_rows_min(src0->type) && src1->ne[1] <= GGML_METAL_MMA_ROWS_MAX &&
+        src1->type == GGML_TYPE_F32 && src1->ne[1] >= ggml_metal_mul_mv_mma_rows_min(src0->type) && src1->ne[1] <= ggml_metal_mul_mv_mma_rows_max(src0->type) &&
         !ggml_is_transposed(src0) && !ggml_is_transposed(src1) &&
         src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 && src1->nb[3] % 16 == 0;
 }
