@@ -6737,7 +6737,8 @@ void check_turbovec_1x_staged(int x86_rules) {
 // ends on a partial flush group.
 void check_turbovec_1x_staged_wide_dims(int x86_rules) {
     turbovec_force_x86_rules_for_test(x86_rules);
-    turbovec_force_planes_for_test(1, 0);
+    // Planes from the first vector, so this small index searches staged.
+    turbovec_force_planes_for_test(1, 1);
     turbovec_force_vector_major_for_test(1);
     const int n = 3000;
     for (const int k : { 10, 64 }) {
@@ -6755,6 +6756,7 @@ void check_turbovec_1x_staged_wide_dims(int x86_rules) {
                         CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
                     }
                     CHECK(ggml_vec_index_add(tv, db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-wide.tvim")[7] == 1);
                     std::vector<float> staged_scores(static_cast<size_t>(3 * k));
                     std::vector<uint64_t> staged_ids(staged_scores.size());
                     CHECK(ggml_vec_index_search(tv, queries.data(), 3, k, staged_scores.data(), staged_ids.data()) ==
@@ -6808,7 +6810,9 @@ void check_turbovec_1x_exact2_rows(int x86_rules) {
 #else
     constexpr bool neon_host = false;
 #endif
-    turbovec_force_planes_for_test(1, 0);
+    // Planes from the first vector: the wider dims use a smaller index than
+    // the default planes threshold.
+    turbovec_force_planes_for_test(1, 1);
     // dim 1024 is the first to reach the row scorer's FMA flush (every 128
     // sign groups); 1056 flushes with a partial group after it.
     for (const int dim_i : { kTv1xStagedDim, 1024, 1056 }) {
