@@ -44,11 +44,10 @@ double neg_inf_f64() {
     return v;
 }
 
-// A relaxed load of the shared floor, the same builtin each standard
-// library's std::atomic<double>::load uses, without instantiating it. The
-// staged search asserts that the atomic is a bare double.
-double load_floor_relaxed(const std::atomic<double> * floor) {
-    const double * p = reinterpret_cast<const double *>(floor);
+// A relaxed load of the shared floor (a std::atomic<double> the staged
+// search asserts is a bare double), with the same builtin each standard
+// library's std::atomic<double>::load uses, without instantiating it.
+double load_floor_relaxed(const double * p) {
     double v = 0.0;
 #if defined(_MSC_VER) && !defined(__clang__)
     const long long bits = __iso_volatile_load64(reinterpret_cast<const volatile long long *>(p));
