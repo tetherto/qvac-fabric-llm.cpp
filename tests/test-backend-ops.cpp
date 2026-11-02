@@ -6818,8 +6818,14 @@ struct test_mul_mat_prec_f32 : public test_mul_mat {
         return out;
     }
 
-    double max_nmse_err() override {
-        return type_a == GGML_TYPE_F32 ? 1e-9 : 5e-4;
+    double max_nmse_err(ggml_backend_t backend) override {
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        const char * name = ggml_backend_reg_name(reg);
+        const bool preserves_f32_inputs = strcmp(name, "CUDA") == 0 || strcmp(name, "CPU") == 0;
+        if (type_a == GGML_TYPE_F32 && preserves_f32_inputs) {
+            return 1e-9;
+        }
+        return test_mul_mat::max_nmse_err(backend);
     }
 };
 
