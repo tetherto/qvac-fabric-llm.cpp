@@ -6804,6 +6804,25 @@ struct test_mul_mat : public test_case {
     }
 };
 
+struct test_mul_mat_prec_f32 : public test_mul_mat {
+    test_mul_mat_prec_f32(ggml_type type, int64_t rows, int64_t columns)
+        : test_mul_mat(type, GGML_TYPE_F32, rows, columns, 256, {1, 1}, {1, 1}) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",prec_f32=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx);
+        GGML_ASSERT(ggml_prec_set_acc(out, GGML_PREC_F32));
+        return out;
+    }
+
+    double max_nmse_err() override {
+        return type_a == GGML_TYPE_F32 ? 1e-9 : 5e-4;
+    }
+};
+
 static ggml_backend_buffer_type_t test_repacked_weight_buffer_type(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -15764,6 +15783,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_round     (type, {1024, 1024, 1, 1}));
         test_cases.emplace_back(new test_trunc     (type, {7, 1, 5, 3}));
         test_cases.emplace_back(new test_trunc     (type, {1024, 1024, 1, 1}));
+    }
+
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+        for (int columns : {1, 2, 5, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat_prec_f32(type, 48, columns));
+            test_cases.emplace_back(new test_mul_mat_prec_f32(type, 96, columns));
+        }
     }
 
     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
