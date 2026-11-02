@@ -508,7 +508,8 @@ if (GGML_XDNA_BUILD_KERNELS)
 endif()
 
 # Host-only tests of what a device cannot check for itself: which weight
-# conversions the repacker accepts, and how many head rows stay exact. They
+# conversions the repacker accepts, how many head rows stay exact, and which
+# nodes the graph planners take for the ones llama builds. They
 # compile the backend sources they test directly and open no device.
 # tests/CMakeLists.txt adds them to ctest: testing is enabled there, after this
 # directory is configured.
@@ -520,4 +521,6 @@ if (GGML_XDNA_BUILD_TESTS)
     # xdna-head.h includes the XRT kernel header
     add_executable(test-xdna-head-rows tests/test-xdna-head-rows.cpp)
     target_link_libraries(test-xdna-head-rows PRIVATE XRT::xrt_coreutil)
+    add_executable(test-xdna-match tests/test-xdna-match.cpp)
+    target_link_libraries(test-xdna-match PRIVATE ggml-base)
 endif()
