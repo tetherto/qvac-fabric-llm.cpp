@@ -59,6 +59,8 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 #ifdef GGML_METAL_FFN_EXPERIMENT
 typedef bool (*ggml_metal_custom2_execute)(ggml_backend_t backend, struct ggml_tensor * tensor, void * userdata);
 GGML_BACKEND_API void ggml_backend_metal_set_custom2(ggml_custom2_op_t tag, ggml_metal_custom2_execute execute);
+// the same for GGML_OP_CUSTOM nodes (ggml_custom_4d) whose fun is tag
+GGML_BACKEND_API void ggml_backend_metal_set_custom(ggml_custom_op_t tag, ggml_metal_custom2_execute execute);
 GGML_BACKEND_API bool ggml_backend_metal_tensor_is_shared(const struct ggml_tensor * tensor);
 // commit a command buffer that signals (or waits for) `value` on an MTLSharedEvent of the backend's device
 GGML_BACKEND_API void ggml_backend_metal_shared_event(ggml_backend_t backend, void * event, uint64_t value, bool wait);

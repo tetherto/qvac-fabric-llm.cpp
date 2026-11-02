@@ -17,6 +17,13 @@ typedef struct ggml_tensor * (*llama_ffn_coreml_split_builder)(struct ggml_conte
 
 LLAMA_API void llama_ffn_coreml_set_split_builder(llama_ffn_coreml_split_builder builder, void * userdata);
 
+// In-graph sidecar: builds the whole FFN of a layer plus residual in the graph (the Metal share from views of the
+// layer's gate/up/down weights) and returns it, or returns nullptr for the normal FFN. Tried before the builder above.
+typedef struct ggml_tensor * (*llama_ffn_coreml_graph_builder)(struct ggml_context *, struct ggml_cgraph *, struct ggml_tensor * input,
+        struct ggml_tensor * residual, struct ggml_tensor * gate, struct ggml_tensor * up, struct ggml_tensor * down, int, void *);
+
+LLAMA_API void llama_ffn_coreml_set_graph_builder(llama_ffn_coreml_graph_builder builder, void * userdata);
+
 #ifdef __cplusplus
 }
 #endif

@@ -565,11 +565,32 @@ void ggml_backend_metal_shared_event(ggml_backend_t backend, void * event, uint6
     ggml_metal_shared_event((ggml_metal_t) backend->context, event, value, wait);
 }
 
+static ggml_custom_op_t custom_tag = nullptr;
+static ggml_metal_custom2_execute custom_execute = nullptr;
+
+void ggml_backend_metal_set_custom(ggml_custom_op_t tag, ggml_metal_custom2_execute execute) {
+    custom_tag = tag;
+    custom_execute = execute;
+}
+
+// executor and userdata of a registered experiment op (MAP_CUSTOM2 or CUSTOM), or nullptr
+static ggml_metal_custom2_execute ggml_backend_metal_experiment_op(const ggml_tensor * tensor, void ** userdata) {
+    if (tensor->op == GGML_OP_MAP_CUSTOM2 && custom2_tag && custom2_execute) {
+        ggml_map_custom2_op_params params;
+        memcpy(&params, tensor->op_params, sizeof(params));
+        if (params.fun == custom2_tag) { *userdata = params.userdata; return custom2_execute; }
+    }
+    if (tensor->op == GGML_OP_CUSTOM && custom_tag && custom_execute) {
+        ggml_custom_op_params params;
+        memcpy(&params, tensor->op_params, sizeof(params));
+        if (params.fun == custom_tag) { *userdata = params.userdata; return custom_execute; }
+    }
+    return nullptr;
+}
+
 static bool ggml_backend_metal_custom2_matches(const ggml_tensor * tensor) {
-    if (!custom2_tag || !custom2_execute || tensor->op != GGML_OP_MAP_CUSTOM2) { return false; }
-    ggml_map_custom2_op_params params;
-    memcpy(&params, tensor->op_params, sizeof(params));
-    return params.fun == custom2_tag;
+    void * userdata = nullptr;
+    return ggml_backend_metal_experiment_op(tensor, &userdata) != nullptr;
 }
 #endif
 
@@ -597,15 +618,15 @@ static enum ggml_status ggml_backend_metal_graph_compute_impl(ggml_backend_t bac
     int first = 0;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!ggml_backend_metal_custom2_matches(node)) { continue; }
+        void * userdata = nullptr;
+        const auto execute = ggml_backend_metal_experiment_op(node, &userdata);
+        if (!execute) { continue; }
         if (first < i) {
             auto before = ggml_graph_view(cgraph, first, i);
             const auto status = ggml_metal_graph_compute(ctx, &before);
             if (status != GGML_STATUS_SUCCESS) { return status; }
         }
-        ggml_map_custom2_op_params params;
-        memcpy(&params, node->op_params, sizeof(params));
-        if (!custom2_execute(backend, node, params.userdata)) { return GGML_STATUS_FAILED; }
+        if (!execute(backend, node, userdata)) { return GGML_STATUS_FAILED; }
         first = i + 1;
     }
     if (first != 0) {

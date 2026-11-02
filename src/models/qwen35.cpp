@@ -22,6 +22,14 @@ void llama_ffn_coreml_set_split_builder(llama_ffn_coreml_split_builder builder, 
     qwen35_coreml_split_builder = builder;
     qwen35_coreml_split_userdata = userdata;
 }
+
+static llama_ffn_coreml_graph_builder qwen35_coreml_graph_builder = nullptr;
+static void * qwen35_coreml_graph_userdata = nullptr;
+
+void llama_ffn_coreml_set_graph_builder(llama_ffn_coreml_graph_builder builder, void * userdata) {
+    qwen35_coreml_graph_builder = builder;
+    qwen35_coreml_graph_userdata = userdata;
+}
 #endif
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -236,7 +244,13 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         cb(attn_post_norm, "attn_post_norm", il);
 
 #ifdef LLAMA_FFN_COREML_EXPERIMENT
-        ggml_tensor * offloaded = qwen35_coreml_builder ? qwen35_coreml_builder(ctx0, attn_post_norm, ffn_residual, il, qwen35_coreml_userdata) : nullptr;
+        const auto & layer = model.layers[il];
+        ggml_tensor * offloaded = qwen35_coreml_graph_builder && !layer.ffn_gate_s && !layer.ffn_up_s && !layer.ffn_down_s
+            ? qwen35_coreml_graph_builder(ctx0, gf, attn_post_norm, ffn_residual, layer.ffn_gate, layer.ffn_up, layer.ffn_down, il, qwen35_coreml_graph_userdata)
+            : nullptr;
+        if (!offloaded && qwen35_coreml_builder) {
+            offloaded = qwen35_coreml_builder(ctx0, attn_post_norm, ffn_residual, il, qwen35_coreml_userdata);
+        }
         if (offloaded) { cur = offloaded; } else
 #endif
         {

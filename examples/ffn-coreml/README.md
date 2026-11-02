@@ -73,6 +73,24 @@ The 8192-channel split on the Q4_0 GGUF uses [qwen3.8-27b-64-dual-q40.json](conf
 
 Because the Neural Engines no longer hold the GPU up, the overlap pairs with a larger Neural Engine share: [qwen3.8-27b-64-dual-s5120.json](configs/qwen3.8-27b-64-dual-s5120.json) keeps 5120 channels on Metal and gives 6144 to each Neural Engine. On M3 Ultra with the Q4_0 GGUF and the prefill attention kernel from `feat/metal-fa-prefill-d256`, single-request server prefill (engine-bench client) measured 519.4 / 537.6 / 507.4 / 454.9 / 379.1 / 294.4 tok/s at about 1k / 4.5k / 21k / 38k / 70k / 123k tokens, against 395.8 / 435.9 / 400.0 / 365.9 / 316.5 / 255.6 for the 8192-channel split without the overlap. The held-out gate passes: mean NLL change +0.00044 nats/token (upper bound +0.00083), KL 0.00046, worst window +0.00211. Without the overlap this split is slower than the 8192-channel one, so keep the two together.
 
+## Load-time export and the in-graph sidecar
+
+`FFN_COREML_OTF=<Metal channels>x<packages>` (for example `8192x2`) builds the Core ML side from the GGUF when the model loads, so there is no conversion step and no assets folder. A weight-free int8 template per channel count ([templates](templates), made by `make_template.py` with coremltools) holds the program. For each layer and package the runtime dequantizes the FFN weights from the GGUF, quantizes them per channel to int8 the way coremltools does (the `weight.bin` is byte-identical to a coremltools export), writes the package, compiles it and caches the compiled model under `FFN_COREML_CACHE` (default `~/Library/Caches/ffn-coreml`). The cache key is the GGUF path, size and modification time and the template. Set `FFN_COREML_TEMPLATES` to the templates folder. On M3 Ultra with the Q4_0 GGUF, a cold start of the 128 programs takes 92 s (export 24.5 s, compile 2.6 s, load 60 s); a cached start takes 3-7 s. `llama-server-coreml` takes `FFN_COREML_OTF` in place of `FFN_COREML_ASSETS`.
+
+`FFN_COREML_INGRAPH=1` (with `FFN_COREML_GPU_RESIDENT=1 FFN_COREML_ASYNC=1`) puts the sidecar into the model graph. The Metal share of each FFN runs as ordinary graph nodes on views of the model's own weights, so there is no weight copy and there are no per-layer prefix and join graphs. Two custom nodes, run by the Metal backend (`ggml_backend_metal_set_custom`), bracket it: start signals the serial worker to run the Neural Engine share on the node's input, finish waits for it and adds the partial outputs. The GPU runs the Metal share while the Neural Engines work. A microbatch of more than 512 rows goes to the Neural Engines in 512-row calls; a last chunk of at least `FFN_COREML_PAD_MIN` rows is padded, a smaller one has its Neural Engine share computed on Metal. Any microbatch size, multi-sequence batches and speculative decoding take this path, which the half-batch overlap does not.
+
+Harness prefill (`split`, Q4_0, M3 Ultra, 8192 Metal channels and 2 x 4608, without the attention kernel, 3 repetitions):
+
+| Microbatch | Metal 2048 / 8192 tokens | In-graph 2048 / 8192 tokens |
+| --- | ---: | ---: |
+| 512 | 331.7 / 320.4 | 447.0 / 427.8 (+35% / +34%) |
+| 1024 | 340.4 / 328.7 | 480.1 / 455.6 (+41% / +39%) |
+| 2048 | 344.8 / 333.3 | 496.1 / 473.4 (+44% / +42%) |
+
+Programs with 1024 rows were slower than 512-row chunks (485.1 / 459.0 at microbatch 2048) and are not kept. Peak process footprint was 6.2-6.8 GB, against 18.0 GB for the runtime with its own Metal weight copies and 1.4-1.8 GB for Metal alone. Quality on held-out text: over 13 repository windows mean NLL change -0.00006 nats/token and KL 0.00017; at microbatch 2048 the logits are identical to microbatch 512; partial chunks (a padded 300-row microbatch, a 100-row Metal tail, a padded chunk inside a 1024-row microbatch) had mean KL 0.00009-0.00010.
+
+Through `llama-server-coreml` with the attention kernel from `feat/metal-fa-prefill-d256` and `-ub 2048`, single-request prefill (engine-bench client) measured 420 / 448 / 429 tok/s at about 1k / 4.4k / 21k tokens, against about 331-335 for Metal alone; 431-449 tok/s with MTP and DFlash2, where the half-batch overlap stays off (about 365); and 148 tok/s total at 16 concurrent requests. In no-speculation, MTP and DFlash2 modes the first 64 generated tokens were identical to Metal alone on three prompts of 784 to 2322 tokens, with the same draft acceptance.
+
 ## Held-out quality gate
 
 The gate compares the split against ordinary Metal on 23 windows of real text that were never used for calibration or layer selection: 20 of 2048 tokens and 3 of 8192 (C++, Python, documentation, a novel and mathematics, 65,536 tokens). [gate/windows.json](gate/windows.json) lists every window as a slice of a source with its SHA256. Repository sources are read at the recorded commit; the five external texts (Project Gutenberg and Wikipedia wikitext, not committed) must be downloaded into one directory first.
