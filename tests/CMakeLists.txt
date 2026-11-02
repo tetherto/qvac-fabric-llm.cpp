@@ -492,15 +492,17 @@ if (GGML_WEBGPU AND NOT EMSCRIPTEN)
     set_tests_properties(test-webgpu-mul-mat-prec-f32 PROPERTIES SKIP_RETURN_CODE 77)
     # Every WebGPU device that registers must compute; with the Vulkan drivers
     # hidden Dawn offers only its Null adapter, which the backend must refuse,
-    # leaving the CPU as the best backend.
+    # leaving the CPU as the best backend. ggml_backend_load_all() loads the
+    # WebGPU backend only when GGML_WEBGPU_AUTOLOAD=1, so both runs opt in.
     llama_build_and_test(test-webgpu-null-adapter.cpp)
+    set_tests_properties(test-webgpu-null-adapter PROPERTIES ENVIRONMENT "GGML_WEBGPU_AUTOLOAD=1")
     if (GGML_BACKEND_DL)
         add_dependencies(test-webgpu-null-adapter ggml-webgpu)
     endif()
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         llama_test(test-webgpu-null-adapter NAME test-webgpu-null-adapter-no-driver ARGS --expect-no-device)
         set_tests_properties(test-webgpu-null-adapter-no-driver PROPERTIES ENVIRONMENT
-            "VK_ICD_FILENAMES=/nonexistent/no-vulkan-driver.json;VK_DRIVER_FILES=/nonexistent/no-vulkan-driver.json")
+            "GGML_WEBGPU_AUTOLOAD=1;VK_ICD_FILENAMES=/nonexistent/no-vulkan-driver.json;VK_DRIVER_FILES=/nonexistent/no-vulkan-driver.json")
     endif()
     llama_build(test-webgpu-registry.cpp)
     if (GGML_BACKEND_DL)
