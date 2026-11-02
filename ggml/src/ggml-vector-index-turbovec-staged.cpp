@@ -1251,7 +1251,7 @@ struct Collector {
 
     void cut_back() {
         cut = true;
-        threshold = cut_to_best(top, s_len, ScoreIdBetterI{},scratch).score;
+        threshold = cut_to_best(top, s_len, ScoreIdBetterI{}, scratch).score;
         if (floor_score != nullptr) {
             double seen = floor_score->load(std::memory_order_relaxed);
             while (threshold > seen && !floor_score->compare_exchange_weak(seen, threshold, std::memory_order_relaxed)) {
@@ -1802,7 +1802,7 @@ bool turbovec_staged_search(
         }
         if (top.size() > s_len) {
             std::vector<ScoreId> scratch;
-            cut_to_best(top, s_len, ScoreIdBetterI{},scratch);
+            cut_to_best(top, s_len, ScoreIdBetterI{}, scratch);
         }
         list.reserve(top.size());
         for (const ScoreId & c : top) {
@@ -2219,7 +2219,7 @@ bool turbovec_staged_search_batch(
             }
             std::vector<ScoreId> & top = cols[i].top;
             if (top.size() > s_len) {
-                cut_to_best(top, s_len, ScoreIdBetterI{},cols[i].scratch);
+                cut_to_best(top, s_len, ScoreIdBetterI{}, cols[i].scratch);
             }
             run_query(q, &top, false, false, 1);
         }
