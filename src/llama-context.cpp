@@ -1744,9 +1744,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = get_gf_res_prev(ubatch.n_tokens);
     auto * gf  = res->get_gf();
 
-    // [TAG_SCHED_PER_SIZE] a batch of up to 8 tokens uses the scheduler of its arena
+    // [TAG_SCHED_PER_SIZE] a small batch uses the scheduler of its arena
+    // TODO: with backend samplers the sampled outputs of these graphs come out wrong when they are replayed as CUDA
+    //       graphs (multi-sequence DFlash drafts at 64 tokens lose ~30% acceptance), so such contexts keep one scheduler
     sched_small_entry * ss = nullptr;
-    if (sched_per_size && ubatch.n_tokens <= n_tokens_per_size) {
+    if (sched_per_size && ubatch.n_tokens <= n_tokens_per_size && sampling.samplers.empty()) {
         const uint32_t key = gf_res_key(ubatch.n_tokens);
         for (auto & e : sched_small) {
             if (e.key == key) {
