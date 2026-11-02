@@ -145,14 +145,19 @@ static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
     }
 }
 
-// the most src1 rows of the few-row MMA kernels; rows past the 16 of one threadgroup run as more threadgroups. Q4_0 and F32
-// beat mul_mm up to 64 rows (concurrent speculative verify batches of Qwen3.8-27B on an M3 Ultra); the other types are not
-// measured above 16
+// the most src1 rows of the few-row MMA kernels; rows past the 16 of one threadgroup run as more threadgroups. Measured on
+// an M3 Ultra over the FFN mat-muls of Qwen3.8-27B (gate/up 17408x5120, down 5120x17408), where they beat mul_mm; Q6_K and
+// the types not measured keep 16
 static int64_t ggml_metal_mul_mv_mma_rows_max(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_Q4_0:
         case GGML_TYPE_F32:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
             return 64;
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q5_K:
+            return 48;
         default:
             return 16;
     }
