@@ -173,7 +173,10 @@ from it: on unstructured random test data 77 to 94% of a top 10 overlaps the
 full scan's, the same as upstream, and real embeddings fare better (see
 upstream's measurements). The results match upstream's single-threaded
 staged search bit for bit, ties included, down to the batch query whose
-sampled seed comes up short and is rescanned with single-query tables.
+sampled seed comes up short and is rescanned unseeded (with single-query
+tables under the aarch64 rules, with the batch's own under the x86 rules).
+A batch over an index with no filter and no removed rows scans the sign
+planes for several queries at once (four on aarch64, six on x86).
 Upstream's thread-pool variant refines inside its scan and can return
 different ids; here a lone query over 32,768 or more vectors splits its scan
 across the index's threads without changing any result. An index stays
@@ -182,7 +185,9 @@ staged if it later shrinks below the threshold.
 instead. On x86, as upstream does, the sign planes are scanned with the
 `vpermb` arithmetic, the shortlist is ranked by counting bit masks against the
 query rather than through lookup tables, and a 4-bit shortlist is rescored
-straight from the bit planes. No fixture from upstream x86 covers those
+straight from the bit planes. A 2-bit shortlist is rescored row by row
+(upstream `legacy_score`) on aarch64, and on x86 when the AVX-512 VNNI kernels
+or the vm8 layout score the index; otherwise by whole blocks. No fixture from upstream x86 covers those
 results; they are checked against reference implementations of upstream's
 arithmetic.
 
