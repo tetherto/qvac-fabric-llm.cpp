@@ -100,6 +100,8 @@ struct llama_context {
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
+    ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -129,6 +131,10 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_embeddings_layer_inp_pos_min(llama_seq_id seq_id, llama_pos pos_min);
+    void set_embeddings_layer_inp_dev(bool value);
+
+    // whether decode accepts entries whose embd is a row of ctx_other's layer input device buffer
+    bool supports_embd_row() const;
     void set_nextn_layer_offset(int32_t offset);
     bool set_draft_vocab(const int32_t * ranges, int32_t n_ranges);
     void set_causal_attn(bool value);
@@ -275,6 +281,11 @@ private:
     uint32_t layer_inp_first_row(const llama_ubatch & ubatch) const;
     bool     layer_inp_row_read (const llama_ubatch & ubatch, uint32_t i) const;
 
+    // (re)allocate the device buffer for cparams.embeddings_layer_inp_dev
+    void layer_inp_dev_alloc();
+
+    ggml_backend_t backend_from_dev(ggml_backend_dev_t dev) const;
+
     //
     // graph
     //
@@ -295,7 +306,7 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
-    llm_graph_result * get_gf_res_prev();
+    llm_graph_result * get_gf_res_prev(uint32_t n_tokens = 0);
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -432,7 +443,9 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // Small batches also get one arena per token count, so speculative verify batches of varying
+    // size keep their own CUDA graphs instead of re-capturing one graph at every size change.
+    std::vector<std::pair<uint32_t, llm_graph_result_ptr>> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
@@ -444,8 +457,49 @@ private:
     // one-time Hadamard transform-coverage check on the first built graph
     bool hadamard_verified = false;
 
+    // [TAG_SCHED_PER_SIZE] wip: with LLAMA_SCHED_PER_SIZE=1 the arenas of batches of up to 8 tokens get their own
+    // scheduler, so alternating batch sizes (the MTP catch-up and draft steps) keep their graphs allocated and reuse
+    // them, instead of rebuilding and re-splitting one graph in the shared scheduler at every size change
+    struct sched_small_entry {
+        uint32_t               key;
+        ggml_backend_sched_ptr sched;
+        llm_graph_result     * ready; // the graph allocated in this scheduler, nullptr when it has to be rebuilt
+    };
+    std::vector<sched_small_entry> sched_small;
+    bool sched_per_size = false;
+
+    // batches of up to this many tokens get their own arena (env LLAMA_GRAPH_PER_SIZE_MAX, default 8)
+    uint32_t n_tokens_per_size = 8;
+
+    // scheduler of the graph of the last process_ubatch(), nullptr for the shared one
+    ggml_backend_sched_t sched_active = nullptr;
+
+    ggml_backend_sched_t sched_res() const { return sched_active ? sched_active : sched.get(); }
+
+    uint32_t gf_res_key(uint32_t n_tokens) const;
+
+    // forget which graphs are allocated, after the graph results were reset
+    void gf_res_invalidate();
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // device buffer with enabled layer inputs, [n_layer_inp*n_embd, n_batch], row = batch index
+    ggml_context_ptr        ctx_layer_inp_dev;
+    ggml_backend_buffer_ptr buf_layer_inp_dev;
+    ggml_tensor *           layer_inp_dev = nullptr;
+    ggml_backend_dev_t      layer_inp_dev_dev = nullptr;
+    ggml_backend_t          layer_inp_backend = nullptr;
+
+    // ordering with the reader context:
+    //   written - recorded by this context after the batch, waited on by the reader
+    //   read    - recorded by the reader after it consumed the rows, waited on by this context
+    ggml_backend_event_ptr ev_layer_inp_written;
+    ggml_backend_event_ptr ev_layer_inp_read;
+    bool ev_layer_inp_read_recorded = false;
+
+    // DFlash/DSpark decoder: the target context whose layer input device buffer embd rows read
+    llama_context * ctx_layer_inp_src = nullptr;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

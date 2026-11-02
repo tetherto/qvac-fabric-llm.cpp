@@ -2290,6 +2290,24 @@ int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq
     return idx;
 }
 
+int32_t common_batch::add_embd_row(int32_t row, const llama_pos * pos, llama_seq_id seq_id, bool output) {
+    const int32_t idx = llama_batch_ext_add_embd_row(batch.get(), seq_id, row);
+    if (idx < 0) {
+        GGML_ABORT("%s: failed to add embd row %d to the batch (error %d, n_tokens = %d)\n", __func__, row, idx, size());
+    }
+    llama_batch_ext_set_pos(batch.get(), idx, pos);
+    if (output) {
+        llama_batch_ext_set_output_logits(batch.get(), idx, true);
+    }
+    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 } };
+    t.embd_row = row;
+    for (int32_t j = 0; j < n_pos; ++j) {
+        t.pos[j] = pos[j];
+    }
+    tokens.push_back(t);
+    return idx;
+}
+
 common_batch common_batch_from_llama_batch(llama_context * ctx, const llama_batch & batch) {
     common_batch res(ctx);
 

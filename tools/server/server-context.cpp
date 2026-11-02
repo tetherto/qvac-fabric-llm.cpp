@@ -213,6 +213,7 @@ struct server_slot {
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    size_t spec_n_pad = 0; // trailing filler tokens in spec_draft (LLAMA_SPEC_PAD), never accepted
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -3034,12 +3035,33 @@ private:
             });
         }
 
+        // [TAG_SPEC_PAD] prototype: with --spec-draft-p-min the drafts of one step end at different lengths, and a
+        // recurrent model splits such a verify batch into one ubatch per length (split_equal). Pad every fresh draft to
+        // the longest one of the step, so the batch stays one equal-length ubatch; the filler is verified but never
+        // accepted, and rolled back like rejected draft tokens
+        static const bool spec_pad = [] { const char * e = getenv("LLAMA_SPEC_PAD"); return e && atoi(e) != 0; }();
+        if (spec_pad && drafting.size() > 1 && common_speculative_get_synth_probs(spec.get()).empty()) {
+            size_t n_step = 0;
+            for (auto * s : drafting) {
+                n_step = std::max(n_step, s->spec_draft.size());
+            }
+            for (auto * s : drafting) {
+                auto & d = s->spec_draft;
+                const size_t n_to = std::min(n_step, (size_t) std::max(0, common_speculative_get_draft_params(spec.get(), s->id).n_max));
+                if (d.size() < n_to) {
+                    const llama_token fill = d.empty() ? s->sampled : d.back();
+                    s->spec_n_pad = n_to - d.size();
+                    d.resize(n_to, fill);
+                }
+            }
+        }
+
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
-            slot.stats.n_draft_tokens += draft.size();
+            slot.stats.n_draft_tokens += draft.size() - slot.spec_n_pad;
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3903,8 +3925,15 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+
+                // [TAG_SPEC_PAD] sample only over the real draft: the filler positions are never accepted
+                const size_t n_real = n_draft - slot.spec_n_pad;
+                const std::vector<int32_t> i_batch_real(slot.spec_i_batch.begin(), slot.spec_i_batch.begin() + n_real + 1);
+                const llama_tokens         draft_real  (slot.spec_draft.begin(),   slot.spec_draft.begin()   + n_real);
+                slot.spec_n_pad = 0;
+
                 auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, i_batch_real, draft_real)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
