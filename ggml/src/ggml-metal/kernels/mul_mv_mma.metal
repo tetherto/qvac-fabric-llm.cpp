@@ -195,7 +195,7 @@ inline void load_mma_blk_b(device const float2 * const y[RT][2], int ib, thread 
     }
 }
 
-// few-row mat-mat (2..16 src1 rows) on 8x8 simdgroup matrices for 32-weight block types: a threadgroup reads each weight once
+// few-row mat-mat (2..64 src1 rows, up to 16 per threadgroup) on 8x8 simdgroup matrices for 32-weight block types: a threadgroup reads each weight once
 // for 8*NT src0 rows x 8*RT src1 rows, and its NSG simdgroups split K
 template<short NT, short RT, typename Q>
 kernel void kernel_mul_mv_mma_blk(
