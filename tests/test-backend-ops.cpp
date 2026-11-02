@@ -9293,6 +9293,43 @@ struct test_diag_mask_inf : public test_case {
     }
 };
 
+struct test_metal_diag_mask_inf_extreme : public test_diag_mask_inf {
+    explicit test_metal_diag_mask_inf_extreme(bool inplace)
+        : test_diag_mask_inf(GGML_TYPE_F32, {2053, 7, 3, 2}, 5, inplace) {}
+
+    std::string vars() override {
+        return test_diag_mask_inf::vars() + ",masked_extremes=1";
+    }
+
+    bool skip_backend(ggml_backend_t backend) override {
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        const char * name = ggml_backend_reg_name(reg);
+        return strcmp(name, "MTL") != 0 && strcmp(name, "CPU") != 0;
+    }
+
+    void set_masked_extremes(ggml_tensor * tensor) {
+        std::vector<float> data(ggml_nelements(tensor));
+        ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
+        for (int64_t row = 0; row < ggml_nrows(tensor); ++row) {
+            for (int64_t col = 0; col < ne[0]; ++col) {
+                if (col - row % ne[1] > n_past) {
+                    data[row * ne[0] + col] = std::numeric_limits<float>::max();
+                }
+            }
+        }
+        ggml_backend_tensor_set(tensor, data.data(), 0, ggml_nbytes(tensor));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        ggml_tensor * input = ggml_get_tensor(ctx, "a");
+        if (type == GGML_TYPE_F32 && input) {
+            set_masked_extremes(input);
+        }
+    }
+
+};
+
 // GGML_OP_SOFT_MAX
 struct test_soft_max : public test_case {
     const ggml_type type;
@@ -15767,6 +15804,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_trunc     (type, {1024, 1024, 1, 1}));
     }
 
+    test_cases.emplace_back(new test_metal_diag_mask_inf_extreme(false));
+    test_cases.emplace_back(new test_metal_diag_mask_inf_extreme(true));
     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {2053, 7, 3, 2}, 0));
     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {2053, 7, 3, 2}, 5, true));

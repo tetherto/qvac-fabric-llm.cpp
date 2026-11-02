@@ -1208,6 +1208,6 @@ kernel void kernel_diag_mask_inf_f32(
     const int row_in_channel = row % args.rows_per_channel;
 
     dst[i] = col - row_in_channel > args.n_past
-                ? (src[i] - FLT_MAX)
+                ? -FLT_MAX
                 : src[i];
 }
