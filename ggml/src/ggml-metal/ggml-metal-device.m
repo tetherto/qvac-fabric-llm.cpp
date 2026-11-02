@@ -2022,6 +2022,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_TOP_K:
         case GGML_OP_ARANGE:
             return true;
+        case GGML_OP_DIAG_MASK_INF:
+            return ggml_nelements(op) <= INT32_MAX &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]);
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_FLASH_ATTN_EXT:

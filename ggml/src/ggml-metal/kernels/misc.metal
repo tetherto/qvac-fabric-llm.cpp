@@ -1186,3 +1186,28 @@ kernel void kernel_pad_replicate_1d_f32(
         y_c[(size_t) t * syt] = x_c[(size_t) src_t * sxt];
     }
 }
+
+kernel void kernel_diag_mask_inf_f32(
+    constant   ggml_metal_kargs_diag_mask_inf & args,
+    device  const float * src,
+    device        float * dst,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+
+    const int row = tgpig.x;
+    const int col_base = tgpig.y * ntg.x;
+    const int col = col_base + tpitg.x;
+
+    if (col >= args.ncols) {
+        return;
+    }
+
+    const int i = row * args.ncols + col;
+    const int row_in_channel = row % args.rows_per_channel;
+
+    dst[i] = col - row_in_channel > args.n_past
+                ? (src[i] - FLT_MAX)
+                : src[i];
+}

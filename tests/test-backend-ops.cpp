@@ -9270,22 +9270,23 @@ struct test_diag_mask_inf : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     const int n_past;
+    const bool inplace;
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne, n_past);
+        return VARS_TO_STR4(type, ne, n_past, inplace);
     }
 
     test_diag_mask_inf(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {10, 10, 3, 2},
-            int n_past = 5)
-        : type(type), ne(ne), n_past(n_past) {}
+            int n_past = 5, bool inplace = false)
+        : type(type), ne(ne), n_past(n_past), inplace(inplace) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_param(a);
         ggml_set_name(a, "a");
 
-        ggml_tensor * out = ggml_diag_mask_inf(ctx, a, n_past);
+        ggml_tensor * out = inplace ? ggml_diag_mask_inf_inplace(ctx, a, n_past) : ggml_diag_mask_inf(ctx, a, n_past);
         ggml_set_name(out, "out");
 
         return out;
@@ -15767,6 +15768,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
+    test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {2053, 7, 3, 2}, 0));
+    test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {2053, 7, 3, 2}, 5, true));
+    test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {2053, 7, 3, 2}, 2053));
     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 1}, 5));
     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 2}, 5));
 
