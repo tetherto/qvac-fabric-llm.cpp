@@ -1083,6 +1083,7 @@ struct common_batch {
         llama_seq_id seq_id;
         bool         output;
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
+        int32_t      embd_row = -1; // see add_embd_row(), -1 if none
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
@@ -1112,6 +1113,10 @@ struct common_batch {
     // add an embedding-only entry (no token id), aborts like add() on failure
     // pos points to n_pos positions
     int32_t add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output);
+
+    // add an entry whose embedding is row `row` of the layer input device buffer of the context's ctx_other
+    // pos points to n_pos positions
+    int32_t add_embd_row(int32_t row, const llama_pos * pos, llama_seq_id seq_id, bool output);
 
     int32_t size() const { return (int32_t) tokens.size(); }
 };

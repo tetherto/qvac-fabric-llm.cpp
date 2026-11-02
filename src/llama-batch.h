@@ -51,6 +51,7 @@ struct llama_ubatch {
     //                          // size               | idx | val
     llama_token  *  token;      // [n_tokens]         | i   | id, token
     float        *  embd;       // [n_embd, n_tokens] | i   | embd
+    int32_t      *  embd_row;   // [n_tokens]         | i   | embd is this row of ctx_other's layer input device buffer
     llama_pos    *  pos;        // [n_tokens*n_pos]   | i   | pos
     int32_t      *  n_seq_id;   // [n_tokens]         | i   | -
     llama_seq_id ** seq_id;     // [n_tokens]         | s   | s0, s1, seq_id
@@ -61,6 +62,8 @@ struct llama_ubatch {
 
     struct data_t {
         std::vector<llama_token>    token;
+        std::vector<int32_t>        embd_row;
+        std::vector<int32_t>        batch_idxs;  // index of each token in the input batch
         std::vector<llama_pos>      pos;
         std::vector<int32_t>        n_seq_id;
         std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
@@ -104,6 +107,7 @@ struct llama_batch_ext {
         llama_token  id = LLAMA_TOKEN_NULL;
         bool         has_embd = false; // whether embd_off is set
         size_t       embd_off = 0; // index offset in the embd array
+        int32_t      embd_row = -1; // row of ctx_other's layer input device buffer used as embd, -1 if none
         bool         output = false; // TODO: have dedicated output flags
         std::unordered_set<llama_seq_id> seq_ids;
         std::array<llama_pos, GGML_MROPE_SECTIONS> pos = {0, 0, 0, 0};
@@ -132,6 +136,7 @@ struct llama_batch_ext {
     bool add_seq(int32_t idx, llama_seq_id seq_id);
     bool set_token_id(int32_t idx, llama_token id);
     bool set_token_embd(int32_t idx, llama_embd embd_in);
+    bool set_token_embd_row(int32_t idx, int32_t row);
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
     bool set_output(int32_t idx, bool output_last);
 };
@@ -206,6 +211,7 @@ private:
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
+    std::vector<int32_t>        embd_row_vec; // owned embd rows built from llama_batch_ext, llama_batch has no slot for them
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;
