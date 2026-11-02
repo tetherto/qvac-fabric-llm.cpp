@@ -47,6 +47,19 @@ static inline const xdna_host_fit * xdna_host_fit_for(enum ggml_type type, int t
     }
 }
 
+static constexpr int64_t XDNA_HOST_FIT_ROWS         = 2560;
+static constexpr int64_t XDNA_HOST_FIT_ROWS_KQUANTS = 128;
+// The largest error of any fit over its measured shapes.
+static constexpr double  XDNA_HOST_FIT_MAX_ERROR    = 0.39;
+
+// The most rows the weight type's fit was measured at, or 0 when no fit covers it.
+static inline int64_t xdna_host_fit_max_rows(enum ggml_type type) {
+    if (xdna_host_fit_for(type, XDNA_HOST_BIG_TEAM) == nullptr) {
+        return 0;
+    }
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_BF16 ? XDNA_HOST_FIT_ROWS : XDNA_HOST_FIT_ROWS_KQUANTS;
+}
+
 // The host's time for the product in ms, or a negative number when no fit covers the weight type.
 static inline double xdna_host_mul_mat_ms(enum ggml_type type, int threads, int64_t M, int64_t K, int64_t N) {
     const xdna_host_fit * f = xdna_host_fit_for(type, threads);

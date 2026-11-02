@@ -712,9 +712,10 @@ static norm_graph build_chain(ggml_backend_t cpu, enum ggml_type wtype, int64_t 
     return g;
 }
 
-// A prefill chunk of one block of rows or fewer is run whole on the host when the host's products cost less than its commands
-// (one CPU graph: the CPU backend's own bits), and keeps its commands when they cost less; GGML_XDNA_HOST_CHUNK=0 and
-// GGML_XDNA_PGEMM_HOST=0 leave every projection to the array.
+// A prefill chunk is run whole on the host when the host's products cost less than its commands (one CPU graph: the CPU
+// backend's own bits), and keeps its commands when they cost less. Above one block of rows the host must win by more than its
+// fits' largest error, and the rows must be within the fit of every weight type: the K-quants' covers one block.
+// GGML_XDNA_HOST_CHUNK=0 and GGML_XDNA_PGEMM_HOST=0 leave every projection to the array.
 static bool test_host_chunk_rule(ggml_backend_t npu, ggml_backend_t cpu, double tol) {
     const host_chunk_count_fn chunks = host_chunk_counter(npu);
     if (!chunks) {
@@ -732,6 +733,11 @@ static bool test_host_chunk_rule(ggml_backend_t npu, ggml_backend_t cpu, double 
         { "41 rows of Q8_0: the host",                    GGML_TYPE_Q8_0, 41,  512,  2048, false, false },
         { "15 rows of BF16: the host",                    GGML_TYPE_BF16, 15,  512,  1024, false, false },
         { "128 rows of large Q8_0 products: the array",   GGML_TYPE_Q8_0, 128, 1024, 4096, false, true },
+        { "132 rows of small Q8_0 products: the host",    GGML_TYPE_Q8_0, 132, 512,  512,  false, false },
+        { "132 rows of BF16: the host",                   GGML_TYPE_BF16, 132, 512,  1024, false, false },
+        { "128 rows of Q8_0 1024 x 1024: the host",       GGML_TYPE_Q8_0, 128, 1024, 1024, false, false },
+        { "132 rows of the same, inside the margin: array", GGML_TYPE_Q8_0, 132, 1024, 1024, false, true },
+        { "132 rows of small Q4_K products: the array",   GGML_TYPE_Q4_K, 132, 512,  512,  false, true },
         { "15 rows of Q8_0, rules off: the array",        GGML_TYPE_Q8_0, 15,  512,  1024, true,  true },
         { "15 rows of BF16, rules off: the array",        GGML_TYPE_BF16, 15,  512,  1024, true,  true },
     };

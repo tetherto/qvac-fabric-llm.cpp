@@ -1582,16 +1582,18 @@ void xdna_ops_plan_gemm(xdna_ops * ops, const struct ggml_cgraph * cgraph) {
 // between them, so none of the floors hides behind another. The plan of a prefill graph (xdna_ops_plan_chunk) puts the
 // projections of one activation, which the array runs as one command, against what the host takes for the same products
 // (xdna-host-cost.h). It decides at two levels:
-//  - A chunk of one block of rows or fewer whose commands cost more than the host's products goes whole to the host: one CPU
-//    graph on the prompt's team, with none of the batch splits the commands cause. The array's side is the sum over the
-//    commands of xdna_pgemm_command_ms, a run of bf16 projections at the cheaper of the array and the host as
+//  - A chunk whose host products cost less than its commands goes whole to the host: one CPU graph on the prompt's team, with
+//    none of the batch splits the commands cause. Within one block of rows the host only has to be quicker; above it, quicker
+//    by more than the fits' largest error. Its rows must be within every weight type's fit. The array's side is the sum over
+//    the commands of xdna_pgemm_command_ms, a run of bf16 projections at the cheaper of the array and the host as
 //    xdna_ops_plan_gemm will place it. A chunk with other array work (the attention, the gated delta net, a weight type the
 //    cost model does not cover) is not estimated.
 //  - A chunk that keeps array work leaves to the host each pgemm command of 2 to 128 rows whose products the host does quicker.
 // Decode (one row) is neither: its projections are the GEMV's, and a graph of one row never plans.
 
-// One block of rows: the array's command costs the same whatever rows of it are real, which is where its floor is the wall.
-static constexpr int64_t CHUNK_HOST_MAX_ROWS = 128;
+// One block of rows: the array's command costs the same whatever rows of it are real, so up to it the measured floor is the
+// command's whole cost.
+static constexpr int64_t CHUNK_BLOCK_ROWS    = 128;
 static constexpr int64_t CHUNK_HOST_MIN_ROWS = 2;
 
 namespace {
@@ -1601,8 +1603,9 @@ enum class mm_kind { host, pgemm, bf16, other };
 // One command of the array: the projections of one activation.
 struct array_group {
     int64_t                          M = 0, K = 0, N = 0;
-    bool                             bf16    = false;
-    double                           host_ms = 0.0;  // on the prompt's team
+    bool                             bf16     = false;
+    double                           host_ms  = 0.0;  // on the prompt's team
+    int64_t                          fit_rows = 0;    // the most rows every weight type's host fit covers
     std::vector<const ggml_tensor *> nodes;
 };
 
@@ -1648,13 +1651,15 @@ static bool chunk_add_node(const xdna_ops * ops, const struct ggml_tensor * node
     }
     const group_key key = { node->src[1], kind == mm_kind::bf16 };
     auto            it  = by_act.find(key);
+    const int64_t fit_rows = xdna_host_fit_max_rows(node->src[0]->type);
     if (it == by_act.end()) {
         it = by_act.emplace(key, groups.size()).first;
-        groups.push_back({ node->src[1]->ne[1], node->src[1]->ne[0], 0, kind == mm_kind::bf16, 0.0, {} });
+        groups.push_back({ node->src[1]->ne[1], node->src[1]->ne[0], 0, kind == mm_kind::bf16, 0.0, fit_rows, {} });
     }
     array_group & g = groups[it->second];
     g.N += node->src[0]->ne[1];
     g.host_ms += host;
+    g.fit_rows = std::min(g.fit_rows, fit_rows);
     g.nodes.push_back(node);
     return true;
 }
@@ -1669,13 +1674,24 @@ static bool chunk_collect(const xdna_ops * ops, const struct ggml_cgraph * cgrap
     return covered && !groups.empty();
 }
 
-static bool chunk_within_a_block(const std::vector<array_group> & groups) {
+static bool chunk_within_fits(const std::vector<array_group> & groups) {
     for (const array_group & g : groups) {
-        if (g.M > CHUNK_HOST_MAX_ROWS) {
+        if (g.M > g.fit_rows) {
             return false;
         }
     }
     return true;
+}
+
+// The share of the array's time the host must beat it by: none within one block, where every command's cost is its measured
+// floor, and the fits' largest error above it.
+static double chunk_host_margin(const std::vector<array_group> & groups) {
+    for (const array_group & g : groups) {
+        if (g.M > CHUNK_BLOCK_ROWS) {
+            return XDNA_HOST_FIT_MAX_ERROR;
+        }
+    }
+    return 0.0;
 }
 
 // The array's time for the groups: the pgemm commands, and each run of bf16 ones at the cheaper of the array and the host.
@@ -1717,7 +1733,7 @@ static std::vector<const struct ggml_tensor *> groups_host_nodes(const std::vect
     }
     const int team = xdna_host_team();
     for (const array_group & g : groups) {
-        if (g.bf16 || g.M < CHUNK_HOST_MIN_ROWS || g.M > CHUNK_HOST_MAX_ROWS) {
+        if (g.bf16 || g.M < CHUNK_HOST_MIN_ROWS || g.M > CHUNK_BLOCK_ROWS) {
             continue;
         }
         double host = 0.0;
@@ -1736,10 +1752,12 @@ bool xdna_ops_plan_chunk(xdna_ops * ops, const struct ggml_cgraph * cgraph) {
     xdna_pgemm_plan_host({});
     std::vector<array_group> groups;
     const bool               covered = chunk_collect(ops, cgraph, groups);
-    if (xdna_env_int("GGML_XDNA_HOST_CHUNK", 1) != 0 && covered && chunk_within_a_block(groups)) {
+    if (xdna_env_int("GGML_XDNA_HOST_CHUNK", 1) != 0 && covered && chunk_within_fits(groups)) {
         const double host_ms = groups_host_ms(groups), array_ms = groups_array_ms(ops, groups);
-        GGML_LOG_DEBUG("%s: chunk of %zu array commands: host %.2f ms, array %.2f ms\n", "ggml-xdna", groups.size(), host_ms, array_ms);
-        if (host_ms < array_ms) {
+        const double margin  = chunk_host_margin(groups);
+        GGML_LOG_DEBUG("%s: chunk of %zu array commands: host %.2f ms, array %.2f ms, margin %.2f\n", "ggml-xdna", groups.size(),
+                       host_ms, array_ms, margin);
+        if (host_ms < array_ms * (1.0 - margin)) {
             return true;
         }
     }
