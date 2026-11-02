@@ -2526,7 +2526,7 @@ static void ggml_cuda_mul_mat_canonical(
     const bool prec_f32 = dst->op_params[0] != GGML_PREC_DEFAULT;
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) ||
-            (prec_f32 && ggml_cuda_mmvf_supports_prec_f32(src0->type, src0->ne, src0->nb, ne11))) {
+            (prec_f32 && ggml_cuda_mmvf_supports_prec_f32(src0, src1))) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);

@@ -808,9 +808,13 @@ static bool mmvf_src0_layout_supported(enum ggml_type type, const int64_t * src0
     return true;
 }
 
-bool ggml_cuda_mmvf_supports_prec_f32(enum ggml_type type, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
-    const bool half_weights = type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
-    return half_weights && ne11 <= MMVF_MAX_BATCH_SIZE && mmvf_src0_layout_supported(type, src0_ne, src0_nb);
+bool ggml_cuda_mmvf_supports_prec_f32(const ggml_tensor * src0, const ggml_tensor * src1) {
+    const bool half_weights = src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16;
+    return half_weights && src1->type == GGML_TYPE_F32 && src1->ne[1] <= MMVF_MAX_BATCH_SIZE &&
+           mmvf_src0_layout_supported(src0->type, src0->ne, src0->nb) &&
+           mmvf_src0_layout_supported(src1->type, src1->ne, src1->nb) &&
+           uintptr_t(src0->data) % (2 * ggml_type_size(src0->type)) == 0 &&
+           uintptr_t(src1->data) % sizeof(float2) == 0;
 }
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {

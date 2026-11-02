@@ -13,4 +13,4 @@ void ggml_cuda_op_mul_mat_vec_f(
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
 
-bool ggml_cuda_mmvf_supports_prec_f32(enum ggml_type type, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
+bool ggml_cuda_mmvf_supports_prec_f32(const ggml_tensor * src0, const ggml_tensor * src1);
