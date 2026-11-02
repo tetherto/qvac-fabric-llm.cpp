@@ -9,6 +9,7 @@
 #include "xdna-conv-prefill.h"
 #include "xdna-gdn-mm.h"
 #include "xdna-head.h"
+#include "xdna-match.h"
 #include "xdna-norm.h"
 #include "xdna-ops.h"
 #include "xdna-pgemm.h"
@@ -913,7 +914,7 @@ struct xdna_rec_plan {
     ggml_tensor * n_beta     = nullptr;  // UNARY beta_sigmoid-N dst
     ggml_tensor * n_resid    = nullptr;  // ADD attn_residual-N (h_attn dst)
     ggml_tensor * n_lout     = nullptr;  // ADD l_out-N (h_out dst)
-    ggml_tensor * n_convst   = nullptr;  // GET_ROWS conv_states-N (conv seed)
+    ggml_tensor * n_convst   = nullptr;  // GET_ROWS behind conv_states-N (conv seed)
     ggml_tensor * n_sstate   = nullptr;  // GET_ROWS cache_s read (ssm seed)
     ggml_tensor * n_hres     = nullptr;  // residual input (attn_residual src[1])
     // weight leaves
@@ -1793,10 +1794,10 @@ static bool xdna_rec_scan(ggml_backend_xdna_context *  ctx,
             const int il = xdna_atoi(nn + 13);
             m[il].il     = il;
             m[il].n_beta = const_cast<ggml_tensor *>(n);
-        } else if (strncmp(nn, "conv_states-", 12) == 0 && n->op == GGML_OP_GET_ROWS) {
+        } else if (strncmp(nn, "conv_states-", 12) == 0 && xdna_rec_state_gather(n)) {
             const int il   = xdna_atoi(nn + 12);
             m[il].il       = il;
-            m[il].n_convst = const_cast<ggml_tensor *>(n);
+            m[il].n_convst = const_cast<ggml_tensor *>(xdna_rec_state_gather(n));
         } else if (strncmp(nn, "l_out-", 6) == 0 && n->op == GGML_OP_ADD) {
             const int il = xdna_atoi(nn + 6);
             m[il].il     = il;
