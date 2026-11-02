@@ -244,8 +244,9 @@ inline constexpr int kMaxThreads = 256;
 // them across threads (upstream turbovec's block-parallel threshold).
 inline constexpr size_t kTurboVecParallelMinBlocks = 1024;
 
-// Byte groups a NEON LUT scan sums in u16 before widening into its float
-// accumulators. Every kernel that must match score_turbovec_lut_block bit for
+// Byte groups a LUT scan sums in u16 before widening into its float
+// accumulators (the NEON scans, and the x86 and scalar forms that must
+// match them). Every kernel that must match score_turbovec_lut_block bit for
 // bit flushes at the same points, so it is shared here.
 inline constexpr int kTurboVecFlushEvery = 256;
 
@@ -761,7 +762,11 @@ int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * 
 int turbovec_exact2_row_parity_for_test(const ggml_vec_index_t * idx, const float * query);
 // round_half_away_f32 and quantise_table16 against std::round at their
 // edges: 0 all equal, otherwise the number of the first case that is not.
-int turbovec_rounding_parity_for_test();
+int turbovec_rounding_parity_for_test(void);
+// The aarch64 deferred sign scan against the per-group kernel, and the
+// ranking's table sums against a scalar sum, on either side of their u16
+// flush: 1 equal bit for bit, 0 not, -1 on a host without them.
+int turbovec_sign_flush_parity_for_test(void);
 // The staged search's fused AVX-512 sign scan against the block-by-block
 // path over a vector-major sign region: n_q lone top-k searches each way,
 // 1 when every id and score bit agrees, 0 not, -1 when the index or host

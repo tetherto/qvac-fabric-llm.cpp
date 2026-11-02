@@ -25,8 +25,9 @@
 
 #if GGML_VEC_INDEX_USE_NEON
 #include <arm_neon.h>
-#elif defined(__SSE2__) || defined(_M_X64)
-#include <emmintrin.h>
+#endif
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_ARM64))
+#include <intrin.h>
 #endif
 
 namespace {
@@ -86,6 +87,8 @@ inline int popcount64(uint64_t x) {
 inline void prefetch_read(const void * p) {
 #if defined(__GNUC__) || defined(__clang__)
     __builtin_prefetch(p, 0, 3);
+#elif GGML_VEC_INDEX_USE_SSE2
+    _mm_prefetch(static_cast<const char *>(p), _MM_HINT_T0);
 #else
     (void) p;
 #endif
@@ -112,6 +115,10 @@ inline int ctz64(uint64_t x) {
     assert(x != 0);
 #if defined(__GNUC__) || defined(__clang__)
     return __builtin_ctzll(x);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+    unsigned long n = 0;
+    _BitScanForward64(&n, x);
+    return static_cast<int>(n);
 #else
     int n = 0;
     while ((x & 1u) == 0) {
@@ -1220,10 +1227,12 @@ struct Collector {
     // range may drop a row that scores strictly less (a tie may still win
     // on its slot). Null for a lone range.
     std::atomic<double> * floor_score = nullptr;
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
     // The VNNI fused scan reads the floor as a bare double (vnni.cpp
     // load_floor_relaxed), so it needs the atomic to be one.
     static_assert(sizeof(std::atomic<double>) == sizeof(double) && std::atomic<double>::is_always_lock_free,
         "std::atomic<double> must be a lock-free bare double");
+#endif
 
     void start(size_t s_len_, float seed_, size_t reserve, std::atomic<double> * floor) {
         top.clear();
@@ -1311,7 +1320,7 @@ struct Collector {
             }
             return;
         }
-#elif defined(__SSE2__) || defined(_M_X64)
+#elif GGML_VEC_INDEX_USE_SSE2
         // The NEON branch with SSE2, the x86_64 baseline, so no dispatch.
         // _mm_max_ps does not propagate a NaN the way vmaxq_f32 does, so a
         // NaN lane is found with cmpunord and keeps its block; in the walk
@@ -1427,7 +1436,7 @@ struct Collector {
         state.cut = cut;
         state.seed_active = seed_active;
         state.seed = seed;
-        state.floor_score = floor_score;
+        state.floor_score = reinterpret_cast<const double *>(floor_score);
         state.above_seed = above_seed;
         return state;
     }
@@ -2350,6 +2359,77 @@ int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * 
     *unit = planes.unit;
     *masks = planes.masks;
     return planes.sum_w;
+}
+
+int turbovec_sign_flush_parity_for_test() {
+#if GGML_VEC_INDEX_USE_NEON
+    uint32_t state = 0x3c6ef372u;
+    auto next = [&]() {
+        state = state * 1664525u + 1013904223u;
+        return state >> 8;
+    };
+    // Sign groups on either side of the u16 flush (every 256), with a
+    // partial last group of four and a partial block of vectors.
+    for (const size_t n_groups : { size_t{ 255 }, size_t{ 256 }, size_t{ 257 }, size_t{ 260 }, size_t{ 515 } }) {
+        const size_t n = 2 * kBlock + 7;
+        const size_t n_blocks = (n + kBlock - 1) / kBlock;
+        std::vector<uint8_t> lut(n_groups * 32);
+        for (uint8_t & v : lut) {
+            // Deferred tables: an entry is at most 31.
+            v = static_cast<uint8_t>(next() % 32);
+        }
+        std::vector<uint8_t> codes(n_blocks * n_groups * kBlock);
+        for (uint8_t & c : codes) {
+            c = static_cast<uint8_t>(next());
+        }
+        std::vector<float> vscales(n);
+        for (float & s : vscales) {
+            s = 0.5f + static_cast<float>(next() % 1000) / 997.0f;
+        }
+        for (size_t block = 0; block < n_blocks; ++block) {
+            float want[kBlock];
+            float got[kBlock];
+            score_turbovec_lut_block(lut.data(), 0.37f, -1.25f, codes.data(), vscales.data(), block, n, 2,
+                static_cast<int>(n_groups * 4), want);
+            score_sign_block_deferred(lut.data(), 0.37f, -1.25f, codes.data(), vscales.data(), block, n, n_groups, got);
+            if (std::memcmp(want, got, sizeof(want)) != 0) {
+                return 0;
+            }
+        }
+    }
+    // The ranking's table sums, widened to u32 every 256 positions.
+    for (const size_t nsg : { size_t{ 255 }, size_t{ 256 }, size_t{ 260 }, size_t{ 512 }, size_t{ 520 } }) {
+        std::vector<uint8_t> t(nsg * 32);
+        for (uint8_t & v : t) {
+            // A table entry is at most 127.
+            v = static_cast<uint8_t>(next() % 128);
+        }
+        for (const size_t n_rows : { size_t{ 1 }, size_t{ 17 }, kRankBatch }) {
+            std::vector<std::vector<uint8_t>> rows(n_rows, std::vector<uint8_t>(nsg));
+            std::vector<const uint8_t *> ptrs(n_rows);
+            for (size_t r = 0; r < n_rows; ++r) {
+                for (uint8_t & b : rows[r]) {
+                    b = static_cast<uint8_t>(next());
+                }
+                ptrs[r] = rows[r].data();
+            }
+            uint32_t got[kRankBatch] = {};
+            table_sums(t.data(), ptrs.data(), n_rows, nsg, got);
+            for (size_t r = 0; r < n_rows; ++r) {
+                uint32_t want = 0;
+                for (size_t c = 0; c < nsg; ++c) {
+                    want += t[c * 32 + (rows[r][c] >> 4)] + t[c * 32 + 16 + (rows[r][c] & 0x0f)];
+                }
+                if (got[r] != want) {
+                    return 0;
+                }
+            }
+        }
+    }
+    return 1;
+#else
+    return -1;
+#endif
 }
 
 int turbovec_rounding_parity_for_test() {

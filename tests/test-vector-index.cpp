@@ -222,6 +222,7 @@ int parallel_pool_selftest_for_test(int n_threads);
 int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * unit, std::vector<uint64_t> * masks);
 int turbovec_exact2_row_parity_for_test(const ggml_vec_index_t * idx, const float * query);
 int turbovec_rounding_parity_for_test(void);
+int turbovec_sign_flush_parity_for_test(void);
 int turbovec_vnni_fused_scan_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k);
 int turbovec_vnni_fused_batch_parity_for_test(ggml_vec_index_t * idx, const float * queries, int n_q, int k);
 int turbovec_sync_plan_for_test(
@@ -6731,10 +6732,11 @@ void check_turbovec_1x_staged(int x86_rules) {
     turbovec_force_x86_rules_for_test(0);
 }
 
-// The staged search at dims where its sign scan flushes its u16 sums
-// (every 256 sign groups, so dim 2048 and up) and the ranking widens its
-// table sums: every returned score is the full scan's for that id. 2080
-// ends on a partial flush group.
+// The staged search end to end at dims past one u16 flush of the aarch64
+// sign scan and ranking (2048, and 2080 with a partial group): every
+// returned score is the full scan's for that id, and most ids are shared.
+// It catches only gross flush errors; the flushes themselves are checked
+// bit for bit by check_turbovec_sign_flush.
 void check_turbovec_1x_staged_wide_dims(int x86_rules) {
     turbovec_force_x86_rules_for_test(x86_rules);
     // Planes from the first vector, so this small index searches staged.
@@ -6785,6 +6787,17 @@ void check_turbovec_1x_staged_wide_dims(int x86_rules) {
     turbovec_force_vector_major_for_test(-1);
     turbovec_force_planes_for_test(-1, 0);
     turbovec_force_x86_rules_for_test(0);
+}
+
+// The aarch64 deferred sign scan and the ranking's table sums on either
+// side of their u16 flush, bit for bit against their references.
+void check_turbovec_sign_flush() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    constexpr bool neon_host = true;
+#else
+    constexpr bool neon_host = false;
+#endif
+    check_simd_parity_status("TurboVec", "sign flush", turbovec_sign_flush_parity_for_test(), neon_host, -1);
 }
 
 // round_half_away_f32 and quantise_table16 (the x86 table builds' rounding)
@@ -8167,6 +8180,7 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_staged_wide_dims(0);
             check_turbovec_1x_staged_wide_dims(1);
             check_turbovec_rounding_helpers();
+            check_turbovec_sign_flush();
             check_turbovec_1x_vpermb();
             check_turbovec_1x_low_planes_tiny();
             check_turbovec_1x_thread_invariance(0);
