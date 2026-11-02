@@ -799,6 +799,9 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_invalidate();
 
+    // the per-size schedulers share the compute buffers of the scheduler created below
+    sched_small.clear();
+
     auto previous_sched = std::move(sched);
     compute_state->sched = nullptr;
     if (!compute_share_source) {
@@ -1758,6 +1761,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             if (moe_cache) {
                 ggml_backend_sched_set_moe_cache(ss->sched.get(), moe_cache->backend(), llama_moe_cache::sched_resolve,
                         llama_moe_cache::sched_begin, llama_moe_cache::sched_prepare, moe_cache.get());
+            }
+            // only one graph of the context runs at a time, so the small graphs can live in the main compute buffers
+            if (!ggml_backend_sched_share_compute_buffers(ss->sched.get(), sched.get())) {
+                LLAMA_LOG_DEBUG("%s: per-size scheduler for %u tokens uses its own compute buffers\n", __func__, ubatch.n_tokens);
             }
         }
     }
