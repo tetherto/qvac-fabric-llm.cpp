@@ -709,7 +709,7 @@ static void gemm_pack_a(const float * src, int64_t ld, int mc, int m_rows, int k
 }
 
 // C starts one page into its buffer: a block's first C line was lost only where another buffer's data ended on it
-// (README, F1).
+// (README, Known limits).
 static const size_t GEMM_C_GUARD = 4096;
 
 // Poison the first mc rows of the C buffer before the run that writes them
@@ -787,8 +787,8 @@ static bool gemm_fold_c(xdna_buffer *                   bo_c,
     return std::find(lost.begin(), lost.end(), 1) == lost.end();
 }
 
-// A block's first C line has been seen to stay unwritten (README, F1): the block is run again, up to this often, before
-// the op fails.
+// A block's first C line has been seen to stay unwritten (README, Known limits): the block is run again, up to this
+// often, before the op fails.
 static const int GEMM_RERUNS = 2;
 
 // Test hook (xdna_ops_test_lose_c_lines): the next folded blocks lose their first C line this many times each.
