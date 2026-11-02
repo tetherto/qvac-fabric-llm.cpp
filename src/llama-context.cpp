@@ -397,6 +397,11 @@ llama_context::llama_context(
     {
         const char * env = getenv("LLAMA_SCHED_PER_SIZE"); // wip [TAG_SCHED_PER_SIZE]
         sched_per_size = env && atoi(env) != 0;
+
+        env = getenv("LLAMA_GRAPH_PER_SIZE_MAX");
+        if (env) {
+            n_tokens_per_size = std::max(0, atoi(env));
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -1738,7 +1743,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // [TAG_SCHED_PER_SIZE] a batch of up to 8 tokens uses the scheduler of its arena
     sched_small_entry * ss = nullptr;
-    if (sched_per_size && ubatch.n_tokens <= 8) {
+    if (sched_per_size && ubatch.n_tokens <= n_tokens_per_size) {
         const uint32_t key = gf_res_key(ubatch.n_tokens);
         for (auto & e : sched_small) {
             if (e.key == key) {
@@ -1748,7 +1753,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
         if (ss == nullptr) {
             sched_small.push_back({ key, ggml_backend_sched_ptr(ggml_backend_sched_new(
-                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), graph_max_nodes(8), false, cparams.op_offload)), nullptr });
+                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), graph_max_nodes(n_tokens_per_size), false, cparams.op_offload)), nullptr });
             ss = &sched_small.back();
             if (moe_cache) {
                 ggml_backend_sched_set_moe_cache(ss->sched.get(), moe_cache->backend(), llama_moe_cache::sched_resolve,
@@ -3025,8 +3030,8 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 uint32_t llama_context::gf_res_key(uint32_t n_tokens) const {
-    // batches of up to 8 tokens (decode, speculative verify) are keyed by their size too
-    return (n_outputs > 0 ? 1u : 0u) | ((n_tokens <= 8 ? n_tokens : 0u) << 1);
+    // small batches (decode, speculative verify) are keyed by their size too
+    return (n_outputs > 0 ? 1u : 0u) | ((n_tokens <= n_tokens_per_size ? n_tokens : 0u) << 1);
 }
 
 void llama_context::gf_res_invalidate() {

@@ -468,6 +468,9 @@ private:
     std::vector<sched_small_entry> sched_small;
     bool sched_per_size = false;
 
+    // batches of up to this many tokens get their own arena (env LLAMA_GRAPH_PER_SIZE_MAX, default 8)
+    uint32_t n_tokens_per_size = 8;
+
     // scheduler of the graph of the last process_ubatch(), nullptr for the shared one
     ggml_backend_sched_t sched_active = nullptr;
 
