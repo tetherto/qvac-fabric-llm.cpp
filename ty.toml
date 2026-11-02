@@ -32,7 +32,7 @@ include = [
 unsupported-operator = "ignore"
 not-subscriptable = "ignore"
 
-# The exporter and the recorded experiment scripts use the separate, pinned Core ML environment. torch declares
+# The exporters use the separate, pinned Core ML environment. torch declares
 # Module.forward as a Callable attribute, so ty >= 0.0.88 rejects method overrides.
 [[overrides]]
 include = [
@@ -40,7 +40,7 @@ include = [
     "./examples/ffn-coreml/export_ffn.py",
     "./examples/ffn-coreml/export_sidecar.py",
     "./examples/ffn-coreml/palettize_ffn.py",
-    "./examples/ffn-coreml/results/**",
+    "./examples/ffn-coreml/make_template.py",
 ]
 
 [overrides.rules]

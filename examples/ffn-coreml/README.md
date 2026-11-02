@@ -1,8 +1,8 @@
 # Qwen3.8-27B Core ML prefill sidecar
 
-This preserves the validated 24-layer experiment from `temp-11259` (`be6e387b9f2fda9a6fa0ca59f9607f2b6bb21db2`). It is a standalone, opt-in benchmark; `llama-server-coreml` (below) runs it inside `llama-server` for benchmarking, not as production integration. Normal builds do not enable the hooks.
+Opt-in Core ML sidecar for Qwen3.8-27B prefill on Apple Silicon: part of each prefill FFN runs on the Neural Engines while Metal runs the rest. Normal builds do not enable the hooks; build from `examples/ffn-coreml` (below).
 
-Start with [RESULTS.md](RESULTS.md), the [24-layer preset](configs/qwen3.8-27b-24.json), and the [recorded measurements](results/2026-10-29/summary.json). Run `python3 examples/ffn-coreml/verify_results.py` to verify the committed evidence without loading a model.
+The recommended setup is the in-graph sidecar with load-time export, see [Load-time export and the in-graph sidecar](#load-time-export-and-the-in-graph-sidecar): no conversion step, any microbatch size, multi-sequence batches and speculative decoding. The other sections document the asset-based runtime it grew from, a 24-layer experiment from `temp-11259` (`be6e387b9`). The recorded runs and experiment notes are on branch `feat/coreml-qwen-3.8` (`examples/ffn-coreml/results`, `RESULTS.md`, `EXPERIMENTS.md`).
 
 ## Validated configuration
 
@@ -46,7 +46,7 @@ export FFN_COREML_CACHE_COMPILED=1
 
 MODEL=/path/to/Qwen3.8-27B-UD-Q4_K_XL.gguf
 ASSETS=/path/to/sidecar24
-PROMPTS=examples/ffn-coreml/results/2026-10-29/prompts
+PROMPTS=/path/to/prompts  # code.txt, prose.txt: plain-text prompts
 build-ffn-coreml/llama-coreml-decoder-bench "$MODEL" "$ASSETS" \
   quality "$PROMPTS/code.txt" 512,2048 16 1 /tmp/qwen-quality
 build-ffn-coreml/llama-coreml-decoder-bench "$MODEL" "$ASSETS" \
@@ -69,7 +69,7 @@ Long-prompt numbers in the engine-bench report were measured with the Metal pref
 
 The Neural Engines only work during each layer's FFN, so on their own they sit idle while Metal runs attention and DeltaNet. With `LLAMA_QWEN35_HALVES=1`, `FFN_COREML_ASYNC=1` and 1024-token microbatches (`-ub 1024` for the server, `FFN_COREML_UBATCH=1024` for the harness), each prefill microbatch of 513 to 1024 tokens runs as two interleaved halves: half A is the first 512 tokens, half B the rest. Per layer the GPU runs B's attention while the Neural Engines run A's FFN, then A's next attention while they run B's FFN. B's attention reads A's K/V of the same layer from the cache, and B's DeltaNet continues from A's state. Core ML calls are handed to a serial worker; the GPU signals a shared Metal event when a half's FFN input is written and waits on a second one before the join. A second half shorter than 512 rows is padded, or runs its FFN on Metal below `FFN_COREML_PAD_MIN`. Decode, multi-sequence batches and the deferred gated delta net (speculative decoding) keep the normal graph.
 
-The 8192-channel split on the Q4_0 GGUF uses [qwen3.8-27b-64-dual-q40.json](configs/qwen3.8-27b-64-dual-q40.json) (the exporter checks the model SHA256). The engine-bench runs added this engine to the skill's `run_engine.sh` as `fabcml`; the change is in `results/2026-10-31-overlap/scripts/engine-bench-patch.diff`.
+The 8192-channel split on the Q4_0 GGUF uses [qwen3.8-27b-64-dual-q40.json](configs/qwen3.8-27b-64-dual-q40.json) (the exporter checks the model SHA256).
 
 Because the Neural Engines no longer hold the GPU up, the overlap pairs with a larger Neural Engine share: [qwen3.8-27b-64-dual-s5120.json](configs/qwen3.8-27b-64-dual-s5120.json) keeps 5120 channels on Metal and gives 6144 to each Neural Engine. On M3 Ultra with the Q4_0 GGUF and the prefill attention kernel from `feat/metal-fa-prefill-d256`, single-request server prefill (engine-bench client) measured 519.4 / 537.6 / 507.4 / 454.9 / 379.1 / 294.4 tok/s at about 1k / 4.5k / 21k / 38k / 70k / 123k tokens, against 395.8 / 435.9 / 400.0 / 365.9 / 316.5 / 255.6 for the 8192-channel split without the overlap. The held-out gate passes: mean NLL change +0.00044 nats/token (upper bound +0.00083), KL 0.00046, worst window +0.00211. Without the overlap this split is slower than the 8192-channel one, so keep the two together.
 
@@ -89,6 +89,16 @@ Harness prefill (`split`, Q4_0, M3 Ultra, 8192 Metal channels and 2 x 4608, with
 
 Programs with 1024 rows were slower than 512-row chunks (485.1 / 459.0 at microbatch 2048) and are not kept. Peak process footprint was 6.2-6.8 GB, against 18.0 GB for the runtime with its own Metal weight copies and 1.4-1.8 GB for Metal alone. Quality on held-out text: over 13 repository windows mean NLL change -0.00006 nats/token and KL 0.00017; at microbatch 2048 the logits are identical to microbatch 512; partial chunks (a padded 300-row microbatch, a 100-row Metal tail, a padded chunk inside a 1024-row microbatch) had mean KL 0.00009-0.00010.
 
+```sh
+cmake -S examples/ffn-coreml -B build-ffn-coreml -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON \
+  -DFFN_COREML_DECODER_EXPERIMENT=ON -DFFN_COREML_SERVER=ON
+cmake --build build-ffn-coreml --target llama-server-coreml -j 8
+
+FFN_COREML_OTF=8192x2 FFN_COREML_TEMPLATES=examples/ffn-coreml/templates FFN_COREML_INGRAPH=1 \
+FFN_COREML_GPU_RESIDENT=1 FFN_COREML_ASYNC=1 FFN_COREML_SINGLE_ENCODER=1 \
+  build-ffn-coreml/llama-server-coreml -m Qwen3.8-27B-Q4_0.gguf -ngl 99 -fa on -ub 2048
+```
+
 Through `llama-server-coreml` with the attention kernel from `feat/metal-fa-prefill-d256` and `-ub 2048`, single-request prefill (engine-bench client) measured 420 / 448 / 429 tok/s at about 1k / 4.4k / 21k tokens, against about 331-335 for Metal alone; 431-449 tok/s with MTP and DFlash2, where the half-batch overlap stays off (about 365); and 148 tok/s total at 16 concurrent requests. In no-speculation, MTP and DFlash2 modes the first 64 generated tokens were identical to Metal alone on three prompts of 784 to 2322 tokens, with the same draft acceptance.
 
 ## Held-out quality gate
@@ -104,7 +114,7 @@ examples/ffn-coreml/gate/run_gate.sh build-ffn-coreml/llama-coreml-decoder-bench
 
 ## Sidecar assets
 
-`ASSETS/layers.txt` lists selected IDs. Each `ASSETS/layerN/ffn-512.mlpackage` contains that layer's suffix. Weights and compiled models are not committed. On the original benchmark Mac, the retained 24-layer selection is `$HOME/qwen38-overall-20261029/combined/expand24/selection`. Connection details remain in the task conversation. Recorded paths replace the original user home with `${HOME}`.
+`ASSETS/layers.txt` lists selected IDs. Each `ASSETS/layerN/ffn-512.mlpackage` contains that layer's suffix. Weights and compiled models are not committed.
 
 `export_sidecar.py` builds a complete asset directory from a preset: it exports and palettizes every selected layer, writes one or two packages per layer, `layers.txt`, and an `export.json` manifest with the GGUF SHA256, tool hashes and channel ranges. The destination must not exist; failures remove temporary output. Use a separate Python environment with the pinned requirements:
 
@@ -147,8 +157,8 @@ Compiled-cache reuse follows the embedding-Gemma pattern. It creates `ffn-512.ml
 - `decoder-coreml.mm`: an optional `ffn-512-1` package (package or compiled cache) must start where `ffn-512` ends and share its output scale. Its prediction runs on a GCD queue while the first runs on the calling thread.
 - Output backing: on by default when `FFN_COREML_GPU_RESIDENT` is set and the output scale is 1; `FFN_COREML_OUTPUT_BACKING=0` disables it. Core ML outputs go to the Metal join inputs directly; `ffn-coreml-common.h` adds an optional third join input for the second package.
 
-Callbacks and builder state are process-global. The harness drives contexts serially. Do not enable this as a multi-request/server backend without lifecycle, concurrency, cancellation, cache validation, and fallback work. This branch intentionally preserves the tested experiment rather than introducing production integration.
+Callbacks and builder state are process-global. The harness drives contexts serially. Do not enable this as a multi-request/server backend without lifecycle, concurrency, cancellation, cache validation, and fallback work.
 
-All remaining layers were screened: 25 new individual candidates were found; the combined 28-layer selection failed (mean KL 0.001127598). Both 22 and 24 passed. Layers 25-27 in *selection count* were not tested; 24 is the largest passing configuration tested, not a proven maximum. See `layer-screen.json` and `rejected28/` in the results directory for evidence.
+All remaining layers were screened: 25 new individual candidates were found; the combined 28-layer selection failed (mean KL 0.001127598). Both 22 and 24 passed. Layers 25-27 in *selection count* were not tested; 24 is the largest passing configuration tested, not a proven maximum. The evidence (`layer-screen.json`, `rejected28/`) is in the results directory on `feat/coreml-qwen-3.8`.
 
 For the next prefill investigation, keep this 24-layer configuration and ordinary Metal as baselines. Profile the remaining attention/state-update work and synchronization before choosing another offload boundary. Keep the existing accuracy gates and zero-decode-offload check; do not infer correctness or speedup from an isolated operator benchmark.
