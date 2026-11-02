@@ -10,6 +10,7 @@
 #include "ggml-metal-tuning.h"
 
 #include <mutex>
+#include <mutex>
 #include <string>
 
 #define GGML_METAL_NAME "MTL"
@@ -547,7 +548,7 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
     return ggml_metal_cpy_tensor_async(ctx_src, ctx_dst, src, dst);
 }
 
-#ifdef GGML_METAL_FFN_EXPERIMENT
+#if defined(GGML_METAL_FFN_EXPERIMENT) || defined(GGML_METAL_CUSTOM_OPS)
 static ggml_custom2_op_t custom2_tag = nullptr;
 static ggml_metal_custom2_execute custom2_execute = nullptr;
 
@@ -565,25 +566,55 @@ void ggml_backend_metal_shared_event(ggml_backend_t backend, void * event, uint6
     ggml_metal_shared_event((ggml_metal_t) backend->context, event, value, wait);
 }
 
-static ggml_custom_op_t custom_tag = nullptr;
-static ggml_metal_custom2_execute custom_execute = nullptr;
+struct metal_custom_op {
+    ggml_custom_op_t tag;
+    ggml_metal_custom2_execute execute;
+    bool serial;
+};
+static std::mutex custom_mutex;
+static std::vector<metal_custom_op> custom_ops;
+
+static void metal_set_custom(ggml_custom_op_t tag, ggml_metal_custom2_execute execute, bool serial) {
+    std::lock_guard<std::mutex> lock(custom_mutex);
+    if (!tag) {
+        for (auto it = custom_ops.begin(); it != custom_ops.end();) {
+            if (it->serial == serial) { it = custom_ops.erase(it); } else { ++it; }
+        }
+        return;
+    }
+    for (auto it = custom_ops.begin(); it != custom_ops.end(); ++it) {
+        if (it->tag != tag) { continue; }
+        if (execute) { *it = {tag, execute, serial}; } else { custom_ops.erase(it); }
+        return;
+    }
+    if (execute) { custom_ops.push_back({tag, execute, serial}); }
+}
 
 void ggml_backend_metal_set_custom(ggml_custom_op_t tag, ggml_metal_custom2_execute execute) {
-    custom_tag = tag;
-    custom_execute = execute;
+    metal_set_custom(tag, execute, false);
+}
+
+void ggml_backend_metal_set_custom_serial(ggml_custom_op_t tag, ggml_metal_custom2_execute execute) {
+    metal_set_custom(tag, execute, true);
 }
 
 // executor and userdata of a registered experiment op (MAP_CUSTOM2 or CUSTOM), or nullptr
-static ggml_metal_custom2_execute ggml_backend_metal_experiment_op(const ggml_tensor * tensor, void ** userdata) {
+static ggml_metal_custom2_execute ggml_backend_metal_experiment_op(const ggml_tensor * tensor, void ** userdata, bool * serial = nullptr) {
     if (tensor->op == GGML_OP_MAP_CUSTOM2 && custom2_tag && custom2_execute) {
         ggml_map_custom2_op_params params;
         memcpy(&params, tensor->op_params, sizeof(params));
         if (params.fun == custom2_tag) { *userdata = params.userdata; return custom2_execute; }
     }
-    if (tensor->op == GGML_OP_CUSTOM && custom_tag && custom_execute) {
+    if (tensor->op == GGML_OP_CUSTOM) {
         ggml_custom_op_params params;
         memcpy(&params, tensor->op_params, sizeof(params));
-        if (params.fun == custom_tag) { *userdata = params.userdata; return custom_execute; }
+        std::lock_guard<std::mutex> lock(custom_mutex);
+        for (const auto & entry : custom_ops) {
+            if (params.fun != entry.tag) { continue; }
+            *userdata = params.userdata;
+            if (serial) { *serial = entry.serial; }
+            return entry.execute;
+        }
     }
     return nullptr;
 }
@@ -597,6 +628,7 @@ static bool ggml_backend_metal_custom2_matches(const ggml_tensor * tensor) {
 static enum ggml_status ggml_backend_metal_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
+#if defined(GGML_METAL_FFN_EXPERIMENT) || defined(GGML_METAL_CUSTOM_OPS)
 #ifdef GGML_METAL_FFN_EXPERIMENT
     static bool layout_dumped = false;
     if (!layout_dumped && getenv("FFN_COREML_TRACE_DECODE") && cgraph->n_nodes > 1000) {
@@ -615,6 +647,7 @@ static enum ggml_status ggml_backend_metal_graph_compute_impl(ggml_backend_t bac
             }
         }
     }
+#endif
     int first = 0;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -640,16 +673,18 @@ static enum ggml_status ggml_backend_metal_graph_compute_impl(ggml_backend_t bac
 static int ggml_backend_metal_default_n_cb(void);
 
 static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-#ifdef GGML_METAL_FFN_EXPERIMENT
-    if (getenv("FFN_COREML_SINGLE_ENCODER")) {
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            if (!ggml_backend_metal_custom2_matches(cgraph->nodes[i])) { continue; }
-            auto * ctx = (ggml_metal_t) backend->context;
-            ggml_metal_set_n_cb(ctx, 0);
-            const auto status = ggml_backend_metal_graph_compute_impl(backend, cgraph);
-            ggml_metal_set_n_cb(ctx, ggml_backend_metal_default_n_cb());
-            return status;
-        }
+#if defined(GGML_METAL_FFN_EXPERIMENT) || defined(GGML_METAL_CUSTOM_OPS)
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        bool serial = false;
+        void * userdata = nullptr;
+        if (!ggml_backend_metal_experiment_op(cgraph->nodes[i], &userdata, &serial)) { continue; }
+        if (!serial && !getenv("FFN_COREML_SINGLE_ENCODER")) { continue; }
+        auto * ctx = (ggml_metal_t) backend->context;
+        const int saved_n_cb = ggml_metal_get_n_cb(ctx);
+        ggml_metal_set_n_cb(ctx, 0);
+        const auto status = ggml_backend_metal_graph_compute_impl(backend, cgraph);
+        ggml_metal_set_n_cb(ctx, saved_n_cb);
+        return status;
     }
 #endif
     return ggml_backend_metal_graph_compute_impl(backend, cgraph);
@@ -871,7 +906,7 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
 }
 
 static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-#ifdef GGML_METAL_FFN_EXPERIMENT
+#if defined(GGML_METAL_FFN_EXPERIMENT) || defined(GGML_METAL_CUSTOM_OPS)
     if (ggml_backend_metal_custom2_matches(op)) { return true; }
 #endif
 

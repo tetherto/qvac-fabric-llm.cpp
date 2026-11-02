@@ -99,6 +99,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_coreml_ffn;
 
 //
 // llm_graph_input
@@ -814,6 +815,8 @@ struct llm_graph_params {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
 
+    llama_coreml_ffn * coreml_ffn = nullptr;
+
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
@@ -917,7 +920,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            coreml_ffn == other.coreml_ffn;
     }
 };
 
@@ -1070,6 +1074,8 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+
+    llama_coreml_ffn * coreml_ffn;
 
     const llama_prec_policy * prec_policy;
 
