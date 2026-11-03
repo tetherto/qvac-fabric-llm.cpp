@@ -6031,7 +6031,8 @@ static bool ggml_hexagon_supported_set_rows(const struct ggml_hexagon_session * 
     const struct ggml_tensor * dst  = op->src[2] ? op->src[2] : op;
 
     const auto * owner = ggml_hexagon_repack_owner(dst);
-    const auto * extra = static_cast<const ggml_hexagon_tensor_extra *>(owner->extra);
+    const auto * extra = owner->buffer && ggml_backend_buffer_is_hexagon(owner->buffer) ?
+        static_cast<const ggml_hexagon_tensor_extra *>(owner->extra) : nullptr;
     if (htp_is_tiled_weight_type(dst->type) &&
         ((extra && (extra->flags & GGML_HEXAGON_TENSOR_TILED)) ||
          (owner->buffer && ggml_backend_buffer_get_usage(owner->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS))) {
