@@ -127,7 +127,11 @@ mul_mat_id_back_b_cuda(const AType   * data_a_ptr, // as       [K, N, n_expert]
         float acc = 0.0;
 
         for (uint32_t u = u0; u < u1; ++u) {
-            const uint32_t e = uint32_t(data_i[u + t*p.ids_nb1]);
+            const int32_t ei = data_i[u + t*p.ids_nb1];
+            if (ei < 0) {
+                continue; // unused slot (upstream mul_mat_id skips id < 0): zero gradient
+            }
+            const uint32_t e = uint32_t(ei);
             for (uint32_t n = 0; n < p.N; ++n) {
                 const float g = data_g[n + u*p.g_nb1 + t*p.g_nb2];
                 acc = fmaf(mmid_read_as(data_a, k, n, e, p), g, acc);
