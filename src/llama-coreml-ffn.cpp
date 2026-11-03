@@ -34,6 +34,9 @@ bool llama_context::set_coreml_ffn(const llama_coreml_ffn_params * params, char 
         synchronize();
         decltype(coreml_ffn) candidate(nullptr, llama_coreml_ffn_free);
         if (params) {
+            if (!llama_supports_coreml_ffn()) {
+                throw std::runtime_error("Core ML FFN support was not built (LLAMA_COREML_FFN=OFF)");
+            }
             if (!cparams.op_offload || !cparams.offload_kqv || cparams.training || cparams.training_ctx || cparams.cb_eval ||
                     cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !ctx_compute.expired() || compute_share_source) {
                 throw std::runtime_error("Core ML FFN requires a default inference context with Metal offload, its own scheduler and no eval callback");
@@ -55,9 +58,7 @@ bool llama_context::set_coreml_ffn(const llama_coreml_ffn_params * params, char 
 }
 
 #ifndef LLAMA_USE_COREML_FFN
-llama_coreml_ffn * llama_coreml_ffn_load(const llama_model &, const llama_coreml_ffn_params &) {
-    throw std::runtime_error("Core ML FFN support was not built (LLAMA_COREML_FFN=OFF)");
-}
+llama_coreml_ffn * llama_coreml_ffn_load(const llama_model &, const llama_coreml_ffn_params &) { return nullptr; }
 int llama_coreml_ffn_neural_engine_cores() { return 0; }
 void llama_coreml_ffn_free(llama_coreml_ffn *) {}
 bool llama_coreml_ffn_check(llama_coreml_ffn *) { return true; }
