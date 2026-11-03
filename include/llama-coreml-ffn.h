@@ -18,7 +18,7 @@ struct llama_coreml_ffn_params {
 LLAMA_API struct llama_coreml_ffn_params llama_coreml_ffn_default_params(void);
 LLAMA_API bool llama_supports_coreml_ffn(void);
 
-// Optional Qwen3.8-27B FFN acceleration, built with LLAMA_COREML_FFN=ON.
+// Optional Qwen3.8-27B FFN acceleration, built with LLAMA_COREML=ON (or LLAMA_COREML_FFN=ON).
 // Requires a model loaded from an unchanged single-file GGUF on disk.
 // Call after context creation, before inference. NULL params disables it.
 // Configuration is context-owned; failure preserves the previous configuration.

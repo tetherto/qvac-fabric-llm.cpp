@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit 
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
-option(LLAMA_COREML "llama: build optional Core ML support" OFF)
-option(LLAMA_COREML_FFN "llama: build optional in-graph Core ML FFN support" OFF)
+option(LLAMA_COREML "llama: build optional Core ML support (EmbeddingGemma and Qwen3.8-27B FFN sidecars)" OFF)
+option(LLAMA_COREML_FFN "llama: build optional in-graph Core ML FFN support (default: LLAMA_COREML)" ${LLAMA_COREML})
 if (LLAMA_COREML OR LLAMA_COREML_FFN)
     if (NOT APPLE)
         message(FATAL_ERROR "Core ML requires macOS 15 or iOS 18")

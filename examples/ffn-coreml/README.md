@@ -2,10 +2,10 @@
 
 ## Command line
 
-The sidecar is off by default. Build with `-DLLAMA_COREML_FFN=ON -DGGML_METAL=ON` (macOS 15 or later) and add `--coreml-ffn` (or set `LLAMA_COREML=1`) to `llama-server`, `llama-cli` or any other tool that uses `common`:
+The sidecar is off by default. Build with `-DLLAMA_COREML=ON` (macOS 15 or later, Metal backend linked) and add `--coreml-ffn` (or set `LLAMA_COREML=1`) to `llama-server`, `llama-cli` or any other tool that uses `common`:
 
 ```sh
-cmake -S . -B build -DLLAMA_COREML_FFN=ON -DGGML_METAL=ON
+cmake -S . -B build -DLLAMA_COREML=ON
 cmake --build build --target llama-server -j 8
 build/bin/llama-server -m Qwen3.8-27B-Q4_0.gguf --coreml-ffn
 ```
@@ -14,7 +14,7 @@ The first start compiles 4.5-9 GB of Core ML programs into `--coreml-ffn-cache` 
 
 ## Library integration
 
-Build `libllama` with `-DLLAMA_COREML_FFN=ON -DGGML_METAL=ON` to use the in-graph FFN sidecar from a native application or addon. This is separate from the EmbeddingGemma `LLAMA_COREML` option. It works with examples, tools and common utilities disabled. Each context must own its scheduler. The installed header is `llama-coreml-ffn.h`; the ordinary build keeps the API and reports the feature unavailable.
+Build `libllama` with `-DLLAMA_COREML=ON` to use the in-graph FFN sidecar from a native application or addon. That option also builds the EmbeddingGemma sidecar; `-DLLAMA_COREML_FFN=ON` alone builds only the FFN sidecar, and `-DLLAMA_COREML_FFN=OFF` keeps only the embedding one. It works with examples, tools and common utilities disabled. Each context must own its scheduler. The installed header is `llama-coreml-ffn.h`; the ordinary build keeps the API and reports the feature unavailable.
 
 The runtime, exporter and templates now live in `src/`. CMake embeds both templates in the Apple library. Applications provide a writable cache directory, with no Python exporter, template directory or FFN environment variables. The disk model source is recorded by `llama_model_load_from_file`; buffer-backed and split-file models are rejected. The source GGUF must remain unchanged and available while configuring the sidecar.
 
@@ -42,7 +42,7 @@ Each chunk starts a prediction with shared Metal input/output buffers. An identi
 A small application using only the public library API is built as `llama-coreml-ffn` when examples are enabled:
 
 ```sh
-cmake -S . -B build-coreml -DLLAMA_COREML_FFN=ON -DGGML_METAL=ON
+cmake -S . -B build-coreml -DLLAMA_COREML=ON
 cmake --build build-coreml --target llama-coreml-ffn -j 8
 build-coreml/bin/llama-coreml-ffn model.gguf /application/writable/cache "Your prompt"
 ```
