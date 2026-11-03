@@ -7077,6 +7077,79 @@ struct test_mul_mat : public test_case {
     }
 };
 
+struct test_mul_mat_prec_f32 : public test_mul_mat {
+    test_mul_mat_prec_f32(ggml_type type, int64_t rows, int64_t columns)
+        : test_mul_mat(type, GGML_TYPE_F32, rows, columns, 256, {1, 1}, {1, 1}) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",prec_f32=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx);
+        GGML_ASSERT(ggml_prec_set_acc(out, GGML_PREC_F32));
+        return out;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        const char * name = ggml_backend_reg_name(reg);
+        const bool preserves_f32_inputs = strcmp(name, "CUDA") == 0 || strcmp(name, "CPU") == 0;
+        if (type_a == GGML_TYPE_F32 && preserves_f32_inputs) {
+            return 1e-9;
+        }
+        return test_mul_mat::max_nmse_err(backend);
+    }
+};
+
+struct test_cuda_mul_mat_prec_f32_view : public test_mul_mat_prec_f32 {
+    const int64_t input_stride;
+    const size_t input_offset;
+    const bool explicit_f32;
+
+    test_cuda_mul_mat_prec_f32_view(ggml_type type, int64_t stride, size_t offset, bool explicit_f32 = true)
+        : test_mul_mat_prec_f32(type, 48, 2), input_stride(stride), input_offset(offset), explicit_f32(explicit_f32) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",prec_f32=" + (explicit_f32 ? "1" : "0") + "," + VARS_TO_STR2(input_stride, input_offset);
+    }
+
+    bool skip_backend(ggml_backend_t backend) override {
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        const char * name = ggml_backend_reg_name(reg);
+        return strcmp(name, "CUDA") != 0 && strcmp(name, "CPU") != 0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * weights = ggml_new_tensor_2d(ctx, type_a, k, m);
+        auto * storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, input_stride, n);
+        auto * input = ggml_view_2d(ctx, storage, k, n, storage->nb[1], input_offset);
+        auto * out = ggml_mul_mat(ctx, weights, input);
+        if (explicit_f32) {
+            GGML_ASSERT(ggml_prec_set_acc(out, GGML_PREC_F32));
+        }
+        return out;
+    }
+};
+
+static void add_mul_mat_prec_f32_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+        for (int columns : {1, 2, 5, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat_prec_f32(type, 48, columns));
+            test_cases.emplace_back(new test_mul_mat_prec_f32(type, 96, columns));
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        test_cases.emplace_back(new test_cuda_mul_mat_prec_f32_view(type, 257, 0));
+        test_cases.emplace_back(new test_cuda_mul_mat_prec_f32_view(type, 258, 0));
+        test_cases.emplace_back(new test_cuda_mul_mat_prec_f32_view(type, 258, sizeof(float)));
+        test_cases.emplace_back(new test_cuda_mul_mat_prec_f32_view(type, 257, 0, false));
+        test_cases.emplace_back(new test_cuda_mul_mat_prec_f32_view(type, 258, 0, false));
+        test_cases.emplace_back(new test_cuda_mul_mat_prec_f32_view(type, 258, sizeof(float), false));
+    }
+}
+
 static ggml_backend_buffer_type_t test_repacked_weight_buffer_type(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -14105,6 +14178,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_single_query_softmax_tests(test_cases, false);
     add_speech_htp_cases(test_cases);
     add_mul_mat_strided_vec4_cases(test_cases);
+    add_mul_mat_prec_f32_cases(test_cases);
     std::default_random_engine rng(0);
 
     // unary ops
