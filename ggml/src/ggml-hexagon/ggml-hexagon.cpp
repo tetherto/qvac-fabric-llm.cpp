@@ -519,7 +519,7 @@ static inline bool ggml_hexagon_can_rt_repack(const struct ggml_tensor * t) {
 }
 
 static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
-    const auto * extra = (const ggml_hexagon_tensor_extra *) t->extra;
+    const auto * extra = (const ggml_hexagon_tensor_extra *) ggml_hexagon_repack_owner(t)->extra;
     if (extra && (extra->flags & GGML_HEXAGON_TENSOR_TILED)) {
         return true;
     }
@@ -527,7 +527,7 @@ static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
 }
 
 static inline bool ggml_hexagon_needs_repack(const struct ggml_tensor * t) {
-    const auto * extra = (const ggml_hexagon_tensor_extra *) t->extra;
+    const auto * extra = (const ggml_hexagon_tensor_extra *) ggml_hexagon_repack_owner(t)->extra;
     if (extra && (extra->flags & GGML_HEXAGON_TENSOR_TILED)) {
         return false;
     }
@@ -7117,6 +7117,9 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     htp_repack_tensor_tiled(src0, raw.data(), raw.size());
                     auto * extra = (ggml_hexagon_tensor_extra *) src0->extra;
                     extra->flags |= GGML_HEXAGON_TENSOR_TILED;
+                    extra->shadow_coverage.assign(1, {0, raw.size()});
+                    extra->shadow_buf = std::move(raw);
+                    extra->repack_ready = true;
                 }
             }
 
