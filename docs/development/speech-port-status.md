@@ -1,11 +1,12 @@
 # Speech ggml port status
 
-Snapshot: `temp-11259` at `d249ebc9c`, 2026-10-21.
+Snapshot: `temp-11259` at `4b955f55f`, 2026-10-26.
 
 The combined [PR #346](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/346)
-is superseded by the reviewed stack below. Superseded does not mean that every
-change from the combined PR has landed. Remaining implementation work stays in a
-separate follow-up PR.
+was closed as superseded by the reviewed stack below. The initial documentation
+closeout landed in [#416](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/416);
+this snapshot includes the completed Hexagon implementation from #417. Remaining
+CUDA work and hardware validation are listed separately below.
 
 ## Merged stack
 
@@ -16,7 +17,8 @@ separate follow-up PR.
 | Metal | [#386](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/386) | Nine speech operations; the other four retain CPU fallback. |
 | Vulkan | [#388](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/388) | Thirteen operations, alignment/grid gates, and stable channel normalization on Vulkan and Metal. |
 | OpenCL | [#401](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/401) | Five operations and CI runtime detection. The source scanner was removed before merge. |
-| Hexagon | [#415](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/415) | SNAKE only, with QDC runner coverage. |
+| Hexagon SNAKE | [#415](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/415) | SNAKE with QDC runner coverage. |
+| Hexagon completion | [#417](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/417) | Remaining speech kernels, shared-op changes, bounded extended-address DMA, and review fixes. |
 
 The proposed Metal extras were assessed as unnecessary for the speech models or
 already covered by the Metal/Vulkan parts; they are not a separate merged patch.
@@ -26,14 +28,11 @@ already covered by the Metal/Vulkan parts; they are not a separate merged patch.
 - CUDA implementations of the new speech operations are not part of the merged
   stack. Existing CUDA operations must not be confused with coverage of these
   new operation IDs.
-- The remaining Hexagon implementation is included in this change: col2im-1d,
-  conv-2d-dw, fused depthwise-conv-1d, timestep-embedding, transpose, GELU-erf,
-  F32 attention inputs, F16 HMX activations, partial output tiles, K=9 matmul,
-  BF16 row gathers, and strided copies/im2col. Existing upstream DMA splitting
-  and batched F32 VTCM matmul are retained. Device validation remains required.
 - The SNAKE reviewer reported a successful Galaxy S25 (SM8750, v79) run. The
-  three QDC jobs skipped device execution because the API key was unavailable.
-  QCS9075M and SM8850 remain unvalidated; green skipped jobs are not device passes.
+  three QDC jobs on the final #417 head also skipped device execution. The full
+  port still needs hardware validation on QCS9075M, SM8750, and SM8850; the S25
+  SNAKE result does not validate the remaining kernels. Green skipped jobs are
+  not device passes. Snapdragon Android and Linux host builds passed.
 - Keep performance/policy changes deferred unless required by a model or requested
   by the backend owners: Metal precision routing and copy fast paths; Vulkan
   precision routing, auxiliary fused/tiled shaders and Adreno policy; OpenCL
@@ -62,6 +61,22 @@ an integration checklist, not a claim that each change is still missing there.
 - SNAKE vector-boundary cases and QDC checks that require actual HTP execution
   ([#415](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/415)). Keep the
   work-queue API and compute-flag adaptation specific to the target backend version.
+- Bounded VTCM input windows and 40-bit DMA address preservation, including
+  tiled copy conversion and F16 HMX activation row transfers. Reset cached
+  windows per operation and synchronize DMA copy destinations
+  ([#417](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/417)).
+- Shared host/DSP depthwise VTCM sizing, including weights and overflow checks,
+  plus the shared matmul partial-tile predicate
+  ([#417](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/417)).
+- IEEE accumulation between depthwise convolution taps and bounded one-time F16
+  weight conversion, with zero-input and padded-edge regressions
+  ([#417](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/417)).
+- F16 HMX activation alignment handling and precision gating limited to the new
+  F16 two-dimensional path; retain existing LLM precision behavior
+  ([#417](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/417)).
+- All-outer-row partitioning for strided copies, BF16 GET_ROWS vector conversion
+  with bounded tails, and weight-buffer/window-boundary regression cases
+  ([#417](https://github.com/tetherto/qvac-fabric-llm.cpp/pull/417)).
 
 ### Candidates retained from the superseded combined PR
 
@@ -84,20 +99,36 @@ parked outside the minimal speech port remains separate from this closeout.
 
 ## Support table provenance
 
-The four refreshed CSVs cover the thirteen speech operations from the merged
-snapshot. Unrelated historical rows are retained to keep this closeout scoped.
-`support` queries backend capability; it does not execute kernels or certify
-numerical correctness. Unsupported CUDA rows describe the current base honestly.
+The four CSVs are complete capability snapshots from the merged revision above,
+replacing the earlier partial refresh. `support` queries backend capability; it
+does not execute kernels or certify numerical correctness. Device-specific
+support can differ with hardware and drivers.
 
-Each backend snapshot contains 129 cases: CPU reports 129 supported, CUDA 0,
-Metal 91, and Vulkan 128. These are case counts, not operation counts. Regenerating
-`docs/ops.md` after the refresh produces the existing file unchanged.
+Collection uses CPU on Ryzen AI 9 HX 370 and CUDA0 on the WSL2 laptop
+(RTX 5090 Laptop GPU), MTL0 on Apple M3 Ultra, and Vulkan0 on Radeon 8060S (RADV, Mesa 25.2.8).
+All builds use Release mode; the standalone CPU build has `GGML_NATIVE=OFF`,
+and CUDA targets architecture 120 with the default FlashAttention quantization
+set (`GGML_CUDA_FA_ALL_QUANTS=OFF`). The WSL run selects the PTX compiler
+from the matching Windows driver directory through `LD_LIBRARY_PATH`.
 
-Generate fresh rows with `test-backend-ops support -b <backend> --output csv`,
-filtering `-o` to `CONV_1D_DW_DIRECT,NORM_CHANNEL,SCALE_RESIDUAL,BIAS_GELU,PAD_REPLICATE_1D,GRU,ZERO_UPSAMPLE,CHANNEL_SHUFFLE,AFFINE_PRELU,SNAKE,LSTM_CELL,TDT_STEP,SIGLU`.
-Use CPU, CUDA0, and Vulkan0 on the RTX 5090 host and MTL0 on the Metal host.
-Replace the matching operation rows in `docs/ops/{CPU,CUDA,Metal,Vulkan}.csv`,
-retaining the existing seven-column schema, then run:
+Each snapshot contains the same 24,304 cases: CPU reports 20,936 supported,
+CUDA 18,485, Metal 16,908, and Vulkan 20,266. Other backend CSVs retain their
+previous snapshots, including HTP; that column does not yet reflect #415/#417.
+The generator also renders operations absent from a snapshot as unsupported,
+so table entries describe collected coverage rather than exhaustive backend support.
+
+Build `test-backend-ops` from the snapshot on each host, then collect the matching
+backend without an operation filter:
+
+```sh
+./build/bin/test-backend-ops support -b CPU --output csv > CPU.csv
+./build/bin/test-backend-ops support -b CUDA0 --output csv > CUDA.csv
+./build/bin/test-backend-ops support -b MTL0 --output csv > Metal.csv
+./build/bin/test-backend-ops support -b Vulkan0 --output csv > Vulkan.csv
+```
+
+Replace `docs/ops/{CPU,CUDA,Metal,Vulkan}.csv` with those outputs, preserving the
+seven-column schema, then regenerate and verify:
 
 ```sh
 python3 scripts/create_ops_docs.py
@@ -106,21 +137,3 @@ diff -u docs/ops.md /tmp/ops-check.md
 ```
 
 The `update-ops-docs` workflow performs the same generation and comparison.
-
-## Hexagon speech validation
-
-Run the focused speech cases and the previously merged SNAKE cases on HTP:
-
-```sh
-test-backend-ops test -b HTP0 -p 'suite=speech_htp,'
-test-backend-ops test -b HTP0 -o SNAKE
-```
-
-The speech group covers vector/tile tails, padding/dilation, planar and channel
-layouts, strides over 64 KiB, fused depthwise convolution with weight buffers,
-F16/BF16 conversion, mixed F32/F16 attention, and partial matmul output tiles.
-New direct-access kernels stage extended-address inputs through DMA on v81.
-The Android and Linux QDC runners require every selected case to execute and
-pass when credentials are available. Without a QDC API key, the workflow skips
-device execution. Completion requires actual runs on QCS9075M,
-SM8750, and SM8850; builds and CPU references do not establish HTP correctness.
