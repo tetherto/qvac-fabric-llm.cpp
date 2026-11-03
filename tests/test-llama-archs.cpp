@@ -2033,6 +2033,11 @@ static int test_kv_shift(const std::string & arch_filter, const size_t seed, con
     return n_failed == 0 ? 0 : 1;
 }
 
+// Tests under LLAMA_TEST_INTERNALS reach llama internals without LLAMA_API (llama_model_saver,
+// llama_model::get_tensor, llama_context::get_sched/sched_reserve/set_embeddings_nextn), which a
+// Windows shared llama.dll does not export. CMake defines it on every other platform, and on Windows
+// in a static build, the same split as the internal-API tests in tests/CMakeLists.txt.
+#ifdef LLAMA_TEST_INTERNALS
 struct mtp_backend_probe {
     ggml_backend_i iface;
     bool pending = false;
@@ -2230,6 +2235,7 @@ static int test_mtp_shared(bool cpu) {
     printf("MTP shared compute: passed\n");
     return 0;
 }
+#endif // LLAMA_TEST_INTERNALS
 
 static void add_hadamard_metadata(gguf_context * ctx, uint32_t block_size = 256, bool include_attn_q = false, bool tied_output = false) {
     // a tied output head is folded through token_embd, so it is not listed as a weight
@@ -2252,6 +2258,7 @@ static void add_hadamard_metadata(gguf_context * ctx, uint32_t block_size = 256,
     gguf_set_arr_str(ctx, "prism.hadamard.inverse_weight_names", inverse_names, 1);
 }
 
+#ifdef LLAMA_TEST_INTERNALS
 static std::string save_model_to_string(const gguf_context * ctx) {
     FILE * file = tmpfile();
     GGML_ASSERT(file);
@@ -2447,6 +2454,7 @@ static void test_hadamard_repack() {
     GGML_ASSERT(!get_logits(loaded.first.get(), loaded.second.get(), tokens).empty());
     fclose(file);
 }
+#endif // LLAMA_TEST_INTERNALS
 
 static void test_hadamard_invalid_block() {
     auto metadata = get_gguf_ctx(LLM_ARCH_QWEN35, false);
@@ -2459,7 +2467,7 @@ static void test_hadamard_invalid_block() {
 
 static void test_hadamard_mtp_arch(llm_arch arch, bool moe) {
     auto metadata = get_gguf_ctx(arch, moe);
-    const std::string prefix = llm_arch_name(arch);
+    const std::string prefix = llama_arch_name(arch);
     gguf_set_val_u32(metadata.get(), (prefix + ".block_count").c_str(), 3);
     gguf_set_val_u32(metadata.get(), (prefix + ".nextn_predict_layers").c_str(), 1);
     add_hadamard_metadata(metadata.get());
@@ -2501,6 +2509,7 @@ static void test_hadamard_mtp_arch(llm_arch arch, bool moe) {
     GGML_ASSERT(common_speculative_process(spec.get(), batch));
 }
 
+#ifdef LLAMA_TEST_INTERNALS
 // normalized Sylvester Walsh-Hadamard entry, the transform prism.hadamard folds with
 static float hadamard_entry(int64_t row, int64_t col, int64_t n) {
     const float scale = 1.0f / std::sqrt(float(n));
@@ -2567,6 +2576,7 @@ static FILE * save_folded_target(const llama_model * model, const std::vector<st
     rewind(file);
     return file;
 }
+#endif // LLAMA_TEST_INTERNALS
 
 static gguf_context_ptr get_borrowing_dflash_metadata() {
     auto metadata = get_gguf_ctx(LLM_ARCH_DFLASH, false);
@@ -2591,6 +2601,7 @@ static llama_model_ptr get_borrowing_dflash(size_t seed) {
     return draft;
 }
 
+#ifdef LLAMA_TEST_INTERNALS
 static std::vector<float> get_borrowed_draft_logits(llama_model * draft, llama_context * target, const std::vector<llama_token> & tokens) {
     auto cp = llama_context_default_params();
     cp.n_ctx = 128;
@@ -2659,19 +2670,24 @@ static void test_hadamard_shared_input() {
     GGML_ASSERT(n_transforms == n_layer + 1 + n_lookups);
     fclose(target_file);
 }
+#endif // LLAMA_TEST_INTERNALS
 
 static int test_hadamard_contracts() {
     init_normal_pool(1234, 0.1f); // fill_normal draws from the shared pool, same seed/stdev as every hadamard fixture
     test_hadamard_invalid_block();
+#ifdef LLAMA_TEST_INTERNALS
     test_hadamard_tied_output();
     test_hadamard_split_futures(false);
     test_hadamard_split_futures(true);
+#endif
     test_hadamard_mtp_arch(LLM_ARCH_QWEN35, false);
     test_hadamard_mtp_arch(LLM_ARCH_QWEN35MOE, true);
     test_hadamard_mtp_arch(LLM_ARCH_QWEN3NEXT, true);
+#ifdef LLAMA_TEST_INTERNALS
     test_hadamard_repack();
     test_hadamard_dflash_borrowed_io();
     test_hadamard_shared_input();
+#endif
     printf("Hadamard contracts: passed\n");
     return 0;
 }
@@ -3011,7 +3027,7 @@ static bool test_layer_inp_pos_min_arch(llm_arch arch) {
     const bool all = layer_inp_rows_match(decode_layer_inp(ctx, tokens, n_floats), ref, n_embd, 0);
 
     if (!skipped || !all) {
-        printf("FAIL: %s layer input rows (pos_min %d: %s, pos_min -1: %s)\n", llm_arch_name(arch), LAYER_INP_POS_MIN,
+        printf("FAIL: %s layer input rows (pos_min %d: %s, pos_min -1: %s)\n", llama_arch_name(arch), LAYER_INP_POS_MIN,
                 skipped ? "ok" : "wrong", all ? "ok" : "wrong");
     }
     return skipped && all;
@@ -3146,7 +3162,7 @@ static void add_tokens_last_output(llama_batch_ext * batch, const std::vector<ll
 static int test_moe_no_output_ubatches() {
     init_normal_pool(NO_OUTPUT_SEED, 0.1f); // fill_normal draws from the shared pool (upstream 8542e94350f)
     auto metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
-    const std::string prefix = llm_arch_name(LLM_ARCH_QWEN3MOE);
+    const std::string prefix = llama_arch_name(LLM_ARCH_QWEN3MOE);
     gguf_set_val_u32(metadata.get(), (prefix + ".expert_used_count").c_str(), NO_OUTPUT_N_EXPERT_USED);
 
     auto mp = llama_model_default_params();
@@ -3183,7 +3199,12 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     if (argc == 2 && (strcmp(argv[1], "--mtp-shared") == 0 || strcmp(argv[1], "--mtp-shared-cpu") == 0)) {
+#ifdef LLAMA_TEST_INTERNALS
         return test_mtp_shared(strcmp(argv[1], "--mtp-shared-cpu") == 0);
+#else
+        printf("MTP shared compute: skipped, it needs llama internals this build does not export\n");
+        return 0;
+#endif
     }
     if (argc == 2 && strcmp(argv[1], "--hadamard-contracts") == 0) {
         return test_hadamard_contracts();
