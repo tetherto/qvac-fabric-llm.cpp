@@ -72,14 +72,16 @@ kernel void kernel_flash_attn_ext_rows(
 
     // note: the K/V cache is shared by all streams (ne13 = ne23 = 1), the row list selects the rows
     // each thread copies up to 4 half4 values (32 bytes) to keep the memory transactions large
+    // the chunks do not cross a head: with DK = 40 or 72 the half4 count per head is not a multiple of 4
 
     // K: all heads of this row
     {
         const int64_t per_head = args.ne10/4;
+        const int64_t nc       = (per_head + 3)/4; // chunks per head
 
-        for (int64_t i = 4*tiitg; i < args.ne_12_2*per_head; i += 4*ntg.x) {
-            const int64_t i2 = i/per_head;
-            const int64_t i0 = i%per_head;
+        for (int64_t i = tiitg; i < args.ne_12_2*nc; i += ntg.x) {
+            const int64_t i2 = i/nc;
+            const int64_t i0 = 4*(i%nc);
             const int      n  = (int) min((int64_t) 4, per_head - i0);
 
             device half4 * dst4 = k_dst + (i2*args.ne11 + i1)*per_head + i0;
@@ -100,10 +102,11 @@ kernel void kernel_flash_attn_ext_rows(
     // V: all heads of this row
     {
         const int64_t per_head = args.ne20/4;
+        const int64_t nc       = (per_head + 3)/4; // chunks per head
 
-        for (int64_t i = 4*tiitg; i < args.ne_12_2*per_head; i += 4*ntg.x) {
-            const int64_t i2 = i/per_head;
-            const int64_t i0 = i%per_head;
+        for (int64_t i = tiitg; i < args.ne_12_2*nc; i += ntg.x) {
+            const int64_t i2 = i/nc;
+            const int64_t i0 = 4*(i%nc);
             const int      n  = (int) min((int64_t) 4, per_head - i0);
 
             device half4 * dst4 = v_dst + (i2*args.ne11 + i1)*per_head + i0;

@@ -1,5 +1,9 @@
 #include "llama-kv-cells.h"
 
+#include <algorithm>
+#include <random>
+#include <vector>
+
 static constexpr uint32_t CELL_0 = 0;
 static constexpr llama_seq_id SEQ_0 = 0;
 
@@ -196,6 +200,137 @@ static void test_mrope_negative_shift_clears_cell() {
     GGML_ASSERT(cells.is_empty(CELL_0));
 }
 
+// the kv_rows lists come from per-sequence cell bitmaps that every cell update has to keep in sync,
+// compare them with a scan of the cells after random updates
+static void test_seq_cells_match_brute_force() {
+    static constexpr uint32_t     N_CELLS = 300; // several 64-bit words, the last one partial
+    static constexpr llama_seq_id N_SEQS  = 6;
+
+    std::mt19937 rng(42);
+
+    const auto rnd = [&](int lo, int hi) {
+        return std::uniform_int_distribution<int>(lo, hi)(rng);
+    };
+
+    llama_kv_cells cells;
+    cells.resize(N_CELLS);
+
+    std::vector<int32_t> data;
+
+    for (int step = 0; step < 20000; ++step) {
+        const uint32_t     i = rnd(0, N_CELLS - 1);
+        const llama_seq_id s = rnd(0, N_SEQS - 1);
+
+        switch (rnd(0, 8)) {
+            case 0:
+            case 1:
+                if (cells.is_empty(i)) {
+                    cells.pos_set(i, rnd(0, 500));
+                    cells.seq_add(i, s);
+                }
+                break;
+            case 2:
+                if (!cells.is_empty(i) && !cells.seq_has(i, s)) {
+                    cells.seq_add(i, s);
+                }
+                break;
+            case 3:
+                if (!cells.is_empty(i) && cells.seq_has(i, s)) {
+                    cells.seq_rm(i, s);
+                }
+                break;
+            case 4:
+                if (!cells.is_empty(i)) {
+                    cells.seq_keep(i, s);
+                }
+                break;
+            case 5:
+                if (!cells.is_empty(i)) {
+                    cells.pos_add(i, rnd(-50, 50), rnd(0, 1) == 1);
+                }
+                break;
+            case 6:
+                if (!cells.is_empty(i)) {
+                    cells.pos_div(i, 2);
+                }
+                break;
+            case 7:
+                if (!cells.is_empty(i) && rnd(0, 3) == 0) {
+                    cells.rm(i);
+                }
+                break;
+            case 8:
+                {
+                    // save/restore of a range, as in state_read
+                    cells.reset_shift();
+                    const uint32_t n = rnd(1, 80);
+                    const uint32_t j = rnd(0, N_CELLS - n);
+                    const uint32_t k = rnd(0, N_CELLS - n);
+                    cells.set(k, cells.cp(j, n));
+                } break;
+        }
+
+        if (step == 10000) {
+            cells.reset();
+        }
+
+        if (step % 97 != 0) {
+            continue;
+        }
+
+        // random slices: a few sequences each, with or without the SWA cutoff
+        std::vector<llama_kv_rows_slice> slices(rnd(1, 4));
+        for (auto & slice : slices) {
+            for (llama_seq_id t = 0; t < N_SEQS; ++t) {
+                if (rnd(0, 2) == 0) {
+                    slice.seq_ids.push_back(t);
+                }
+            }
+            if (slice.seq_ids.empty()) {
+                slice.seq_ids.push_back(s);
+            }
+            slice.p_min = rnd(0, 1) ? -1 : rnd(0, 400);
+        }
+
+        data.assign(slices.size()*N_CELLS, -2);
+        cells.get_seq_cells(slices, data.data(), N_CELLS);
+
+        for (size_t is = 0; is < slices.size(); ++is) {
+            const auto & slice = slices[is];
+
+            std::vector<int32_t> expected;
+            for (uint32_t c = 0; c < N_CELLS; ++c) {
+                bool has = false;
+                for (const llama_seq_id t : slice.seq_ids) {
+                    has = has || (!cells.is_empty(c) && cells.seq_has(c, t));
+                }
+                if (has && cells.pos_get(c) >= slice.p_min) {
+                    expected.push_back(c);
+                }
+            }
+            expected.resize(N_CELLS, -1);
+
+            GGML_ASSERT(std::equal(expected.begin(), expected.end(), data.begin() + is*N_CELLS));
+        }
+
+        for (llama_seq_id t = 0; t < N_SEQS; ++t) {
+            const llama_pos pm = rnd(0, 400);
+
+            uint32_t n_all = 0;
+            uint32_t n_pm  = 0;
+            for (uint32_t c = 0; c < N_CELLS; ++c) {
+                if (!cells.is_empty(c) && cells.seq_has(c, t)) {
+                    n_all += 1;
+                    n_pm  += cells.pos_get(c) >= pm;
+                }
+            }
+
+            GGML_ASSERT(cells.seq_n_cells(t)     == n_all);
+            GGML_ASSERT(cells.seq_n_cells(t, pm) == n_pm);
+        }
+    }
+}
+
 int main() {
     test_scalar_shift_does_not_touch_ext();
     test_mrope_shift_updates_active_axes();
@@ -203,6 +338,7 @@ int main() {
     test_mrope_image_grid_negative_shift_clears_cells();
     test_scalar_div_tracks_position_delta();
     test_mrope_negative_shift_clears_cell();
+    test_seq_cells_match_brute_force();
 
     return 0;
 }

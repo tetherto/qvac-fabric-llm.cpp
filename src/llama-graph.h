@@ -346,6 +346,10 @@ struct llm_attn_mask {
     ggml_tensor * rows = nullptr; // I32 [n_kv_rows, n_slices]
     uint32_t      n_kv = 0;
 
+    // false if the mask is never built over kv_rows, so it is reused like a dense mask
+    // (masks built with build_attn_inp_kq_mask)
+    bool allow_rows = false;
+
     // fill every token of a sequence with the mask row of its first token (dspark draft blocks)
     bool block_uniform = false;
 };

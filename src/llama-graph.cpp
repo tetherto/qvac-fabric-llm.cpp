@@ -67,12 +67,18 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+// length of the kv_rows lists, 0 for the dense mask over the whole cache
+// not in training: that path attends to k_cur/v_cur instead of the cache
+static uint32_t get_n_kv_rows(const llama_kv_cache_context * mctx, const llama_cparams & cparams) {
+    return cparams.fused_kv_rows && !cparams.training ? mctx->get_n_kv_rows() : 0;
+}
+
 static bool can_reuse_attn_mask(
         const llm_attn_mask & attn_mask,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
-    const uint32_t n_kv_rows = cparams.fused_kv_rows ? mctx->get_n_kv_rows() : 0;
+    const uint32_t n_kv_rows = attn_mask.allow_rows ? get_n_kv_rows(mctx, cparams) : 0;
     const uint32_t n_slices  = llama_kv_cache::get_n_kv_slices(ubatch);
     const auto     n_tokens  = ubatch.n_tokens;
 
@@ -107,9 +113,10 @@ static llm_attn_mask build_attn_inp_attn_mask(
         const llama_cparams & cparams) {
     llm_attn_mask attn_mask;
 
-    attn_mask.n_kv = mctx->get_n_kv();
+    attn_mask.n_kv       = mctx->get_n_kv();
+    attn_mask.allow_rows = true;
 
-    const uint32_t n_kv_rows = cparams.fused_kv_rows ? mctx->get_n_kv_rows() : 0;
+    const uint32_t n_kv_rows = get_n_kv_rows(mctx, cparams);
 
     if (n_kv_rows == 0) {
         attn_mask.rows = nullptr;
