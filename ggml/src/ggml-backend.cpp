@@ -221,6 +221,23 @@ size_t ggml_backend_buft_get_alloc_size_n(ggml_backend_buffer_type_t buft, struc
     return ggml_backend_buft_get_alloc_size_n_default(buft, tensors, n_tensors);
 }
 
+size_t ggml_backend_buft_get_buffer_alloc_size(ggml_backend_buffer_type_t buft, size_t size) {
+    GGML_ASSERT(buft);
+    // the allocation wrapper never calls the backend for an empty buffer
+    if (size == 0 || buft->device == NULL) {
+        return size;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(buft->device);
+    auto get_size = reg ? reinterpret_cast<ggml_backend_buft_get_buffer_alloc_size_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_get_buffer_alloc_size")) : nullptr;
+    if (get_size == nullptr) {
+        return size;
+    }
+    const size_t result = get_size(buft, size);
+    GGML_ASSERT(result >= size);
+    return result;
+}
+
 bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
     if (buft->iface.is_host) {
