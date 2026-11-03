@@ -4,6 +4,8 @@ set(GGML_VECTOR_INDEX_IMPL_SOURCES
     "${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index.cpp"
     "${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-turbovec.cpp"
     "${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-turbovec-v8.cpp"
+    "${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-cpu.cpp"
+    "${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-turbovec-staged.cpp"
     "${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-search.cpp"
     "${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-persistence.cpp")
 
