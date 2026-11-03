@@ -130,9 +130,15 @@ struct img_tool {
             return {0, 0};
         }
 
-        auto round_by_factor = [f = opts.align_size, even = opts.round_half_even](float x) {
-            const float q = x / static_cast<float>(f);
-            return static_cast<int>(even ? std::nearbyint(q) : std::round(q)) * f;
+        auto round_by_factor = [f = opts.align_size, even = opts.round_half_even](int x) {
+            if (!even) {
+                return static_cast<int>(std::round(static_cast<float>(x) / static_cast<float>(f))) * f;
+            }
+            const int quotient = x / f;
+            const int remainder = x % f;
+            // Round ties to even, independently of the floating-point rounding mode.
+            const bool up = remainder > f - remainder || (remainder == f - remainder && quotient % 2 != 0);
+            return (quotient + up) * f;
         };
         auto ceil_by_factor  = [f = opts.align_size](double x) { return static_cast<int>(std::ceil(x / static_cast<double>(f))) * f; };
         auto floor_by_factor = [f = opts.align_size](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
@@ -149,7 +155,7 @@ struct img_tool {
             w_bar = ceil_by_factor(width  * scale);
             h_bar = ceil_by_factor(height * scale);
         } else {
-            // always align up first
+            // align to the nearest multiple first
             w_bar = std::max(opts.align_size, round_by_factor(width));
             h_bar = std::max(opts.align_size, round_by_factor(height));
         }
@@ -801,6 +807,12 @@ mtmd_image_preproc_out mtmd_image_preprocessor_fixed_size::preprocess(const clip
     mtmd_image_preproc_out output;
     output.append(hparams, resized_image, true);
     return output;
+}
+
+// Resize to [min_pixels, max_pixels] with aspect ratio preserved, aligned to `align_size`, rounding .5 to even
+// like the transformers smart_resize reference (Python round()); models opt in via hparams.image_round_half_even.
+clip_image_size mtmd_calc_dynamic_image_size(const clip_image_size & size, int align_size, int min_pixels, int max_pixels) {
+    return img_tool::calc_size_preserved_ratio(size, {align_size, min_pixels, max_pixels, 0, /* round_half_even */ true});
 }
 
 //
