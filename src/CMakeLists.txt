@@ -95,7 +95,7 @@ endif()
 
 if (LLAMA_COREML_FFN)
     if (NOT TARGET ggml-metal OR GGML_BACKEND_DL)
-        message(FATAL_ERROR "LLAMA_COREML_FFN requires a linked Metal backend (GGML_BACKEND_DL=OFF)")
+        message(FATAL_ERROR "LLAMA_COREML_FFN requires a linked Metal backend (GGML_BACKEND_DL=OFF); use -DLLAMA_COREML_FFN=OFF to build only the Core ML embedding sidecar")
     endif()
     include(${CMAKE_CURRENT_SOURCE_DIR}/llama-coreml-ffn-templates.cmake)
     target_sources(llama PRIVATE llama-coreml-ffn.mm)

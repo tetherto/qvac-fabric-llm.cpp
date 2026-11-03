@@ -3099,7 +3099,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--coreml-ffn"},
-        "run part of each FFN on the Apple Neural Engine for prompts of 256+ tokens (Qwen3.8-27B, -DLLAMA_COREML_FFN=ON builds; default: off)",
+        "run part of each FFN on the Apple Neural Engine for prompts of 256+ tokens (Qwen3.8-27B, -DLLAMA_COREML=ON builds; default: off)",
         [](common_params & params) {
             params.coreml_ffn = true;
         }

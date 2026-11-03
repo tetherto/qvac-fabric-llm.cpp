@@ -1456,7 +1456,7 @@ common_init_result_ptr common_init_from_model_and_params(llama_model* model, com
 
     if (params.coreml_ffn) {
         if (!llama_supports_coreml_ffn()) {
-            COM_WRN("%s", "Core ML FFN is unavailable in this build; enable -DLLAMA_COREML_FFN=ON; using Metal\n");
+            COM_WRN("%s", "Core ML FFN is unavailable in this build; enable -DLLAMA_COREML=ON; using Metal\n");
         } else {
             auto ffn_params = llama_coreml_ffn_default_params();
             const std::string cache = params.coreml_ffn_cache.empty() ? (fs_get_cache_directory() / "coreml-ffn").string() : params.coreml_ffn_cache;

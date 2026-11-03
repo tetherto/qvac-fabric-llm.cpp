@@ -35,7 +35,7 @@ bool llama_context::set_coreml_ffn(const llama_coreml_ffn_params * params, char 
         decltype(coreml_ffn) candidate(nullptr, llama_coreml_ffn_free);
         if (params) {
             if (!llama_supports_coreml_ffn()) {
-                throw std::runtime_error("Core ML FFN support was not built (LLAMA_COREML_FFN=OFF)");
+                throw std::runtime_error("Core ML FFN support was not built (enable -DLLAMA_COREML=ON)");
             }
             if (!cparams.op_offload || !cparams.offload_kqv || cparams.training || cparams.training_ctx || cparams.cb_eval ||
                     cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !ctx_compute.expired() || compute_share_source) {
