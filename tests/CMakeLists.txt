@@ -577,6 +577,8 @@ llama_build(test-backend-ops.cpp LINK ggml)
 
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 
+llama_build_and_test(test-backend-memory.cpp LINK ggml)
+
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
 
 # Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
