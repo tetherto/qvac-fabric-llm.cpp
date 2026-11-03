@@ -4359,6 +4359,9 @@ kernel void kernel_mul_mat_id_back_b_f32(
 
         for (int u = u0; u < u1; ++u) {
             const int e = data_i[u + t*args.ids_nb1];
+            if (e < 0) {
+                continue; // unused slot (upstream mul_mat_id skips id < 0): zero gradient
+            }
             for (int n = 0; n < args.N; ++n) {
                 const float gv = data_g[n + u*args.g_nb1 + t*args.g_nb2];
                 const float av = data_a[k + n*args.as_nb1 + e*args.as_nb2];
@@ -4400,6 +4403,9 @@ kernel void kernel_mul_mat_id_back_b_q8_0(
 
         for (int u = u0; u < u1; ++u) {
             const int e = data_i[u + t*args.ids_nb1];
+            if (e < 0) {
+                continue; // unused slot (upstream mul_mat_id skips id < 0): zero gradient
+            }
             for (int n = 0; n < args.N; ++n) {
                 const float gv = data_g[n + u*args.g_nb1 + t*args.g_nb2];
                 device const block_q8_0 & blk = data_a[(e*args.N + n)*blocks_per_row + ib];
