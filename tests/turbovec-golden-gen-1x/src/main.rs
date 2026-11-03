@@ -75,8 +75,14 @@ fn main() {
     // the two round scores differently. `--vector-major` prints the 4-bit
     // searches under the permute-dot kernel (run it on such a host); the
     // default output pins the LUT scan so it does not depend on the machine.
+    if std::env::args().any(|a| a == "--vm8-2bit-section") {
+        // Child of `--vector-major`, run with TURBOVEC_2BIT_VM8=1.
+        print_vm8_2bit_section();
+        return;
+    }
     if std::env::args().any(|a| a == "--vector-major") {
         print_vector_major();
+        print_batch_section();
         return;
     }
     if std::env::args().any(|a| a == "--staged") {
@@ -525,6 +531,91 @@ fn print_staged_short() {
             println!("      {{ {fmt_ids} }},");
             println!("      {{ {fmt_f32} }} }},");
         }
+    }
+    println!("}};");
+}
+
+// Batched searches: upstream fuses 12, 8 or 4 queries (`pd_scan`) and runs
+// a remainder query by query, so 20 queries take the 12 and 8 widths and 6
+// queries the 4 and the single-query path; 16 is 12 + 4 and 11 is 8 + 3
+// single queries. Appended to the vector-major fixture; the rows above stay
+// byte-identical.
+const BATCH_NQS: [usize; 4] = [20, 16, 11, 6];
+const BATCH_MAX_NQ: usize = 20;
+
+fn batch_case_rows(bits: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for dim in [128usize, 200, 1536] {
+        let mut db = rows(SEED_DB, N_DB, dim);
+        for v in &mut db[..dim] {
+            *v = 0.0;
+        }
+        let calib = rows(SEED_CALIB, N_CALIB, dim);
+        let id_list = ids(N_DB);
+        let allow: Vec<u64> = id_list.iter().copied().step_by(3).collect();
+        let mut plain = IdMapIndex::new(dim, bits).unwrap();
+        plain.add_with_ids(&db, &id_list).unwrap();
+        let mut calibrated = IdMapIndex::new(dim, bits).unwrap();
+        calibrated.calibrate(&calib).unwrap();
+        calibrated.add_with_ids(&db, &id_list).unwrap();
+        for nq in BATCH_NQS {
+            let queries = rows(SEED_QUERY, nq, dim);
+            for (cal, filt) in [(0, 0), (1, 0), (0, 1)] {
+                let idx = if cal == 1 { &calibrated } else { &plain };
+                let (scores, out_ids) = if filt == 1 {
+                    idx.search_with_allowlist(&queries, K, Some(&allow)).unwrap()
+                } else {
+                    idx.search(&queries, K)
+                };
+                assert_eq!(out_ids.len(), nq * K);
+                let fmt_ids = out_ids.iter().map(|x| format!("{x}u")).collect::<Vec<_>>().join(", ");
+                let fmt_f32 = scores.iter().map(|x| format!("{:.9e}f", x)).collect::<Vec<_>>().join(", ");
+                out.push(format!("    {{ {bits}, {dim}, {cal}, {filt}, {nq},\n      {{ {fmt_ids} }},\n      {{ {fmt_f32} }} }},"));
+            }
+        }
+    }
+    out
+}
+
+fn print_batch_section() {
+    println!();
+    println!("// Batched searches (20, 16, 11 and 6 queries; plain, calibrated, and every third id");
+    println!("// allowed). 4-bit under the permute-dot kernel, 2-bit under the nibble LUT.");
+    println!("struct Tv1xBatchCase {{ int bits; int dim; int calibrated; int filtered; int n_q; uint64_t ids[{BATCH_MAX_NQ} * {K}]; float scores[{BATCH_MAX_NQ} * {K}]; }};");
+    println!("static const Tv1xBatchCase kTv1xBatchCases[] = {{");
+    for bits in [4usize, 2] {
+        for row in batch_case_rows(bits) {
+            println!("{row}");
+        }
+    }
+    println!("}};");
+    // The same 2-bit searches under TURBOVEC_2BIT_VM8=1, which upstream
+    // reads once per process: a child process prints them.
+    let exe = std::env::current_exe().unwrap();
+    let child = std::process::Command::new(exe)
+        .arg("--vm8-2bit-section")
+        .env("TURBOVEC_2BIT_VM8", "1")
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stderr));
+    print!("{}", String::from_utf8(child.stdout).unwrap());
+}
+
+fn print_vm8_2bit_section() {
+    // The opt-in only changes anything on aarch64 with i8mm; elsewhere these
+    // rows would silently repeat the LUT ones.
+    #[cfg(target_arch = "aarch64")]
+    assert!(std::arch::is_aarch64_feature_detected!("i8mm"), "the 2-bit vm8 rows need aarch64 with i8mm");
+    #[cfg(not(target_arch = "aarch64"))]
+    panic!("the 2-bit vm8 rows need aarch64 with i8mm");
+    assert_eq!(std::env::var("TURBOVEC_2BIT_VM8").as_deref(), Ok("1"));
+    println!();
+    println!("// The 2-bit batched searches under TURBOVEC_2BIT_VM8=1 (aarch64 with i8mm):");
+    println!("// dims whose byte-group count is a multiple of 8 take the vm8 layout, where");
+    println!("// batches of 12, 8 and 4 score with SMMLA and other queries with the LUT.");
+    println!("static const Tv1xBatchCase kTv1xVm8TwoBitCases[] = {{");
+    for row in batch_case_rows(2) {
+        println!("{row}");
     }
     println!("}};");
 }

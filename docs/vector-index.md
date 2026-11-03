@@ -125,16 +125,34 @@ quantization. An index that is never calibrated is plain TurboQuant.
 
 Like upstream, 4-bit search picks its arithmetic by host. On aarch64 with the
 dot-product extension, 4-bit codes are scored with upstream's int8
-permute-dot arithmetic (an SDOT kernel over upstream's vector-major block
-layout); elsewhere they are scored through the nibble lookup tables, as 2-
-and 3-bit codes always are. The two round differently, so 4-bit scores, and
-occasionally which ids sit at the edge of a top-k, depend on the host exactly
-as upstream's do. Upstream also uses permute-dot on x86 with AVX-512 VBMI
-and VNNI; this port keeps the lookup tables there for now.
+permute-dot arithmetic over upstream's vector-major block layout; elsewhere
+they are scored through the nibble lookup tables, as 2- and 3-bit codes are
+by default. The two round differently, so 4-bit scores, and occasionally
+which ids sit at the edge of a top-k, depend on the host exactly as
+upstream's do. Upstream also uses permute-dot on x86 with AVX-512 VBMI and
+VNNI; this port keeps the lookup tables there for now.
+
+On aarch64 with the int8 matrix-multiply extension (i8mm) as well, a 4-bit
+index whose dimension is a multiple of 16 takes upstream's wider `vm8`
+block layout, and the queries of a multi-query search are scored in fused
+batches of 12, 8 or 4 with SMMLA kernels, as upstream does (other dimensions
+batch with SMMLA over the vector-major layout). Permute-dot sums are exact
+integers, so every kernel returns the same scores. The block layout is chosen when an index is created
+and never reaches a file: snapshots are written from sequential rows.
+
+`TURBOVEC_2BIT_VM8=1` in the environment, read once per process, opts in to
+upstream's experimental 2-bit `vm8` path, with upstream's semantics: on an
+i8mm host, a 2-bit index whose dimension is a multiple of 32 takes the `vm8`
+layout, and batches of 12, 8 or 4 queries (filtered searches included) score
+it with int8 SMMLA arithmetic, which rounds differently from the lookup
+tables a single query and any query outside a batch still use. On aarch64
+the variable also turns off staged search at 2 and 4 bits. Results then
+match upstream run with the same variable; any other value leaves search
+unchanged.
 
 Large 2- and 4-bit indexes search in stages, as upstream does. From 32,768
 vectors, at dimensions that are multiples of 32, on aarch64 (4 bits also needs
-the dot-product extension), a search scans the sign planes alone for a
+the dot-product extension; neither runs under `TURBOVEC_2BIT_VM8=1`), a search scans the sign planes alone for a
 shortlist (`max(384, 16k)` at 2 bits; `max(256, 20k)`, or `16k` from `k = 64`,
 at 4 bits), ranks the shortlist with estimates that add the lower planes,
 and rescores the best few with the full scan's own arithmetic. Returned
