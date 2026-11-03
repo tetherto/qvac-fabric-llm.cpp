@@ -1385,6 +1385,12 @@ typedef struct {
 } ggml_metal_kargs_pad;
 
 typedef struct {
+    int32_t ncols;
+    int32_t rows_per_channel;
+    int32_t n_past;
+} ggml_metal_kargs_diag_mask_inf;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;
