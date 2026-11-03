@@ -3244,6 +3244,14 @@ static bool xdna_weight_here(const struct ggml_tensor * w) {
            ggml_backend_buffer_get_type(w->buffer) == ggml_backend_xdna_device_get_buffer_type(nullptr);
 }
 
+// A MUL_MAT that runs on the prefill GEMM in this graph, as xdna_ops_compute
+// routes it. A fusion that lays its result out as a reader's A leaves its own
+// node unwritten, which a one-row reader the isolation mode or a GEMV group
+// takes would read: llama crops a prompt's last layer to its output rows.
+static bool xdna_takes_pgemm(const xdna_ops * ops, const struct ggml_tensor * t) {
+    return xdna_ops_supported(ops, t) && ops->gemv_group_of.count(t) == 0 && xdna_pgemm_supported(t);
+}
+
 static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx, struct ggml_cgraph * cgraph) {
     if (!ctx->device) {
         return GGML_STATUS_SUCCESS;
@@ -3545,7 +3553,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             consumed.insert(up);
             glu_fused.insert(node);
             if (uses[node] == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-                xdna_pgemm_glu_fused_supported(node, reader[node])) {
+                xdna_pgemm_glu_fused_supported(node, reader[node]) && xdna_takes_pgemm(&ctx->ops, reader[node])) {
                 glu_to_a.insert(node);
             }
         }
@@ -3833,8 +3841,8 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             const auto & rd = readers[m];
             bool         ok = !rd.empty() && xdna_weight_here(m->src[1]);
             for (const struct ggml_tensor * t : rd) {
-                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == m && t->src[0] != m && xdna_pgemm_supported(t) &&
-                     xdna_weight_here(t->src[0]);
+                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == m && t->src[0] != m &&
+                     xdna_takes_pgemm(&ctx->ops, t) && xdna_weight_here(t->src[0]);
             }
             if (ok) {
                 norm_a.insert(m);
@@ -3877,7 +3885,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                 ok = ok && !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
             }
             for (const struct ggml_tensor * t : readers[v]) {
-                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == v && xdna_pgemm_supported(t);
+                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == v && xdna_takes_pgemm(&ctx->ops, t);
             }
             // the GDN output the norm reads: left where the array wrote it when
             // nothing else reads its rows (xdna_gdn_mm_keep)
@@ -3945,7 +3953,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                 ok = ok && readers[c].size() == 1 && !consumed.count(c) && !(c->flags & GGML_TENSOR_FLAG_OUTPUT);
             }
             for (const struct ggml_tensor * t : readers[g]) {
-                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == g && xdna_pgemm_supported(t);
+                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == g && xdna_takes_pgemm(&ctx->ops, t);
             }
             if (ok) {
                 gate_a.insert(g);
