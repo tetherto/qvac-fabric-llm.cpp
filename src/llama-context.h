@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -18,6 +19,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_coreml_embedding;
 class llama_batch_allocr;
 class llama_moe_cache;
 
@@ -124,6 +126,7 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
+    bool set_coreml_model(const char * directory, int32_t max_inflight);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_embeddings_layer_inp_pos_min(llama_seq_id seq_id, llama_pos pos_min);
@@ -267,7 +270,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, const llama_ubatch & ubatch, size_t token_offset);
+    bool extract_layer_inputs(const llm_graph_result * res, const llama_ubatch & ubatch, size_t token_offset);
 
     // first ubatch row whose layer inputs are read, rows before it are not copied
     uint32_t layer_inp_first_row(const llama_ubatch & ubatch) const;
@@ -303,6 +306,15 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    // create a new backend scheduler for a graph of the specified size and register the callbacks below
+    void sched_new(size_t max_nodes, bool parallel);
+
+    // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+    static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+
+    // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
+    static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -328,7 +340,12 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
-    std::unique_ptr<llama_moe_cache> moe_cache;
+    std::unique_ptr<llama_coreml_embedding, void (*)(llama_coreml_embedding *)> coreml{nullptr, nullptr};
+    bool coreml_contract_matches() const;
+    bool coreml_ubatch_eligible() const;
+    bool run_coreml_probe(llama_coreml_embedding * candidate);
+    bool encode_coreml(const llama_ubatch & ubatch);
+    llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -345,6 +362,7 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+    std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
     // per sequence: layer input rows at lower positions are not read (-1 = all rows are read)
     std::vector<llama_pos> embd_layer_inp_pos_min;
@@ -395,6 +413,30 @@ private:
 
     bool sched_need_reserve = true;
 
+    // whether the reserve graph has a logits tensor, set in sched_reserve()
+    // true until then, because the first output_reserve() runs before any graph is reserved
+    bool graph_has_logits = true;
+
+    // state of sched_copy_experts, reset before each graph compute
+    struct copy_experts_info {
+        const ggml_tensor *  ids = nullptr;
+        std::vector<int32_t> ids_data;
+        std::vector<bool>    used;
+
+        void reset() {
+            ids = nullptr;
+            ids_data.clear();
+            used.clear();
+        }
+    };
+
+    copy_experts_info copy_experts;
+
+    // graph reallocations during inference where the backend assignments did not change, split by whether the
+    // graph size is the same as the previously scheduled one (unexpected) or different
+    int32_t n_reallocs_same = 0;
+    int32_t n_reallocs_diff = 0;
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
@@ -431,11 +473,7 @@ private:
     llm_graph_result * gf_res_prev_active = nullptr;
 
     // the model's Hadamard transforms plus the target's when tensors are borrowed through ctx_other
-    llama_hadamard_rotations hadamard_rotations;
-    llama_hadamard_rotations hadamard_inverses;
-
-    // one-time Hadamard transform-coverage check on the first built graph
-    bool hadamard_verified = false;
+    std::unique_ptr<llama_hadamard> hdmd; // llama_hadamard is incomplete here
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
@@ -447,6 +485,9 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // true after the prism.hadamard coverage check passes on a reserved graph
+    bool hadamard_verified = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

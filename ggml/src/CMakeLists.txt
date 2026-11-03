@@ -411,6 +411,16 @@ function(ggml_backend_export_log_functions target)
 endfunction()
 
 function(ggml_add_backend_library backend)
+    if (GGML_BACKEND_EMBEDDED)
+        # static copy linked into another backend module: not loadable, not installed, not exported
+        add_library(${backend} STATIC ${ARGN})
+        set_target_properties(${backend} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(${backend} PRIVATE GGML_BACKEND_EMBEDDED)
+        target_link_libraries(${backend} PRIVATE ggml-base)
+        target_include_directories(${backend} PRIVATE ..)
+        return()
+    endif()
+
     if (GGML_BACKEND_DL)
         add_library(${backend} MODULE ${ARGN})
         ggml_backend_export_log_functions(${backend})
@@ -425,16 +435,17 @@ function(ggml_add_backend_library backend)
         # with cmake-bare
         # add_dependencies(ggml ${backend})
 
+        # the component lets a build that makes one module install just that module
         if (GGML_BACKEND_DIR)
             install(TARGETS ${backend}
                     EXPORT ggml-targets
-                    LIBRARY DESTINATION ${GGML_BACKEND_DIR}
-                    RUNTIME DESTINATION ${GGML_BACKEND_DIR})
+                    LIBRARY DESTINATION ${GGML_BACKEND_DIR} COMPONENT ${backend}
+                    RUNTIME DESTINATION ${GGML_BACKEND_DIR} COMPONENT ${backend})
         else()
             install(TARGETS ${backend}
                     EXPORT ggml-targets
-                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${backend}
+                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT ${backend})
         endif()
     else()
         add_library(${backend} ${ARGN})
@@ -508,6 +519,8 @@ function(ggml_add_cpu_backend_variant tag_name)
             set(GGML_INTERNAL_${feat} ON)
         endforeach()
     elseif (GGML_SYSTEM_ARCH STREQUAL "s390x")
+        set(GGML_NATIVE OFF)
+
         foreach (feat VXE2 NNPA)
             set(GGML_INTERNAL_${feat} OFF)
         endforeach()
@@ -625,6 +638,14 @@ if (GGML_CPU_ALL_VARIANTS)
         if (CMAKE_SYSTEM_NAME MATCHES "Linux")
             ggml_add_cpu_backend_variant(z15    Z15 VXE2)
             ggml_add_cpu_backend_variant(z16    Z16 VXE2 NNPA)
+
+            # check if compiler supports "-march=z17" codename
+            check_cxx_compiler_flag("-march=arch15" GGML_CXX_SUPPORTS_Z17)
+            if (GGML_CXX_SUPPORTS_Z17)
+                ggml_add_cpu_backend_variant(arch15 Z17 VXE2 NNPA)
+            else()
+                message(WARNING "Skipping z17 target: compiler must be GCC 15.1 and later")
+            endif()
         else()
             message(FATAL_ERROR "Unsupported s390x target OS: ${CMAKE_SYSTEM_NAME}")
         endif()
@@ -642,6 +663,19 @@ elseif (GGML_CPU)
     ggml_add_cpu_backend_variant_impl("")
 endif()
 
+# ggml-xdna runs host ops on a CPU backend; a DL module cannot link the CPU modules, so it gets its own copy (every XDNA host has zen4 features)
+if (GGML_XDNA AND GGML_BACKEND_DL)
+    if (NOT GGML_SYSTEM_ARCH STREQUAL "x86")
+        message(FATAL_ERROR "ggml-xdna is x86-only")
+    endif()
+    if (NOT GGML_CPU)
+        include(ggml-cpu/CMakeLists.txt)
+    endif()
+    set(GGML_BACKEND_EMBEDDED ON)
+    ggml_add_cpu_backend_variant(xdna SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16)
+    unset(GGML_BACKEND_EMBEDDED)
+endif()
+
 ggml_add_backend(BLAS)
 ggml_add_backend(CANN)
 ggml_add_backend(CUDA)
@@ -657,6 +691,7 @@ ggml_add_backend(WebGPU)
 ggml_add_backend(zDNN)
 ggml_add_backend(OpenCL)
 ggml_add_backend(Hexagon)
+ggml_add_backend(XDNA)
 ggml_add_backend(ZenDNN)
 ggml_add_backend(OPENVINO)
 
@@ -689,6 +724,12 @@ endif()
 if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
     foreach (target ${GGML_CORE_TARGETS})
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        if (target STREQUAL "ggml-base" OR target STREQUAL "ggml")
+            set_target_properties(${target} PROPERTIES
+                C_VISIBILITY_PRESET hidden
+                CXX_VISIBILITY_PRESET hidden
+            )
+        endif()
         target_compile_definitions(${target} PRIVATE GGML_BUILD)
         if (BUILD_SHARED_LIBS OR NOT WIN32)
             target_compile_definitions(${target} PUBLIC  GGML_SHARED)

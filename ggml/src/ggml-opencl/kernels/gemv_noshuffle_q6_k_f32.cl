@@ -229,26 +229,28 @@ kernel void kernel_gemv_noshuffle_q6_K_f32(
     float2  total_sum = 0.0f;
 
     int line_stride_a = ne01 / 2;
+    // Keep tail lanes active for subgroup ops, but read a valid weight row.
+    int gid_s = min(gid, line_stride_a - 1);
     int block_stride_a = NSUBGROUPS * ne01;
 
     for (int k = grp; k < nb; k += NSUBGROUPS) {
-        reg_d = src0_d[gid + k/8 * line_stride_a];
-        reg_s = as_char4(src0_s[gid + k * line_stride_a]);
+        reg_d = src0_d[gid_s + k/8 * line_stride_a];
+        reg_s = as_char4(src0_s[gid_s + k * line_stride_a]);
 
         if (slid < 4) {
             reg_b.s0123 = read_imagef(src1, 0 + slid*2 + k*8);
             reg_b.s4567 = read_imagef(src1, 1 + slid*2 + k*8);
         }
 
-        reg_a_l.s0 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*0).x;
-        reg_a_l.s1 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*1).x;
-        reg_a_l.s2 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*2).x;
-        reg_a_l.s3 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*3).x;
+        reg_a_l.s0 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*0).x;
+        reg_a_l.s1 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*1).x;
+        reg_a_l.s2 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*2).x;
+        reg_a_l.s3 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*3).x;
 
-        reg_a_h.s0 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*0).x);
-        reg_a_h.s1 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*1).x);
-        reg_a_h.s2 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*2).x);
-        reg_a_h.s3 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*3).x);
+        reg_a_h.s0 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*0).x);
+        reg_a_h.s1 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*1).x);
+        reg_a_h.s2 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*2).x);
+        reg_a_h.s3 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*3).x);
 
 #ifdef VECTOR_SUB_GROUP_BROADCAT
         dequantize_block_acc_bcast_8_hi(total_sum, as_ushort8(reg_a_l), as_uchar8(reg_a_h), reg_d, reg_s, reg_b);
@@ -256,15 +258,15 @@ kernel void kernel_gemv_noshuffle_q6_K_f32(
         dequantize_block_acc_bcast_1_hi(total_sum, as_ushort8(reg_a_l), as_uchar8(reg_a_h), reg_d, reg_s, reg_b);
 #endif // VECTOR_SUB_GROUP_BROADCAT
 
-        reg_a_l.s0 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*4).x;
-        reg_a_l.s1 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*5).x;
-        reg_a_l.s2 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*6).x;
-        reg_a_l.s3 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*7).x;
+        reg_a_l.s0 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*4).x;
+        reg_a_l.s1 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*5).x;
+        reg_a_l.s2 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*6).x;
+        reg_a_l.s3 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*7).x;
 
-        reg_a_h.s0 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*4).x);
-        reg_a_h.s1 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*5).x);
-        reg_a_h.s2 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*6).x);
-        reg_a_h.s3 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*7).x);
+        reg_a_h.s0 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*4).x);
+        reg_a_h.s1 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*5).x);
+        reg_a_h.s2 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*6).x);
+        reg_a_h.s3 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*7).x);
 
 #ifdef VECTOR_SUB_GROUP_BROADCAT
         dequantize_block_acc_bcast_8_lo(total_sum, as_ushort8(reg_a_l), as_uchar8(reg_a_h), reg_d, reg_s, reg_b);

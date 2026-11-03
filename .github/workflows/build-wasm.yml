@@ -33,6 +33,7 @@ on:
       'ggml/src/ggml-webgpu/wgsl-shaders/embed_wgsl.py'
     ]
 
+cache-mode: none
 permissions:
   contents: read
 
@@ -63,7 +64,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: webgpu-ubuntu-24.04-arm-wasm
+          restore: false
           save: false
 
       - name: Install Emscripten

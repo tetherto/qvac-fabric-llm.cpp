@@ -123,7 +123,7 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
                     inputs.messages.begin(), inputs.messages.end(),
                     [](const common_chat_msg & m) { return !m.reasoning_content.empty(); });
                 try {
-                    render = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
+                    render = common_chat_templates_apply(chat_templates.get(), inputs).prompt.str();
 
                     size_t last_im_end = render.rfind("<|im_end|>");
                     if (last_im_end != std::string::npos) {

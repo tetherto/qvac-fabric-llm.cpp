@@ -183,8 +183,8 @@ public:
             llama_io_read_i & io,
                llama_seq_id   seq_id,
       llama_state_seq_flags   flags,
-          slot_info_vec_t *   sinfos_out,
-    const slot_info_vec_t *   sinfos_in);
+            slot_info_vec_t * sinfos_out,
+      const slot_info_vec_t * sinfos_in);
 
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
@@ -194,6 +194,15 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+
+    // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
+    // the ubatch splits into n_slices groups of tokens with one sequence each
+    // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
+    // TODO: allow slices with coupled sequences
+    static uint32_t get_n_kv_slices(const llama_ubatch & ubatch);
+
+    // padded length of the longest cell list of the slices; 0 if kv_rows are not used (multiple streams)
+    uint32_t get_n_kv_rows(const llama_ubatch & ubatch) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -205,10 +214,6 @@ public:
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
-
-    // gradient-aware retrieval for LoRA training
-    ggml_tensor * get_k_lora(ggml_context * ctx, ggml_tensor * k_cur, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v_lora(ggml_context * ctx, ggml_tensor * v_cur, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     //
     // preparation API
@@ -244,7 +249,7 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
     void set_input_k_shift_data(int32_t * data) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -289,8 +294,8 @@ private:
     const uint32_t n_swa = 0;
 
     // env: LLAMA_ATTN_ROT_DISABLE
-    bool attn_rot_k = false;
-    bool attn_rot_v = false;
+    uint32_t n_rot_k = 0;
+    uint32_t n_rot_v = 0;
 
     // if all layers participating in the cache have constant head size, the value is stored here
     // otherwise the value is -1
@@ -410,6 +415,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_n_kv_rows() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -427,10 +433,6 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
 
-    // gradient-aware retrieval for LoRA training
-    ggml_tensor * get_k_lora(ggml_context * ctx, ggml_tensor * k_cur, int32_t il) const;
-    ggml_tensor * get_v_lora(ggml_context * ctx, ggml_tensor * v_cur, int32_t il) const;
-
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
     //   helps understand the implementation logic of cpy_k and cpy_v
@@ -444,7 +446,7 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -485,4 +487,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // see llama_kv_cache::get_n_kv_rows
+    uint32_t n_kv_rows = 0;
 };

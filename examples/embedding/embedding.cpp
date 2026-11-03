@@ -43,14 +43,14 @@ static std::vector<std::string> split_lines(const std::string & s, const std::st
     return lines;
 }
 
-static void batch_add_seq(llama_batch & batch, const std::vector<int32_t> & tokens, llama_seq_id seq_id) {
+static void batch_add_seq(common_batch & batch, const std::vector<int32_t> & tokens, llama_seq_id seq_id) {
     size_t n_tokens = tokens.size();
     for (size_t i = 0; i < n_tokens; i++) {
-        common_batch_add(batch, tokens[i], i, { seq_id }, true);
+        batch.add(tokens[i], i, seq_id, true);
     }
 }
 
-static bool batch_decode(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd_out, int embd_norm, bool benchmark) {
+static bool batch_decode(llama_context * ctx, common_batch & batch, float * output, int n_seq, int n_embd_out, int embd_norm, bool benchmark) {
     const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
 
     // clear previous kv_cache values (irrelevant for embeddings)
@@ -58,16 +58,16 @@ static bool batch_decode(llama_context * ctx, llama_batch & batch, float * outpu
 
     // run model
     if (!benchmark) {
-        LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
+        LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.size(), n_seq);
     }
-    const int ret = llama_decode(ctx, batch);
+    const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
     if (ret < 0 || (benchmark && ret != 0)) {
         LOG_ERR("%s : failed to process\n", __func__);
         return false;
     }
 
-    for (int i = 0; i < batch.n_tokens; i++) {
-        if (!batch.logits[i]) {
+    for (int i = 0; i < batch.size(); i++) {
+        if (!batch.tokens[i].output) {
             continue;
         }
 
@@ -81,8 +81,8 @@ static bool batch_decode(llama_context * ctx, llama_batch & batch, float * outpu
             GGML_ASSERT(embd != NULL && "failed to get token embeddings");
         } else {
             // try to get sequence embeddings - supported only when pooling_type is not NONE
-            embd = llama_get_embeddings_seq(ctx, batch.seq_id[i][0]);
-            embd_pos = batch.seq_id[i][0];
+            embd = llama_get_embeddings_seq(ctx, batch.tokens[i].seq_id);
+            embd_pos = batch.tokens[i].seq_id;
             GGML_ASSERT(embd != NULL && "failed to get sequence embeddings");
         }
 
@@ -316,7 +316,7 @@ int main(int argc, char ** argv) {
 
     // initialize batch
     const int n_prompts = prompts.size();
-    struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    common_batch batch(ctx);
 
     // count number of embeddings
     int n_embd_count = 0;
@@ -340,26 +340,26 @@ int main(int argc, char ** argv) {
     int n_batches = 0;
     std::vector<int> batch_tokens;
     const auto encode = [&]() {
-        common_batch_clear(batch);
+        batch.clear();
         int e = 0;
         int s = 0;
         n_batches = 0;
         batch_tokens.clear();
         for (const auto & inp : inputs) {
-            if (batch.n_tokens + inp.size() > n_batch || s >= n_seq_max) {
+            if (batch.size() + inp.size() > n_batch || s >= n_seq_max) {
                 if (!batch_decode(ctx, batch, emb + e * n_embd_out, s, n_embd_out, params.embd_normalize, bench_repetitions != 0)) {
                     return false;
                 }
                 ++n_batches;
-                batch_tokens.push_back(batch.n_tokens);
-                e += pooling_type == LLAMA_POOLING_TYPE_NONE ? batch.n_tokens : s;
+                batch_tokens.push_back(batch.size());
+                e += pooling_type == LLAMA_POOLING_TYPE_NONE ? batch.size() : s;
                 s = 0;
-                common_batch_clear(batch);
+                batch.clear();
             }
             batch_add_seq(batch, inp, s++);
         }
         ++n_batches;
-        batch_tokens.push_back(batch.n_tokens);
+        batch_tokens.push_back(batch.size());
         return batch_decode(ctx, batch, emb + e * n_embd_out, s, n_embd_out, params.embd_normalize, bench_repetitions != 0);
     };
 
@@ -372,7 +372,6 @@ int main(int argc, char ** argv) {
     for (int pass = 0; pass < n_passes; ++pass) {
         const auto start = std::chrono::steady_clock::now();
         if (!encode()) {
-            llama_batch_free(batch);
             return 1;
         }
         const double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -538,7 +537,6 @@ int main(int argc, char ** argv) {
     }
 
     // clean up
-    llama_batch_free(batch);
     llama_backend_free();
 
     return 0;

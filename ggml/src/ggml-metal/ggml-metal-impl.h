@@ -40,7 +40,6 @@
 
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
-#define N_NC_Q4_0 2 // src1 rows of kernel_mul_mv_q4_0_f32_nc
 // glu holds 2 accs per row, so use fewer rows per simdgroup
 #define N_R0_Q4_0_GLU 1
 
@@ -133,19 +132,25 @@
 #define FC_MOE_REDUCE                  1900
 #define FC_DSV4_HC                     2000
 #define FC_PAD                         2100
-#define FC_MUL_MV_MMA                  2200
-#define FC_GATED_DELTA_NET_DEFERRED    2300
+#define FC_FLASH_ATTN_EXT_TENSOR       2200
+#define FC_LIGHTNING_INDEXER           2200
+#define FC_MUL_MV_MMA                  2300
+#define FC_GATED_DELTA_NET_DEFERRED    2400
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
 #define OP_FLASH_ATTN_EXT_NCPSG 64
+
+#define OP_FLASH_ATTN_EXT_TENSOR_NQPSG       32
+#define OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE 16
+#define OP_FLASH_ATTN_EXT_TENSOR_NCPSG       64
+#define OP_FLASH_ATTN_EXT_TENSOR_NSG         8
 
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
 #define OP_FLASH_ATTN_EXT_VEC_NHPTG_MAX 4
 
 #define OP_LIGHTNING_INDEXER_DK    128
-#define OP_LIGHTNING_INDEXER_NH     64
 #define OP_LIGHTNING_INDEXER_NHPTG   8
 #define OP_LIGHTNING_INDEXER_NKPSG   8
 #define OP_LIGHTNING_INDEXER_NSG     8
@@ -329,15 +334,6 @@ typedef struct {
     uint64_t nb3;
 } ggml_metal_kargs_cpy;
 
-#define GGML_METAL_CPY_BATCH_MAX 16
-
-// consecutive copies with one layout, each shifted by a byte offset in the source and in the destination
-typedef struct {
-    ggml_metal_kargs_cpy cpy;
-    int64_t dsrc[GGML_METAL_CPY_BATCH_MAX];
-    int64_t ddst[GGML_METAL_CPY_BATCH_MAX];
-} ggml_metal_kargs_cpy_batch;
-
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;
@@ -450,6 +446,19 @@ typedef struct {
     uint64_t nb3;
     int32_t  nblocks;
 } ggml_metal_kargs_flash_attn_ext_kv_f16;
+
+// gather the K/V cache rows referenced by the kv_rows lists into contiguous F16 buffers
+typedef struct {
+    int32_t  ne11;      // number of rows per list (n_kv_rows)
+    int32_t  ne_12_2;   // number of K/V heads
+    int32_t  ne10;      // DK
+    int32_t  ne20;      // DV, set to 0 to skip gathering V (V is a view of K)
+    uint64_t v_off;     // byte offset of the gathered V region in dst
+    uint64_t nb11;      // K source strides (ne13 = 1: the cache is shared by all streams)
+    uint64_t nb12;
+    uint64_t nb21;      // V source strides (ne23 = 1)
+    uint64_t nb22;
+} ggml_metal_kargs_flash_attn_ext_rows;
 
 typedef struct {
     int32_t  ne11;
@@ -629,7 +638,6 @@ typedef struct {
 } ggml_metal_kargs_mul_mv_ext;
 
 typedef struct {
-    int32_t  ne02;
     int32_t  ne10;
     int32_t  ne11;  // n_expert_used (bcast)
     uint64_t nb11;
@@ -659,7 +667,6 @@ typedef struct {
     uint64_t nb12;
     uint64_t nb13;
     int32_t  ne20;
-    int32_t  ne21;
     int32_t  ne0;
     int32_t  ne1;
     int16_t  r2;

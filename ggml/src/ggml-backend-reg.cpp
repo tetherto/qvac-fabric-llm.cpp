@@ -70,6 +70,10 @@
 #include "ggml-hexagon.h"
 #endif
 
+#ifdef GGML_USE_XDNA
+#include "ggml-xdna.h"
+#endif
+
 #ifdef GGML_USE_BLAS
 #include "ggml-blas.h"
 #endif
@@ -217,6 +221,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_HEXAGON
         register_backend(ggml_backend_hexagon_reg());
+#endif
+#ifdef GGML_USE_XDNA
+        register_backend(ggml_backend_xdna_reg());
 #endif
 #ifdef GGML_USE_CANN
         register_backend(ggml_backend_cann_reg());
@@ -637,7 +644,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
         std::error_code cwd_ec;
         const fs::path cwd = fs::current_path(cwd_ec);
         if (cwd_ec) {
-            GGML_LOG_DEBUG("%s: current_path() failure, error-message: %s\n", __func__, cwd_ec.message().c_str());
+            GGML_LOG_DEBUG("%s: failed to get current directory: %s\n", __func__, cwd_ec.message().c_str());
         } else {
             search_paths.push_back(cwd);
         }
@@ -717,22 +724,11 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
     };
 
     for (const auto & search_path : search_paths) {
-        if (!fs::exists(search_path, ec)) {
-            if (ec) {
-                GGML_LOG_DEBUG("%s: posix_stat(%s) failure, error-message: %s\n", __func__, path_str(search_path).c_str(), ec.message().c_str());
-            } else {
-                GGML_LOG_DEBUG("%s: search path %s does not exist\n", __func__, path_str(search_path).c_str());
-            }
-            continue;
-        }
         GGML_LOG_INFO("%s: searching for %s in %s\n", __func__, path_str(name_path).c_str(), path_str(search_path).c_str());
         std::vector<fs::path> candidates;
         std::error_code dir_ec;
-        fs::directory_iterator dir_it(search_path, fs::directory_options::skip_permission_denied, dir_ec);
-        if (dir_ec) {
-            GGML_LOG_DEBUG("%s: failed to enumerate %s: %s\n", __func__, path_str(search_path).c_str(), dir_ec.message().c_str());
-            continue;
-        }
+        fs::directory_iterator dir_it(search_path, dir_ec);
+
         for (const fs::directory_iterator end; dir_it != end; dir_it.increment(dir_ec)) {
             const auto & entry = *dir_it;
             if (entry.is_regular_file(ec)) {
@@ -748,6 +744,10 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
         std::sort(candidates.begin(), candidates.end());
         for (const auto & candidate : candidates) {
             tryEntryWithScore(candidate);
+        }
+
+        if (dir_ec) {
+            GGML_LOG_DEBUG("%s: failed to enumerate %s: %s\n", __func__, path_str(search_path).c_str(), dir_ec.message().c_str());
         }
     }
 
@@ -872,6 +872,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("sycl", silent, dir_path);
     ggml_backend_load_best("vulkan", silent, dir_path);
     ggml_backend_load_best("virtgpu", silent, dir_path);
+    ggml_backend_load_best("xdna", silent, dir_path);
 
     bool useOpencl = true;
     const char * webgpu_autoload = std::getenv("GGML_WEBGPU_AUTOLOAD");

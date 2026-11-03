@@ -13,12 +13,20 @@ extern "C" {
 // incompatible changes, so mismatched peers are rejected at the HELLO
 // handshake instead of misdecoding graphs. The
 // HELLO fields are uint8_t on the wire, so the value must stay <= 255.
-// 108 adds butterfly communicator rounds and round-tagged peer frames.
-// 109 adds cache flags to SET_TENSOR and SET_TENSOR_2D.
-// 110 widens rpc_tensor::name with GGML_MAX_NAME 128.
-// 111 adds the speech ops to the ggml_op enum.
-// 112 adds GATED_DELTA_NET_DEFERRED and GDN_CONV_DEFERRED to the ggml_op enum.
-#define RPC_PROTO_MAJOR_VERSION    112
+// upstream b11514 owns 8 (fork 108); the fork wire diverged at pick 300
+// (command queue, session ids, acks), so fork majors here run one ahead of
+// the b11259 fork:
+// 109 adds butterfly communicator rounds and round-tagged peer frames
+//     (b11259 fork: 108); 109.1 adds RPC_CMD_SET_TENSOR_2D_HASH.
+// 110 adds cache flags to SET_TENSOR and SET_TENSOR_2D (b11259 fork: 109).
+// 111 widens rpc_tensor::name with GGML_MAX_NAME 128 (temp-11018: 110).
+// 112 adds the speech ops to the ggml_op enum (temp-11018: 111).
+// 113 adds GATED_DELTA_NET_DEFERRED and GDN_CONV_DEFERRED to the ggml_op enum
+//     (temp-11259: 112).
+// A minor bump is additive: the client still accepts a server with an older
+// minor and must gate every command introduced by a later minor on the minor
+// the server announces at HELLO.
+#define RPC_PROTO_MAJOR_VERSION    113
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 

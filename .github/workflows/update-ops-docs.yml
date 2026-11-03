@@ -14,8 +14,9 @@ on:
             - 'docs/ops/**'
             - 'scripts/create_ops_docs.py'
 
+cache-mode: none
 permissions:
-    contents: read
+  contents: read
 
 jobs:
     authorize:

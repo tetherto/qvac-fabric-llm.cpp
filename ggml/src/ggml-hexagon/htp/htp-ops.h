@@ -2,8 +2,6 @@
 #define HTP_OPS_H
 
 #include <assert.h>
-#include <stddef.h>
-#include <stdint.h>
 
 // ggml-common.h must be included prio to this header
 
@@ -24,6 +22,8 @@ enum htp_data_type {
     HTP_TYPE_Q4_0   = 2,
     HTP_TYPE_Q4_1   = 3,
     HTP_TYPE_Q8_0   = 8,
+    HTP_TYPE_Q2_K   = 10,
+    HTP_TYPE_Q3_K   = 11,
     HTP_TYPE_Q4_K   = 12,
     HTP_TYPE_Q5_K   = 13,
     HTP_TYPE_Q6_K   = 14,
@@ -32,20 +32,14 @@ enum htp_data_type {
     HTP_TYPE_I64    = 27,
     HTP_TYPE_BF16   = 30,
     HTP_TYPE_MXFP4  = 39,
-
-    // types used internally for repack, dyn.quant, etc
-    HTP_TYPE_Q4_0_TILED = 200,
-    HTP_TYPE_Q4_1_TILED,
-    HTP_TYPE_Q8_0_TILED,
-    HTP_TYPE_MXFP4_TILED,
+    HTP_TYPE_Q1_0   = 41,
+    HTP_TYPE_Q2_0   = 42,
 
     HTP_TYPE_INVALID
 };
 
-// Constats for internal types
-#define QK_Q4_0_TILED  256  // 32x32 Q4_0 tiled layout
+// Constants for internal types
 #define QK_Q8_0_TILED  128  // 32x32 Q8_0 tiled layout
-#define QK_MXFP4_TILED 256  // 32x32 MXFP4 tiled layout
 
 
 
@@ -114,14 +108,14 @@ enum htp_op_code {
     HTP_OP_MDEV_GROUP,
     HTP_OP_ROLL,
     HTP_OP_ARGMAX,
-    HTP_OP_SNAKE,
-    HTP_OP_UNARY_GELU_QUICK,
-    HTP_OP_COL2IM_1D,
-    HTP_OP_CONV_2D_DW,
-    HTP_OP_DEPTHWISE_CONV_1D,
-    HTP_OP_TIMESTEP_EMBEDDING,
     HTP_OP_UNARY_GELU_ERF,
-
+    HTP_OP_GLU_GEGLU_ERF,
+    HTP_OP_POOL_2D,
+    HTP_OP_POOL_1D,
+    HTP_OP_UNARY_GELU_QUICK,
+    HTP_OP_IM2COL_3D,
+    HTP_OP_HADAMARD,
+    HTP_OP_SNAKE,
 
     HTP_OP_INVALID
 };
@@ -144,7 +138,7 @@ enum htp_op_code {
 
 enum htp_tensor_flags {
     HTP_TENSOR_WEIGHT  = (1U << 0), // Tensor buffer model weight data (not compute)
-    HTP_TENSOR_REPACK  = (1U << 1), // Tensor is in repacked tiled format
+    HTP_TENSOR_TILED   = (1U << 1), // Tensor is in tiled format
     HTP_TENSOR_FENCE   = (1U << 2)  // Tensor is synchronization fence (explicitly managed)
 };
 
@@ -198,6 +192,20 @@ enum htp_profiler_mode {
     HTP_PROF_BASIC    = 1,
     HTP_PROF_PMU      = 2,
     HTP_PROF_TRACE    = 3,
+};
+
+// DCVS/HMX power profile requested for the session.
+enum htp_power_mode {
+    HTP_POWER_MODE_LOW_POWER_SAVER            = 0,
+    HTP_POWER_MODE_POWER_SAVER                = 1,
+    HTP_POWER_MODE_HIGH_POWER_SAVER           = 2,
+    HTP_POWER_MODE_LOW_BALANCED               = 3,
+    HTP_POWER_MODE_BALANCED                   = 4,
+    HTP_POWER_MODE_HIGH_PERFORMANCE           = 5,
+    HTP_POWER_MODE_SUSTAINED_HIGH_PERFORMANCE = 6,
+    HTP_POWER_MODE_BURST                      = 7,
+
+    HTP_POWER_MODE_COUNT
 };
 
 enum htp_trace_event_id {
@@ -270,33 +278,5 @@ struct htp_opbatch_rsp {
     uint32_t n_traces[HTP_MAX_NTHREADS + 1];
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
-
-#define HTP_DW1D_LANES 32
-
-static inline uint64_t htp_dw1d_round_up(uint64_t n) {
-    return (n + HTP_DW1D_LANES - 1) / HTP_DW1D_LANES * HTP_DW1D_LANES;
-}
-
-static inline uint64_t htp_dw1d_in_pitch(uint32_t out_len, uint32_t taps, uint32_t dilation, uint32_t pad,
-                                         uint32_t in_len) {
-    const uint64_t reach  = htp_dw1d_round_up(out_len) + (uint64_t) (taps - 1) * dilation;
-    const uint64_t staged = (uint64_t) pad + in_len;
-    return htp_dw1d_round_up(reach > staged ? reach : staged);
-}
-
-static inline size_t htp_dw1d_vtcm_bytes(uint32_t channels, uint64_t in_pitch, uint64_t out_pitch, uint32_t taps) {
-    if (in_pitch > SIZE_MAX || out_pitch > SIZE_MAX - in_pitch) {
-        return SIZE_MAX;
-    }
-    const uint64_t weight_pitch = htp_dw1d_round_up(taps);
-    if (weight_pitch > SIZE_MAX - (in_pitch + out_pitch)) {
-        return SIZE_MAX;
-    }
-    const size_t pitch = in_pitch + out_pitch + weight_pitch;
-    if (pitch > SIZE_MAX / sizeof(float) || (pitch && channels > SIZE_MAX / sizeof(float) / pitch)) {
-        return SIZE_MAX;
-    }
-    return (size_t) channels * pitch * sizeof(float);
-}
 
 #endif /* HTP_OPS_H */

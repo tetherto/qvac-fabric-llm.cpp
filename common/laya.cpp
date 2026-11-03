@@ -942,34 +942,32 @@ static common_laya_result laya_predict(const common_laya & laya, const json & re
     // forward passes, packing as many sequences as fit in one batch
     const int n_seq_max = llama_n_seq_max(ctx);
 
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    common_batch batch(ctx);
 
     const int64_t t_start_us = ggml_time_us();
 
     for (size_t r0 = 0; r0 < rows.size(); ) {
-        common_batch_clear(batch);
+        batch.clear();
 
         size_t r1 = r0;
-        while (r1 < rows.size() && (int) (r1 - r0) < n_seq_max && batch.n_tokens + (int) rows[r1].item.ids.size() <= n_batch) {
+        while (r1 < rows.size() && (int) (r1 - r0) < n_seq_max && batch.size() + (int) rows[r1].item.ids.size() <= n_batch) {
             const auto & ids = rows[r1].item.ids;
             for (size_t i = 0; i < ids.size(); ++i) {
-                common_batch_add(batch, ids[i], i, { (llama_seq_id) (r1 - r0) }, true);
+                batch.add(ids[i], i, (llama_seq_id) (r1 - r0), true);
             }
             ++r1;
         }
 
         llama_memory_clear(llama_get_memory(ctx), true);
-        if (llama_decode(ctx, batch) != 0) {
-            llama_batch_free(batch);
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
             throw std::runtime_error("llama_decode failed");
         }
-        res.n_tokens += batch.n_tokens;
+        res.n_tokens += batch.size();
         res.n_passes++;
 
         for (size_t r = r0; r < r1; ++r) {
             const float * out = llama_get_embeddings_seq(ctx, r - r0);
             if (out == nullptr) {
-                llama_batch_free(batch);
                 throw std::runtime_error("no decision output for a sequence");
             }
 
@@ -984,8 +982,6 @@ static common_laya_result laya_predict(const common_laya & laya, const json & re
 
         r0 = r1;
     }
-
-    llama_batch_free(batch);
 
     res.t_ms = (ggml_time_us() - t_start_us) / 1000.0;
 
