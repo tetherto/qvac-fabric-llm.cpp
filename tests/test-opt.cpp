@@ -173,6 +173,17 @@ static void helper_free_ctx_data(struct helper_ctx_data ctx_data) {
     ggml_opt_dataset_free(ctx_data.dataset_unsupervised);
 }
 
+// A fresh scheduler with the same backends and options as the one passed in. A shared scheduler
+// remembers the previous test's graph size, and GGML_SCHED_DEBUG_REALLOC aborts when a different
+// graph of the same size needs a reallocation.
+static ggml_backend_sched_t helper_new_sched_like(ggml_backend_sched_t backend_sched) {
+    std::vector<ggml_backend_t> backends;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(backend_sched); ++i) {
+        backends.push_back(ggml_backend_sched_get_backend(backend_sched, i));
+    }
+    return ggml_backend_sched_new(backends.data(), nullptr, backends.size(), GGML_DEFAULT_GRAPH_SIZE, false, true);
+}
+
 static void print_ok(bool subtest_ok) {
     printf(subtest_ok ? "\033[1;32mOK\033[0m\n" : "\033[1;31mFAIL\033[0m\n");
 }
@@ -856,9 +867,11 @@ static ggml_opt_optimizer_params helper_get_opt_pars_wd(void * userdata) {
 }
 
 static std::pair<int, int> test_loss_scale(
-        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched_shared, ggml_backend_t backend) {
     int ntest = 0;
     int npass = 0;
+
+    ggml_backend_sched_t backend_sched = helper_new_sched_like(backend_sched_shared);
 
     const float scales[2] = { 1.0f, 1e-3f };
     float       results[2] = { 0.0f, 0.0f };
@@ -883,6 +896,8 @@ static std::pair<int, int> test_loss_scale(
         helper_free_ctx_data(cd);
     }
 
+    ggml_backend_sched_free(backend_sched);
+
     const bool subtest_ok = almost_equal(results[0], results[1], 1e-4);
     printf("  %s(subtest=weights_after_scaled_backward, optimizer=%s): unscaled=%f scaled=%f ",
            __func__, ggml_opt_optimizer_name(optim), results[0], results[1]);
@@ -896,9 +911,11 @@ static std::pair<int, int> test_loss_scale(
 }
 
 static std::pair<int, int> test_loss_scale_state(
-        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched_shared, ggml_backend_t backend) {
     int ntest = 0;
     int npass = 0;
+
+    ggml_backend_sched_t backend_sched = helper_new_sched_like(backend_sched_shared);
 
     const char * fname = "test-opt-loss-scale-state.gguf";
 
@@ -965,6 +982,7 @@ static std::pair<int, int> test_loss_scale_state(
     }
 
     remove(fname);
+    ggml_backend_sched_free(backend_sched);
 
     // the first half ran unscaled, so only the momenta carried across the scale change are
     // being checked here; they must reproduce the reference trajectory

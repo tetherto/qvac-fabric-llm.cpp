@@ -196,7 +196,7 @@ int main() {
     ggml_tensor * result_a = ggml_scale(ctx_a.get(), tensor_a, 2.0f);
     ggml_cgraph * graph    = ggml_new_graph_custom(ctx_a.get(), 16, false);
     ggml_build_forward_expand(graph, result_a);
-    graph->uid = 1; // nonzero uid: RPC client caches the graph so queued re-dispatches exercise GRAPH_RECOMPUTE
+    graph->uid = ggml_graph_next_uid();
     ggml_cgraph * foreign_graph = ggml_new_graph_custom(ctx_a.get(), 1, false);
     ggml_graph_add_node(foreign_graph, tensor_a);
 
@@ -255,11 +255,12 @@ int main() {
         std::vector<uint8_t> cached_input(cached_input_stride * cached_rows);
         std::vector<uint8_t> cached_output(cached_output_stride * cached_rows, 0);
         for (bool weights : { false, true }) {
-            ggml_backend_buffer_set_usage(buffer_cached.get(), weights ? GGML_BACKEND_BUFFER_USAGE_WEIGHTS : GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            ggml_backend_buffer_set_usage(buffer_cached.get(),
+                weights ? GGML_BACKEND_BUFFER_USAGE_WEIGHTS : GGML_BACKEND_BUFFER_USAGE_COMPUTE);
             ggml_set_name(tensor_cached, weights ? "rpc_weight_2d" : "rpc_activation_2d");
             for (size_t row = 0; row < cached_rows; row++) {
                 for (size_t i = 0; i < cached_row_size; i++) {
-                    cached_input[row * cached_input_stride + i] = (uint8_t) (row + i + (weights ? 1 : 0));
+                    cached_input[row * cached_input_stride + i] = (uint8_t) (row + i);
                 }
             }
 
@@ -298,6 +299,13 @@ int main() {
     std::vector<float> input(ggml_nelements(tensor_a));
     std::vector<std::vector<float>> queued_results(8, std::vector<float>(ggml_nelements(result_a)));
     for (int iteration = 0; iteration < 8; iteration++) {
+        if (iteration == 4) {
+            ggml_backend_buffer_ptr unrelated(ggml_backend_alloc_buffer(backend_a.get(), 4096));
+            if (unrelated == nullptr) {
+                fprintf(stderr, "failed to allocate unrelated RPC buffer\n");
+                return 1;
+            }
+        }
         ggml_backend_event_t event = events[iteration % 4];
         ggml_backend_event_synchronize(event);
         std::fill(input.begin(), input.end(), (float) iteration);

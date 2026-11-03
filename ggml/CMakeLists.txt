@@ -4,8 +4,8 @@ project("ggml" C CXX ASM)
 
 ### GGML Version
 set(GGML_VERSION_MAJOR 0)
-set(GGML_VERSION_MINOR 20)
-set(GGML_VERSION_PATCH 2)
+set(GGML_VERSION_MINOR 25)
+set(GGML_VERSION_PATCH 3)
 set(GGML_VERSION_BASE "${GGML_VERSION_MAJOR}.${GGML_VERSION_MINOR}.${GGML_VERSION_PATCH}")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
@@ -202,17 +202,19 @@ option(GGML_MUSA                            "ggml: use MUSA"                    
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
 option(GGML_CUDA_CUTLASS                    "ggml: build CUTLASS kernels"                     OFF)
-set   (GGML_CUDA_PEER_MAX_BATCH_SIZE "128" CACHE STRING
-                                            "ggml: max. batch size for using peer access")
 option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
 option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
+set   (GGML_CUDA_FA_QUANTS "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" CACHE STRING
+                                            "ggml: FlashAttention K-V type combinations to compile, \"all\" or a list such as \"q8_0-q8_0;q8_0-q4_0\"")
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
+set   (GGML_CUDA_MODULE_SUFFIX "" CACHE STRING
+                                            "ggml: suffix for the CUDA backend module name, so two CUDA builds can share one directory")
 
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
 option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              ON)
@@ -245,6 +247,8 @@ option(GGML_METAL_EMBED_LIBRARY             "ggml: embed Metal library"         
 set   (GGML_METAL_MACOSX_VERSION_MIN "" CACHE STRING
                                             "ggml: metal minimum macOS version")
 set   (GGML_METAL_STD "" CACHE STRING       "ggml: metal standard version (-std flag)")
+set   (GGML_METAL_TARGET_OS "macos" CACHE STRING
+                                            "ggml: metal -mtargetos OS name (macos, ios, xros, tvos)")
 option(GGML_OPENMP                          "ggml: use OpenMP"                                ON)
 option(GGML_OPENMP_FETCH                    "ggml: fetch LLVM OpenMP"                         OFF)
 option(GGML_RPC                             "ggml: use RPC"                                   OFF)
@@ -521,10 +525,6 @@ write_basic_package_version_file(
     VERSION ${GGML_INSTALL_VERSION}
     COMPATIBILITY SameMajorVersion)
 
-target_compile_definitions(ggml-base PRIVATE
-    GGML_VERSION="${GGML_INSTALL_VERSION}"
-    GGML_COMMIT="${GGML_BUILD_COMMIT}"
-)
 message(STATUS "ggml version: ${GGML_INSTALL_VERSION}")
 message(STATUS "ggml commit:  ${GGML_BUILD_COMMIT}")
 

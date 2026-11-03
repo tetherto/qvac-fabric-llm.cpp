@@ -5,10 +5,13 @@ on:
   schedule:
     - cron: '28 5 * * *' # Update every day at 5:28 UTC
 
+permissions:
+  contents: read
+
 jobs:
   update:
     name: Update Winget Package
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # previously ubuntu-latest
     if: github.repository_owner == 'ggml-org'
 
     steps:

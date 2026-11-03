@@ -6,7 +6,7 @@
 
 <p>
 <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-<a href="https://github.com/ggml-org/llama.cpp"><img src="https://img.shields.io/badge/based%20on-llama.cpp%20b10549-orange.svg" alt="Based on llama.cpp"></a>
+<a href="https://github.com/ggml-org/llama.cpp"><img src="https://img.shields.io/badge/based%20on-llama.cpp%20b10796-orange.svg" alt="Based on llama.cpp"></a>
 </p>
 
 </div>
@@ -195,7 +195,7 @@ For more detailed build instructions, see [docs/build.md](docs/build.md).
 
 qvac-fabric-llm.cpp is a maintained fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). The project regularly synchronizes with upstream releases to incorporate improvements, bug fixes, and new model support, while extending the engine with capabilities not present in the upstream project.
 
-**Current upstream baseline:** llama.cpp b10549
+**Current upstream baseline:** llama.cpp b10796
 
 ### Upstream Compatibility
 

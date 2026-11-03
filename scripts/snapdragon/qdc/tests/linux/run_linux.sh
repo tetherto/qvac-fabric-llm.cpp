@@ -124,9 +124,9 @@ note_timeout_if_triggered() {
 
 completion_extra_args() {
   case "$1" in
-    cpu) echo "--device none --ctx-size 128 -no-cnv -n 32 --seed 42 --batch-size 128" ;;
-    gpu) echo "--device GPUOpenCL --ctx-size 128 -no-cnv -n 32 --seed 42 --ubatch-size 512" ;;
-    npu) echo "--device HTP0 --ctx-size 128 -no-cnv -n 32 --seed 42 --ubatch-size 1024" ;;
+    cpu) echo "--device none --ctx-size 2048 -no-cnv -n 32 --seed 42" ;;
+    gpu) echo "--device GPUOpenCL --ctx-size 2048 -no-cnv -n 32 --seed 42" ;;
+    npu) echo "--device HTP0 --ctx-size 2048 -no-cnv -n 32 --seed 42 --ubatch-size 1024" ;;
   esac
 }
 
@@ -161,12 +161,14 @@ run_bench_case() {
   local ndev=${parts[0]} device=${parts[1]}
   local log_suffix=$(backend_log_name "$name")
   local log="$LOG_DIR/llama_bench_${log_suffix}.log"
+  local ubatch_arg=""
+  [ "$name" = "npu" ] && ubatch_arg="--ubatch-size 1024"
   echo "=== [bench:$name] llama-bench --device $device (NDEV=$ndev) ==="
   timeout 600 env GGML_HEXAGON_NDEV=$ndev ./bin/llama-bench \
       -m "$MODEL_PATH" \
       --device "$device" \
       -ngl 99 \
-      --batch-size 128 \
+      $ubatch_arg \
       -t 4 \
       -p 128 \
       -n 32 \
@@ -206,6 +208,60 @@ run_backend_ops_case() {
   fi
 }
 
+
+run_backend_ops_snake_case() {
+  local log="$LOG_DIR/backend_ops_snake.log"
+  local clean_log="$LOG_DIR/backend_ops_snake_plain.log"
+  local timeout_seconds=600
+  timeout "$timeout_seconds" env GGML_HEXAGON_NDEV=1 GGML_HEXAGON_HOSTBUF=0 ./bin/test-backend-ops \
+      -b HTP0 -o SNAKE > "$log" 2>&1
+  local rc=$?
+  note_timeout_if_triggered "$rc" "$timeout_seconds" "$log"
+  sed $'s/\033\[[0-9;]*m//g' "$log" > "$clean_log"
+  if [ "$rc" -eq 0 ]; then
+    if ! grep -q 'Backend HTP0: OK' "$clean_log" ||
+       ! grep -Eq '^[[:space:]]*SNAKE\(.*\): OK$' "$clean_log" ||
+       grep -Eq '^[[:space:]]*SNAKE\(.*\): not supported' "$clean_log"; then
+      rc=1
+      echo 'HTP0 must run and pass all SNAKE cases' >> "$log"
+    fi
+  fi
+  if [ "$rc" -eq 0 ]; then
+    xml_case_pass "tests.test_backend_ops_posix" "test_backend_ops_snake_htp0"
+  else
+    xml_case_fail "tests.test_backend_ops_posix" "test_backend_ops_snake_htp0" "$rc" "$log"
+  fi
+}
+
+run_backend_ops_speech_case() {
+  local log="$LOG_DIR/backend_ops_speech.log"
+  local clean_log="$LOG_DIR/backend_ops_speech_plain.log"
+  local timeout_seconds=600
+  timeout "$timeout_seconds" env GGML_HEXAGON_NDEV=1 GGML_HEXAGON_HOSTBUF=0 ./bin/test-backend-ops \
+      -b HTP0 -p 'suite=speech_htp,' > "$log" 2>&1
+  local rc=$?
+  note_timeout_if_triggered "$rc" "$timeout_seconds" "$log"
+  sed $'s/\033\[[0-9;]*m//g' "$log" > "$clean_log"
+  if [ "$rc" -eq 0 ]; then
+    if ! grep -q 'Backend HTP0: OK' "$clean_log" ||
+       grep -Eq 'suite=speech_htp,.*: not supported' "$clean_log"; then
+      rc=1
+    fi
+    local op
+    for op in DEPTHWISE_CONV_1D COL2IM_1D CONV_2D_DW IM2COL MUL_MAT TIMESTEP_EMBEDDING GELU_ERF GET_ROWS CPY FLASH_ATTN_EXT; do
+      if ! grep -Eq "^[[:space:]]*$op\\(suite=speech_htp,.*\\): OK$" "$clean_log"; then
+        rc=1
+        echo "No $op speech case passed on HTP0" >> "$log"
+      fi
+    done
+  fi
+  if [ "$rc" -eq 0 ]; then
+    xml_case_pass "tests.test_backend_ops_posix" "test_backend_ops_speech_htp0"
+  else
+    xml_case_fail "tests.test_backend_ops_posix" "test_backend_ops_speech_htp0" "$rc" "$log"
+  fi
+}
+
 xml_open
 
 case "{TEST_MODE}" in
@@ -215,11 +271,15 @@ case "{TEST_MODE}" in
     ;;
   backend-ops)
     for d in mxfp4 fp16 q4_0; do run_backend_ops_case "$d"; done
+    run_backend_ops_snake_case
+    run_backend_ops_speech_case
     ;;
   all)
     for b in cpu gpu npu; do run_completion_case "$b"; done
     for b in cpu gpu npu; do run_bench_case "$b"; done
     for d in mxfp4 fp16 q4_0; do run_backend_ops_case "$d"; done
+    run_backend_ops_snake_case
+    run_backend_ops_speech_case
     ;;
   *)
     echo "FATAL: unsupported TEST_MODE={TEST_MODE}"

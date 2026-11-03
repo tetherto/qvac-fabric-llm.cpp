@@ -4,6 +4,7 @@
 #include "llama.h"
 #include "speculative.h"
 
+#include <cmath>
 #include <limits>
 #include <string>
 #include <vector>
@@ -33,6 +34,62 @@ static void test(void) {
             std::numeric_limits<int32_t>::max(),
             std::numeric_limits<int32_t>::max(),
             std::numeric_limits<int32_t>::max());
+
+    {
+        common_params_speculative spec;
+        spec.synth_len = 3.4;
+
+        auto assert_invalid = [](const common_params_speculative & value, int32_t n_max) {
+            try {
+                common_speculative_synth_rates_resolve(&value, n_max);
+                assert(false);
+            } catch (const std::invalid_argument &) {
+            }
+        };
+
+        const auto rates = common_speculative_synth_rates_resolve(&spec, 4);
+        assert(rates.size() == 4);
+        assert(std::abs(rates[0] - 0.80581) < 1e-5);
+        assert(std::abs(rates[1] - 0.64933) < 1e-5);
+        assert(std::abs(rates[2] - 0.52323) < 1e-5);
+        assert(std::abs(rates[3] - 0.42163) < 1e-5);
+        assert(std::abs(1.0 + rates[0] + rates[1] + rates[2] + rates[3] - 3.4) < 1e-8);
+
+        spec.synth_len = 1.0;
+        assert(common_speculative_synth_rates_resolve(&spec, 4) == std::vector<double>({0.0, 0.0, 0.0, 0.0}));
+
+        spec.synth_len = 5.0;
+        assert(common_speculative_synth_rates_resolve(&spec, 4) == std::vector<double>({1.0, 1.0, 1.0, 1.0}));
+
+        spec.synth_len = 5.1;
+        assert_invalid(spec, 4);
+
+        spec.synth_len = std::numeric_limits<double>::quiet_NaN();
+        assert_invalid(spec, 4);
+
+        spec.synth_len = 0.0;
+        assert_invalid(spec, 4);
+
+        spec.synth_len = -1.0;
+        spec.synth_rates = {0.8, 0.6, 0.4};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, 0.6, 0.4, 0.2};
+        assert(common_speculative_synth_rates_resolve(&spec, 4) == spec.synth_rates);
+
+        spec.synth_rates = {0.8, 0.9, 0.4, 0.2};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, std::numeric_limits<double>::quiet_NaN(), 0.4, 0.2};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, 0.6, 0.4, -0.2};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, 0.6, 0.4, 0.2};
+        spec.synth_len = 3.0;
+        assert_invalid(spec, 4);
+    }
 
     {
         common_params base;
@@ -172,6 +229,12 @@ static void test(void) {
     argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // draft vocabulary ranges are B:E pairs of integers (llama_set_draft_vocab checks their order and bounds)
+    for (const char * ranges : {"0:10:20", "7", "a:5", "5:9x", "0:10,"}) {
+        argv = {"binary_name", "--spec-draft-vocab", ranges};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    }
+
     printf("test-arg-parser: test valid usage\n\n");
 
     argv = {"binary_name", "-m", "model_file.gguf"};
@@ -197,6 +260,30 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
 
+    {
+        common_params synth_params;
+        argv = {"binary_name", "--spec-synth-len", "3.4"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+        assert(synth_params.speculative.synth_len == 3.4);
+    }
+
+    {
+        common_params synth_params;
+        argv = {"binary_name", "--spec-synth-rates", "0.8,0.6,0.2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+        assert(synth_params.speculative.synth_rates == std::vector<double>({0.8, 0.6, 0.2}));
+    }
+
+    {
+        common_params synth_params;
+        argv = {"binary_name", "--spec-synth-len", "3.4x"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    argv = {"binary_name", "--spec-draft-vocab", "0:98304,248032:248320"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert((params.speculative.draft.vocab_ranges == std::vector<int32_t>{0, 98304, 248032, 248320}));
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
@@ -217,6 +304,20 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
 
+    {
+        common_params cache_params;
+        cache_params.model.path = "model_file.gguf";
+        assert(cache_params.moe_cache_auto && !cache_params.moe_cache_auto_explicit);
+        for (const char * value : {"auto", "0", "128", "auto"}) {
+            argv = {"binary_name", "--moe-cache-mib", value};
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+            const bool automatic = std::string(value) == "auto";
+            assert(cache_params.moe_cache_auto == automatic);
+            assert(cache_params.moe_cache_auto_explicit == automatic);
+            assert(cache_params.moe_cache_size == (std::string(value) == "128" ? 128 * 1024 * 1024 : 0));
+        }
+    }
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -231,6 +332,20 @@ static void test(void) {
     printf("test-arg-parser: skip on windows build\n");
 #else
     printf("test-arg-parser: test environment variables (valid + invalid usages)\n\n");
+
+    {
+        common_params cache_params;
+        cache_params.model.path = "model_file.gguf";
+        setenv("LLAMA_ARG_MOE_CACHE_MIB", "auto", true);
+        argv = {"binary_name"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+        assert(cache_params.moe_cache_auto && cache_params.moe_cache_auto_explicit);
+        argv = {"binary_name", "--moe-cache-mib", "0"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+        assert(!cache_params.moe_cache_auto && !cache_params.moe_cache_auto_explicit);
+        assert(cache_params.moe_cache_size == 0);
+        unsetenv("LLAMA_ARG_MOE_CACHE_MIB");
+    }
 
     setenv("LLAMA_ARG_THREADS", "blah", true);
     argv = {"binary_name"};

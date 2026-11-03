@@ -42,7 +42,7 @@ ov::Output<ov::Node> slice_axis(const ov::Output<ov::Node> & input, int64_t axis
 
 ov::Output<ov::Node> static_shape_dims_or_shapeof(const ov::Output<ov::Node> & input,
                                                   const std::vector<int> & dims) {
-    const auto partial_shape = input.get_partial_shape();
+    const auto & partial_shape = input.get_partial_shape();
     if (partial_shape.is_static()) {
         std::vector<int64_t> values;
         values.reserve(dims.size());
@@ -54,54 +54,6 @@ ov::Output<ov::Node> static_shape_dims_or_shapeof(const ov::Output<ov::Node> & i
 
     auto shape = std::make_shared<ov::op::v3::ShapeOf>(input, ov::element::i64);
     return get_dimensions(shape, dims);
-}
-
-ov::Output<ov::Node> translate_mul_mat_id_gather_matmul_fallback(const NodeContext & context,
-                                                                 ov::Output<ov::Node> expert_weights,
-                                                                 ov::Output<ov::Node> activations,
-                                                                 ov::Output<ov::Node> ids) {
-    auto gather_axis = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{}, {0});
-    ov::Output<ov::Node> selected_weights = std::make_shared<ov::op::v8::Gather>(expert_weights, ids, gather_axis);
-
-    const auto output_type = context.get_output_type();
-    if (selected_weights.get_element_type() != ov::element::f32) {
-        selected_weights = std::make_shared<ov::op::v0::Convert>(selected_weights, ov::element::f32);
-    }
-    if (activations.get_element_type() != ov::element::f32) {
-        activations = std::make_shared<ov::op::v0::Convert>(activations, ov::element::f32);
-    }
-
-    auto activations_shape = std::make_shared<ov::op::v3::ShapeOf>(activations, ov::element::i64);
-    auto ids_shape = std::make_shared<ov::op::v3::ShapeOf>(ids, ov::element::i64);
-    ov::Output<ov::Node> acts_target_dims = std::make_shared<ov::op::v0::Concat>(
-        ov::OutputVector{
-            get_dimensions(activations_shape, {0}),
-            get_dimensions(ids_shape, {1}),
-            get_dimensions(activations_shape, {2}),
-        },
-        0);
-    ov::Output<ov::Node> acts_broadcasted =
-        std::make_shared<ov::op::v3::Broadcast>(activations, acts_target_dims, ov::op::BroadcastType::BIDIRECTIONAL);
-
-    auto activations_expanded = std::make_shared<ov::op::v0::Unsqueeze>(acts_broadcasted, const_i64({2}));
-    ov::Output<ov::Node> result =
-        std::make_shared<ov::op::v0::MatMul>(activations_expanded, selected_weights, false, true);
-
-    auto output_shape = context.get_output_shape();
-    FRONT_END_OP_CONVERSION_CHECK(output_shape.rank().is_static() && output_shape.rank().get_length() == 4,
-                                  "Unexpected MUL_MAT_ID output rank");
-    FRONT_END_OP_CONVERSION_CHECK(output_shape[3].is_static(), "Expected static row dimension for MUL_MAT_ID output");
-
-    auto batch_dim = ov::op::v0::Constant::create(ov::element::i64, {1}, {1});
-    auto row_dim = ov::op::v0::Constant::create(ov::element::i64, {1}, {output_shape[3].get_length()});
-    auto result_target_dims = std::make_shared<ov::op::v0::Concat>(
-        ov::OutputVector{batch_dim, get_dimensions(ids_shape, {0, 1}), row_dim}, 0);
-    result = std::make_shared<ov::op::v1::Reshape>(result, result_target_dims, false);
-
-    if (result.get_element_type() != output_type) {
-        result = std::make_shared<ov::op::v0::Convert>(result, output_type);
-    }
-    return result;
 }
 
 ov::Output<ov::Node> translate_mul_mat_id_mxfp4_packed(const NodeContext & context,
@@ -154,11 +106,14 @@ ov::Output<ov::Node> translate_mul_mat_id_mxfp4_packed(const NodeContext & conte
         qs, ov::op::v0::Constant::create(ov::element::u8, ov::Shape{}, {0x0F}), ov::op::AutoBroadcastType::NUMPY);
     auto high_shift = std::make_shared<ov::op::v15::BitwiseRightShift>(
         qs, ov::op::v0::Constant::create(ov::element::u8, ov::Shape{}, {4}), ov::op::AutoBroadcastType::NUMPY);
+    // i64 indices on purpose: the CPU plugin's i32 JIT gather kernel miscomputes the index-load
+    // offset for tensors of this size (vpgatherdd walks ~4x the index buffer below its base) and
+    // segfaults when the page below happens to be unmapped.
     auto nibbles = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{low, high_shift}, 4);
-    auto nibble_indices = std::make_shared<ov::op::v0::Convert>(nibbles, ov::element::i32);
+    auto nibble_indices = std::make_shared<ov::op::v0::Convert>(nibbles, ov::element::i64);
     auto weights_f32 = std::make_shared<ov::op::v8::Gather>(f4_lut, nibble_indices, gather_axis);
 
-    auto scale_indices = std::make_shared<ov::op::v0::Convert>(scale_byte, ov::element::i32);
+    auto scale_indices = std::make_shared<ov::op::v0::Convert>(scale_byte, ov::element::i64);
     auto scales_f32 = std::make_shared<ov::op::v8::Gather>(scale_lut, scale_indices, gather_axis);
     ov::Output<ov::Node> selected_weights = std::make_shared<ov::op::v1::Multiply>(weights_f32, scales_f32,
                                                                                   ov::op::AutoBroadcastType::NUMPY);
@@ -229,7 +184,6 @@ OutputVector translate_mul_mat_id(const NodeContext & context) {
     auto expert_weights_rank = expert_weights.get_partial_shape().rank();
     FRONT_END_OP_CONVERSION_CHECK(expert_weights_rank.is_static(),
                                   "Expected static rank for MUL_MAT_ID expert weights");
-    const bool use_gpu_fallback = ggml_openvino_get_device_name() == "GPU";
     if (expert_weights_rank.get_length() == 4) {
         auto expert_weights_shape_3d = static_shape_dims_or_shapeof(expert_weights, {1, 2, 3});
         expert_weights = std::make_shared<ov::op::v1::Reshape>(expert_weights, expert_weights_shape_3d, false);
@@ -246,14 +200,9 @@ OutputVector translate_mul_mat_id(const NodeContext & context) {
     }
 
     const auto output_type = context.get_output_type();
-    if (activations.get_element_type() != ov::element::f32) {
-        activations = std::make_shared<ov::op::v0::Convert>(activations, ov::element::f32);
-    }
-
-    if (use_gpu_fallback || !expert_weights.get_partial_shape().is_static() || !activations.get_partial_shape().is_static() ||
-        !ids.get_partial_shape().is_static()) {
-        return rename_outputs_with_suffix({translate_mul_mat_id_gather_matmul_fallback(context, expert_weights, activations, ids)},
-                                          context.get_name());
+    const auto activations_type = ggml_openvino_get_device_name() == "GPU" ? ov::element::f16 : ov::element::f32;
+    if (activations.get_element_type() != activations_type) {
+        activations = std::make_shared<ov::op::v0::Convert>(activations, activations_type);
     }
 
     // GatherMatmul's A input is [n_used_or_1, n_tokens, k]; activations_3d is

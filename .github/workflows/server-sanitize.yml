@@ -31,7 +31,12 @@ on:
       '.github/workflows/server-sanitize.yml'
     ]
 
+permissions:
+  contents: read
+
 env:
+  # note: this is dud token to avoid rate limiting (https://github.com/ggml-org/llama.cpp/pull/25706#issuecomment-4979941302)
+  HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
   LLAMA_ARG_LOG_COLORS: 1
   LLAMA_ARG_LOG_PREFIX: 1
   LLAMA_ARG_LOG_TIMESTAMPS: 1
@@ -59,19 +64,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  runner_names:
-    permissions:
-      contents: read
-    uses: ./.github/workflows/reusable-runner-names.yml
-
   authorize:
     permissions: {}
     uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
   server:
-    needs: [authorize, runner_names]
+    needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64 }}
+    runs-on: hf-jobs-cpu-performance
 
     strategy:
       matrix:
@@ -80,20 +80,6 @@ jobs:
       fail-fast: false
 
     steps:
-      #- name: Dependencies
-      #  id: depends
-      #  run: |
-      #    sudo apt-get update
-      #    sudo apt-get -y install \
-      #      build-essential \
-      #      xxd \
-      #      git \
-      #      cmake \
-      #      curl \
-      #      wget \
-      #      language-pack-en \
-      #      libssl-dev
-
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
@@ -101,13 +87,23 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential cmake python3-full
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
         with:
-          node-version: lts/*
-          check-latest: true
-          cache: "npm"
-          cache-dependency-path: "tools/ui/package-lock.json"
+          restore: false
+          save: false
+
+      - name: ccache-buckets-restore
+        uses: ./.github/actions/ccache-buckets
+        with:
+          key: server-sanitize-${{ matrix.sanitizer }}
+          folder: llama.cpp
+          hf_bucket: ggml-org/cache
 
       - name: Build
         id: cmake_build
@@ -123,21 +119,22 @@ jobs:
             -DLLAMA_SANITIZE_UNDEFINED=${{ matrix.sanitizer == 'UNDEFINED' }}
           cmake --build build --config ${{ matrix.build_type }} -j $(nproc) --target llama-server
 
-      - name: Python setup
-        id: setup_python
-        uses: actions/setup-python@v7
+      - name: ccache-buckets-save
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        uses: ./.github/actions/ccache-buckets
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
+        with:
+          key: server-sanitize-${{ matrix.sanitizer }}
+          folder: llama.cpp
+          evict-old-files: 1d
+          hf_bucket: ggml-org/cache
+          save: true
 
       - name: Install Python dependencies
         run: |
           python3 -m venv .venv
           .venv/bin/pip install -r tools/server/tests/requirements.txt
-
-      # QVAC-24501: the harness binds a fixed 8080 unless PORT is set, and both
-      # legs can land on one fleet host. Colliding legs either fail to bind or -
-      # worse - one leg's tests drive the other leg's server and pass against a
-      # binary built with the wrong sanitizer.
-      - name: Pick a server port for this runner
-        run: echo "PORT=$(.github/scripts/pick-server-port.sh)" >> "$GITHUB_ENV"
 
       - name: Tests
         id: server_integration_tests
@@ -145,8 +142,7 @@ jobs:
         run: |
           source .venv/bin/activate
           cd tools/server/tests
-          export ${{ matrix.extra_args }}
-          ./tests.sh
+          PYTEST_WORKERS=4 ./tests.sh
 
       - name: Slow tests
         id: server_integration_tests_slow
@@ -154,5 +150,4 @@ jobs:
         run: |
           source .venv/bin/activate
           cd tools/server/tests
-          export ${{ matrix.extra_args }}
-          SLOW_TESTS=1 ./tests.sh
+          PYTEST_WORKERS=4 SLOW_TESTS=1 ./tests.sh

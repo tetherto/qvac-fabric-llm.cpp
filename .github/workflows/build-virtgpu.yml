@@ -22,6 +22,9 @@ on:
       'ggml/src/ggml-virtgpu/**'
     ]
 
+permissions:
+  contents: read
+
 # QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
 # re-dispatch supersedes the in-flight run. The default branch deliberately
 # keeps upstream's run_id behaviour — master pushes must not cancel each other,

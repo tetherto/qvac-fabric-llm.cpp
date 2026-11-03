@@ -47,6 +47,16 @@ bool llama_hparams::is_swa_any() const {
     return false;
 }
 
+bool llama_hparams::is_swa_all() const {
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        if (!is_swa_impl[il]) {
+            return false;
+        }
+    }
+
+    return n_layer_all > 0;
+}
+
 uint32_t llama_hparams::n_head(uint32_t il) const {
     if (il < n_layer_all) {
         return n_head_arr[il];
@@ -69,6 +79,31 @@ uint32_t llama_hparams::n_ff(uint32_t il) const {
     }
 
     GGML_ABORT("fatal error");
+}
+
+uint32_t llama_hparams::n_ff_exp(uint32_t il) const {
+    if (il < n_layer_all) {
+        return n_ff_exp_arr[il];
+    }
+
+    GGML_ABORT("fatal error");
+}
+
+uint32_t llama_hparams::n_expert_used(uint32_t il) const {
+    if (il < n_layer_all) {
+        return n_expert_used_arr[il];
+    }
+
+    GGML_ABORT("fatal error");
+}
+
+uint32_t llama_hparams::n_expert_used_max() const {
+    uint32_t val = 0;
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        val = std::max(val, n_expert_used(il));
+    }
+
+    return val;
 }
 
 uint32_t llama_hparams::n_gqa(uint32_t il) const {
@@ -258,7 +293,8 @@ bool llama_hparams::is_ple(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_pos_per_embd() const {
-    return rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
+    return (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE)
+            ? GGML_MROPE_SECTIONS : 1;
 }
 
 bool llama_hparams::is_swa(uint32_t il) const {

@@ -11,7 +11,6 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
-using json = nlohmann::ordered_json;
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
@@ -584,6 +583,21 @@ struct server_prompt {
             checkpoints,
         };
     }
+};
+
+// discarded context checkpoints, kept so that new checkpoints reuse their memory instead of page-faulting fresh allocations
+struct server_checkpoint_pool {
+    std::list<common_prompt_checkpoint> spare;
+
+    // move the checkpoint at `it` into the pool, returns the iterator that follows it
+    std::list<common_prompt_checkpoint>::iterator discard(
+            std::list<common_prompt_checkpoint> & checkpoints,
+            std::list<common_prompt_checkpoint>::iterator it);
+
+    // append a checkpoint to `checkpoints`; a reused one keeps its target and draft data for update_tgt() and update_dft() to overwrite
+    common_prompt_checkpoint & add(std::list<common_prompt_checkpoint> & checkpoints);
+
+    void clear();
 };
 
 struct server_prompt_data {

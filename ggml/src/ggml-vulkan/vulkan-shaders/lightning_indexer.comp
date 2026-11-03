@@ -3,112 +3,149 @@
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#if USE_SUBGROUP_ADD
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+#define BINDING_IDX_K 0u
 
 #include "types.glsl"
+#include "fa_types.glsl"
+#define FaTypeV GGML_TYPE_F32
 
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint FaTypeK = GGML_TYPE_F32;
+layout(constant_id = 1) const uint FaBlockBytesK = 4;
+layout(constant_id = 2) const uint SUBGROUP_SIZE = 32;
 
-layout(push_constant) uniform parameter {
-    uint n_embd;
-    uint n_head;
+#include "flash_attn_dequant.glsl"
+
+// one workgroup computes one output element, one invocation per head element
+#define HEAD_SIZE 128
+
+layout(local_size_x = HEAD_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer QBuf { float q[]; };
+layout(binding = 1) readonly buffer KBufF16 { float16_t k_f16[]; };
+layout(binding = 1) readonly buffer KBufF32 { float k_f32[]; };
+layout(binding = 1) readonly buffer KBufBF16 { uint16_t k_bf16[]; };
+layout(binding = 2) readonly buffer WBuf { float weights[]; };
+layout(binding = 3) readonly buffer MBuf { float16_t mask[]; };
+layout(binding = 4) writeonly buffer DstBuf { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
     uint n_kv;
+    uint n_heads;
     uint n_tokens;
-    uint n_stream;
-    uint n_mask_stream;
-    uint q_nb0;
+    uint n_streams;
+    uint n_masks;
+    uint dispatch_x;
     uint q_nb1;
     uint q_nb2;
     uint q_nb3;
-    uint q_offset;
-    uint k_nb0;
-    uint k_nb1;
     uint k_nb2;
     uint k_nb3;
-    uint k_offset;
-    uint w_nb0;
     uint w_nb1;
     uint w_nb3;
-    uint w_offset;
-    uint m_nb0;
     uint m_nb1;
     uint m_nb3;
-    uint m_offset;
-    uint dst_nb0;
-    uint dst_nb1;
-    uint dst_nb3;
-    uint dst_offset;
-} p;
+    uint d_nb1;
+    uint d_nb3;
+};
 
-layout(binding = 0) readonly buffer QBuf { float data_q[]; };
-layout(binding = 1) readonly buffer KBuf { A_TYPE data_a[]; };
-#ifdef A_TYPE_PACKED16
-layout(binding = 1) readonly buffer KBuf16 { A_TYPE_PACKED16 data_a_packed16[]; };
-#endif
-#ifdef A_TYPE_PACKED32
-layout(binding = 1) readonly buffer KBuf32 { A_TYPE_PACKED32 data_a_packed32[]; };
-#endif
-layout(binding = 2) readonly buffer WBuf { float data_w[]; };
-layout(binding = 3) readonly buffer MBuf { float16_t data_m[]; };
-layout(binding = 4) writeonly buffer DstBuf { float data_dst[]; };
+shared float k_row[HEAD_SIZE];
 
-#include "dequant_funcs.glsl"
-
-shared float partial[128];
-
-float load_k(const uint base, const uint ie) {
-#if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1) || defined(DATA_A_Q5_0) || defined(DATA_A_Q5_1)
-    const uint ib = base + ie / QUANT_K;
-    const vec2 v = dequantize(ib, ie % (QUANT_K / QUANT_R), 0);
-    const vec2 dm = get_dm(ib, 0);
-    return v[(ie / (QUANT_K / QUANT_R)) % QUANT_R] * dm.x + dm.y;
-#elif defined(DATA_A_Q8_0)
-    const uint ib = base + ie / QUANT_K;
-    const uint iqs = (ie % QUANT_K) & ~1u;
-    const vec2 v = dequantize(ib, iqs, 0);
-    const vec2 dm = get_dm(ib, 0);
-    return v[ie & 1u] * dm.x;
+#if USE_SUBGROUP_ADD
+shared float sg_partials[HEAD_SIZE / SUBGROUP_SIZE];
 #else
-    return float(dequantize1(base + ie, 0, 0));
+shared float partials[HEAD_SIZE];
 #endif
-}
 
 void main() {
-    const uint ik = gl_WorkGroupID.x;
-    const uint it = gl_WorkGroupID.y;
-    const uint is = gl_WorkGroupID.z;
-    const uint lane = gl_LocalInvocationID.x;
-    const uint block_size = gl_WorkGroupSize.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint output_idx = gl_WorkGroupID.y * dispatch_x + gl_WorkGroupID.x;
+    const uint n_outputs = n_kv * n_tokens * n_streams;
 
-    precise float score = 0.0;
-    for (uint ih = lane; ih < p.n_head; ih += block_size) {
-        const uint q_base = p.q_offset + ih*p.q_nb1 + it*p.q_nb2 + is*p.q_nb3;
-        const uint k_base = p.k_offset + ik*p.k_nb2 + is*p.k_nb3;
-
-        precise float qk = 0.0;
-        for (uint ie = 0; ie < p.n_embd; ++ie) {
-            qk = qk + data_q[q_base + ie*p.q_nb0] * load_k(k_base, ie);
-        }
-
-        score = score + max(qk, 0.0) * data_w[p.w_offset + ih*p.w_nb0 + it*p.w_nb1 + is*p.w_nb3];
+    if (fa_type_needs_shmem(FaTypeK)) {
+        init_iq_shmem(gl_WorkGroupSize);
     }
 
-    partial[lane] = score;
+    if (output_idx >= n_outputs) {
+        return;
+    }
+
+    const uint ik = output_idx % n_kv;
+    const uint ts = output_idx / n_kv;
+    const uint t = ts % n_tokens;
+    const uint s = ts / n_tokens;
+    const uint k_offset = ik * k_nb2 + s * k_nb3;
+
+    // k strides come in as bytes, so scale them down to the view being indexed
+    const uint k_block_elems = fa_block_elems(FaTypeK);
+    const uint k_elem_bytes = FaBlockBytesK / k_block_elems;
+
+    if (FaTypeK == GGML_TYPE_F16) {
+        k_row[tid] = float(k_f16[k_offset / k_elem_bytes + tid]);
+    } else if (FaTypeK == GGML_TYPE_F32) {
+        k_row[tid] = k_f32[k_offset / k_elem_bytes + tid];
+    } else if (FaTypeK == GGML_TYPE_BF16) {
+        k_row[tid] = bf16_to_fp32(uint(k_bf16[k_offset / k_elem_bytes + tid]));
+    } else if (4 * tid < HEAD_SIZE) {
+        const uint coord = 4 * tid;
+        const uint ib = coord / k_block_elems;
+        const uint iqs = coord % k_block_elems;
+        const vec4 values = dequantize4(ib, iqs, k_offset / FaBlockBytesK, BINDING_IDX_K);
+        k_row[coord + 0] = values.x;
+        k_row[coord + 1] = values.y;
+        k_row[coord + 2] = values.z;
+        k_row[coord + 3] = values.w;
+    }
     barrier();
 
-    [[unroll]] for (uint offset = block_size / 2; offset > 0; offset >>= 1) {
-        if (lane < offset) {
-            partial[lane] = partial[lane] + partial[lane + offset];
+    const float k_val = k_row[tid];
+
+    float score = 0.0;
+    for (uint h = 0; h < n_heads; ++h) {
+        const float prod = q[h * q_nb1 + t * q_nb2 + s * q_nb3 + tid] * k_val;
+
+#if USE_SUBGROUP_ADD
+        const float sg_sum = subgroupAdd(prod);
+        if (gl_SubgroupInvocationID == 0) {
+            sg_partials[gl_SubgroupID] = sg_sum;
         }
         barrier();
+
+        if (tid == 0) {
+            float sum = 0.0;
+            [[unroll]] for (uint i = 0; i < HEAD_SIZE / SUBGROUP_SIZE; ++i) {
+                sum += sg_partials[i];
+            }
+            score += max(sum, 0.0) * weights[h + t * w_nb1 + s * w_nb3];
+        }
+        // the reads above must complete before the next iteration overwrites sg_partials
+        barrier();
+#else
+        partials[tid] = prod;
+        barrier();
+
+        [[unroll]] for (uint stride = HEAD_SIZE / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                partials[tid] += partials[tid + stride];
+            }
+            barrier();
+        }
+
+        if (tid == 0) {
+            score += max(partials[0], 0.0) * weights[h + t * w_nb1 + s * w_nb3];
+        }
+        // the read of partials[0] above must complete before the next iteration
+        // overwrites partials[tid]
+        barrier();
+#endif
     }
 
-    if (lane == 0) {
-        const uint im = is % p.n_mask_stream;
-        const uint mask_idx = p.m_offset + ik*p.m_nb0 + it*p.m_nb1 + im*p.m_nb3;
-        const uint dst_idx = p.dst_offset + ik*p.dst_nb0 + it*p.dst_nb1 + is*p.dst_nb3;
-        data_dst[dst_idx] = partial[0] + float(data_m[mask_idx]);
+    if (tid == 0) {
+        const uint mask_offset = ik + t * m_nb1 + (s % n_masks) * m_nb3;
+        dst[ik + t * d_nb1 + s * d_nb3] = score + float(mask[mask_offset]);
     }
 }

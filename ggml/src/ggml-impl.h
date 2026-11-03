@@ -30,7 +30,7 @@ extern "C" {
 
 void ggml_print_backtrace(void);
 
-uint64_t ggml_graph_next_uid(void);
+GGML_API uint64_t ggml_graph_next_uid(void);
 
 #ifndef MIN
 #    define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -86,6 +86,22 @@ static bool ggml_are_same_layout(const struct ggml_tensor * a, const struct ggml
     }
     return true;
 }
+
+// GGML_OP_LSTM_CELL gate chunks along ne0 of the pre-activation tensor (PyTorch/NeMo order).
+enum ggml_lstm_gate {
+    GGML_LSTM_GATE_INPUT  = 0,
+    GGML_LSTM_GATE_FORGET = 1,
+    GGML_LSTM_GATE_CELL   = 2,
+    GGML_LSTM_GATE_OUTPUT = 3,
+    GGML_LSTM_N_GATES     = 4,
+};
+
+// GGML_OP_LSTM_CELL result chunks along ne0.
+enum ggml_lstm_out {
+    GGML_LSTM_OUT_H  = 0,
+    GGML_LSTM_OUT_C  = 1,
+    GGML_LSTM_N_OUTS = 2,
+};
 
 static bool ggml_op_is_empty(enum ggml_op op) {
     switch (op) {
@@ -160,6 +176,18 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
     return ((const float *)(tensor->op_params))[i];
 }
 
+// [TAG_GGML_PREC]
+// - GGML_OP_MUL_MAT
+//   0 - acc
+//   1 - hint
+//   2 - src0 precision
+//   3 - src1 precision
+//
+// - GGML_OP_MUL_MAT_ID
+//   0 - acc
+//   1 - hint
+//   2 - src0 precision
+//   3 - src1 precision
 static void ggml_set_op_params_i32(struct ggml_tensor * tensor, uint32_t i, int32_t value) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(int32_t));
     ((int32_t *)(tensor->op_params))[i] = value;

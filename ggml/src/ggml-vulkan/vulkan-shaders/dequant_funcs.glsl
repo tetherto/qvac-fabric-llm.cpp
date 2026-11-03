@@ -131,6 +131,20 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_PTQ1_0)
+#include "ptq1_0.glsl"
+
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(ptq1_0_trit(ib, a_offset, iqs), ptq1_0_trit(ib, a_offset, iqs + 1u));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return vec4(ptq1_0_trit(ib, a_offset, iqs),
+                ptq1_0_trit(ib, a_offset, iqs + 1u),
+                ptq1_0_trit(ib, a_offset, iqs + 2u),
+                ptq1_0_trit(ib, a_offset, iqs + 3u));
+}
+#endif
+
 #if defined(DATA_A_Q1_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint bits = uint(data_a[a_offset + ib].qs[iqs / 8u]) >> (iqs % 8u);
@@ -149,6 +163,17 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #endif
 
 #if defined(DATA_A_Q2_0)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint bits = uint(data_a[a_offset + ib].qs[iqs / 4u]) >> (2u * (iqs % 4u));
+    return vec2(bits & 3u, (bits >> 2u) & 3u) - 1.0f;
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const uint bits = uint(data_a[a_offset + ib].qs[iqs / 4u]);
+    return vec4(bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, bits >> 6u) - 1.0f;
+}
+#endif
+
+#if defined(DATA_A_PQ2_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint bits = uint(data_a[a_offset + ib].qs[iqs / 4u]) >> (2u * (iqs % 4u));
     return vec2(bits & 3u, (bits >> 2u) & 3u) - 1.0f;
@@ -493,49 +518,6 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_TQ1_0)
-float dequantize1(uint ib, uint iqs, uint a_offset) {
-    const uint pow3[6] = uint[6](1u, 3u, 9u, 27u, 81u, 243u);
-
-    if (iqs < 160u) {               // 5 trits per byte (160 elems)
-        const uint n = iqs / 32u;
-        const uint m = iqs % 32u;
-        const uint byte = m;
-        const uint q = uint(data_a[a_offset + ib].qs[byte]);
-        const uint xi = (((q * pow3[n]) & 255u) * 3u) >> 8;
-        return float(int(xi) - 1);
-    } else if (iqs < 240u) {        // 5 trits per byte (80 elems)
-        const uint e = iqs - 160u;
-        const uint n = e / 16u;
-        const uint m = e % 16u;
-        const uint byte = 32u + m;
-        const uint q = uint(data_a[a_offset + ib].qs[byte]);
-        const uint xi = (((q * pow3[n]) & 255u) * 3u) >> 8;
-        return float(int(xi) - 1);
-    } else {                        // 4 trits per byte (16 elems)
-        const uint e = iqs - 240u;
-        const uint n = e / (QUANT_K / 64u);
-        const uint j = e % (QUANT_K / 64u);
-        const uint q = uint(data_a[a_offset + ib].qh[j]);
-        const uint xi = (((q * pow3[n]) & 255u) * 3u) >> 8;
-        return float(int(xi) - 1);
-    }
-}
-
-vec2 dequantize(uint ib, uint iqs, uint a_offset) {
-    return vec2(dequantize1(ib, iqs, a_offset), dequantize1(ib, iqs + 1u, a_offset));
-}
-
-vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
-    return vec4(
-        dequantize1(ib, iqs + 0u, a_offset),
-        dequantize1(ib, iqs + 1u, a_offset),
-        dequantize1(ib, iqs + 2u, a_offset),
-        dequantize1(ib, iqs + 3u, a_offset)
-    );
-}
-#endif
-
 #if defined(DATA_A_MXFP4)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
@@ -608,10 +590,17 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_Q2_0) || defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_TQ1_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL) || \
+#if defined(DATA_A_Q2_0) || defined(DATA_A_PQ2_0) || defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL) || \
     defined(DATA_A_ANY_PQ3_OR_4_0) || defined(DATA_A_ANY_TBQ3_OR_4_0)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
+}
+#endif
+
+#if defined(DATA_A_PTQ1_0)
+vec2 get_dm(uint ib, uint a_offset) {
+    const float d = float(data_a[a_offset + ib].d);
+    return vec2(d, 0);
 }
 #endif
 
@@ -656,6 +645,21 @@ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
 }
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(1, 0);
+}
+#endif
+
+#if defined(DATA_A_TQ1_0)
+float tq1_0_val(uint ib, uint e, uint a_offset) {
+    const uint bidx = tq1_0_byte_of(e);
+    const uint qbyte = uint(bidx < 48u ? data_a[a_offset + ib].qs[bidx]
+                                       : data_a[a_offset + ib].qh[bidx - 48u]);
+    return float(tq1_0_trit(qbyte, tq1_0_digit_of(e))) - 1.0;
+}
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(tq1_0_val(ib, iqs, a_offset), tq1_0_val(ib, iqs + 1u, a_offset));
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].d), 0);
 }
 #endif
 

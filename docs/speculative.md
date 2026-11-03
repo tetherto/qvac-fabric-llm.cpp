@@ -74,6 +74,33 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
+DFlash2 drafts add grouped convolution and a candidate selector. The selector is detected from the checkpoint; use the same `draft-dflash` type.
+For example, convert `incoai/Qwen3.8-27B-DFlash2` against its target tokenizer, then start the server:
+
+```bash
+python convert_hf_to_gguf.py incoai/Qwen3.8-27B-DFlash2 \
+    --target-model-dir Qwen/Qwen3.8-27B --outtype bf16 --outfile Qwen3.8-27B-DFlash2.gguf
+
+llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 7 -fa on --jinja
+```
+
+The target GGUF must use the same tokenizer as the draft.
+Reconvert older DFlash2 GGUFs for image or video inputs; the draft needs the target's M-RoPE metadata.
+
+A DFlash2 drafter can propose tokens from part of the vocabulary only.
+`--spec-draft-vocab` takes ascending, disjoint `[begin, end)` token id ranges. The drafter computes its output head over those rows only, and the target still verifies over the full vocabulary, so the output is unchanged.
+Tokens outside the ranges are never drafted, which can lower acceptance for text that uses them.
+Each range adds a mat-mul and a concat to the draft graph, so a few wide ranges cost less than many narrow ones.
+The ranges have no effect when the draft output head has a LoRA adapter or a Hadamard rotation, or when the loader stores it in a repacked or split buffer type, such as `CPU_REPACK` for a quantized head on the CPU. The drafter then uses the full vocabulary.
+Invalid ranges, ranges that cover fewer tokens than the drafter's selector top-k, a speculative type other than `draft-dflash`, or a drafter that is not DFlash2 or has a reduced (d2t) vocabulary stop the speculative setup with an error.
+For the Qwen3.8 DFlash2 drafter, `0:98304,248032:248320` keeps the first 98304 tokens and the special tokens at the end of the vocabulary:
+
+```bash
+llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-vocab 0:98304,248032:248320 -fa on --jinja
+```
+
 See:
 
 - #22105
@@ -212,6 +239,15 @@ Use `--backend-sampling` to run supported target-model samplers on the model bac
 
 Unsupported samplers and device layouts fall back to CPU sampling. Tensor split mode does not support backend sampling. A fixed seed produces repeatable random draws, but stochastic CPU and backend sampling can still select different tokens because floating-point operations can differ between implementations and devices. Use greedy sampling when exact output matching is required.
 
+### Synthetic Acceptance
+
+`llama-server` and `llama-cli` can replace normal speculative verification with synthetic decisions for benchmarking. The generated output is not valid model output because accepted draft tokens do not have to match the target model.
+
+Use exactly one of these options:
+
+- `--spec-synth-rates P0,P1,...` sets unconditional per-position acceptance probabilities. Entry `i` is the probability that the first `i+1` draft tokens are all accepted. The number of entries must match the effective maximum draft length. Values must be finite, within `[0, 1]`, and monotonically non-increasing.
+- `--spec-synth-len L` sets the target mean acceptance length, including the target token. For `K` maximum draft tokens, `L` must be within `[1, K+1]`. The server finds a constant conditional probability `p` such that `p + p^2 + ... + p^K = L - 1`, then uses unconditional rates `[p, p^2, ..., p^K]`.
+
 ### General Speculative Parameters
 
 ```
@@ -244,6 +280,10 @@ Unsupported samplers and device layouts fall back to CPU sampling. Tensor split 
 --spec-draft-p-min, --draft-p-min       P
                                         minimum speculative decoding probability (greedy) (default: 0.00)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
+--spec-draft-vocab                      B:E[,B:E...]
+                                        token id ranges [B, E) a DFlash2 drafter may propose; the target still verifies over the full vocabulary
+                                        (default: full vocabulary)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_VOCAB)
 --spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft  N
                                         max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)
                                         (env: LLAMA_ARG_N_GPU_LAYERS_DRAFT)

@@ -1,0 +1,539 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+// Backward of ggml_flash_attn_ext (GGML_OP_FLASH_ATTN_EXT_BACK), scalar path.
+// FA_BACK_TARGET selects the result:
+//   0 STATS: per q row (logsumexp, dot(grad_o, o))
+//   1 DQ:    gradient of q
+//   2 DKV:   gradient of k, then of v, stacked along dim 3
+// The softmax is recomputed per row from the stats, P is never stored.
+// Same thread mapping as flash_attn.comp: a workgroup owns Br outer rows,
+// D_split lanes share one row's head dimension and cols_per_iter inner
+// columns are processed per iteration.
+
+#define FA_BACK_STATS 0
+#define FA_BACK_DQ    1
+#define FA_BACK_DKV   2
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint32_t WorkGroupSize = 128;
+layout (constant_id = 1) const uint32_t Br = 4;
+layout (constant_id = 2) const uint32_t Bc = 32;
+layout (constant_id = 3) const uint32_t HS = 64;
+layout (constant_id = 4) const uint32_t D_split = 8;
+layout (constant_id = 5) const uint32_t SubGroupSize = 32;
+
+layout (push_constant) uniform parameter {
+    uint32_t N;
+    uint32_t KV;
+    uint32_t neq2;
+    uint32_t nek2;
+    uint32_t nek3;
+    uint32_t nem2;
+    uint32_t nem3;
+
+    uint32_t nbq1, nbq2, nbq3;
+    uint32_t nbk1, nbk2, nbk3;
+    uint32_t nbv1, nbv2, nbv3;
+    uint32_t nbm1, nbm2, nbm3;
+    uint32_t nbo1, nbo2, nbo3;
+    uint32_t nbd1, nbd2, nbd3;
+
+    float scale;
+    uint32_t mask_enable;
+
+    uint32_t mask_opt;
+    uint32_t mo_stride;
+    uint32_t mo_batch;
+} p;
+
+layout (binding = 0) readonly buffer Q  {vec4       data_qv4[];};
+layout (binding = 1) readonly buffer K  {KV_TYPEV4  data_kv4[];};
+layout (binding = 2) readonly buffer V  {KV_TYPEV4  data_vv4[];};
+layout (binding = 3) readonly buffer M  {float16_t  data_m[];};
+layout (binding = 4) readonly buffer O  {vec4       data_ov4[];};
+layout (binding = 5) readonly buffer G  {vec4       data_gv4[];};
+layout (binding = 6) readonly buffer ST {float      data_stats[];};
+layout (binding = 7) writeonly buffer D  {vec4       data_dv4[];};
+layout (binding = 7) writeonly buffer DF {float      data_df[];};
+layout (binding = 8) readonly buffer MO  {uint32_t   data_mask_opt[];};
+
+#define MASK_OPT_ALL_NEG_INF 1
+#define MASK_OPT_ALL_ZERO 2
+
+#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+
+const uint32_t HS_per_thread = HS / D_split;
+const uint32_t cols_per_iter = WorkGroupSize / D_split;
+const uint32_t cols_per_thread = Bc / cols_per_iter;
+const uint32_t num_subgroups = SubGroupSize == 0 ? 0 : WorkGroupSize / SubGroupSize;
+
+const uint32_t tmpsh_size = (SubGroupSize > 0) ? num_subgroups * D_split : WorkGroupSize;
+shared float tmpsh[tmpsh_size];
+shared vec4 tmpshv4[tmpsh_size];
+
+const uint32_t masksh_stride = Br + 1;
+shared float masksh[Bc * masksh_stride];
+
+const uint32_t sh_stride = HS / 4 + 1;
+shared vec4 Ash[Br * sh_stride];
+shared vec4 Bsh[Br * sh_stride];
+
+#define NEG_INF uintBitsToFloat(0xFF800000)
+#define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
+
+uint32_t tid, d_tid, col_tid;
+
+float reduce_cols_max(float v) {
+    if (SubGroupSize > 0) {
+        [[unroll]] for (uint s = D_split; s < SubGroupSize; s *= 2) {
+            v = max(v, subgroupShuffleXor(v, s));
+        }
+        barrier();
+        if (gl_SubgroupInvocationID == d_tid) {
+            tmpsh[gl_SubgroupID * D_split + d_tid] = v;
+        }
+        barrier();
+        v = tmpsh[d_tid];
+        [[unroll]] for (uint32_t s = 1; s < num_subgroups; ++s) {
+            v = max(v, tmpsh[s * D_split + d_tid]);
+        }
+    } else {
+        barrier();
+        tmpsh[tid] = v;
+        barrier();
+        [[unroll]] for (int s = int(WorkGroupSize) / 2; s >= int(D_split); s >>= 1) {
+            if (tid < s) {
+                tmpsh[tid] = max(tmpsh[tid], tmpsh[tid ^ s]);
+            }
+            barrier();
+        }
+        v = tmpsh[d_tid];
+    }
+    return v;
+}
+
+float reduce_cols_sum(float v) {
+    if (SubGroupSize > 0) {
+        [[unroll]] for (uint s = D_split; s < SubGroupSize; s *= 2) {
+            v += subgroupShuffleXor(v, s);
+        }
+        barrier();
+        if (gl_SubgroupInvocationID == d_tid) {
+            tmpsh[gl_SubgroupID * D_split + d_tid] = v;
+        }
+        barrier();
+        v = tmpsh[d_tid];
+        [[unroll]] for (uint32_t s = 1; s < num_subgroups; ++s) {
+            v += tmpsh[s * D_split + d_tid];
+        }
+    } else {
+        barrier();
+        tmpsh[tid] = v;
+        barrier();
+        [[unroll]] for (int s = int(WorkGroupSize) / 2; s >= int(D_split); s >>= 1) {
+            if (tid < s) {
+                tmpsh[tid] = tmpsh[tid] + tmpsh[tid ^ s];
+            }
+            barrier();
+        }
+        v = tmpsh[d_tid];
+    }
+    return v;
+}
+
+vec4 reduce_cols_sum_v4(vec4 v) {
+    if (SubGroupSize > 0) {
+        [[unroll]] for (uint s = D_split; s < SubGroupSize; s *= 2) {
+            v += subgroupShuffleXor(v, s);
+        }
+        barrier();
+        if (gl_SubgroupInvocationID == d_tid) {
+            tmpshv4[gl_SubgroupID * D_split + d_tid] = v;
+        }
+        barrier();
+        v = tmpshv4[d_tid];
+        [[unroll]] for (uint32_t s = 1; s < num_subgroups; ++s) {
+            v += tmpshv4[s * D_split + d_tid];
+        }
+    } else {
+        barrier();
+        tmpshv4[tid] = v;
+        barrier();
+        [[unroll]] for (int s = int(WorkGroupSize) / 2; s >= int(D_split); s >>= 1) {
+            if (tid < s) {
+                tmpshv4[tid] = tmpshv4[tid] + tmpshv4[tid ^ s];
+            }
+            barrier();
+        }
+        v = tmpshv4[d_tid];
+    }
+    return v;
+}
+
+float reduce_dsplit(float v) {
+    [[unroll]] for (uint s = D_split / 2; s > 0; s >>= 1) {
+        v += subgroupShuffleXor(v, s);
+    }
+    return v;
+}
+
+uint32_t stats_index(uint32_t row, uint32_t iq2, uint32_t iq3) {
+    return 2 * ((iq3 * p.neq2 + iq2) * p.N + row);
+}
+
+#if FA_BACK_TARGET == FA_BACK_DKV
+
+void main() {
+    tid     = gl_LocalInvocationIndex;
+    d_tid   = tid % D_split;
+    col_tid = tid / D_split;
+
+    const uint32_t i   = gl_WorkGroupID.x;
+    const uint32_t ik2 = gl_WorkGroupID.y;
+    const uint32_t ik3 = gl_WorkGroupID.z;
+    const uint32_t iq3 = ik3;
+    const uint32_t rk2 = p.neq2 / p.nek2;
+
+    const uint32_t k_offset = ik2 * p.nbk2 + ik3 * p.nbk3;
+    const uint32_t v_offset = ik2 * p.nbv2 + ik3 * p.nbv3;
+
+    [[unroll]] for (uint32_t idx = 0; idx < Br * HS / 4; idx += WorkGroupSize) {
+        const uint32_t d = (idx + tid) % (HS / 4);
+        const uint32_t r = (idx + tid) / (HS / 4);
+        if (r < Br && i * Br + r < p.KV) {
+            Ash[r * sh_stride + d] = vec4(data_kv4[(k_offset + (i * Br + r) * p.nbk1) / 4 + d]) * p.scale;
+            Bsh[r * sh_stride + d] = vec4(data_vv4[(v_offset + (i * Br + r) * p.nbv1) / 4 + d]);
+        }
+    }
+    barrier();
+
+    vec4 dk[Br][HS_per_thread / 4];
+    vec4 dv[Br][HS_per_thread / 4];
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        [[unroll]] for (uint32_t d = 0; d < HS_per_thread / 4; ++d) {
+            dk[r][d] = vec4(0.0);
+            dv[r][d] = vec4(0.0);
+        }
+    }
+
+    const uint32_t Tc = CEIL_DIV(p.N, Bc);
+
+    for (uint32_t h = 0; h < rk2; ++h) {
+        const uint32_t iq2 = ik2 * rk2 + h;
+
+        const uint32_t q_offset = iq2 * p.nbq2 + iq3 * p.nbq3;
+        const uint32_t o_offset = iq2 * p.nbo1 + iq3 * p.nbo3;
+        const uint32_t m_offset = (iq2 % p.nem2) * p.nbm2 + (iq3 % p.nem3) * p.nbm3;
+        const uint32_t mo_offset = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.mo_batch + i / 16;
+
+        [[dont_unroll]]
+        for (uint32_t j = 0; j < Tc; ++j) {
+            uint32_t mask_code = 0;
+            if (p.mask_opt != 0) {
+                mask_code = (data_mask_opt[mo_offset + j * p.mo_stride] >> ((i % 16) * 2)) & 3;
+                if (mask_code == MASK_OPT_ALL_NEG_INF) {
+                    continue;
+                }
+            }
+            const bool tile_mask = p.mask_enable != 0 && mask_code != MASK_OPT_ALL_ZERO;
+
+            if (tile_mask) {
+                barrier();
+
+                [[unroll]] for (uint32_t idx = 0; idx < Bc * Br; idx += WorkGroupSize) {
+                    const uint32_t r = (idx + tid) % Br;
+                    const uint32_t c = (idx + tid) / Br;
+                    if (idx + tid < Bc * Br) {
+                        const uint32_t qrow = j * Bc + c;
+                        const uint32_t krow = i * Br + r;
+                        masksh[c * masksh_stride + r] = (qrow < p.N && krow < p.KV)
+                            ? float(data_m[m_offset + qrow * p.nbm1 + krow]) : NEG_INF;
+                    }
+                }
+                barrier();
+            }
+
+            float Sf[Br][cols_per_thread];
+            float dPf[Br][cols_per_thread];
+            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                const uint32_t qrow = j * Bc + c * cols_per_iter + col_tid;
+                [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                    Sf[r][c] = 0.0;
+                    dPf[r][c] = 0.0;
+                }
+                if (qrow < p.N) {
+                    [[unroll]] for (uint32_t d = 0; d < HS_per_thread / 4; ++d) {
+                        const vec4 Qv = data_qv4[(q_offset + qrow * p.nbq1) / 4 + d * D_split + d_tid];
+                        const vec4 Gv = data_gv4[(o_offset + qrow * p.nbo2) / 4 + d * D_split + d_tid];
+                        [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                            Sf[r][c]  += dot(Ash[r * sh_stride + d * D_split + d_tid], Qv);
+                            dPf[r][c] += dot(Bsh[r * sh_stride + d * D_split + d_tid], Gv);
+                        }
+                    }
+                }
+            }
+
+            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                    Sf[r][c]  = reduce_dsplit(Sf[r][c]);
+                    dPf[r][c] = reduce_dsplit(dPf[r][c]);
+                }
+            }
+
+            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                const uint32_t qrow = j * Bc + c * cols_per_iter + col_tid;
+                if (qrow >= p.N) {
+                    continue;
+                }
+
+                const uint32_t si = stats_index(qrow, iq2, iq3);
+                const float L     = data_stats[si];
+                const float delta = data_stats[si + 1];
+
+                float Pf[Br];
+                float dSf[Br];
+                [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                    float s = Sf[r][c];
+                    if (tile_mask) {
+                        s += masksh[(c * cols_per_iter + col_tid) * masksh_stride + r];
+                    }
+
+                    Pf[r]  = (s == NEG_INF) ? 0.0 : exp(s - L);
+                    dSf[r] = p.scale * Pf[r] * (dPf[r][c] - delta);
+                }
+
+                [[unroll]] for (uint32_t d = 0; d < HS_per_thread / 4; ++d) {
+                    const vec4 Qv = data_qv4[(q_offset + qrow * p.nbq1) / 4 + d * D_split + d_tid];
+                    const vec4 Gv = data_gv4[(o_offset + qrow * p.nbo2) / 4 + d * D_split + d_tid];
+                    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                        dv[r][d] += Pf[r] * Gv;
+                        dk[r][d] += dSf[r] * Qv;
+                    }
+                }
+            }
+        }
+    }
+
+    const uint32_t dk_offset = ik2 * p.nbd2 + ik3 * p.nbd3;
+    const uint32_t dv_offset = dk_offset + p.nek3 * p.nbd3;
+
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        [[unroll]] for (uint32_t d = 0; d < HS_per_thread / 4; ++d) {
+            const vec4 dkv = reduce_cols_sum_v4(dk[r][d]);
+            const vec4 dvv = reduce_cols_sum_v4(dv[r][d]);
+            if (col_tid == 0 && i * Br + r < p.KV) {
+                data_dv4[(dk_offset + (i * Br + r) * p.nbd1) / 4 + d * D_split + d_tid] = dkv;
+                data_dv4[(dv_offset + (i * Br + r) * p.nbd1) / 4 + d * D_split + d_tid] = dvv;
+            }
+        }
+    }
+}
+
+#else
+
+void main() {
+    tid     = gl_LocalInvocationIndex;
+    d_tid   = tid % D_split;
+    col_tid = tid / D_split;
+
+    const uint32_t i   = gl_WorkGroupID.x;
+    const uint32_t iq2 = gl_WorkGroupID.y;
+    const uint32_t iq3 = gl_WorkGroupID.z;
+    const uint32_t rk2 = p.neq2 / p.nek2;
+    const uint32_t ik2 = iq2 / rk2;
+    const uint32_t ik3 = iq3;
+
+    const uint32_t q_offset = iq2 * p.nbq2 + iq3 * p.nbq3;
+    const uint32_t k_offset = ik2 * p.nbk2 + ik3 * p.nbk3;
+    const uint32_t v_offset = ik2 * p.nbv2 + ik3 * p.nbv3;
+    const uint32_t o_offset = iq2 * p.nbo1 + iq3 * p.nbo3;
+    const uint32_t m_offset = (iq2 % p.nem2) * p.nbm2 + (iq3 % p.nem3) * p.nbm3;
+    const uint32_t mo_offset = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.mo_batch + i * p.mo_stride;
+
+    [[unroll]] for (uint32_t idx = 0; idx < Br * HS / 4; idx += WorkGroupSize) {
+        const uint32_t d = (idx + tid) % (HS / 4);
+        const uint32_t r = (idx + tid) / (HS / 4);
+        if (r < Br && i * Br + r < p.N) {
+            Ash[r * sh_stride + d] = data_qv4[(q_offset + (i * Br + r) * p.nbq1) / 4 + d] * p.scale;
+#if FA_BACK_TARGET == FA_BACK_DQ
+            Bsh[r * sh_stride + d] = data_gv4[(o_offset + (i * Br + r) * p.nbo2) / 4 + d];
+#endif
+        }
+    }
+    barrier();
+
+#if FA_BACK_TARGET == FA_BACK_STATS
+    float Mf[Br], Lf[Br];
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        Mf[r] = NEG_FLT_MAX_OVER_2;
+        Lf[r] = 0.0;
+    }
+#else
+    float Lrow[Br], Drow[Br];
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        const uint32_t row = min(i * Br + r, p.N - 1);
+        const uint32_t si = stats_index(row, iq2, iq3);
+        Lrow[r] = data_stats[si];
+        Drow[r] = data_stats[si + 1];
+    }
+
+    vec4 dq[Br][HS_per_thread / 4];
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        [[unroll]] for (uint32_t d = 0; d < HS_per_thread / 4; ++d) {
+            dq[r][d] = vec4(0.0);
+        }
+    }
+#endif
+
+    const uint32_t Tc = CEIL_DIV(p.KV, Bc);
+
+    [[dont_unroll]]
+    for (uint32_t j = 0; j < Tc; ++j) {
+        uint32_t mask_code = 0;
+        if (p.mask_opt != 0) {
+            mask_code = (data_mask_opt[mo_offset + j / 16] >> ((j % 16) * 2)) & 3;
+            if (mask_code == MASK_OPT_ALL_NEG_INF) {
+                continue;
+            }
+        }
+        const bool tile_mask = p.mask_enable != 0 && mask_code != MASK_OPT_ALL_ZERO;
+
+        if (tile_mask) {
+            barrier();
+            [[unroll]] for (uint32_t idx = 0; idx < Bc * Br; idx += WorkGroupSize) {
+                const uint32_t c = (idx + tid) % Bc;
+                const uint32_t r = (idx + tid) / Bc;
+                if (idx + tid < Bc * Br) {
+                    const uint32_t qrow = i * Br + r;
+                    const uint32_t kcol = j * Bc + c;
+                    masksh[c * masksh_stride + r] = (qrow < p.N && kcol < p.KV)
+                        ? float(data_m[m_offset + qrow * p.nbm1 + kcol]) : NEG_INF;
+                }
+            }
+            barrier();
+        }
+
+        float Sf[Br][cols_per_thread];
+#if FA_BACK_TARGET == FA_BACK_DQ
+        float dPf[Br][cols_per_thread];
+#endif
+        [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+            const uint32_t kcol = j * Bc + c * cols_per_iter + col_tid;
+            [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                Sf[r][c] = 0.0;
+#if FA_BACK_TARGET == FA_BACK_DQ
+                dPf[r][c] = 0.0;
+#endif
+            }
+            if (kcol < p.KV) {
+                [[unroll]] for (uint32_t d = 0; d < HS_per_thread / 4; ++d) {
+                    const vec4 Kv = vec4(data_kv4[(k_offset + kcol * p.nbk1) / 4 + d * D_split + d_tid]);
+#if FA_BACK_TARGET == FA_BACK_DQ
+                    const vec4 Vv = vec4(data_vv4[(v_offset + kcol * p.nbv1) / 4 + d * D_split + d_tid]);
+#endif
+                    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                        Sf[r][c] += dot(Ash[r * sh_stride + d * D_split + d_tid], Kv);
+#if FA_BACK_TARGET == FA_BACK_DQ
+                        dPf[r][c] += dot(Bsh[r * sh_stride + d * D_split + d_tid], Vv);
+#endif
+                    }
+                }
+            }
+        }
+
+        [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+            const uint32_t kcol = j * Bc + c * cols_per_iter + col_tid;
+            [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                Sf[r][c] = reduce_dsplit(Sf[r][c]);
+#if FA_BACK_TARGET == FA_BACK_DQ
+                dPf[r][c] = reduce_dsplit(dPf[r][c]);
+#endif
+                if (tile_mask) {
+                    Sf[r][c] += masksh[(c * cols_per_iter + col_tid) * masksh_stride + r];
+                } else if (kcol >= p.KV) {
+                    Sf[r][c] = NEG_INF;
+                }
+            }
+        }
+
+#if FA_BACK_TARGET == FA_BACK_STATS
+        [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+            float rowmaxf = NEG_FLT_MAX_OVER_2;
+            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                rowmaxf = max(rowmaxf, Sf[r][c]);
+            }
+            const float Moldf = Mf[r];
+            Mf[r] = max(rowmaxf, Moldf);
+            Lf[r] = exp(Moldf - Mf[r]) * Lf[r];
+            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                Lf[r] += exp(Sf[r][c] - Mf[r]);
+            }
+        }
+#else
+        [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+            const uint32_t kcol = j * Bc + c * cols_per_iter + col_tid;
+            if (kcol >= p.KV) {
+                continue;
+            }
+
+            float dSf[Br];
+            [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                const float s = Sf[r][c];
+                // masked columns and fully masked rows (L == -inf) contribute nothing
+                const float pr = (s == NEG_INF) ? 0.0 : exp(s - Lrow[r]);
+                dSf[r] = p.scale * pr * (dPf[r][c] - Drow[r]);
+            }
+
+            [[unroll]] for (uint32_t d = 0; d < HS_per_thread / 4; ++d) {
+                const vec4 Kv = vec4(data_kv4[(k_offset + kcol * p.nbk1) / 4 + d * D_split + d_tid]);
+                [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                    dq[r][d] += dSf[r] * Kv;
+                }
+            }
+        }
+#endif
+    }
+
+#if FA_BACK_TARGET == FA_BACK_STATS
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        const uint32_t row = i * Br + r;
+
+        const float Moldf = Mf[r];
+        const float M = reduce_cols_max(Moldf);
+        const float L = reduce_cols_sum(exp(Moldf - M) * Lf[r]);
+
+        float delta = 0.0;
+        if (row < p.N) {
+            [[unroll]] for (uint32_t d = 0; d < HS_per_thread / 4; ++d) {
+                const uint32_t idx = (o_offset + row * p.nbo2) / 4 + d * D_split + d_tid;
+                delta += dot(data_gv4[idx], data_ov4[idx]);
+            }
+        }
+        delta = reduce_dsplit(delta);
+
+        if (tid == 0 && row < p.N) {
+            const uint32_t si = stats_index(row, iq2, iq3);
+            data_df[si]     = L == 0.0 ? NEG_INF : M + log(L);
+            data_df[si + 1] = delta;
+        }
+    }
+#else
+    const uint32_t d_offset = iq2 * p.nbd2 + iq3 * p.nbd3;
+
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        [[unroll]] for (uint32_t d = 0; d < HS_per_thread / 4; ++d) {
+            const vec4 dqv = reduce_cols_sum_v4(dq[r][d]);
+            if (col_tid == 0 && i * Br + r < p.N) {
+                data_dv4[(d_offset + (i * Br + r) * p.nbd1) / 4 + d * D_split + d_tid] = dqv;
+            }
+        }
+    }
+#endif
+}
+#endif

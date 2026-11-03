@@ -22,6 +22,9 @@ on:
       'ggml/src/ggml-cpu/arch/riscv/**'
     ]
 
+permissions:
+  contents: read
+
 # QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
 # re-dispatch supersedes the in-flight run. The default branch deliberately
 # keeps upstream's run_id behaviour — master pushes must not cancel each other,
@@ -39,12 +42,6 @@ env:
 
 jobs:
   ubuntu-cpu-riscv64-native:
-    # QVAC-24501: ubuntu-24.04-riscv is not a GitHub image - it comes from the
-    # RISE runner service (github.com/apps/rise-risc-v-runners), which an org
-    # must be onboarded to before the label resolves. Upstream is; we are not, so
-    # every run queued to the 24h ceiling and was cancelled without executing a
-    # step. TO RESTORE: onboard the org, then delete this `if`. See QVAC-23796.
-    if: false  # no runner: org not onboarded to the RISE RISC-V runner service
     runs-on: ubuntu-24.04-riscv
 
     steps:
@@ -77,7 +74,7 @@ jobs:
 
       # note: sparing some ccache since these jobs run on dedicated runners that are not part of the organitzation
       #- name: ccache
-      #  uses: ggml-org/ccache-action@afde29e5b5422e5da23cb1f639e8baecadeadfc3 # https://github.com/ggml-org/ccache-action/pull/1
+      #  uses: ggml-org/ccache-action@v1.2.24
       #  with:
       #    key: riscv-ubuntu-native
       #    evict-old-files: 1d
@@ -114,86 +111,3 @@ jobs:
           wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K/stories260K.bin
           ./bin/llama-convert-llama2c-to-ggml --copy-vocab-from-model ./tok512.bin --llama2c-model stories260K.bin --llama2c-output-model stories260K.gguf
           ./bin/llama-completion -m stories260K.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
-
-  ubuntu-riscv64-native-sanitizer:
-    # QVAC-24501: see ubuntu-cpu-riscv64-native above - same RISE service. A
-    # 3-way matrix, so 3 of the 12 permanently-queued jobs.
-    if: false  # no runner: org not onboarded to the RISE RISC-V runner service
-    runs-on: ubuntu-24.04-riscv
-
-    continue-on-error: true
-
-    strategy:
-      matrix:
-        sanitizer: [ADDRESS, THREAD, UNDEFINED]
-        build_type: [Debug]
-
-    steps:
-      - name: Install dependencies
-        run: |
-          # Set gcc-14 and g++-14 as the default compilers
-          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100
-          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100
-
-          git lfs install
-
-      - name: GCC version check
-        run: |
-          gcc --version
-          g++ --version
-
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      # note: sparing some ccache since these jobs run on dedicated runners that are not part of the organitzation
-      #- name: ccache
-      #  uses: ggml-org/ccache-action@afde29e5b5422e5da23cb1f639e8baecadeadfc3 # https://github.com/ggml-org/ccache-action/pull/1
-      #  with:
-      #    key: riscv-ubuntu-native-sanitizer-${{ matrix.sanitizer }}-${{ matrix.build_type }}
-      #    evict-old-files: 1d
-      #    save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-
-      - name: Build
-        id: cmake_build
-        if: ${{ matrix.sanitizer != 'THREAD' }}
-        run: |
-          cmake -B build \
-            -DLLAMA_OPENSSL=OFF \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DGGML_OPENMP=ON \
-            -DLLAMA_BUILD_EXAMPLES=ON \
-            -DLLAMA_BUILD_TOOLS=ON \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
-            -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc-14 \
-            -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++-14
-
-          cmake --build build --config ${{ matrix.build_type }} -j $(nproc)
-
-      - name: Build (no OpenMP)
-        id: cmake_build_no_openmp
-        if: ${{ matrix.sanitizer == 'THREAD' }}
-        run: |
-          cmake -B build \
-            -DLLAMA_OPENSSL=OFF \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DGGML_OPENMP=OFF \
-            -DLLAMA_BUILD_EXAMPLES=ON \
-            -DLLAMA_BUILD_TOOLS=ON \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
-            -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc-14 \
-            -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++-14
-
-          cmake --build build --config ${{ matrix.build_type }} -j $(nproc)
-
-      - name: Test
-        id: cmake_test
-        run: |
-          cd build
-          ctest -L main --verbose --timeout 900

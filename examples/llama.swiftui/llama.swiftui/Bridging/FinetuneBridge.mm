@@ -731,6 +731,7 @@ extern "C" enum llama_swift_finetune_error llama_swift_run_lora_finetune(
         /*checkpoint_path        =*/ checkpoint_loaded ? optimizer_checkpoint_path.c_str() : nullptr,
         /*load_optimizer_state   =*/ checkpoint_loaded,
         /*assistant_loss_only    =*/ false,
+        /*flash_attn             =*/ false,
     };
 
     llama_opt_init(ctx, model, opt_params);

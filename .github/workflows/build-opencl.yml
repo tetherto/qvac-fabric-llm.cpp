@@ -23,6 +23,9 @@ on:
       'ggml/src/ggml-opencl/**'
     ]
 
+permissions:
+  contents: read
+
 # QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
 # re-dispatch supersedes the in-flight run. The default branch deliberately
 # keeps upstream's run_id behaviour — master pushes must not cancel each other,
@@ -40,6 +43,9 @@ env:
 
 jobs:
   windows-2025-opencl-adreno:
+    permissions:
+      contents: read
+      actions: write
     runs-on: windows-2025
 
     steps:
@@ -48,7 +54,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ggml-org/ccache-action@v1.2.24
         with:
           key: opencl-windows-2025-x64
           variant: ccache
@@ -85,6 +91,16 @@ jobs:
           cmake -S . -B build -G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DCMAKE_PREFIX_PATH="$env:RUNNER_TEMP/opencl-arm64-release" -DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=ON -DLLAMA_BUILD_BORINGSSL=ON
           cmake --build build --config Release -j ${env:NUMBER_OF_PROCESSORS}
 
+      - name: ccache-clear
+        uses: ./.github/actions/ccache-clear
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          key: opencl-windows-2025-x64
+          older: 5m
+          min: 1
+          dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
+
   ubuntu-24-opencl:
     runs-on: ubuntu-24.04
 
@@ -103,11 +119,15 @@ jobs:
         id: depends
         run: |
           sudo apt-get update
-          # intel-opencl-icd provides a CPU OpenCL device (same package set the
-          # OpenVINO job installs); the rest is the ICD loader + CL headers.
+          # pocl-opencl-icd provides a CPU OpenCL device (intel-opencl-icd is
+          # Intel's GPU runtime and gives no device on a hosted runner); the
+          # rest is the ICD loader + CL headers. NOTE: the backend needs
+          # cl_khr_fp16, which POCL exposes only on CPUs with native f16, and
+          # Intel's CPU runtime lacks half-precision math, so on most hosted
+          # runners no device runs the kernels and this job is build coverage.
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake clinfo \
-            ocl-icd-opencl-dev opencl-headers opencl-clhpp-headers intel-opencl-icd
+            ocl-icd-opencl-dev opencl-headers opencl-clhpp-headers pocl-opencl-icd
 
       - name: Build (GGML_OPENCL, portable kernels)
         id: cmake_build
@@ -121,9 +141,13 @@ jobs:
           # runs, so an object built on an AVX-512 runner gets reused on a runner
           # without it and test-backend-ops dies with SIGILL (exit 132) before
           # printing a single test. Every other x64 job here already sets OFF.
+          # Adreno kernels default ON and reject non-Adreno devices, so the
+          # POCL CPU device would be dropped and test-backend-ops would run no
+          # kernels. These ops do not need the Adreno kernels.
           cmake -B build \
             -DGGML_NATIVE=OFF \
             -DGGML_OPENCL=ON \
+            -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \
             -DLLAMA_BUILD_TOOLS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_SERVER=OFF
@@ -136,11 +160,23 @@ jobs:
           # CONV_2D (regular direct conv), CONV_2D_DW (depthwise), POOL_2D,
           # HARDSWISH, HARDSIGMOID. These kernels load unconditionally (no
           # GGML_OPENCL_USE_ADRENO_KERNELS gate), so they are portable OpenCL C
-          # and run here on the Intel CPU ICD, compared against the CPU
+          # and run here on the POCL CPU device, compared against the CPU
           # reference. NOTE: a CPU ICD does NOT reproduce Adreno-compiler bugs
           # (e.g. the char->float type-punning miscompile this PR works around) —
           # that requires the manual Firebase Test Lab device run. This job is a
           # regression net for kernel math / indexing / dtype correctness that a
-          # compile-only job cannot catch.
+          # compile-only job cannot catch. The speech ops (GRU, ZERO_UPSAMPLE,
+          # CHANNEL_SHUFFLE, AFFINE_PRELU, SNAKE) are portable OpenCL C as well.
+          # The backend only admits Adreno and Intel GPUs by name; a CPU device
+          # is let in by the env var below, which exists for test hosts.
+          # test-backend-ops counts a backend it never ran as passed, so the
+          # step requires a passing OpenCL result when a device ran and warns
+          # visibly when none did instead of going green in silence.
           clinfo -l || true
-          ./build/bin/test-backend-ops test -o CONV_2D,CONV_2D_DW,POOL_2D,HARDSWISH,HARDSIGMOID
+          export GGML_OPENCL_ALLOW_GENERIC_DEVICE=1
+          ./build/bin/test-backend-ops test -o CONV_2D,CONV_2D_DW,POOL_2D,HARDSWISH,HARDSIGMOID,GRU,ZERO_UPSAMPLE,CHANNEL_SHUFFLE,AFFINE_PRELU,SNAKE | tee tbo.log
+          if grep -q "Backend OpenCL:" tbo.log; then
+            grep -q "Backend OpenCL: .*OK" tbo.log
+          else
+            echo "::warning::no usable OpenCL device on this runner; the kernels were built but not executed"
+          fi

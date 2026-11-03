@@ -6,23 +6,39 @@
 #include "llama-adapter.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include <memory>
 #include <set>
 #include <functional>
 #include <map>
+#include <tuple>
+#include <unordered_map>
 
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 
+// Activation-side transform for a folded model weight.
+struct llama_hadamard_transform {
+    ggml_tensor * rot;
+    ggml_tensor * signs; // nullptr for identity sign mode
+    // Permute tiled [hd, nk, rep] activations to grouped [hd, rep, nk] order.
+    int64_t perm_hd  = 0;
+    int64_t perm_nk  = 0;
+    int64_t perm_rep = 0;
+};
+using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
+
 struct llama_cparams;
 struct llama_layer;
+struct llama_prec_policy;
 
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
+class llama_kv_cache_dsa_iswa_context;
 class llama_kv_cache_msa_context;
 class llama_kv_cache_dsv4_raw_context;
 class llama_kv_cache_dsv4_context;
@@ -57,6 +73,7 @@ enum llm_ffn_op_type : int {
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
     LLM_FFN_GEGLU,
+    LLM_FFN_GEGLU_ERF,
     LLM_FFN_REGLU,
     LLM_FFN_SWIGLU_OAI_MOE,
     LLM_FFN_SITU,           // kimi-k3
@@ -131,8 +148,14 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * tokens = nullptr; // I32 [n_batch]
-    ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * tokens       = nullptr; // I32 [n_batch]
+    ggml_tensor * embd         = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * mixed_tokens = nullptr; // I32 [n_tok_rows], mixed path: ids of the token rows
+    ggml_tensor * mixed_slots  = nullptr; // I64 [n_tok_rows], mixed path: batch index of the token rows
+    ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
+    ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
+
+    float scale_tok = 1.0f;
 
     const int64_t n_embd = 0;
 };
@@ -273,6 +296,14 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // deferred gated delta net commit (see llama_memory_recurrent::gdn_deferred), else null:
+    // the ssm base states always live in plane 0, so they get their own copy indices
+    ggml_tensor * s_copy_base       = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_base_main  = nullptr; // I32 [n_seqs]
+    ggml_tensor * s_copy_base_extra = nullptr; // I32 [n_rs - n_seqs]
+    ggml_tensor * rec_idx           = nullptr; // I32 [3, n_seqs] {pending, read_row, write_row}
+    bool          s_base_inplace    = false;   // the base states are read and written in place
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -374,6 +405,9 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // like can_reuse, but does not re-bind mctx
+    bool can_reuse_impl(const llm_graph_params & params);
+
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
@@ -405,6 +439,9 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // like can_reuse, but does not re-bind mctx
+    bool can_reuse_impl(const llm_graph_params & params);
+
     ggml_tensor * get_k_idxs_mla() const { return self_k_idxs_mla; }
     ggml_tensor * get_k_idxs_lid() const { return self_k_idxs_lid; }
 
@@ -425,6 +462,32 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_dsa_context * mctx;
+};
+
+// DSA input (full-attention layers + indexer) with K-only input for the SWA layers
+class llm_graph_input_attn_k_dsa_iswa : public llm_graph_input_i {
+public:
+    llm_graph_input_attn_k_dsa_iswa(
+            std::unique_ptr<llm_graph_input_attn_k_dsa> inp_dsa,
+            std::unique_ptr<llm_graph_input_attn_k>     inp_swa,
+            const llama_kv_cache_dsa_iswa_context *     mctx) :
+        inp_dsa(std::move(inp_dsa)),
+        inp_swa(std::move(inp_swa)),
+        mctx(mctx) {
+    }
+    ~llm_graph_input_attn_k_dsa_iswa() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    llm_graph_input_attn_k_dsa * get_dsa() const { return inp_dsa.get(); }
+    llm_graph_input_attn_k     * get_swa() const { return inp_swa.get(); }
+
+    std::unique_ptr<llm_graph_input_attn_k_dsa> inp_dsa;
+    std::unique_ptr<llm_graph_input_attn_k>     inp_swa;
+
+    const llama_kv_cache_dsa_iswa_context * mctx;
 };
 
 // standard K/V attention input against the base cache, plus destination indices for the indexer key cache
@@ -752,6 +815,10 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_hadamard_rotations * hadamard_rotations;
+    const llama_hadamard_rotations * hadamard_inverses;
+
+    const llama_prec_policy * prec_policy = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -786,6 +853,7 @@ struct llm_graph_params {
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
+            ubatch.is_mixed()   == other.ubatch.is_mixed() &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
                 (!ubatch.embd  && !other.ubatch.embd)  ||
@@ -834,6 +902,10 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        if (cparams.draft_vocab != other.cparams.draft_vocab) {
             return false;
         }
 
@@ -992,6 +1064,10 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_hadamard_rotations * hadamard_rotations;
+    const llama_hadamard_rotations * hadamard_inverses;
+
+    const llama_prec_policy * prec_policy;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1001,6 +1077,10 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // activation transforms of this graph by (input, rot, signs, perm), shared by the folded weights that read the same input
+    using hadamard_act_key = std::tuple<const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int64_t, int64_t, int64_t>;
+    mutable std::map<hadamard_act_key, ggml_tensor *> hadamard_acts;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1014,6 +1094,15 @@ struct llm_graph_context {
     ggml_tensor * build_cvec(
              ggml_tensor * cur,
                      int   il) const;
+
+    ggml_tensor * build_hadamard_inverse_after_lookup(
+              ggml_tensor * cur,
+        const ggml_tensor * table) const;
+
+    // the activation-side transform of a folded weight, built once per input
+    ggml_tensor * build_hadamard_activation(
+                     ggml_tensor * cur,
+        const llama_hadamard_transform & t) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
@@ -1045,6 +1134,19 @@ struct llm_graph_context {
                   int64_t   n_head,
                   int64_t   n_head_kv,
                       int   il) const;
+
+    // Set reshape to false to return contiguous projections before clamp/reshape.
+    llm_graph_qkv build_qkv(
+        const llama_layer & layer,
+              ggml_tensor * cur,
+                  int64_t   n_embd_head_q,
+                  int64_t   n_head_q,
+                  int64_t   n_embd_head_k,
+                  int64_t   n_head_k,
+                  int64_t   n_embd_head_v,
+                  int64_t   n_head_v,
+                      int   il,
+                     bool   reshape = true) const;
 
     ggml_tensor * build_ffn(
              ggml_tensor * cur,
@@ -1114,7 +1216,8 @@ struct llm_graph_context {
     // inputs
     //
 
-    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    // tok_scale: applied to token rows only
+    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
@@ -1138,6 +1241,7 @@ struct llm_graph_context {
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                int64_t   n_kv_max,
                   float   kq_scale,
                     int   il) const;
 
@@ -1190,6 +1294,8 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_k_dsa * build_attn_inp_k_dsa() const;
+
+    llm_graph_input_attn_k_dsa_iswa * build_attn_inp_k_dsa_iswa() const;
 
     llm_graph_input_attn_kv_msa * build_attn_inp_kv_msa(bool msa_enabled) const;
 

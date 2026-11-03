@@ -8,6 +8,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <array>
 #include <list>
 #include <set>
 #include <sstream>
@@ -17,6 +18,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
@@ -271,7 +273,7 @@ struct common_params_sampling {
         COMMON_SAMPLER_TYPE_TEMPERATURE,
     };
 
-    common_grammar              grammar;      // optional grammar constraint (user / output-format / tool-calls)
+    common_grammar                      grammar;          // optional grammar constraint (user / output-format / tool-calls)
     bool                                grammar_lazy = false;
     std::vector<common_grammar_trigger> grammar_triggers; // optional triggers (for lazy grammars)
     std::set<llama_token>               preserved_tokens;
@@ -331,6 +333,8 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    std::vector<int32_t> vocab_ranges; // [begin, end) token id pairs a DFlash2 drafter may propose (empty = all)
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -370,6 +374,9 @@ struct common_params_speculative_ngram_cache {
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
+    double synth_len = -1.0;
+    std::vector<double> synth_rates;
+
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
@@ -382,6 +389,10 @@ struct common_params_speculative {
 
     bool has_dft() const {
         return !draft.mparams.empty();
+    }
+
+    bool has_synth() const {
+        return synth_len != -1.0 || !synth_rates.empty();
     }
 
     uint32_t need_n_rs_seq() const {
@@ -483,7 +494,7 @@ struct common_params {
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
 
-    enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; // on-demand reading of tensors marked by the arch
+    enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -591,6 +602,7 @@ struct common_params {
     ggml_type cache_type_v   = GGML_TYPE_F16; // KV cache data type for the V
     size_t moe_cache_size = 0; // persistent GPU MoE cache size in bytes
     bool   moe_cache_auto = true;
+    bool   moe_cache_auto_explicit = false; // user requested auto sizing on any supported backend
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -608,6 +620,11 @@ struct common_params {
     int mtmd_batch_max_tokens = 1024;
     int image_max_tiles = -1;  // override preproc_max_tiles from GGUF; -1 = use model default
     int image_no_upscale = -1; // override preproc_no_upscale from GGUF; -1 = use model default, 0 = off, 1 = on
+
+    // for video input
+    float       video_fps                   = 4.0f;
+    int64_t     video_timestamp_interval_ms = 5000;
+    std::string video_ffmpeg_bin_dir        = "";
 
     // finetune
     struct lr_opt lr;
@@ -632,13 +649,14 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+    int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
-    std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
+    std::vector<std::string> hostnames = {"127.0.0.1"};
     bool use_jinja = true;                                                                                  // NOLINT
 
     // server CORS params
@@ -663,6 +681,7 @@ struct common_params {
     std::string ssl_file_cert = "";                                                                         // NOLINT
 
     std::map<std::string, std::string> default_template_kwargs;
+    bool preserve_reasoning_specified = false;
 
     // CLI params
     std::string server_base; // if set, connect to this server instead of starting a new one
@@ -813,7 +832,9 @@ static std::vector<T> string_split(const std::string & str, char delim) {
     while (std::getline(str_stream, token, delim)) {
         T value;
         std::istringstream token_stream(token);
-        token_stream >> value;
+        if (!(token_stream >> value)) {
+            throw std::invalid_argument("invalid value: \"" + token + "\"");
+        }
         values.push_back(value);
     }
     return values;
@@ -881,9 +902,20 @@ void string_process_escapes(std::string & input);
 std::string string_from(bool value);
 std::string string_from(const std::vector<int> & values);
 std::string string_from(const struct llama_context * ctx, const std::vector<llama_token> & tokens);
-std::string string_from(const struct llama_context * ctx, const struct llama_batch & batch);
 
 bool glob_match(const std::string & pattern, const std::string & str);
+
+//
+// Unicode utils
+//
+
+#ifdef _WIN32
+std::wstring utf8_to_wstring(const std::string & str);
+std::string  wstring_to_utf8(const std::wstring & str);
+#endif
+
+// returns the path as a UTF-8 string, preserving its separators
+std::string fs_path_to_utf8(const std::filesystem::path & path);
 
 //
 // Environment utils
@@ -894,17 +926,19 @@ bool glob_match(const std::string & pattern, const std::string & str);
 std::string common_get_env(const std::string & name);
 void        common_set_env(const std::string & name, const std::string & value);
 
+// reads a path from the environment, an unset variable gives an empty path
+std::filesystem::path common_get_path_from_env(const std::string & name);
+
 //
 // Filesystem utils
 //
 
 bool fs_validate_filename(const std::string & filename, bool allow_subdirs = false);
-bool fs_create_directory_with_parents(const std::string & path);
 bool fs_is_directory(const std::string & path);
 
-std::string fs_get_cache_directory();
-std::string fs_get_cache_file(const std::string & filename);
-std::string fs_get_config_directory();
+std::filesystem::path fs_get_cache_directory();
+std::filesystem::path fs_get_cache_file(const std::string & filename);
+std::filesystem::path fs_get_config_directory();
 
 struct common_file_info {
     std::string path;
@@ -916,6 +950,8 @@ std::vector<common_file_info> fs_list(const std::string & path, bool include_dir
 
 // fs open, also handle UTF8 on Windows
 std::ifstream fs_open_ifstream(const std::string & fname, std::ios_base::openmode mode);
+
+void fs_write_atomic(const std::filesystem::path & path, const std::string & data);
 
 //
 // TTY utils
@@ -1037,6 +1073,55 @@ void common_batch_add(
     const std::vector<llama_seq_id> & seq_ids,
                                bool   logits);
 
+// wrapper around llama_batch_ext that provide getter functions for downstream code
+struct common_batch {
+    struct token {
+        llama_token  id;
+        std::array<llama_pos, GGML_MROPE_SECTIONS> pos; // only pos[0] is used for text tokens
+        llama_seq_id seq_id;
+        bool         output;
+        llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
+    };
+
+    std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
+    llama_batch_ext_ptr batch;
+
+    int32_t n_pos = 1; // positions per embedding entry, GGML_MROPE_SECTIONS for MROPE/IMROPE
+
+    common_batch() = default;
+    common_batch(struct llama_context * ctx);
+
+    llama_batch_ext * get() const { return batch.get(); }
+
+    // content type of the batch, all entries carry the same combination
+    bool has_token() const { return !tokens.empty() && tokens[0].id != LLAMA_TOKEN_NULL; }
+    bool has_embd () const { return !tokens.empty() && tokens[0].embd.data != nullptr; }
+
+    void clear();
+
+    // returns the batch index (>= 0), aborts if the entry cannot be added (batch full, invalid token or seq id)
+    int32_t add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool output);
+
+    bool set_output(int32_t idx, bool value);
+
+    // attach a token embedding to the entry at idx, can only be set once per entry
+    bool set_embd(int32_t idx, llama_embd embd);
+
+    // add an embedding-only entry (no token id), aborts like add() on failure
+    // pos points to n_pos positions
+    int32_t add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output);
+
+    int32_t size() const { return (int32_t) tokens.size(); }
+};
+
+// create a single-sequence batch from a list of tokens
+// last token always have output_logits set to true
+common_batch common_batch_get_one(struct llama_context * ctx, const llama_tokens & tokens);
+
+// convert a legacy llama_batch, applying its defaults: seq 0, positions continue from memory, last token is output
+// the embd rows are read at the model input width
+common_batch common_batch_from_llama_batch(struct llama_context * ctx, const llama_batch & batch);
+
 // decodes a single batch of tokens for a prompt and manages session tokens
 //
 // Note: We save state before the last token so that we can replay it to ensure
@@ -1044,7 +1129,7 @@ void common_batch_add(
 // tokens from memory, so this approach works across all model architectures.
 bool common_prompt_batch_decode(
               struct llama_context * ctx,
-    const std::vector<llama_token> & all_tokens,
+                const llama_tokens & all_tokens,
                                int   n_new,
                                int & n_past,
                                int   n_batch,

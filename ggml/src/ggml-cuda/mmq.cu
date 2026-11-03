@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_q_case<GGML_TYPE_Q1_0>(ctx, args, stream);
@@ -13,6 +13,14 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q2_0:
             mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, args, stream);
             break;
+        case GGML_TYPE_PQ2_0:
+            mul_mat_q_case<GGML_TYPE_PQ2_0>(ctx, args, stream);
+            break;
+#if !defined(GGML_USE_HIP)
+        case GGML_TYPE_PTQ1_0:
+            mul_mat_q_case<GGML_TYPE_PTQ1_0>(ctx, args, stream);
+            break;
+#endif
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
             break;
@@ -71,15 +79,65 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_MXFP4:
+            // src1 at Q4 uses the native FP4 instructions, which are Blackwell-only
+            if (prec_src1 == GGML_PREC_Q4) {
+                mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q4>(ctx, args, stream);
+                break;
+            }
             mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
             break;
         case GGML_TYPE_NVFP4:
+            if (prec_src1 == GGML_PREC_Q4) {
+                mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q4>(ctx, args, stream);
+                break;
+            }
             mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
             break;
         default:
             GGML_ABORT("fatal error");
             break;
     }
+}
+
+// overrides the src1 precision requested by the graph, "auto" keeps the requested one
+static ggml_prec ggml_cuda_mmq_get_prec_env() {
+    const char * env_c = getenv("GGML_CUDA_MMQ_PREC");
+    if (env_c == nullptr) {
+        return GGML_PREC_UNDEFINED;
+    }
+    std::string env_cpp = env_c;
+    for (char & c : env_cpp) {
+        c = std::tolower(c);
+    }
+    if (env_cpp == "q4") {
+        return GGML_PREC_Q4;
+    }
+    if (env_cpp == "q8") {
+        return GGML_PREC_Q8;
+    }
+    if (env_cpp != "auto") {
+        GGML_LOG_WARN("%s: Unknown value for GGML_CUDA_MMQ_PREC: '%s'. Available: 'q4', 'q8', 'auto'.\n", __func__, env_cpp.c_str());
+    }
+    return GGML_PREC_UNDEFINED;
+}
+
+// src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations, in which case they
+// default to the native W4A4 instructions on Blackwell.
+static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, const int cc) {
+    static const ggml_prec prec_env = ggml_cuda_mmq_get_prec_env();
+
+    ggml_prec prec = prec_env;
+    if (prec == GGML_PREC_UNDEFINED) {
+        prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
+    }
+
+    // Q4 only for the FP4 types on Blackwell
+    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
+    const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
+    if (prec == GGML_PREC_Q8 || !can_use_q4) {
+        return GGML_PREC_Q8;
+    }
+    return GGML_PREC_Q4;
 }
 
 void ggml_cuda_mul_mat_q(
@@ -128,7 +186,9 @@ void ggml_cuda_mul_mat_q(
 
     const bool fallback = ne01 % 128 != 0;
 
-    const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
+    const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
+
+    const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
@@ -171,8 +231,8 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
-        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+            ne1, ne1};
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
 
@@ -244,6 +304,13 @@ void ggml_cuda_mul_mat_q(
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
+    // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+    // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+    int64_t ncols_opt = ne12;
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+        ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+    }
+
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
@@ -251,9 +318,9 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        ne12, ncols_opt};
 
-    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
@@ -264,8 +331,14 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     bool mmq_supported;
 
     switch (type) {
+#if !defined(GGML_USE_HIP)
+        case GGML_TYPE_PTQ1_0:
+            mmq_supported = turing_mma_available(cc);
+            break;
+#endif
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_PQ2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -309,12 +382,20 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         }
     }
 
+#if !defined(GGML_USE_HIP)
+    if (type == GGML_TYPE_PTQ1_0) {
+        return true;
+    }
+#endif
+
     if (turing_mma_available(cc)) {
         return true;
     }
 
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
-        return false;
+        // for MoE, mmq is faster even without native dp4a
+        // TODO: check if cards older than pascal might benefit from this as well
+        return cc >= GGML_CUDA_CC_PASCAL && n_experts > 0;
     }
 
 #ifdef GGML_CUDA_FORCE_MMQ
@@ -353,6 +434,24 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                 return true;
             }
 
+            // RDNA3.5 (gfx1151): with the HIP 7.15 (ROCm 10.0) BLAS libraries, dequantization + hipBLAS outpaces
+            //     Q8_0 MMQ above 512 rows. Qwen3.8-27B Q8_0 prefill: pp1024 291 -> 320 t/s, pp2048 308 -> 354 t/s; at
+            //     pp512 MMQ is still as fast or faster. With HIP 7.2 (ROCm 7.2.2) hipBLAS is slower instead (pp2048
+            //     317 -> 288 t/s), so older HIP keeps MMQ. GGML_CUDA_RDNA3_5_Q8_0_MMQ_MAX overrides the row limit.
+            if (GGML_CUDA_CC_IS_RDNA3_5(cc) && type == GGML_TYPE_Q8_0 && n_experts == 0) {
+                // static storage: MSVC rejects reading a block-scope constexpr in a capture-less lambda (C3493)
+#if defined(GGML_USE_HIP) && HIP_VERSION >= 71500000
+                static constexpr int64_t q8_0_mmq_max_default = 512;
+#else
+                static constexpr int64_t q8_0_mmq_max_default = INT64_MAX;
+#endif // defined(GGML_USE_HIP) && HIP_VERSION >= 71500000
+                static const int64_t q8_0_mmq_max = [] {
+                    const char * env = getenv("GGML_CUDA_RDNA3_5_Q8_0_MMQ_MAX");
+                    return env ? (int64_t) atoll(env) : q8_0_mmq_max_default;
+                }();
+                return ne11 <= q8_0_mmq_max;
+            }
+
             // For some quantization types MMQ can have lower peak TOPS than hipBLAS
             //     so it's only faster for sufficiently small batch sizes:
             switch (type) {
@@ -373,11 +472,16 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return true;
     }
 
-    // gfx900 (Vega 10) lacks native dp4a, loses to dequant + hipBLAS
+    // gfx900 (Vega 10), gfx909, and gfx90c lack native dp4a, losing to dequant + hipBLAS
     // for dense matrices; keep MMQ only for MoE, where the
     // hipBLAS path is much slower.
-    if (cc == GGML_CUDA_CC_VEGA) {
+    if (cc == GGML_CUDA_CC_VEGA || GGML_CUDA_CC_IS_GCN_APU(cc)) {
         return n_experts > 0;
+    }
+
+    // MUSA: the MMQ kernels compute wrong values on PH1 (MTT S5000).
+    if (cc == GGML_CUDA_CC_PH1) {
+        return false;
     }
 
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;

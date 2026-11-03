@@ -2,8 +2,10 @@
 
 #pragma once
 
+#include "ggml.h"
+
 #include <stdbool.h>
-#include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,6 +13,7 @@ extern "C" {
 
 struct ggml_tensor;
 struct ggml_cgraph;
+struct ggml_metal_device_props;
 
 enum ggml_mem_range_type {
     MEM_RANGE_TYPE_SRC = 0,
@@ -42,19 +45,51 @@ bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const struct ggml_tensor * tenso
 // - new dst range overlaps with any existing range (src or dst)
 bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const struct ggml_tensor * tensor);
 
-// reorder the nodes in the graph to improve concurrency, while respecting fusion
+// reorder the nodes in the graph to improve concurrency, while respecting the fusions of a device with props
 //
 // note: this implementation is generic and not specific to metal
 //       if it proves to work well, we can start using it for other backends in the future
-void ggml_graph_optimize(struct ggml_cgraph * gf);
+void ggml_graph_optimize(struct ggml_cgraph * gf, const struct ggml_metal_device_props * props);
 
-// match gated_delta_net + the strided cpy that scatters state snapshots into the cache.
-// returns extra graph nodes after the gdn (0 if no match). cache/slot_stride may be NULL.
-int ggml_metal_try_gdn_cache_fusion(
-        const struct ggml_cgraph * gf,
-        int node_idx,
-        const struct ggml_tensor ** cache,
-        int64_t * slot_stride);
+// mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
+bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg_mem);
+bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
+bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
+
+// the activation and the sign vector of the sign MUL of a signed FWHT: x has the shape of the MUL. with one row both
+// operands do and x is src[0]; the FWHT then reads both at the same offsets, so their order does not change the product
+struct ggml_metal_fwht_operands {
+    const struct ggml_tensor * x;
+    const struct ggml_tensor * signs;
+};
+struct ggml_metal_fwht_operands ggml_metal_fwht_signed_operands(const struct ggml_tensor * mul);
+
+// the few-row MMA kernel for a src0 type and rt src1 tiles: per 32-weight block (q4_0, q8_0 with one tile), q5_K, pq2_0, or the generic 64-weight chunk kernel
+enum ggml_metal_mma_kind { GGML_METAL_MMA_KIND_BLK, GGML_METAL_MMA_KIND_Q5_K, GGML_METAL_MMA_KIND_PQ2_0, GGML_METAL_MMA_KIND_GEN };
+enum ggml_metal_mma_kind ggml_metal_mul_mv_mma_kind(enum ggml_type type, int rt);
+// the src1 tiles of the few-row MMA kernels for mat-mul op: one 8-row tile, or two above 8 rows
+int ggml_metal_mul_mv_mma_rt(const struct ggml_tensor * op);
+// the weights of K per simdgroup step of the few-row MMA kernel for a src0 type and rt src1 tiles, 0 if none takes the type
+int64_t ggml_metal_mul_mv_mma_k_step(enum ggml_type type, int rt);
+
+// true if the few-row MMA kernels take mat-mul op on a device with these properties. they fill simdgroup matrices
+// per lane, so they need a GPU with native simdgroup matrices (MTLGPUFamilyApple7+), not one enabled by the probe
+bool ggml_metal_mul_mat_use_mma(const struct ggml_tensor * op, bool has_native_simdgroup_mm, bool has_tensor);
+// true if the device, the hadamard hint and the types allow the few-row MMA kernels for mat-mul op. it reads no shapes or
+// strides, so a decision based on it is the same for every batch size, and use_mma can still reject the op
+bool ggml_metal_mul_mat_may_use_mma(const struct ggml_tensor * op, bool has_native_simdgroup_mm, bool has_tensor);
+// true if the 2-row Q4_0 kernel takes mat-mul op instead of the MMA kernels
+bool ggml_metal_mul_mat_use_nc(const struct ggml_tensor * op);
+// true if the types and the hadamard hint of mat-mul op allow a mat-vec kernel that adds a residual in its store. it
+// reads no shapes, like ggml_metal_mul_mat_may_use_mma
+bool ggml_metal_mul_mat_mv_may_add(const struct ggml_tensor * op);
+// true if mat-mul op runs on a mat-vec kernel that can add a residual in its store (one src1 row)
+bool ggml_metal_mul_mat_mv_use_add(const struct ggml_tensor * op);
+// the f32 operand that f32 add sums with mat-mul mm, if mm is exactly one of its operands and the other one is not a
+// weight (a bias), else NULL. it reads no shapes, so it gives the same answer for every batch size
+const struct ggml_tensor * ggml_metal_mul_mat_add_operand(const struct ggml_tensor * mm, const struct ggml_tensor * add);
+// the operand of ggml_metal_mul_mat_add_operand if it is a same-shape contiguous residual of mm, else NULL
+const struct ggml_tensor * ggml_metal_mul_mat_add_residual(const struct ggml_tensor * mm, const struct ggml_tensor * add);
 
 #ifdef __cplusplus
 }

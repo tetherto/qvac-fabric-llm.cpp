@@ -4,8 +4,8 @@ include(CheckIncludeFileCXX)
 
 ### llama.cpp version
 set(LLAMA_VERSION_MAJOR 0)
-set(LLAMA_VERSION_MINOR 1)
-set(LLAMA_VERSION_PATCH 2)
+set(LLAMA_VERSION_MINOR 5)
+set(LLAMA_VERSION_PATCH 0)
 set(LLAMA_VERSION_BASE "${LLAMA_VERSION_MAJOR}.${LLAMA_VERSION_MINOR}.${LLAMA_VERSION_PATCH}")
 
 # whether this is a development/nightly build
@@ -135,8 +135,8 @@ option(LLAMA_BUILD_TOOLS     "llama: build tools"                               
 option(LLAMA_BUILD_EXAMPLES  "llama: build examples"                                                             ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER    "llama: build server example"                                                       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       ON)
-option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available (requires LLAMA_BUILD_UI=ON)" ON)
+option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       OFF)
+option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available" ON)
 
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
@@ -202,6 +202,16 @@ llama_option_depr(WARNING     LLAMA_CURL)
 
 include("cmake/license.cmake")
 license_add_file("llama.cpp" "LICENSE")
+
+#
+# compile options
+#
+
+# clang stores the modification time of the precompiled header sources inside the
+# header and rejects it when they differ, so the timestamp is left out of it
+add_compile_options(
+    "$<$<COMPILE_LANG_AND_ID:C,Clang,IntelLLVM>:SHELL:-Xclang -fno-pch-timestamp>"
+    "$<$<COMPILE_LANG_AND_ID:CXX,Clang,IntelLLVM>:SHELL:-Xclang -fno-pch-timestamp>")
 
 #
 # 3rd-party
@@ -360,6 +370,12 @@ if (LLAMA_MTMD AND TARGET mtmd)
   install(
       TARGETS vendor-hash miniaudio stb
       EXPORT llama-targets)
+
+  # Consumers that inspect images before mtmd decodes them need the same stb
+  # parser, so ship the header the exported stb target points at.
+  install(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/vendor/stb/stb_image.h
+    DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/stb)
 
   if (NOT LLAMA_BUILD_COMMON) # otherwise already exported above
     install(TARGETS sheredom EXPORT llama-targets)

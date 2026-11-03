@@ -7,6 +7,7 @@ On Linux: runs test-backend-ops directly via run_linux.sh (BASH framework).
 """
 
 import os
+import re
 import sys
 
 import pytest
@@ -14,7 +15,7 @@ import pytest
 from utils import (
     BIN_PATH,
     push_bundle_if_needed,
-    run_script,
+    run_snapdragon,
     write_qdc_log,
 )
 
@@ -31,16 +32,37 @@ def test_backend_ops_htp0(type_a):
     else:
         pattern = f"type_a={type_a}"
 
-    quoted_pattern = f'"{pattern}"' if type_a == "q4_0" else pattern
-    result = run_script(
-        "run-tool.sh",
-        extra_env={"HB": "0"},
-        extra_args=["test-backend-ops", "-b", "HTP0", "-o", "MUL_MAT", "-p", quoted_pattern],
+    result = run_snapdragon(
+        ["test-backend-ops", "-b", "HTP0", "-o", "MUL_MAT", "-p", pattern],
     )
     write_qdc_log(f"backend_ops_{type_a}.log", result.stdout or "")
     assert result.returncode == 0, (
         f"test-backend-ops type_a={type_a} failed (exit {result.returncode})"
     )
+
+
+def test_backend_ops_snake_htp0():
+    result = run_snapdragon(["test-backend-ops", "-b", "HTP0", "-o", "SNAKE"])
+    output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout or "")
+    write_qdc_log("backend_ops_snake.log", result.stdout or "")
+    assert result.returncode == 0, f"SNAKE failed (exit {result.returncode})"
+    assert re.search(r"Backend HTP0: OK", output), "HTP0 did not complete successfully"
+    assert re.search(r"^\s*SNAKE\(.*\): OK$", output, re.MULTILINE), "No SNAKE case passed on HTP0"
+    assert not re.search(r"^\s*SNAKE\(.*\): not supported", output, re.MULTILINE), "SNAKE cases were skipped"
+
+
+SPEECH_OPS = ("DEPTHWISE_CONV_1D", "COL2IM_1D", "CONV_2D_DW", "IM2COL", "MUL_MAT", "TIMESTEP_EMBEDDING", "GELU_ERF", "GET_ROWS", "CPY", "FLASH_ATTN_EXT")
+
+
+def test_backend_ops_speech_htp0():
+    result = run_snapdragon(["test-backend-ops", "-b", "HTP0", "-p", "suite=speech_htp,"])
+    output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout or "")
+    write_qdc_log("backend_ops_speech.log", result.stdout or "")
+    assert result.returncode == 0, f"Speech ops failed (exit {result.returncode})"
+    assert re.search(r"Backend HTP0: OK", output), "HTP0 did not complete successfully"
+    assert not re.search(r"suite=speech_htp,.*: not supported", output), "Speech cases were skipped"
+    for op in SPEECH_OPS:
+        assert re.search(rf"^\s*{op}\(suite=speech_htp,.*\): OK$", output, re.MULTILINE), f"No {op} speech case passed on HTP0"
 
 
 if __name__ == "__main__":

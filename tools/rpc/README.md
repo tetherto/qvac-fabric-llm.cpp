@@ -128,9 +128,27 @@ By default, the cache is stored in the `$HOME/.cache/llama.cpp/rpc` directory an
 
 ### RDMA transport
 
-On Linux systems with RoCEv2-capable NICs (e.g. Mellanox ConnectX), the RPC backend can use RDMA instead of TCP for lower latency and higher throughput. The transport is negotiated automatically -- no changes to command-line usage are required.
+The RPC backend can use RDMA instead of TCP for lower latency and higher throughput. The transport is negotiated during the initial handshake -- no changes to command-line usage are required, and the connection falls back to TCP unless both peers can use RDMA.
 
-RDMA is enabled by default when `libibverbs` is found at build time.
+Two providers are supported, each enabled by default when its library is found at build time:
+
+- **Linux**: RoCEv2-capable NICs (e.g. Mellanox ConnectX), via `libibverbs`. Shared builds load `libibverbs.so.1` at runtime, so a host without it still runs RPC over TCP. Static builds link it.
+- **macOS**: RDMA over Thunderbolt on Apple silicon Macs with Thunderbolt 5, via `librdma`. Requires macOS 26.2 or later, with RDMA enabled once from macOS Recovery via `rdma_ctl enable`. See [TN3205](https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt).
+
+RDMA is point-to-point, so each side uses the local device whose GID matches the address the connection was made on. Connect over the RDMA-capable link -- with Thunderbolt, use the peer's Thunderbolt address in `--rpc`; a connection made over another interface stays on TCP.
+
+To force plain TCP without rebuilding, set `GGML_RPC_NO_RDMA` on either peer:
+```bash
+$ GGML_RPC_NO_RDMA=1 bin/ggml-rpc-server
+```
+
+The `transport` line the server prints at startup shows which applies:
+
+- `TCP (RDMA auto-negotiate enabled)`: the RDMA library loaded and lists at least one RDMA device, so each connection tries RDMA.
+- `TCP (RDMA unavailable)`: the RDMA library is missing or incomplete, or the host has no RDMA device.
+- `TCP (RDMA disabled by GGML_RPC_NO_RDMA)`: RDMA was turned off on purpose.
+
+On Linux, after 100 ms without a completion, the transport waits for a completion event so an idle connection does not keep a CPU core busy.
 
 ### Direct all-reduce
 
@@ -144,7 +162,7 @@ Allow the communication port through the firewall and ensure that the servers ca
 
 #### Testing direct all-reduce
 
-Graph and collective commands are queued asynchronously; synchronization and readback report deferred transport failures. While a direct communicator is active, its client dispatchers busy-poll to reduce command latency. This trades CPU time for lower dispatch latency. Set `GGML_RPC_NO_BUSY_SPIN=1` on the main host to use sleeping dispatchers for an A/B comparison. Polling stops when the last shared communicator handle is released.
+Graph and collective commands are queued asynchronously; synchronization and readback report deferred transport failures. While a direct communicator is active, its client dispatchers busy-poll for up to 100 ms after a command, then sleep until the next command. Set `GGML_RPC_NO_BUSY_SPIN=1` on the main host to use sleeping dispatchers throughout for an A/B comparison.
 
 The local test runner starts isolated CPU RPC servers; it needs Python 3 but no GPU or model:
 

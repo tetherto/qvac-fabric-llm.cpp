@@ -213,7 +213,9 @@ set_target_properties(ggml-base PROPERTIES
     SOVERSION ${GGML_VERSION_MAJOR}
 )
 
-target_include_directories(ggml-base PRIVATE .)
+configure_file(ggml-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/ggml-version.h @ONLY)
+
+target_include_directories(ggml-base PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()
@@ -365,6 +367,10 @@ if (GGML_OPENMP_ENABLED)
     target_link_libraries(ggml-base PRIVATE ${GGML_OPENMP_TARGET_C} ${GGML_OPENMP_TARGET_CXX})
 endif()
 
+if (DEFINED GGML_MAX_NAME)
+    target_compile_definitions(ggml-base PUBLIC GGML_MAX_NAME=${GGML_MAX_NAME})
+endif()
+
 add_library(ggml
             ggml-backend-dl.cpp
             ggml-backend-reg.cpp)
@@ -392,9 +398,22 @@ if (GGML_VECTOR_INDEX)
     add_subdirectory(ggml-vector-index)
 endif()
 
+# Windows with a static ggml-base: GGML_API exports nothing, so a backend module does not export the logger
+# functions that the loader uses to forward its log lines (ggml-backend-reg.cpp). Export them with the linker.
+# MinGW ld has no /EXPORT, so it is not covered.
+function(ggml_backend_export_log_functions target)
+    if (WIN32 AND NOT BUILD_SHARED_LIBS AND (MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC"))
+        target_link_options(${target} PRIVATE
+            "LINKER:/EXPORT:ggml_log_set"
+            "LINKER:/EXPORT:ggml_log_get"
+            "LINKER:/EXPORT:ggml_log_callback_default")
+    endif()
+endfunction()
+
 function(ggml_add_backend_library backend)
     if (GGML_BACKEND_DL)
         add_library(${backend} MODULE ${ARGN})
+        ggml_backend_export_log_functions(${backend})
         # write the shared library to the output directory
         # Set output name with qvac- prefix to match backend_filename_prefix() in ggml-backend-reg.cpp
         set_target_properties(${backend} PROPERTIES
@@ -671,6 +690,8 @@ if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
     foreach (target ${GGML_CORE_TARGETS})
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)
-        target_compile_definitions(${target} PUBLIC  GGML_SHARED)
+        if (BUILD_SHARED_LIBS OR NOT WIN32)
+            target_compile_definitions(${target} PUBLIC  GGML_SHARED)
+        endif()
     endforeach()
 endif()

@@ -1,5 +1,18 @@
 cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
+# ARM64EC uses the x64 ABI, so it needs the x64 import libraries. The arm64 ones
+# hold native ARM64 symbols and cannot satisfy EC references at link time.
+# FindCUDAToolkit picks the library dir from the host arch, not the target, so
+# anchor its search at lib/x64 here. It derives everything else from CUDA_CUDART.
+string(TOLOWER "${CMAKE_GENERATOR_PLATFORM}" GGML_CUDA_PLATFORM_LWR)
+if (MSVC AND GGML_CUDA_PLATFORM_LWR STREQUAL "arm64ec")
+    find_library(CUDA_CUDART
+        NAMES cudart
+        HINTS ${CUDAToolkit_ROOT} ENV CUDA_PATH
+        PATH_SUFFIXES lib/x64
+    )
+endif()
+
 find_package(CUDAToolkit)
 
 if (CUDAToolkit_FOUND)
@@ -113,17 +126,8 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
-    if (GGML_CUDA_FA_ALL_QUANTS)
-        file(GLOB   SRCS "template-instances/fattn-vec*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-    else()
-        list(APPEND GGML_SOURCES_CUDA
-            template-instances/fattn-vec-instance-f16-f16.cu
-            template-instances/fattn-vec-instance-q4_0-q4_0.cu
-            template-instances/fattn-vec-instance-q8_0-q8_0.cu
-            template-instances/fattn-vec-instance-bf16-bf16.cu)
-    endif()
+    ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
     if (GGML_CUDA_CUTLASS)
         if (CUDAToolkit_VERSION VERSION_LESS "12.9")
@@ -151,7 +155,12 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
-    add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
+    # A second CUDA build, such as a CUDA 12 module next to a CUDA 13 one, needs
+    # its own file name. The loader still finds it by the qvac-ggml-cuda prefix.
+    if (GGML_BACKEND_DL AND GGML_CUDA_MODULE_SUFFIX)
+        set_target_properties(ggml-cuda PROPERTIES OUTPUT_NAME "qvac-ggml-cuda${GGML_CUDA_MODULE_SUFFIX}")
+    endif()
+
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)

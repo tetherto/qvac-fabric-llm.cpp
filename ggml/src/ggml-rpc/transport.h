@@ -16,8 +16,14 @@ struct socket_t {
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
     bool exchange_data(const void * send_data, void * recv_data, size_t size);
+    // Must be called at every message boundary: the RDMA transport coalesces
+    // writes into fixed-size frames and posts the trailing partial frame only
+    // here. No-op on TCP.
+    bool flush();
     bool set_timeout(int timeout_ms);
     void shutdown();
+    // Port the socket is bound to, or -1 on error.
+    int local_port() const;
 
     socket_ptr accept(int timeout_ms = -1, bool * timed_out = nullptr);
 
@@ -35,3 +41,7 @@ private:
 
 bool rpc_transport_init();
 void rpc_transport_shutdown();
+
+// True when new connections will try RDMA: the RDMA library loaded, it lists an
+// RDMA device, and GGML_RPC_NO_RDMA is unset. They fall back to TCP when RDMA fails.
+bool rpc_transport_rdma_available();

@@ -14,6 +14,8 @@
 #define N_MM_SIMD_GROUP_X 2
 #define N_MM_SIMD_GROUP_Y 2
 
+#define N_MM_NPART_AMAX 256
+
 // kernel parameters for mat-vec threadgroups
 //
 // N_R0: number of src0 rows to process per simdgroup
@@ -27,8 +29,18 @@
 #define N_R0_Q2_0 8
 #define N_SG_Q2_0 2
 
+#define N_R0_PQ2_0 8
+#define N_SG_PQ2_0 2
+// glu holds 2 accs per row
+#define N_R0_PQ2_0_GLU 2
+#define N_R0_PTQ1_0 5
+#define N_R0_PTQ1_0_R4 4
+#define N_R0_PTQ1_0_ID 4
+#define N_SG_PTQ1_0 1
+
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
+#define N_NC_Q4_0 2 // src1 rows of kernel_mul_mv_q4_0_f32_nc
 // glu holds 2 accs per row, so use fewer rows per simdgroup
 #define N_R0_Q4_0_GLU 1
 
@@ -44,7 +56,7 @@
 #define N_R0_Q8_0 2
 #define N_SG_Q8_0 4
 
-#define N_R0_MXFP4 2
+#define N_R0_MXFP4 4
 #define N_SG_MXFP4 2
 
 #define N_R0_Q2_K 4
@@ -64,24 +76,31 @@
 
 #define N_R0_IQ1_S 4
 #define N_SG_IQ1_S 2
+#define N_R0_IQ1_S_SPLIT 8
 
 #define N_R0_IQ1_M 4
 #define N_SG_IQ1_M 2
+#define N_R0_IQ1_M_SPLIT 8
 
 #define N_R0_IQ2_XXS 4
 #define N_SG_IQ2_XXS 2
+#define N_R0_IQ2_XXS_SPLIT 8
 
 #define N_R0_IQ2_XS 4
 #define N_SG_IQ2_XS 2
+#define N_R0_IQ2_XS_SPLIT 8
 
 #define N_R0_IQ2_S 4
 #define N_SG_IQ2_S 2
+#define N_R0_IQ2_S_SPLIT 8
 
 #define N_R0_IQ3_XXS 4
 #define N_SG_IQ3_XXS 2
+#define N_R0_IQ3_XXS_SPLIT 8
 
 #define N_R0_IQ3_S 4
 #define N_SG_IQ3_S 2
+#define N_R0_IQ3_S_SPLIT 8
 
 #define N_R0_IQ4_NL 2
 #define N_SG_IQ4_NL 2
@@ -109,6 +128,13 @@
 #define FC_SUM_ROWS                    1400
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
+#define FC_NORM                        1700
+#define FC_TOPK_MOE                    1800
+#define FC_MOE_REDUCE                  1900
+#define FC_DSV4_HC                     2000
+#define FC_PAD                         2100
+#define FC_MUL_MV_MMA                  2200
+#define FC_GATED_DELTA_NET_DEFERRED    2300
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -116,6 +142,7 @@
 
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
+#define OP_FLASH_ATTN_EXT_VEC_NHPTG_MAX 4
 
 #define OP_LIGHTNING_INDEXER_DK    128
 #define OP_LIGHTNING_INDEXER_NH     64
@@ -160,6 +187,10 @@
 #define OP_SUM_ROWS_NUM_SUM_ROWS 10
 #define OP_SUM_ROWS_NUM_MEAN     11
 
+#define OP_SSM_SCAN_SSD_CS  64 // Metal-specific; Chunk Size; 64 is largest multiple of 8 (simdgroup tile) fitting into 32 KiB Metal threadgroup mem limit (~26.75 KiB shared mem; see smem layout comment in kernel_ssm_scan_ssd_mma_f32)
+#define OP_SSM_SCAN_SSD_HD  64 // Metal-specific; Head Dim the MMA kernel is specialized for (Mamba-2); use_mma gates on d_inner == this
+#define OP_SSM_SCAN_SSD_NSG 4  // Metal-specific; Number of SimdGroups per threadgroup; NSG*32 == threads dispatched per threadgroup
+
 // kernel argument structs
 //
 // - element counters (e.g. ne00) typically use int32_t to reduce register usage
@@ -193,6 +224,7 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
     int32_t  dim;
+    int32_t  nc0;
 } ggml_metal_kargs_concat;
 
 typedef struct {
@@ -297,6 +329,15 @@ typedef struct {
     uint64_t nb3;
 } ggml_metal_kargs_cpy;
 
+#define GGML_METAL_CPY_BATCH_MAX 16
+
+// consecutive copies with one layout, each shifted by a byte offset in the source and in the destination
+typedef struct {
+    ggml_metal_kargs_cpy cpy;
+    int64_t dsrc[GGML_METAL_CPY_BATCH_MAX];
+    int64_t ddst[GGML_METAL_CPY_BATCH_MAX];
+} ggml_metal_kargs_cpy_batch;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;
@@ -374,6 +415,29 @@ typedef struct {
     bool     inplace;
     float    sin_sign;
 } ggml_metal_kargs_rope;
+
+// fused RMS_NORM + MUL + ROPE (+ SET_ROWS): the rows are normalized, weighted and rotated over their full width
+typedef struct {
+    int32_t  ne00;     // row width: the norm width and the RoPE dims
+    int32_t  ne01;     // rows per token (heads)
+    int32_t  ne02;     // tokens
+    uint64_t nb01;     // src row stride
+    uint64_t nb02;     // src token stride
+    uint64_t nb1;      // dst row stride
+    uint64_t nb2;      // dst token stride
+    uint64_t nb_set;   // set_rows: dst stride per row index
+    float    eps;
+    int32_t  n_ctx_orig;
+    float    freq_base;
+    float    freq_scale;
+    float    ext_factor;
+    float    attn_factor;
+    float    beta_fast;
+    float    beta_slow;
+    bool     src2;     // RoPE frequency factors
+    bool     set_rows; // write each token to the dst row given by the indices instead of its own row
+    bool     idx_i32;  // the indices are i32, else i64
+} ggml_metal_kargs_norm_rope;
 
 typedef struct {
     int32_t  ne0;
@@ -484,7 +548,20 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  n_kv_max_padded;
 } ggml_metal_kargs_flash_attn_ext_vec;
+
+typedef struct {
+    int32_t  ne30;
+    int32_t  ne31;
+    int32_t  ne32;
+    int32_t  ne33;
+    uint64_t nb31;
+    uint64_t nb32;
+    uint64_t nb33;
+    int32_t  n_kv_max;
+    int32_t  n_kv_max_padded;
+} ggml_metal_kargs_flash_attn_ext_vec_idx;
 
 typedef struct {
     int32_t  nrows;
@@ -527,6 +604,7 @@ typedef struct {
     int32_t  nr0;
     int16_t  r2;
     int16_t  r3;
+    float    eps; // fused RMS_NORM (FC_mul_mv_norm)
 } ggml_metal_kargs_mul_mv;
 
 typedef struct {
@@ -560,6 +638,14 @@ typedef struct {
     int32_t  ne20;  // n_expert_used
     uint64_t nb21;
 } ggml_metal_kargs_mul_mm_id_map0;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    uint64_t nb01;
+    uint64_t nb02;
+} ggml_metal_kargs_mul_mm_id_amax;
 
 typedef struct {
     int32_t  ne00;
@@ -610,6 +696,10 @@ typedef struct {
     uint64_t nbs2;
 } ggml_metal_kargs_mul_mv_id;
 
+// epilogues of the fused rms_norm kernel, with the arithmetic of the unfused kernels
+#define GGML_METAL_NORM_EPI_NONE      0
+#define GGML_METAL_NORM_EPI_SILU_GATE 1 // silu(g)*y (UNARY(SILU) + MUL)
+
 // NORM
 // RMS_NORM
 typedef struct {
@@ -625,6 +715,8 @@ typedef struct {
     uint64_t nbf1[3];
     uint64_t nbf2[3];
     uint64_t nbf3[3];
+    float    scale;
+    float    bias;
 } ggml_metal_kargs_norm;
 
 typedef struct {
@@ -793,6 +885,7 @@ typedef struct {
 typedef struct {
     int32_t T;
     int32_t C;
+    int64_t ne; // T * C, kept 64-bit so a 2^31-element activation does not wrap
 } ggml_metal_kargs_snake;
 
 typedef struct {
@@ -806,6 +899,7 @@ typedef struct {
     uint64_t nb0;
     uint64_t nb1;
     uint64_t nb2;
+    uint64_t nb3;
 } ggml_metal_kargs_conv_transpose_2d;
 
 typedef struct {
@@ -1040,7 +1134,6 @@ typedef struct {
     uint64_t nb00;
     uint64_t nb01;
     uint64_t nb02;
-    int64_t  ne10;
     int64_t  ne11;
     uint64_t nb10;
     uint64_t nb11;
@@ -1058,6 +1151,8 @@ typedef struct {
     int64_t  n_head;
     int64_t  n_group;
     int64_t  n_seq_tokens;
+    int64_t  n_seq_tokens_total;
+    int64_t  token_offset;
     int64_t  n_seqs;
     int64_t  K;
     uint64_t s_off;
@@ -1123,9 +1218,53 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
-    uint64_t ns_cache;
-    int32_t  fuse_cache;
+    uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
 } ggml_metal_kargs_gated_delta_net;
+
+typedef struct {
+    int32_t  ne01; // q heads
+    int32_t  ne11; // k heads
+    int32_t  ne21; // v heads
+    int32_t  ne22; // n_tokens
+    int32_t  ne23; // n_seqs
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    uint64_t nb31; // gate strides
+    uint64_t nb32;
+    uint64_t nb33;
+    uint64_t nb41; // beta strides
+    uint64_t nb42;
+    uint64_t nb43;
+    uint64_t nb51; // state strides
+    uint64_t nb52;
+    uint64_t nb53;
+    uint64_t nb61; // record row stride
+    int32_t  rec_v; // record offsets (floats)
+    int32_t  rec_g;
+    int32_t  rec_b;
+    int32_t  fused; // 1 => the new base is written to dst_fuse (the recurrent cache)
+    int32_t  gates; // 1 => g and beta are raw: g = softplus(g + dt) * a, beta = sigmoid(beta)
+} ggml_metal_kargs_gated_delta_net_deferred;
+
+typedef struct {
+    int32_t  C;        // channels
+    int32_t  n_tokens;
+    int32_t  K;        // history keeps K + 3 columns
+    int32_t  n_norm;   // leading heads that get L2-normalized
+    float    eps;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb1;      // dst
+    uint64_t nb2;
+    uint64_t nb_h1;    // history row stride
+} ggml_metal_kargs_gdn_conv_deferred;
 
 typedef struct {
     int32_t  ne00;
@@ -1245,6 +1384,10 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    int32_t  lp0;
+    int32_t  lp1;
+    int32_t  lp2;
+    int32_t  lp3;
 } ggml_metal_kargs_pad;
 
 typedef struct {
@@ -1349,9 +1492,63 @@ typedef struct {
     int32_t  len;
 } ggml_metal_kargs_argsort_merge;
 
+// Use one threadgroup per FWHT row for folded model widths.
+#define GGML_METAL_FWHT_TG_MIN_N 512
+#define GGML_METAL_FWHT_TG_NT    256
+#define GGML_METAL_FWHT_TG_NT_FALLBACK 128
+
+typedef struct {
+    int32_t  ne00;   // number of columns (elements per row)
+    int32_t  ne01;   // rows
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb01;   // row stride in src0
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  top_k;  // k
+} ggml_metal_kargs_top_k;
+
+// widths at or above this use the threadgroup FWHT kernel, one row per threadgroup
+// with GGML_METAL_FWHT_TG_NT threads, instead of one row per simdgroup
+#define GGML_METAL_FWHT_TG_MIN_N 512
+#define GGML_METAL_FWHT_TG_NT    256
+
+typedef struct {
+    int32_t  ne01;      // n_tokens
+    uint64_t nb01;      // logits row stride
+    uint64_t nb1_ids;   // ids row stride
+    float    clamp;
+    float    scale;
+} ggml_metal_kargs_topk_moe;
+
+typedef struct {
+    int32_t ne00; // n_embd
+    int32_t ne02; // n_tokens
+} ggml_metal_kargs_moe_reduce;
+
 typedef struct {
     int32_t nrows;
+    int32_t n_blk;
 } ggml_metal_kargs_fwht;
+
+typedef struct {
+    int32_t ne00;       // row width
+    int32_t n_blk;      // FWHT blocks per row
+    float   eps;
+    int32_t write_norm; // also store the weighted norm, which has other consumers
+} ggml_metal_kargs_rms_norm_fwht;
+
+typedef struct {
+    int32_t  nrows;
+    int32_t  n_blk;
+    int32_t  ne0;   // shape of the CONT source view: CONT copies in source element order, whatever its own shape
+    int32_t  ne1;
+    int32_t  ne2;
+    uint64_t nb0;   // byte strides of the CONT source view
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_fwht_gather;
 
 typedef struct {
     int64_t  ne0;
@@ -1401,8 +1598,10 @@ typedef struct {
     uint64_t nb_x2;
     uint64_t nb_w0;
     uint64_t nb_w1;
+    uint64_t nb_w2;
     uint64_t nb_d0;
     uint64_t nb_d1;
+    float    scale;
 } ggml_metal_kargs_dsv4_hc_pre;
 
 typedef struct {
@@ -1479,12 +1678,107 @@ typedef struct {
 } ggml_metal_kargs_silu_back;
 
 typedef struct {
-    int32_t n_rows;
-    int32_t n_experts;
-    int32_t n_expert_used;
-    int32_t with_norm;
-    float   clamp_val;
-    float   scale_val;
-} ggml_metal_kargs_topk_moe;
+    int32_t H;           // hidden size
+    int32_t N;           // batch (columns)
+    int32_t prev_row;    // elements per column of the previous state: H, or 2H when masked
+    int32_t c_base;      // where c starts inside a previous-state column
+    int32_t mask_stride; // 0 broadcasts a single mask entry over every column
+} ggml_metal_kargs_lstm_cell;
+
+
+typedef struct {
+    int32_t n_dur;       // entries in the duration table
+    int32_t blank_id;
+    int32_t max_symbols; // symbols allowed at one encoder frame
+    int32_t rnnt;        // 1 = no duration head, advance one frame
+} ggml_metal_kargs_tdt_step;
+
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    int32_t K;
+    int32_t dilation;
+    int32_t has_bias;
+    int32_t causal;   // 0 = symmetric edge-clamp (vector_estimator), 1 = causal-left (vocoder)
+    int32_t seg_len;  // 0 = one segment of L, else clamp inside each seg_len window
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+} ggml_metal_kargs_conv_1d_dw_direct;
+
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    int32_t K;
+    int32_t dilation;
+    int32_t has_bias;
+    int32_t causal;
+    int32_t seg_len;
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+    float   eps;
+} ggml_metal_kargs_conv_1d_dw_direct_norm_channel;
+
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    float   eps;
+    // Per-axis element strides for x and y.  Lets the same kernel handle
+    // both [T, C] (sxt=1, sxc=L) and [C, T] (sxt=C, sxc=1) layouts.
+    int32_t sxt;  // x stride per time step (in elements)
+    int32_t sxc;  // x stride per channel  (in elements)
+    int32_t syt;  // y stride per time step (in elements)
+    int32_t syc;  // y stride per channel  (in elements)
+} ggml_metal_kargs_norm_channel;
+
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+    int32_t srt;
+    int32_t src;
+} ggml_metal_kargs_scale_residual;
+
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+} ggml_metal_kargs_bias_gelu;
+
+
+typedef struct {
+    int32_t L_in;
+    int32_t L_out;
+    int32_t C;
+    int32_t pad_left;
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+} ggml_metal_kargs_pad_replicate_1d;
+
+
+// Channels one thread holds in registers between the depthwise taps and the layer-norm reduction.
+#define GGML_METAL_DW_LN_MAX_PER_THREAD 8
+#define GGML_METAL_NORM_CHANNEL_MAX_SIMDGROUPS 8
 
 #endif // GGML_METAL_IMPL

@@ -15,6 +15,9 @@ on:
       '**/*.cpp'
     ]
 
+permissions:
+  contents: read
+
 # QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
 # re-dispatch supersedes the in-flight run. The default branch deliberately
 # keeps upstream's run_id behaviour — this workflow only ever runs post-merge,

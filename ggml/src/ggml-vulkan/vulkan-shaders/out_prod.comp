@@ -10,9 +10,9 @@ const uint num_threads = 256;
 layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
 
 void get_dst_indices(uint idx, out uint i20, out uint i21, out uint i22, out uint i23) {
-    i23 = fastdiv(idx, (p.ne22*p.ne21*p.ne20));
+    i23 = fastdiv_small(idx, (p.ne22*p.ne21*p.ne20));
     const uint i23_offset = i23 * p.ne22*p.ne21*p.ne20;
-    i22 = fastdiv((idx - i23_offset), (p.ne21*p.ne20));
+    i22 = fastdiv_small((idx - i23_offset), (p.ne21*p.ne20));
     const uint i22_offset = i22*p.ne21*p.ne20;
     i21 = (idx - i23_offset - i22_offset) / p.ne20;
     i20 = idx - i23_offset - i22_offset - i21*p.ne20;

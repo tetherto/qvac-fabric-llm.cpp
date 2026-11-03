@@ -3,6 +3,13 @@
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
 
+// ggml-common.h is include-guarded per TU and skips ggml-tbq-types.h in the
+// GPU-backend DECL contexts (Metal/CUDA/HIP/SYCL/MUSA). A host TU of one of
+// those backends that already included it (e.g. SYCL's set_rows.cpp via
+// common.hpp) would get no TBQ block layouts from the include above, so pull
+// them in directly; #pragma once makes this a no-op everywhere else.
+#include "ggml-tbq-types.h"
+
 #include "ggml.h"
 
 // GGML internal header

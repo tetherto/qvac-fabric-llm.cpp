@@ -493,6 +493,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
+            if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
+                return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
+            }
             return
                 src1->type == GGML_TYPE_F32 ||
                 src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
@@ -508,6 +512,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 
             return max_bias == 0.0f;
         }
+        case GGML_OP_FLASH_ATTN_EXT_BACK:
+            return src0->type == GGML_TYPE_F32 &&
+                (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+                (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) &&
+                (!op->src[3] || op->src[3]->type == GGML_TYPE_F16);
         case GGML_OP_IM2COL_BACK:
             return src0->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
         case GGML_OP_GET_ROWS_BACK:
@@ -520,6 +529,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_GATED_DELTA_NET_DEFERRED:
+            return ggml_backend_dev_supports_inplace_src(dev, op->src[6]);
+        case GGML_OP_GDN_CONV_DEFERRED:
+            return ggml_backend_dev_supports_inplace_src(dev, op->src[2]);
         default:
             return true;
     }

@@ -16,6 +16,9 @@ on:
       - '**/requirements*.txt'
       # - 'pyrightconfig.json'
 
+permissions:
+  contents: read
+
 # QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
 # re-dispatch supersedes the in-flight run. The default branch deliberately
 # keeps upstream's run_id behaviour — master pushes must not cancel each other,
@@ -25,19 +28,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  runner_names:
-    permissions:
-      contents: read
-    uses: ./.github/workflows/reusable-runner-names.yml
-
   authorize:
     permissions: {}
     uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
   python-type-check:
-    needs: [authorize, runner_names]
+    needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
+    runs-on: qvac-ubuntu2404-x64
     name: python type-check
     steps:
       - name: Check out source repository
@@ -46,7 +44,7 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-          pip-install: -r requirements/requirements-all.txt ty==0.0.35
+          pip-install: -r requirements/requirements-all.txt ty==0.0.84
       # - name: Type-check with Pyright
       #   uses: jakebailey/pyright-action@v2
       #   with:
@@ -55,4 +53,4 @@ jobs:
       #     warnings: true
       - name: Type-check with ty
         run: |
-            ty check --output-format=github
+            ty check --exit-zero-on-warning --output-format=github

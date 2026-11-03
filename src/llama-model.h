@@ -19,6 +19,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_model;
 
 // available models
 enum llm_type {
@@ -118,6 +119,8 @@ enum llm_type {
     LLM_TYPE_17B_16E, // llama4 Scout
     LLM_TYPE_17B_128E, // llama4 Maverick
     LLM_TYPE_A13B,
+    LLM_TYPE_1B_A400M, // Granite3 MoE
+    LLM_TYPE_3B_A800M, // Granite3 MoE
     LLM_TYPE_7B_A1B,
     LLM_TYPE_8B_A1B, // lfm2moe
     LLM_TYPE_7_9B_A1_3B, // Ling-3.0-tiny
@@ -128,8 +131,10 @@ enum llm_type {
     LLM_TYPE_26B_A4B, // Gemma4
     LLM_TYPE_30B_A3B,
     LLM_TYPE_31B_A3_5B,
+    LLM_TYPE_32B_A9B, // Granite4 Hybrid
     LLM_TYPE_35B_A3B, // Qwen3.5
     LLM_TYPE_48B_A3B, // Kimi Linear
+    LLM_TYPE_75B_A9B, // Nemotron 3 Puzzle
     LLM_TYPE_80B_A3B, // Qwen3 Next
     LLM_TYPE_A3B,     // Qwen3.8 Flash Next
     LLM_TYPE_100B_A6B,
@@ -143,6 +148,7 @@ enum llm_type {
     LLM_TYPE_230B_A10B, // Minimax M2
     LLM_TYPE_428B_A23B, // Minimax M3
     LLM_TYPE_235B_A22B,
+    LLM_TYPE_288B_A19B, // dots3-note
     LLM_TYPE_300B_A47B, // Ernie MoE big
     LLM_TYPE_310B_A15B, // /MiMo-V2-Flash
     LLM_TYPE_355B_A32B, // GLM-4.5
@@ -150,6 +156,7 @@ enum llm_type {
     LLM_TYPE_685B_A37B, // DeepSeek V3.2
     LLM_TYPE_744B_A40B, // GLM-5
     LLM_TYPE_2_8T_A50B, // Kimi-K3
+    LLM_TYPE_320B_A18B, // GLM-5.3-Flash
     LLM_TYPE_E2B,
     LLM_TYPE_E4B,
 };
@@ -371,7 +378,13 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act    = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+    struct ggml_tensor * ffn_exp_probs_b_vl = nullptr; // deepseek4 vision (bias for image tokens)
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
+
+    struct ggml_tensor * dflash_attn_conv_base = nullptr;
+    struct ggml_tensor * dflash_attn_conv_proj = nullptr;
+    struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
+    struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -559,6 +572,10 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    // glm5-next k-pool indexer
+    struct ggml_tensor * indexer_kpool_gate = nullptr;
+    struct ggml_tensor * indexer_kpool_ape  = nullptr;
+
     // MSA
     struct ggml_tensor * index_q_proj = nullptr;
     struct ggml_tensor * index_k_proj = nullptr;
@@ -608,6 +625,19 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+struct llama_prec_policy {
+    // the key is the weight tensor `res->src[0]`, stores the recommended accumulation type of the op (unused for now)
+    // TODO: migrate ad-hoc ggml_prec_set_acc() calls to this container + update apply() to use it
+    std::unordered_map<const ggml_tensor *, ggml_prec> prec_acc;
+
+    // the key is the weight tensor `res->src[0]`, stores the recommended activation precision type
+    std::unordered_map<const ggml_tensor *, ggml_prec> prec_src1;
+
+    bool apply(ggml_tensor * res) const;
+
+    void load(llama_model_loader & ml, const llama_model & model);
+};
+
 // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
 struct ggml_backend_buft_comparator {
     bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
@@ -623,6 +653,9 @@ struct llama_model {
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
+
+    // per-tensor activation precision policy
+    llama_prec_policy prec_policy;
 
     // for classifier models
     std::vector<std::string> classifier_labels;
@@ -648,6 +681,9 @@ struct llama_model {
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
+
+    // hrm-text initial low-cycle state
+    struct ggml_tensor * hrm_z_l_init = nullptr;
 
     // DeepSeek-V4
     struct ggml_tensor * hc_head_fn    = nullptr;
@@ -683,8 +719,13 @@ struct llama_model {
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;
     struct ggml_tensor * dspark_markov_w2   = nullptr;
+    struct ggml_tensor * dspark_markov_w2_s = nullptr;
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
+
+    struct ggml_tensor * dflash_selector_prev   = nullptr;
+    struct ggml_tensor * dflash_selector_next   = nullptr;
+    struct ggml_tensor * dflash_selector_hidden = nullptr;
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
@@ -701,6 +742,14 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
+    // Activation-side transforms for Hadamard-folded GGUF tensors.
+    std::unordered_map<std::string, uint32_t> hadamard_weight_blocks;
+    std::unordered_map<std::string, uint32_t> hadamard_inverse_blocks;
+    std::map<uint32_t, std::vector<int32_t>> hadamard_sign_data;
+    bool hadamard_gdn_v_grouped = false;
+    llama_hadamard_rotations hadamard_rotations;
+    llama_hadamard_rotations hadamard_inverses;
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 
@@ -709,6 +758,9 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+
+    // which tensors can be prefetched - driven by TENSOR_READ_LAZY
+    std::unordered_set<const ggml_tensor *> can_prefetch;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
@@ -732,6 +784,8 @@ struct llama_model {
         uint16_t idx, std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context_ptr> & ctx_split_map,
         llama_model_loader & ml, bool use_mmap_buffer, bool use_mlock, int32_t n_gpu_layers);
 
+    void initialize_hadamard_transforms();
+
     void print_backend_buffers_info(int32_t n_gpu_layers);
 
     std::string arch_name() const;
@@ -748,6 +802,7 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+    bool training() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -762,6 +817,9 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+
+    // true if the loader stored the weight in a backend-specific layout (repacked or split), so views of its rows are not valid
+    bool has_backend_layout(const struct ggml_tensor * weight) const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
@@ -839,6 +897,9 @@ struct llama_model_base : public llama_model {
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
                 int flags);
 
+    // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
+    void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
+
     void load_stats  (llama_model_loader & ml) override;
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;
@@ -873,7 +934,7 @@ const char * llm_type_name(llm_type type);
     const int64_t n_token_types  = vocab.n_token_types();    GGML_UNUSED(n_token_types); \
     const int64_t n_rot          = hparams.n_rot();          GGML_UNUSED(n_rot); \
     const int64_t n_expert       = hparams.n_expert;         GGML_UNUSED(n_expert); \
-    const int64_t n_expert_used  = hparams.n_expert_used;    GGML_UNUSED(n_expert_used); \
+    const int64_t n_expert_used  = hparams.n_expert_used();  GGML_UNUSED(n_expert_used); \
     const int64_t n_ctx_train    = hparams.n_ctx_train;      GGML_UNUSED(n_ctx_train);
 
 // For internal test use

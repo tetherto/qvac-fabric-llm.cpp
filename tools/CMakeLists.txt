@@ -13,6 +13,12 @@ llama_add_compile_flags()
 # tools
 
 if (EMSCRIPTEN)
+    add_subdirectory(llama-bench)
+    # Model graph construction exceeds Emscripten's default 64 KiB stack.
+    target_link_options(llama-bench PRIVATE
+        "SHELL:-s EXPORTED_RUNTIME_METHODS=FS,callMain"
+        "SHELL:-s EXIT_RUNTIME=1"
+        "SHELL:-s STACK_SIZE=8388608")
 else()
     add_subdirectory(batched-bench)
     add_subdirectory(vector-index-bench)
@@ -28,7 +34,7 @@ else()
         add_subdirectory(server)
     endif()
     add_subdirectory(tokenize)
-    add_subdirectory(parser)
+    add_subdirectory(laya)
     add_subdirectory(tts)
     if (LLAMA_MTMD)
         add_subdirectory(mtmd)
@@ -42,5 +48,8 @@ else()
         add_subdirectory(export-lora)
     endif()
     add_subdirectory(fit-params)
+    if (GGML_METAL)
+        add_subdirectory(tuning)
+    endif()
     add_subdirectory(results)
 endif()

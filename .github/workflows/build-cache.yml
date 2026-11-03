@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: '0 * * * *'
 
+permissions:
+  contents: read
+
 # QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
 # re-dispatch supersedes the in-flight run. The default branch deliberately
 # keeps upstream's run_id behaviour — this workflow is cron-only, and an hourly
@@ -46,8 +49,8 @@ jobs:
 
     env:
       # Sync versions in build-openvino.yml, build-self-hosted.yml, release.yml, build-cache.yml, .devops/openvino.Dockerfile
-      OPENVINO_VERSION_MAJOR: "2026.3"
-      OPENVINO_VERSION_FULL: "2026.3.0.22451.bd8d6542e3c"
+      OPENVINO_VERSION_MAJOR: "2026.4"
+      OPENVINO_VERSION_FULL: "2026.4.0.22959.99c81491cc3"
 
     steps:
       - name: Clone
@@ -74,8 +77,8 @@ jobs:
 
     env:
       # Sync versions in build.yml, build-self-hosted.yml, release.yml, build-cache.yml, .devops/openvino.Dockerfile
-      OPENVINO_VERSION_MAJOR: "2026.3"
-      OPENVINO_VERSION_FULL: "2026.3.0.22451.bd8d6542e3c"
+      OPENVINO_VERSION_MAJOR: "2026.4"
+      OPENVINO_VERSION_FULL: "2026.4.0.22959.99c81491cc3"
 
     steps:
       - name: Clone

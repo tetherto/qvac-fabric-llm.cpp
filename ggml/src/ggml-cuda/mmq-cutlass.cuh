@@ -61,6 +61,13 @@ ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized(ggml_backend_cud
                                                                 ggml_tensor *                        dst,
                                                                 const ggml_cuda_cutlass_activation & activation);
 
+ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized_bf16(ggml_backend_cuda_context &          ctx,
+                                                                     const ggml_tensor *                  src0,
+                                                                     const ggml_tensor *                  src1,
+                                                                     const ggml_tensor *                  dst,
+                                                                     const ggml_cuda_cutlass_activation & activation,
+                                                                     void *                               output);
+
 ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,

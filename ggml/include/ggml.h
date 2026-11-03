@@ -225,8 +225,10 @@
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
+// 128 fits the ACE-Step DiT tensor names that exceed 64 chars. name[] is an inline
+// array in struct ggml_tensor, so every consumer must be rebuilt against this header.
 #ifndef GGML_MAX_NAME
-#   define GGML_MAX_NAME        64
+#   define GGML_MAX_NAME        128
 #endif
 
 #define GGML_DEFAULT_N_THREADS  4
@@ -438,13 +440,26 @@ extern "C" {
         GGML_TYPE_PQ3_0_64  = 48, // PolarQuant 3-bit (Stage 1 only), block=64  (3.25 bpw)
         GGML_TYPE_PQ4_0     = 49, // PolarQuant 4-bit (Stage 1 only), block=128 (4.125 bpw)
         GGML_TYPE_PQ4_0_64  = 50, // PolarQuant 4-bit (Stage 1 only), block=64  (4.25 bpw)
-        GGML_TYPE_COUNT     = 51,
+        GGML_TYPE_PQ2_0     = 142,
+        GGML_TYPE_PTQ1_0    = 143,
+        GGML_TYPE_COUNT     = 144,
     };
 
-    // precision
+    // [TAG_GGML_PREC]
+    // this enum is used to declare the allowed numerical precision/data-types types that can be used during the compute of an op
+    // the declared types can be:
+    //  - result accumulation type
+    //  - source tensor data representation type
+    //  - etc.
+    // the precision parameters are stored as ggml_tensor.op_params to the respective ops
     enum ggml_prec {
-        GGML_PREC_DEFAULT =  0, // stored as ggml_tensor.op_params, 0 by default
-        GGML_PREC_F32     = 10,
+        GGML_PREC_UNDEFINED = 0,
+        GGML_PREC_DEFAULT   = 0,  // note: deprecated, use GGML_PREC_UNDEFINED
+        GGML_PREC_F32       = 10,
+        GGML_PREC_BF16      = 15,
+        GGML_PREC_F16       = 20,
+        GGML_PREC_Q8        = 30,
+        GGML_PREC_Q4        = 40,
     };
 
     // op hint
@@ -483,6 +498,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PQ2_0  = 141, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PTQ1_0 = 143, // except 1d tensors
     };
 
     // available tensor operations:
@@ -573,7 +590,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
-        GGML_OP_FLASH_ATTN_BACK,
+        GGML_OP_FLASH_ATTN_EXT_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_CONV_BACK_SX,
         GGML_OP_SSM_CONV_BACK_C,
@@ -610,7 +627,73 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // Fused ops for ConvNeXt-style convolutional blocks: each collapses a
+        // multi-op sub-graph into one dispatch.
+        GGML_OP_CONV_1D_DW_DIRECT,
+        GGML_OP_NORM_CHANNEL,
+        GGML_OP_SCALE_RESIDUAL,
+        GGML_OP_BIAS_GELU,
+        GGML_OP_PAD_REPLICATE_1D,
+
+        // Fused batched GRU (LavaSR denoiser): the whole recurrent sweep over
+        // the L time-steps as one op, parallel over the batch.
+        GGML_OP_GRU,
+
+        // Zero-insertion upsample along ne0 (LavaSR denoiser transpose-conv):
+        // out[i0*s] = in[i0], zeros between, in one pass.
+        GGML_OP_ZERO_UPSAMPLE,
+
+        // Channel shuffle over ne2 (LavaSR denoiser): one plane copy per
+        // output channel instead of a permute/reshape/transpose/cont chain.
+        GGML_OP_CHANNEL_SHUFFLE,
+
+        // Fused affine + per-channel PReLU (LavaSR denoiser):
+        // out = x*aw + ab + max(x,0) + slope*min(x,0).
+        GGML_OP_AFFINE_PRELU,
+
+        // Snake activation y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
+        // (ACE-Step Oobleck VAE).
+        GGML_OP_SNAKE,
+
+        // Fused LSTM cell (Parakeet TDT decoder): the four gate activations plus
+        // the new cell and hidden state as one op.
+        GGML_OP_LSTM_CELL,
+
+        // Greedy transducer (RNN-T / TDT) step control: turns one decoded
+        // (token, duration index) pair into the next loop counters and the
+        // 0/1 mask that says whether the step's predictor update is kept.
+        GGML_OP_TDT_STEP,
+
+        // Gated delta net with a deferred state commit (speculative decoding): the base state is
+        // replayed forward by rows recorded in the previous call instead of keeping a state
+        // snapshot per draft token. See ggml_gated_delta_net_deferred.
+        GGML_OP_GATED_DELTA_NET_DEFERRED,
+        GGML_OP_GDN_CONV_DEFERRED,
+
         GGML_OP_COUNT,
+    };
+
+    // GGML_OP_TDT_STEP loop counters along ne0 of the I32 control row. The
+    // result repeats this layout in its first GGML_TDT_STEP_N_INS slots, so a
+    // view of the result feeds the next step directly.
+    enum ggml_tdt_step_in {
+        GGML_TDT_STEP_IN_T  = 0,  // encoder frame the step reads
+        GGML_TDT_STEP_IN_S  = 1,  // symbols already emitted at that frame
+        GGML_TDT_STEP_IN_N  = 2,  // frames in the window
+        GGML_TDT_STEP_N_INS = 3,
+    };
+
+    // GGML_OP_TDT_STEP result layout along ne0, all I32.
+    enum ggml_tdt_step_out {
+        GGML_TDT_STEP_OUT_T      = GGML_TDT_STEP_IN_T,
+        GGML_TDT_STEP_OUT_S      = GGML_TDT_STEP_IN_S,
+        GGML_TDT_STEP_OUT_N      = GGML_TDT_STEP_IN_N,
+        GGML_TDT_STEP_OUT_UPDATE = 3,  // 1 when the step's predictor update is kept
+        GGML_TDT_STEP_OUT_HOLD   = 4,  // 1 - update
+        GGML_TDT_STEP_OUT_FRAME  = 5,  // next frame index, clamped to [0, n_frames)
+        GGML_TDT_STEP_OUT_TOKEN  = 6,  // the token the step was given
+        GGML_TDT_STEP_OUT_DUR    = 7,  // the duration index the step was given
+        GGML_TDT_STEP_N_OUTS     = 8,
     };
 
     enum ggml_unary_op {
@@ -647,6 +730,8 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SWIGLU_CLAMP,
+        GGML_GLU_OP_SIGLU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1379,6 +1464,15 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // unlike the other gated ops, the sigmoid is applied to the gate: out = a*sigmoid(b)
+    GGML_API struct ggml_tensor * ggml_siglu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_siglu_swapped(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
     // A: n columns, r rows,
     // B: n columns, r rows,
     GGML_API struct ggml_tensor * ggml_glu_split(
@@ -1412,11 +1506,22 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    GGML_API struct ggml_tensor * ggml_siglu_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
     GGML_API struct ggml_tensor * ggml_swiglu_oai(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             float                 alpha,
+            float                 limit);
+
+    GGML_API struct ggml_tensor * ggml_swiglu_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
             float                 limit);
 
     // normalize along rows
@@ -1482,6 +1587,42 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 eps);
 
+    // [TAG_GGML_PREC]
+    // set the minimum required accumulator type for the implementation to use during the compute
+    // for example:
+    //  - GGML_PREC_F32  - requires accumulation of the results in F32
+    //  - GGML_PREC_BF16 - can accumulate the results in BF16, F32
+    //  - GGML_PREC_F16  - can accumulate the results in F16, F32
+    //  - GGML_PREC_Q8   - not allowed
+    //  - GGML_PREC_Q4   - not allowed
+    //
+    // return false on faliure
+    GGML_API bool ggml_prec_set_acc(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
+    // [TAG_GGML_PREC]
+    // set the smallest rank that the implementation can use to internally convert the src[idx] data to
+    // ranks in decreasing order:
+    //  - GGML_PREC_F32  - GGML_TYPE_F32
+    //  - GGML_PREC_BF16 - GGML_TYPE_BF16
+    //  - GGML_PREC_F16  - GGML_TYPE_F16,
+    //  - GGML_PREC_Q8   - GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K, etc.
+    //  - GGML_PREC_Q4   - GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, etc.
+    //
+    // for example:
+    //   - ggml_prec_set_src(a, GGML_PREC_Q8, 1):
+    //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to GGML_TYPE_Q8_0
+    //     - cannot quantize it down to GGML_TYPE_Q4_0 or GGML_TYPE_NVFP4
+    //   - ggml_prec_set_src(a, GGML_PREC_Q4, 1):
+    //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to 4-bit datatypes such as GGML_TYPE_Q4_K, GGML_TYPE_NVFP4 etc.
+    //
+    // return false on faliure
+    GGML_API bool ggml_prec_set_src(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec,
+            int                  idx);
+
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
@@ -1492,9 +1633,10 @@ extern "C" {
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
-    GGML_API void ggml_mul_mat_set_prec(
+    GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
-            enum ggml_prec       prec);
+            enum ggml_prec       prec),
+        "use ggml_prec_set_acc() instead");
 
     // change the hint of a matrix multiplication
     GGML_API void ggml_mul_mat_set_hint(
@@ -1800,6 +1942,19 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   n_past);
 
+    GGML_API struct ggml_tensor * ggml_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 min,
+            float                 max);
+
+    // in-place, returns view(a)
+    GGML_API struct ggml_tensor * ggml_clamp_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 min,
+            float                 max);
+
     GGML_API struct ggml_tensor * ggml_soft_max(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -2065,14 +2220,6 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_rope_set_offset(
             struct ggml_tensor  * a,
             int                   n_offs);
-
-    // clamp
-    // in-place, returns view(a)
-    GGML_API struct ggml_tensor * ggml_clamp(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            float                 min,
-            float                 max);
 
     // im2col
     // converts data into a format that effectively results in a convolution when combined with matrix multiplication
@@ -2422,6 +2569,244 @@ extern "C" {
             int                   p0,
             int                   p1);
 
+    // Fused depthwise 1D convolution with edge-clamp (replicate)
+    // padding and bias add. Per-channel filter of width K applied independently
+    // to every batch in a (ne0 = L, ne1 = C, ne2 = B, ne3 = 1) tensor.
+    //   y[t, c, batch] = bias[c]
+    //                  + sum_{k=0..K-1} a[clamp(t + (k - K/2)*dilation, 0, L-1), c, batch]
+    //                                 * w[k, c]
+    //
+    // a:    [L, C, B, 1]  f32 contiguous
+    // w:    [K, 1, C, 1]  f32 contiguous (a depthwise conv weight)
+    // bias: [C]           f32 contiguous, or NULL to skip the bias add
+    // dilation: positive integer
+    //
+    // Output matches a's shape. Currently supports K in {3, 5, 7}.
+    GGML_API struct ggml_tensor * ggml_conv_1d_dw_direct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * bias,
+            int                   dilation);
+
+    // [C, T]-layout variant: a is [C, L, B, 1] with C inner-most. Same kernel,
+    // strides flipped via a layout flag in op_params.
+    GGML_API struct ggml_tensor * ggml_conv_1d_dw_direct_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * bias,
+            int                   dilation);
+
+    // [C, T]-layout + causal-left padding variant.  Used by the vocoder
+    // ConvNeXt chain.  K may be 3, 5, or 7.
+    GGML_API struct ggml_tensor * ggml_conv_1d_dw_direct_causal_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * bias,
+            int                   dilation);
+
+    // [C, T] variant over independent batches and T / seg_len segments: the
+    // edge clamp never crosses a batch or segment boundary.
+    GGML_API struct ggml_tensor * ggml_conv_1d_dw_direct_ct_segmented(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * bias,
+            int                   dilation,
+            int                   seg_len);
+
+    // Fused channel-axis layer norm. Normalises across the
+    // channel dim (ne[1]) of each batch in a [L, C, B, 1] tensor and applies
+    // an affine scale + shift. Replaces the permute + cont + ggml_norm + mul
+    // + add + permute + cont chain that stock ggml_norm requires (since it
+    // normalises along ne[0]).
+    //
+    //   y[t, c, batch] = ((a[t, c, batch] - mean[t, batch]) /
+    //                     sqrt(var[t, batch] + eps)) * g[c] + b[c]
+    //
+    // a: [L, C, B, 1]  f32 contiguous
+    // g: [C]            f32 contiguous (scale)
+    // b: [C]            f32 contiguous (shift)
+    // eps: numerical epsilon (passed as float op param)
+    GGML_API struct ggml_tensor * ggml_norm_channel(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * b,
+            float                 eps);
+
+    // [C, T]-layout variant: a is [C, T, B, 1] with C inner-most. g and b
+    // still have length C (== a->ne[0] here, vs == a->ne[1] in the [T, C]
+    // variant). Same op as ggml_norm_channel; this variant only sets the
+    // layout flag.
+    GGML_API struct ggml_tensor * ggml_norm_channel_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * b,
+            float                 eps);
+
+    // Fused (x + bias) * gamma + residual. Channel-axis
+    // broadcasts for `bias` and `gamma` (both [C]); `x` and `residual`
+    // are [L, C, B, 1] f32 contiguous. Output matches `x`.
+    //
+    //   y[t, c, batch] = residual[t, c, batch] + (x[t, c, batch] + bias[c]) * gamma[c]
+    GGML_API struct ggml_tensor * ggml_scale_residual(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * residual);
+
+    // [C, T]-layout variant. Bias/gamma still have length C (== x->ne[0]
+    // here, vs == x->ne[1] in the [T, C] variant).
+    GGML_API struct ggml_tensor * ggml_scale_residual_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * residual);
+
+    // Fused transpose variant. `x` is contiguous [T, C, B, 1], while
+    // `residual` and the returned tensor are contiguous [C, T, B, 1].
+    GGML_API struct ggml_tensor * ggml_scale_residual_tc_to_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * residual);
+
+    // Fused bias-add + GELU (erf form, the gelu_erf in ggml).
+    // Channel-axis broadcasts for `bias` ([C]); `x` is [L, C, B, 1] f32
+    // contiguous. Output matches `x`.
+    //
+    //   y[t, c, batch] = gelu_erf(x[t, c, batch] + bias[c])
+    //                  = 0.5 * v * (1 + erf(v * 1/sqrt(2)))  where v = x + bias
+    GGML_API struct ggml_tensor * ggml_bias_gelu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias);
+
+    // [C, T]-layout variant.  Bias still has length C (== x->ne[0] here).
+    GGML_API struct ggml_tensor * ggml_bias_gelu_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias);
+
+    // Fused transpose variant. `x` is contiguous [T, C, B, 1]; the returned
+    // tensor is contiguous [C, T, B, 1].
+    GGML_API struct ggml_tensor * ggml_bias_gelu_tc_to_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias);
+
+    // Edge-replicate padding for 1D conv inputs, in one dispatch instead of
+    // a view + repeat_4d + concat sequence. pad_left alone gives causal
+    // padding, pad_left + pad_right the symmetric edge-clamp form.
+    // Input `x` is `[L_in, C, 1, 1]` f32 contiguous; the
+    // output has `ne = [L_in + pad_left + pad_right, C, 1, 1]` where:
+    //
+    //   y[t, c] = x[clamp(t - pad_left, 0, L_in - 1), c]
+    //
+    // (Replicate / edge-clamp semantics — the leftmost row of `x` fills
+    // the left pad, the rightmost row fills the right pad.)
+    GGML_API struct ggml_tensor * ggml_pad_replicate_1d(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            int                   pad_left,
+            int                   pad_right);
+
+    // [C, T]-layout variant.  Input x is [C, L_in, 1, 1]; output is
+    // [C, L_in + pad_left + pad_right, 1, 1].
+    GGML_API struct ggml_tensor * ggml_pad_replicate_1d_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            int                   pad_left,
+            int                   pad_right);
+
+    // Fused batched GRU, PyTorch semantics (gate order r,z,n; reset on hh new-gate; h0=0).
+    // whh [H,3H]; gi_all [3H,B,L] = precomputed Wih*x+bih; bhh [3H] -> [H,B,L]; reverse flips t.
+    GGML_API struct ggml_tensor * ggml_gru(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * whh,
+            struct ggml_tensor  * gi_all,
+            struct ggml_tensor  * bhh,
+            bool                  reverse);
+
+    // Zero-insertion upsample of ne0 by factor s: result ne0 = (a->ne0 - 1)*s + 1,
+    // result[i0*s, ...] = a[i0, ...], zeros elsewhere.  a must be contiguous.
+    GGML_API struct ggml_tensor * ggml_zero_upsample(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   s);
+
+    // Channel shuffle of ne2 into `groups` groups (PyTorch): result channel c' =
+    // a channel (c'%groups)*(ne2/groups) + c'/groups. a contiguous, ne2 % groups == 0.
+    GGML_API struct ggml_tensor * ggml_channel_shuffle(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   groups);
+
+    // Fused affine + per-channel PReLU: out = x*aw + ab + max(x,0) + slope*min(x,0).
+    // x [F,T,C,Bc] contiguous; aw,ab [F,C] (per freq,channel); slope [C].
+    GGML_API struct ggml_tensor * ggml_affine_prelu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * aw,
+            struct ggml_tensor  * ab,
+            struct ggml_tensor  * slope);
+
+    // snake activation: y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
+    // (ACE-Step Oobleck VAE).  x: [T, C]; a, inv_b: one per channel.
+    GGML_API struct ggml_tensor * ggml_snake(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,      // [T, C]
+            struct ggml_tensor  * a,      // per-channel scale inside sin(), F32
+            struct ggml_tensor  * inv_b); // per-channel output scale, F32
+
+    // fused LSTM cell: c_new = sigmoid(f)*c_prev + sigmoid(i)*tanh(g),
+    // h_new = sigmoid(o)*tanh(c_new).  Result rows [0, H) are h_new, [H, 2H) are c_new.
+    GGML_API struct ggml_tensor * ggml_lstm_cell(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gates,   // [4H, N] pre-activations, i | f | g | o along ne0, F32
+            struct ggml_tensor  * c_prev); // [H, N] previous cell state, F32
+
+    // Same cell over a packed [h | c] previous state, selected per column: a column
+    // whose mask entry is non-zero takes the fresh pair, the rest copy hc_prev bit
+    // for bit (a select, so a held column is exact even for non-finite values).
+    GGML_API struct ggml_tensor * ggml_lstm_cell_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gates,   // [4H, N] pre-activations, i | f | g | o along ne0, F32
+            struct ggml_tensor  * hc_prev, // [2H, N] previous h | c, F32
+            struct ggml_tensor  * mask);   // [N] or [1] I32, non-zero takes the fresh pair
+
+    // one greedy transducer step, run entirely on the backend so K steps can be
+    // unrolled into a single graph. With t = state[T], s = state[S], n = state[N]
+    // and dur = dur_table[dur_idx]:
+    //   t >= n            -> update = 0, counters unchanged (the step is a no-op)
+    //   token == blank_id -> update = 0, t += rnnt ? 1 : max(1, dur), s = 0
+    //   otherwise         -> update = 1, s += 1, and when (!rnnt && dur > 0) or
+    //                        s >= max_symbols_per_step: t += rnnt ? 1 : max(1, dur), s = 0
+    // rnnt != 0 ignores dur_idx / dur_table and advances t by one frame.
+    // The step also copies (token, dur_idx) into its TOKEN and DUR slots, so a
+    // chain of steps leaves every decoded pair in one buffer. Like ggml_cpy the
+    // result is a view of dst, which lets that chain write rows of one tensor.
+    // dst must live where the op runs: the scheduler does not fall back to
+    // another backend for a pre-allocated destination, so every backend that
+    // runs the decoder needs this op.
+    GGML_API struct ggml_tensor * ggml_tdt_step(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * token,      // I32 [1] argmax over the vocabulary
+            struct ggml_tensor  * dur_idx,    // I32 [1] argmax over the duration head
+            struct ggml_tensor  * state,      // I32 [GGML_TDT_STEP_N_INS] loop counters
+            struct ggml_tensor  * dur_table,  // I32 [D] frame advance per duration index
+            struct ggml_tensor  * dst,        // I32 [GGML_TDT_STEP_N_OUTS] destination row
+            int                   blank_id,
+            int                   max_symbols_per_step,
+            int                   rnnt);
+
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
     GGML_API struct ggml_tensor * ggml_roll(
@@ -2510,25 +2895,45 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
-    GGML_API void ggml_flash_attn_ext_set_prec(
+    GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
-            enum ggml_prec       prec);
+            enum ggml_prec       prec),
+        "use ggml_prec_set_acc() instead");
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
+
+    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+    // n_kv_max must bound the number of finite entries in every mask row.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    // TODO: needs to be adapted to ggml_flash_attn_ext
-    GGML_API struct ggml_tensor * ggml_flash_attn_back(
-           struct ggml_context * ctx,
-           struct ggml_tensor  * q,
-           struct ggml_tensor  * k,
-           struct ggml_tensor  * v,
-           struct ggml_tensor  * d,
-           bool                  masked);
+    enum ggml_flash_attn_ext_back_target {
+        GGML_FLASH_ATTN_EXT_BACK_STATS = 0, // [2, n_batch, n_head, ne3]: (logsumexp, dot(grad_o, o)) per q row
+        GGML_FLASH_ATTN_EXT_BACK_DQ    = 1, // same shape as q
+        GGML_FLASH_ATTN_EXT_BACK_DKV   = 2, // [n_embd_k, n_kv, n_head_kv, 2*ne3]: dk in ne3 [0, ne3), dv in [ne3, 2*ne3)
+    };
+
+    // backward of ggml_flash_attn_ext in 3 passes, the softmax is recomputed per row
+    // o:      the ggml_flash_attn_ext result, its op_params are reused
+    // grad_o: gradient of o, same shape
+    // stats:  result of the STATS target, NULL for STATS
+    // requires n_embd_k == n_embd_v, no sinks, max_bias == 0, logit_softcap == 0
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * o,
+            struct ggml_tensor  * grad_o,
+            struct ggml_tensor  * stats,
+            enum ggml_flash_attn_ext_back_target target);
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
@@ -2695,6 +3100,58 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * d);
 
+    // gated delta net with a deferred state commit, for speculative decoding. q, k, v, g and beta
+    // are as in ggml_gated_delta_net.
+    // Instead of a state snapshot per draft token, the last rows of each call are recorded and the
+    // base state is brought up to date by replaying the kept rows at the start of the next call.
+    //   state   : [S_v, S_v, H_v, n_seqs] committed base state
+    //   rec     : [n_rec, n_rows] record storage, n_rec = ggml_gated_delta_net_rec_size(); updated in place
+    //   rec_idx : I32 [3, n_seqs] per seq: {pending, read_row, write_row}
+    // for each seq the base is first replayed by the first `pending` rows of rec row `read_row`, then
+    // the block runs; the last R = min(n_tokens, K) rows are recorded into rec row `write_row` and the
+    // new base is the state after the first n_tokens - R tokens. Rows read and rows written must not overlap.
+    // record layout (floats): k [S_k, H_k, K] | v [S_v, H_v, K] | g [G, H_v, K] | beta [H_v, K], G = g->ne[0];
+    // recorded row r belongs to token n_tokens - R + r.
+    // dt, a (optional, [H_v], G == 1 only): g and beta are then the raw gate inputs, activated as
+    // g = softplus(g + dt) * a and beta = sigmoid(beta) (the records keep the activated values)
+    // result 1D: attn [S_v, H_v, n_tokens, n_seqs] | new base [S_v, S_v, H_v, n_seqs]
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_deferred(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * rec,
+            struct ggml_tensor  * rec_idx,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * a,
+            int64_t               K);
+
+    GGML_API int64_t ggml_gated_delta_net_rec_size(int64_t S_k, int64_t H_k, int64_t S_v, int64_t H_v, int64_t G, int64_t K);
+
+    // causal depthwise conv + SiLU of a gated delta net layer with a deferred conv-state commit, the
+    // conv-state counterpart of ggml_gated_delta_net_deferred. the leading n_norm heads of head_dim
+    // channels (the q and k heads) are then L2-normalized: y / sqrt(sum(y^2) + eps).
+    //   x       : [C, n_tokens, n_seqs] new conv inputs
+    //   w       : [d_conv, C] conv weights
+    //   hist    : [(K + d_conv - 1) * C, n_rows] conv input history (time-major), updated in place
+    //   rec_idx : I32 [3, n_seqs] per seq {pending, read_row, write_row}, as for ggml_gated_delta_net_deferred
+    // the conv window of a seq is history columns [pending, pending + d_conv - 1) of row read_row. the last
+    // min(n_tokens, K) + d_conv - 1 conv input columns are stored in row write_row.
+    // result: [C, n_tokens, n_seqs]
+    GGML_API struct ggml_tensor * ggml_gdn_conv_deferred(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * hist,
+            struct ggml_tensor  * rec_idx,
+            int64_t               K,
+            int64_t               n_norm,
+            int64_t               head_dim,
+            float                 eps);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
@@ -2739,11 +3196,21 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * weights);
 
+    // hc_pre with a per-element gate (Qwen3.8-Flash-Next): gate [n_embd, hc, n_tokens]
+    //   result[i, t] = scale*sum_h x[i, h, t]*sigmoid(gate[i, h, t])
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_gated(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate,
+            float                 scale);
+
     // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
     //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
     //          -> [n_embd, hc, n_tokens]
     //   result[i, dst, t] = x[i, t]*post[dst, t]
     //                       + sum_src residual[i, src, t]*comb[dst, src, t]
+    //   comb == NULL uses the identity: result[i, dst, t] = x[i, t]*post[dst, t] + residual[i, dst, t]
     //
     GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,

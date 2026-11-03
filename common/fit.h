@@ -11,6 +11,16 @@ enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_ERROR   = 2, // a hard error occurred, e.g. because no model could be found at the specified path
 };
 
+// a second model that shares the devices of the main model, e.g. a draft model
+//   - its context follows the context of the main model, so its memory is measured again whenever that context changes
+//   - shares_model tells the fit that the weights are already counted in the main model, as for an MTP context
+struct common_fit_extra_model {
+    const char * path_model;
+    llama_model_params * mparams;
+    llama_context_params * cparams;
+    bool shares_model;
+};
+
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
 //   - returns SUCCESS if parameters fit, FAILURE if they cannot fit, or ERROR on a hard error
 //   - restores parameters, tensor split, and null-terminated overrides on FAILURE or ERROR
@@ -26,10 +36,14 @@ common_params_fit_status common_fit_params(
    llama_model_tensor_buft_override * tensor_buft_overrides, // null-terminated overrides; automatic placement needs llama_max_tensor_buft_overrides elements
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
+      const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                                bool   prefetch_weights_auto, // enable prefetch when fitting a dense model
-                     ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+                     ggml_log_level   log_level,              // minimum log level to print during fitting, lower levels go to debug log
+                               bool   moe_cache_auto_explicit = false); // opt in to automatic caching on non-CUDA backends
 
 // Automatic acceleration policies, exposed for hardware-independent tests.
+bool common_fit_auto_moe_cache_backend(const char * backend_name, bool explicit_auto);
+
 bool common_fit_auto_moe_cache(
         const llama_model_params & mparams, const llama_context_params & cparams,
         uint32_t n_expert, size_t n_devices, bool shares_host, bool cache_supported);
@@ -68,7 +82,8 @@ uint32_t common_fit_reduced_n_ctx(
         int64_t  sum_projected_used,
         int64_t  sum_projected_used_min_ctx,
         uint32_t hp_nct,
-        uint32_t n_ctx_min);
+        uint32_t n_ctx_min,
+        uint32_t n_streams);
 
 // print estimated memory to stdout
 void common_fit_print(
@@ -98,3 +113,43 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
+
+// memory of the extra model of a fit, measured as the fit measures it; a borrowing draft is measured next to the main model
+// the rows are the extra model's own, on its devices
+common_device_memory_data_vec common_get_extra_device_memory_data(
+       const common_fit_extra_model * extra,
+                         const char * path_main,
+           const llama_model_params * mparams_main,
+         const llama_context_params * cparams_main,
+    std::vector<ggml_backend_dev_t> & devs,
+                           uint32_t & hp_ngl,
+                           uint32_t & hp_n_ctx_train,
+                           uint32_t & hp_n_expert,
+                     ggml_log_level   log_level);
+
+// what common_get_device_memory_data reports for the main model at the parameters a fit leaves in place
+struct common_fit_measurement {
+    bool                            measured    = false;
+    common_device_memory_data_vec   memory;              // one row per device, then a trailing host row
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t                        n_layer     = 0;
+    uint32_t                        n_ctx_train = 0;
+    uint32_t                        n_expert    = 0;
+};
+
+// common_fit_params, then the memory of the parameters it leaves in mparams and cparams
+//   - a fit that needs no changes reuses its first probe; any other outcome is measured by one more probe
+//   - nothing is measured on ERROR
+common_params_fit_status common_fit_params_measured(
+                         const char * path_model,
+                 llama_model_params * mparams,
+               llama_context_params * cparams,
+                              float * tensor_split,
+   llama_model_tensor_buft_override * tensor_buft_overrides,
+                             size_t * margins,
+                           uint32_t   n_ctx_min,
+      const common_fit_extra_model * extra,
+                               bool   prefetch_weights_auto,
+                     ggml_log_level   log_level,
+             common_fit_measurement * measurement,
+                               bool   moe_cache_auto_explicit = false);

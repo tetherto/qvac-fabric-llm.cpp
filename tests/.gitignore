@@ -1,6 +1,7 @@
 *
 !*.*
 !snapshots/
+!fusion/
 !turbovec-golden-gen/
 !turbovec-golden-gen/Cargo.toml
 !turbovec-golden-gen/src/

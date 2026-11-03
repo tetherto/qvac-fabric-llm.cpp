@@ -22,6 +22,9 @@ on:
       'ggml/src/ggml-cpu/**'
     ]
 
+permissions:
+  contents: read
+
 # QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
 # re-dispatch supersedes the in-flight run. The default branch deliberately
 # keeps upstream's run_id behaviour — master pushes must not cancel each other,
@@ -38,15 +41,14 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
-
   ubuntu-24-s390x:
-    # QVAC-24501: ubuntu-24.04-s390x is not a GitHub image - it comes from IBM's
-    # hosted-runner service (github.com/IBM/actionspz), which an org must be
-    # onboarded to before the label resolves. Upstream is; we are not, so every
-    # run queued to the 24h ceiling and was cancelled without executing a step.
-    # TO RESTORE: onboard the org, then delete this `if`. See QVAC-23796.
-    if: false  # no runner: org not onboarded to the IBM hosted-runner service
+    name: ubuntu-24-s390x (VXE ${{ matrix.vxe }})
     runs-on: ubuntu-24.04-s390x
+
+    strategy:
+      fail-fast: false
+      matrix:
+        vxe: ["ON", "OFF"]  # `-DGGML_VXE=ON/OFF`
 
     steps:
       - name: Clone
@@ -87,7 +89,8 @@ jobs:
         run: |
           cmake -B build \
             -DLLAMA_FATAL_WARNINGS=ON \
-            -DGGML_RPC=ON
+            -DGGML_RPC=ON \
+            -DGGML_VXE=${{ matrix.vxe }}
           time cmake --build build --config Release -j $(nproc)
 
       - name: Test
@@ -105,8 +108,6 @@ jobs:
           ./bin/llama-completion -m stories260K-be.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
 
   ubuntu-24-ppc64le:
-    # QVAC-24501: see ubuntu-24-s390x above - same IBM service, same history.
-    if: false  # no runner: org not onboarded to the IBM hosted-runner service
     runs-on: ubuntu-24.04-ppc64le
 
     steps:

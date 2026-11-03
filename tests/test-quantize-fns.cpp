@@ -8,6 +8,8 @@
 
 #undef NDEBUG
 #include <assert.h>
+#include <algorithm>
+#include <cmath>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,7 +44,9 @@ static float max_quantization_error_for(ggml_type type) {
         case GGML_TYPE_Q1_0:    return MAX_QUANTIZATION_TOTAL_ERROR_BINARY;
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
-        case GGML_TYPE_Q2_0:    return MAX_QUANTIZATION_TOTAL_ERROR_TERNARY;
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_PQ2_0:
+        case GGML_TYPE_PTQ1_0:  return MAX_QUANTIZATION_TOTAL_ERROR_TERNARY;
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
         case GGML_TYPE_TBQ3_0_64:
@@ -72,7 +76,9 @@ static float max_dot_product_error_for(ggml_type type) {
         case GGML_TYPE_Q1_0:    return MAX_DOT_PRODUCT_ERROR_BINARY;
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
-        case GGML_TYPE_Q2_0:    return MAX_DOT_PRODUCT_ERROR_TERNARY;
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_PQ2_0:
+        case GGML_TYPE_PTQ1_0:  return MAX_DOT_PRODUCT_ERROR_TERNARY;
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
         case GGML_TYPE_TBQ3_0_64:
@@ -88,9 +94,9 @@ static float max_dot_product_error_for(ggml_type type) {
 
 
 // Generate synthetic data
-static void generate_data(float offset, size_t n, float * dst) {
+static void generate_data(float offset, size_t n, float * dst, float amplitude = 2.0f) {
     for (size_t i = 0; i < n; i++) {
-        dst[i] = 0.1 + 2*cosf(i + offset);
+        dst[i] = 0.1 + amplitude*cosf(i + offset);
     }
 }
 
@@ -135,23 +141,75 @@ static float reference_quantization_error(const ggml_type_traits * qfns, const g
     return array_rmse(tmp_out.data(), tmp_out_ref.data(), test_size);
 }
 
-static float dot_product_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data1, const float * test_data2) {
-    GGML_UNUSED(qfns);
-
-    std::vector<uint8_t> tmp_q1(2*test_size);
-    std::vector<uint8_t> tmp_q2(2*test_size);
-
+// Total dot product error
+static float dot_product_error(const ggml_type_traits_cpu * qfns_cpu, ggml_type src0_type, size_t test_size,
+                               const float * test_data1, const float * test_data2,
+                               const float * test_data3, const float * test_data4,
+                               const int nrc) {
     const auto * vdot = ggml_get_type_traits_cpu(qfns_cpu->vec_dot_type);
+    const size_t pad  = 64;
+    const size_t bx   = ggml_row_size(src0_type, test_size) + pad;
+    const size_t by   = ggml_row_size(qfns_cpu->vec_dot_type, test_size) + pad;
+
+    std::vector<uint8_t> tmp_q1(bx * nrc);
+    std::vector<uint8_t> tmp_q2(by * nrc);
 
     qfns_cpu->from_float(test_data1, tmp_q1.data(), test_size);
     vdot->from_float(test_data2, tmp_q2.data(), test_size);
 
-    float result = INFINITY;
-    qfns_cpu->vec_dot(test_size, &result, 0, tmp_q1.data(), 0, tmp_q2.data(), 0, 1);
+    if (nrc == 1) {
+        float result = INFINITY;
+        qfns_cpu->vec_dot(test_size, &result, 0, tmp_q1.data(), 0, tmp_q2.data(), 0, 1);
 
-    const float dot_ref = dot_product(test_data1, test_data2, test_size);
+        const float dot_ref = dot_product(test_data1, test_data2, test_size);
+        return fabsf(result - dot_ref) / test_size;
+    }
 
-    return fabsf(result - dot_ref) / test_size;
+    // nrc == 2: kernel computes a 2x2 dot product matrix
+    // Output layout: s[0]=dot(vx0,vy0), s[1]=dot(vx1,vy0), s[bs]=dot(vx0,vy1), s[bs+1]=dot(vx1,vy1)
+    // row and output strides are padded, same as in the mul_mat path
+    qfns_cpu->from_float(test_data3, tmp_q1.data() + bx, test_size);
+    vdot->from_float(test_data4, tmp_q2.data() + by, test_size);
+
+    const size_t bs = 16;
+    std::vector<float> result(bs + 2, INFINITY);
+    qfns_cpu->vec_dot(test_size, result.data(), bs, tmp_q1.data(), bx, tmp_q2.data(), by, 2);
+
+    const float ref00 = dot_product(test_data1, test_data2, test_size);
+    const float ref10 = dot_product(test_data3, test_data2, test_size);
+    const float ref01 = dot_product(test_data1, test_data4, test_size);
+    const float ref11 = dot_product(test_data3, test_data4, test_size);
+
+    const auto err = [test_size](float val, float ref) {
+        const float e = fabsf(val - ref) / test_size;
+        return std::isfinite(e) ? e : INFINITY;
+    };
+
+    return std::max({err(result[0], ref00), err(result[1], ref10), err(result[bs], ref01), err(result[bs + 1], ref11)});
+}
+
+static int test_vec_dot_f32(bool verbose) {
+    const auto * f32 = ggml_get_type_traits_cpu(GGML_TYPE_F32);
+    int num_failed = 0;
+    for (int n : {1, 2, 3, 5, 7, 8, 15, 16, 17, 31, 33, 63, 67, 127, 129, 193, 255, 1023}) {
+        std::vector<float> a(n);
+        std::vector<float> b(n);
+        generate_data(0.0, n, a.data());
+        generate_data(1.0, n, b.data());
+
+        float result = 0.0f;
+        f32->vec_dot(n, &result, 0, a.data(), 0, b.data(), 0, 1);
+        const float ref = dot_product(a.data(), b.data(), n);
+        const float error = fabsf(result - ref) / n;
+
+        const bool failed = !(error < MAX_QUANTIZATION_REFERENCE_ERROR);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf(" f32 vec_dot n=%4d:                 %s (ref=%f got=%f err=%f)\n",
+                   n, RESULT_STR[failed], ref, result, error);
+        }
+    }
+    return num_failed;
 }
 
 // Backend path: builds ggml compute graphs and runs them through the scheduler.
@@ -429,6 +487,12 @@ static void run_cpu_tests(size_t         test_size,
 
     ggml_cpu_init();
 
+    // nrc=2 kernels need a second pair of rows.
+    std::vector<float> test_data3(test_size);
+    std::vector<float> test_data4(test_size);
+    generate_data(3.0, test_data3.size(), test_data3.data(), 1.0f);
+    generate_data(4.0, test_data4.size(), test_data4.data(), 1.5f);
+
     bool failed = false;
 
     for (int i = 0; i < GGML_TYPE_COUNT; i++) {
@@ -462,7 +526,7 @@ static void run_cpu_tests(size_t         test_size,
                 printf("%5s reference implementation error: %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], reference_error);
             }
 
-            const float vec_dot_error = dot_product_error(qfns, qfns_cpu, test_size, test_data, test_data2);
+            const float vec_dot_error = dot_product_error(qfns_cpu, type, test_size, test_data, test_data2, nullptr, nullptr, 1);
             const float max_allowed_error = max_dot_product_error_for(type);
             failed = !(vec_dot_error < max_allowed_error);
             res.num_failed += failed;
@@ -470,6 +534,16 @@ static void run_cpu_tests(size_t         test_size,
                 printf("%5s dot product error:              %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], vec_dot_error);
             }
             res.dot_errors[i] = vec_dot_error;
+
+            // Test nrc=2 path for types that support it
+            if (qfns_cpu->nrows == 2) {
+                const float vec_dot_error_nrc2 = dot_product_error(qfns_cpu, type, test_size, test_data, test_data2, test_data3.data(), test_data4.data(), 2);
+                failed = !(vec_dot_error_nrc2 < max_allowed_error);
+                res.num_failed += failed;
+                if (failed || verbose) {
+                    printf("%5s dot product error (nrc=2):    %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], vec_dot_error_nrc2);
+                }
+            }
         }
     }
 }
@@ -661,6 +735,29 @@ static void test_tq_quantize_val_boundaries(void) {
     assert(!failed);
 }
 
+static void test_pq2_raw_decode_levels(void) {
+    block_pq2_0 block = {};
+    block.d = ggml_fp32_to_fp16(2.0f);
+    block.qs[0] = 0xe4;
+
+    float decoded[QK_PQ2_0];
+    dequantize_row_pq2_0(&block, decoded, QK_PQ2_0);
+    assert(decoded[0] == -2.0f);
+    assert(decoded[1] ==  0.0f);
+    assert(decoded[2] ==  2.0f);
+    assert(decoded[3] ==  4.0f);
+
+    float ternary[QK_PQ2_0];
+    for (int i = 0; i < QK_PQ2_0; ++i) {
+        ternary[i] = (float) (i % 3 - 1);
+    }
+    quantize_row_pq2_0_ref(ternary, &block, QK_PQ2_0);
+    for (int i = 0; i < QK_PQ2_0; ++i) {
+        const uint8_t code = (block.qs[i / 4] >> (2 * (i % 4))) & 3;
+        assert(code <= 2);
+    }
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
     size_t test_size = 32 * 128;
@@ -704,12 +801,14 @@ int main(int argc, char * argv[]) {
         if (err) return err;
     } else {
         run_cpu_tests(test_size, verbose, test_data.data(), test_data2.data(), res);
+        res.num_failed += test_vec_dot_f32(verbose);
     }
 
     run_cross_type_checks(verbose, res);
 
     test_tq_forward_inverse_roundtrip();
     test_tq_quantize_val_boundaries();
+    test_pq2_raw_decode_levels();
 
     if (res.num_failed || verbose) {
         printf("%d tests failed\n", res.num_failed);

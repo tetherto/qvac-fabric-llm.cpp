@@ -3,7 +3,7 @@
 #include "value.h"
 
 // for converting from JSON to jinja values
-#include <nlohmann/json.hpp>
+#include "json.h"
 
 #include <sstream>
 #include <string>
@@ -348,6 +348,43 @@ static value default_value(const func_args & args) {
     return no_value ? args.get_pos(1) : args.get_pos(0);
 }
 
+static value toobject(const func_args & args) {
+    auto out = mk_val<value_object>();
+    value iter = args.get_pos(0, mk_val<value_undefined>());
+    bool iter_first = false;
+    if (is_val<value_array>(iter)) {
+        iter_first = true;
+        for (const auto & it : iter->as_array()) {
+            if (is_val<value_array>(it) && it->as_array().size() == 2) {
+                auto tuple = it->as_array();
+                auto key = tuple[0];
+                auto val = tuple[1];
+                JJ_DEBUG("namespace/dict: adding key '%s'", key->as_string().str().c_str());
+                out->insert(key, val);
+            } else {
+                throw raised_exception("namespace/dict() iterable argument must consist of tuples, not " + it->type());
+            }
+        }
+    } else if (is_val<value_object>(iter)) {
+        iter_first = true;
+        for (const auto & pair : iter->as_ordered_object()) {
+            JJ_DEBUG("namespace/dict: adding key '%s'", pair.first->as_string().str().c_str());
+            out->insert(pair.first, pair.second);
+        }
+    }
+    for (const auto & arg : args.get_args()) {
+        if (is_val<value_kwarg>(arg)) {
+            auto kwarg = cast_val<value_kwarg>(arg);
+            JJ_DEBUG("namespace/dict: adding key '%s'", kwarg->key.c_str());
+            out->insert(kwarg->key, kwarg->val);
+        } else if (!iter_first) {
+            throw raised_exception("namespace/dict() arguments must be kwargs, dict and/or iterable of tuples, not " + arg->type());
+        }
+        iter_first = false;
+    }
+    return out;
+}
+
 const func_builtins & global_builtins() {
     static const func_builtins builtins = {
         {"raise_exception", [](const func_args & args) -> value {
@@ -355,18 +392,8 @@ const func_builtins & global_builtins() {
             std::string msg = args.get_pos(0)->as_string().str();
             throw raised_exception("Jinja Exception: " + msg);
         }},
-        {"namespace", [](const func_args & args) -> value {
-            auto out = mk_val<value_object>();
-            for (const auto & arg : args.get_args()) {
-                if (!is_val<value_kwarg>(arg)) {
-                    throw raised_exception("namespace() arguments must be kwargs");
-                }
-                auto kwarg = cast_val<value_kwarg>(arg);
-                JJ_DEBUG("namespace: adding key '%s'", kwarg->key.c_str());
-                out->insert(kwarg->key, kwarg->val);
-            }
-            return out;
-        }},
+        {"dict", toobject},
+        {"namespace", toobject},
         {"strftime_now", [](const func_args & args) -> value {
             args.ensure_vals<value_string>();
             std::string format = args.get_pos(0)->as_string().str();
@@ -515,8 +542,28 @@ const func_builtins & global_builtins() {
         }},
         {"test_is_sameas", [](const func_args & args) -> value {
             // Check if an object points to the same memory address as another object
-            (void)args;
-            throw not_implemented_exception("sameas test not implemented");
+            args.ensure_count(2);
+            auto a = args.get_pos(0);
+            auto b = args.get_pos(1);
+            bool res = false;
+            if (!is_val<value_undefined>(a) && !is_val<value_undefined>(b)) {
+                if (is_val<value_none>(a) && is_val<value_none>(b)) {
+                    res = true;
+                } else if (is_val<value_bool>(a) && is_val<value_bool>(b)) {
+                    if (a->as_bool() == b->as_bool()) {
+                        res = true;
+                    }
+                } else if (is_val<value_int>(a) && is_val<value_int>(b)) {
+                    const int64_t x = a->as_int();
+                    // Allow comparison within small-int cache range
+                    if (x >= -5 && x <= 256 && x == b->as_int()) {
+                        res = true;
+                    }
+                } else if (a == b) {
+                    res = true;
+                }
+            }
+            return mk_val<value_bool>(res);
         }},
         {"test_is_escaped", [](const func_args & args) -> value {
             (void)args;
@@ -1355,7 +1402,7 @@ const func_builtins & value_undefined_t::get_builtins() const {
 //////////////////////////////////
 
 
-static value from_json(const nlohmann::ordered_json & j, bool mark_input) {
+static value from_json(const common_json & j, bool mark_input) {
     if (j.is_null()) {
         return mk_val<value_none>();
     } else if (j.is_boolean()) {
@@ -1452,7 +1499,7 @@ bool value_compare(const value & a, const value & b, value_compare_op op) {
 }
 
 template<>
-void global_from_json(context & ctx, const nlohmann::ordered_json & json_obj, bool mark_input) {
+void global_from_json(context & ctx, const common_json & json_obj, bool mark_input) {
     // printf("global_from_json: %s\n" , json_obj.dump(2).c_str());
     if (json_obj.is_null() || !json_obj.is_object()) {
         throw std::runtime_error("global_from_json: input JSON value must be an object");

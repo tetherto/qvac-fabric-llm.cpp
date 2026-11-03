@@ -37,7 +37,7 @@ public:
         data.insert(data.end(), bytes, bytes + size);
     }
 
-    void write_tensor(const ggml_tensor * tensor, size_t offset, size_t size) override {
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
         const size_t start = data.size();
         data.resize(start + size);
         ggml_backend_tensor_get(tensor, data.data() + start, offset, size);

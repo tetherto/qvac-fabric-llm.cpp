@@ -3,10 +3,6 @@ name: UI
 on:
   workflow_dispatch:
     inputs:
-      sha:
-        description: 'Commit SHA1 to build'
-        required: false
-        type: string
   push:
     branches:
       - master
@@ -24,6 +20,9 @@ on:
       'tools/ui/**.*',
       'tools/server/tests/**.*'
     ]
+
+permissions:
+  contents: read
 
 env:
   LLAMA_ARG_LOG_COLORS: 1
@@ -43,7 +42,7 @@ env:
 # commits from the same non-master ref share a group and cancel each other.
 # See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.sha || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -61,21 +60,21 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Setup Node.js
         id: node
         uses: actions/setup-node@v6
         with:
-          node-version: lts/*
-          check-latest: true
-          cache: "npm"
-          cache-dependency-path: "tools/ui/package-lock.json"
+          node-version: "24"
+          # cache: "npm"
+          # cache-dependency-path: "tools/ui/package-lock.json"
+          package-manager-cache: false
 
       - name: Download built UI artifacts
         uses: actions/download-artifact@v6
         with:
-          name: ui-build
+          name: llama-ui.zip
           path: tools/ui/dist/
 
       - name: Install dependencies
@@ -119,16 +118,16 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Setup Node.js
         id: node
         uses: actions/setup-node@v6
         with:
-          node-version: lts/*
-          check-latest: true
-          cache: "npm"
-          cache-dependency-path: "tools/ui/package-lock.json"
+          node-version: "24"
+          # cache: "npm"
+          # cache-dependency-path: "tools/ui/package-lock.json"
+          package-manager-cache: false
 
       - name: Install dependencies
         id: setup
@@ -139,7 +138,7 @@ jobs:
       - name: Download built UI artifacts (reuses ui-build)
         uses: actions/download-artifact@v6
         with:
-          name: ui-build
+          name: llama-ui.zip
           path: tools/ui/dist/
 
       - name: Install Playwright browsers
