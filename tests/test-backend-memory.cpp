@@ -4,6 +4,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -157,6 +158,88 @@ void check_gpu(ggml_backend_t cpu) {
     ggml_backend_free(gpu);
 }
 
+void check_repack_matmul(ggml_backend_t backend, ggml_tensor * weights,
+                         const std::vector<uint8_t> & expected, const char * name, int & checks) {
+    const int64_t width = weights->ne[0];
+    const int64_t rows = weights->ne[1];
+    auto * ctx = ggml_init({ggml_tensor_overhead() * 4 + ggml_graph_overhead_custom(8, false), nullptr, true});
+    check(ctx != nullptr, "REPACK matmul context allocation failed");
+    auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, 1);
+    auto * output = ggml_mul_mat(ctx, weights, input);
+    check(ggml_backend_supports_op(backend, output), "REPACK matmul unsupported");
+    auto * graph = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(graph, output);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "REPACK matmul buffer allocation failed");
+
+    std::vector<float> activation(width), canonical(width * rows), actual(rows);
+    for (int64_t i = 0; i < width; ++i) {
+        activation[i] = float(int((i * 13) % 71) - 35) / 37.0f;
+    }
+    const auto * traits = ggml_get_type_traits(weights->type);
+    check(traits->to_float != nullptr, "REPACK reference dequantizer unavailable");
+    traits->to_float(expected.data(), canonical.data(), width * rows);
+    ggml_backend_tensor_set(input, activation.data(), 0, activation.size() * sizeof(float));
+    const auto status = ggml_backend_graph_compute(backend, graph);
+    ggml_backend_synchronize(backend);
+    check(status == GGML_STATUS_SUCCESS, "REPACK matmul execution failed");
+    ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+
+    double squared_error = 0.0;
+    double squared_reference = 0.0;
+    bool finite = true;
+    for (int64_t row = 0; row < rows; ++row) {
+        double reference = 0.0;
+        for (int64_t col = 0; col < width; ++col) {
+            reference += double(canonical[row * width + col]) * activation[col];
+        }
+        finite = finite && std::isfinite(reference) && std::isfinite(actual[row]);
+        const double difference = reference - actual[row];
+        squared_error += difference * difference;
+        squared_reference += reference * reference;
+    }
+    const double nmse = squared_reference > 0.0 ? squared_error / squared_reference : INFINITY;
+    const bool passed = finite && std::isfinite(nmse) && nmse <= 5e-4;
+    std::printf("%s %s matmul: %s (NMSE %.12g, limit 0.0005)\n",
+                ggml_type_name(weights->type), name, passed ? "PASS" : "FAIL", nmse);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    check(passed, "REPACK matmul differs from canonical reference");
+    ++checks;
+}
+
+void check_foreign_set_rows(ggml_backend_t backend, int & checks) {
+    auto * cpu = ggml_backend_cpu_init();
+    check(cpu != nullptr, "foreign-buffer CPU backend unavailable");
+    auto * ctx = ggml_init({ggml_tensor_overhead() * 8, nullptr, true});
+    check(ctx != nullptr, "foreign-buffer context allocation failed");
+    auto * destination = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 256, 32);
+    auto * alias = ggml_view_tensor(ctx, destination);
+    auto * values = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 1);
+    auto * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
+    auto * write = ggml_set_rows(ctx, destination, values, indices);
+    auto * alias_write = ggml_set_rows(ctx, alias, values, indices);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    check(buffer != nullptr, "foreign-buffer allocation failed");
+    check(ggml_backend_supports_op(backend, write), "SET_ROWS rejected a canonical CPU destination");
+    ++checks;
+
+    // A foreign backend's opaque metadata must not affect Hexagon layout detection.
+    std::vector<uint8_t> foreign_extra(ggml_nbytes(destination), 0xff);
+    void * original_extra = destination->extra;
+    destination->extra = foreign_extra.data();
+    const bool direct_supported = ggml_backend_supports_op(backend, write);
+    const bool alias_supported = ggml_backend_supports_op(backend, alias_write);
+    destination->extra = original_extra;
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(cpu);
+    check(direct_supported, "SET_ROWS inspected foreign CPU metadata");
+    check(alias_supported, "SET_ROWS inspected foreign CPU alias metadata");
+    checks += 2;
+    std::puts("foreign CPU SET_ROWS queries: 3 PASS");
+}
+
 void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
     auto * ctx = ggml_init({ggml_tensor_overhead() * 16, nullptr, true});
     check(ctx != nullptr, "REPACK context allocation failed");
@@ -182,12 +265,15 @@ void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
         values[i] = float(int(i % 67) - 33) / 19.0f;
     }
     check(ggml_quantize_chunk(type, values.data(), b.data(), 0, 32, 256, nullptr) == bytes, "REPACK quantization failed");
-    auto verify = [&](ggml_tensor * tensor, const char * name) {
+    auto verify = [&](ggml_tensor * tensor, const char * name, bool compute = false) {
         ggml_backend_tensor_get(tensor, actual.data(), 0, bytes);
         const bool passed = actual == expected;
         std::printf("%s %s: %s\n", ggml_type_name(type), name, passed ? "PASS" : "FAIL");
         check(passed, "REPACK canonical bytes changed");
         ++checks;
+        if (compute) {
+            check_repack_matmul(backend, tensor, expected, name, checks);
+        }
     };
 
     expected = a;
@@ -196,13 +282,13 @@ void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
     std::copy(b.begin() + half, b.end(), expected.begin() + half);
     for (int repeat = 0; repeat < 2; ++repeat) {
         ggml_backend_tensor_set(overwrite, b.data() + half, half, half);
-        verify(overwrite, repeat == 0 ? "partial" : "repeat");
+        verify(overwrite, repeat == 0 ? "partial" : "repeat", repeat == 1);
     }
 
     ggml_backend_tensor_set(streamed, a.data(), 0, half);
     ggml_backend_tensor_set(streamed, a.data(), 0, half);
     ggml_backend_tensor_set(streamed, b.data() + half, half, half);
-    verify(streamed, "streamed-overlap");
+    verify(streamed, "streamed-overlap", true);
 
     ggml_backend_tensor_set(strided, a.data(), 0, bytes);
     for (int repeat = 0; repeat < 2; ++repeat) {
@@ -210,7 +296,7 @@ void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
         std::vector<uint8_t> upper(half);
         ggml_backend_tensor_get_2d(strided, upper.data(), half, row, 16, row, row);
         check(std::equal(upper.begin(), upper.end(), b.begin() + half), "REPACK strided readback changed");
-        verify(strided, repeat == 0 ? "strided" : "strided-repeat");
+        verify(strided, repeat == 0 ? "strided" : "strided-repeat", repeat == 1);
     }
 
     ggml_backend_tensor_copy_async(backend, backend, overwrite, copied);
@@ -218,7 +304,7 @@ void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
     verify(copied, "copy");
     std::copy(b.begin(), b.begin() + row, expected.begin());
     ggml_backend_tensor_set(copied, b.data(), 0, row);
-    verify(copied, "copy-partial");
+    verify(copied, "copy-partial", true);
 
     ggml_backend_buffer_clear(buffer, 0);
     ggml_backend_tensor_get(overwrite, expected.data(), 0, bytes);
@@ -236,10 +322,10 @@ void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
     expected = a;
     std::copy(b.begin() + half, b.end(), expected.begin() + half);
     ggml_backend_tensor_set(alias, b.data() + half, half, half);
-    verify(overwrite, "alias-partial-write");
+    verify(overwrite, "alias-partial-write", true);
     expected = b;
     ggml_backend_tensor_set(overwrite, b.data(), 0, half);
-    verify(alias, "alias-base-update");
+    verify(alias, "alias-base-update", true);
     ggml_backend_buffer_clear(buffer, 0);
     ggml_backend_tensor_get(overwrite, expected.data(), 0, bytes);
     verify(alias, "alias-clear");
@@ -266,8 +352,11 @@ void check_repack(const char * name) {
                           GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         check_repack_type(backend, type, checks);
     }
+    if (std::strncmp(ggml_backend_name(backend), "HTP", 3) == 0) {
+        check_foreign_set_rows(backend, checks);
+    }
     ggml_backend_free(backend);
-    std::printf("REPACK transfers: %d passed, 0 failed, 0 unsupported, 0 skipped\n", checks);
+    std::printf("REPACK checks: %d passed, 0 failed, 0 unsupported, 0 skipped\n", checks);
 }
 
 }  // namespace

@@ -1284,7 +1284,7 @@ ggml_backend_hexagon_device_context::~ggml_backend_hexagon_device_context() {
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(fence_buffer_type.context);
 }
 
-static bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b) {
+bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b) {
     return b->buft->iface.get_alignment == ggml_backend_hexagon_buffer_type_get_alignment;
 }
 

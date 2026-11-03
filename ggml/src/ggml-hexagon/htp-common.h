@@ -120,6 +120,8 @@ uint32_t     htp_session_n_threads(const struct ggml_hexagon_session * sess);
 uint32_t     htp_session_n_hmx(const struct ggml_hexagon_session * sess);
 uint32_t     htp_session_mdev_count(const struct ggml_hexagon_session * sess);
 
+bool         ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b);
+
 htp_op_code  htp_op_remap(const struct ggml_tensor * t);
 
 #endif // HTP_COMMON_H
