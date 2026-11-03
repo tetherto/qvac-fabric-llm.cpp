@@ -1744,6 +1744,14 @@ static bool htp_kparams_solve_set_rows(
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * dst  = op->src[2] ? op->src[2] : op;
 
+    const auto * owner = htp_repack_owner(dst);
+    const auto * extra = static_cast<const htp_tensor_extra *>(owner->extra);
+    if (htp_is_tiled_weight_type(dst->type) &&
+        ((extra && (extra->flags & HTP_TENSOR_TILED)) ||
+         (owner->buffer && ggml_backend_buffer_get_usage(owner->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS))) {
+        return false;
+    }
+
     if (dst->type == GGML_TYPE_Q8_0 && src0->ne[0] < 32) {
         return false;
     }

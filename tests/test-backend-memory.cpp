@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -156,10 +157,127 @@ void check_gpu(ggml_backend_t cpu) {
     ggml_backend_free(gpu);
 }
 
+void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
+    auto * ctx = ggml_init({ggml_tensor_overhead() * 16, nullptr, true});
+    check(ctx != nullptr, "REPACK context allocation failed");
+    auto * overwrite = ggml_new_tensor_2d(ctx, type, 256, 32);
+    auto * streamed = ggml_new_tensor_2d(ctx, type, 256, 32);
+    auto * strided = ggml_new_tensor_2d(ctx, type, 256, 32);
+    auto * copied = ggml_new_tensor_2d(ctx, type, 256, 32);
+    auto * alias = ggml_view_tensor(ctx, overwrite);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "REPACK buffer allocation failed");
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    const size_t bytes = ggml_nbytes(overwrite);
+    const size_t half = bytes / 2;
+    const size_t row = ggml_row_size(type, 256);
+    std::vector<float> values(256 * 32);
+    std::vector<uint8_t> a(bytes), b(bytes), actual(bytes), expected(bytes);
+    for (size_t i = 0; i < values.size(); ++i) {
+        values[i] = float(int(i % 97) - 48) / 31.0f;
+    }
+    check(ggml_quantize_chunk(type, values.data(), a.data(), 0, 32, 256, nullptr) == bytes, "REPACK quantization failed");
+    for (size_t i = 0; i < values.size(); ++i) {
+        values[i] = float(int(i % 67) - 33) / 19.0f;
+    }
+    check(ggml_quantize_chunk(type, values.data(), b.data(), 0, 32, 256, nullptr) == bytes, "REPACK quantization failed");
+    auto verify = [&](ggml_tensor * tensor, const char * name) {
+        ggml_backend_tensor_get(tensor, actual.data(), 0, bytes);
+        const bool passed = actual == expected;
+        std::printf("%s %s: %s\n", ggml_type_name(type), name, passed ? "PASS" : "FAIL");
+        check(passed, "REPACK canonical bytes changed");
+        ++checks;
+    };
+
+    expected = a;
+    ggml_backend_tensor_set(overwrite, a.data(), 0, bytes);
+    verify(overwrite, "full");
+    std::copy(b.begin() + half, b.end(), expected.begin() + half);
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        ggml_backend_tensor_set(overwrite, b.data() + half, half, half);
+        verify(overwrite, repeat == 0 ? "partial" : "repeat");
+    }
+
+    ggml_backend_tensor_set(streamed, a.data(), 0, half);
+    ggml_backend_tensor_set(streamed, a.data(), 0, half);
+    ggml_backend_tensor_set(streamed, b.data() + half, half, half);
+    verify(streamed, "streamed-overlap");
+
+    ggml_backend_tensor_set(strided, a.data(), 0, bytes);
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        ggml_backend_tensor_set_2d(strided, b.data() + half, half, row, 16, row, row);
+        std::vector<uint8_t> upper(half);
+        ggml_backend_tensor_get_2d(strided, upper.data(), half, row, 16, row, row);
+        check(std::equal(upper.begin(), upper.end(), b.begin() + half), "REPACK strided readback changed");
+        verify(strided, repeat == 0 ? "strided" : "strided-repeat");
+    }
+
+    ggml_backend_tensor_copy_async(backend, backend, overwrite, copied);
+    ggml_backend_synchronize(backend);
+    verify(copied, "copy");
+    std::copy(b.begin(), b.begin() + row, expected.begin());
+    ggml_backend_tensor_set(copied, b.data(), 0, row);
+    verify(copied, "copy-partial");
+
+    ggml_backend_buffer_clear(buffer, 0);
+    ggml_backend_tensor_get(overwrite, expected.data(), 0, bytes);
+    std::copy(b.begin() + half, b.end(), expected.begin() + half);
+    ggml_backend_tensor_set(overwrite, b.data() + half, half, half);
+    verify(overwrite, "clear-partial");
+    expected = a;
+    ggml_backend_tensor_set(overwrite, a.data(), 0, bytes);
+    verify(overwrite, "replace-full");
+    verify(alias, "alias-read");
+    expected = b;
+    ggml_backend_tensor_set(alias, b.data(), 0, bytes);
+    verify(overwrite, "alias-full-write");
+    ggml_backend_tensor_set(overwrite, a.data(), 0, bytes);
+    expected = a;
+    std::copy(b.begin() + half, b.end(), expected.begin() + half);
+    ggml_backend_tensor_set(alias, b.data() + half, half, half);
+    verify(overwrite, "alias-partial-write");
+    expected = b;
+    ggml_backend_tensor_set(overwrite, b.data(), 0, half);
+    verify(alias, "alias-base-update");
+    ggml_backend_buffer_clear(buffer, 0);
+    ggml_backend_tensor_get(overwrite, expected.data(), 0, bytes);
+    verify(alias, "alias-clear");
+
+    if (type == GGML_TYPE_Q8_0 && std::strncmp(ggml_backend_name(backend), "HTP", 3) == 0) {
+        auto * values = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 1);
+        auto * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
+        auto * write = ggml_set_rows(ctx, alias, values, indices);
+        check(!ggml_backend_supports_op(backend, write), "SET_ROWS accepted a packed destination");
+        std::puts("q8_0 packed SET_ROWS rejection: PASS");
+        ++checks;
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+}
+
+void check_repack(const char * name) {
+    auto * dev = ggml_backend_dev_by_name(name);
+    check(dev != nullptr, "REPACK backend unavailable");
+    auto * backend = ggml_backend_dev_init(dev, nullptr);
+    check(backend != nullptr, "REPACK backend initialization failed");
+    int checks = 0;
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
+                          GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        check_repack_type(backend, type, checks);
+    }
+    ggml_backend_free(backend);
+    std::printf("REPACK transfers: %d passed, 0 failed, 0 unsupported, 0 skipped\n", checks);
+}
+
 }  // namespace
 
-int main() try {
+int main(int argc, char ** argv) try {
     ggml_backend_load_all();
+    if (argc == 3 && std::strcmp(argv[1], "--repack") == 0) {
+        check_repack(argv[2]);
+        return 0;
+    }
     auto * cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     check(cpu != nullptr, "CPU backend unavailable");
     check_host(cpu);

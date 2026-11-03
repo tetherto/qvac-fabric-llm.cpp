@@ -4,11 +4,30 @@
 #include "htp-opnode.h"
 #include "htp-repack.h"
 
+#include <cstring>
+#include <utility>
+#include <vector>
+
 struct htp_tensor_extra {
-    std::vector<uint8_t> shadow_buf;
-    size_t               shadow_size { 0 };
-    uint32_t             flags { 0 };
+    std::vector<uint8_t>                   shadow_buf;
+    std::vector<std::pair<size_t, size_t>> shadow_coverage;
+    bool                                   repack_ready { false };
+    uint32_t                               flags { 0 };
+
+    explicit htp_tensor_extra(uint32_t flags = 0) : flags(flags) {}
 };
+
+static inline const ggml_tensor * htp_repack_owner(const ggml_tensor * tensor) {
+    if (!htp_is_tiled_weight_type(tensor->type)) {
+        return tensor;
+    }
+    while (tensor->view_src && tensor->view_offs == 0 && tensor->type == tensor->view_src->type &&
+           ggml_are_same_shape(tensor, tensor->view_src) &&
+           memcmp(tensor->nb, tensor->view_src->nb, sizeof(tensor->nb)) == 0) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
 
 extern int    opt_arch;
 extern size_t opt_ndev;
