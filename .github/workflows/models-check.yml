@@ -167,7 +167,7 @@ jobs:
 
   rocm:
     needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
+    if: false  # No matching AMD GPU hardware.
     runs-on: [self-hosted, Linux, gfx1201, 1accel]
     container: "rocm/dev-ubuntu-24.04:7.2.4-complete"
 
@@ -306,7 +306,7 @@ jobs:
 
   vulkan-amd:
     needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
+    if: false  # No matching AMD GPU hardware.
     runs-on: [self-hosted, Linux, gfx1201, 1accel]
     container: "ubuntu:26.04"
 
@@ -377,7 +377,7 @@ jobs:
   webgpu-nvidia:
     needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: qvac-ubuntu2204-x64-gpu
+    runs-on: qvac-ubuntu2404-x64-gpu
 
     steps:
       - name: Clone
