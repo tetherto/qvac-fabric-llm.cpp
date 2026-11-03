@@ -268,6 +268,19 @@ llama_coreml_ffn * llama_coreml_ffn_load(const llama_model & model, const llama_
     }
 }
 
+int llama_coreml_ffn_neural_engine_cores() {
+    @autoreleasepool {
+        if (@available(macOS 14.0, iOS 17.0, *)) {
+            for (id<MLComputeDeviceProtocol> device in MLAllComputeDevices()) {
+                if ([device isKindOfClass:[MLNeuralEngineComputeDevice class]]) {
+                    return int(((MLNeuralEngineComputeDevice *) device).totalCoreCount);
+                }
+            }
+        }
+        return 0;
+    }
+}
+
 void llama_coreml_ffn_free(llama_coreml_ffn * runtime) { delete runtime; }
 
 bool llama_coreml_ffn_check(llama_coreml_ffn * runtime) {

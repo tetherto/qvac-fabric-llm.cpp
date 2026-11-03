@@ -5,7 +5,11 @@
 #include <stdexcept>
 
 llama_coreml_ffn_params llama_coreml_ffn_default_params() {
-    return {nullptr, 8192, 2, 256};
+    // Ultra chips have two 16-core Neural Engines and run two programs at once
+    if (llama_coreml_ffn_neural_engine_cores() > 16) {
+        return {nullptr, 8192, 2, 256};
+    }
+    return {nullptr, 11264, 1, 256};
 }
 
 bool llama_supports_coreml_ffn() {
@@ -54,6 +58,7 @@ bool llama_context::set_coreml_ffn(const llama_coreml_ffn_params * params, char 
 llama_coreml_ffn * llama_coreml_ffn_load(const llama_model &, const llama_coreml_ffn_params &) {
     throw std::runtime_error("Core ML FFN support was not built (LLAMA_COREML_FFN=OFF)");
 }
+int llama_coreml_ffn_neural_engine_cores() { return 0; }
 void llama_coreml_ffn_free(llama_coreml_ffn *) {}
 bool llama_coreml_ffn_check(llama_coreml_ffn *) { return true; }
 ggml_tensor * llama_coreml_ffn_build(llama_coreml_ffn *, ggml_context *, ggml_cgraph *,

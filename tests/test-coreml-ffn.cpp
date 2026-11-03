@@ -97,7 +97,8 @@ static void check_context_lifecycle() {
 int main() {
     try {
         const auto params = llama_coreml_ffn_default_params();
-        check(!params.cache_dir && params.metal_channels == 8192 && params.n_packages == 2 && params.min_tokens == 256, "default parameters");
+        check(!params.cache_dir && params.min_tokens == 256 && ((params.metal_channels == 8192 && params.n_packages == 2) ||
+            (params.metal_channels == 11264 && params.n_packages == 1)), "default parameters");
         char error[64] = {};
         check(!llama_set_coreml_ffn(nullptr, &params, error, sizeof(error)) && error[0], "null context error");
         check(!llama_set_coreml_ffn(nullptr, &params, nullptr, 0), "null error buffer");

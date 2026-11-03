@@ -273,7 +273,7 @@ llama_context::llama_context(
     }
 
     if (params.ctx_other_share_compute && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr &&
-        &params.ctx_other->get_model() == &model &&
+        &params.ctx_other->get_model() == &model && !params.ctx_other->coreml_ffn &&
         cparams.n_seq_max == 1 && params.ctx_other->n_seq_max() == 1) {
         ctx_compute = params.ctx_other->compute_state;
         params.ctx_other->compute_share_source = true;

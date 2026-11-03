@@ -1,5 +1,17 @@
 # Qwen3.8-27B Core ML prefill sidecar
 
+## Command line
+
+The sidecar is off by default. Build with `-DLLAMA_COREML_FFN=ON -DGGML_METAL=ON` (macOS 15 or later) and add `--coreml-ffn` to `llama-server`, `llama-cli` or any other tool that uses `common`:
+
+```sh
+cmake -S . -B build -DLLAMA_COREML_FFN=ON -DGGML_METAL=ON
+cmake --build build --target llama-server -j 8
+build/bin/llama-server -m Qwen3.8-27B-Q4_0.gguf --coreml-ffn
+```
+
+The first start compiles 4.5-9 GB of Core ML programs into `--coreml-ffn-cache` (default `~/Library/Caches/llama.cpp/coreml-ffn`, or `$LLAMA_CACHE/coreml-ffn`) in about 1-2 minutes; later starts load them in about 3 s. Only prompt batches of 256 or more tokens use the Neural Engine; decode stays on Metal. Other models, other builds and unsupported contexts log a warning and run on Metal. The default split is `8192x2` on chips with two Neural Engines (Ultra) and `11264x1` otherwise; `--coreml-ffn-split` overrides it.
+
 ## Library integration
 
 Build `libllama` with `-DLLAMA_COREML_FFN=ON -DGGML_METAL=ON` to use the in-graph FFN sidecar from a native application or addon. This is separate from the EmbeddingGemma `LLAMA_COREML` option. It works with examples, tools and common utilities disabled. Each context must own its scheduler. The installed header is `llama-coreml-ffn.h`; the ordinary build keeps the API and reports the feature unavailable.
