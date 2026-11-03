@@ -29,9 +29,6 @@ constexpr int kTurboVecDimMultiple = 8;
 constexpr int kTurboVecScoreBlock = 32;
 // 32-row blocks per parallel task of the cache repacks.
 constexpr size_t kTurboVecBlocksPerTask = 64;
-#if GGML_VEC_INDEX_USE_NEON
-constexpr int kTurboVecFlushEvery = 256;
-#endif
 constexpr uint64_t kTurboVecRotationSeed = 42;
 constexpr int kTurboVecHadamardRounds = 2;
 // rand_core 0.6 `seed_from_u64(42)`, frozen by upstream turbovec 1.x
@@ -900,7 +897,7 @@ static float turbovec_norm_sq_with(TurboVecSimd simd, const float * row, int dim
 #if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
         case TurboVecSimd::avx2:
         case TurboVecSimd::avx512:
-            return ggml_vec_index_detail::turbovec_norm_sq_avx(row, dim);
+            return ggml_vec_index_detail::turbovec_norm_sq_avx2(row, dim);
 #endif
         default:
             break;
@@ -1412,6 +1409,47 @@ static void build_turbovec_query_lut(
 
     for (int g = 0; g < n_byte_groups; ++g) {
         const int dim_start = g * codes_per_byte;
+        if (bits == 2) {
+            // Upstream H67/H109: a 2-bit sub-table's entry (a, b) is
+            // q[d] * c[a] + q[d + 1] * c[b], so it is 4 + 4 products and 16
+            // adds, summed as (0 + p_a) + p_b like the loop below, so every
+            // entry is the same bit pattern; f32 addition is monotone in
+            // each operand, so the extremes are the sums of the addends'.
+            // The bias takes the two halves' minima as one sum, as below.
+            float sub_mins[2];
+            for (int half = 0; half < 2; ++half) {
+                const size_t d = static_cast<size_t>(dim_start + half * 2);
+                float pa[4];
+                float pb[4];
+                for (int c = 0; c < 4; ++c) {
+                    pa[c] = 0.0f + turbovec_lut_product(rotated_query[d], centroids[c]);
+                    pb[c] = turbovec_lut_product(rotated_query[d + 1], centroids[c]);
+                }
+                float * entries = float_vals.data() + static_cast<size_t>(g) * 32 + static_cast<size_t>(half) * 16;
+                for (int a = 0; a < 4; ++a) {
+                    for (int b = 0; b < 4; ++b) {
+                        entries[a * 4 + b] = pa[a] + pb[b];
+                    }
+                }
+                float a_min = pa[0];
+                float a_max = pa[0];
+                float b_min = pb[0];
+                float b_max = pb[0];
+                for (int c = 1; c < 4; ++c) {
+                    a_min = std::min(a_min, pa[c]);
+                    a_max = std::max(a_max, pa[c]);
+                    b_min = std::min(b_min, pb[c]);
+                    b_max = std::max(b_max, pb[c]);
+                }
+                const float sub_min = a_min + b_min;
+                const float sub_max = a_max + b_max;
+                mins[static_cast<size_t>(g) * 2 + static_cast<size_t>(half)] = sub_min;
+                sub_mins[half] = sub_min;
+                max_span = std::max(max_span, sub_max - sub_min);
+            }
+            out_bias += sub_mins[0] + sub_mins[1];
+            continue;
+        }
         float lo_min = FLT_MAX;
         float lo_max = -FLT_MAX;
         for (uint16_t nibble = 0; nibble < 16; ++nibble) {
@@ -1460,16 +1498,10 @@ static void build_turbovec_query_lut(
     }
     const float inv_scale = 1.0f / out_scale;
     for (int g = 0; g < n_byte_groups; ++g) {
-        const float lo_min = mins[static_cast<size_t>(g) * 2];
-        const float hi_min = mins[static_cast<size_t>(g) * 2 + 1];
-        for (int i = 0; i < 16; ++i) {
-            const size_t lo = static_cast<size_t>(g) * 32 + static_cast<size_t>(i);
-            const size_t hi = static_cast<size_t>(g) * 32 + 16 + static_cast<size_t>(i);
-            out_values[lo] = static_cast<uint8_t>(
-                std::max(0.0f, std::min(max_lut, std::round((float_vals[lo] - lo_min) * inv_scale))));
-            out_values[hi] = static_cast<uint8_t>(
-                std::max(0.0f, std::min(max_lut, std::round((float_vals[hi] - hi_min) * inv_scale))));
-        }
+        const size_t lo = static_cast<size_t>(g) * 32;
+        const size_t hi = lo + 16;
+        quantise_table16(float_vals.data() + lo, mins[static_cast<size_t>(g) * 2], inv_scale, max_lut, out_values.data() + lo);
+        quantise_table16(float_vals.data() + hi, mins[static_cast<size_t>(g) * 2 + 1], inv_scale, max_lut, out_values.data() + hi);
     }
 }
 
@@ -2209,7 +2241,10 @@ static void set_blocked_lane_byte(uint8_t * group_bytes, size_t lane, uint8_t va
 
 static int8_t turbovec_round_i8(float value) {
     // Rust `(x).round().clamp(-127.0, 127.0) as i8`: half away from zero.
-    return static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, std::round(value))));
+    // round_half_away_f32 is std::round but for the sign of a zero, which
+    // the integer cast erases; std::round itself is a libm call per weight
+    // on x86's baseline.
+    return static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, round_half_away_f32(value))));
 }
 
 // The query rounded to int8 under one scale (upstream `build_permute_dot`).
@@ -2952,7 +2987,11 @@ void score_turbovec_permute_dot_batch_block(
             permute_dot_block_sums_sdot_4(batch.pds + q, block, n_byte_groups, sums + q);
         }
         done = true;
-    } else if (batch.bits == 4 && turbovec_cpu_dot_product()) {
+    } else if (batch.bits == 4 && turbovec_cpu_dot_product() &&
+               (batch.layout != kTurboVecLayoutVm8 || std::all_of(batch.pds, batch.pds + n, [](const TurboVecPermuteDot * pd) {
+                    return !pd->vm8_weights.empty();
+                }))) {
+        // A vm8 query needs its vm8 weights, as the single-query path checks.
         for (int q = 0; q < n; ++q) {
             if (batch.layout == kTurboVecLayoutVm8) {
                 permute_dot_block_sums_sdot_vm8_single(*batch.pds[q], block, n_byte_groups, sums[q]);
@@ -4841,102 +4880,6 @@ void reencode_turbovec_rows(
     });
     out_codes.swap(next_codes);
     out_scales.swap(next_scales);
-}
-
-void quantize_turbovec_q2_row(const float * src, uint8_t * dst, float * scales, int dim) {
-    std::vector<float> shift;
-    std::vector<float> scale;
-    quantize_turbovec_batch(src, 1, 2, dst, scales, dim, shift, scale);
-}
-
-void decode_turbovec_q2_row(const uint8_t * codes, const float * scales, float * dst, int dim) {
-    decode_turbovec_q2_row_calibrated(codes, scales, nullptr, nullptr, dst, dim);
-}
-
-void decode_turbovec_q2_row_calibrated(
-        const uint8_t * codes,
-        const float * scales,
-        const float * tqplus_shift,
-        const float * tqplus_scale,
-        float * dst,
-        int dim) {
-    decode_turbovec_row_calibrated(2, true, codes, scales, tqplus_shift, tqplus_scale, dst, dim);
-}
-
-float dot_turbovec_q2_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim) {
-    std::vector<uint8_t> lut;
-    float lut_scale = 1.0f;
-    float lut_bias = 0.0f;
-    build_turbovec_q2_lut(rotated_query, dim, lut, lut_scale, lut_bias);
-    return dot_turbovec_q2_lut_row(lut.data(), lut_scale, lut_bias, codes, scales, dim);
-}
-
-float dot_turbovec_q2_row(const float * query, const uint8_t * codes, const float * scales, int dim) {
-    std::vector<float> rotated(static_cast<size_t>(dim));
-    rotate_turbovec_query(true, query, rotated.data(), dim);
-    return dot_turbovec_q2_rotated_row(rotated.data(), codes, scales, dim);
-}
-
-void quantize_turbovec_q4_row(const float * src, uint8_t * dst, float * scales, int dim) {
-    std::vector<float> shift;
-    std::vector<float> scale;
-    quantize_turbovec_batch(src, 1, 4, dst, scales, dim, shift, scale);
-}
-
-void build_turbovec_q2_lut(const float * rotated_query, int dim, std::vector<uint8_t> & lut, float & scale, float & bias) {
-    build_turbovec_lut(2, true, rotated_query, dim, lut, scale, bias);
-}
-
-float dot_turbovec_q2_lut_row(
-        const uint8_t * lut,
-        float lut_scale,
-        float lut_bias,
-        const uint8_t * codes,
-        const float * scales,
-        int dim) {
-    return dot_turbovec_lut_row(lut, lut_scale, lut_bias, codes, scales, 2, dim);
-}
-
-void decode_turbovec_q4_row(const uint8_t * codes, const float * scales, float * dst, int dim) {
-    decode_turbovec_q4_row_calibrated(codes, scales, nullptr, nullptr, dst, dim);
-}
-
-void decode_turbovec_q4_row_calibrated(
-        const uint8_t * codes,
-        const float * scales,
-        const float * tqplus_shift,
-        const float * tqplus_scale,
-        float * dst,
-        int dim) {
-    decode_turbovec_row_calibrated(4, true, codes, scales, tqplus_shift, tqplus_scale, dst, dim);
-}
-
-void build_turbovec_q4_lut(const float * rotated_query, int dim, std::vector<uint8_t> & lut, float & scale, float & bias) {
-    build_turbovec_lut(4, true, rotated_query, dim, lut, scale, bias);
-}
-
-float dot_turbovec_q4_lut_row(
-        const uint8_t * lut,
-        float lut_scale,
-        float lut_bias,
-        const uint8_t * codes,
-        const float * scales,
-        int dim) {
-    return dot_turbovec_lut_row(lut, lut_scale, lut_bias, codes, scales, 4, dim);
-}
-
-float dot_turbovec_q4_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim) {
-    std::vector<uint8_t> lut;
-    float lut_scale = 1.0f;
-    float lut_bias = 0.0f;
-    build_turbovec_q4_lut(rotated_query, dim, lut, lut_scale, lut_bias);
-    return dot_turbovec_q4_lut_row(lut.data(), lut_scale, lut_bias, codes, scales, dim);
-}
-
-float dot_turbovec_q4_row(const float * query, const uint8_t * codes, const float * scales, int dim) {
-    std::vector<float> rotated(static_cast<size_t>(dim));
-    rotate_turbovec_query(true, query, rotated.data(), dim);
-    return dot_turbovec_q4_rotated_row(rotated.data(), codes, scales, dim);
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS

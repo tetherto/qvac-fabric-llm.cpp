@@ -374,8 +374,8 @@ void build_image(const ggml_vec_index & idx, uint64_t nonce, TurboVecV8Image & i
 }  // namespace
 
 // The rows in upstream order: the order an upstream index with the same
-// add/remove history holds them in. Falls back to slot order if the
-// tracked order was lost.
+// add/remove history holds them in, which is slot order since removes
+// swap like upstream's.
 void turbovec_v8_build_image(const ggml_vec_index & idx, TurboVecV8Image & image) {
     build_image(idx, 0, image);
 }
