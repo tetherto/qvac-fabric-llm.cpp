@@ -475,6 +475,88 @@ void write_topk_results(
     write_topk_heap(k, out_scores, out_ids, heap);
 }
 
+// A single TurboVec query over at least this many 32-vector blocks splits
+// them across threads (upstream turbovec's block-parallel threshold).
+constexpr size_t kTurboVecParallelMinBlocks = 1024;
+
+struct TurboVecQueryLut {
+    const uint8_t * lut;
+    float scale;
+    float bias;
+    const float * score_query;
+};
+
+// Scores blocks [block_begin, block_end) straight into the top-k heap,
+// skipping tombstones, blocks with no allowed slot and disallowed slots.
+void score_turbovec_block_range(
+        const ggml_vec_index_t & idx,
+        const TurboVecQueryLut & query,
+        size_t block_begin,
+        size_t block_end,
+        const uint8_t * allowed_blocks,
+        const uint8_t * allowed_mask,
+        int k,
+        std::vector<ScoreId> & heap) {
+    const size_t n_slots = idx.slot_to_id.size();
+    const int bits = idx.turbovec_bits;
+    const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / bits);
+    const float * vector_scales = idx.turbovec_scale.data();
+    std::array<float, 32> block_scores{};
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
+    static const bool has_turbovec_avx2 = cpu_has_avx2();
+#else
+    (void) n_byte_groups;
+#endif
+    for (size_t block = block_begin; block < block_end; ++block) {
+        if (allowed_blocks != nullptr && allowed_blocks[block] == 0) {
+            continue;
+        }
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+        g_turbovec_block_score_calls.fetch_add(1, std::memory_order_relaxed);
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
+        if (has_turbovec_avx2) {
+            ggml_vec_index_detail::score_turbovec_lut_block_avx2(
+                query.lut,
+                query.scale,
+                query.bias,
+                idx.turbovec_blocked_data.data(),
+                vector_scales,
+                block,
+                n_byte_groups,
+                n_slots,
+                block_scores.data());
+        } else
+#endif
+        {
+            score_turbovec_lut_block(
+                query.lut,
+                query.scale,
+                query.bias,
+                idx.turbovec_blocked_data.data(),
+                vector_scales,
+                block,
+                n_slots,
+                bits,
+                idx.dim,
+                block_scores.data());
+        }
+        const size_t base_slot = block * 32;
+        const size_t count = std::min(static_cast<size_t>(32), n_slots - base_slot);
+        for (size_t lane = 0; lane < count; ++lane) {
+            const size_t slot = base_slot + lane;
+            if (!slot_is_active(idx, slot) || (allowed_mask != nullptr && allowed_mask[slot] == 0)) {
+                continue;
+            }
+            float score = block_scores[lane];
+            if (!std::isfinite(score)) {
+                score = score_slot(idx, query.score_query, slot, 0.0, query.lut, query.scale, query.bias);
+            }
+            update_topk_heap(heap, k, { score, idx.slot_to_id[slot] });
+        }
+    }
+}
+
 // Run a single query against all slots, write top-k into out_scores/out_ids.
 // If the index holds fewer than k entries, pad with sentinels.
 void search_one(
@@ -488,10 +570,10 @@ void search_one(
     std::vector<float>     & rotated_query_scratch,
     std::vector<float>     & calibrated_query_scratch,
     std::vector<uint8_t>   & turbovec_lut_scratch,
-    std::vector<float>     & turbovec_scores_scratch,
     std::vector<uint8_t>   & allowed_blocks_scratch,
     const std::vector<size_t> * allowed_slots = nullptr,
-    const float * pre_rotated_turbovec_query = nullptr) {
+    const float * pre_rotated_turbovec_query = nullptr,
+    int n_threads = 1) {
 
     const size_t n_slots = idx.slot_to_id.size();
 
@@ -500,7 +582,6 @@ void search_one(
     rotated_query_scratch.clear();
     calibrated_query_scratch.clear();
     turbovec_lut_scratch.clear();
-    turbovec_scores_scratch.clear();
     allowed_blocks_scratch.clear();
     const size_t candidate_hint = allowed_slots != nullptr ?
         std::min(allowed_slots->size(), n_slots) :
@@ -512,7 +593,6 @@ void search_one(
     std::vector<float> & rotated_query = rotated_query_scratch;
     std::vector<float> & calibrated_query = calibrated_query_scratch;
     std::vector<uint8_t> & turbovec_lut = turbovec_lut_scratch;
-    std::vector<float> & turbovec_scores = turbovec_scores_scratch;
     float turbovec_lut_scale = 1.0f;
     float turbovec_lut_bias = 0.0f;
     if (is_turbovec(idx)) {
@@ -566,64 +646,53 @@ void search_one(
                     }
                 }
             }
-            turbovec_scores.assign(n_slots, -std::numeric_limits<float>::infinity());
-
-            const float * vector_scales = idx.turbovec_scale.data();
-            std::array<float, 32> block_scores{};
-#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
-            static const bool has_turbovec_avx2 = cpu_has_avx2();
-#endif
-            for (size_t block = 0; block < idx.turbovec_blocked_n_blocks; ++block) {
-                if (!allowed_blocks.empty() && allowed_blocks[block] == 0) {
-                    continue;
-                }
-#ifdef GGML_VEC_INDEX_TEST_HOOKS
-                g_turbovec_block_score_calls.fetch_add(1, std::memory_order_relaxed);
-#endif
-#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
-                if (has_turbovec_avx2) {
-                    ggml_vec_index_detail::score_turbovec_lut_block_avx2(
-                        turbovec_lut.data(),
-                        turbovec_lut_scale,
-                        turbovec_lut_bias,
-                        idx.turbovec_blocked_data.data(),
-                        vector_scales,
-                        block,
-                        n_byte_groups,
-                        n_slots,
-                        block_scores.data());
-                } else
-#endif
-                {
-                    score_turbovec_lut_block(
-                        turbovec_lut.data(),
-                        turbovec_lut_scale,
-                        turbovec_lut_bias,
-                        idx.turbovec_blocked_data.data(),
-                        vector_scales,
-                        block,
-                        n_slots,
-                        bits,
-                        idx.dim,
-                        block_scores.data());
-                }
-                const size_t base_slot = block * 32;
-                const size_t count = std::min(static_cast<size_t>(32), n_slots - base_slot);
-                for (size_t lane = 0; lane < count; ++lane) {
-                    float score = block_scores[lane];
-                    if (!std::isfinite(score)) {
-                        score = score_slot(
-                            idx,
-                            score_query,
-                            base_slot + lane,
-                            max_query,
-                            turbovec_lut.data(),
-                            turbovec_lut_scale,
-                            turbovec_lut_bias);
+            const uint8_t * allowed_mask = nullptr;
+            std::vector<uint8_t> allowed_mask_storage;
+            if (allowed_slots != nullptr) {
+                allowed_mask_storage.assign(n_slots, 0);
+                for (size_t slot : *allowed_slots) {
+                    if (slot < n_slots) {
+                        allowed_mask_storage[slot] = 1;
                     }
-                    turbovec_scores[base_slot + lane] = score;
                 }
+                allowed_mask = allowed_mask_storage.data();
             }
+            const TurboVecQueryLut query_lut = {
+                turbovec_lut.data(), turbovec_lut_scale, turbovec_lut_bias, score_query,
+            };
+            const uint8_t * block_filter = allowed_blocks.empty() ? nullptr : allowed_blocks.data();
+            const size_t n_blocks = idx.turbovec_blocked_n_blocks;
+            // Split on the blocks a filter actually leaves to score, so a
+            // narrow filter over a large index stays on one thread
+            // (upstream #554).
+            const size_t n_scored = allowed_blocks.empty() ?
+                n_blocks :
+                static_cast<size_t>(std::count(allowed_blocks.begin(), allowed_blocks.end(), uint8_t{ 1 }));
+            if (n_threads > 1 && n_scored >= kTurboVecParallelMinBlocks) {
+                // One query over many blocks: score block ranges on each
+                // worker into its own heap, then merge. Top-k uses a strict
+                // (score, id) order, so the split cannot change the result.
+                const size_t n_ranges = static_cast<size_t>(n_threads) * 4;
+                const size_t per_range = (n_blocks + n_ranges - 1) / n_ranges;
+                std::vector<std::vector<ScoreId>> range_heaps(n_ranges);
+                parallel_for(n_ranges, n_threads, [&](size_t range, size_t) {
+                    const size_t begin = range * per_range;
+                    const size_t end = std::min(n_blocks, begin + per_range);
+                    if (begin < end) {
+                        score_turbovec_block_range(
+                            idx, query_lut, begin, end, block_filter, allowed_mask, k, range_heaps[range]);
+                    }
+                });
+                for (const std::vector<ScoreId> & range_heap : range_heaps) {
+                    for (const ScoreId & candidate : range_heap) {
+                        update_topk_heap(heap, k, candidate);
+                    }
+                }
+            } else {
+                score_turbovec_block_range(idx, query_lut, 0, n_blocks, block_filter, allowed_mask, k, heap);
+            }
+            write_topk_heap(k, out_scores, out_ids, heap);
+            return;
         }
     }
 
@@ -635,16 +704,14 @@ void search_one(
         heap,
         allowed_slots,
         [&](size_t slot) -> double {
-            return turbovec_scores.empty() ?
-                score_slot(
-                    idx,
-                    score_query,
-                    slot,
-                    max_query,
-                    turbovec_lut.data(),
-                    turbovec_lut_scale,
-                    turbovec_lut_bias) :
-                turbovec_scores[slot];
+            return score_slot(
+                idx,
+                score_query,
+                slot,
+                max_query,
+                turbovec_lut.data(),
+                turbovec_lut_scale,
+                turbovec_lut_bias);
         });
 }
 
@@ -1048,12 +1115,6 @@ static int ggml_vec_index_search_impl(
             allowed_ptr = &allowed_slots;
         }
 
-        std::vector<ScoreId> heap;
-        std::vector<float> rotated_query_scratch;
-        std::vector<float> calibrated_query_scratch;
-        std::vector<uint8_t> turbovec_lut_scratch;
-        std::vector<float> turbovec_scores_scratch;
-        std::vector<uint8_t> allowed_blocks_scratch;
         std::vector<float> rotated_turbovec_queries;
         if (is_turbovec(*idx)) {
             rotated_turbovec_queries.resize(n_q_sz * dim_sz);
@@ -1064,11 +1125,12 @@ static int ggml_vec_index_search_impl(
                 n_q,
                 dim);
         }
-        int q = 0;
+        // Queries covered by the fused four-query TurboVec kernel.
+        int n_batched = 0;
 #if GGML_VEC_INDEX_USE_NEON
         const int batch_bits = idx->turbovec_bits;
         const size_t batch_n_byte_groups =
-            dim_sz / static_cast<size_t>(8 / batch_bits);
+            is_turbovec(*idx) ? dim_sz / static_cast<size_t>(8 / batch_bits) : 0;
         const size_t batch_heap_capacity = std::min(k_sz, idx->slot_to_id.size());
         const uint64_t per_query_scratch =
             static_cast<uint64_t>(batch_n_byte_groups) * 32 +
@@ -1086,46 +1148,62 @@ static int ggml_vec_index_search_impl(
         if (is_turbovec(*idx) &&
             allowed_ptr == nullptr &&
             active_count(*idx) == idx->slot_to_id.size() &&
-            batch_scratch_is_bounded) {
-            const size_t expected_blocked_bytes =
-                idx->turbovec_blocked_n_blocks * batch_n_byte_groups * 32;
-            if (idx->turbovec_blocked_data.size() == expected_blocked_bytes &&
-                idx->turbovec_blocked_n_blocks ==
-                    (idx->slot_to_id.size() + 31) / 32) {
-                TurboVecBatch4Scratch batch_scratch;
-                for (; q + 4 <= n_q; q += 4) {
-                    search_turbovec_four_queries(
-                        *idx,
-                        rotated_turbovec_queries.data() + static_cast<size_t>(q) * dim_sz,
-                        k,
-                        out_scores + static_cast<size_t>(q) * k_sz,
-                        out_ids + static_cast<size_t>(q) * k_sz,
-                        batch_scratch);
-                }
-            }
+            batch_scratch_is_bounded &&
+            idx->turbovec_blocked_data.size() == idx->turbovec_blocked_n_blocks * batch_n_byte_groups * 32 &&
+            idx->turbovec_blocked_n_blocks == (idx->slot_to_id.size() + 31) / 32) {
+            n_batched = n_q / 4 * 4;
         }
 #endif
-        for (; q < n_q; ++q) {
-            const double max_query = query_max_abs_values.empty() ?
-                0.0 : query_max_abs_values[static_cast<size_t>(q)];
+        struct Scratch {
+            std::vector<ScoreId> heap;
+            std::vector<float> rotated_query;
+            std::vector<float> calibrated_query;
+            std::vector<uint8_t> lut;
+            std::vector<uint8_t> allowed_blocks;
+#if GGML_VEC_INDEX_USE_NEON
+            TurboVecBatch4Scratch batch;
+#endif
+        };
+        // Several queries split across threads; a lone query may instead
+        // split its blocks.
+        const size_t n_batches = static_cast<size_t>(n_batched / 4);
+        const size_t n_tasks = n_batches + static_cast<size_t>(n_q - n_batched);
+        const int query_threads = n_tasks >= 2 ? idx->n_threads : 1;
+        const int block_threads = query_threads > 1 ? 1 : idx->n_threads;
+        std::vector<Scratch> scratch(std::max<size_t>(1, std::min(n_tasks, static_cast<size_t>(query_threads))));
+        parallel_for(n_tasks, query_threads, [&](size_t task, size_t worker) {
+            Scratch & sc = scratch[worker];
+#if GGML_VEC_INDEX_USE_NEON
+            if (task < n_batches) {
+                const size_t q = task * 4;
+                search_turbovec_four_queries(
+                    *idx,
+                    rotated_turbovec_queries.data() + q * dim_sz,
+                    k,
+                    out_scores + q * k_sz,
+                    out_ids + q * k_sz,
+                    sc.batch);
+                return;
+            }
+#endif
+            const size_t q = static_cast<size_t>(n_batched) + (task - n_batches);
+            const double max_query = query_max_abs_values.empty() ? 0.0 : query_max_abs_values[q];
             search_one(
                 *idx,
-                queries + static_cast<size_t>(q) * static_cast<size_t>(dim),
+                queries + q * dim_sz,
                 k,
-                out_scores + static_cast<size_t>(q) * static_cast<size_t>(k),
-                out_ids    + static_cast<size_t>(q) * static_cast<size_t>(k),
+                out_scores + q * k_sz,
+                out_ids + q * k_sz,
                 max_query,
-                heap,
-                rotated_query_scratch,
-                calibrated_query_scratch,
-                turbovec_lut_scratch,
-                turbovec_scores_scratch,
-                allowed_blocks_scratch,
+                sc.heap,
+                sc.rotated_query,
+                sc.calibrated_query,
+                sc.lut,
+                sc.allowed_blocks,
                 allowed_ptr,
-                rotated_turbovec_queries.empty() ?
-                    nullptr :
-                    rotated_turbovec_queries.data() + static_cast<size_t>(q) * dim_sz);
-        }
+                rotated_turbovec_queries.empty() ? nullptr : rotated_turbovec_queries.data() + q * dim_sz,
+                block_threads);
+        });
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
     } catch (...) {
@@ -1263,7 +1341,6 @@ int ggml_vec_index_search_ivf(
         std::vector<float> rotated_query_scratch;
         std::vector<float> calibrated_query_scratch;
         std::vector<uint8_t> turbovec_lut_scratch;
-        std::vector<float> turbovec_scores_scratch;
         std::vector<uint8_t> allowed_blocks_scratch;
         std::vector<float> rotated_turbovec_queries;
         if (is_turbovec(*idx)) {
@@ -1299,8 +1376,7 @@ int ggml_vec_index_search_ivf(
                     rotated_query_scratch,
                     calibrated_query_scratch,
                     turbovec_lut_scratch,
-                    turbovec_scores_scratch,
-                    allowed_blocks_scratch,
+                        allowed_blocks_scratch,
                     &empty_slots,
                     pre_rotated_turbovec_query);
                 continue;
@@ -1353,7 +1429,6 @@ int ggml_vec_index_search_ivf(
                 rotated_query_scratch,
                 calibrated_query_scratch,
                 turbovec_lut_scratch,
-                turbovec_scores_scratch,
                 allowed_blocks_scratch,
                 &candidate_slots,
                 pre_rotated_turbovec_query);

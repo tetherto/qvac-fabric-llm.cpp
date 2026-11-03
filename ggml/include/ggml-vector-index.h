@@ -20,6 +20,7 @@
 // Endianness: persistence format is fixed little-endian. Stream loaders decode
 // fields into host values; mmap loading requires a little-endian host.
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifndef GGML_API
@@ -91,34 +92,24 @@ GGML_VEC_INDEX_API const char * ggml_vec_index_error_to_string(int error);
 // per vector. `bit_width=32` stores full f32 vectors. Returns NULL on bad args.
 GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width);
 
-// Creates a TurboQuant q2 vector index. This is distinct from the generic
-// q4/q8 modes created by `ggml_vec_index_create`: vectors are normalized,
-// rotated, quantized with Lloyd-Max q2 codebooks, and searched against rotated
-// queries. This implementation requires a 64-bit target,
-// `0 < dim <= 1024 && dim % 8 == 0`, and supports add/search/filter/IVF plus
-// regular snapshot write/load. TurboVec materializes a dense `dim x dim`
-// rotation matrix on first use. Snapshots from earlier releases with larger
-// dimensions can be loaded and rewritten, but add/search/IVF are unsupported.
-// `ggml_vec_index_prepare` is best-effort and does not report allocation status.
-// mmap loading and logged mutations are reserved for later format work.
-GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
-
-// Creates a TurboQuant q4 vector index. This is distinct from the generic
-// `bit_width=4` mode created by `ggml_vec_index_create`: vectors are normalized,
-// rotated, quantized with Lloyd-Max q4 codebooks, and searched against rotated
-// queries. This implementation requires a 64-bit target,
-// `0 < dim <= 1024 && dim % 8 == 0`, and supports add/search/filter/IVF plus
-// regular snapshot write/load. TurboVec materializes a dense `dim x dim`
-// rotation matrix on first use. Snapshots from earlier releases with larger
-// dimensions can be loaded and rewritten, but add/search/IVF are unsupported.
-// `ggml_vec_index_prepare` is best-effort and does not report allocation status.
-// mmap loading and logged mutations are reserved for later format work.
-GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim);
-
-// Creates a TurboQuant index with `bit_width` 2, 3 or 4 (the encoding of
-// upstream turbovec 1.1.2). Requires a 64-bit target and
-// `0 < dim <= 16384 && dim % 8 == 0`. Returns NULL on bad args.
+// Creates a TurboQuant index with `bit_width` 2, 3 or 4: a port of upstream
+// turbovec 1.1.2 that encodes, snapshots and syncs byte for byte as turbovec
+// does (except that large indexes always store the sequential unit layout,
+// see docs/vector-index.md). Vectors and queries are rotated with turbovec's deterministic
+// block-Hadamard transform, quantized with Lloyd-Max codebooks (optionally
+// under a TQ+ calibration, see `ggml_vec_index_turbovec_calibrate`), and
+// searched against the rotated query without decoding. Requires a 64-bit
+// target and `0 < dim <= 16384 && dim % 8 == 0`. Supports add, search,
+// filtered search, IVF, snapshots, in-memory snapshots and incremental sync;
+// mmap loading and delta logs are not supported. `ggml_vec_index_prepare` is
+// best-effort and does not report allocation status. Returns NULL on bad args.
 GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec(int dim, int bit_width);
+
+// Shorthands for `ggml_vec_index_create_turbovec(dim, 2)` and `(dim, 4)`. The
+// TurboVec q4 mode is distinct from the generic `bit_width=4` mode created by
+// `ggml_vec_index_create`.
+GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
+GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim);
 
 // Fits the TurboVec TQ+ per-coordinate calibration from `n` sample vectors
 // (row-major, `dim` floats each) and commits it. Every later add is encoded
@@ -138,6 +129,14 @@ GGML_VEC_INDEX_API int ggml_vec_index_turbovec_calibrate(
 GGML_VEC_INDEX_API int ggml_vec_index_turbovec_is_calibrated(const ggml_vec_index_t * idx);
 
 GGML_VEC_INDEX_API void ggml_vec_index_free(ggml_vec_index_t * idx);
+
+// Worker threads search, add and TurboVec calibration may use, including
+// the calling thread; 1 (the default) runs every call on the calling thread.
+// Query batches are split across threads, and a single TurboVec query over
+// 32,768 or more vectors splits its blocks. Results do not depend on the
+// thread count. `n_threads` must be in 1..256.
+GGML_VEC_INDEX_API int ggml_vec_index_set_threads(ggml_vec_index_t * idx, int n_threads);
+GGML_VEC_INDEX_API int ggml_vec_index_threads(const ggml_vec_index_t * idx);
 
 // Mutation.
 //
@@ -307,7 +306,11 @@ GGML_VEC_INDEX_API int ggml_vec_index_search_ivf(
     float                  * out_scores,
     uint64_t               * out_ids);
 
-// Persistence. Writers use .tvim v2 for f32/q4/q8 and v3 for TurboVec.
+// Persistence. Writers use .tvim v2 for f32/q4/q8. TurboVec indexes write
+// upstream turbovec's v8 container, readable by turbovec 1.1 and later;
+// indexes loaded from a v3 snapshot keep writing v3. A v8 snapshot reserves
+// two fixed-size commit headers, mostly zero, which the writer leaves as a
+// file hole where the filesystem supports one.
 // Delta-bound handles must use `ggml_vec_index_compact_delta`; ordinary
 // snapshot writes return GGML_VEC_INDEX_E_INVALID_ARG.
 // Returns GGML_VEC_INDEX_E_NOT_DURABLE when the file was atomically replaced
@@ -317,7 +320,42 @@ GGML_VEC_INDEX_API int ggml_vec_index_write(
     ggml_vec_index_t * idx,
     const char       * path);
 
-// Loads v2/v3 files and migrates v1 f32 snapshots. Legacy bit_width=8 snapshots
+// In-memory snapshots of a TurboVec index (not a v3-loaded one): exactly the
+// bytes `ggml_vec_index_write` puts in the file, padding included. The
+// buffer is allocated by the library; free it with `ggml_vec_index_bytes_free`.
+// Other storage modes return GGML_VEC_INDEX_E_INVALID_ARG.
+GGML_VEC_INDEX_API int ggml_vec_index_to_bytes(
+    const ggml_vec_index_t * idx,
+    uint8_t               ** out_bytes,
+    size_t                 * out_size);
+
+GGML_VEC_INDEX_API void ggml_vec_index_bytes_free(uint8_t * bytes);
+
+// Exact byte size `ggml_vec_index_to_bytes` returns, without serializing.
+// Returns 0 for indexes it does not support.
+GGML_VEC_INDEX_API size_t ggml_vec_index_serialized_size(const ggml_vec_index_t * idx);
+
+// Loads a TurboVec v8 snapshot from memory with the same validation as
+// `ggml_vec_index_load_ex`.
+GGML_VEC_INDEX_API int ggml_vec_index_from_bytes(
+    const uint8_t      * bytes,
+    size_t               size,
+    ggml_vec_index_t  ** out);
+
+// Incremental save of a TurboVec index (not a v3-loaded one) to `path`
+// (upstream turbovec `sync`). The first sync to a path, and any sync after a
+// calibrate, writes the whole file and claims it; later syncs write only the
+// blocks and commit header that changed, durable after one fsync. A crash
+// at any byte leaves the previous commit loadable. Loading a synced file
+// binds the loaded index to it, so syncs continue incrementally. Returns
+// GGML_VEC_INDEX_E_IO when another writer has advanced or replaced the file
+// (load it to adopt its state), and GGML_VEC_INDEX_E_NOT_DURABLE as
+// `ggml_vec_index_write` does. One writer per path.
+GGML_VEC_INDEX_API int ggml_vec_index_sync(
+    ggml_vec_index_t * idx,
+    const char       * path);
+
+// Loads v2/v3 and v7/v8 files and migrates v1 f32 snapshots. Legacy bit_width=8 snapshots
 // are quantized to q8; all other legacy bit widths migrate to f32/32-bit.
 // Returns 0 on success and stores the loaded handle in `out`.
 GGML_VEC_INDEX_API int ggml_vec_index_load_ex(
@@ -375,6 +413,35 @@ GGML_VEC_INDEX_API int ggml_vec_index_compact_delta(
 GGML_VEC_INDEX_API int ggml_vec_index_len(const ggml_vec_index_t * idx);
 GGML_VEC_INDEX_API int ggml_vec_index_dim(const ggml_vec_index_t * idx);
 GGML_VEC_INDEX_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
+
+// Storage mode of an index. `bit_width` alone cannot tell generic q4 from
+// TurboVec q4.
+enum ggml_vec_index_storage {
+    GGML_VEC_INDEX_STORAGE_NONE        = 0,
+    GGML_VEC_INDEX_STORAGE_F32         = 1,
+    GGML_VEC_INDEX_STORAGE_Q8          = 2,
+    GGML_VEC_INDEX_STORAGE_Q4          = 3,
+    GGML_VEC_INDEX_STORAGE_TURBOVEC_Q2 = 4,
+    GGML_VEC_INDEX_STORAGE_TURBOVEC_Q3 = 5,
+    GGML_VEC_INDEX_STORAGE_TURBOVEC_Q4 = 6,
+};
+
+// Returns a `ggml_vec_index_storage` value; GGML_VEC_INDEX_STORAGE_NONE for
+// a NULL handle.
+GGML_VEC_INDEX_API int ggml_vec_index_storage(const ggml_vec_index_t * idx);
+
+// Returns 1 for a TurboVec index loaded from a v3 snapshot, which keeps the
+// turbovec 0.9 encoding (see `ggml_vec_index_create_turbovec`).
+GGML_VEC_INDEX_API int ggml_vec_index_turbovec_is_legacy(const ggml_vec_index_t * idx);
+
+// Copies the live ids into `out_ids`, up to `capacity` of them, and stores
+// the live count in `out_count`. Pass `capacity` 0 to query the count. Ids
+// come in a stable order that changes only with mutations.
+GGML_VEC_INDEX_API int ggml_vec_index_ids(
+    const ggml_vec_index_t * idx,
+    uint64_t               * out_ids,
+    size_t                   capacity,
+    size_t                 * out_count);
 
 // File format (.tvim versions 2 and 3, all little-endian):
 // "TQ+" here is the TurboVec per-coordinate calibration scheme, unrelated to
