@@ -3099,12 +3099,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--coreml-ffn"},
-        {"--no-coreml-ffn"},
-        "run part of each FFN on the Apple Neural Engine for prompts of 256+ tokens (Qwen3.8-27B, -DLLAMA_COREML_FFN=ON builds; default: false)",
-        [](common_params & params, bool value) {
-            params.coreml_ffn = value;
+        "run part of each FFN on the Apple Neural Engine for prompts of 256+ tokens (Qwen3.8-27B, -DLLAMA_COREML_FFN=ON builds; default: off)",
+        [](common_params & params) {
+            params.coreml_ffn = true;
         }
-    ).set_env("LLAMA_ARG_COREML_FFN"));
+    ).set_env("LLAMA_COREML"));
     add_opt(common_arg(
         {"--coreml-ffn-cache"}, "DIR",
         "directory for the compiled Core ML FFN programs, 4.5-9 GB per model (default: <cache dir>/coreml-ffn)",

@@ -2,7 +2,7 @@
 
 ## Command line
 
-The sidecar is off by default. Build with `-DLLAMA_COREML_FFN=ON -DGGML_METAL=ON` (macOS 15 or later) and add `--coreml-ffn` to `llama-server`, `llama-cli` or any other tool that uses `common`:
+The sidecar is off by default. Build with `-DLLAMA_COREML_FFN=ON -DGGML_METAL=ON` (macOS 15 or later) and add `--coreml-ffn` (or set `LLAMA_COREML=1`) to `llama-server`, `llama-cli` or any other tool that uses `common`:
 
 ```sh
 cmake -S . -B build -DLLAMA_COREML_FFN=ON -DGGML_METAL=ON
