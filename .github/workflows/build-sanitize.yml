@@ -56,7 +56,7 @@ jobs:
   ctest:
     needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: [self-hosted, X64, CPU, Linux]
+    runs-on: qvac-ubuntu2404-x64
 
     continue-on-error: ${{ matrix.sanitizer == 'THREAD' }}
 
