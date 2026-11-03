@@ -53,7 +53,10 @@ GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
 // call with a worst-case graph to avoid buffer reallocations
 // not strictly required for single buffer usage: ggml_gallocr_alloc_graph will reallocate the buffers automatically if needed
 // returns false if the buffer allocation failed
-// ggml_gallocr_resrve_n_size writes the buffer sizes per galloc buffer that would be allocated by ggml_gallocr_reserve_n to sizes
+// ggml_gallocr_reserve_n_size writes the reported physical buffer sizes that
+// ggml_gallocr_reserve_n would allocate, including optional backend guards.
+// Repeated buffer types are charged only at their first index. No payload is
+// allocated; an unrepresentable aggregate is reported as SIZE_MAX.
 GGML_API bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 GGML_API void ggml_gallocr_reserve_n_size(
     ggml_gallocr_t galloc,
@@ -77,7 +80,9 @@ GGML_API size_t ggml_gallocr_get_host_size(ggml_gallocr_t galloc);
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 
-// returns the size of the buffer that would be allocated by ggml_backend_alloc_ctx_tensors_from_buft. returns 0 on failure
+// returns the total reported physical buffer size that ggml_backend_alloc_ctx_tensors_from_buft would allocate,
+// including optional backend guards per chunk, without allocating payloads.
+// returns 0 on failure and SIZE_MAX for an unrepresentable aggregate
 GGML_API size_t                       ggml_backend_alloc_ctx_tensors_from_buft_size(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 // returns NULL on failure or if all tensors in ctx are already allocated or zero-sized
 GGML_API struct ggml_backend_buffer * ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
