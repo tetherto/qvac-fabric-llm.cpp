@@ -62,7 +62,24 @@ if (GGML_VECTOR_INDEX_AVX2_FLAG)
         PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX2_FLAG}")
 endif()
 
+# TurboVec encodes must match upstream turbovec bit for bit: upstream neither
+# fuses a multiply with an add nor reassociates, so keep the compiler from
+# contracting and undo any fast-math a toolchain turns on (the arm64 clang
+# toolchains pass -ffp-model=fast).
+set(GGML_VECTOR_INDEX_FP_OPTIONS "")
+if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    set(GGML_VECTOR_INDEX_FP_OPTIONS "/fp:precise")
+    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        list(APPEND GGML_VECTOR_INDEX_FP_OPTIONS "/clang:-ffp-contract=off")
+    endif()
+elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set(GGML_VECTOR_INDEX_FP_OPTIONS -fno-fast-math -ffp-contract=off)
+elseif (MSVC)
+    set(GGML_VECTOR_INDEX_FP_OPTIONS "/fp:precise")
+endif()
+
 add_library(ggml-vector-index ${GGML_VECTOR_INDEX_SOURCES})
+target_compile_options(ggml-vector-index PRIVATE ${GGML_VECTOR_INDEX_FP_OPTIONS})
 add_library(ggml::ggml-vector-index ALIAS ggml-vector-index)
 add_library(ggml::vector-index ALIAS ggml-vector-index)
 
@@ -119,6 +136,7 @@ if (LLAMA_BUILD_TESTS)
     add_library(ggml-vector-index-test STATIC ${GGML_VECTOR_INDEX_SOURCES})
     target_compile_features(ggml-vector-index-test PRIVATE cxx_std_17)
     target_compile_definitions(ggml-vector-index-test PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
+    target_compile_options(ggml-vector-index-test PRIVATE ${GGML_VECTOR_INDEX_FP_OPTIONS})
     target_include_directories(
         ggml-vector-index-test
         PUBLIC ${CMAKE_CURRENT_LIST_DIR}/../../include)

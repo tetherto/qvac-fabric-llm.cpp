@@ -82,6 +82,19 @@ int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
 void turbovec_reset_block_score_call_count_for_test(void);
 int64_t turbovec_block_score_call_count_for_test(void);
 uint64_t turbovec_ziggurat_table_hash_for_test(void);
+void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
+int turbovec_index_hashes_for_test(
+    const ggml_vec_index_t * idx,
+    uint64_t * codes_hash,
+    uint64_t * scales_hash,
+    uint64_t * shift_hash,
+    uint64_t * scale_hash);
+void turbovec_codebook_values(
+    int bits,
+    int dim,
+    bool legacy,
+    std::vector<float> & boundaries,
+    std::vector<float> & centroids);
 double turbovec_ziggurat_x_for_test(int index);
 double turbovec_ziggurat_f_for_test(int index);
 double turbovec_regularized_beta_for_test(double x, double a, double b);
@@ -106,12 +119,13 @@ constexpr bool kTurboVecInterleavedBlockLayout = false;
 #endif
 #endif
 constexpr bool kTurboVecSupported = sizeof(size_t) >= 8;
-constexpr int kTurboVecMaxTestDim = 1024;
+constexpr int kTurboVecMaxTestDim = 16384;
 
 #include "turbovec-golden-q2.inc"
 #include "turbovec-golden-q4.inc"
 #include "turbovec-golden-dim256-q2.inc"
 #include "turbovec-golden-dim256-q4.inc"
+#include "turbovec-1x-golden.inc"
 
 #define CHECK(cond)                                                            \
     do {                                                                       \
@@ -122,6 +136,7 @@ constexpr int kTurboVecMaxTestDim = 1024;
     } while (0)
 
 uint32_t bit_ulp_diff(uint32_t actual, uint32_t expected);
+ggml_vec_index_t * create_legacy_turbovec(int dim, int bit_width);
 void check_bits_within_ulp(
         const char * label,
         uint32_t actual,
@@ -418,10 +433,7 @@ void check_turbovec_rust_golden(
 #else
     (void) rust_rotation_hash;
 #endif
-    auto * tv = bits == 2 ?
-        ggml_vec_index_create_turbovec_q2(dim) :
-        ggml_vec_index_create_turbovec_q4(dim);
-    CHECK(tv != nullptr);
+    auto * tv = create_legacy_turbovec(dim, bits);
     std::vector<uint64_t> ids(static_cast<size_t>(n_db));
     for (int i = 0; i < n_db; ++i) {
         ids[static_cast<size_t>(i)] = static_cast<uint64_t>(i);
@@ -1876,6 +1888,40 @@ void write_v2_turbovec_index(
     write_file_bytes(path, bytes);
 }
 
+// An empty v3 snapshot of a legacy (turbovec 0.9) TurboVec index. v3 files
+// are the only way to obtain a legacy index through the public API: loading
+// one keeps the 0.9 rotation, codebook and first-add TQ+ fit.
+void write_empty_v3_turbovec_index(const std::string & path, int dim, int bit_width) {
+    std::vector<uint8_t> bytes = {
+        'T', 'V', 'P', 'I', 3, static_cast<uint8_t>(bit_width),
+        static_cast<uint8_t>(bit_width == 2 ? 5 : 4), 1,
+    };
+    append_u32_le(bytes, static_cast<uint32_t>(dim));
+    append_u32_le(bytes, 0);
+    append_u32_le(bytes, 1);
+    append_u32_le(bytes, sizeof(float));
+    append_u32_le(bytes, 0);
+    append_u32_le(bytes, 0);
+    const uint32_t header_crc = crc32c_update(0xffffffffu, bytes.data(), bytes.size()) ^ 0xffffffffu;
+    append_u32_le(bytes, header_crc);
+    append_u32_le(bytes, 0);
+    append_u32_le(bytes, 0);
+    append_u32_le(bytes, 0);
+    write_file_bytes(path, bytes);
+}
+
+ggml_vec_index_t * create_legacy_turbovec(int dim, int bit_width) {
+    const std::string path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-legacy-turbovec-" + std::to_string(dim) + "-q" +
+          std::to_string(bit_width) + ".tvim")).string();
+    write_empty_v3_turbovec_index(path, dim, bit_width);
+    ggml_vec_index_t * idx = ggml_vec_index_load(path.c_str());
+    std::filesystem::remove(path);
+    CHECK(idx != nullptr);
+    return idx;
+}
+
 template <typename Fn>
 void expect_corrupt_load_fails(
         const std::string & source_path,
@@ -3082,9 +3128,7 @@ void check_turbovec_oversized_snapshot_compatibility(int bits) {
     std::filesystem::remove(path);
     std::filesystem::remove(roundtrip_path);
 
-    auto * current = bits == 2 ?
-        ggml_vec_index_create_turbovec_q2(current_dim) :
-        ggml_vec_index_create_turbovec_q4(current_dim);
+    auto * current = create_legacy_turbovec(current_dim, bits);
     CHECK(current != nullptr);
     std::vector<float> current_vectors(static_cast<size_t>(count * current_dim), 0.0f);
     current_vectors[0] = 1.0f;
@@ -3321,9 +3365,7 @@ void check_tqplus_deterministic_layout(
         }
     }
 
-    ggml_vec_index_t * index = bits == 2 ?
-        ggml_vec_index_create_turbovec_q2(dim) :
-        ggml_vec_index_create_turbovec_q4(dim);
+    ggml_vec_index_t * index = create_legacy_turbovec(dim, bits);
     CHECK(index != nullptr);
     CHECK(ggml_vec_index_add(index, vectors.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
     const uint64_t expected_blocked_hash = bits == 2 ?
@@ -3766,9 +3808,7 @@ void check_turbovec_rounding_mode_persistence(int bits) {
         std::filesystem::remove(path);
 
         CHECK(std::fesetround(rounding_mode) == 0);
-        auto * tv = bits == 2 ?
-            ggml_vec_index_create_turbovec_q2(dim) :
-            ggml_vec_index_create_turbovec_q4(dim);
+        auto * tv = create_legacy_turbovec(dim, bits);
         CHECK(tv != nullptr);
         ggml_vec_index_prepare(tv);
         CHECK(ggml_vec_index_add(tv, vectors.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
@@ -3880,9 +3920,7 @@ void check_turbovec_mutation_cache_regression(int bits) {
             static_cast<uint64_t>(500000 + bits * 10000 + row);
     }
 
-    auto * tv = bits == 2 ?
-        ggml_vec_index_create_turbovec_q2(dim) :
-        ggml_vec_index_create_turbovec_q4(dim);
+    auto * tv = create_legacy_turbovec(dim, bits);
     CHECK(tv != nullptr);
     CHECK(ggml_vec_index_add(tv, vectors.data(), n_initial, ids.data()) == GGML_VEC_INDEX_OK);
     const uint64_t rotation_hash = turbovec_rotation_hash_for_test(dim);
@@ -4114,9 +4152,7 @@ void check_turbovec_v3_corruption_rejected(int bits) {
             static_cast<uint64_t>(600000 + bits * 10000 + row);
     }
 
-    auto * tv = bits == 2 ?
-        ggml_vec_index_create_turbovec_q2(dim) :
-        ggml_vec_index_create_turbovec_q4(dim);
+    auto * tv = create_legacy_turbovec(dim, bits);
     CHECK(tv != nullptr);
     CHECK(ggml_vec_index_add(tv, vectors.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
 
@@ -4164,9 +4200,7 @@ void check_turbovec_tiny_tqplus_scale_rejected(int bits) {
     }
     const uint64_t id = static_cast<uint64_t>(625000 + bits);
 
-    auto * tv = bits == 2 ?
-        ggml_vec_index_create_turbovec_q2(dim) :
-        ggml_vec_index_create_turbovec_q4(dim);
+    auto * tv = create_legacy_turbovec(dim, bits);
     CHECK(tv != nullptr);
     CHECK(ggml_vec_index_add(tv, vector.data(), 1, &id) == GGML_VEC_INDEX_OK);
 
@@ -4208,9 +4242,7 @@ void check_turbovec_zero_scale_and_legacy_calibration(int bits) {
             static_cast<float>(std::sin(0.07 * static_cast<double>(i + 1)));
     }
     const uint64_t zero_id = static_cast<uint64_t>(620000 + bits);
-    auto * tv = bits == 2 ?
-        ggml_vec_index_create_turbovec_q2(dim) :
-        ggml_vec_index_create_turbovec_q4(dim);
+    auto * tv = create_legacy_turbovec(dim, bits);
     CHECK(tv != nullptr);
     CHECK(ggml_vec_index_add(tv, zero.data(), 1, &zero_id) == GGML_VEC_INDEX_OK);
 
@@ -4393,7 +4425,461 @@ void check_quantized_partial_replay_rollback(int bit_width) {
     std::filesystem::remove(rollback_path);
 }
 
+// ---------------------------------------------------------------------------
+// TurboVec 1.x: parity with upstream turbovec 1.1.2 (tests/turbovec-1x-golden.inc)
+// ---------------------------------------------------------------------------
+
+uint64_t tv1x_splitmix64(uint64_t x) {
+    x += UINT64_C(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return x ^ (x >> 31);
+}
+
+// Mirrors golden_value() in tests/turbovec-golden-gen-1x: integer bits and
+// exact f32 steps, so both sides build identical inputs.
+float tv1x_value(uint64_t seed, size_t row, size_t col, size_t dim) {
+    const uint64_t r = tv1x_splitmix64((seed * UINT64_C(0x100000001b3)) ^ static_cast<uint64_t>(row * dim + col));
+    const float unit = static_cast<float>(r >> 40) * (1.0f / 16777216.0f) * 2.0f - 1.0f;
+    const float scale = 0.25f * static_cast<float>(1 + col % 7);
+    const float offset = 0.125f * static_cast<float>(col % 5);
+    return unit * scale + offset;
+}
+
+std::vector<float> tv1x_rows(uint64_t seed, size_t n, size_t dim) {
+    std::vector<float> out(n * dim);
+    for (size_t row = 0; row < n; ++row) {
+        for (size_t col = 0; col < dim; ++col) {
+            out[row * dim + col] = tv1x_value(seed, row, col, dim);
+        }
+    }
+    return out;
+}
+
+uint64_t tv1x_fnv(const void * data, size_t size) {
+    return fnv1a_bytes(static_cast<const uint8_t *>(data), size);
+}
+
+std::vector<uint64_t> tv1x_ids(size_t n) {
+    std::vector<uint64_t> ids(n);
+    for (size_t i = 0; i < n; ++i) {
+        ids[i] = 1000 + 7 * static_cast<uint64_t>(i);
+    }
+    return ids;
+}
+
+std::vector<uint8_t> tv1x_snapshot_bytes(ggml_vec_index_t * idx, const char * name) {
+    const std::string path = (std::filesystem::temp_directory_path() / name).string();
+    std::filesystem::remove(path);
+    CHECK(ggml_vec_index_write(idx, path.c_str()) == GGML_VEC_INDEX_OK);
+    std::vector<uint8_t> bytes = read_file_bytes(path);
+    std::filesystem::remove(path);
+    return bytes;
+}
+
+void tv1x_check_search(
+        ggml_vec_index_t * idx,
+        const std::vector<float> & queries,
+        const uint64_t * expected_ids,
+        const float * expected_scores) {
+    std::vector<float> scores(static_cast<size_t>(kTv1xNQuery * kTv1xK));
+    std::vector<uint64_t> ids(scores.size());
+    CHECK(ggml_vec_index_search(idx, queries.data(), kTv1xNQuery, kTv1xK, scores.data(), ids.data()) ==
+          GGML_VEC_INDEX_OK);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        CHECK(ids[i] == expected_ids[i]);
+        const float tolerance = 1e-5f * std::max(1.0f, std::fabs(expected_scores[i]));
+        CHECK(std::fabs(scores[i] - expected_scores[i]) <= tolerance);
+    }
+}
+
+void check_turbovec_1x_golden_case(const Tv1xIndexCase & c) {
+    const size_t dim = static_cast<size_t>(c.dim);
+    std::vector<float> db = tv1x_rows(kTv1xSeedDb, kTv1xNDb, dim);
+    std::fill(db.begin(), db.begin() + static_cast<std::ptrdiff_t>(dim), 0.0f);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, kTv1xNQuery, dim);
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, kTv1xNCalib, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(kTv1xNDb);
+
+    auto * plain = ggml_vec_index_create_turbovec(c.dim, c.bits);
+    CHECK(plain != nullptr);
+    CHECK(ggml_vec_index_bit_width(plain) == c.bits);
+    CHECK(ggml_vec_index_add(plain, db.data(), kTv1xNDb, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_turbovec_is_calibrated(plain) == 0);
+    tv1x_check_search(plain, queries, c.search_ids, c.search_scores);
+    const std::vector<uint8_t> plain_bytes = tv1x_snapshot_bytes(plain, "ggml-vector-index-tv1x-plain.tvim");
+    CHECK(plain_bytes.size() == c.snapshot_len);
+    CHECK(tv1x_fnv(plain_bytes.data(), plain_bytes.size()) == c.snapshot_hash);
+
+    auto * calibrated = ggml_vec_index_create_turbovec(c.dim, c.bits);
+    CHECK(calibrated != nullptr);
+    CHECK(ggml_vec_index_turbovec_calibrate(calibrated, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_turbovec_is_calibrated(calibrated) == 1);
+    CHECK(ggml_vec_index_add(calibrated, db.data(), kTv1xNDb, ids.data()) == GGML_VEC_INDEX_OK);
+    tv1x_check_search(calibrated, queries, c.calibrated_search_ids, c.calibrated_search_scores);
+    const std::vector<uint8_t> calibrated_bytes =
+        tv1x_snapshot_bytes(calibrated, "ggml-vector-index-tv1x-calibrated.tvim");
+    CHECK(calibrated_bytes.size() == c.calibrated_snapshot_len);
+    CHECK(tv1x_fnv(calibrated_bytes.data(), calibrated_bytes.size()) == c.calibrated_snapshot_hash);
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+    uint64_t codes = 0;
+    uint64_t scales = 0;
+    uint64_t shift = 0;
+    uint64_t scale = 0;
+    CHECK(turbovec_index_hashes_for_test(plain, &codes, &scales, &shift, &scale) == 1);
+    CHECK(codes == c.codes_hash);
+    CHECK(scales == c.scales_hash);
+    CHECK(turbovec_index_hashes_for_test(calibrated, &codes, &scales, &shift, &scale) == 1);
+    CHECK(shift == c.calib_shift_hash);
+    CHECK(scale == c.calib_scale_hash);
+    CHECK(codes == c.calibrated_codes_hash);
+    CHECK(scales == c.calibrated_scales_hash);
+    // Calibrating a populated index re-encodes its rows from their codes.
+    CHECK(ggml_vec_index_turbovec_calibrate(plain, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+    CHECK(turbovec_index_hashes_for_test(plain, &codes, &scales, &shift, &scale) == 1);
+    CHECK(codes == c.reencoded_codes_hash);
+    CHECK(scales == c.reencoded_scales_hash);
+#endif
+    ggml_vec_index_free(calibrated);
+    ggml_vec_index_free(plain);
+}
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+void check_turbovec_1x_rotation_and_codebooks() {
+    for (const Tv1xRotationCase & c : kTv1xRotationCases) {
+        const std::vector<float> row = tv1x_rows(kTv1xSeedRotation, 1, static_cast<size_t>(c.dim));
+        std::vector<float> rotated(row.size());
+        turbovec_hadamard_rotate_for_test(row.data(), rotated.data(), c.dim);
+        CHECK(tv1x_fnv(rotated.data(), rotated.size() * sizeof(float)) == c.hash);
+    }
+    for (const Tv1xCodebookCase & c : kTv1xCodebookCases) {
+        std::vector<float> boundaries;
+        std::vector<float> centroids;
+        turbovec_codebook_values(c.bits, c.dim, false, boundaries, centroids);
+        CHECK(tv1x_fnv(boundaries.data(), boundaries.size() * sizeof(float)) == c.boundaries_hash);
+        CHECK(tv1x_fnv(centroids.data(), centroids.size() * sizeof(float)) == c.centroids_hash);
+    }
+}
+#endif
+
+uint32_t tv1x_crc32(const std::vector<uint8_t> & bytes, size_t size) {
+    // Superblocks are under 4096 bytes, where upstream's crc32 is one chain.
+    CHECK(size < 4096);
+    return crc32c_update(0xffffffffu, bytes.data(), size) ^ 0xffffffffu;
+}
+
+void tv1x_reseal_superblock(std::vector<uint8_t> & image, size_t superblock_len) {
+    write_u32_le_at(image, superblock_len - 4, tv1x_crc32(image, superblock_len - 4));
+}
+
+std::vector<uint8_t> tv1x_upstream_image() {
+    std::vector<uint8_t> image(kTv1xImageLen, 0);
+    std::memcpy(image.data(), kTv1xImageSuperblock, sizeof(kTv1xImageSuperblock));
+    std::memcpy(image.data() + sizeof(kTv1xImageSuperblock), kTv1xImageHeader0, sizeof(kTv1xImageHeader0));
+    std::memcpy(
+        image.data() + sizeof(kTv1xImageSuperblock) + 2 * kTv1xImageHeaderLen,
+        kTv1xImageUnits,
+        sizeof(kTv1xImageUnits));
+    return image;
+}
+
+ggml_vec_index_t * tv1x_load_bytes(const std::vector<uint8_t> & bytes, int * status = nullptr) {
+    const std::string path =
+        (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-load.tvim").string();
+    write_file_bytes(path, bytes);
+    ggml_vec_index_t * idx = nullptr;
+    const int rc = ggml_vec_index_load_ex(path.c_str(), &idx);
+    std::filesystem::remove(path);
+    if (status != nullptr) {
+        *status = rc;
+    }
+    return idx;
+}
+
+// A v8 unit in the planes layout holds the block's sign bytes group-major
+// across its 32 lanes, then each lane's low planes.
+std::vector<uint8_t> tv1x_to_planes_layout(const std::vector<uint8_t> & image, int dim, int bits) {
+    std::vector<uint8_t> out = image;
+    const size_t sb_len = sizeof(kTv1xImageSuperblock);
+    const size_t row_bytes = static_cast<size_t>(dim) / static_cast<size_t>(8 / bits);
+    const size_t nsg = static_cast<size_t>(dim) / 8;
+    const size_t low_row = static_cast<size_t>(bits - 1) * nsg;
+    const size_t unit_len = 32 * row_bytes + 32 * 4 + 32 * 8;
+    const size_t units_at = sb_len + 2 * kTv1xImageHeaderLen;
+    const size_t n_units = (image.size() - units_at) / unit_len;
+    for (size_t u = 0; u < n_units; ++u) {
+        uint8_t * unit = out.data() + units_at + u * unit_len;
+        std::vector<uint8_t> codes(32 * row_bytes);
+        for (size_t lane = 0; lane < 32; ++lane) {
+            std::vector<uint8_t> packed(static_cast<size_t>(bits) * nsg, 0);
+            for (int coord = 0; coord < dim; ++coord) {
+                const size_t group = static_cast<size_t>(coord) / 2;
+                const uint8_t byte = image[units_at + u * unit_len + group * 32 + lane];
+                const uint8_t code = static_cast<uint8_t>(coord % 2 == 0 ? byte >> 4 : byte & 0x0f);
+                for (int plane = 0; plane < bits; ++plane) {
+                    if ((code >> plane) & 1) {
+                        packed[static_cast<size_t>(plane) * nsg + static_cast<size_t>(coord) / 8] |=
+                            static_cast<uint8_t>(1u << (7 - coord % 8));
+                    }
+                }
+            }
+            for (size_t g = 0; g < nsg; ++g) {
+                codes[g * 32 + lane] = packed[low_row + g];
+            }
+            std::memcpy(codes.data() + nsg * 32 + lane * low_row, packed.data(), low_row);
+        }
+        std::memcpy(unit, codes.data(), codes.size());
+    }
+    out[7] = 1;
+    tv1x_reseal_superblock(out, sb_len);
+    return out;
+}
+
+void check_turbovec_1x_snapshot_interop() {
+    CHECK(kTv1xImageBits == 4);
+    const size_t dim = static_cast<size_t>(kTv1xImageDim);
+    const std::vector<float> db = tv1x_rows(kTv1xSeedDb, kTv1xNDb, dim);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, kTv1xNQuery, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(kTv1xNDb);
+
+    auto * idx = ggml_vec_index_create_turbovec(kTv1xImageDim, kTv1xImageBits);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, db.data(), kTv1xNDb, ids.data()) == GGML_VEC_INDEX_OK);
+    std::vector<float> expected_scores(static_cast<size_t>(kTv1xNQuery * kTv1xK));
+    std::vector<uint64_t> expected_ids(expected_scores.size());
+    CHECK(ggml_vec_index_search(
+        idx, queries.data(), kTv1xNQuery, kTv1xK, expected_scores.data(), expected_ids.data()) ==
+        GGML_VEC_INDEX_OK);
+
+    // Our snapshot is upstream's image, piece by piece.
+    const std::vector<uint8_t> ours = tv1x_snapshot_bytes(idx, "ggml-vector-index-tv1x-image.tvim");
+    const std::vector<uint8_t> upstream = tv1x_upstream_image();
+    CHECK(ours.size() == upstream.size());
+    CHECK(std::memcmp(ours.data(), kTv1xImageSuperblock, sizeof(kTv1xImageSuperblock)) == 0);
+    CHECK(std::memcmp(ours.data() + sizeof(kTv1xImageSuperblock), kTv1xImageHeader0, sizeof(kTv1xImageHeader0)) == 0);
+    CHECK(ours == upstream);
+
+    auto check_loaded = [&](ggml_vec_index_t * loaded) {
+        CHECK(loaded != nullptr);
+        CHECK(ggml_vec_index_len(loaded) == kTv1xNDb);
+        CHECK(ggml_vec_index_dim(loaded) == kTv1xImageDim);
+        CHECK(ggml_vec_index_bit_width(loaded) == kTv1xImageBits);
+        std::vector<float> scores(expected_scores.size());
+        std::vector<uint64_t> out(expected_ids.size());
+        CHECK(ggml_vec_index_search(loaded, queries.data(), kTv1xNQuery, kTv1xK, scores.data(), out.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(out == expected_ids);
+        CHECK(scores == expected_scores);
+    };
+
+    // Upstream's image loads, and saving it again reproduces it.
+    auto * loaded = tv1x_load_bytes(upstream);
+    check_loaded(loaded);
+    CHECK(tv1x_snapshot_bytes(loaded, "ggml-vector-index-tv1x-resave.tvim") == upstream);
+    ggml_vec_index_free(loaded);
+
+    // The planes unit layout (written by upstream for large 2/4-bit indexes)
+    // loads to the same index.
+    auto * planes = tv1x_load_bytes(tv1x_to_planes_layout(upstream, kTv1xImageDim, kTv1xImageBits));
+    check_loaded(planes);
+    CHECK(tv1x_snapshot_bytes(planes, "ggml-vector-index-tv1x-planes-resave.tvim") == upstream);
+    ggml_vec_index_free(planes);
+
+    const size_t sb_len = sizeof(kTv1xImageSuperblock);
+    int status = GGML_VEC_INDEX_OK;
+    // A torn commit header fails its CRC, and the zeroed alternate slot is
+    // not a commit either.
+    {
+        std::vector<uint8_t> bad = upstream;
+        bad[sb_len + 8] ^= 0x01;
+        CHECK(tv1x_load_bytes(bad, &status) == nullptr);
+        CHECK(status != GGML_VEC_INDEX_OK);
+    }
+    // A codebook that drifted from the canonical one is refused even when
+    // the superblock CRC is resealed over it.
+    {
+        std::vector<uint8_t> bad = upstream;
+        bad[24] ^= 0x01;
+        tv1x_reseal_superblock(bad, sb_len);
+        CHECK(tv1x_load_bytes(bad, &status) == nullptr);
+    }
+    // A positional (TurboQuantIndex) file has no ids for this API.
+    {
+        std::vector<uint8_t> bad = upstream;
+        bad[6] = 0;
+        tv1x_reseal_superblock(bad, sb_len);
+        CHECK(tv1x_load_bytes(bad, &status) == nullptr);
+        CHECK(status == GGML_VEC_INDEX_E_INVALID_ARG);
+    }
+    // Truncation, an unknown revision and a negative per-vector scale.
+    {
+        std::vector<uint8_t> bad(upstream.begin(), upstream.begin() + static_cast<std::ptrdiff_t>(upstream.size() / 2));
+        CHECK(tv1x_load_bytes(bad, &status) == nullptr);
+        bad = upstream;
+        bad[4] = 9;
+        CHECK(tv1x_load_bytes(bad, &status) == nullptr);
+        CHECK(status == GGML_VEC_INDEX_E_BAD_VERSION);
+        bad = upstream;
+        const size_t units_at = sb_len + 2 * kTv1xImageHeaderLen;
+        const size_t row_bytes = dim / 2;
+        bad[units_at + 32 * row_bytes + 3] |= 0x80;
+        CHECK(tv1x_load_bytes(bad, &status) == nullptr);
+    }
+    CHECK(ggml_vec_index_load_mmap(
+        (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-missing.tvim").string().c_str()) == nullptr);
+    ggml_vec_index_free(idx);
+}
+
+void check_turbovec_1x_calibrate_api() {
+    constexpr int dim = 64;
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, 256, dim);
+    const std::vector<float> db = tv1x_rows(kTv1xSeedDb, 40, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(40);
+
+    CHECK(ggml_vec_index_turbovec_calibrate(nullptr, calib.data(), 256) == GGML_VEC_INDEX_E_INVALID_ARG);
+    CHECK(ggml_vec_index_turbovec_is_calibrated(nullptr) == 0);
+    auto * generic = ggml_vec_index_create(dim, 4);
+    CHECK(ggml_vec_index_turbovec_calibrate(generic, calib.data(), 256) == GGML_VEC_INDEX_E_INVALID_ARG);
+    ggml_vec_index_free(generic);
+    auto * legacy = create_legacy_turbovec(dim, 4);
+    CHECK(ggml_vec_index_turbovec_calibrate(legacy, calib.data(), 256) == GGML_VEC_INDEX_E_INVALID_ARG);
+    ggml_vec_index_free(legacy);
+
+    for (const int bits : { 2, 3, 4 }) {
+        auto * tv = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(tv != nullptr);
+        CHECK(ggml_vec_index_turbovec_calibrate(tv, nullptr, 256) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), 1) == GGML_VEC_INDEX_E_INVALID_ARG);
+        std::vector<float> bad = calib;
+        bad[17] = std::numeric_limits<float>::quiet_NaN();
+        CHECK(ggml_vec_index_turbovec_calibrate(tv, bad.data(), 256) == GGML_VEC_INDEX_E_INVALID_ARG);
+        // Identical rows give every coordinate a zero span: the fit is the
+        // identity, which is refused rather than committed.
+        std::vector<float> flat(static_cast<size_t>(dim) * 8);
+        for (size_t row = 0; row < 8; ++row) {
+            std::copy(calib.begin(), calib.begin() + dim, flat.begin() + static_cast<std::ptrdiff_t>(row * dim));
+        }
+        CHECK(ggml_vec_index_turbovec_calibrate(tv, flat.data(), 8) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_turbovec_is_calibrated(tv) == 0);
+
+        CHECK(ggml_vec_index_add(tv, db.data(), 40, ids.data()) == GGML_VEC_INDEX_OK);
+        auto * filter = ggml_vec_index_filter_create(tv, ids.data(), 4);
+        CHECK(filter != nullptr);
+        CHECK(ggml_vec_index_build_ivf(tv, 2, 1) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), 256) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_turbovec_is_calibrated(tv) == 1);
+        std::array<float, 1> score{};
+        std::array<uint64_t, 1> out{};
+        // A calibration re-encodes every row: prepared filters and IVF state
+        // go stale.
+        CHECK(ggml_vec_index_search_prepared_filtered(tv, filter, db.data(), 1, 1, score.data(), out.data()) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_search_ivf(tv, db.data(), 1, 1, 2, score.data(), out.data()) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        ggml_vec_index_filter_free(filter);
+        CHECK(ggml_vec_index_search(tv, db.data() + 5 * dim, 1, 1, score.data(), out.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out[0] == ids[5]);
+        // Refitting is allowed, and the calibration survives a snapshot.
+        CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data() + 16 * dim, 200) == GGML_VEC_INDEX_OK);
+        const std::vector<uint8_t> bytes = tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-calibrated-api.tvim");
+        auto * loaded = tv1x_load_bytes(bytes);
+        CHECK(loaded != nullptr);
+        CHECK(ggml_vec_index_turbovec_is_calibrated(loaded) == 1);
+        CHECK(ggml_vec_index_search(loaded, db.data() + 5 * dim, 1, 1, score.data(), out.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out[0] == ids[5]);
+        CHECK(tv1x_snapshot_bytes(loaded, "ggml-vector-index-tv1x-calibrated-api-2.tvim") == bytes);
+        ggml_vec_index_free(loaded);
+        ggml_vec_index_free(tv);
+    }
+}
+
+void check_turbovec_1x_dims() {
+    CHECK(ggml_vec_index_create_turbovec(64, 1) == nullptr);
+    CHECK(ggml_vec_index_create_turbovec(64, 5) == nullptr);
+    CHECK(ggml_vec_index_create_turbovec(68, 2) == nullptr);
+    CHECK(ggml_vec_index_create_turbovec(kTurboVecMaxTestDim + 8, 2) == nullptr);
+    // The block-Hadamard rotation lifts the 0.9 dense-rotation cap.
+    for (const int dim : { 1000, 3072, kTurboVecMaxTestDim }) {
+        auto * tv = ggml_vec_index_create_turbovec(dim, dim == kTurboVecMaxTestDim ? 2 : 3);
+        CHECK(tv != nullptr);
+        const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 3, static_cast<size_t>(dim));
+        const std::vector<uint64_t> ids = tv1x_ids(3);
+        CHECK(ggml_vec_index_add(tv, rows.data(), 3, ids.data()) == GGML_VEC_INDEX_OK);
+        std::array<float, 3> scores{};
+        std::array<uint64_t, 3> out{};
+        CHECK(ggml_vec_index_search(tv, rows.data() + dim, 1, 3, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out[0] == ids[1]);
+        const std::vector<uint8_t> bytes = tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-dims.tvim");
+        auto * loaded = tv1x_load_bytes(bytes);
+        CHECK(loaded != nullptr);
+        CHECK(ggml_vec_index_dim(loaded) == dim);
+        CHECK(ggml_vec_index_search(loaded, rows.data() + dim, 1, 3, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out[0] == ids[1]);
+        ggml_vec_index_free(loaded);
+        ggml_vec_index_free(tv);
+    }
+}
+
+// A v8 file is read only as far as its geometry and a CRC-checked header
+// declare, so a sparse file with a huge apparent size costs no memory,
+// whether its metadata is valid or not.
+void check_turbovec_1x_sparse_load() {
+    constexpr int dim = 32;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 64, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(64);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-sparse.tvim").string();
+    std::filesystem::remove(path);
+    auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+    CHECK(ggml_vec_index_add(tv, rows.data(), 64, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(tv);
+    const std::vector<uint8_t> image = read_file_bytes(path);
+    auto write_sparse = [&](const std::vector<uint8_t> & bytes) {
+        write_file_bytes(path, bytes);
+        std::error_code ec;
+        std::filesystem::resize_file(path, uintmax_t{ 1 } << 40, ec);
+        return !ec;
+    };
+    if (!write_sparse(image)) {
+        std::printf("SKIP TurboVec sparse load: no sparse files here\n");
+        std::filesystem::remove(path);
+        return;
+    }
+    auto * loaded = ggml_vec_index_load(path.c_str());
+    CHECK(loaded != nullptr);
+    CHECK(ggml_vec_index_len(loaded) == 64);
+    ggml_vec_index_free(loaded);
+
+    // An invalid dimension.
+    std::vector<uint8_t> bad = image;
+    put_u32_le(bad, 8, 7);
+    CHECK(write_sparse(bad));
+    ggml_vec_index_t * out = nullptr;
+    CHECK(ggml_vec_index_load_ex(path.c_str(), &out) == GGML_VEC_INDEX_E_IO);
+    CHECK(out == nullptr);
+    // A huge row count in the only header, whose CRC then fails.
+    bad = image;
+    const size_t sb_len = 24 + 3 * 4 + 4 * 4 + 4 + 4;
+    write_u64_le_at(bad, sb_len + 8, uint64_t{ 1 } << 34);
+    CHECK(write_sparse(bad));
+    CHECK(ggml_vec_index_load_ex(path.c_str(), &out) == GGML_VEC_INDEX_E_IO);
+    CHECK(out == nullptr);
+    std::filesystem::remove(path);
+}
+
+void check_turbovec_1x() {
+    for (const Tv1xIndexCase & c : kTv1xIndexCases) {
+        check_turbovec_1x_golden_case(c);
+    }
+    check_turbovec_1x_snapshot_interop();
+    check_turbovec_1x_calibrate_api();
+    check_turbovec_1x_dims();
+    check_turbovec_1x_sparse_load();
+}
+
 }  // namespace
+
 
 int main(int argc, char ** argv) {
     const std::filesystem::path test_temp_dir = make_test_temp_dir();
@@ -4405,8 +4891,7 @@ int main(int argc, char ** argv) {
             {
                 constexpr int tv_cache_dim = 64;
                 CHECK(turbovec_rotation_cache_bytes_for_test() == 0);
-                auto * tv_cache = ggml_vec_index_create_turbovec_q2(tv_cache_dim);
-                CHECK(tv_cache != nullptr);
+                auto * tv_cache = create_legacy_turbovec(tv_cache_dim, 2);
                 ggml_vec_index_prepare(tv_cache);
                 CHECK(turbovec_rotation_cache_bytes_for_test() >=
                       static_cast<size_t>(tv_cache_dim) * static_cast<size_t>(tv_cache_dim) *
@@ -4441,6 +4926,7 @@ int main(int argc, char ** argv) {
             check_turbovec_sparse_filter_block_selection();
 
             check_turbovec_numeric_helper_parity();
+            check_turbovec_1x_rotation_and_codebooks();
             check_tqplus_deterministic_layout(
                 2,
                 UINT64_C(0xc4140782241d45eb),
@@ -4712,16 +5198,16 @@ int main(int argc, char ** argv) {
         CHECK(tv_out[0] == tv_ids[0]);
         CHECK(ggml_vec_index_load_mmap(tv_snapshot_path.c_str()) == nullptr);
         ggml_vec_index_free(tv_loaded);
-        std::vector<uint8_t> unchecksummed_tv = read_file_bytes(tv_snapshot_path);
-        CHECK(unchecksummed_tv.size() > 16);
-        CHECK(unchecksummed_tv[4] == 3);
-        CHECK((unchecksummed_tv[7] & 1) != 0);
-        unchecksummed_tv[7] = 0;
-        unchecksummed_tv.resize(unchecksummed_tv.size() - 16);
-        write_file_bytes(tv_unchecksummed_path, unchecksummed_tv);
-        auto * unchecksummed_loaded = ggml_vec_index_load(tv_unchecksummed_path.c_str());
-        CHECK(unchecksummed_loaded == nullptr);
-        ggml_vec_index_free(unchecksummed_loaded);
+        // TurboVec 1.x snapshots are upstream v8 containers; a damaged
+        // superblock fails its CRC instead of loading.
+        std::vector<uint8_t> corrupt_tv = read_file_bytes(tv_snapshot_path);
+        CHECK(corrupt_tv.size() > 64);
+        CHECK(std::memcmp(corrupt_tv.data(), "TV8", 4) == 0);
+        corrupt_tv[40] ^= 0x01;
+        write_file_bytes(tv_unchecksummed_path, corrupt_tv);
+        auto * corrupt_loaded = ggml_vec_index_load(tv_unchecksummed_path.c_str());
+        CHECK(corrupt_loaded == nullptr);
+        ggml_vec_index_free(corrupt_loaded);
         ggml_vec_index_t * tv_delta_loaded = nullptr;
         CHECK(ggml_vec_index_load_with_delta_ex(
             tv_snapshot_path.c_str(), tv_delta_path.c_str(), &tv_delta_loaded) ==
@@ -4871,6 +5357,10 @@ int main(int argc, char ** argv) {
         check_turbovec_v3_corruption_rejected(bit_width);
         check_turbovec_tiny_tqplus_scale_rejected(bit_width);
         check_turbovec_zero_scale_and_legacy_calibration(bit_width);
+    }
+
+    if (kTurboVecSupported) {
+        check_turbovec_1x();
     }
 
     // Rust TurboVec golden parity: generated by tests/turbovec-golden-gen.
