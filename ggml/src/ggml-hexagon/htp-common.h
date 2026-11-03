@@ -81,7 +81,7 @@ static inline bool htp_can_rt_repack(const struct ggml_tensor * t) {
 }
 
 static inline bool htp_tensor_is_tiled(const struct ggml_tensor * t) {
-    const auto * extra = (const struct htp_tensor_extra *) t->extra;
+    const auto * extra = (const struct htp_tensor_extra *) htp_repack_owner(t)->extra;
     if (extra && (extra->flags & HTP_TENSOR_TILED)) {
         return true;
     }
@@ -89,7 +89,7 @@ static inline bool htp_tensor_is_tiled(const struct ggml_tensor * t) {
 }
 
 static inline bool htp_needs_repack(const struct ggml_tensor * t) {
-    const auto * extra = (const struct htp_tensor_extra *) t->extra;
+    const auto * extra = (const struct htp_tensor_extra *) htp_repack_owner(t)->extra;
     if (extra && (extra->flags & HTP_TENSOR_TILED)) {
         return false;
     }

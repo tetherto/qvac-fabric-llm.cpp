@@ -240,6 +240,34 @@ void check_foreign_set_rows(ggml_backend_t backend, int & checks) {
     std::puts("foreign CPU SET_ROWS queries: 3 PASS");
 }
 
+void check_runtime_repack(ggml_backend_t backend, ggml_type type,
+                          const std::vector<uint8_t> & a, const std::vector<uint8_t> & b, int & checks) {
+    auto * ctx = ggml_init({ggml_tensor_overhead() * 4, nullptr, true});
+    check(ctx != nullptr, "runtime REPACK context allocation failed");
+    auto * weights = ggml_new_tensor_2d(ctx, type, 256, 32);
+    auto * alias = ggml_view_tensor(ctx, weights);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "runtime REPACK buffer allocation failed");
+    // Keep the default buffer usage so Hexagon tiles these weights during compute.
+    ggml_backend_tensor_set(weights, a.data(), 0, a.size());
+    check_repack_matmul(backend, weights, a, "runtime-full", checks);
+    std::vector<uint8_t> actual(a.size());
+    ggml_backend_tensor_get(alias, actual.data(), 0, actual.size());
+    check(actual == a, "runtime REPACK lost canonical bytes");
+    ++checks;
+
+    const size_t half = a.size() / 2;
+    std::vector<uint8_t> expected = a;
+    std::copy(b.begin() + half, b.end(), expected.begin() + half);
+    ggml_backend_tensor_set(alias, b.data() + half, half, half);
+    check_repack_matmul(backend, alias, expected, "runtime-alias-partial", checks);
+    ggml_backend_tensor_get(weights, actual.data(), 0, actual.size());
+    check(actual == expected, "runtime REPACK partial update lost untouched bytes");
+    ++checks;
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+}
+
 void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
     auto * ctx = ggml_init({ggml_tensor_overhead() * 16, nullptr, true});
     check(ctx != nullptr, "REPACK context allocation failed");
@@ -265,6 +293,7 @@ void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
         values[i] = float(int(i % 67) - 33) / 19.0f;
     }
     check(ggml_quantize_chunk(type, values.data(), b.data(), 0, 32, 256, nullptr) == bytes, "REPACK quantization failed");
+    check_runtime_repack(backend, type, a, b, checks);
     auto verify = [&](ggml_tensor * tensor, const char * name, bool compute = false) {
         ggml_backend_tensor_get(tensor, actual.data(), 0, bytes);
         const bool passed = actual == expected;

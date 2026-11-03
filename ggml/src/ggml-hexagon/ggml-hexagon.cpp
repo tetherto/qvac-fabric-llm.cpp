@@ -2494,6 +2494,9 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     htp_repack_tensor_tiled(src0, raw.data(), raw.size());
                     auto * extra = (htp_tensor_extra *) src0->extra;
                     extra->flags |= HTP_TENSOR_TILED;
+                    extra->shadow_coverage.assign(1, {0, raw.size()});
+                    extra->shadow_buf = std::move(raw);
+                    extra->repack_ready = true;
                 }
             }
 
