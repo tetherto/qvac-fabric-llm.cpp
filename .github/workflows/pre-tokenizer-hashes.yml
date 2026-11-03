@@ -22,9 +22,6 @@ concurrency:
     group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
     cancel-in-progress: true
 
-permissions:
-    contents: read
-
 jobs:
     authorize:
         permissions: {}
