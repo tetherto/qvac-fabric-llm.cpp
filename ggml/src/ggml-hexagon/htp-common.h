@@ -4,6 +4,20 @@
 #include "htp-opnode.h"
 #include "htp-repack.h"
 
+#include <cstring>
+
+static inline const ggml_tensor * htp_repack_owner(const ggml_tensor * tensor) {
+    if (!htp_is_tiled_weight_type(tensor->type)) {
+        return tensor;
+    }
+    while (tensor->view_src && tensor->view_offs == 0 && tensor->type == tensor->view_src->type &&
+           ggml_are_same_shape(tensor, tensor->view_src) &&
+           memcmp(tensor->nb, tensor->view_src->nb, sizeof(tensor->nb)) == 0) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
 extern int    opt_arch;
 extern size_t opt_ndev;
 extern size_t opt_nhvx;
@@ -58,7 +72,7 @@ static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t)
 }
 
 static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
-    return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_TILED) != 0;
+    return (ggml_hexagon_tensor_get_flags(htp_repack_owner(t)) & HTP_TENSOR_TILED) != 0;
 }
 
 static inline bool ggml_hexagon_tensor_can_tile(const struct ggml_tensor * t) {
@@ -118,6 +132,8 @@ size_t       htp_session_vtcm_size(const struct ggml_hexagon_session * sess);
 uint32_t     htp_session_n_hvx(const struct ggml_hexagon_session * sess);
 uint32_t     htp_session_n_hmx(const struct ggml_hexagon_session * sess);
 uint32_t     htp_session_mdev_count(const struct ggml_hexagon_session * sess);
+
+bool         ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b);
 
 htp_op_code  htp_op_remap(const struct ggml_tensor * t);
 
