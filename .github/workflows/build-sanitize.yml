@@ -109,6 +109,8 @@ jobs:
         if: ${{ matrix.sanitizer == 'THREAD' }}
         run: |
           cmake -B build \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
             -DGGML_VECTOR_INDEX=ON \
