@@ -97,6 +97,7 @@ int ggml_metal_op_snake_fused       (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_upscale           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pad               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pad_reflect_1d    (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_diag_mask_inf     (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_roll              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_arange            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx);

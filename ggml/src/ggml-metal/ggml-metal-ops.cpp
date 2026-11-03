@@ -578,6 +578,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_pad_reflect_1d(ctx, idx);
             } break;
+        case GGML_OP_DIAG_MASK_INF:
+            {
+                n_fuse = ggml_metal_op_diag_mask_inf(ctx, idx);
+            } break;
         case GGML_OP_ROLL:
             {
                 n_fuse = ggml_metal_op_roll(ctx, idx);
@@ -8560,6 +8564,38 @@ int ggml_metal_op_pad_replicate_1d(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2); // y
 
     ggml_metal_encoder_dispatch_threadgroups(enc, C, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_diag_mask_inf(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int32_t ncols = (int32_t) op->src[0]->ne[0];
+    const int32_t nrows = (int32_t) ggml_nrows(op->src[0]);
+    const int32_t rows_per_channel = (int32_t) op->src[0]->ne[1];
+    const int32_t n_past = ((const int32_t *) op->op_params)[0];
+
+    ggml_metal_kargs_diag_mask_inf args = {
+        /*.ncols            =*/ ncols,
+        /*.rows_per_channel =*/ rows_per_channel,
+        /*.n_past           =*/ n_past,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_diag_mask_inf(lib, op);
+
+    const int nth = std::min<int>(ncols, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    const int n_tiles = 1 + (ncols - 1) / nth;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, nrows, n_tiles, 1, nth, 1, 1);
 
     return 1;
 }
