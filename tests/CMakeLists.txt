@@ -744,3 +744,8 @@ if (GGML_METAL)
     llama_build_and_test(test-metal-glu-alias.cpp)
     set_tests_properties(test-metal-glu-alias PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+find_package(Threads REQUIRED)
+add_executable(test-cpu-affinity test-cpu-affinity.cpp)
+target_link_libraries(test-cpu-affinity PRIVATE ggml-cpu Threads::Threads)
+llama_test(test-cpu-affinity)
