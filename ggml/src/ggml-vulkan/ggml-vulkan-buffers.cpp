@@ -2,13 +2,36 @@
 #define VMA_IMPLEMENTATION
 #include "ggml-vulkan-common.h"
 
+#include <cstdint>
+#include <cstdlib>
+#include <mutex>
+#include <shared_mutex>
+
+static void * portable_aligned_malloc(size_t align, size_t size) {
+#ifdef _WIN32
+    return _aligned_malloc(size, align);
+#else
+    return std::aligned_alloc(align, size);
+#endif
+}
+
+static void portable_aligned_free(void * ptr) {
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
+}
+
 ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
-    /* .get_name         = */ ggml_backend_vk_buffer_type_name,
-    /* .alloc_buffer     = */ ggml_backend_vk_buffer_type_alloc_buffer,
-    /* .get_alignment    = */ ggml_backend_vk_buffer_type_get_alignment,
-    /* .get_max_size     = */ ggml_backend_vk_buffer_type_get_max_size,
-    /* .get_alloc_size   = */ ggml_backend_vk_buffer_type_get_alloc_size,
-    /* .is_host          = */ NULL,
+    /* .get_name            = */ ggml_backend_vk_buffer_type_name,
+    /* .alloc_buffer        = */ ggml_backend_vk_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n      = */ NULL,
+    /* .get_alignment       = */ ggml_backend_vk_buffer_type_get_alignment,
+    /* .get_max_size        = */ ggml_backend_vk_buffer_type_get_max_size,
+    /* .get_alloc_size      = */ ggml_backend_vk_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ NULL,
 };
 
 static vk_buffer ggml_vk_create_buffer(vk_device& device, const vk::BufferCreateInfo& buffer_info, const VmaAllocationCreateInfo& alloc_info) {
@@ -156,9 +179,40 @@ void ggml_vk_destroy_buffer(vk_buffer& buf) {
     buf.reset();
 }
 
-void * ggml_vk_host_malloc(vk_device& device, size_t size) {
+// caller must hold host_allocations_mutex
+static size_t ggml_vk_host_allocation_find(const void * ptr) {
+    for (size_t i = 0; i < vk_instance.host_allocations.size(); i++) {
+        const uint8_t * base = (const uint8_t *) vk_instance.host_allocations[i].base;
+        if (ptr >= base && ptr < base + vk_instance.host_allocations[i].size) {
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
+void * ggml_vk_host_malloc(size_t size) {
     VK_LOG_MEMORY("ggml_vk_host_malloc(" << size << ")");
 
+    ggml_vk_instance_init();
+
+    if (vk_instance.multi_device) {
+        const size_t align      = std::max<size_t>(vk_instance.host_import_alignment, TENSOR_ALIGNMENT);
+        const size_t alloc_size = (size + align - 1) / align * align;
+
+        void * ptr = portable_aligned_malloc(align, alloc_size);
+        if (ptr == nullptr) {
+            return nullptr;
+        }
+        vk_host_allocation entry;
+        entry.base = ptr;
+        entry.size = alloc_size;
+
+        std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
+        vk_instance.host_allocations.push_back(std::move(entry));
+        return ptr;
+    }
+
+    vk_device dev0 = ggml_vk_get_device(0);
     const vk::BufferCreateInfo buffer_info{
         vk::BufferCreateFlags(),
         size,
@@ -169,7 +223,7 @@ void * ggml_vk_host_malloc(vk_device& device, size_t size) {
     };
 
     VmaAllocationCreateInfo alloc_info = {};
-    alloc_info.usage = (device->prefer_host_memory ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO);
+    alloc_info.usage = (dev0->prefer_host_memory ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO);
     alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
         VMA_ALLOCATION_CREATE_MAPPED_BIT;
     alloc_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -178,63 +232,86 @@ void * ggml_vk_host_malloc(vk_device& device, size_t size) {
     // so the tallocr base-align (ggml-alloc.c:71) consumes no unreserved slack
     // This issue is upstream, at least until b9518. And it is triggered by VMA
     // and possibility of buffer misalignment.
-    const size_t host_align = std::max<size_t>(TENSOR_ALIGNMENT, device->properties.limits.minMemoryMapAlignment);
-    vk_buffer buf = ggml_vk_create_buffer_aligned(device, buffer_info, alloc_info, host_align);
-
-    if(!(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
-        fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned memory\n",
-            size/1024.0/1024.0);
-        buf.reset();
+    const size_t host_align = std::max<size_t>(TENSOR_ALIGNMENT, dev0->properties.limits.minMemoryMapAlignment);
+    vk_buffer buf;
+    try {
+        buf = ggml_vk_create_buffer_aligned(dev0, buffer_info, alloc_info, host_align);
+    } catch (vk::SystemError& e) {
+        GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
         return nullptr;
     }
 
-    std::lock_guard<std::shared_mutex> guard(device->pinned_memory_mutex);
-    device->pinned_memory.push_back(std::make_tuple(buf->info.pMappedData, size, buf));
+    if (!(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+        fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned memory\n", size / 1024.0 / 1024.0);
+        ggml_vk_destroy_buffer(buf);
+        return nullptr;
+    }
 
+    vk_host_allocation entry;
+    entry.base             = buf->info.pMappedData;
+    entry.size             = size;
+    entry.views[dev0->idx] = buf;
+
+    std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
+    vk_instance.host_allocations.push_back(std::move(entry));
     return buf->info.pMappedData;
 }
 
-void ggml_vk_host_free(vk_device& device, void* ptr) {
+void ggml_vk_host_free(void * ptr) {
     if (ptr == nullptr) {
         return;
     }
     VK_LOG_MEMORY("ggml_vk_host_free(" << ptr << ")");
-    std::lock_guard<std::shared_mutex> guard(device->pinned_memory_mutex);
 
-    vk_buffer buf;
-    size_t index;
-    for (size_t i = 0; i < device->pinned_memory.size(); i++) {
-        const uint8_t* addr = (const uint8_t*) std::get<0>(device->pinned_memory[i]);
-        const uint8_t* endr = addr + std::get<1>(device->pinned_memory[i]);
-        if (ptr >= addr && ptr < endr) {
-            buf = std::get<2>(device->pinned_memory[i]);
-            index = i;
-            break;
+    vk_host_allocation entry;
+    {
+        std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
+        const size_t index = ggml_vk_host_allocation_find(ptr);
+        if (index == SIZE_MAX) {
+            fprintf(stderr, "WARNING: failed to free pinned memory: memory not in map\n");
+            return;
         }
-    }
-    if (buf == nullptr) {
-        fprintf(stderr, "WARNING: failed to free pinned memory: memory not in map\n");
-        return;
+        entry = std::move(vk_instance.host_allocations[index]);
+        vk_instance.host_allocations.erase(vk_instance.host_allocations.begin() + index);
     }
 
-    ggml_vk_destroy_buffer(buf);
-
-    device->pinned_memory.erase(device->pinned_memory.begin() + index);
+    for (auto & view : entry.views) {
+        ggml_vk_destroy_buffer(view);
+    }
+    if (vk_instance.multi_device) {
+        portable_aligned_free(entry.base);
+    }
 }
 
 void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf, size_t& buf_offset) {
-    std::shared_lock<std::shared_mutex> guard(device->pinned_memory_mutex);
     buf = nullptr;
     buf_offset = 0;
-    for (size_t i = 0; i < device->pinned_memory.size(); i++) {
-        const uint8_t* addr = (const uint8_t*) std::get<0>(device->pinned_memory[i]);
-        const uint8_t* endr = addr + std::get<1>(device->pinned_memory[i]);
-        if (ptr >= addr && ptr < endr) {
-            buf = std::get<2>(device->pinned_memory[i]);
-            buf_offset = ((const uint8_t *)ptr) - addr;
-            break;
+
+    std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
+
+    const size_t index = ggml_vk_host_allocation_find(ptr);
+    if (index == SIZE_MAX) {
+        return;
+    }
+    vk_host_allocation & entry = vk_instance.host_allocations[index];
+
+    if (entry.views[device->idx] == nullptr) {
+        const uint32_t bit = 1u << device->idx;
+        if (!vk_instance.multi_device || !vk_instance.device_host_buffer_import[device->idx] || (vk_instance.host_import_failed & bit)) {
+            return;
+        }
+        GGML_ASSERT(device->external_memory_host);
+        // const only propagates from the const context; the pointee is mutable
+        entry.views[device->idx] = ggml_vk_buffer_from_host_ptr(const_cast<vk_device&>(device), entry.base, entry.size);
+        if (entry.views[device->idx] == nullptr) {
+            vk_instance.host_import_failed |= bit;
+            GGML_LOG_WARN("ggml_vulkan: %s: host memory import failed, using staging\n", device->name.c_str());
+            return;
         }
     }
+
+    buf = entry.views[device->idx];
+    buf_offset = (const uint8_t *) ptr - (const uint8_t *) entry.base;
 }
 
 void ggml_vk_ensure_sync_staging_buffer(vk_device& device, size_t size) {
@@ -550,7 +627,10 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
     // the HW device to host copy path.
-    if(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && src->device->uma) {
+    // AMD UMA: uncached host-visible memory is write-combined, CPU reads are slow
+    const bool slow_host_read = src->device->vendor_id == VK_VENDOR_ID_AMD &&
+                                !(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
+    if(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && src->device->uma && !slow_host_read) {
         GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
@@ -641,7 +721,11 @@ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size
 void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_memset_async(" << offset << ", " << c << ", " << size << ")");
 
-    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+    // Host memsets run at submit time, before earlier GPU work in the batch.
+    // Only UMA may take this path, as upstream does. On ReBAR, an earlier
+    // node that aliases the range would overwrite the memset.
+    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
+        dst->device->uma) {
         deferred_memset((uint8_t*)dst->info.pMappedData + offset, c, size, &ctx->memsets);
         return;
     }
@@ -653,7 +737,8 @@ void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset,
 void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_memset(" << offset << ", " << c << ", " << size << ")");
 
-    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
+        dst->device->uma) {
         memset((uint8_t*)dst->info.pMappedData + offset, c, size);
         return;
     }

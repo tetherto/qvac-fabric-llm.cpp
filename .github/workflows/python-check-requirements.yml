@@ -14,6 +14,7 @@ on:
       - 'convert*.py'
       - '**/requirements*.txt'
 
+cache-mode: none
 permissions:
   contents: read
 

@@ -205,9 +205,6 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
             ggml_row_size(g_cs->type, g_cs->ne[0] - 1));
     cb(g_last, "g_last", il);
 
-    // TODO: remove this cont when CUDA supports non-cont unary ops
-    g_last = ggml_cont(ctx0, g_last);
-
     // [1, 1, n_chunks, H_v * n_seqs] KDA: [S_k, 1, n_chunks, H_v * n_seqs]
     ggml_tensor * g_last_exp_t = ggml_transpose(ctx0, ggml_exp(ctx0, g_last));
     cb(g_last_exp_t, "g_last_exp_t", il);
@@ -584,7 +581,8 @@ ggml_tensor * llm_build_delta_net_base::build_rs_ssm(
                             mctx_cur->get_head()*ssm_states_all->nb[1]);
     }
 
-    return build_rs(ssm_states_all, inp->s_copy_base_main, inp->s_copy_base_extra, hparams.n_embd_s(), n_seqs,
+    // one gather of all n_rs base states: the ubatch states, then the extra cells (see build_rs)
+    return build_rs(ssm_states_all, inp->s_copy_base, inp->s_copy_base_main, hparams.n_embd_s(), n_seqs,
                     mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z());
 }
 

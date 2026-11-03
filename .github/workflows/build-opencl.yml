@@ -23,7 +23,9 @@ on:
       'ggml/src/ggml-opencl/**'
     ]
 
+cache-mode: write
 permissions:
+  actions: write
   contents: read
 
 # QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
@@ -43,9 +45,6 @@ env:
 
 jobs:
   windows-2025-opencl-adreno:
-    permissions:
-      contents: read
-      actions: write
     runs-on: windows-2025
 
     steps:

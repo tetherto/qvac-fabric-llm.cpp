@@ -245,8 +245,6 @@ static __global__ void quantize_mmq_nvfp4(
     static_assert(!scatter || !cutlass_layout);
 #if defined(BLACKWELL_MMA_AVAILABLE)
 
-    const int64_t blocks_per_col = (ne0 + QK_FP4_MMQ - 1) / QK_FP4_MMQ;
-
     int64_t base_idx;
     if constexpr (scatter) {
         base_idx = (int64_t) blockIdx.x * s02; // one physical row per token
@@ -395,7 +393,8 @@ static __global__ void quantize_mmq_nvfp4(
             yqs[1] = q1;
             block_scales[ggml_cuda_cutlass_blockscaled_scale_offset(blockIdx.x, isb, ne0 / QK_NVFP4_SUB)] = fp8_code;
         } else {
-            block_fp4_mmq * yb = y + (blockIdx.y * ((int64_t) blocks_per_col * ne1) + k_block * ne1 + blockIdx.x);
+            const int64_t blocks_per_col = (ne0 + QK_FP4_MMQ - 1) / QK_FP4_MMQ;
+            block_fp4_mmq * yb = y + (blockIdx.y * (blocks_per_col * ne1) + k_block * ne1 + blockIdx.x);
             uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
             yqs[2 * sub + 0] = q0;
             yqs[2 * sub + 1] = q1;
@@ -687,7 +686,6 @@ void quantize_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -717,7 +715,6 @@ void quantize_scatter_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 

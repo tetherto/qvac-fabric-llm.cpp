@@ -33,6 +33,7 @@ on:
       'ggml/src/ggml-vulkan/**'
     ]
 
+cache-mode: none
 permissions:
   contents: read
 

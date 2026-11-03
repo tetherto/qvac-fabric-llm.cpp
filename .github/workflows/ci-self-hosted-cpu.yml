@@ -30,6 +30,7 @@ on:
       'ggml/src/ggml-cpu/**'
     ]
 
+cache-mode: none
 permissions:
   contents: read
 

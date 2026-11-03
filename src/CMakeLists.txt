@@ -27,9 +27,9 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-dsa-iswa.cpp
     llama-kv-cache-msa.cpp
     llama-kv-cache-dsv4.cpp
-    llama-moe-cache.cpp
     llama-lora-training.cpp
     llama-memory.cpp
+    llama-moe-cache.cpp
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp
     llama-memory-hybrid-idx.cpp
@@ -77,6 +77,14 @@ target_include_directories(
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+if (LLAMA_COREML)
+    target_sources(llama PRIVATE llama-coreml.mm)
+    target_compile_definitions(llama PRIVATE LLAMA_USE_COREML)
+    target_link_libraries(llama PRIVATE "-framework CoreML" "-framework Foundation")
+    set_source_files_properties(llama-coreml.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc" SKIP_UNITY_BUILD_INCLUSION ON)
+    set_target_properties(llama PROPERTIES OBJCXX_STANDARD 17 OBJCXX_STANDARD_REQUIRED ON)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

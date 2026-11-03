@@ -3,6 +3,7 @@ on:
   workflow_dispatch:
   workflow_call:
 
+cache-mode: none
 permissions:
   contents: read
 

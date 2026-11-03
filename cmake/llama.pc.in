@@ -7,4 +7,5 @@ Name: llama
 Description: Port of Facebook's LLaMA model in C/C++
 Version: @LLAMA_VERSION@
 Libs: -L${libdir} -lggml -lggml-base -lllama
+Libs.private: @LLAMA_PC_LIBS_PRIVATE@
 Cflags: -I${includedir}

@@ -12,17 +12,12 @@ class FakeWriter:
     def __init__(self):
         self.values = {}
 
-    def add_uint32(self, key, value):
-        self.values[key] = value
-
-    def add_string(self, key, value):
-        self.values[key] = value
-
-    def add_array(self, key, value):
-        self.values[key] = value
-
-    def add_bool(self, key, value):
-        self.values[key] = value
+    def __getattr__(self, name):
+        prefix = "add_prism_hadamard_"
+        if not name.startswith(prefix):
+            raise AttributeError(name)
+        key = "prism.hadamard." + name[len(prefix):]
+        return lambda value: self.values.__setitem__(key, value)
 
     def get_total_parameter_count(self):
         return 0, 0, 0, 0
@@ -53,6 +48,9 @@ def make_model(tmp_path: Path, arch, tensors, fuse=False, block_size=256) -> Any
     model.filter_tensors = lambda item: item
     model.map_tensor_name = lambda name, try_suffixes=(".weight", ".bias"): name
     model._hadamard_gdn_v_grouped = False
+    model._fusable_qkv_weight_layers = set()
+    model.hparams = {}
+    model.model_tensors = {}
     return model
 
 
@@ -120,8 +118,8 @@ def test_hadamard_metadata_rejects_unsafe_fusion(tmp_path, tensors, message):
     assert model.gguf_writer.values == {}
 
 
-def test_hadamard_metadata_rejects_qwen3_moe(tmp_path):
-    model = make_model(tmp_path, gguf.MODEL_ARCH.QWEN3MOE, [folded("output.weight")])
+def test_hadamard_metadata_rejects_unverified_arch(tmp_path):
+    model = make_model(tmp_path, gguf.MODEL_ARCH.GPT2, [folded("output.weight")])
 
     with pytest.raises(ValueError, match="not verified"):
         model.add_hadamard_metadata()

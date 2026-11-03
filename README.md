@@ -71,9 +71,9 @@ Choose a cache budget that leaves VRAM for other model weights, the KV cache, an
 
 `ggml-vector-index` provides a standalone C API for local vector search, including compressed CPU indexes for applications that need on-device retrieval.
 
-- **Storage**: full-precision f32, generic q8 and packed q4, plus TurboVec 2-bit and 4-bit modes with scalar, NEON, and AVX2 scoring paths.
+- **Storage**: full-precision f32, generic q8 and packed q4, plus TurboVec 2-, 3- and 4-bit modes (a byte-exact port of [turbovec](https://github.com/ryancodrai/turbovec) 1.1.2, dimensions up to 16384) with scalar, NEON, and AVX2 scoring paths.
 - **Search**: exact top-k scans, filtering by caller-provided IDs, reusable prepared filters, and optional IVF search for approximate candidate selection.
-- **Persistence**: index snapshots, with read-only mmap loading and incremental mutation logs for the generic storage modes. TurboVec supports snapshot save/load; mmap and logged mutations are not yet supported for TurboVec.
+- **Persistence**: index snapshots, with read-only mmap loading and incremental mutation logs for the generic storage modes. TurboVec writes turbovec's own v8 files, in memory or on disk, and saves incrementally with crash-safe `sync`.
 
 The library is disabled by default. Enable it with `-DGGML_VECTOR_INDEX=ON` and link `ggml::vector-index` explicitly; it is not integrated into the llama runtime or server. See the [Vector Index Guide](docs/vector-index.md) for supported dimensions, API usage, persistence contracts, and benchmarks.
 
@@ -145,6 +145,12 @@ Enhanced GPU support with targeted optimizations for Qualcomm Adreno GPUs.
 - Adreno-specific Vulkan shader variants for improved throughput.
 - Vulkan Memory Allocator (VMA) integration for efficient GPU memory management.
 
+### AMD XDNA (NPU) Backend *(exclusive)*
+
+Offloads GEMM (matrix multiplication) to the AMD XDNA NPU (Ryzen AI, NPU2) via XRT for inference on Strix-class APUs. See [ggml/src/ggml-xdna/README.md](ggml/src/ggml-xdna/README.md) for build and usage instructions.
+
+Requires Linux with an NPU2 (XDNA2) device, XRT 2.25.x (installed under `/opt/xilinx/xrt`) and a Python interpreter with mlir-aie (IRON) to compile the kernels at build time. Enable with `-DGGML_XDNA=ON`.
+
 ---
 
 ## Quick Start
@@ -165,6 +171,11 @@ cmake --build build --config Release
 
 # With Metal support (macOS, iOS)
 cmake -B build -DGGML_METAL=ON
+cmake --build build --config Release
+
+# With AMD XDNA NPU support (Linux, Strix-class APUs)
+cmake -B build -DGGML_XDNA=ON -DGGML_OPENMP=ON \
+      -DGGML_XDNA_GEMM_PYTHON=$HOME/aie-env/bin/python
 cmake --build build --config Release
 ```
 

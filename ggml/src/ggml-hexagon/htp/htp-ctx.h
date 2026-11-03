@@ -3,6 +3,7 @@
 
 #include "dma-queue.h"
 #include "hmx-queue.h"
+#include "htp-dcache.h"
 #include "htp-ops.h"
 #include "hex-profile.h"
 #include "work-queue.h"
@@ -18,8 +19,7 @@
 #define HTP_MAX_NTHREADS 10
 #endif
 
-#define HTP_MAX_MMAPS        64
-#define HTP_MAX_DIRTY_RANGES 64
+#define HTP_MAX_MMAPS 64
 
 // Memory mapping
 struct htp_mmap {
@@ -27,11 +27,6 @@ struct htp_mmap {
     uint64_t base;
     uint32_t fd;
     uint32_t flags;
-};
-
-struct htp_dirty_range {
-    uint32_t start;
-    uint32_t end;
 };
 
 // Scratchpad state
@@ -173,30 +168,11 @@ int op_solve_tri(struct htp_ops_context * octx);
 int op_gated_delta_net(struct htp_ops_context * octx);
 int op_pad(struct htp_ops_context * octx);
 int op_im2col(struct htp_ops_context * octx);
+int op_im2col_3d(struct htp_ops_context * octx);
+int op_pool_2d(struct htp_ops_context * octx);
+int op_pool_1d(struct htp_ops_context * octx);
 int op_allreduce(struct htp_ops_context * octx);
 int op_roll(struct htp_ops_context * octx);
 int op_snake(struct htp_ops_context * octx);
-int op_col2im_1d(struct htp_ops_context * octx);
-int op_conv_2d_dw(struct htp_ops_context * octx);
-int op_depthwise_conv_1d(struct htp_ops_context * octx);
-int op_timestep_embedding(struct htp_ops_context * octx);
-struct htp_transpose_f32 {
-    struct htp_ops_context * octx;
-    const uint8_t *          src;
-    uint8_t *                dst;
-    uint32_t                 rows;
-    uint32_t                 cols;
-    uint32_t                 src_row_stride;
-    uint32_t                 dst_row_stride;
-    uint32_t                 batch2;
-    uint32_t                 batch3;
-    uint32_t                 src_stride2;
-    uint32_t                 src_stride3;
-    uint32_t                 dst_stride2;
-    uint32_t                 dst_stride3;
-};
-
-bool htp_transpose_f32(const struct htp_transpose_f32 * job);
-
 
 #endif /* HTP_CTX_H */

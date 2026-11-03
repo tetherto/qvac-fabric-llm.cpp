@@ -17,8 +17,6 @@
 #include <stdexcept>
 #include <unordered_map>
 
-using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
-
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
@@ -249,7 +247,16 @@ struct llama_model_loader {
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
-    void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
+    // byte range within a mapped file
+    struct mapping_range {
+        size_t first; // inclusive
+        size_t last;  // exclusive
+    };
+
+    // sorted, non-overlapping ranges of file 'idx' that back the tensors of 'ctx'
+    // ranges owned by other contexts are excluded, so that a buffer wrapping them won't pin
+    // data that this context never reads (lazy tensors, -cmoe tensors, ...)
+    std::vector<mapping_range> get_mapping_ranges(uint32_t idx, ggml_context * ctx) const;
 
     // release a weight's mmap pages
     void unmap_weight(const llama_tensor_weight & w) const;
@@ -259,8 +266,13 @@ struct llama_model_loader {
     const void * load_data_range(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const;
 
     // Returns false if cancelled by progress_callback
-    bool load_all_data(size_t size_data, struct ggml_context * ctx, llama_buf_map & bufs, llama_mlocks * lmlocks,
-                       llama_progress_callback progress_callback, void * progress_callback_user_data);
+    bool load_all_data(
+            size_t size_data,
+            struct ggml_context * ctx,
+            std::vector<ggml_backend_buffer_t> & bufs,
+            llama_mlocks * lmlocks,
+            llama_progress_callback progress_callback,
+            void * progress_callback_user_data);
 
     std::string ftype_name() const;
 

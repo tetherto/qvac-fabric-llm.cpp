@@ -24,6 +24,7 @@ on:
       'ggml/src/ggml-cuda/**'
     ]
 
+cache-mode: none
 permissions:
   contents: read
 
@@ -67,7 +68,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: cuda-ubuntu-24.04-cuda
+          restore: false
           save: false
 
       - name: ccache-buckets-restore
@@ -80,7 +81,7 @@ jobs:
           hf_bucket: ggml-org/cache
 
       - name: Build with CMake
-        # TODO: Remove GGML_CUDA_CUB_3DOT2 flag once CCCL 3.2 is bundled within CTK and that CTK version is used in this project
+        # TODO: Drop GGML_CUDA_CCCL_VERSION when this job uses CTK >= 13.5, which bundles CCCL >= 3.5.
         run: |
           cmake -S . -B build -G Ninja \
             -DLLAMA_FATAL_WARNINGS=ON \
@@ -89,7 +90,7 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
             -DGGML_NATIVE=OFF \
             -DGGML_CUDA=ON \
-            -DGGML_CUDA_CUB_3DOT2=ON
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3
           cmake --build build
 
       - name: ccache-buckets-save
@@ -127,7 +128,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: cuda-ubuntu-22.04-hip
+          restore: false
           save: false
 
       - name: ccache-buckets-restore
@@ -183,7 +184,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: cuda-ubuntu-22.04-musa
+          restore: false
           save: false
 
       - name: ccache-buckets-restore

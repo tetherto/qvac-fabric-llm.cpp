@@ -17,6 +17,7 @@ on:
       '**/*.cpp',
       '**/*.swift',
       '**/*.m',
+      '**/*.mm',
       '**/*.metal',
       'scripts/vector-index-package-smoke.sh'
     ]
@@ -35,10 +36,12 @@ on:
       '**/*.cpp',
       '**/*.swift',
       '**/*.m',
+      '**/*.mm',
       '**/*.metal',
       'scripts/vector-index-package-smoke.sh'
     ]
 
+cache-mode: none
 permissions:
   contents: read
 
@@ -59,6 +62,25 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  macos-coreml-compile:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure Core ML
+        run: >-
+          cmake -S . -B build-coreml
+          -DLLAMA_COREML=ON
+          -DLLAMA_FATAL_WARNINGS=ON
+          -DLLAMA_BUILD_TESTS=OFF
+          -DLLAMA_BUILD_TOOLS=OFF
+          -DLLAMA_BUILD_APP=OFF
+          -DLLAMA_OPENSSL=OFF
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
+      - name: Compile Core ML runtime and tools
+        run: cmake --build build-coreml --target llama llama-embedding llama-coreml-embedding-bench llama-coreml-embedding-plan -j 3
+      - name: Core ML contract tests without model assets
+        run: ctest --test-dir build-coreml -R '^coreml-contract$' --output-on-failure
+
   macos-latest-arm64:
     runs-on: macos-latest
 
@@ -70,7 +92,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: apple-arm64
+          restore: false
           save: false
 
       - name: ccache-buckets-restore
@@ -120,8 +142,9 @@ jobs:
         id: cmake_test
         run: |
           cd build
+          # Metal Paravirtual devices are difficult to support -> disable
           # ref: https://github.com/ggml-org/llama.cpp/pull/19802#issuecomment-4013704023
-          ctest -L main -E "test-llama-archs|test-glm5-kpool-sequences|test-save-load-state" --verbose --timeout 1800
+          ctest -L main -E "test-llama-archs|test-glm5-kpool-sequences|test-llama-context|test-save-load-state|test-recurrent-state-rollback" --verbose --timeout 1800
 
   macos-latest-x64:
     runs-on: macos-15-intel
@@ -134,7 +157,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: apple-x64
+          restore: false
           save: false
 
       - name: ccache-buckets-restore
@@ -216,6 +239,10 @@ jobs:
 
   macos-latest-ios-xcode:
     runs-on: macos-latest
+
+    permissions:
+      actions: write
+      contents: read
 
     steps:
       - name: Checkout code
@@ -313,6 +340,10 @@ jobs:
   macos-latest-swift:
     runs-on: macos-latest
     needs: macos-latest-ios-xcode
+
+    permissions:
+      actions: read
+      contents: read
 
     strategy:
       matrix:

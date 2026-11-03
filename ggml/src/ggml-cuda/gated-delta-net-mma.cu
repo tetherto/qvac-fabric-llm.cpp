@@ -4,15 +4,9 @@
 #include <climits>
 #include <mutex>
 
-namespace {
-constexpr int D     = 128;
-constexpr int WARPS = 8;
-using bf16          = nv_bfloat16;
-#ifdef GGML_USE_HIP
-constexpr int N = 16;
-#else
-constexpr int N = 8;
-#endif // GGML_USE_HIP
+namespace ggml_cuda_gated_delta_net_mma {
+constexpr int D = 128;
+using bf16      = nv_bfloat16;
 
 template <int R, int C> struct matrix {
     bf16 hi[R * C], lo[R * C];
@@ -21,7 +15,7 @@ template <int R, int C> struct matrix {
 #ifdef GGML_USE_HIP
         return r * C + c;
 #else
-        return ggml_cuda_mma::swizzle_bytes<true, nv_bfloat162>(r, c / 2, C / 2) / 2 + c % 2;
+        return 2 * ggml_cuda_mma::swizzle<C / 2, nv_bfloat162>(r * (C / 2) + c / 2, r) + c % 2;
 #endif // GGML_USE_HIP
     }
 
@@ -89,9 +83,9 @@ __device__ __forceinline__ tile_t load(const matrix<R, C> & m, int row, int col,
 #else
     const auto * packed = reinterpret_cast<const nv_bfloat162 *>(data);
     if constexpr (TRANS) {
-        load_ldmatrix_trans<true>(t, packed, col, row / 2, C / 2);
+        load_ldmatrix_trans_swizzled<C / 2>(t, packed, col * (C / 2) + row / 2);
     } else {
-        load_ldmatrix<true>(t, packed, row, col / 2, C / 2);
+        load_ldmatrix_swizzled<C / 2>(t, packed, row * (C / 2) + col / 2);
     }
 #endif // GGML_USE_HIP
     return t;
@@ -131,6 +125,13 @@ template <int R, int C> __device__ __forceinline__ void store(matrix<R, C> & m, 
 template <int C, int V, int BLOCKS = 1>
 static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_mma_args a) {
 #if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+    static_assert(ggml_cuda_get_physical_warp_size() == 32, "GDN MMA requires 32-lane warps");
+    constexpr int WARPS = 8;
+#ifdef GGML_USE_HIP
+    constexpr int N = 16;
+#else
+    constexpr int N = 8;
+#endif // GGML_USE_HIP
     static_assert(C >= 16 && (C & (C - 1)) == 0 && V % N == 0 && D % V == 0, "invalid GDN tile");
     extern __shared__ __align__(128) unsigned char bytes[];
     auto &                                         s    = *reinterpret_cast<shared<C, V> *>(bytes);
@@ -229,6 +230,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         // V32 overlaps Gram work with one output tile per projection warp.
         constexpr bool SPLIT_PROJECTION = C == 16 && V == 32;
         acc            base_output[((C / 16) * (V / N) + WARPS - 1) / WARPS];
+        // delta = beta * (v - decay * K S), base output = decay * Q S
         auto           project = [&]() {
             if constexpr (V == 32) {
                 if (warp < 4) {
@@ -250,6 +252,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 }
             }
         };
+        // A = beta * strict_tril(K K^T * decay), P = tril(Q K^T * decay)
         for (int ti = warp; ti < 2 * (C / 16) * (C / N) && (V != 32 || warp < 4); ti += (V == 32 ? 4 : WARPS)) {
             const bool gram = ti < (C / 16) * (C / N);
             const int  t = ti % ((C / 16) * (C / N)), r = (t / (C / N)) * 16, c = (t % (C / N)) * N;
@@ -276,6 +279,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             project();
         }
         __syncthreads();
+        // inverse = (I + A)^-1 by forward substitution
         for (int row = warp; row < C; row += WARPS) {
             float x[(C + 31) / 32];
 #pragma unroll
@@ -304,6 +308,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             project();
         }
         __syncthreads();
+        // solved = inverse * delta
         for (int ti = warp; ti < (C / 16) * (V / N); ti += WARPS) {
             const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
             acc       x;
@@ -311,6 +316,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             store(s.scratch.solved, x, r, c);
         }
         __syncthreads();
+        // out = base output + P * solved
         for (int ti = (SPLIT_PROJECTION ? warp - 4 : warp); ti < (C / 16) * (V / N) && (!SPLIT_PROJECTION || warp >= 4);
              ti += WARPS) {
             const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
@@ -324,6 +330,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 }
             }
         }
+        // S = decay(chunk) * S + K^T * (solved * decay to chunk end)
         for (int i = tid; i < C * V; i += 256) {
             const int   t = i / V, v = i % V, j = s.scratch.solved.index(t, v);
             const float x = __bfloat162float(s.scratch.solved.hi[j]) + __bfloat162float(s.scratch.solved.lo[j]);
@@ -376,7 +383,7 @@ template <int C, int V, int BLOCKS = 1> bool init(int device) {
 
 enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head };
 
-static gdn_path plan(int device, const ggml_cuda_gdn_mma_args & a) {
+static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
     if (!a.eligible || a.H_k != 16 || (a.H != 16 && a.H != 32 && a.H != 48 && a.H != 64) || a.n_tokens < 64 ||
         a.n_tokens > INT64_MAX - 32 || a.rq3 <= 0 || a.n_seqs <= 0 || a.n_seqs > INT_MAX / (a.H * 4)) {
@@ -384,7 +391,7 @@ static gdn_path plan(int device, const ggml_cuda_gdn_mma_args & a) {
     }
     const auto & info = ggml_cuda_info().devices[device];
 #ifdef GGML_USE_HIP
-    if (info.cc != GGML_CUDA_CC_OFFSET_AMD + 0x1151 || a.n_tokens < 2048) {
+    if (!GGML_CUDA_CC_IS_RDNA3_5(info.cc) || a.n_tokens < 2048) {
         return gdn_path::ar;
     }
     return init<16, 64>(device) ? gdn_path::slice64 : gdn_path::ar;
@@ -393,7 +400,9 @@ static gdn_path plan(int device, const ggml_cuda_gdn_mma_args & a) {
     return gdn_path::ar;
 #else
     // Enable only architectures benchmarked for this schedule. MMA support alone does not imply a speedup.
-    if (!ampere_mma_available(info.cc) || (info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK)) {
+    if (!ampere_mma_available(info.cc) ||
+        (info.cc != GGML_CUDA_CC_AMPERE_GA10X && info.cc != GGML_CUDA_CC_ADA_LOVELACE &&
+         info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK)) {
         return gdn_path::ar;
     }
     // Value splitting pays off when whole heads leave at least half the SMs idle.
@@ -408,12 +417,13 @@ static gdn_path plan(int device, const ggml_cuda_gdn_mma_args & a) {
 #endif // GGML_USE_HIP
 }
 }  // namespace
+using namespace ggml_cuda_gated_delta_net_mma;
 
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cudaStream_t stream) {
     if (!a.state_out) {
         return false;
     }
-    const auto path = plan(device, a);
+    const auto path = select_gdn_mma_path(device, a);
     if (path == gdn_path::ar) {
         return false;
     }

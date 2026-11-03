@@ -3,6 +3,10 @@ name: Server
 on:
   workflow_dispatch: # allows manual triggering
     inputs:
+      sha:
+        description: 'Commit SHA1 to build'
+        required: false
+        type: string
       slow_tests:
         description: 'Run slow tests'
         required: true
@@ -39,6 +43,7 @@ on:
       'tools/server/**.*'
     ]
 
+cache-mode: none
 permissions:
   contents: read
 
@@ -65,7 +70,7 @@ env:
 # `ubuntu`, 5th of `windows`) are exactly the long ones.
 # See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event.inputs.sha && format('{0}-slow{1}', github.event.inputs.sha, github.event.inputs.slow_tests)) || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -92,12 +97,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: server-ubuntu-24.04-arm
+          restore: false
           save: false
 
       - name: ccache-buckets-restore
@@ -164,10 +169,12 @@ jobs:
           SLOW_TESTS=1 ./tests.sh
 
   windows:
-    permissions:
-      contents: read
-      actions: write
     runs-on: windows-2025
+
+    cache-mode: write
+    permissions:
+      actions: write
+      contents: read
 
     steps:
       - name: Clone
@@ -175,7 +182,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24

@@ -17,7 +17,7 @@ on:
     tags:
       - 'gguf-v*'           # Push events to every version tag
 
-
+cache-mode: none
 permissions:
   contents: read
 

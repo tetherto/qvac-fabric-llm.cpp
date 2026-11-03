@@ -157,12 +157,14 @@ static bool fake_buft_is_host(ggml_backend_buffer_type_t) { return false; }
 
 static ggml_backend_buffer_type fake_buft = {
     /* .iface = */ {
-        /* .get_name       = */ fake_buft_get_name,
-        /* .alloc_buffer   = */ fake_buft_alloc_buffer,
-        /* .get_alignment  = */ fake_buft_get_alignment,
-        /* .get_max_size   = */ nullptr,
-        /* .get_alloc_size = */ nullptr,
-        /* .is_host        = */ fake_buft_is_host,
+        /* .get_name         = */ fake_buft_get_name,
+        /* .alloc_buffer     = */ fake_buft_alloc_buffer,
+        /* .alloc_buffer_n   = */ nullptr,
+        /* .get_alignment    = */ fake_buft_get_alignment,
+        /* .get_max_size     = */ nullptr,
+        /* .get_alloc_size   = */ nullptr,
+        /* .get_alloc_size_n = */ nullptr,
+        /* .is_host          = */ fake_buft_is_host,
     },
     /* .device  = */ nullptr,
     /* .context = */ nullptr,
