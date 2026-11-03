@@ -8,7 +8,6 @@ program in file order: offset of its metadata, MILBlob data type, role, kind, ch
 """
 
 import argparse
-import json
 from pathlib import Path
 import shutil
 import struct
@@ -108,9 +107,6 @@ def main():
     shutil.copy(package / "Manifest.json", args.output / "Manifest.json")
     shutil.copy(package / "Data/com.apple.CoreML/model.mlmodel", args.output / "model.mlmodel")
     (args.output / "layout.txt").write_text("\n".join(lines) + "\n")
-    (args.output / "template.json").write_text(json.dumps({
-        "channels": C, "hidden": H, "tokens": args.tokens, "chunk": args.chunk, "blobs": count, "weight_bytes": len(blob),
-        "quantization": "int8 per channel, linear_symmetric", "coremltools": ct.__version__}, indent=2) + "\n")
     shutil.rmtree(work)
     print(f"template {args.output}: {count} blobs, weight.bin {len(blob)} bytes", flush=True)
 
