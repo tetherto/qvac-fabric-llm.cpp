@@ -343,23 +343,6 @@ static bool ggml_metal_fusion_check_snake(
     return types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x;
 }
 
-// true if the byte ranges of two tensors overlap in the same Metal buffer
-static bool ggml_metal_fusion_overlap(const ggml_tensor * a, const ggml_tensor * b) {
-    ggml_backend_buffer_t ba = a->view_src ? a->view_src->buffer : a->buffer;
-    ggml_backend_buffer_t bb = b->view_src ? b->view_src->buffer : b->buffer;
-
-    const ggml_metal_buffer_id bid_a = ggml_metal_buffer_get_id((ggml_metal_buffer_t) ba->context, a);
-    const ggml_metal_buffer_id bid_b = ggml_metal_buffer_get_id((ggml_metal_buffer_t) bb->context, b);
-
-    if (bid_a.metal == nullptr || bid_a.metal != bid_b.metal) {
-        return false;
-    }
-
-    return bid_a.offs <= bid_b.offs
-        ? bid_b.offs - bid_a.offs < ggml_nbytes(a)
-        : bid_a.offs - bid_b.offs < ggml_nbytes(b);
-}
-
 // MUL + MUL_MAT(hadamard): the sign vector folds into the FWHT kernel, so the MUL is elided.
 // the MUL_MAT reads the MUL through a RESHAPE, which is not a chain link, so the checks live
 // here (unsafe = true): the raw pattern MUL -> RESHAPE -> MUL_MAT must be consecutive and the
