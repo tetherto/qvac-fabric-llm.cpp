@@ -498,9 +498,11 @@ struct ggml_gallocr {
 
     struct node_alloc * node_allocs; // [n_nodes]
     int n_nodes;
+    size_t node_alloc_bytes;
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+    size_t leaf_alloc_bytes;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -941,6 +943,7 @@ static bool ggml_gallocr_reserve_n_impl(
     if (galloc->n_nodes < graph->n_nodes) {
         free(galloc->node_allocs);
         galloc->node_allocs = calloc(graph->n_nodes, sizeof(struct node_alloc));
+        galloc->node_alloc_bytes = graph->n_nodes * sizeof(struct node_alloc);
         GGML_ASSERT(galloc->node_allocs != NULL);
     }
     galloc->n_nodes = graph->n_nodes;
@@ -974,6 +977,7 @@ static bool ggml_gallocr_reserve_n_impl(
     if (galloc->n_leafs < graph->n_leafs) {
         free(galloc->leaf_allocs);
         galloc->leaf_allocs = calloc(graph->n_leafs, sizeof(galloc->leaf_allocs[0]));
+        galloc->leaf_alloc_bytes = graph->n_leafs * sizeof(galloc->leaf_allocs[0]);
         GGML_ASSERT(galloc->leaf_allocs != NULL);
     }
     galloc->n_leafs = graph->n_leafs;
@@ -1209,6 +1213,49 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     }
 
     return true;
+}
+
+static bool ggml_gallocr_first_allocator(ggml_gallocr_t galloc, int index) {
+    for (int i = 0; i < index; ++i) {
+        if (galloc->buf_tallocs[i] == galloc->buf_tallocs[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_gallocr_first_buffer(ggml_gallocr_t galloc, int index) {
+    for (int i = 0; i < index; ++i) {
+        if (galloc->buffers[i] == galloc->buffers[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static size_t ggml_gallocr_allocator_host_size(ggml_gallocr_t galloc) {
+    size_t size = 0;
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        if (ggml_gallocr_first_allocator(galloc, i)) {
+            size += sizeof(*galloc->buf_tallocs[i]) + galloc->buf_tallocs[i]->n_chunks * sizeof(struct tallocr_chunk);
+        }
+        if (galloc->buffers[i] && ggml_gallocr_first_buffer(galloc, i)) {
+            size += sizeof(*galloc->buffers[i]);
+        }
+    }
+    return size;
+}
+
+size_t ggml_gallocr_get_host_size(ggml_gallocr_t galloc) {
+    GGML_ASSERT(galloc);
+    size_t size = sizeof(*galloc) + galloc->node_alloc_bytes + galloc->leaf_alloc_bytes;
+    size += galloc->n_buffers * (sizeof(galloc->bufts[0]) + sizeof(galloc->buffers[0]) + sizeof(galloc->buf_tallocs[0]));
+    size += galloc->hash_set.size * (sizeof(galloc->hash_set.keys[0]) + sizeof(galloc->hash_values[0]));
+    size += ggml_bitset_size(galloc->hash_set.size) * sizeof(galloc->hash_set.used[0]);
+    if (galloc->shared_buffers) {
+        size += sizeof(*galloc->shared_buffers);
+    }
+    return size + ggml_gallocr_allocator_host_size(galloc);
 }
 
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {

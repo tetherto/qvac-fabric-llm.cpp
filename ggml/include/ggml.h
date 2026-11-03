@@ -913,6 +913,7 @@ extern "C" {
 
     // use this to compute the memory overhead of a tensor
     GGML_API size_t ggml_tensor_overhead(void);
+    GGML_API size_t ggml_context_overhead(void);
 
     GGML_API bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbytes);
 
