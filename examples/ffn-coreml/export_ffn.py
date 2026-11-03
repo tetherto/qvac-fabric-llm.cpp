@@ -47,7 +47,7 @@ def main():
             raise ValueError(f"Invalid weight: {name}")
         weights[kind] = weight
         metadata["weights"][kind] = {"name": name, "shape": list(weight.shape), "ggml_type": tensor.tensor_type.name,
-                                     "sha256": hashlib.sha256(weight).hexdigest()}
+                                     "sha256": hashlib.sha256(weight.data).hexdigest()}
     hidden = weights["up"].shape[1]
     intermediate = weights["up"].shape[0]
     if weights["gate"].shape != (intermediate, hidden) or weights["down"].shape != (hidden, intermediate):
@@ -65,7 +65,7 @@ def main():
         if not args.no_reference_files:
             weight.tofile(args.output / f"{kind}.f16")
         metadata["weights"][kind] = dict(metadata["source_weights"][kind], shape=list(weight.shape),
-                                          sha256=hashlib.sha256(weight).hexdigest())
+                                          sha256=hashlib.sha256(weight.data).hexdigest())
     metadata.update(source_intermediate=intermediate, channel_start=args.channel_start, channel_count=count)
     intermediate = count
     metadata.update(hidden=hidden, intermediate=intermediate, tokens=args.tokens)
