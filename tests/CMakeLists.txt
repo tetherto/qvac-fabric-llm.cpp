@@ -608,6 +608,9 @@ llama_build(test-backend-ops.cpp LINK ggml)
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 
 llama_build_and_test(test-backend-memory.cpp LINK ggml)
+# a synthetic buffer type with a guard; needs the non-public ggml-backend-impl.h
+llama_build_and_test(test-backend-buffer-size.cpp LINK ggml)
+target_include_directories(test-backend-buffer-size PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
 

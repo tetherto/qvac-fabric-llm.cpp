@@ -13,6 +13,7 @@
 #include <mutex>
 #include <thread>
 #include <cstddef>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <sstream>
@@ -469,6 +470,32 @@ struct ggml_hexagon_rpcmem_block {
     }
 };
 
+static constexpr size_t HEXAGON_BUFFER_PAGE_BYTES   = 4 * 1024;
+static constexpr size_t HEXAGON_TENSOR_GUARD_BYTES  = 4 * 1024;
+static constexpr size_t HEXAGON_DMA64_ALIGN_BYTES   = 2 * 1024 * 1024;
+
+static size_t hexagon_round_up_or_saturate(size_t size, size_t alignment) {
+    if (size > SIZE_MAX - (alignment - 1)) {
+        return SIZE_MAX;
+    }
+    return (size + alignment - 1) & ~(alignment - 1);
+}
+
+// Physical bytes behind one shared buffer: the payload rounded to a page, a
+// guard page, and the DMA64 alignment for unpinned buffers. The allocator
+// and the allocation-free size query must agree on this number.
+static size_t ggml_hexagon_shared_buffer_physical_size(size_t size, bool pinned) {
+    size_t total = hexagon_round_up_or_saturate(size, HEXAGON_BUFFER_PAGE_BYTES);
+    if (total == SIZE_MAX || total > SIZE_MAX - HEXAGON_TENSOR_GUARD_BYTES) {
+        return SIZE_MAX;
+    }
+    total += HEXAGON_TENSOR_GUARD_BYTES;
+    if (!pinned && opt_dma64) {
+        total = hexagon_round_up_or_saturate(total, HEXAGON_DMA64_ALIGN_BYTES);
+    }
+    return total;
+}
+
 struct ggml_hexagon_shared_buffer {
     ggml_hexagon_session *                     sess;
     std::shared_ptr<ggml_hexagon_rpcmem_block> mem;
@@ -548,12 +575,9 @@ struct ggml_hexagon_shared_buffer {
         this->pinned   = pinned;
         this->extended = false;
 
-        // Size adjustment inside the buffer class: 4K aligned data size + 4K guard page
-        size_t guard_offset = (size + 4095) & ~4095;
-        size_t total_size   = guard_offset + 4096;
-        if (!pinned && opt_dma64) {
-            constexpr size_t extended_align = 2 * 1024 * 1024;
-            total_size = (total_size + extended_align - 1) & ~(extended_align - 1);
+        const size_t total_size = ggml_hexagon_shared_buffer_physical_size(size, pinned);
+        if (total_size == SIZE_MAX) {
+            throw std::bad_alloc();
         }
 
         alloc(total_size);
@@ -1310,9 +1334,21 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size_n(
 
     size_t total = 0;
     for (const auto & item : plan) {
-        total += item.size;
+        const size_t size = ggml_backend_buft_get_buffer_alloc_size(buft, item.size);
+        total = size > SIZE_MAX - total ? SIZE_MAX : total + size;
     }
     return total;
+}
+
+// Registry procedure "ggml_backend_buft_get_buffer_alloc_size": the physical
+// size the device and host buffer types allocate for a payload, without
+// allocating. Both types create unpinned shared buffers.
+static size_t ggml_backend_hexagon_buffer_alloc_size(ggml_backend_buffer_type_t buft, size_t size) {
+    GGML_UNUSED(buft);
+    if (size == 0) {
+        return 0;
+    }
+    return ggml_hexagon_shared_buffer_physical_size(size, false);
 }
 
 static ggml_backend_buffer_type_i ggml_backend_hexagon_buffer_type_interface = {
@@ -3166,6 +3202,9 @@ static void ggml_backend_hexagon_device_get_props(ggml_backend_dev_t dev, struct
     props->name        = ggml_backend_hexagon_device_get_name(dev);
     props->description = ggml_backend_hexagon_device_get_description(dev);
     props->type        = ggml_backend_hexagon_device_get_type(dev);
+    // FastRPC tensor buffers and host allocations compete for system RAM.
+    // A zero capacity query is unknown capacity, not a separate zero-byte pool.
+    props->memory_unified = true;
     ggml_backend_hexagon_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ true,
@@ -3607,6 +3646,9 @@ static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, cons
         return (void *) ggml_backend_hexagon_conv_taps_f32;
     }
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_buft_get_buffer_alloc_size") == 0) {
+        return (void *) ggml_backend_hexagon_buffer_alloc_size;
+    }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_hexagon_split_buffer_type;
     }

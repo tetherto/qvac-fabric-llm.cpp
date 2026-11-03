@@ -1054,13 +1054,29 @@ static bool ggml_gallocr_reserve_n_impl(
     return true;
 }
 
+// Repeated buffer types share one physical allocation; the size query charges
+// it at its first index only, matching ggml_gallocr_get_buffer_size.
+static bool ggml_gallocr_buft_is_repeated(ggml_gallocr_t galloc, int buffer_id) {
+    for (int i = 0; i < buffer_id; i++) {
+        if (galloc->bufts[i] == galloc->bufts[buffer_id]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void ggml_gallocr_reserve_n_size(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * sizes) {
     GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true));
     for (int i = 0; i < galloc->n_buffers; i++) {
         sizes[i] = 0;
+        if (ggml_gallocr_buft_is_repeated(galloc, i)) {
+            continue;
+        }
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
-            sizes[i] += galloc->buf_tallocs[i]->chunks[c]->max_size;
+            const size_t size = ggml_backend_buft_get_buffer_alloc_size(
+                galloc->bufts[i], galloc->buf_tallocs[i]->chunks[c]->max_size);
+            sizes[i] = size > SIZE_MAX - sizes[i] ? SIZE_MAX : sizes[i] + size;
         }
     }
 }
