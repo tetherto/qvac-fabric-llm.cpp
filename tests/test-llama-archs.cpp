@@ -1172,11 +1172,11 @@ static std::string get_device_label(ggml_backend_dev_t dev) {
 // A unified cache has one cell-to-block map for every sequence. Image patches can share a
 // temporal position, so until QSA has sequence-local ranks this configuration must stay dense.
 static int test_qsa_unified_multiseq(size_t seed, float stdev) {
-    // visible (finite) cells of the selection masks and of the causal masks they are built on
+    // visible (finite) cells of the selection masks, and the layers that have one (once per ubatch)
     struct observed_nodes {
-        bool   top_k    = false;
-        size_t n_sparse = 0;
-        size_t n_dense  = 0;
+        bool                  top_k    = false;
+        size_t                n_sparse = 0;
+        std::set<std::string> layers;
     } observed;
 
     auto observe = [](ggml_tensor * tensor, bool ask, void * data) {
@@ -1189,11 +1189,11 @@ static int test_qsa_unified_multiseq(size_t seed, float stdev) {
             if (std::strncmp(tensor->name, "kq_mask_qsa-", 12) != 0) {
                 return false;
             }
-            // sel = set_rows(-inf, 0) + kq_mask may be computed in place over the mask input, so read it first
-            GGML_ASSERT(std::strcmp(tensor->src[1]->name, "attn_inp_kq_mask") == 0);
-            nodes.n_dense += count_finite(get_tensor_f32(tensor->src[1]));
             return true;
         }
+        // upstream builds the selection from set_rows(-inf, 0) alone, without adding the kq_mask,
+        // so the causal cell count is derived from the batches below instead of read from the graph
+        nodes.layers.insert(tensor->name);
         nodes.n_sparse += count_finite(get_tensor_f32(tensor));
         return true;
     };
@@ -1292,17 +1292,34 @@ static int test_qsa_unified_multiseq(size_t seed, float stdev) {
     steps.push_back(make_batch({ { 0, 64, 0 }, { 1, 40, 3 } }));
     steps.push_back(make_batch({ { 1, 16, 8 }, { 0, 32, 8 } }));
 
+    // (seq, pos) of the cells already in the cache, the batch tokens are appended per step
+    std::vector<std::pair<llama_seq_id, llama_pos>> cells;
+
     for (const auto & step : steps) {
-        observed.n_sparse = observed.n_dense = 0;
+        observed.n_sparse = 0;
+        observed.layers.clear();
         const auto actual   = decode(unified.second.get(), step->batch);
         const auto expected = decode(streams.second.get(), step->batch);
         const auto baseline = decode(dense.second.get(),   step->batch);
+
+        // cells the causal mask allows: same sequence, position not after the token
+        for (int32_t i = 0; i < step->batch.n_tokens; ++i) {
+            cells.emplace_back(step->batch.seq_id[i][0], step->batch.pos[i]);
+        }
+        size_t n_causal = 0;
+        for (int32_t i = 0; i < step->batch.n_tokens; ++i) {
+            for (const auto & [seq, pos] : cells) {
+                n_causal += seq == step->batch.seq_id[i][0] && pos <= step->batch.pos[i];
+            }
+        }
+        const size_t n_dense = n_causal*observed.layers.size();
 
         // unified matches per-stream to ~1e-14
         GGML_ASSERT(nmse(actual, expected) < 1e-11);
         // the selection drops cells the causal mask allows and that reaches the logits;
         // how much it moves them depends on the weight draw, which differs per C++ stdlib
-        GGML_ASSERT(observed.n_sparse > 0 && observed.n_sparse < observed.n_dense);
+        GGML_ASSERT(!observed.layers.empty());
+        GGML_ASSERT(observed.n_sparse > 0 && observed.n_sparse < n_dense);
         GGML_ASSERT(nmse(expected, baseline) > 0.0);
     }
 
