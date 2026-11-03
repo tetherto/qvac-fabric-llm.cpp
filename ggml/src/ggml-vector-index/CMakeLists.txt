@@ -56,10 +56,119 @@ endif()
 if (GGML_VECTOR_INDEX_AVX2_FLAG)
     list(APPEND GGML_VECTOR_INDEX_SOURCES
          ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-avx2.h
-         ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-avx2.cpp)
+         ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-avx2.cpp
+         ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-turbovec-avx2.cpp)
     set_source_files_properties(
         ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-avx2.cpp
+        ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-turbovec-avx2.cpp
         PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX2_FLAG}")
+endif()
+
+# The TurboVec layout and checksum kernels need SSSE3 and SSE4.2, and the
+# rotation kernels AVX-512 F (with AVX2). Each gets its own object, like the
+# AVX2 one, and runs only after a runtime CPU check.
+set(GGML_VECTOR_INDEX_SSE42_FLAG "")
+set(GGML_VECTOR_INDEX_SSE42_ENABLED OFF)
+set(GGML_VECTOR_INDEX_AVX512_FLAG "")
+set(GGML_VECTOR_INDEX_SSE42_CHECK_SOURCE [=[
+    #include <immintrin.h>
+    #include <cstdint>
+    int main() {
+        const __m128i v = _mm_shuffle_epi8(_mm_set1_epi8(3), _mm_set1_epi8(1));
+        const unsigned crc = _mm_crc32_u8(0u, static_cast<unsigned char>(_mm_cvtsi128_si32(v)));
+        return crc == 0u ? 0 : 1;
+    }
+]=])
+set(GGML_VECTOR_INDEX_AVX512_CHECK_SOURCE [=[
+    #include <immintrin.h>
+    int main() {
+        alignas(64) float src[16] = {};
+        const __m512i idx = _mm512_set1_epi32(1);
+        __m512 v = _mm512_i32gather_ps(idx, src, 4);
+        v = _mm512_shuffle_f32x4(v, v, 0x44);
+        v = _mm512_mask_blend_ps(0xff00, _mm512_add_ps(v, v), _mm512_sub_ps(v, v));
+        const __m256 w = _mm256_i32gather_ps(src, _mm256_set1_epi32(2), 4);
+        _mm512_storeu_ps(src, v);
+        return src[0] == _mm256_cvtss_f32(w) ? 0 : 1;
+    }
+]=])
+if (GGML_SYSTEM_ARCH STREQUAL "x86")
+    set(GGML_VECTOR_INDEX_SSE42_CANDIDATE OFF)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        check_cxx_compiler_flag("-mssse3" GGML_VECTOR_INDEX_SUPPORTS_MSSSE3)
+        check_cxx_compiler_flag("-msse4.2" GGML_VECTOR_INDEX_SUPPORTS_MSSE42)
+        if (GGML_VECTOR_INDEX_SUPPORTS_MSSSE3 AND GGML_VECTOR_INDEX_SUPPORTS_MSSE42)
+            set(GGML_VECTOR_INDEX_SSE42_FLAG "-mssse3;-msse4.2")
+            set(GGML_VECTOR_INDEX_SSE42_CANDIDATE ON)
+        endif()
+    elseif (MSVC)
+        # MSVC compiles SSSE3 and SSE4.2 intrinsics without an /arch flag.
+        set(GGML_VECTOR_INDEX_SSE42_CANDIDATE ON)
+    endif()
+    if (GGML_VECTOR_INDEX_SSE42_CANDIDATE)
+        set(CMAKE_REQUIRED_FLAGS_SAVE ${CMAKE_REQUIRED_FLAGS})
+        string(REPLACE ";" " " GGML_VECTOR_INDEX_SSE42_REQUIRED_FLAGS "${GGML_VECTOR_INDEX_SSE42_FLAG}")
+        set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${GGML_VECTOR_INDEX_SSE42_REQUIRED_FLAGS}")
+        check_cxx_source_compiles(
+            "${GGML_VECTOR_INDEX_SSE42_CHECK_SOURCE}"
+            GGML_VECTOR_INDEX_SUPPORTS_SSE42_KERNEL)
+        set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_SAVE})
+        if (GGML_VECTOR_INDEX_SUPPORTS_SSE42_KERNEL)
+            set(GGML_VECTOR_INDEX_SSE42_ENABLED ON)
+        endif()
+    endif()
+
+    # The AVX-512 kernels fall back to the AVX2 ones for short tails.
+    if (GGML_VECTOR_INDEX_AVX2_FLAG)
+        if (MSVC)
+            check_cxx_compiler_flag("/arch:AVX512" GGML_VECTOR_INDEX_SUPPORTS_ARCH_AVX512)
+            if (GGML_VECTOR_INDEX_SUPPORTS_ARCH_AVX512)
+                set(GGML_VECTOR_INDEX_AVX512_FLAG "/arch:AVX512")
+            endif()
+        elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            check_cxx_compiler_flag("-mavx512f" GGML_VECTOR_INDEX_SUPPORTS_MAVX512F)
+            if (GGML_VECTOR_INDEX_SUPPORTS_MAVX512F)
+                set(GGML_VECTOR_INDEX_AVX512_FLAG "${GGML_VECTOR_INDEX_AVX2_FLAG};-mavx512f")
+            endif()
+        endif()
+    endif()
+    if (GGML_VECTOR_INDEX_AVX512_FLAG)
+        set(CMAKE_REQUIRED_FLAGS_SAVE ${CMAKE_REQUIRED_FLAGS})
+        string(REPLACE ";" " " GGML_VECTOR_INDEX_AVX512_REQUIRED_FLAGS "${GGML_VECTOR_INDEX_AVX512_FLAG}")
+        set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${GGML_VECTOR_INDEX_AVX512_REQUIRED_FLAGS}")
+        check_cxx_source_compiles(
+            "${GGML_VECTOR_INDEX_AVX512_CHECK_SOURCE}"
+            GGML_VECTOR_INDEX_SUPPORTS_AVX512_KERNEL)
+        set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_SAVE})
+        if (NOT GGML_VECTOR_INDEX_SUPPORTS_AVX512_KERNEL)
+            set(GGML_VECTOR_INDEX_AVX512_FLAG "")
+        endif()
+    endif()
+endif()
+
+if (GGML_VECTOR_INDEX_AVX2_FLAG OR GGML_VECTOR_INDEX_SSE42_ENABLED)
+    list(APPEND GGML_VECTOR_INDEX_SOURCES ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-x86.h)
+endif()
+if (GGML_VECTOR_INDEX_SSE42_ENABLED)
+    list(APPEND GGML_VECTOR_INDEX_SOURCES ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-sse42.cpp)
+    if (GGML_VECTOR_INDEX_SSE42_FLAG)
+        set_source_files_properties(
+            ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-sse42.cpp
+            PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_SSE42_FLAG}")
+    endif()
+endif()
+if (GGML_VECTOR_INDEX_AVX512_FLAG)
+    list(APPEND GGML_VECTOR_INDEX_SOURCES ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-turbovec-avx512.cpp)
+    set_source_files_properties(
+        ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-turbovec-avx512.cpp
+        PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX512_FLAG}")
+endif()
+set(GGML_VECTOR_INDEX_X86_DEFINITIONS "")
+if (GGML_VECTOR_INDEX_SSE42_ENABLED)
+    list(APPEND GGML_VECTOR_INDEX_X86_DEFINITIONS GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+endif()
+if (GGML_VECTOR_INDEX_AVX512_FLAG)
+    list(APPEND GGML_VECTOR_INDEX_X86_DEFINITIONS GGML_VEC_INDEX_HAVE_AVX512_KERNEL)
 endif()
 
 # TurboVec encodes must match upstream turbovec bit for bit: upstream neither
@@ -80,6 +189,9 @@ endif()
 
 add_library(ggml-vector-index ${GGML_VECTOR_INDEX_SOURCES})
 target_compile_options(ggml-vector-index PRIVATE ${GGML_VECTOR_INDEX_FP_OPTIONS})
+if (GGML_VECTOR_INDEX_X86_DEFINITIONS)
+    target_compile_definitions(ggml-vector-index PRIVATE ${GGML_VECTOR_INDEX_X86_DEFINITIONS})
+endif()
 add_library(ggml::ggml-vector-index ALIAS ggml-vector-index)
 add_library(ggml::vector-index ALIAS ggml-vector-index)
 
@@ -137,6 +249,9 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(ggml-vector-index-test PRIVATE cxx_std_17)
     target_compile_definitions(ggml-vector-index-test PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
     target_compile_options(ggml-vector-index-test PRIVATE ${GGML_VECTOR_INDEX_FP_OPTIONS})
+    if (GGML_VECTOR_INDEX_X86_DEFINITIONS)
+        target_compile_definitions(ggml-vector-index-test PRIVATE ${GGML_VECTOR_INDEX_X86_DEFINITIONS})
+    endif()
     target_include_directories(
         ggml-vector-index-test
         PUBLIC ${CMAKE_CURRENT_LIST_DIR}/../../include)
