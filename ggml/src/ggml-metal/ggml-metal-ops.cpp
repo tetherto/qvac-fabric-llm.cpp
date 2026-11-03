@@ -4348,7 +4348,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     // the loop bound over the mask columns / K/V row lists
     const int64_t ne11_attn = has_rows ? kv_rows->ne[0] : ne11;
 
-    // the row lists are padded by the KV cache to a multiple of 256, so the pad path never triggers
+    // the row lists are padded by the KV cache to a multiple of 256 (supports_op rejects other lengths), so the pad path never triggers
     GGML_ASSERT(!has_rows || ne11_attn % OP_FLASH_ATTN_EXT_NCPSG == 0);
     GGML_ASSERT(!has_rows || ne11_attn % OP_FLASH_ATTN_EXT_VEC_NCPSG == 0);
 

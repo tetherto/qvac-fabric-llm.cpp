@@ -2057,6 +2057,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 if (op->src[2]->ne[0] % 4 != 0) {
                     return false;
                 }
+
+                // the kernels have no pad path for the row lists: their length must be a multiple of the KV block sizes
+                // (the KV cache pads the lists to 256)
+                if (kv_rows->ne[0] % OP_FLASH_ATTN_EXT_NCPSG != 0 || kv_rows->ne[0] % OP_FLASH_ATTN_EXT_VEC_NCPSG != 0) {
+                    return false;
+                }
             }
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&

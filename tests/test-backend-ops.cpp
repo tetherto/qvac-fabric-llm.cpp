@@ -17043,6 +17043,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // head sizes whose half4 count per head is not a multiple of 4, and a row list that is not padded
+    for (int64_t nb : {1, 64}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 40, 4, 2, 1024, 256, nb, 4));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 72, 4, 2, 1024, 256, nb, 4));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 64, 4, 2, 1024, 257, nb, 4));
+    }
+
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
