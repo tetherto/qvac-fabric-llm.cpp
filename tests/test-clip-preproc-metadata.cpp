@@ -13,10 +13,13 @@
 #include "mtmd-model.h"
 #include "mtmd-impl.h"
 #include "mtmd.h"
+#include "ggml-alloc.h"
 #include "gguf.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <initializer_list>
 #include <string>
 
 static int g_failures = 0;
@@ -39,11 +42,11 @@ struct fixture_params {
     int spatial_merge_size = 2;
     int image_min_pixels = 4096;
     int image_max_pixels = 262144;
+    int memory_norm_elements = 0;
 };
 
-// Minimal vision mmproj metadata: everything load_hparams reads as required, plus the two keys
-// under test. No tensors.
-static std::string write_fixture(const char * name, const fixture_params & p) {
+// Memory fixtures include a tiny encoder; preprocessing fixtures need only metadata.
+static std::string write_fixture(const char * name, const fixture_params & p, size_t * weight_bytes = nullptr) {
     std::string path = std::string("test-clip-preproc-") + name + ".gguf";
 
     gguf_context * ctx = gguf_init_empty();
@@ -52,14 +55,15 @@ static std::string write_fixture(const char * name, const fixture_params & p) {
     gguf_set_val_bool(ctx, KEY_HAS_VISION_ENC, true);
     gguf_set_val_str(ctx, KEY_PROJ_TYPE, p.proj_type);
 
-    gguf_set_val_u32(ctx, "clip.vision.embedding_length", 960);
-    gguf_set_val_u32(ctx, "clip.vision.projection_dim", 960);
-    gguf_set_val_u32(ctx, "clip.vision.feed_forward_length", 2560);
-    gguf_set_val_u32(ctx, "clip.vision.block_count", 12);
-    gguf_set_val_u32(ctx, "clip.vision.attention.head_count", 12);
+    const bool memory_fixture = p.memory_norm_elements > 0;
+    gguf_set_val_u32(ctx, "clip.vision.embedding_length", memory_fixture ? 32 : 960);
+    gguf_set_val_u32(ctx, "clip.vision.projection_dim", memory_fixture ? 32 : 960);
+    gguf_set_val_u32(ctx, "clip.vision.feed_forward_length", memory_fixture ? 64 : 2560);
+    gguf_set_val_u32(ctx, "clip.vision.block_count", memory_fixture ? 1 : 12);
+    gguf_set_val_u32(ctx, "clip.vision.attention.head_count", memory_fixture ? 1 : 12);
     gguf_set_val_f32(ctx, "clip.vision.attention.layer_norm_epsilon", 1e-6f);
     gguf_set_val_u32(ctx, KEY_PATCH_SIZE, 16);
-    gguf_set_val_u32(ctx, KEY_PROJ_SCALE_FACTOR, 4);
+    gguf_set_val_u32(ctx, KEY_PROJ_SCALE_FACTOR, memory_fixture ? 1 : 4);
 
     gguf_set_val_u32(ctx, KEY_IMAGE_SIZE, (uint32_t) p.image_size);
     if (p.write_preproc_image_size) {
@@ -78,9 +82,79 @@ static std::string write_fixture(const char * name, const fixture_params & p) {
     const float std_one[3] = { 1.0f, 1.0f, 1.0f };
     gguf_set_arr_data(ctx, KEY_IMAGE_STD, GGUF_TYPE_FLOAT32, std_one, 3);
 
+    ggml_context * tensors = nullptr;
+    if (memory_fixture) {
+        ggml_init_params tp = {2 * 1024 * 1024, nullptr, false};
+        tensors = ggml_init(tp);
+        auto tensor = [&](const char * tn, std::initializer_list<int64_t> dims) {
+            ggml_tensor * t = ggml_new_tensor(tensors, GGML_TYPE_F32, (int) dims.size(), dims.begin());
+            ggml_set_name(t, tn);
+            std::memset(t->data, 0, ggml_nbytes(t));
+            gguf_add_tensor(ctx, t);
+        };
+        tensor("v.patch_embd.weight", {16, 16, 3, 32});
+        tensor("v.position_embd.weight", {32, 1});
+        tensor("v.blk.0.attn_q.weight", {32, 32});
+        tensor("v.blk.0.attn_k.weight", {32, 32});
+        tensor("v.blk.0.attn_v.weight", {32, 32});
+        tensor("v.blk.0.attn_out.weight", {32, 32});
+        tensor("v.blk.0.ln1.weight", {32});
+        tensor("v.blk.0.ln2.weight", {32});
+        tensor("v.blk.0.ffn_up.weight", {32, 64});
+        tensor("v.blk.0.ffn_down.weight", {64, 32});
+        tensor("mm.model.fc.weight", {32, 32});
+        tensor("v.norm_embd.weight", {p.memory_norm_elements});
+
+        ggml_init_params ap = {32 * ggml_tensor_overhead(), nullptr, true};
+        ggml_context * allocated = ggml_init(ap);
+        for (ggml_tensor * t = ggml_get_first_tensor(tensors); t; t = ggml_get_next_tensor(tensors, t)) {
+            ggml_dup_tensor(allocated, t);
+        }
+        ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        ggml_backend_buffer_t control = ggml_backend_alloc_ctx_tensors_from_buft(allocated, ggml_backend_dev_buffer_type(cpu));
+        *weight_bytes = ggml_backend_buffer_get_size(control);
+        ggml_backend_buffer_free(control);
+        ggml_free(allocated);
+    }
     gguf_write_to_file(ctx, path.c_str(), false);
     gguf_free(ctx);
+    ggml_free(tensors);
     return path;
+}
+
+static void expect_weight_buffers(int norm_elements, bool no_alloc) {
+    fixture_params p = {16, 16, false};
+    p.proj_type = "idefics3";
+    p.memory_norm_elements = norm_elements;
+    size_t expected = 0;
+    const std::string path = write_fixture("memory", p, &expected);
+    mtmd_model_params mp;
+    mp.no_alloc = no_alloc;
+    mp.image_no_upscale = -1;
+    mp.image_tile_mode = MTMD_IMAGE_TILE_MODE_SEQUENTIAL;
+    size_t actual = 0;
+    bool cpu_owner = false;
+    bool null_owner = false;
+    try {
+        ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        mtmd_models res = mtmd_model_load(path.c_str(), mp, ggml_backend_dev_buffer_type(cpu));
+        if (res.v) {
+            for (const auto & entry : res.v->mem_weights) {
+                actual += entry.second;
+                cpu_owner |= entry.first == cpu;
+                null_owner |= entry.first == nullptr;
+            }
+        }
+    } catch (const std::exception & e) {
+        std::printf("memory norm=%d no_alloc=%d: load failed: %s\n", norm_elements, no_alloc, e.what());
+    }
+    std::remove(path.c_str());
+    if (actual != expected || actual == 0 || !cpu_owner || null_owner) {
+        std::printf("FAIL memory norm=%d no_alloc=%d: expected CPU allocated buffers %zu, reported %zu, cpu_owner=%d, null_owner=%d\n", norm_elements, no_alloc, expected, actual, cpu_owner, null_owner);
+        g_failures++;
+    } else {
+        std::printf("ok   memory norm=%d no_alloc=%d: allocated buffers %zu\n", norm_elements, no_alloc, actual);
+    }
 }
 
 // Loads the fixture and returns everything the loader logged.
@@ -146,6 +220,10 @@ static void expect_passes_validation(const char * name, const fixture_params & p
 }
 
 int main() {
+    for (bool no_alloc : {true, false}) {
+        expect_weight_buffers(1, no_alloc);
+        expect_weight_buffers(2, no_alloc);
+    }
     // GLM5V uses the common n_merge validation before its image preprocessor can divide by it.
     {
         fixture_params p = { 512, 2048, false };

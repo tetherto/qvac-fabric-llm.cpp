@@ -1524,8 +1524,6 @@ struct mtmd_model_loader {
                 ggml_set_name(data_tensor, cur->name);
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
-                // add to weight memory counter
-                model.mem_weights[ggml_backend_buft_get_device(buft)] += ggml_nbytes(cur);
             }
             return cur;
         };
@@ -3972,6 +3970,15 @@ struct mtmd_model_loader {
                             "%s: failed to allocate the %s buffer for the projector weights (%.2f MiB)\n",
                             __func__, ggml_backend_buft_name(buft), total_data_size / 1024.0 / 1024.0));
                     }
+                }
+            }
+            for (auto * buf : {model.buf.get(), model.buf_repack.get()}) {
+                if (buf) {
+                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+                    if (!dev) {
+                        dev = cpu_dev;
+                    }
+                    model.mem_weights[dev] += ggml_backend_buffer_get_size(buf);
                 }
             }
             // read the weight from file
