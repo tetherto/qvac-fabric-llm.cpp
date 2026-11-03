@@ -15,6 +15,12 @@
 // prefill GEMM): a later graph must not reuse the A an earlier one laid out
 // for the same tensor.
 //
+// A prompt's last layer cropped to its output row, as llama builds it when
+// only the last token's logits are asked for: the FFN of that one row in a
+// prefill graph, on both routes, with the SwiGLU folded into the GEMM and not.
+// The fused route runs one-row projections off the prefill GEMM, so no fusion
+// may leave the norm or the SwiGLU only in such a projection's A.
+//
 // Every intermediate is cleared before each backend runs, so a node read
 // before it was written shows as zeros instead of as the other backend's
 // result. Skips (exit 0) when no XDNA device is registered.
@@ -65,6 +71,7 @@ struct norm_graph {
     ggml_cgraph *         gf  = nullptr;
     std::vector<ggml_tensor *> inputs;
     std::vector<ggml_tensor *> checked;  // compared, in graph order
+    int32_t                    out_row = 0;  // what an I32 input (the output-row crop) selects
 };
 
 // K x M activations, an N x K Q4_K projection; side_reader adds SQR(sum)
@@ -119,6 +126,11 @@ static void set_inputs(norm_graph & g, uint32_t seed) {
     std::uniform_real_distribution<float> u(-1.0f, 1.0f);
     for (size_t i = 0; i < g.inputs.size(); i++) {
         ggml_tensor *      t = g.inputs[i];
+        if (t->type == GGML_TYPE_I32) {
+            std::vector<int32_t> rows(ggml_nelements(t), g.out_row);
+            ggml_backend_tensor_set(t, rows.data(), 0, ggml_nbytes(t));
+            continue;
+        }
         std::mt19937       rng((t->type == GGML_TYPE_F32 ? seed : 1234) * 16 + (uint32_t) i);
         std::vector<float> f(ggml_nelements(t));
         for (float & x : f) {
@@ -163,6 +175,65 @@ static norm_graph build_one_token(ggml_backend_t cpu, int64_t K, int64_t N) {
     g.checked = { out };
     g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
     return g;
+}
+
+// Qwen3.5-0.8B's residual and FFN widths, and a short prompt's rows
+static constexpr int64_t CROP_EMBD   = 1024;
+static constexpr int64_t CROP_FFN    = 3584;
+static constexpr int64_t CROP_PROMPT = 16;
+
+// An M-row Q4_K projection, the GET_ROWS of its last row, then RMS_NORM, MUL
+// and a SwiGLU FFN of that one row, in the device's buffers as an offloaded
+// layer's are (the norm is laid out as an A only there)
+static norm_graph build_cropped_ffn(ggml_backend_buffer_type_t buft, int64_t K, int64_t F, int64_t M) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * p     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, K);
+    ggml_tensor * rows  = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * w     = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, K);
+    ggml_tensor * wg    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, F);
+    ggml_tensor * wu    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, F);
+    ggml_tensor * wd    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, F, K);
+    g.inputs            = { x, p, rows, w, wg, wu, wd };
+    g.out_row           = (int32_t) M - 1;
+    ggml_tensor * last  = ggml_get_rows(g.ctx, ggml_mul_mat(g.ctx, p, x), rows);
+    ggml_tensor * norm  = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, last, 1e-6f), w);
+    ggml_tensor * glu   = ggml_swiglu_split(g.ctx, ggml_mul_mat(g.ctx, wg, norm), ggml_mul_mat(g.ctx, wu, norm));
+    ggml_tensor * out   = ggml_mul_mat(g.ctx, wd, glu);
+    ggml_set_name(out, "ffn_out");
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors_from_buft(g.ctx, buft);
+    return g;
+}
+
+// the cropped FFN on both routes, the SwiGLU folded into the GEMM and not
+static bool check_cropped_ffn(ggml_backend_t cpu, ggml_backend_t npu, ggml_backend_buffer_type_t buft, double tol) {
+    bool passed = true;
+    for (const char * route : { "fused", "per-op" }) {
+        setenv("GGML_XDNA_FUSED_LAYER", std::strcmp(route, "fused") == 0 ? "1" : "0", 1);
+        for (const char * fold : { "1", "0" }) {
+            setenv("GGML_XDNA_PGEMM_GLU", fold, 1);
+            norm_graph                      g = build_cropped_ffn(buft, CROP_EMBD, CROP_FFN, CROP_PROMPT);
+            std::vector<std::vector<float>> want, got;
+            if (!run(g, cpu, want) || !run(g, npu, got)) {
+                std::printf("test-xdna-graph: compute failed\n");
+                return false;
+            }
+            const double e  = nmse(want[0], got[0]);
+            const bool   ok = e < tol;
+            passed          = passed && ok;
+            std::printf("FFN of a cropped row, %-6s GLU fold %s nmse %.3g %s\n", route, fold, e, ok ? "ok" : "FAIL");
+            ggml_backend_buffer_free(g.buf);
+            ggml_free(g.ctx);
+        }
+    }
+    unsetenv("GGML_XDNA_PGEMM_GLU");
+    unsetenv("GGML_XDNA_FUSED_LAYER");
+    return passed;
 }
 
 int main(void) {
@@ -221,6 +292,8 @@ int main(void) {
         ggml_free(g.ctx);
     }
     unsetenv("GGML_XDNA_FUSED_LAYER");
+
+    passed = check_cropped_ffn(cpu, npu, ggml_backend_dev_buffer_type(dev), tol) && passed;
 
     ggml_backend_free(npu);
     ggml_backend_free(cpu);
