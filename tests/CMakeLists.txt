@@ -633,6 +633,10 @@ set_tests_properties(test-memory-seq-token-count PROPERTIES FIXTURES_REQUIRED te
 
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
+    find_package(Threads REQUIRED)
+    add_executable(test-cpu-affinity test-cpu-affinity.cpp)
+    target_link_libraries(test-cpu-affinity PRIVATE ggml Threads::Threads)
+    llama_test(test-cpu-affinity)
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
     target_include_directories(test-quantize-fns PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
