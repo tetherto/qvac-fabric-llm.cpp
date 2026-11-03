@@ -18,6 +18,10 @@
 
 #include <bitset>
 
+#if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL) || defined(GGML_VEC_INDEX_HAVE_VPOPCNT_KERNEL)
+#include "ggml-vector-index-x86.h"
+#endif
+
 #if GGML_VEC_INDEX_USE_NEON
 #include <arm_neon.h>
 #endif
@@ -39,6 +43,10 @@ constexpr float kSignLutCapSingle = 31.0f;
 
 std::atomic<int> g_planes_override{ -1 };
 std::atomic<size_t> g_planes_min_vectors{ kTurboVecPlanesMinVectors };
+#if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL) || defined(GGML_VEC_INDEX_HAVE_VPOPCNT_KERNEL)
+// Off keeps the bit-mask build and count on their scalar loops (tests).
+std::atomic<bool> g_low_kernels_enabled{ true };
+#endif
 
 // Set bits of a word; MSVC has no __builtin_popcount.
 inline int popcount64(uint64_t x) {
@@ -68,13 +76,16 @@ size_t rescore_len(size_t k, int bits) {
 
 struct SignLut {
     std::vector<uint8_t> values;
+    // The `vpermb` tables, for a vector-major sign region.
+    std::vector<uint8_t> split;
     float scale = 1.0f;
     float bias = 0.0f;
 };
 
 // Per-query nibble tables over a sign plane (upstream build_sign_lut): the
 // high nibble of byte group g covers dims 8g..8g+3, the low nibble the next
-// four, and entry p is sum_j (+-m) * q[d + j].
+// four, and entry p is sum_j (+-m) * q[d + j]. `single_query` caps the
+// entries for aarch64's deferred-widening single-query scan.
 SignLut build_sign_lut(const float * q, float m, int dim, bool single_query) {
     const size_t n_groups = static_cast<size_t>(dim) / 8;
     SignLut out;
@@ -128,6 +139,29 @@ SignLut build_sign_lut(const float * q, float m, int dim, bool single_query) {
     return out;
 }
 
+// The x86 sign scan's `vpermb` tables for a sign region in the vector-major
+// layout (upstream builds them with every sign table there).
+void split_sign_lut(const ggml_vec_index & idx, SignLut & lut) {
+    if (turbovec_sign_layout(idx) == kTurboVecLayoutVm) {
+        lut.split.resize(lut.values.size());
+        turbovec_split_lut_for_vnni(lut.values.data(), lut.values.size() / 32, lut.split.data());
+    }
+}
+
+// One block of sign scores, with the kernel upstream scans the sign region
+// with on this index's host: the `vpermb` scan over a vector-major region
+// (x86), the nibble LUT scan otherwise.
+void score_sign_block(const ggml_vec_index & idx, const SignLut & lut, const uint8_t * sign, size_t block, size_t n,
+        float * out) {
+    const float * vscales = idx.turbovec_scale.data();
+    if (turbovec_sign_layout(idx) == kTurboVecLayoutVm) {
+        score_turbovec_lut_block_vnni(lut.values.data(), lut.split.empty() ? nullptr : lut.split.data(), lut.scale,
+            lut.bias, sign, vscales, block, n, 2, idx.dim / 2, out);
+        return;
+    }
+    score_turbovec_lut_block(lut.values.data(), lut.scale, lut.bias, sign, vscales, block, n, 2, idx.dim / 2, out);
+}
+
 // One query as bit masks over a low plane row (upstream LowPlanes): each
 // coordinate rounded to a signed kLowBits-bit weight, the row's dot product
 // counted with AND and popcount per weight bit.
@@ -156,7 +190,20 @@ LowPlanes build_low_planes(const float * q, float m, int dim) {
     const bool valid = q_max > 0.0f && std::isfinite(q_max);
     const bool overflow = valid && static_cast<double>(top) / q_max >= 0x1.fffffep127 + 0x1p103;
     const float inv = valid && !overflow ? top / q_max : 0.0f;
-    for (int i = 0; i < dim; ++i) {
+    bool built = false;
+#if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL)
+    // Upstream's AVX-512 build (sixteen coordinates a step), where dim
+    // allows it; the same weights as the loop below. Its conversions are
+    // not saturating, so an overflowing query takes the loop.
+    const VecIndexCpuFeatures & features = vec_index_cpu_features();
+    if (!overflow && dim % 16 == 0 && features.avx512bw && features.avx2 &&
+        g_low_kernels_enabled.load(std::memory_order_relaxed)) {
+        out.sum_w = ggml_vec_index_detail::turbovec_build_low_masks_avx512(
+            q, static_cast<size_t>(dim), inv, static_cast<uint32_t>(top), masks.data());
+        built = true;
+    }
+#endif
+    for (int i = 0; i < dim && !built; ++i) {
         const uint32_t w = overflow ? (q[i] != 0.0f ? static_cast<uint32_t>(top) : 0u) :
             std::min(static_cast<uint32_t>(std::fabs(q[i]) * inv + 0.5f), static_cast<uint32_t>(top));
         if (w == 0) {
@@ -191,6 +238,17 @@ uint64_t load_word(const uint8_t * bytes, size_t n) {
 }
 
 int64_t low_dot(const LowPlanes & planes, const uint8_t * row) {
+#if defined(GGML_VEC_INDEX_HAVE_VPOPCNT_KERNEL)
+    // Upstream's VPOPCNTDQ form, counting the same bits.
+    static const bool has_vpopcnt = [] {
+        const VecIndexCpuFeatures & f = vec_index_cpu_features();
+        return f.avx512bw && f.avx512vpopcntdq;
+    }();
+    if (has_vpopcnt && g_low_kernels_enabled.load(std::memory_order_relaxed)) {
+        return ggml_vec_index_detail::turbovec_low_dot_avx512(
+            reinterpret_cast<const uint8_t *>(planes.masks.data()), row, planes.row_len);
+    }
+#endif
     int64_t acc = 0;
     const size_t words_per_chunk = kLowChunk / 8;
     for (size_t c = 0; c * kLowChunk < planes.row_len; ++c) {
@@ -201,7 +259,9 @@ int64_t low_dot(const LowPlanes & planes, const uint8_t * row) {
             for (int b = 0; b < kLowBits; ++b) {
                 const uint64_t p = group[static_cast<size_t>(b) * words_per_chunk + j];
                 const uint64_t n = group[static_cast<size_t>(kLowBits + b) * words_per_chunk + j];
-                acc += (static_cast<int64_t>(popcount64(l & p)) - static_cast<int64_t>(popcount64(l & n))) << b;
+                // A multiply, not a shift: the difference can be negative.
+                acc += (static_cast<int64_t>(popcount64(l & p)) - static_cast<int64_t>(popcount64(l & n))) *
+                    (int64_t{ 1 } << b);
             }
         }
     }
@@ -215,19 +275,25 @@ bool turbovec_planes_for(int bits, int dim) {
     if (forced >= 0) {
         return forced != 0 && (bits == 2 || bits == 4) && dim % 32 == 0;
     }
-    // Upstream pack.rs `planes_for`: aarch64 searches 2-bit planes always
-    // and 4-bit planes with its dot-product kernels; x86 needs AVX-512
-    // kernels this port does not have yet.
+    // Upstream pack.rs `planes_for`: on x86 both widths need the
+    // vector-major kernels (the `vpermb` scan reads the sign region);
+    // aarch64 searches 2-bit planes always and 4-bit planes with its
+    // dot-product kernels. dim % 32 == 0 is a whole sign unit at either
+    // width.
+    if (dim % 32 != 0 || (bits != 2 && bits != 4)) {
+        return false;
+    }
+    if (turbovec_x86_rules()) {
+        return turbovec_cpu_vector_major();
+    }
 #if GGML_VEC_INDEX_USE_NEON
     // TURBOVEC_2BIT_VM8 replaces the classic NEON scan the sign region
     // needs, so upstream drops the planes layout at both widths.
-    if (dim % 32 != 0 || turbovec_vm8_2bit_enabled()) {
+    if (turbovec_vm8_2bit_enabled()) {
         return false;
     }
-    return bits == 2 || (bits == 4 && turbovec_cpu_vector_major());
+    return bits == 2 || turbovec_cpu_vector_major();
 #else
-    (void) bits;
-    (void) dim;
     return false;
 #endif
 }
@@ -264,7 +330,7 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot) {
     try {
         repack_turbovec_sign_codes(
             idx.turbovec_data.data(), n, idx.turbovec_bits, idx.dim, first_slot, idx.turbovec_sign_blocked,
-            idx.n_threads);
+            idx.n_threads, turbovec_sign_layout(idx));
     } catch (const std::bad_alloc &) {
         // Without memory for the sign planes the index drops back to full
         // scans, so a mutation never fails after its rows are committed;
@@ -298,8 +364,10 @@ void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last)
 
 namespace {
 
-// Upstream seeds its buffered collectors on aarch64 only, and only for an
-// index of at least 1024 full blocks (pack.rs planes_sample).
+// Upstream seeds its buffered collectors for an index of at least 1024 full
+// blocks (pack.rs planes_sample). What a seed changes is which query of a
+// batch is rescanned with single-query tables, and only aarch64's differ
+// (their entries are capped at 31), so the port computes it there alone.
 #if GGML_VEC_INDEX_USE_NEON
 constexpr bool kSeedSupported = true;
 #else
@@ -324,9 +392,7 @@ float sample_seed(const ggml_vec_index & idx, const SignLut & lut, size_t s_len,
     for (size_t i = 0; i < kSampleBlocks; ++i) {
         // Offset by half a stride so the sample is not the index's head.
         const size_t block = i * stride + stride / 2;
-        score_turbovec_lut_block(
-            lut.values.data(), lut.scale, lut.bias, idx.turbovec_sign_blocked.data(), idx.turbovec_scale.data(),
-            block, n, 2, idx.dim / 2, scores.data() + i * kBlock);
+        score_sign_block(idx, lut, idx.turbovec_sign_blocked.data(), block, n, scores.data() + i * kBlock);
     }
     std::nth_element(scores.begin(), scores.begin() + static_cast<std::ptrdiff_t>(r - 1), scores.end(),
         [](float a, float b) { return a > b; });
@@ -599,11 +665,15 @@ bool turbovec_staged_search(
     const size_t s_len = shortlist_len(k_sz, bits);
     const size_t t_len = rescore_len(k_sz, bits);
     const bool refines = s_len < n_allowed && t_len < s_len;
+    // Upstream's aarch64 rules: 4-bit ranking reads the sign tables, and a
+    // lone query's sign tables are capped for its deferred-widening scan.
+    // Its x86 rules count bit masks and keep 7-bit tables throughout.
 #if GGML_VEC_INDEX_USE_NEON
-    const bool table_rank = bits == 4;
+    const bool arm_rules = !idx.turbovec_x86;
 #else
-    const bool table_rank = false;
+    const bool arm_rules = false;
 #endif
+    const bool table_rank = arm_rules && bits == 4;
 
     // The sign stage ranks on the query pulled toward the centre; later
     // stages read the plain query.
@@ -614,8 +684,9 @@ bool turbovec_staged_search(
                 kSignCentre * idx.turbovec_tqplus_shift[static_cast<size_t>(d)] / idx.turbovec_tqplus_scale[static_cast<size_t>(d)];
         }
     }
-    SignLut sign_lut = build_sign_lut(q_sign.data(), m, dim, single_query || opts.sign_single);
+    SignLut sign_lut = build_sign_lut(q_sign.data(), m, dim, arm_rules && (single_query || opts.sign_single));
     sign_lut.bias += bias_corr;
+    split_sign_lut(idx, sign_lut);
     SignLut plain_lut;
     if (refines && table_rank && calibrated) {
         plain_lut = build_sign_lut(query, m, dim, single_query);
@@ -636,20 +707,50 @@ bool turbovec_staged_search(
         }
     };
     std::vector<uint8_t> exact_lut;
+    std::vector<uint8_t> exact_split;
     float exact_scale = 1.0f;
     float exact_bias = 0.0f;
     TurboVecPermuteDot pd;
     const bool permute_dot = turbovec_uses_permute_dot(idx);
+    // Upstream x86 rescores a 4-bit shortlist from the planes themselves
+    // (`exact4_sum`), its sign plane read from the vector-major region.
+    const bool exact4 = permute_dot && turbovec_sign_layout(idx) == kTurboVecLayoutVm;
+    std::vector<int8_t> exact4_w;
     bool exact_built = false;
     auto build_exact = [&]() {
         if (permute_dot) {
             build_turbovec_permute_dot(query, dim, pd, turbovec_layout(idx) == kTurboVecLayoutVm8);
             pd.bias = bias_corr;
+            if (exact4) {
+                // Position 8c + b is dim 8c + 7 - b, zero-padded to 64s.
+                exact4_w.assign((static_cast<size_t>(dim) + 63) / 64 * 64, 0);
+                for (int d = 0; d < dim; ++d) {
+                    exact4_w[static_cast<size_t>(d / 8) * 8 + 7 - static_cast<size_t>(d % 8)] =
+                        pd.weights[static_cast<size_t>(d)];
+                }
+                int32_t wsum = 0;
+                for (int8_t w : pd.weights) {
+                    wsum += w;
+                }
+                pd.zero = -128 * wsum;
+            }
         } else {
             build_turbovec_lut(bits, false, query, dim, exact_lut, exact_scale, exact_bias);
             exact_bias += bias_corr;
+            if (turbovec_scores_vnni_lut(idx)) {
+                exact_split.resize(exact_lut.size());
+                turbovec_split_lut_for_vnni(exact_lut.data(), exact_lut.size() / 32, exact_split.data());
+            }
         }
         exact_built = true;
+    };
+    // One candidate's exact 4-bit score from the planes: the permute-dot
+    // integer sum and its epilogue, the full scan's score bit for bit.
+    auto exact4_score = [&](size_t v) {
+        const int32_t sum = turbovec_exact4_sum(exact4_w.data(), pd.levels, pd.zero,
+            idx.turbovec_sign_blocked.data() + (v / kBlock) * nsg * kBlock, idx.turbovec_data.data() + v * row_bytes,
+            nsg, v % kBlock);
+        return std::fma(static_cast<float>(sum), pd.scale, pd.bias) * vscales[v];
     };
     auto plain_score = [&](size_t v, float s) {
         return centre != nullptr ? s - kSignCentre * vscales[v] * (*centre)[v] : s;
@@ -690,7 +791,7 @@ bool turbovec_staged_search(
         // score of a 48-block sample and rescans a query that comes back
         // with fewer than s_len rows above it. The rows kept are the same
         // either way; only which query is short matters, to the caller.
-        const bool seeded = kSeedSupported && opts.seed_short != nullptr && allowed_mask == nullptr &&
+        const bool seeded = kSeedSupported && arm_rules && opts.seed_short != nullptr && allowed_mask == nullptr &&
             2 * s_len < n_allowed && n / kBlock >= kSeedMinBlocks;
         float seed = -std::numeric_limits<float>::infinity();
         if (seeded) {
@@ -703,7 +804,8 @@ bool turbovec_staged_search(
         // Collects a range's rows in a buffer cut back to its best s_len
         // whenever it doubles; the s_len-th best kept is the cut-off.
         auto scan = [&](size_t block_begin, size_t block_end, std::vector<ScoreId> & top, size_t & above_seed) {
-            top.reserve(2 * s_len);
+            // A short range never needs the full 2 * s_len.
+            top.reserve(std::min(2 * s_len, (block_end - block_begin) * kBlock + 1));
             bool cut = false;
             double threshold = 0.0;
             auto cut_back = [&]() {
@@ -723,9 +825,7 @@ bool turbovec_staged_search(
                 if (!scan_blocks.empty() && scan_blocks[block] == 0) {
                     continue;
                 }
-                score_turbovec_lut_block(
-                    sign_lut.values.data(), sign_lut.scale, sign_lut.bias, idx.turbovec_sign_blocked.data(), vscales,
-                    block, n, 2, dim / 2, block_scores);
+                score_sign_block(idx, sign_lut, idx.turbovec_sign_blocked.data(), block, n, block_scores);
                 const size_t count = std::min(kBlock, n - block * kBlock);
                 if (seeded) {
                     for (size_t lane = 0; lane < count; ++lane) {
@@ -895,6 +995,15 @@ bool turbovec_staged_search(
         build_exact();
     }
     std::sort(list.begin(), list.end(), [](const Candidate & a, const Candidate & b) { return a.slot < b.slot; });
+    if (exact4) {
+        std::vector<float> exact(list.size());
+        for_each_candidate(list.size(), [&](size_t i) { exact[i] = exact4_score(list[i].slot); });
+        for (size_t i = 0; i < list.size(); ++i) {
+            update_topk_heap(heap, k, { exact[i], topk_key(idx, list[i].slot) });
+        }
+        return true;
+    }
+    const uint8_t * split_ptr = exact_split.empty() ? nullptr : exact_split.data();
     if (!split) {
         float block_scores[kBlock];
         size_t scored_block = SIZE_MAX;
@@ -902,7 +1011,8 @@ bool turbovec_staged_search(
             const size_t block = c.slot / kBlock;
             if (block != scored_block) {
                 score_turbovec_block(
-                    idx, exact_lut.data(), exact_scale, exact_bias, permute_dot ? &pd : nullptr, block, block_scores);
+                    idx, exact_lut.data(), exact_scale, exact_bias, permute_dot ? &pd : nullptr, block, block_scores,
+                    split_ptr);
                 scored_block = block;
             }
             update_topk_heap(heap, k, { block_scores[c.slot % kBlock], topk_key(idx, c.slot) });
@@ -927,7 +1037,7 @@ bool turbovec_staged_search(
         for (size_t b = task * kBlocksPerTask; b < end; ++b) {
             score_turbovec_block(
                 idx, exact_lut.data(), exact_scale, exact_bias, permute_dot ? &pd : nullptr,
-                list[block_starts[b]].slot / kBlock, block_scores);
+                list[block_starts[b]].slot / kBlock, block_scores, split_ptr);
             for (size_t i = block_starts[b]; i < block_starts[b + 1]; ++i) {
                 exact[i] = block_scores[list[i].slot % kBlock];
             }
@@ -940,6 +1050,65 @@ bool turbovec_staged_search(
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+int turbovec_low_kernel_parity_for_test(int kernel) {
+#if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL) || defined(GGML_VEC_INDEX_HAVE_VPOPCNT_KERNEL)
+    const VecIndexCpuFeatures & f = vec_index_cpu_features();
+    bool available = false;
+#if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL)
+    available = available || (kernel == 0 && f.avx512bw && f.avx2);
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_VPOPCNT_KERNEL)
+    available = available || (kernel == 1 && f.avx512bw && f.avx512vpopcntdq);
+#endif
+    if (!available) {
+        return -1;
+    }
+    uint32_t state = 0x6a09e667u + static_cast<uint32_t>(kernel);
+    auto next = [&]() {
+        state = state * 1664525u + 1013904223u;
+        return state >> 8;
+    };
+    bool ok = true;
+    // A row shorter than one mask group, one across groups with a short
+    // tail, and whole groups.
+    for (const int dim : { 16, 128, 784, 1536 }) {
+        std::vector<float> q(static_cast<size_t>(dim));
+        for (int trial = 0; trial < 6 && ok; ++trial) {
+            for (float & x : q) {
+                x = static_cast<float>(static_cast<int>(next() % 20001) - 10000) / 4093.0f;
+            }
+            if (trial == 1) {
+                // Ties at the rounding boundary and zero weights.
+                for (size_t i = 0; i < q.size(); i += 3) {
+                    q[i] = 0.0f;
+                }
+            }
+            g_low_kernels_enabled.store(kernel != 0, std::memory_order_relaxed);
+            const LowPlanes scalar = build_low_planes(q.data(), 1.5f, dim);
+            g_low_kernels_enabled.store(true, std::memory_order_relaxed);
+            const LowPlanes simd = build_low_planes(q.data(), 1.5f, dim);
+            if (kernel == 0) {
+                ok = scalar.masks == simd.masks && scalar.sum_w == simd.sum_w && scalar.unit == simd.unit;
+                continue;
+            }
+            std::vector<uint8_t> row(static_cast<size_t>(dim) / 8);
+            for (uint8_t & b : row) {
+                b = static_cast<uint8_t>(next());
+            }
+            const int64_t got = low_dot(simd, row.data());
+            g_low_kernels_enabled.store(false, std::memory_order_relaxed);
+            const int64_t want = low_dot(simd, row.data());
+            g_low_kernels_enabled.store(true, std::memory_order_relaxed);
+            ok = got == want;
+        }
+    }
+    return ok ? 1 : 0;
+#else
+    (void) kernel;
+    return -1;
+#endif
+}
+
 int32_t turbovec_low_planes_for_test(const float * q, int dim, float m, float * unit, std::vector<uint64_t> * masks) {
     const LowPlanes planes = build_low_planes(q, m, dim);
     *unit = planes.unit;
