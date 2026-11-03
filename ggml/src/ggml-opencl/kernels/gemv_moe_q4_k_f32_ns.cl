@@ -7,19 +7,20 @@
 #define N_SIMDGROUP 4
 #define SIMDGROUP_WIDTH 64
 
-inline void get_scale_min_k4(
-    int j,
-    global const uchar * q,
-    uchar * d,
-    uchar * m
-) {
+// Returns the 6-bit sub-block scale in bits 0-7 and the min in bits 8-15.
+// Writing the results through pointers to private scalars is miscompiled by the
+// Adreno E031.47 shader compiler, which yields corrupted scales, so this stays
+// pointer-free and scalar.
+inline uint get_scale_min_k4_packed(int j, global const uchar * q) {
+    uint d, m;
     if (j < 4) {
-        *d = q[j]   & 63;
-        *m = q[j+4] & 63;
+        d = q[j]   & 63u;
+        m = q[j+4] & 63u;
     } else {
-        *d = (q[j+4] & 0x0F) | ((q[j-4] & 0xC0) >> 2);
-        *m = ((q[j+4] >> 4) & 0x0F) | ((q[j]   & 0xC0) >> 2);
+        d = (q[j+4] & 0x0Fu) | ((q[j-4] & 0xC0u) >> 2);
+        m = ((q[j+4] >> 4) & 0x0Fu) | ((q[j] & 0xC0u) >> 2);
     }
+    return d | (m << 8);
 }
 
 static inline float8 q4_k_to_fp32_packed8(ushort2 q4x8, float scale, float minv) {
@@ -83,11 +84,10 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns(
 
         // Load sub-block scale and min
         global const uchar * sc = src0_s + (expert_id * ne01 + i01) * scales_per_row + sb * K_SCALE_SIZE;
-        uchar sv, mn;
-        get_scale_min_k4(j, sc, &sv, &mn);
+        uint sm = get_scale_min_k4_packed(j, sc);
 
-        float scale = (float)d_val * (float)sv;
-        float minv  = (float)dm_val * (float)mn;
+        float scale = (float)d_val * (float)(sm & 0xFFu);
+        float minv  = (float)dm_val * (float)(sm >> 8);
 
         // Load 4 uints of quants (32 nibbles = 32 elements)
         uint q_base = expert_q_offset + ib * ne01 * 4 + i01;
@@ -198,11 +198,10 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_wimg(
         half dm_val  = src0_dm[expert_d_offset + sb * ne01 + i01];
 
         global const uchar * sc = src0_s + (expert_id * ne01 + i01) * scales_per_row + sb * K_SCALE_SIZE;
-        uchar sv, mn;
-        get_scale_min_k4(j, sc, &sv, &mn);
+        uint sm = get_scale_min_k4_packed(j, sc);
 
-        float scale = (float)d_val * (float)sv;
-        float minv  = (float)dm_val * (float)mn;
+        float scale = (float)d_val * (float)(sm & 0xFFu);
+        float minv  = (float)dm_val * (float)(sm >> 8);
 
         uint q_base = expert_q_offset + ib * ne01 * 4 + i01;
 

@@ -38,6 +38,7 @@ bool ggml_op_can_inplace(enum ggml_op op) {
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
         case GGML_OP_SILU_BACK:
+        case GGML_OP_SIGMOID_BACK:
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_CLAMP:
@@ -479,8 +480,15 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
+struct ggml_gallocr_shared_buffers {
+    size_t refs;
+    int n_buffers;
+    struct vbuffer ** buffers;
+};
+
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
+    struct ggml_gallocr_shared_buffers * shared_buffers;
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     int n_buffers;
@@ -490,9 +498,11 @@ struct ggml_gallocr {
 
     struct node_alloc * node_allocs; // [n_nodes]
     int n_nodes;
+    size_t node_alloc_bytes;
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+    size_t leaf_alloc_bytes;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -535,9 +545,37 @@ ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
 }
 
+static void ggml_gallocr_shared_buffers_unref(struct ggml_gallocr_shared_buffers * shared) {
+    GGML_ASSERT(shared != NULL && shared->refs > 0);
+    if (--shared->refs > 0) {
+        return;
+    }
+
+    for (int i = 0; i < shared->n_buffers; ++i) {
+        bool freed = false;
+        for (int j = 0; j < i; ++j) {
+            if (shared->buffers[j] == shared->buffers[i]) {
+                freed = true;
+                break;
+            }
+        }
+        if (!freed) {
+            ggml_vbuffer_free(shared->buffers[i]);
+        }
+    }
+
+    free(shared->buffers);
+    free(shared);
+}
+
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
     if (galloc == NULL) {
         return;
+    }
+
+    if (galloc->shared_buffers != NULL) {
+        ggml_gallocr_shared_buffers_unref(galloc->shared_buffers);
+        galloc->buffers = NULL;
     }
 
     for (int i = 0; i < galloc->n_buffers; i++) {
@@ -577,6 +615,48 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
     free(galloc);
+}
+
+bool ggml_gallocr_share_buffers(ggml_gallocr_t dst, ggml_gallocr_t src) {
+    if (dst == NULL || src == NULL || dst == src ||
+        dst->n_buffers != src->n_buffers || dst->shared_buffers != NULL) {
+        return false;
+    }
+
+    for (int i = 0; i < dst->n_buffers; ++i) {
+        if (dst->bufts[i] != src->bufts[i] || dst->buffers[i] != NULL || src->buffers[i] == NULL) {
+            return false;
+        }
+
+        // Reset callbacks can invalidate tensor extras still used by another scheduler's graph.
+        for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; ++c) {
+            ggml_backend_buffer_t buffer = src->buffers[i]->chunks[c];
+            if (buffer != NULL && buffer->iface.reset != NULL) {
+                return false;
+            }
+        }
+    }
+
+    struct ggml_gallocr_shared_buffers * shared = src->shared_buffers;
+    if (shared != NULL &&
+        (shared->n_buffers != src->n_buffers || shared->buffers != src->buffers)) {
+        return false;
+    }
+
+    if (shared == NULL) {
+        shared = calloc(1, sizeof(*shared));
+        GGML_ASSERT(shared != NULL);
+        shared->refs = 1;
+        shared->n_buffers = src->n_buffers;
+        shared->buffers = src->buffers;
+        src->shared_buffers = shared;
+    }
+
+    free(dst->buffers);
+    shared->refs++;
+    dst->shared_buffers = shared;
+    dst->buffers = shared->buffers;
+    return true;
 }
 
 typedef struct ggml_gallocr * ggml_gallocr_t;
@@ -822,6 +902,18 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
+static bool ggml_gallocr_shared_buffers_need_grow(ggml_gallocr_t galloc) {
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; ++c) {
+            const size_t current = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
+            if (ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c) > current) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
@@ -851,6 +943,7 @@ static bool ggml_gallocr_reserve_n_impl(
     if (galloc->n_nodes < graph->n_nodes) {
         free(galloc->node_allocs);
         galloc->node_allocs = calloc(graph->n_nodes, sizeof(struct node_alloc));
+        galloc->node_alloc_bytes = graph->n_nodes * sizeof(struct node_alloc);
         GGML_ASSERT(galloc->node_allocs != NULL);
     }
     galloc->n_nodes = graph->n_nodes;
@@ -884,6 +977,7 @@ static bool ggml_gallocr_reserve_n_impl(
     if (galloc->n_leafs < graph->n_leafs) {
         free(galloc->leaf_allocs);
         galloc->leaf_allocs = calloc(graph->n_leafs, sizeof(galloc->leaf_allocs[0]));
+        galloc->leaf_alloc_bytes = graph->n_leafs * sizeof(galloc->leaf_allocs[0]);
         GGML_ASSERT(galloc->leaf_allocs != NULL);
     }
     galloc->n_leafs = graph->n_leafs;
@@ -899,6 +993,18 @@ static bool ggml_gallocr_reserve_n_impl(
             galloc->leaf_allocs[i].leaf.addr = hn->addr;
             galloc->leaf_allocs[i].leaf.size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], leaf);
         }
+    }
+
+    // Never resize storage still referenced by another gallocr.
+    if (galloc->shared_buffers != NULL && ggml_gallocr_shared_buffers_need_grow(galloc)) {
+        GGML_LOG_DEBUG("%s: detaching shared compute buffers for a larger reservation\n", __func__);
+        struct vbuffer ** buffers = calloc(galloc->n_buffers, sizeof(*buffers));
+        GGML_ASSERT(buffers != NULL);
+
+        struct ggml_gallocr_shared_buffers * shared = galloc->shared_buffers;
+        galloc->shared_buffers = NULL;
+        galloc->buffers = buffers;
+        ggml_gallocr_shared_buffers_unref(shared);
     }
 
     // reallocate buffers if needed
@@ -1046,6 +1152,18 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         }
     }
 
+    // check leafs
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        struct leaf_alloc * leaf_alloc = &galloc->leaf_allocs[i];
+        if (!ggml_gallocr_node_needs_realloc(galloc, leaf, &leaf_alloc->leaf)) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: leaf %s is not valid\n", __func__, leaf->name);
+#endif
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -1095,6 +1213,49 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     }
 
     return true;
+}
+
+static bool ggml_gallocr_first_allocator(ggml_gallocr_t galloc, int index) {
+    for (int i = 0; i < index; ++i) {
+        if (galloc->buf_tallocs[i] == galloc->buf_tallocs[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_gallocr_first_buffer(ggml_gallocr_t galloc, int index) {
+    for (int i = 0; i < index; ++i) {
+        if (galloc->buffers[i] == galloc->buffers[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static size_t ggml_gallocr_allocator_host_size(ggml_gallocr_t galloc) {
+    size_t size = 0;
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        if (ggml_gallocr_first_allocator(galloc, i)) {
+            size += sizeof(*galloc->buf_tallocs[i]) + galloc->buf_tallocs[i]->n_chunks * sizeof(struct tallocr_chunk);
+        }
+        if (galloc->buffers[i] && ggml_gallocr_first_buffer(galloc, i)) {
+            size += sizeof(*galloc->buffers[i]);
+        }
+    }
+    return size;
+}
+
+size_t ggml_gallocr_get_host_size(ggml_gallocr_t galloc) {
+    GGML_ASSERT(galloc);
+    size_t size = sizeof(*galloc) + galloc->node_alloc_bytes + galloc->leaf_alloc_bytes;
+    size += galloc->n_buffers * (sizeof(galloc->bufts[0]) + sizeof(galloc->buffers[0]) + sizeof(galloc->buf_tallocs[0]));
+    size += galloc->hash_set.size * (sizeof(galloc->hash_set.keys[0]) + sizeof(galloc->hash_values[0]));
+    size += ggml_bitset_size(galloc->hash_set.size) * sizeof(galloc->hash_set.used[0]);
+    if (galloc->shared_buffers) {
+        size += sizeof(*galloc->shared_buffers);
+    }
+    return size + ggml_gallocr_allocator_host_size(galloc);
 }
 
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {

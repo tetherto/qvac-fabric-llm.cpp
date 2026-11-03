@@ -162,6 +162,10 @@ struct mtmd_cli_context {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        mparams.image_tile_mode  = (int)params.image_tile_mode;
+        mparams.image_max_tiles  = params.image_max_tiles;
+        mparams.image_no_upscale = params.image_no_upscale;
+        mparams.skip_audio       = params.mmproj_no_audio;
         {
             // non-causal models need the whole image in one ubatch
             const int n_ubatch = llama_n_ubatch(lctx);

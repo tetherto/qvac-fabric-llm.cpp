@@ -13,6 +13,14 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q2_0:
             mul_mat_q_case<GGML_TYPE_Q2_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
+        case GGML_TYPE_PQ2_0:
+            mul_mat_q_case<GGML_TYPE_PQ2_0, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+#if !defined(GGML_USE_HIP)
+        case GGML_TYPE_PTQ1_0:
+            mul_mat_q_case<GGML_TYPE_PTQ1_0, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+#endif
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
@@ -360,8 +368,14 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     bool mmq_supported;
 
     switch (type) {
+#if !defined(GGML_USE_HIP)
+        case GGML_TYPE_PTQ1_0:
+            mmq_supported = turing_mma_available(cc);
+            break;
+#endif
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_PQ2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -404,6 +418,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             return false;
         }
     }
+
+#if !defined(GGML_USE_HIP)
+    if (type == GGML_TYPE_PTQ1_0) {
+        return true;
+    }
+#endif
 
     if (turing_mma_available(cc)) {
         return true;
@@ -449,6 +469,24 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             // https://github.com/ggml-org/llama.cpp/pull/18202
             if (n_experts >= 64) {
                 return true;
+            }
+
+            // RDNA3.5 (gfx1151): with the HIP 7.15 (ROCm 10.0) BLAS libraries, dequantization + hipBLAS outpaces
+            //     Q8_0 MMQ above 512 rows. Qwen3.8-27B Q8_0 prefill: pp1024 291 -> 320 t/s, pp2048 308 -> 354 t/s; at
+            //     pp512 MMQ is still as fast or faster. With HIP 7.2 (ROCm 7.2.2) hipBLAS is slower instead (pp2048
+            //     317 -> 288 t/s), so older HIP keeps MMQ. GGML_CUDA_RDNA3_5_Q8_0_MMQ_MAX overrides the row limit.
+            if (GGML_CUDA_CC_IS_RDNA3_5(cc) && type == GGML_TYPE_Q8_0 && n_experts == 0) {
+                // static storage: MSVC rejects reading a block-scope constexpr in a capture-less lambda (C3493)
+#if defined(GGML_USE_HIP) && HIP_VERSION >= 71500000
+                static constexpr int64_t q8_0_mmq_max_default = 512;
+#else
+                static constexpr int64_t q8_0_mmq_max_default = INT64_MAX;
+#endif // defined(GGML_USE_HIP) && HIP_VERSION >= 71500000
+                static const int64_t q8_0_mmq_max = [] {
+                    const char * env = getenv("GGML_CUDA_RDNA3_5_Q8_0_MMQ_MAX");
+                    return env ? (int64_t) atoll(env) : q8_0_mmq_max_default;
+                }();
+                return ne11 <= q8_0_mmq_max;
             }
 
             // For some quantization types MMQ can have lower peak TOPS than hipBLAS

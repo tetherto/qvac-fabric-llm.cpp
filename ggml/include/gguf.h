@@ -74,6 +74,14 @@ extern "C" {
 
         // if not NULL, create a ggml_context and allocate the tensor data in it
         struct ggml_context ** ctx;
+
+        // if true, stop parsing immediately after the KV pairs and skip tensor info entirely;
+        // ctx is ignored when this flag is set
+#ifdef __cplusplus
+        bool kv_only = false;
+#else
+        bool kv_only;
+#endif
     };
 
     // callback to simulate or wrap a FILE pointer - read up to `len` bytes at `offset` into `output` and return the number of bytes read
@@ -82,6 +90,8 @@ extern "C" {
     GGML_API struct gguf_context * gguf_init_empty(void);
     GGML_API struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_params params);
     GGML_API struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params);
+
+    // read GGUF from an in-memory buffer
     GGML_API struct gguf_context * gguf_init_from_buffer(const void * data, size_t size, struct gguf_init_params params);
 
     // max_chunk_read is the maximum number of bytes that the GGUF code will read at once from the callback, a value of 0 means no limit
@@ -208,4 +218,9 @@ extern "C" {
 
 #ifdef  __cplusplus
 }
+#endif
+
+#if defined(__cplusplus)
+#include <streambuf>
+GGML_API struct gguf_context * gguf_init_from_buffer(std::basic_streambuf<char>& streambuf, struct gguf_init_params params);
 #endif

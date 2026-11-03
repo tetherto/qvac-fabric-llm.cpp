@@ -4,9 +4,11 @@
 #include "chat.h"
 #include "common.h"
 #include "download.h"
+#include "ggml-rpc.h"
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "llama.h"
+#include "llama-coreml.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -23,12 +25,14 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
 #include <cstdarg>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <list>
 #include <numeric>
 #include <regex>
@@ -53,6 +57,8 @@
 #endif
 
 #define LLAMA_MAX_URL_LENGTH 2084 // Maximum URL Length in Chrome: 2083
+
+static_assert(LLAMA_COREML_DEFAULT_INFLIGHT == 1, "update common_params::coreml_max_inflight");
 
 using json = common_json;
 using namespace common_arg_utils;
@@ -248,6 +254,29 @@ std::vector<std::string> common_arg::get_env() const {
 // utils
 //
 
+static int32_t parse_token_id(const std::string & value) {
+    size_t n_parsed = 0;
+    const int32_t id = std::stoi(value, &n_parsed);
+    if (n_parsed != value.size()) {
+        throw std::invalid_argument("invalid token id: " + value);
+    }
+    return id;
+}
+
+// parses "B:E[,B:E...]" into [begin, end) token id pairs; llama_set_draft_vocab checks their order and bounds
+static std::vector<int32_t> parse_token_ranges(const std::string & value) {
+    std::vector<int32_t> ranges;
+    for (const auto & range : string_split<std::string>(value, ',')) {
+        const auto bounds = string_split<std::string>(range, ':');
+        if (bounds.size() != 2) {
+            throw std::invalid_argument("invalid token range: " + range);
+        }
+        ranges.push_back(parse_token_id(bounds[0]));
+        ranges.push_back(parse_token_id(bounds[1]));
+    }
+    return ranges;
+}
+
 // Helper function to parse tensor buffer override strings
 static void parse_tensor_buffer_overrides(const std::string & value, std::vector<llama_model_tensor_buft_override> & overrides) {
     ggml_backend_load_all();
@@ -311,6 +340,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TBQ3_0,
+    GGML_TYPE_TBQ4_0,
+    GGML_TYPE_PQ3_0,
+    GGML_TYPE_PQ4_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -943,7 +976,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.cors_origins = "localhost";
     }
 
-    // pad tensor_buft_overrides for llama_params_fit:
+    // Pad writable space for llama_params_fit with null entries, preserving
+    // the terminator required by common_model_params_to_llama (including back()).
     const size_t ntbo = llama_max_tensor_buft_overrides();
     while (params.tensor_buft_overrides.size() < ntbo) {
         params.tensor_buft_overrides.push_back({nullptr, nullptr});
@@ -1181,7 +1215,36 @@ static void add_rpc_devices(const std::string & servers) {
     if (!ggml_backend_rpc_add_server_fn) {
         throw std::invalid_argument("failed to find RPC add server function");
     }
-    for (const auto & server : rpc_servers) {
+    typedef bool (*ggml_backend_rpc_prefetch_connection_t)(const char * endpoint);
+    ggml_backend_rpc_prefetch_connection_t ggml_backend_rpc_prefetch_connection_fn = (ggml_backend_rpc_prefetch_connection_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_prefetch_connection");
+    if (!ggml_backend_rpc_prefetch_connection_fn) {
+        throw std::invalid_argument("failed to find RPC prefetch connection function");
+    }
+    std::vector<uint8_t> prefetch_ok(rpc_servers.size(), false);
+    std::vector<std::thread> prefetch_threads;
+    std::atomic<size_t> next_server(0);
+    const size_t n_prefetch_threads = std::min(rpc_servers.size(), (size_t) GGML_RPC_MAX_SERVERS);
+    prefetch_threads.reserve(n_prefetch_threads);
+    for (size_t i = 0; i < n_prefetch_threads; i++) {
+        prefetch_threads.emplace_back([&]() {
+            while (true) {
+                size_t server = next_server++;
+                if (server >= rpc_servers.size()) {
+                    break;
+                }
+                prefetch_ok[server] = ggml_backend_rpc_prefetch_connection_fn(rpc_servers[server].c_str());
+            }
+        });
+    }
+    for (auto & thread : prefetch_threads) {
+        thread.join();
+    }
+    for (size_t i = 0; i < rpc_servers.size(); i++) {
+        if (!prefetch_ok[i]) {
+            LOG_WRN("failed to connect to RPC server %s\n", rpc_servers[i].c_str());
+            continue;
+        }
+        const auto & server = rpc_servers[i];
         auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
         ggml_backend_register(reg);
     }
@@ -2602,6 +2665,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_DOWNLOAD}).set_env("LLAMA_ARG_MMPROJ_AUTO"));
     add_opt(common_arg(
+        {"--mmproj-audio"},
+        {"--no-mmproj-audio"},
+        string_format("whether to load the audio encoder of the multimodal projector, if it has one (default: %s)", params.mmproj_no_audio ? "disabled" : "enabled"),
+        [](common_params & params, bool value) {
+            params.mmproj_no_audio = !value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_AUDIO"));
+    add_opt(common_arg(
         {"--mmproj-offload"},
         {"--no-mmproj-offload"},
         string_format("whether to enable GPU offloading for multimodal projector (default: %s)", params.mmproj_use_gpu ? "enabled" : "disabled"),
@@ -2630,6 +2701,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("MTMD_BACKEND_DEVICE")); // no LLAMA_ARG_ prefix for backward compatibility reason
     add_opt(common_arg(
+        {"--mmproj-backend"}, "NAME",
+        "GPU backend for multimodal projector (e.g. CUDA, Metal, Vulkan)\n"
+        "if not specified, will use MTMD_BACKEND_DEVICE env var or default GPU backend",
+        [](common_params & params, const std::string & value) {
+            params.mmproj_backend = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",
         "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",
         [](common_params & params, const std::string & value) {
@@ -2652,6 +2731,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.image_max_tokens = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TOKENS"));
+    add_opt(common_arg(
+        {"--image-tile-mode"}, "MODE",
+        "tile encoding mode for multi-tile vision models (e.g. Qwen3VL):\n"
+        "  batched    - all tiles in one forward pass\n"
+        "  sequential - tiles encoded one-by-one (default)\n"
+        "  disabled   - tiling disabled, single tile only",
+        [](common_params & params, const std::string & value) {
+            if (value == "batched")         { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_BATCHED; }
+            else if (value == "sequential") { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_SEQUENTIAL; }
+            else if (value == "disabled")   { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_DISABLED; }
+            else { throw std::invalid_argument("unknown --image-tile-mode: " + value + " (use batched, sequential, or disabled)"); }
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_TILE_MODE"));
     add_opt(common_arg(
         {"--mtmd-batch-max-tokens"}, "N",
         string_format("maximum number of image tokens per batch when encoding images (default: %d)", params.mtmd_batch_max_tokens),
@@ -2680,6 +2772,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.video_ffmpeg_bin_dir = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_FFMPEG_DIR"));
+    add_opt(common_arg(
+        {"--image-max-tiles"}, "N",
+        "maximum number of tiles for multi-tile vision models (e.g. Qwen3VL), overrides the\n"
+        "value from the GGUF; use when the GGUF lacks the key or the model default is wrong\n"
+        "for your model size (Qwen3VL defaults to 4, too low for 8B+ variants)",
+        [](common_params & params, int value) {
+            if (value < 1)   { throw std::invalid_argument("--image-max-tiles must be >= 1"); }
+            if (value > 256) { throw std::invalid_argument("--image-max-tiles must be <= 256"); }
+            params.image_max_tiles = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TILES"));
+    add_opt(common_arg(
+        {"--image-no-upscale"}, "on|off",
+        "in idefics3-style preprocessing, round an image's long side up to a whole number of\n"
+        "slices and cap it, instead of always stretching it to the cap; overrides the value\n"
+        "from the GGUF. Small images then stay small and become far fewer slices. This is\n"
+        "what separates the VisionPsy Flash checkpoint from the base one, whose mmprojs are\n"
+        "otherwise indistinguishable, so a Flash checkpoint run without it is silently\n"
+        "running base preprocessing",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.image_no_upscale = 1;
+            } else if (is_falsey(value)) {
+                params.image_no_upscale = 0;
+            } else {
+                throw std::invalid_argument("unknown --image-no-upscale: " + value + " (use on or off)");
+            }
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_NO_UPSCALE"));
     add_opt(common_arg(
         {"--rpc"}, "SERVERS",
         "comma-separated list of RPC servers (host:port)",
@@ -2778,13 +2899,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
-        [](common_params & params, int value) {
-            if (value < 0) {
+        {"--moe-cache-mib"}, "N|auto",
+        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: auto with --fit on CUDA, else 0, disabled; auto opts in on supported backends)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_cache_auto = true;
+                params.moe_cache_auto_explicit = true;
+                params.moe_cache_size = 0;
+                return;
+            }
+            size_t pos = 0;
+            const long long size_mib = std::stoll(value, &pos);
+            if (size_mib < 0 || pos != value.size() ||
+                static_cast<unsigned long long>(size_mib) > std::numeric_limits<size_t>::max() / (1024ULL * 1024ULL)) {
                 throw std::invalid_argument("invalid value");
             }
-            params.moe_cache_size = (size_t) value*1024*1024;
+            params.moe_cache_auto = false;
+            params.moe_cache_auto_explicit = false;
+            params.moe_cache_size = size_t(size_mib) * 1024 * 1024;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
@@ -2963,6 +3095,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("whether to offload host tensor operations to device (default: %s)", params.no_op_offload ? "false" : "true"),
         [](common_params & params, bool value) {
             params.no_op_offload = !value;
+        }
+    ));
+    add_opt(common_arg(
+        {"-pw", "--prefetch-weights"}, "0|1|auto",
+        "prefetch weight transfers to overlap CPU->GPU copies with compute (default: auto for fitted dense models)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.prefetch_weights_auto = true;
+                params.prefetch_weights = false;
+            } else if (value == "0" || value == "1") {
+                params.prefetch_weights_auto = false;
+                params.prefetch_weights = value == "1";
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
         }
     ));
     add_opt(common_arg(
@@ -3310,6 +3457,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.embd_normalize = value;
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--coreml-model"}, "DIR",
+        "optional Core ML embedding sidecar directory; incompatible models or batches use ggml",
+        [](common_params & params, const std::string & value) {
+            params.coreml_model = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_COREML_MODEL"));
+    add_opt(common_arg(
+        {"--coreml-max-inflight"}, "N",
+        string_format("Core ML predictions in flight, 1..%d (default: %d)", LLAMA_COREML_MAX_INFLIGHT, params.coreml_max_inflight),
+        [](common_params & params, int value) {
+            if (value < 1 || value > LLAMA_COREML_MAX_INFLIGHT) {
+                throw std::invalid_argument("Core ML max-inflight must be between 1 and 8");
+            }
+            params.coreml_max_inflight = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_COREML_MAX_INFLIGHT"));
     add_opt(common_arg(
         {"--embd-output-format"}, "FORMAT",
         "empty = default, \"array\" = [[],[]...], \"json\" = openai style, \"json+\" = same \"json\" + cosine similarity matrix, \"raw\" = plain whitespace-delimited output (one embedding per line)",
@@ -4231,6 +4395,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.p_min = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-vocab"}, "B:E[,B:E...]",
+        "token id ranges [B, E) a DFlash2 drafter may propose; the target still verifies over the full vocabulary\n"
+        "(default: full vocabulary)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.vocab_ranges = parse_token_ranges(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},

@@ -158,6 +158,10 @@ To disable the Metal build at compile time use the `-DGGML_METAL=OFF` cmake opti
 
 When built with Metal support, you can explicitly disable GPU inference with the `--n-gpu-layers 0` command-line argument.
 
+## Core ML embeddings
+
+On macOS 15 / iOS 18, enable EmbeddingGemma 2 Core ML support with `-DLLAMA_COREML=ON`. The runtime is part of the `llama` library and can use CPU + Neural Engine; it requires a matching exported sidecar with raw pooled output. The embedding CLI and server select it with `--coreml-model DIR` and retain ggml fallback. See the [Core ML guide](../examples/embedding-coreml/README.md) for export, public API configuration, and validation.
+
 ## SYCL
 
 SYCL is a higher-level programming model to improve programming productivity on various hardware accelerators.
@@ -333,6 +337,10 @@ The following compilation options are also available to tweak performance:
 | GGML_CUDA_FORCE_CUBLAS        | Boolean                | false   | Force the use of FP16 cuBLAS instead of custom matrix multiplication kernels for quantized models. There may be issues with numerical overflows (except for V100, CDNA and RDNA4 which use FP32 compute type by default) and memory use will be higher. Prompt processing may become faster on recent datacenter GPUs (the custom kernels were tuned primarily for RTX 3000/4000).   |
 | GGML_CUDA_FA_QUANTS           | `all` or `type_K-type_V` list | q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16 | Select which K/V type combinations to compile the FlashAttention CUDA kernels for. `all` compiles every combination, but compilation takes much longer. Otherwise a `;`-separated list of `type_K-type_V` pairs; f16-f16 is always compiled. Combinations that were not compiled fall back to f16-f16 kernel with a warning. Legal types: f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0. |
 | GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Deprecated alias for `GGML_CUDA_FA_QUANTS=all`.                                                                                                                                                                                                                                                                                                                               |
+
+`GGML_CUDA_CUTLASS=ON` enables optional block-scaled matrix multiplication for dense MXFP4 and NVFP4 weights on SM120/SM121 Blackwell GPUs. It requires CUDA 12.9 or newer. CMake downloads the pinned CUTLASS release unless `FETCHCONTENT_SOURCE_DIR_CUTLASS` points to a local CUTLASS source tree.
+
+Weights are repacked during loading without changing the GGUF format. Small batches use the repacked MMVQ kernels; larger batches use CUTLASS where supported, with the existing CUDA kernels as a fallback. MXFP4 uses FP8 activations and NVFP4 uses FP4 activations for CUTLASS prefill. Measure model accuracy as well as prompt processing and generation speed when enabling this option. `--no-repack`, `GGML_CUDA_FORCE_MMQ`, and `GGML_CUDA_FORCE_CUBLAS` disable automatic placement in the repacked buffer.
 
 ## MUSA
 
@@ -846,11 +854,55 @@ cmake -B build -DGGML_WEBGPU=ON
 cmake --build build --config Release
 ```
 
+Native builds must use a Dawn package compatible with the target platform and C++ runtime. For clang/libc++ builds, build Dawn with the same toolchain instead of combining it with a GCC/libstdc++ prebuilt package. Set `Dawn_DIR` or `CMAKE_PREFIX_PATH` to locate that package.
+
+WebGPU does not require disabling CUDA, Vulkan, or Metal. Disable other GPU backends when isolating WebGPU measurements, or select the WebGPU device explicitly with `--device WebGPU`. Dynamic backend builds must package the WebGPU module alongside their other backend modules. WebGPU discovery through `ggml_backend_load_all()` is opt-in: set `GGML_WEBGPU_AUTOLOAD=1` before starting the process. Otherwise a packaged WebGPU module is not loaded, preserving the existing CUDA, Vulkan, and Metal selection. `--device WebGPU` selects an already registered device; it does not enable loading. The automatic loader keeps WebGPU disabled on Adreno 6xx when the Vulkan probe identifies that device family. Explicit module loading through `ggml_backend_load()` or `GGML_BACKEND_PATH` remains available and bypasses the automatic loading policy.
+
 ### Browser Support
 
-WebGPU allows cross-platform access to the GPU from supported browsers. We utilize [Emscripten](https://emscripten.org/) to compile ggml's WebGPU backend to WebAssembly. Emscripten does not officially support WebGPU bindings yet, but Dawn currently maintains its own WebGPU bindings called emdawnwebgpu.
+Browser builds compile the engine to WebAssembly with [Emscripten](https://emscripten.org/) and use emdawnwebgpu to access the browser's WebGPU API. A native Bare addon cannot be loaded by a browser; the WASM build is a separate artifact.
 
 Follow the instructions [here](https://dawn.googlesource.com/dawn/+/refs/heads/main/src/emdawnwebgpu/) to download or build the emdawnwebgpu package (Note that it might be safer to build the emdawnwebgpu package locally, so that it stays in sync with the version of Dawn you have installed above). When building using CMake, the path to the emdawnwebgpu port file needs to be set with the flag `EMDAWNWEBGPU_DIR`.
+
+The backend requires the adapter to expose `shader-f16`. If it is missing, WebGPU registers no device and logs the reason. On affected Chromium NVIDIA/Vulkan configurations, launching Chromium with `--enable-dawn-features=vulkan_enable_f16_on_nvidia` can expose this feature. Check the actual adapter features and GPU offload logs before interpreting benchmark results.
+
+To build the browser benchmark, activate Emscripten and run from the repository root:
+
+```sh
+emcmake cmake -S . -B build-webgpu-wasm -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_WEBGPU=ON \
+    -DGGML_OPENMP=OFF \
+    -DLLAMA_OPENSSL=OFF \
+    -DLLAMA_BUILD_HTML=OFF \
+    -DLLAMA_BUILD_APP=OFF \
+    -DEMDAWNWEBGPU_DIR=/absolute/path/to/emdawnwebgpu_pkg
+cmake --build build-webgpu-wasm --target llama-bench
+python3 -m http.server 8000 --bind 127.0.0.1
+```
+
+Open `http://localhost:8000/tests/test-webgpu-browser.html`, select a GGUF model, and run the benchmark. The page stages the model in WASM memory and explicitly selects WebGPU. It uses one CPU thread because this build does not enable Emscripten pthreads. The benchmark target reserves an 8 MiB stack for model graph construction. Reload the page for each run because the benchmark exits its runtime. Require positive GPU layer-offload counts, benchmark results, and `EXIT: 0`; a feature probe alone does not establish that inference used the GPU. The page holds the model in browser memory, so allow enough memory for the model, staging copies, and inference buffers.
+
+### Native registration test
+
+With `GGML_WEBGPU=ON` and `LLAMA_BUILD_TESTS=ON`, build and run the registry regression test:
+
+```sh
+cmake --build build --target test-webgpu-registry
+TEST_WEBGPU_REQUIRE_DEVICE=1 ctest --test-dir build -R '^test-webgpu-registry' --output-on-failure
+```
+
+Run this in separate native builds with `GGML_BACKEND_DL=ON` and `GGML_BACKEND_DL=OFF`. The test enables dynamic discovery with `GGML_WEBGPU_AUTOLOAD=1` and checks repeated registration and device reuse. A separate dynamic-build test verifies that `GGML_WEBGPU_AUTOLOAD=0` does not load WebGPU. Without `TEST_WEBGPU_REQUIRE_DEVICE=1`, an unavailable device or Dawn's Null test backend skips the test with exit code 77. With `TEST_WEBGPU_REQUIRE_DEVICE=1`, either condition fails the test. For a deliberately disabled adapter fixture, set `TEST_WEBGPU_EXPECT_DISABLED=1` instead; this requires zero devices and an explanatory warning. These environment variables control test expectations, not adapter capabilities.
+
+For inference validation, use the same model and workload on native and browser builds:
+
+```sh
+cmake --build build --target llama-bench test-backend-ops
+GGML_WEBGPU_AUTOLOAD=1 build/bin/test-backend-ops test -b WebGPU
+GGML_WEBGPU_AUTOLOAD=1 build/bin/llama-bench -v -m /absolute/path/to/model.gguf --load-mode none --device WebGPU -ngl 999 -fa on -t 1 -p 128 -n 16 -r 3
+```
+
+Check that the operator test actually exercises WebGPU and that the benchmark offloads layers to it. On hybrid GPU systems, also record the adapter identity without external ICD pinning to verify the high-performance preference. Compare throughput only with matching model, quantization, flash-attention settings, and prompt and generation lengths.
 
 ## IBM Z & LinuxONE
 

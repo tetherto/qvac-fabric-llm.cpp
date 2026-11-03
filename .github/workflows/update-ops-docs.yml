@@ -19,7 +19,13 @@ permissions:
   contents: read
 
 jobs:
+    authorize:
+        permissions: {}
+        uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
     update-ops-docs:
+        needs: authorize
+        if: needs.authorize.outputs.allowed == 'true'
         runs-on: ubuntu-slim
 
         steps:

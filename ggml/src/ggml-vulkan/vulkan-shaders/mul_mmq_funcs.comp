@@ -1,0 +1,242 @@
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "types.glsl"
+
+// Each iqs value maps to a 32-bit integer
+
+#if defined(DATA_A_Q4_0)
+i32vec2 repack(uint ib, uint iqs) {
+    // Use 2-byte loads since a q4_0 block (18 bytes) is not divisible by 4
+    const u16vec2 quants = u16vec2(data_a[ib].qs[iqs * 2    ],
+                                   data_a[ib].qs[iqs * 2 + 1]);
+    const uint32_t vui = pack32(quants);
+    return i32vec2( vui       & 0x0F0F0F0F,
+                   (vui >> 4) & 0x0F0F0F0F);
+}
+
+ACC_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
+    return ACC_TYPE(da * (float(q_sum) * dsb.x - (8 / sum_divisor) * dsb.y));
+}
+#endif
+
+#if defined(DATA_A_Q4_1)
+i32vec2 repack(uint ib, uint iqs) {
+    // Use 4-byte loads since a q4_1 block (20 bytes) is divisible by 4
+    const uint32_t vui = data_a_packed32[ib].qs[iqs];
+    return i32vec2( vui       & 0x0F0F0F0F,
+                   (vui >> 4) & 0x0F0F0F0F);
+}
+
+ACC_TYPE mul_q8_1(const int32_t q_sum, const vec2 dma, const vec2 dsb, const int32_t sum_divisor) {
+    return ACC_TYPE(float(q_sum) * dma.x * dsb.x + dma.y * dsb.y / sum_divisor);
+}
+#endif
+
+#if defined(DATA_A_Q5_0)
+i32vec2 repack(uint ib, uint iqs) {
+    // Use 2-byte loads since a q5_0 block (22 bytes) is not divisible by 4
+    const u16vec2 quants = u16vec2(data_a[ib].qs[iqs * 2    ],
+                                   data_a[ib].qs[iqs * 2 + 1]);
+    const uint32_t vui = pack32(quants);
+    const int32_t qh = int32_t((uint32_t(data_a[ib].qh[1]) << 16 | data_a[ib].qh[0]) >> (4 * iqs));
+    const int32_t v0 = int32_t(vui & 0x0F0F0F0F)
+                     | ((qh & 0xF) * 0x02040810) & 0x10101010; // (0,1,2,3) -> (4,12,20,28)
+
+    const int32_t v1 = int32_t((vui >> 4) & 0x0F0F0F0F)
+                     | (((qh >> 16) & 0xF) * 0x02040810) & 0x10101010; // (16,17,18,19) -> (4,12,20,28)
+
+    return i32vec2(v0, v1);
+}
+
+ACC_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
+    return ACC_TYPE(da * (float(q_sum) * dsb.x - (16 / sum_divisor) * dsb.y));
+}
+#endif
+
+#if defined(DATA_A_Q5_1)
+i32vec2 repack(uint ib, uint iqs) {
+    // Use 4-byte loads since a q5_1 block (24 bytes) is divisible by 4
+    const uint32_t vui = data_a_packed32[ib].qs[iqs];
+    const int32_t qh = int32_t(data_a_packed32[ib].qh >> (4 * iqs));
+    const int32_t v0 = int32_t(vui & 0x0F0F0F0F)
+                     | ((qh & 0xF) * 0x02040810) & 0x10101010; // (0,1,2,3) -> (4,12,20,28)
+
+    const int32_t v1 = int32_t((vui >> 4) & 0x0F0F0F0F)
+                     | (((qh >> 16) & 0xF) * 0x02040810) & 0x10101010; // (16,17,18,19) -> (4,12,20,28)
+
+    return i32vec2(v0, v1);
+}
+
+ACC_TYPE mul_q8_1(const int32_t q_sum, const vec2 dma, const vec2 dsb, const int32_t sum_divisor) {
+    return ACC_TYPE(float(q_sum) * dma.x * dsb.x + dma.y * dsb.y / sum_divisor);
+}
+#endif
+
+#if defined(DATA_A_Q8_0)
+int32_t repack(uint ib, uint iqs) {
+    // Use 2-byte loads since a q8_0 block (34 bytes) is not divisible by 4
+    return pack32(i16vec2(data_a[ib].qs[iqs * 2    ],
+                          data_a[ib].qs[iqs * 2 + 1]));
+}
+
+ACC_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
+    return ACC_TYPE(float(q_sum) * da * dsb.x);
+}
+#endif
+
+#if defined(DATA_A_TQ2_0)
+i32vec2 repack(uint ib, uint iqs) {
+    const uint k00 = iqs + 0u;
+    const uint ip00 = ((k00 >> 7) & 1u) * 32u;
+    const uint b00 = (k00 & 31u) + ip00;
+    const uint s00 = ((k00 >> 5) & 3u) * 2u;
+
+    const uint k01 = iqs + 1u;
+    const uint ip01 = ((k01 >> 7) & 1u) * 32u;
+    const uint b01 = (k01 & 31u) + ip01;
+    const uint s01 = ((k01 >> 5) & 3u) * 2u;
+
+    const uint k02 = iqs + 2u;
+    const uint ip02 = ((k02 >> 7) & 1u) * 32u;
+    const uint b02 = (k02 & 31u) + ip02;
+    const uint s02 = ((k02 >> 5) & 3u) * 2u;
+
+    const uint k03 = iqs + 3u;
+    const uint ip03 = ((k03 >> 7) & 1u) * 32u;
+    const uint b03 = (k03 & 31u) + ip03;
+    const uint s03 = ((k03 >> 5) & 3u) * 2u;
+
+    const int q00 = int(data_a[ib].qs[b00]);
+    const int q01 = int(data_a[ib].qs[b01]);
+    const int q02 = int(data_a[ib].qs[b02]);
+    const int q03 = int(data_a[ib].qs[b03]);
+
+    const int t00 = (q00 >> int(s00)) & 3;
+    const int t01 = (q01 >> int(s01)) & 3;
+    const int t02 = (q02 >> int(s02)) & 3;
+    const int t03 = (q03 >> int(s03)) & 3;
+
+    const int v0 = (t00 & 0xFF) | ((t01 & 0xFF) << 8) | ((t02 & 0xFF) << 16) | ((t03 & 0xFF) << 24);
+
+
+    const uint k10 = iqs + 16u + 0u;
+    const uint ip10 = ((k10 >> 7) & 1u) * 32u;
+    const uint b10 = (k10 & 31u) + ip10;
+    const uint s10 = ((k10 >> 5) & 3u) * 2u;
+
+    const uint k11 = iqs + 16u + 1u;
+    const uint ip11 = ((k11 >> 7) & 1u) * 32u;
+    const uint b11 = (k11 & 31u) + ip11;
+    const uint s11 = ((k11 >> 5) & 3u) * 2u;
+
+    const uint k12 = iqs + 16u + 2u;
+    const uint ip12 = ((k12 >> 7) & 1u) * 32u;
+    const uint b12 = (k12 & 31u) + ip12;
+    const uint s12 = ((k12 >> 5) & 3u) * 2u;
+
+    const uint k13 = iqs + 16u + 3u;
+    const uint ip13 = ((k13 >> 7) & 1u) * 32u;
+    const uint b13 = (k13 & 31u) + ip13;
+    const uint s13 = ((k13 >> 5) & 3u) * 2u;
+
+    const int q10 = int(data_a[ib].qs[b10]);
+    const int q11 = int(data_a[ib].qs[b11]);
+    const int q12 = int(data_a[ib].qs[b12]);
+    const int q13 = int(data_a[ib].qs[b13]);
+
+    const int u10 = (q10 >> int(s10)) & 3;
+    const int u11 = (q11 >> int(s11)) & 3;
+    const int u12 = (q12 >> int(s12)) & 3;
+    const int u13 = (q13 >> int(s13)) & 3;
+
+    const int v1 = (u10 & 0xFF) | ((u11 & 0xFF) << 8) | ((u12 & 0xFF) << 16) | ((u13 & 0xFF) << 24);
+
+    return i32vec2(v0, v1);
+}
+
+ACC_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
+    return ACC_TYPE(da * (float(q_sum) * dsb.x - float(1.0f / sum_divisor) * dsb.y));
+}
+#endif
+
+#if defined(DATA_A_TQ1_0)
+int dequant1(uint ib, uint iqs) {
+    const uint pow3[6] = uint[6](1u, 3u, 9u, 27u, 81u, 243u);
+
+    if (iqs < 160u) {
+        const uint n = iqs / 32u;
+        const uint m = iqs % 32u;
+        const uint q = uint(data_a[ib].qs[m]);
+        const uint xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
+        return int(xi) - 1;
+    } else if (iqs < 240u) {
+        const uint e = iqs - 160u;
+        const uint n = e / 16u;
+        const uint m = e % 16u;
+        const uint q = uint(data_a[ib].qs[32u + m]);
+        const uint xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
+        return int(xi) - 1;
+    } else {
+        const uint e = iqs - 240u;
+        const uint n = e / (QUANT_K / 64u);
+        const uint j = e % (QUANT_K / 64u);
+        const uint q = uint(data_a[ib].qh[j]);
+        const uint xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
+        return int(xi) - 1;
+    }
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    // Pack 4 consecutive elements starting at iqs and iqs+16 into two 32-bit ints
+    const uint k00 = iqs + 0u;
+    const uint k01 = iqs + 1u;
+    const uint k02 = iqs + 2u;
+    const uint k03 = iqs + 3u;
+
+    const int t00 = dequant1(ib, k00);
+    const int t01 = dequant1(ib, k01);
+    const int t02 = dequant1(ib, k02);
+    const int t03 = dequant1(ib, k03);
+
+    const int v0 = (t00 & 0xFF) | ((t01 & 0xFF) << 8) | ((t02 & 0xFF) << 16) | ((t03 & 0xFF) << 24);
+
+    const uint k10 = iqs + 32u + 0u;
+    const uint k11 = iqs + 32u + 1u;
+    const uint k12 = iqs + 32u + 2u;
+    const uint k13 = iqs + 32u + 3u;
+
+    const int u10 = dequant1(ib, k10);
+    const int u11 = dequant1(ib, k11);
+    const int u12 = dequant1(ib, k12);
+    const int u13 = dequant1(ib, k13);
+
+    const int v1 = (u10 & 0xFF) | ((u11 & 0xFF) << 8) | ((u12 & 0xFF) << 16) | ((u13 & 0xFF) << 24);
+
+    return i32vec2(v0, v1);
+}
+
+ACC_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
+    // q_sum already incorporates (-1,0,1) values; no offset correction needed
+    return ACC_TYPE(da * (float(q_sum) * dsb.x));
+}
+#endif
+
+#if defined(DATA_A_TQ1_0) || defined(DATA_A_TQ2_0) || defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+FLOAT_TYPE get_d(uint ib) {
+    return FLOAT_TYPE(data_a[ib].d);
+}
+#endif
+
+#if defined(DATA_A_MXFP4)
+FLOAT_TYPE get_d(uint ib) {
+    return FLOAT_TYPE(e8m0_to_fp32(data_a[ib].e));
+}
+#endif
+
+#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1)
+FLOAT_TYPE_VEC2 get_dm(uint ib) {
+    return FLOAT_TYPE_VEC2(data_a_packed32[ib].dm);
+}
+#endif

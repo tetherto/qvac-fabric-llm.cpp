@@ -1,0 +1,22 @@
+// Copyright (c) 2026 Tether Operations, S.A. de C.V.
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
+#include "ggml.h"
+#include "ggml-backend.h"
+
+#ifdef  __cplusplus
+extern "C" {
+#endif
+
+// backend API
+GGML_BACKEND_API ggml_backend_t ggml_backend_xdna_init(void);
+
+GGML_BACKEND_API bool ggml_backend_is_xdna(ggml_backend_t backend);
+
+GGML_BACKEND_API ggml_backend_reg_t ggml_backend_xdna_reg(void);
+
+#ifdef  __cplusplus
+}
+#endif
