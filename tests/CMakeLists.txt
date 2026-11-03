@@ -771,6 +771,10 @@ if (TARGET gguf-model-data)
 endif()
 
 if (GGML_OPENCL)
+    llama_build_and_test(test-opencl-buffer-type-init.cpp)
+    set_tests_properties(test-opencl-buffer-type-init PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build_and_test(test-opencl-add-strided-row.cpp)
+    set_tests_properties(test-opencl-add-strided-row PROPERTIES SKIP_RETURN_CODE 77)
     llama_build_and_test(test-opencl-mul-mat-sum-range.cpp)
     set_tests_properties(test-opencl-mul-mat-sum-range PROPERTIES
         SKIP_RETURN_CODE 77
