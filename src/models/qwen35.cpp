@@ -198,12 +198,16 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             !inp_rs->rec_idx && cparams.n_rs_seq == 0 && !cparams.embeddings_nextn_masked &&
             !inp_attn->self_k_rot && !inp_attn->self_v_rot && ggml_n_dims(inp_attn->get_v_idxs()) == 1 &&
             (!loras || loras->empty());
-        // the half attention builder takes separate Q/K/V projections
+        // the half attention builder takes separate Q/K/V projections; control vectors and layer taps need the normal loop
         for (int il = 0; halves && il < n_layer; ++il) {
-            halves = hparams.is_recr(il) || !model.layers[il].wqkv;
+            halves = (hparams.is_recr(il) || !model.layers[il].wqkv) && !cvec->tensor_for(il) &&
+                ((size_t) il >= cparams.embeddings_layer_inp.size() || !cparams.embeddings_layer_inp[il]);
         }
         if (halves) {
             inpL = build_halves(inp, inpL, inp_pos, sections);
+            if (crop_before_nextn(inp_out_ids)) {
+                inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+            }
         }
     }
 #endif
