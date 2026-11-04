@@ -974,11 +974,13 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 static std::atomic<bool> ggml_cuda_vmm_failed[GGML_CUDA_MAX_DEVICES] = {};
 
 struct ggml_cuda_pool_vmm_fallback : public ggml_cuda_pool {
+    ggml_backend_cuda_context &     ctx;
     int                             device;
     int                             physical_device;
     std::unique_ptr<ggml_cuda_pool> pool;
 
-    explicit ggml_cuda_pool_vmm_fallback(int device) :
+    ggml_cuda_pool_vmm_fallback(ggml_backend_cuda_context & ctx, int device) :
+        ctx(ctx),
         device(device),
         physical_device(ggml_cuda_get_physical_device(device)) {}
 
@@ -993,7 +995,7 @@ struct ggml_cuda_pool_vmm_fallback : public ggml_cuda_pool {
                 }
             }
             if (!pool) {
-                pool.reset(new ggml_cuda_pool_leg(device));
+                pool.reset(new ggml_cuda_pool_leg(ctx, device));
             }
         }
         return pool->alloc(size, actual_size);
@@ -1011,7 +1013,7 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(g
                                                                                [[maybe_unused]] int        stream_no) {
 #if defined(GGML_USE_VMM)
     if (ggml_cuda_info().devices[device].vmm) {
-        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm_fallback(device));
+        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm_fallback(ctx, device));
     }
 #endif // defined(GGML_USE_VMM)
     return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(ctx, device));
