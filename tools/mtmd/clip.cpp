@@ -200,7 +200,6 @@ struct clip_ctx {
 
     // for measuring memory usage
     bool no_alloc = false;
-    std::map<ggml_backend_dev_t, size_t> mem_usage;
     std::map<ggml_backend_dev_t, size_t> mem_compute;
 
     bool support_batch = false;
@@ -2604,8 +2603,6 @@ struct clip_model_loader {
                 ggml_set_name(data_tensor, cur->name);
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
-                // add to weight memory counter
-                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
             }
             return cur;
         };
@@ -7310,7 +7307,16 @@ const clip_hparams * clip_get_hparams(const struct clip_ctx * ctx) {
 }
 
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx) {
-    std::map<ggml_backend_dev_t, size_t> result = ctx->mem_usage;
+    std::map<ggml_backend_dev_t, size_t> result;
+    for (auto * buf : {ctx->buf.get(), ctx->buf_repack.get()}) {
+        if (buf) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+            if (!dev) {
+                dev = ggml_backend_get_device(ctx->backend);
+            }
+            result[dev] += ggml_backend_buffer_get_size(buf);
+        }
+    }
     for (auto & [dev, size] : ctx->mem_compute) {
         result[dev] += size;
     }

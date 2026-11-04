@@ -29,6 +29,7 @@
 #include "mtmd-image.h"
 
 #include <cstdio>
+#include <cfenv>
 
 static int g_failures = 0;
 
@@ -70,6 +71,30 @@ static void expect_sizing(const char * what, int w, int h, bool no_upscale,
 }
 
 int main() {
+    const int rounding_mode = std::fegetround();
+    const int modes[] = {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
+    const int cases[][2] = {{463, 448}, {464, 448}, {465, 480}, {496, 512}, {3600, 3584}};
+    for (const int mode : modes) {
+        if (std::fesetround(mode) != 0) {
+            ++g_failures;
+            continue;
+        }
+        for (const auto & entry : cases) {
+            const auto got = mtmd_calc_dynamic_image_size({320, entry[0]}, 32, 0, 0);
+            if (got.width != 320 || got.height != entry[1]) {
+                std::printf("FAIL dynamic resize height %d in mode %d: %dx%d\n", entry[0], mode, got.width, got.height);
+                ++g_failures;
+            }
+        }
+    }
+    std::fesetround(rounding_mode);
+    const auto capped = mtmd_calc_dynamic_image_size({1024, 1024}, 32, 0, 512 * 512);
+    const auto enlarged = mtmd_calc_dynamic_image_size({128, 128}, 32, 256 * 256, 0);
+    if (capped.width != 512 || capped.height != 512 || enlarged.width != 256 || enlarged.height != 256) {
+        std::printf("FAIL dynamic resize pixel limits\n");
+        ++g_failures;
+    }
+
     // 4:3 and its transpose. This is the class the float32 scale got wrong: 720 * (2048/960)
     // is exactly 1536, and in float32 it lands just above, which buys a fourth slice row.
     expect_sizing("landscape 4:3",  960,  720, false, 2048, 1536, 4, 3);

@@ -3657,6 +3657,11 @@ static bool ggml_hexagon_supported_flash_attn_ext(const struct ggml_hexagon_sess
         return false;
     }
 
+    // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+    if (op->src[5] != nullptr) {
+        return false;
+    }
+
     if (src4 && src4->type != GGML_TYPE_F32) {  // sinks
         return false;
     }

@@ -57,15 +57,14 @@ the delta log, it returns `GGML_VEC_INDEX_E_PARTIAL_COMPACT`.
 
 TurboVec is a separate compressed search mode built on the same index API: a
 port of upstream [turbovec](https://github.com/ryancodrai/turbovec) 1.1.2 that
-encodes, snapshots and syncs byte for byte as turbovec does (see Persistence
-for the one layout difference on large indexes). Vectors and
+encodes, snapshots and syncs byte for byte as turbovec does. Vectors and
 queries are rotated into a quantization-friendly space, optional TQ+
 calibration and Lloyd-Max codebooks produce q2, q3 or q4 codes stored in
 bit-plane rows, and search builds lookup tables from the rotated query to score
-packed codes without reconstructing full vectors. A blocked copy of the packed
-codes supports scalar, NEON, and AVX2 scoring. Derived rotation, blocked-code,
-and IVF state is invalidated or rebuilt after mutations, compaction, and
-snapshot loading.
+packed codes without reconstructing full vectors. Codes are kept in a 32-vector
+blocked layout that scalar, NEON, and AVX2 scoring read directly. Derived
+rotation and IVF state is invalidated or rebuilt after mutations, compaction,
+and snapshot loading.
 
 Each layer carries its own regression coverage: result ordering, architecture
 parity, snapshot corruption, mmap restrictions, delta replay, compaction, stale
@@ -89,9 +88,11 @@ target_link_libraries(my_target PRIVATE ggml::vector-index)
 ```
 
 NEON kernels are selected automatically on supported ARM builds. On x86,
-AVX2 kernels are built separately when `GGML_NATIVE=ON` or `GGML_AVX2=ON` and
-are selected at runtime. Scalar and SIMD reduction order can produce small
-score differences across CPU architectures.
+the AVX2 and AVX-512 kernels (BW, VBMI, VNNI, GFNI and VPOPCNTDQ forms, each
+in its own object) are built whenever the compiler supports them and are
+selected after a runtime CPU check; a CPU without one uses that kernel's
+scalar model, which computes the same result. Scalar and SIMD reduction
+order can produce small score differences across CPU architectures.
 
 ## Storage Modes
 
@@ -123,9 +124,80 @@ their codes. Pass a random, representative sample of about 1000 vectors, and
 calibrate before adding when possible: re-encoding stored rows is a second
 quantization. An index that is never calibrated is plain TurboQuant.
 `ggml_vec_index_prepare` is best-effort and does not report allocation status.
-Search keeps a 32-vector blocked copy of the packed codes in memory for
-NEON/AVX2 LUT scoring; this cache is updated after adds and rebuilt after
-compaction, calibration and snapshot loading.
+
+Like upstream, search picks its arithmetic by host. On aarch64 with the
+dot-product extension, and on x86 with AVX-512 F, BW, VBMI and VNNI, 4-bit
+codes are scored with upstream's int8 permute-dot arithmetic over upstream's
+vector-major block layout; the two architectures sum the same integers, so
+their scores agree. On such an x86 host 2- and 3-bit codes take the
+vector-major layout too and are scored as upstream's `vpermb` scan scores
+them: an exact sum of the lookup-table entries, then one multiply and one
+add. Everywhere else codes are scored through the nibble lookup tables,
+whose partial sums are folded in every 256 byte groups. These round
+differently, so scores, and occasionally which ids sit at the edge of a
+top-k, depend on the host exactly as upstream's do.
+`TURBOVEC_NO_VECTOR_MAJOR` (or the older `TURBOVEC_NO_VNNI`) set to anything
+but `0`, read once per process, keeps the lookup tables for new indexes, and
+`TURBOVEC_NO_GFNI`, set to any value (`0` included), keeps the x86
+permute-dot kernel off its GFNI form (the same sums), as upstream's do.
+
+On aarch64 with the int8 matrix-multiply extension (i8mm) as well, a 4-bit
+index whose dimension is a multiple of 16 takes upstream's wider `vm8`
+block layout, and the queries of a multi-query search are scored in fused
+batches of 12, 8 or 4 with SMMLA kernels, as upstream does (other dimensions
+batch with SMMLA over the vector-major layout). Permute-dot sums are exact
+integers, so every kernel returns the same scores. The block layout is
+chosen when an index is created and never reaches a file: snapshots are
+written from sequential rows. `TURBOVEC_NO_I8MM` set to anything keeps the
+SDOT kernels and the vector-major layout, as upstream's does.
+
+`TURBOVEC_2BIT_VM8=1` in the environment, read once per process, opts in to
+upstream's experimental 2-bit `vm8` path, with upstream's semantics: on an
+i8mm host, a 2-bit index whose dimension is a multiple of 32 takes the `vm8`
+layout, and batches of 12, 8 or 4 queries (filtered searches included) score
+it with int8 SMMLA arithmetic, which rounds differently from the lookup
+tables a single query and any query outside a batch still use. On aarch64
+the variable also turns off staged search at 2 and 4 bits. Results then
+match upstream run with the same variable; any other value leaves search
+unchanged.
+
+Large 2- and 4-bit indexes search in stages, as upstream does. From 32,768
+vectors, at dimensions that are multiples of 32, on aarch64 (4 bits also needs
+the dot-product extension; neither runs under `TURBOVEC_2BIT_VM8=1`) and on
+x86 hosts with the vector-major layout, a search scans the sign planes alone for a
+shortlist (`max(384, 16k)` at 2 bits; `max(256, 20k)`, or `16k` from `k = 64`,
+at 4 bits), ranks the shortlist with estimates that add the lower planes,
+and rescores the best few with the full scan's own arithmetic. Returned
+scores are exactly the full scan's, but which ids are returned can differ
+from it: on unstructured random test data 77 to 94% of a top 10 overlaps the
+full scan's, the same as upstream, and real embeddings fare better (see
+upstream's measurements). The results match upstream's single-threaded
+staged search bit for bit, ties included, down to the batch query whose
+sampled seed comes up short and is rescanned unseeded (with single-query
+tables under the aarch64 rules, with the batch's own under the x86 rules).
+A batch over an index with no filter and no removed rows scans the sign
+planes for several queries at once (four on aarch64, six on x86).
+Upstream's thread-pool variant refines inside its scan and can return
+different ids; here a lone query over 32,768 or more vectors splits its scan
+across the index's threads without changing any result. An index stays
+staged if it later shrinks below the threshold.
+`ggml_vec_index_turbovec_set_staged(idx, 0)` makes an index scan in full
+instead. On x86, as upstream does, the sign planes are scanned with the
+`vpermb` arithmetic, the shortlist is ranked by counting bit masks against the
+query rather than through lookup tables, and a 4-bit shortlist is rescored
+straight from the bit planes. A 2-bit shortlist is rescored row by row
+(upstream `legacy_score`) on aarch64, and on x86 when the AVX-512 VNNI kernels
+or the vm8 layout score the index; otherwise by whole blocks. No fixture from upstream x86 covers those
+results; they are checked against reference implementations of upstream's
+arithmetic.
+
+A TurboVec 1.x index holds its codes once, in the 32-vector blocked layout that
+search scores, so it uses about half the code memory of upstream turbovec,
+which keeps bit-plane rows next to its search cache. A staged index also keeps
+the bit-plane rows and a blocked copy of its sign planes, because its
+shortlist ranking reads the planes row by row. Adds and removals patch the
+blocked codes in place; calibration and snapshot loading rebuild them. Legacy
+v3 indexes keep bit-plane rows next to the blocked copy.
 
 Indexes loaded from a v3 snapshot (written by earlier releases) keep the
 turbovec 0.9 encoding they were written with: a dense Gaussian QR rotation,
@@ -197,7 +269,7 @@ log. Plain `add`, `remove`, `compact`, and snapshot `write` operations return
 
 `ggml_vec_index_add_logged` and `ggml_vec_index_remove_logged` append durable
 mutations. Before starting a new log, establish the snapshot lineage with a
-successful `ggml_vec_index_write` or `ggml_vec_index_load`. The first logged
+successful durable `ggml_vec_index_write` or a `ggml_vec_index_load`. The first logged
 mutation binds the handle to the delta log; later logged mutations and
 `ggml_vec_index_compact_delta` must use that same file. Equivalent hardlink
 aliases identify the same log.
@@ -211,23 +283,35 @@ durability could not be confirmed. `GGML_VEC_INDEX_E_PARTIAL_COMPACT` means the
 snapshot was replaced but its durability could not be confirmed, or resetting
 the delta log failed.
 
+`ggml_vec_index_write_with_durability` with `GGML_VEC_INDEX_DURABILITY_FAST`
+writes the same snapshot through the same temp file and atomic rename but
+skips the data and directory fsyncs, as upstream turbovec's `Durability::Fast`
+does. The destination never holds a torn snapshot and survives a process
+crash, but a power loss shortly afterwards may lose the new file, so a fast
+write does not let a delta log start. Syncs are always durable.
+
 TurboVec snapshots use upstream turbovec's v8 container, the `.tvim` files
 turbovec's own `IdMapIndex` writes: a superblock with the codebook and
 calibration, two commit header slots, and one unit per 32-row block. Files are
 interchangeable with turbovec 1.1 and later in both directions; v7 files and
 v8 files in the bit-planes unit layout load too, and positional `.tv` files
-(no ids) are rejected. Row order follows upstream's swap-remove order, so a
-snapshot is byte-identical to the one turbovec writes for the same history,
-with one exception: from 32,768 vectors, at 2 or 4 bits and dimensions that
-are multiples of 32, turbovec on aarch64 and on x86 with AVX-512 VBMI and VNNI
-stores block units in its bit-planes layout, while this writer always uses
-the sequential layout. Both forms load in either implementation.
+(no ids) are rejected. Removal is upstream's swap-remove (the last row moves
+into the hole), so a snapshot is byte-identical to the one turbovec writes
+for the same history. Like turbovec, an index that would search in stages at
+its current size stores its block units in the bit-planes layout and every
+other index in the sequential one; both forms load in either
+implementation.
 Each header slot reserves room for 1024 pending removals, so even a small file
 carries a few hundred KiB of zero padding; the writer leaves it as a file hole
 where the filesystem supports one. v8 carries no checksum over the block
 codes, only over the superblock and headers. Loading validates the codebook,
 calibration and per-vector scales and rejects duplicate ids. TurboVec
 snapshots do not support mmap loading or delta logs.
+
+Writers build block units as they go: a write or full sync holds about 1 MiB
+beyond the index, and `ggml_vec_index_to_bytes` holds only its output. A load
+reads the file's declared content and decodes it straight into the blocked
+codes.
 
 `ggml_vec_index_to_bytes` and `ggml_vec_index_from_bytes` move the same image
 through memory, and `ggml_vec_index_serialized_size` reports its size.
