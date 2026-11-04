@@ -202,6 +202,9 @@ if (TARGET ggml-vector-index)
         install(TARGETS test-vector-index-hooks RUNTIME)
     endif()
     llama_test(test-vector-index-hooks ARGS --internal-hooks)
+    if (LLAMA_SANITIZE_THREAD OR GGML_SANITIZE_THREAD)
+        set_tests_properties(test-vector-index-hooks PROPERTIES ENVIRONMENT "TSAN_OPTIONS=die_after_fork=0")
+    endif()
     # The full suite again, against the hooks build, so checks that need
     # internal access (rotation and golden hashes) run alongside it.
     llama_test(test-vector-index-hooks NAME test-vector-index-hooks-full)
