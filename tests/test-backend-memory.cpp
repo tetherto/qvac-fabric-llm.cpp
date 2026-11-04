@@ -209,7 +209,7 @@ void check_repack_matmul(ggml_backend_t backend, ggml_tensor * weights,
 }
 
 void check_foreign_set_rows(ggml_backend_t backend, int & checks) {
-    auto * cpu = ggml_backend_cpu_init();
+    auto * cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     check(cpu != nullptr, "foreign-buffer CPU backend unavailable");
     auto * ctx = ggml_init({ggml_tensor_overhead() * 8, nullptr, true});
     check(ctx != nullptr, "foreign-buffer context allocation failed");
