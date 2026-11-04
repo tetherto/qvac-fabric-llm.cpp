@@ -264,6 +264,7 @@ private:
     bool debug_fake_timing = false;
 
     void update_meta(const std::string & name, const server_model_meta & meta);
+    void validate_download_locked(const std::string & name);
 
     // unload least recently used models if the limit is reached
     void unload_lru();
@@ -302,6 +303,7 @@ public:
 
     // check if a model instance exists (thread-safe)
     bool has_model(const std::string & name);
+    void validate_download(const std::string & name);
 
     // downloads that never finished, with their sidecar kinds (thread-safe)
     std::vector<server_unfinished_download> unfinished_downloads_get();
