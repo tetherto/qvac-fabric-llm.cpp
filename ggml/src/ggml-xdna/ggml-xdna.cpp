@@ -3521,6 +3521,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // The fused sessions' device state goes back into llama's cache before any route reads or rewrites it, a chunk that runs
     // whole on the host included.
     xdna_rec_follow_cache(ctx, cgraph);
+    xdna_ops_plan_blocks(&ctx->ops, cgraph);
 
     // A prefill whose commands would cost more than the host's products runs whole on the host. A decode, one token a sequence
     // however many sequences share the graph, plans nothing.
@@ -5482,6 +5483,9 @@ static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const c
     }
     if (std::strcmp(name, "ggml_backend_xdna_test_gemm_count") == 0) {
         return (void *) xdna_ops_test_gemm_count;
+    }
+    if (std::strcmp(name, "ggml_backend_xdna_test_block_switches") == 0) {
+        return (void *) xdna_ops_test_block_switches;
     }
     if (std::strcmp(name, "ggml_backend_xdna_test_host_chunk_count") == 0) {
         return (void *) xdna_test_host_chunk_count;
