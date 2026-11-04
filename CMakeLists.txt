@@ -3,7 +3,11 @@ project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
 option(LLAMA_COREML "llama: build optional Core ML support (EmbeddingGemma and Qwen3.8-27B FFN sidecars)" OFF)
-option(LLAMA_COREML_FFN "llama: build optional in-graph Core ML FFN support (default: LLAMA_COREML)" ${LLAMA_COREML})
+# empty follows LLAMA_COREML on every configure; an option() default would stay at its first cached value
+set(LLAMA_COREML_FFN "" CACHE STRING "llama: build optional in-graph Core ML FFN support (ON, OFF, or empty to follow LLAMA_COREML)")
+if (LLAMA_COREML_FFN STREQUAL "")
+    set(LLAMA_COREML_FFN ${LLAMA_COREML})
+endif()
 if (LLAMA_COREML OR LLAMA_COREML_FFN)
     if (NOT APPLE)
         message(FATAL_ERROR "Core ML requires macOS 15 or iOS 18")
