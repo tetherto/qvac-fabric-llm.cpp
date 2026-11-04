@@ -1094,7 +1094,7 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
 static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * t) {
     if (!ggml_backend_buft_is_host(buft) && htp_is_tiled_weight_tensor(t)) {
         const size_t tiled_size = ggml_hexagon_tiled_alloc_size(t);
-        if (ggml_hexagon_needs_canonical_tail(t->type)) {
+        if (t->op == GGML_OP_NONE && ggml_hexagon_needs_canonical_tail(t->type)) {
             GGML_ASSERT(tiled_size <= SIZE_MAX - ggml_nbytes(t));
             return tiled_size + ggml_nbytes(t);
         }
