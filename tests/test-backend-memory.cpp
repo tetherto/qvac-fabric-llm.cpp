@@ -219,9 +219,11 @@ void check_foreign_set_rows(ggml_backend_t backend, int & checks) {
     auto * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
     auto * write = ggml_set_rows(ctx, destination, values, indices);
     auto * alias_write = ggml_set_rows(ctx, alias, values, indices);
+    auto * matmul      = ggml_mul_mat(ctx, destination, values);
     auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
     check(buffer != nullptr, "foreign-buffer allocation failed");
     check(ggml_backend_supports_op(backend, write), "SET_ROWS rejected a canonical CPU destination");
+    const bool matmul_supported = ggml_backend_supports_op(backend, matmul);
     ++checks;
 
     // A foreign backend's opaque metadata must not affect Hexagon layout detection.
@@ -230,14 +232,16 @@ void check_foreign_set_rows(ggml_backend_t backend, int & checks) {
     destination->extra = foreign_extra.data();
     const bool direct_supported = ggml_backend_supports_op(backend, write);
     const bool alias_supported = ggml_backend_supports_op(backend, alias_write);
+    const bool foreign_matmul_supported = ggml_backend_supports_op(backend, matmul);
     destination->extra = original_extra;
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     ggml_backend_free(cpu);
     check(direct_supported, "SET_ROWS inspected foreign CPU metadata");
     check(alias_supported, "SET_ROWS inspected foreign CPU alias metadata");
-    checks += 2;
-    std::puts("foreign CPU SET_ROWS queries: 3 PASS");
+    check(foreign_matmul_supported == matmul_supported, "MUL_MAT inspected foreign CPU metadata");
+    checks += 3;
+    std::puts("foreign CPU support queries: 4 PASS");
 }
 
 void check_runtime_repack(ggml_backend_t backend, ggml_type type,
@@ -267,6 +271,76 @@ void check_runtime_repack(ggml_backend_t backend, ggml_type type,
     ++checks;
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+}
+
+void check_computed_float_repack(ggml_backend_t backend, int & checks) {
+    constexpr int     graph_capacity = 5;  // three inputs and two computed tensors
+    constexpr int64_t tile_size      = 32;
+    // Keep the computed matmul source eligible for Hexagon tiling.
+    static_assert(WIDTH % tile_size == 0 && ROWS % tile_size == 0);
+    const size_t context_size =
+        ggml_tensor_overhead() * graph_capacity + ggml_graph_overhead_custom(graph_capacity, false);
+    auto * ctx = ggml_init({ context_size, nullptr, true });
+    check(ctx != nullptr, "computed REPACK context allocation failed");
+    auto * lhs      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, WIDTH, ROWS);
+    auto * rhs      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, WIDTH, ROWS);
+    auto * computed = ggml_add(ctx, lhs, rhs);
+    auto * input    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, WIDTH, 1);
+    auto * output   = ggml_mul_mat(ctx, computed, input);
+    check(ggml_backend_supports_op(backend, computed), "computed REPACK add unsupported");
+    check(ggml_backend_supports_op(backend, output), "computed REPACK matmul unsupported");
+    auto * graph = ggml_new_graph_custom(ctx, graph_capacity, false);
+    ggml_build_forward_expand(graph, output);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "computed REPACK buffer allocation failed");
+
+    std::vector<float> a(WIDTH * ROWS), b(WIDTH * ROWS), x(WIDTH), actual(ROWS);
+    for (size_t i = 0; i < a.size(); ++i) {
+        a[i] = float(i % WIDTH) / float(WIDTH);
+        b[i] = float(i / WIDTH) / float(ROWS);
+    }
+    for (size_t i = 0; i < x.size(); ++i) {
+        x[i] = 1.0f + float(i) / float(WIDTH);
+    }
+    ggml_backend_tensor_set(lhs, a.data(), 0, a.size() * sizeof(float));
+    ggml_backend_tensor_set(rhs, b.data(), 0, b.size() * sizeof(float));
+    ggml_backend_tensor_set(input, x.data(), 0, x.size() * sizeof(float));
+    check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "computed REPACK graph failed");
+    ggml_backend_synchronize(backend);
+    ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+
+    double squared_error     = 0.0;
+    double squared_reference = 0.0;
+    for (size_t row = 0; row < actual.size(); ++row) {
+        double reference = 0.0;
+        for (size_t col = 0; col < x.size(); ++col) {
+            reference += double(a[row * x.size() + col] + b[row * x.size() + col]) * x[col];
+        }
+        const double difference = reference - actual[row];
+        squared_error += difference * difference;
+        squared_reference += reference * reference;
+    }
+    std::vector<float> canonical(a.size()), readback(a.size());
+    for (size_t i = 0; i < canonical.size(); ++i) {
+        canonical[i] = a[i] + b[i];
+    }
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(computed, canonical.data(), 0, canonical.size() * sizeof(float));
+    ggml_backend_tensor_get(computed, readback.data(), 0, readback.size() * sizeof(float));
+    check(readback == canonical, "computed REPACK weight-buffer upload changed F32 data");
+    ++checks;
+    canonical[0] += 1.0f;
+    ggml_backend_tensor_set_2d(computed, canonical.data(), 0, WIDTH * sizeof(float), 1, WIDTH * sizeof(float),
+                               WIDTH * sizeof(float));
+    ggml_backend_tensor_get(computed, readback.data(), 0, readback.size() * sizeof(float));
+    check(readback == canonical, "computed REPACK weight-buffer row update changed F32 data");
+    ++checks;
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    check(squared_reference > 0.0 && squared_error / squared_reference <= 5e-4,
+          "computed REPACK matmul differs from canonical reference");
+    ++checks;
+    std::puts("computed F32 graph and uploads: 3 PASS");
 }
 
 void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
@@ -400,6 +474,7 @@ void check_repack(const char * name) {
         check(ggml_backend_buft_get_alloc_size(buft, probe.product) == ggml_nbytes(probe.product),
               "REPACK expanded a computed F32 tensor");
         ++checks;
+        check_computed_float_repack(backend, checks);
         check_foreign_set_rows(backend, checks);
     }
     ggml_backend_free(backend);

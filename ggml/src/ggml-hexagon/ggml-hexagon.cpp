@@ -672,20 +672,6 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                    size_t                offset,
                                                    size_t                size);
 
-static bool ggml_hexagon_needs_canonical_tail(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_IQ4_NL:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_MXFP4:
-        case GGML_TYPE_F16:
-            return false;
-        default:
-            return true;
-    }
-}
-
 static size_t ggml_hexagon_tiled_alloc_size(const ggml_tensor * tensor) {
     const int64_t ne0 = hex_round_up(tensor->ne[0], 32);
     const int64_t ne1 = hex_round_up(tensor->ne[1], 32);
@@ -703,6 +689,8 @@ static uint8_t * ggml_hexagon_canonical_tail(const ggml_tensor * tensor) {
     GGML_ASSERT(data_addr >= base_addr && data_addr - base_addr <= buffer_size);
     const size_t available = buffer_size - (data_addr - base_addr);
     const size_t tiled_size = ggml_hexagon_tiled_alloc_size(tensor);
+    const size_t allocated  = ggml_backend_buffer_get_alloc_size(tensor->buffer, tensor);
+    GGML_ASSERT(tiled_size <= allocated && ggml_nbytes(tensor) <= allocated - tiled_size);
     GGML_ASSERT(tiled_size <= available && ggml_nbytes(tensor) <= available - tiled_size);
     return data + tiled_size;
 }
@@ -757,7 +745,7 @@ static void ggml_hexagon_finish_repack_shadow(ggml_tensor * tensor) {
     }
 
     htp_repack_tensor_tiled(tensor, extra->shadow_buf.data(), size);
-    if (ggml_hexagon_needs_canonical_tail(tensor->type)) {
+    if (htp_needs_canonical_tail(tensor->type)) {
         memcpy(ggml_hexagon_canonical_tail(tensor), extra->shadow_buf.data(), size);
     }
     ggml_hexagon_reset_repack_shadow(extra);
@@ -792,7 +780,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         extra->flags |= HTP_TENSOR_WEIGHT;
-        if (htp_is_tiled_weight_tensor(tensor)) {
+        if (htp_can_store_tiled(tensor)) {
             extra->flags |= HTP_TENSOR_TILED;
         }
     }
@@ -808,7 +796,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
     const size_t tensor_size = ggml_nbytes(tensor);
     GGML_ASSERT(offset <= tensor_size && size <= tensor_size - offset);
     if (offset == 0 && size == tensor_size) {
-        if (ggml_hexagon_needs_canonical_tail(tensor->type)) {
+        if (htp_needs_canonical_tail(tensor->type)) {
             auto * canonical = ggml_hexagon_canonical_tail(tensor);
             memcpy(canonical, data, size);
             htp_repack_tensor_tiled(tensor, canonical, size);
@@ -851,7 +839,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
         return;
     }
 
-    if (ggml_hexagon_needs_canonical_tail(tensor->type)) {
+    if (htp_needs_canonical_tail(tensor->type)) {
         memcpy(data, ggml_hexagon_canonical_tail(tensor) + offset, size);
     } else {
         ggml_hexagon_unpack_canonical_range(data, tensor, offset, size);
@@ -884,7 +872,7 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
 
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         extra->flags |= HTP_TENSOR_WEIGHT;
-        if (htp_is_tiled_weight_tensor(tensor)) {
+        if (htp_can_store_tiled(tensor)) {
             extra->flags |= HTP_TENSOR_TILED;
         }
     }
@@ -950,7 +938,7 @@ static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buff
         return;
     }
 
-    if (ggml_hexagon_needs_canonical_tail(tensor->type)) {
+    if (htp_needs_canonical_tail(tensor->type)) {
         const size_t tensor_size = ggml_nbytes(tensor);
         GGML_ASSERT(offset <= tensor_size && size <= tensor_size - offset);
         for (size_t i = 0; i < n_copies; i++) {
@@ -1092,9 +1080,9 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * t) {
-    if (!ggml_backend_buft_is_host(buft) && htp_is_tiled_weight_tensor(t)) {
+    if (!ggml_backend_buft_is_host(buft) && htp_can_store_tiled(t)) {
         const size_t tiled_size = ggml_hexagon_tiled_alloc_size(t);
-        if (t->op == GGML_OP_NONE && ggml_hexagon_needs_canonical_tail(t->type)) {
+        if (htp_needs_canonical_tail(t->type)) {
             GGML_ASSERT(tiled_size <= SIZE_MAX - ggml_nbytes(t));
             return tiled_size + ggml_nbytes(t);
         }
@@ -2567,7 +2555,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     htp_repack_tensor_tiled(src0, raw.data(), raw.size());
                     auto * extra = (htp_tensor_extra *) src0->extra;
                     extra->flags |= HTP_TENSOR_TILED;
-                    if (ggml_hexagon_needs_canonical_tail(src0->type)) {
+                    if (htp_needs_canonical_tail(src0->type)) {
                         memcpy(ggml_hexagon_canonical_tail(src0), raw.data(), raw.size());
                     }
                     extra->repack_ready = true;
