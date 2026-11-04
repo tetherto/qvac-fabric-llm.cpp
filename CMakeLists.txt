@@ -2,10 +2,15 @@ cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit 
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
-option(LLAMA_COREML "llama: build optional Core ML support" OFF)
-if (LLAMA_COREML)
+option(LLAMA_COREML "llama: build optional Core ML support (EmbeddingGemma and Qwen3.8-27B FFN sidecars)" OFF)
+# empty follows LLAMA_COREML on every configure; an option() default would stay at its first cached value
+set(LLAMA_COREML_FFN "" CACHE STRING "llama: build optional in-graph Core ML FFN support (ON, OFF, or empty to follow LLAMA_COREML)")
+if (LLAMA_COREML_FFN STREQUAL "")
+    set(LLAMA_COREML_FFN ${LLAMA_COREML})
+endif()
+if (LLAMA_COREML OR LLAMA_COREML_FFN)
     if (NOT APPLE)
-        message(FATAL_ERROR "LLAMA_COREML requires macOS 15 or iOS 18")
+        message(FATAL_ERROR "Core ML requires macOS 15 or iOS 18")
     endif()
     enable_language(OBJC OBJCXX)
 endif()
@@ -339,7 +344,8 @@ set(LLAMA_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location o
 
 set(LLAMA_PUBLIC_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/include/llama.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-cpp.h)
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-cpp.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-coreml-ffn.h)
 
 if (LLAMA_COREML)
     list(APPEND LLAMA_PUBLIC_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-coreml.h)
@@ -452,8 +458,11 @@ else()
 endif()
 
 set(LLAMA_PC_LIBS_PRIVATE "")
-if (LLAMA_COREML)
+if (LLAMA_COREML OR LLAMA_COREML_FFN)
     set(LLAMA_PC_LIBS_PRIVATE "-framework CoreML -framework Foundation")
+endif()
+if (LLAMA_COREML_FFN)
+    string(APPEND LLAMA_PC_LIBS_PRIVATE " -framework Metal")
 endif()
 
 configure_file(cmake/llama.pc.in
