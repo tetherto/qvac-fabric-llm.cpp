@@ -3045,6 +3045,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--coreml-ffn"},
+        "run part of each FFN on the Apple Neural Engine for prompts of 256+ tokens (Qwen3.8-27B, -DLLAMA_COREML=ON builds; default: off)",
+        [](common_params & params) {
+            params.coreml_ffn = true;
+        }
+    ).set_env("LLAMA_COREML"));
+    add_opt(common_arg(
+        {"--coreml-ffn-cache"}, "DIR",
+        "directory for the compiled Core ML FFN programs, 4.5-9 GB per model (default: <cache dir>/coreml-ffn)",
+        [](common_params & params, const std::string & value) {
+            params.coreml_ffn_cache = value;
+        }
+    ).set_env("LLAMA_ARG_COREML_FFN_CACHE"));
+    add_opt(common_arg(
+        {"--coreml-ffn-split"}, "METALxN",
+        "Metal channels and Core ML programs per FFN, e.g. 8192x2 or 11264x1 (default: 8192x2 with two Neural Engines, else 11264x1)",
+        [](common_params & params, const std::string & value) {
+            int metal = 0, packages = 0;
+            char tail = 0;
+            if (sscanf(value.c_str(), "%dx%d%c", &metal, &packages, &tail) != 2 || metal <= 0 || packages < 1 || packages > 2) {
+                throw std::invalid_argument("--coreml-ffn-split must look like 8192x2 or 11264x1");
+            }
+            params.coreml_ffn_metal    = metal;
+            params.coreml_ffn_packages = packages;
+        }
+    ).set_env("LLAMA_ARG_COREML_FFN_SPLIT"));
+    add_opt(common_arg(
         {"-pw", "--prefetch-weights"}, "0|1|auto",
         "prefetch weight transfers to overlap CPU->GPU copies with compute (default: auto for fitted dense models)",
         [](common_params & params, const std::string & value) {

@@ -742,6 +742,29 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
     }
 }
 
+#ifdef GGML_METAL_CUSTOM_OPS
+void ggml_metal_shared_event(ggml_metal_t ctx, void * event, uint64_t value, bool wait) {
+    @autoreleasepool {
+        id<MTLSharedEvent> ev = (id<MTLSharedEvent>) event;
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+
+        if (wait) {
+            [cmd_buf encodeWaitForEvent:ev value:value];
+        } else {
+            [cmd_buf encodeSignalEvent:ev value:value];
+        }
+
+        [cmd_buf commit];
+
+        [ctx->cmd_bufs_ext addObject:cmd_buf];
+        ctx->cmd_buf_last = cmd_buf;
+
+        [cmd_buf retain];
+    }
+}
+#endif
+
 ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
     return ctx->ev_cpy;
 }
@@ -830,3 +853,5 @@ bool ggml_metal_supports_family(ggml_metal_t ctx, int family) {
 void ggml_metal_capture_next_compute(ggml_metal_t ctx) {
     ctx->capture_compute = 1;
 }
+
+int ggml_metal_get_n_cb(ggml_metal_t ctx) { return ctx->n_cb; }

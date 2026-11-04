@@ -596,6 +596,10 @@ struct common_params {
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
+    bool coreml_ffn        = false; // run part of each Qwen3.8-27B FFN on the Neural Engine
+    std::string coreml_ffn_cache;   // compiled Core ML FFN programs, empty = <cache dir>/coreml-ffn
+    int32_t coreml_ffn_metal    = 0; // Metal channels per FFN, 0 = library default
+    int32_t coreml_ffn_packages = 0; // Core ML programs per FFN, 0 = library default
     bool training          = false; // build the context for training (see llama_opt_init)
     bool prefetch_weights      = false; // prefetch weight transfers to overlap CPU->GPU copies with compute
     bool prefetch_weights_auto = true;  // enable weight prefetch when fitting a dense model
