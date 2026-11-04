@@ -2630,8 +2630,8 @@ static int test_moe_no_output_ubatches() {
 
     auto mp = llama_model_default_params();
     mp.progress_callback = silent_model_load_progress;
-    size_t seed = NO_OUTPUT_SEED;
-    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, mp));
+    tensor_data_params tensor_params = { NO_OUTPUT_SEED, 0.1f };
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &tensor_params, mp));
     GGML_ASSERT(model);
 
     const uint32_t n_tokens = NO_OUTPUT_N_UBATCH * NO_OUTPUT_N_UBATCHES;
