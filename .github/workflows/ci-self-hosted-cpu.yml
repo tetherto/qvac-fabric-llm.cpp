@@ -60,6 +60,7 @@ jobs:
     needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
     runs-on: qvac-ubuntu2204-x64
+    timeout-minutes: 180
 
     steps:
       - name: Clone
