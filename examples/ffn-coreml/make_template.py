@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Build a weight-free int8 Core ML template for the FFN sidecar.
 
-The runtime (ffn-coreml-otf.h) writes weights/weight.bin for each layer from the GGUF at load time, so users do not
-run a conversion. The program is the one export_ffn.py builds (1x1 conv layout, tanh SiLU, channel chunks) with
-per-channel symmetric int8 weights, as linear_quantize_weights makes them. layout.txt lists every weight blob of the
-program in file order: offset of its metadata, MILBlob data type, role, kind, chunk and shape.
+The runtime (src/llama-coreml-ffn-export.h) writes weights/weight.bin for each layer from the GGUF at load time, so
+users do not run a conversion. The program is the one export_ffn.py builds (1x1 conv layout, tanh SiLU, channel chunks)
+with per-channel symmetric int8 weights, as linear_quantize_weights makes them. layout.txt lists every weight blob of
+the program in file order: offset of its metadata, MILBlob data type, role, kind, chunk and shape.
 """
 
 import argparse
@@ -13,29 +13,13 @@ import shutil
 import struct
 
 import coremltools as ct
-from coremltools.converters.mil import Builder as mb
 import numpy as np
 
+from export_ffn import convert
 
-def build(path, channels, hidden, tokens, chunk, weights):
-    def silu(gate):
-        half = mb.mul(x=gate, y=0.5)
-        return mb.mul(x=half, y=mb.add(x=mb.tanh(x=half), y=1.0))
 
-    @mb.program(input_specs=[mb.TensorSpec(shape=(tokens, hidden))], opset_version=ct.target.macOS15)
-    def program(x):
-        x = mb.expand_dims(x=mb.transpose(x=x, perm=[1, 0]), axes=[0, 2])
-        result = None
-        for start in range(0, channels, chunk):
-            end = min(start + chunk, channels)
-            up = mb.conv(x=x, weight=weights["up"][start:end, :, None, None])
-            gate = mb.conv(x=x, weight=weights["gate"][start:end, :, None, None])
-            part = mb.conv(x=mb.mul(x=silu(gate), y=up), weight=weights["down"][:, start:end, None, None].copy())
-            result = part if result is None else mb.add(x=result, y=part)
-        return mb.transpose(x=mb.squeeze(x=result, axes=[0, 2]), perm=[1, 0], name="y")
-
-    model = ct.convert(program, convert_to="mlprogram", minimum_deployment_target=ct.target.macOS15,
-                       compute_precision=ct.precision.FLOAT16, skip_model_load=True)
+def build(path, tokens, chunk, weights):
+    model = convert(weights, tokens, chunk, "tanh")
     config = ct.optimize.coreml.OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int8", granularity="per_channel", weight_threshold=4096)
     model = ct.optimize.coreml.linear_quantize_weights(model, ct.optimize.coreml.OptimizationConfig(global_config=config))
     model.save(str(path))
@@ -67,7 +51,7 @@ def main():
     work = args.output.with_name(args.output.name + ".build")
     shutil.rmtree(work, ignore_errors=True)
     package = work / "ffn.mlpackage"
-    model = build(package, C, H, args.tokens, args.chunk, weights)
+    model = build(package, args.tokens, args.chunk, weights)
 
     # identify every blob by its contents: int8 data and FP16 scales of a weight chunk, or the zero conv bias
     blob = (package / "Data/com.apple.CoreML/weights/weight.bin").read_bytes()

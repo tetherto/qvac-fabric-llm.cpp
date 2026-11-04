@@ -16,6 +16,43 @@ from gguf import GGUFReader
 from gguf.quants import dequantize
 
 
+def convert(weights, tokens, chunk, activation, output_scale=1, layout="conv"):
+    """Core ML program of the SwiGLU block in weights (gate, up: channels x hidden; down: hidden x channels)."""
+    channels, hidden = weights["up"].shape
+
+    def silu(gate):
+        if activation == "tanh":
+            half = mb.mul(x=gate, y=0.5)
+            return mb.mul(x=half, y=mb.add(x=mb.tanh(x=half), y=1.0))
+        return mb.mul(x=gate, y=mb.sigmoid(x=gate))
+
+    @mb.program(input_specs=[mb.TensorSpec(shape=(tokens, hidden))], opset_version=ct.target.macOS15)
+    def program(x):
+        if layout == "linear":
+            up = mb.matmul(x=x, y=weights["up"], transpose_y=True)
+            gate = mb.matmul(x=x, y=weights["gate"], transpose_y=True)
+            activated = mb.mul(x=silu(gate), y=up)
+            if output_scale != 1:
+                activated = mb.mul(x=activated, y=float(output_scale))
+            return mb.matmul(x=activated, y=weights["down"], transpose_y=True, name="y")
+        x = mb.expand_dims(x=mb.transpose(x=x, perm=[1, 0]), axes=[0, 2])
+        result = None
+        # Split intermediate channels for ANE compilation.
+        for start in range(0, channels, chunk):
+            end = min(start + chunk, channels)
+            up = mb.conv(x=x, weight=weights["up"][start:end, :, None, None])
+            gate = mb.conv(x=x, weight=weights["gate"][start:end, :, None, None])
+            activated = mb.mul(x=silu(gate), y=up)
+            if output_scale != 1:
+                activated = mb.mul(x=activated, y=float(output_scale))
+            part = mb.conv(x=activated, weight=weights["down"][:, start:end, None, None].copy())
+            result = part if result is None else mb.add(x=result, y=part)
+        return mb.transpose(x=mb.squeeze(x=result, axes=[0, 2]), perm=[1, 0], name="y")
+
+    return ct.convert(program, convert_to="mlprogram", minimum_deployment_target=ct.target.macOS15,
+                      compute_precision=ct.precision.FLOAT16, skip_model_load=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("gguf", type=Path)
@@ -72,37 +109,7 @@ def main():
     (args.output / "manifest.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
     for tokens in args.tokens:
-        def silu(gate):
-            if args.activation == "tanh":
-                half = mb.mul(x=gate, y=0.5)
-                return mb.mul(x=half, y=mb.add(x=mb.tanh(x=half), y=1.0))
-            return mb.mul(x=gate, y=mb.sigmoid(x=gate))
-
-        @mb.program(input_specs=[mb.TensorSpec(shape=(tokens, hidden))], opset_version=ct.target.macOS15)
-        def program(x):
-            if args.layout == "linear":
-                up = mb.matmul(x=x, y=weights["up"], transpose_y=True)
-                gate = mb.matmul(x=x, y=weights["gate"], transpose_y=True)
-                activated = mb.mul(x=silu(gate), y=up)
-                if args.output_scale != 1:
-                    activated = mb.mul(x=activated, y=float(args.output_scale))
-                return mb.matmul(x=activated, y=weights["down"], transpose_y=True, name="y")
-            x = mb.expand_dims(x=mb.transpose(x=x, perm=[1, 0]), axes=[0, 2])
-            result = None
-            # Split intermediate channels for ANE compilation.
-            for start in range(0, intermediate, args.chunk):
-                end = min(start + args.chunk, intermediate)
-                up = mb.conv(x=x, weight=weights["up"][start:end, :, None, None])
-                gate = mb.conv(x=x, weight=weights["gate"][start:end, :, None, None])
-                activated = mb.mul(x=silu(gate), y=up)
-                if args.output_scale != 1:
-                    activated = mb.mul(x=activated, y=float(args.output_scale))
-                part = mb.conv(x=activated, weight=weights["down"][:, start:end, None, None].copy())
-                result = part if result is None else mb.add(x=result, y=part)
-            return mb.transpose(x=mb.squeeze(x=result, axes=[0, 2]), perm=[1, 0], name="y")
-
-        model = ct.convert(program, convert_to="mlprogram", minimum_deployment_target=ct.target.macOS15,
-                           compute_precision=ct.precision.FLOAT16, skip_model_load=True)
+        model = convert(weights, tokens, args.chunk, args.activation, args.output_scale, args.layout)
         model.user_defined_metadata["source_layer"] = str(args.layer)
         model.user_defined_metadata["output_scale"] = str(args.output_scale)
         model.user_defined_metadata["channel_start"] = str(args.channel_start)
