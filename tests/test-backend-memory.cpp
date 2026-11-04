@@ -395,6 +395,11 @@ void check_repack(const char * name) {
         check_repack_type(backend, type, checks);
     }
     if (std::strncmp(ggml_backend_name(backend), "HTP", 3) == 0) {
+        Probe probe;
+        auto * buft = ggml_backend_dev_buffer_type(dev);
+        check(ggml_backend_buft_get_alloc_size(buft, probe.product) == ggml_nbytes(probe.product),
+              "REPACK expanded a computed F32 tensor");
+        ++checks;
         check_foreign_set_rows(backend, checks);
     }
     ggml_backend_free(backend);
