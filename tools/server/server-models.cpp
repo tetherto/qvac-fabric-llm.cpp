@@ -1284,6 +1284,29 @@ void server_models::update_meta(const std::string & name, const server_model_met
     cv.notify_all(); // notify wait_until_loading_finished
 }
 
+void server_models::validate_download_locked(const std::string & name) {
+    const auto it = mapping.find(name);
+    if (it == mapping.end()) {
+        return;
+    }
+    const auto & cur = it->second.meta;
+    if (cur.status == SERVER_MODEL_STATUS_DOWNLOADING) {
+        throw std::invalid_argument("model '" + name + "' is already downloading");
+    }
+    if (cur.is_running()) {
+        throw std::invalid_argument("model '" + name + "' is running, unload it first");
+    }
+    if (cur.source != SERVER_MODEL_SOURCE_CACHE) {
+        throw std::invalid_argument("model '" + name + "' already exists");
+    }
+}
+
+void server_models::validate_download(const std::string & name) {
+    std::unique_lock<std::mutex> lk(mutex);
+    cv.wait(lk, [this]() { return !is_reloading; });
+    validate_download_locked(name);
+}
+
 bool server_models::has_model(const std::string & name) {
     std::lock_guard<std::mutex> lk(mutex);
     if (mapping.find(name) != mapping.end()) {
@@ -1387,18 +1410,9 @@ void server_models::load(const std::string & name, const load_options & opts) {
     // is downloaded again with its files kept, a download on its way and a running
     // model are refused, and a preset or local model is not a download
     if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
+        validate_download_locked(name);
         auto it = mapping.find(name);
         if (it != mapping.end()) {
-            const auto & cur = it->second.meta;
-            if (cur.status == SERVER_MODEL_STATUS_DOWNLOADING) {
-                throw std::invalid_argument("model '" + name + "' is already downloading");
-            }
-            if (cur.is_running()) {
-                throw std::invalid_argument("model '" + name + "' is running, unload it first");
-            }
-            if (cur.source != SERVER_MODEL_SOURCE_CACHE) {
-                throw std::invalid_argument("model '" + name + "' already exists");
-            }
             SRV_INF("resuming download for model '%s'\n", name.c_str());
         }
 
@@ -2538,6 +2552,7 @@ void server_models_routes::init_routes() {
             throw std::invalid_argument("model must be a non-empty string");
         }
         const auto sidecars = parse_sidecars(body);
+        models.validate_download(name);
 
         common_params_model model;
         model.hf_repo = name;

@@ -5,6 +5,41 @@
 #include <array>
 #include <cfenv>
 
+#if GGML_VEC_INDEX_USE_NEON
+#include <arm_neon.h>
+#endif
+
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) || defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+#include "ggml-vector-index-x86.h"
+#endif
+
+// Hardware CRC-32C on little-endian aarch64, behind a runtime check
+// (upstream's crc32c crate uses the same instructions).
+#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(__AARCH64EB__)
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define GGML_VEC_INDEX_ARM_CRC32 1
+#define GGML_VEC_INDEX_CRC_TARGET
+#elif defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#define GGML_VEC_INDEX_ARM_CRC32 1
+#define GGML_VEC_INDEX_CRC_TARGET
+#elif defined(__clang__)
+#include <arm_acle.h>
+#define GGML_VEC_INDEX_ARM_CRC32 1
+#define GGML_VEC_INDEX_CRC_TARGET __attribute__((target("crc")))
+#elif defined(__GNUC__) && __GNUC__ >= 10
+// GCC 10+ declares the CRC intrinsics for functions targeting +crc.
+#include <arm_acle.h>
+#define GGML_VEC_INDEX_ARM_CRC32 1
+#define GGML_VEC_INDEX_CRC_TARGET __attribute__((target("+crc")))
+#else
+#define GGML_VEC_INDEX_ARM_CRC32 0
+#endif
+#else
+#define GGML_VEC_INDEX_ARM_CRC32 0
+#endif
+
 class DeltaReplayNearestRounding {
 public:
     DeltaReplayNearestRounding() : saved_rounding(std::fegetround()) {
@@ -248,9 +283,9 @@ static bool read_u64_le(std::ifstream & f, uint64_t & v) {
     return true;
 }
 
-// CRC-32C (Castagnoli), one table lookup per byte; callers apply the
-// initial value and the final inversion.
-uint32_t crc32c_update(uint32_t crc, const void * data, size_t size) {
+// CRC-32C (Castagnoli), one table lookup per byte: the reference every
+// hardware path below must match.
+static uint32_t crc32c_update_table(uint32_t crc, const uint8_t * bytes, size_t size) {
     static const std::array<uint32_t, 256> table = [] {
         std::array<uint32_t, 256> t{};
         for (uint32_t i = 0; i < 256; ++i) {
@@ -262,12 +297,127 @@ uint32_t crc32c_update(uint32_t crc, const void * data, size_t size) {
         }
         return t;
     }();
-    const auto * bytes = static_cast<const uint8_t *>(data);
     for (size_t i = 0; i < size; ++i) {
         crc = (crc >> 8) ^ table[(crc ^ bytes[i]) & 0xffu];
     }
     return crc;
 }
+
+#if GGML_VEC_INDEX_ARM_CRC32
+// The ARMv8 CRC32C instructions apply the reflected table step to each byte
+// (crc32cb) or to eight little-endian bytes at once (crc32cd), so the
+// result equals the table loop for any input.
+GGML_VEC_INDEX_CRC_TARGET
+static uint32_t crc32c_update_arm(uint32_t crc, const uint8_t * bytes, size_t size) {
+    while (size != 0 && (reinterpret_cast<uintptr_t>(bytes) & 7u) != 0) {
+        crc = __crc32cb(crc, *bytes++);
+        --size;
+    }
+    for (; size >= 8; size -= 8, bytes += 8) {
+        uint64_t word = 0;
+        std::memcpy(&word, bytes, sizeof(word));
+        crc = __crc32cd(crc, word);
+    }
+    while (size != 0) {
+        crc = __crc32cb(crc, *bytes++);
+        --size;
+    }
+    return crc;
+}
+#endif
+
+enum class Crc32cKernel { table, arm, sse42 };
+
+static uint32_t crc32c_update_with(Crc32cKernel kernel, uint32_t crc, const uint8_t * bytes, size_t size) {
+    switch (kernel) {
+#if GGML_VEC_INDEX_ARM_CRC32
+        case Crc32cKernel::arm:
+            return crc32c_update_arm(crc, bytes, size);
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+        case Crc32cKernel::sse42:
+            return ggml_vec_index_detail::crc32c_update_sse42(crc, bytes, size);
+#endif
+        default:
+            break;
+    }
+    return crc32c_update_table(crc, bytes, size);
+}
+
+// CRC-32C update; callers apply the initial value and the final inversion.
+uint32_t crc32c_update(uint32_t crc, const void * data, size_t size) {
+    static const Crc32cKernel kernel = [] {
+        const VecIndexCpuFeatures & features = vec_index_cpu_features();
+#if GGML_VEC_INDEX_ARM_CRC32
+        if (features.arm_crc32) {
+            return Crc32cKernel::arm;
+        }
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+        if (features.sse42) {
+            return Crc32cKernel::sse42;
+        }
+#endif
+        (void) features;
+        return Crc32cKernel::table;
+    }();
+    return crc32c_update_with(kernel, crc, static_cast<const uint8_t *>(data), size);
+}
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// 1 when the hardware CRC-32C path (0: ARMv8 CRC32, 1: SSE4.2) matches the
+// table loop over random buffers of every length 0..5000 at every alignment
+// and seed, 0 on a mismatch, -1 when this build or CPU lacks the path.
+int crc32c_kernel_parity_for_test(int kernel) {
+    Crc32cKernel selected = Crc32cKernel::table;
+    bool available = false;
+    if (kernel == 0) {
+        selected = Crc32cKernel::arm;
+        available = GGML_VEC_INDEX_ARM_CRC32 && vec_index_cpu_features().arm_crc32;
+    } else if (kernel == 1) {
+        selected = Crc32cKernel::sse42;
+#if defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+        available = vec_index_cpu_features().sse42;
+#endif
+    }
+    if (!available) {
+        return -1;
+    }
+    constexpr size_t max_len = 5000;
+    std::vector<uint8_t> buf(max_len + 16);
+    uint64_t state = UINT64_C(0x9e3779b97f4a7c15);
+    auto next = [&state]() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    };
+    for (uint8_t & b : buf) {
+        b = static_cast<uint8_t>(next() >> 56);
+    }
+    for (size_t len = 0; len <= max_len; ++len) {
+        const size_t start = static_cast<size_t>(next() % 16);
+        const uint32_t seed = len % 3 == 0 ? 0xffffffffu : static_cast<uint32_t>(next());
+        const uint8_t * p = buf.data() + start;
+        if (crc32c_update_with(selected, seed, p, len) != crc32c_update_table(seed, p, len)) {
+            return 0;
+        }
+    }
+    // Every start offset against one fixed length, and split updates.
+    for (size_t start = 0; start < 16; ++start) {
+        const uint8_t * p = buf.data() + start;
+        const uint32_t whole = crc32c_update_with(selected, 0xffffffffu, p, 4093);
+        const uint32_t split = crc32c_update_with(
+            selected, crc32c_update_with(selected, 0xffffffffu, p, 13 + start), p + 13 + start, 4080 - start);
+        if (whole != crc32c_update_table(0xffffffffu, p, 4093) || split != whole) {
+            return 0;
+        }
+    }
+    // The CRC-32C check value: crc32c("123456789") == 0xe3069283.
+    const uint8_t check[9] = { '1', '2', '3', '4', '5', '6', '7', '8', '9' };
+    return ~crc32c_update_with(selected, 0xffffffffu, check, sizeof(check)) == 0xe3069283u ? 1 : 0;
+}
+#endif
 
 static bool read_u32_le_crc(std::ifstream & f, uint32_t & v, uint32_t & crc) {
     uint8_t bytes[4];
@@ -357,14 +507,136 @@ static bool turbovec_tqplus_shift_is_valid(float shift, size_t dim) {
     return std::fabs(static_cast<double>(shift)) <= max_abs_shift;
 }
 
-bool all_finite_abs_less_than(const float * values, size_t n, float max_abs) {
+static size_t first_invalid_abs_scalar(const float * values, size_t n, float max_abs) {
     for (size_t i = 0; i < n; ++i) {
         if (!std::isfinite(values[i]) || std::fabs(values[i]) >= max_abs) {
-            return false;
+            return i;
         }
     }
-    return true;
+    return n;
 }
+
+#if GGML_VEC_INDEX_USE_NEON
+// Upstream encode.rs aarch64 `first_invalid_in_chunk`: an all-clean fast
+// path testing |x| < |max_abs| four lanes per vcalt (NaN, Inf and
+// over-magnitude values fail), with the exact scalar predicate pinpointing
+// the first invalid element of a flagged quad.
+static size_t first_invalid_abs_neon(const float * values, size_t n, float max_abs) {
+    const float32x4_t bound = vdupq_n_f32(max_abs);
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const uint32x4_t ok = vcaltq_f32(vld1q_f32(values + i), bound);
+        if (vminvq_u32(ok) == 0) {
+            const size_t at = first_invalid_abs_scalar(values + i, 4, max_abs);
+            if (at != 4) {
+                return i + at;
+            }
+        }
+    }
+    return i + first_invalid_abs_scalar(values + i, n - i, max_abs);
+}
+#endif
+
+static size_t first_invalid_abs(const float * values, size_t n, float max_abs) {
+#if GGML_VEC_INDEX_USE_NEON
+    return first_invalid_abs_neon(values, n, max_abs);
+#else
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+    if (vec_index_cpu_features().avx2) {
+        return ggml_vec_index_detail::first_invalid_abs_avx2(values, n, max_abs);
+    }
+#endif
+    return first_invalid_abs_scalar(values, n, max_abs);
+#endif
+}
+
+bool all_finite_abs_less_than(const float * values, size_t n, float max_abs, int n_threads) {
+    // Large inputs split into chunks scanned on the worker threads.
+    constexpr size_t kValuesPerTask = size_t{ 1 } << 18;
+    std::atomic<bool> ok{ true };
+    parallel_for((n + kValuesPerTask - 1) / kValuesPerTask, n_threads, [&](size_t task, size_t) {
+        if (!ok.load(std::memory_order_relaxed)) {
+            return;
+        }
+        const size_t begin = task * kValuesPerTask;
+        const size_t len = std::min(n, begin + kValuesPerTask) - begin;
+        if (first_invalid_abs(values + begin, len, max_abs) != len) {
+            ok.store(false, std::memory_order_relaxed);
+        }
+    });
+    return ok.load(std::memory_order_relaxed);
+}
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// 1 when the input validation scan (0: NEON, 1: AVX2) reports the scalar
+// scan's first invalid index on clean and poisoned inputs, 0 on a mismatch,
+// -1 when this build or CPU lacks the kernel.
+int vector_validation_kernel_parity_for_test(int kernel) {
+    std::function<size_t(const float *, size_t, float)> simd;
+#if GGML_VEC_INDEX_USE_NEON
+    if (kernel == 0) {
+        simd = first_invalid_abs_neon;
+    }
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+    if (kernel == 1 && vec_index_cpu_features().avx2) {
+        simd = ggml_vec_index_detail::first_invalid_abs_avx2;
+    }
+#endif
+    if (!simd) {
+        return -1;
+    }
+    const float bound = kTurboVecMaxInputMagnitude;
+    const float poisons[] = {
+        std::numeric_limits<float>::quiet_NaN(),
+        -std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        bound,
+        -bound,
+        std::nextafter(bound, 0.0f),
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::denorm_min(),
+        -0.0f,
+    };
+    std::vector<float> values(67);
+    for (size_t n = 0; n <= values.size(); ++n) {
+        for (size_t i = 0; i < n; ++i) {
+            values[i] = static_cast<float>((static_cast<int>(i * 37 % 101) - 50)) * 0.125f;
+        }
+        if (simd(values.data(), n, bound) != first_invalid_abs_scalar(values.data(), n, bound)) {
+            return 0;
+        }
+        for (float poison : poisons) {
+            for (size_t at = 0; at < n; ++at) {
+                const float saved = values[at];
+                values[at] = poison;
+                if (simd(values.data(), n, bound) != first_invalid_abs_scalar(values.data(), n, bound)) {
+                    return 0;
+                }
+                // A second, later poison must not move the reported index.
+                if (at + 5 < n) {
+                    values[at + 5] = std::numeric_limits<float>::infinity();
+                    const bool same =
+                        simd(values.data(), n, bound) == first_invalid_abs_scalar(values.data(), n, bound);
+                    values[at + 5] = static_cast<float>((static_cast<int>((at + 5) * 37 % 101) - 50)) * 0.125f;
+                    if (!same) {
+                        return 0;
+                    }
+                }
+                values[at] = saved;
+            }
+        }
+        // A NaN or infinite bound must give the scalar predicate's answers.
+        for (float odd_bound : { std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity() }) {
+            if (simd(values.data(), n, odd_bound) != first_invalid_abs_scalar(values.data(), n, odd_bound)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+#endif
 
 bool checked_mul_u64(uint64_t a, uint64_t b, uint64_t & out) {
     if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a) {
@@ -436,63 +708,161 @@ int snapshot_write_v1_preflight(size_t n, size_t dim) {
     return GGML_VEC_INDEX_OK;
 }
 
-// Removes temp siblings of `path` that a killed writer left behind: names
-// of the form `<base>.tmp.<suffix>` with this file's suffix shapes, older
-// than an hour (upstream turbovec sweep_stale_tmps). Runs once per
-// destination per process; failures are ignored.
-static void sweep_stale_temp_files(const char * path) {
+// The part after `<base>.tmp.` of a temp name: `pid.seq.hex8`, as both this
+// file and upstream turbovec name their temps (`pid.seq` from upstream's
+// older writers). The sweep reclaims only these shapes, so a user's own
+// `<name>.tmp.backup` never matches.
+static bool is_temp_suffix(const std::string & suffix) {
+    auto digits = [](const std::string & part) {
+        return !part.empty() && std::all_of(part.begin(), part.end(), [](char c) { return c >= '0' && c <= '9'; });
+    };
+    const size_t first = suffix.find('.');
+    if (first == std::string::npos) {
+        return false;
+    }
+    const size_t second = suffix.find('.', first + 1);
+    if (!digits(suffix.substr(0, first)) ||
+        !digits(suffix.substr(first + 1, second == std::string::npos ? std::string::npos : second - first - 1))) {
+        return false;
+    }
+    if (second == std::string::npos) {
+        return true;
+    }
+    const std::string rand = suffix.substr(second + 1);
+    return rand.size() == 8 &&
+        std::all_of(rand.begin(), rand.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; });
+}
+
+// A fresh `.tmp.pid.seq.hex8` suffix (upstream io.rs tmp_sibling): the
+// process id, a per-process sequence and 32 bits that keep two processes
+// with the same id (in different containers) apart.
+static std::string next_temp_suffix() {
+    static std::atomic<uint64_t> sequence{ 0 };
+#ifdef _WIN32
+    const uint64_t pid = static_cast<uint64_t>(GetCurrentProcessId());
+#else
+    const uint64_t pid = static_cast<uint64_t>(::getpid());
+#endif
+    const uint64_t seq = sequence.fetch_add(1);
+    uint64_t x = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) ^
+        (pid << 32) ^ (seq * UINT64_C(0x9e3779b97f4a7c15));
+    x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+    x ^= x >> 31;
+    char suffix[64];
+    std::snprintf(suffix, sizeof(suffix), ".tmp.%llu.%llu.%08x", static_cast<unsigned long long>(pid),
+                  static_cast<unsigned long long>(seq), static_cast<unsigned>(x & 0xffffffffu));
+    return suffix;
+}
+
+// The basename a writer uses for `base`'s temp with this suffix: the whole
+// name, or for a long one the cut that keeps the temp within 255 bytes
+// (at a UTF-8 character boundary, as upstream and the POSIX writer cut).
+static std::string temp_stem_for(const std::string & base, size_t suffix_len) {
+    constexpr size_t kNameMax = 255;
+    const size_t tail = std::strlen(".tmp.") + suffix_len;
+    if (base.size() + tail <= kNameMax || tail >= kNameMax) {
+        return base;
+    }
+    size_t cut = kNameMax - tail;
+    while (cut > 0 && (static_cast<unsigned char>(base[cut]) & 0xc0) == 0x80) {
+        --cut;
+    }
+    return base.substr(0, cut);
+}
+
+#ifdef _WIN32
+// The Windows writer cuts in UTF-16 code units instead.
+static std::wstring temp_stem_for_wide(const std::wstring & base, size_t suffix_len) {
+    constexpr size_t kNameMax = 255;
+    const size_t tail = std::wcslen(L".tmp.") + suffix_len;
+    if (base.size() + tail <= kNameMax || tail >= kNameMax) {
+        return base;
+    }
+    std::wstring stem = base.substr(0, kNameMax - tail);
+    if (!stem.empty() && stem.back() >= 0xd800 && stem.back() <= 0xdbff) {
+        stem.pop_back();
+    }
+    return stem;
+}
+#endif
+
+// Removes temp siblings of `path` that a killed writer left behind, older
+// than an hour (upstream turbovec sweep_stale_tmps): `<stem>.tmp.<suffix>`
+// with a temp suffix, where the stem is the destination's basename or the
+// exact cut a writer makes of it. A cut stem is skipped when a file of that
+// name exists, since the temp may then be that file's in-flight write. Runs
+// once per destination per process (every time past 4096 destinations);
+// failures are ignored and never fail the write.
+static void sweep_stale_temp_files(const char * path) try {
     static std::mutex mutex;
     static std::unordered_set<std::string> swept;
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!swept.insert(path).second) {
-            return;
-        }
-    }
     std::filesystem::path destination;
     if (!filesystem_path_from_utf8(path, destination)) {
         return;
     }
-    const std::string base = destination.filename().string();
+    const std::filesystem::path base_path = destination.filename();
+    const std::string base = base_path.u8string();
+    // A destination that is itself a temp name has no leaked siblings.
+    const size_t own_at = base.rfind(".tmp.");
+    if (own_at != std::string::npos && is_temp_suffix(base.substr(own_at + 5))) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (swept.size() < 4096 && !swept.insert(path).second) {
+            return;
+        }
+    }
     std::filesystem::path parent = destination.parent_path();
     if (parent.empty()) {
         parent = ".";
     }
-    auto our_suffix = [](const std::string & suffix) {
-        // POSIX mkstemp: six alphanumerics. Windows: pid.tid.sequence.
-        if (suffix.size() == 6 &&
-            std::all_of(suffix.begin(), suffix.end(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0; })) {
-            return true;
-        }
-        int dots = 0;
-        for (char c : suffix) {
-            if (c == '.') {
-                ++dots;
-            } else if (c < '0' || c > '9') {
-                return false;
-            }
-        }
-        return dots == 2;
-    };
     std::error_code ec;
     const auto now = std::filesystem::file_time_type::clock::now();
-    for (const auto & entry : std::filesystem::directory_iterator(parent, ec)) {
-        const std::string name = entry.path().filename().string();
-        const size_t at = name.rfind(".tmp.");
-        if (at == std::string::npos || !our_suffix(name.substr(at + 5))) {
+    for (std::filesystem::directory_iterator it(parent, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::filesystem::path entry = it->path();
+        std::string name;
+        try {
+            name = entry.filename().u8string();
+        } catch (...) {
             continue;
         }
-        // A long destination's temp carries a cut base: a prefix of it.
+        const size_t at = name.rfind(".tmp.");
+        if (at == std::string::npos) {
+            continue;
+        }
+        const std::string suffix = name.substr(at + 5);
+        if (!is_temp_suffix(suffix)) {
+            continue;
+        }
         const std::string stem = name.substr(0, at);
-        if (stem.empty() || base.compare(0, stem.size(), stem) != 0) {
+        bool ours = stem == base;
+        if (!ours && !stem.empty()) {
+            bool cut = stem == temp_stem_for(base, suffix.size());
+#ifdef _WIN32
+            const std::wstring wide_name = entry.filename().wstring();
+            const size_t wide_at = wide_name.rfind(L".tmp.");
+            cut = cut ||
+                (wide_at != std::wstring::npos &&
+                 wide_name.substr(0, wide_at) == temp_stem_for_wide(base_path.wstring(), wide_name.size() - wide_at - 5));
+#endif
+            std::error_code exists_ec;
+            ours = cut && !std::filesystem::exists(entry.parent_path() / std::filesystem::u8path(stem), exists_ec) && !exists_ec;
+        }
+        if (!ours) {
             continue;
         }
         std::error_code entry_ec;
-        const auto modified = std::filesystem::last_write_time(entry.path(), entry_ec);
+        if (!std::filesystem::is_regular_file(entry, entry_ec) || entry_ec) {
+            continue;
+        }
+        const auto modified = std::filesystem::last_write_time(entry, entry_ec);
         if (!entry_ec && now - modified > std::chrono::hours(1)) {
-            std::filesystem::remove(entry.path(), entry_ec);
+            std::filesystem::remove(entry, entry_ec);
         }
     }
+} catch (...) {
 }
 
 struct TempFile {
@@ -554,24 +924,21 @@ static bool open_temp_file(const char * path, TempFile & temp) {
     if (!utf8_to_wide(path, destination)) {
         return false;
     }
-    static std::atomic<uint64_t> sequence{ 0 };
     for (int attempt = 0; attempt < 128; ++attempt) {
-        wchar_t suffix[96];
-        std::swprintf(suffix, sizeof(suffix) / sizeof(suffix[0]), L".tmp.%lu.%lu.%llu",
-                      static_cast<unsigned long>(GetCurrentProcessId()),
-                      static_cast<unsigned long>(GetCurrentThreadId()),
-                      static_cast<unsigned long long>(sequence.fetch_add(1)));
+        const std::string ascii_suffix = next_temp_suffix();
+        const std::wstring suffix(ascii_suffix.begin(), ascii_suffix.end());
         // Keep the temp's file name within NAME_MAX for long destinations.
         std::wstring base = destination;
         const size_t name_at = base.find_last_of(L"\\/") == std::wstring::npos ? 0 : base.find_last_of(L"\\/") + 1;
-        const size_t suffix_len = std::wcslen(suffix);
+        const size_t suffix_len = suffix.size();
         if (base.size() - name_at + suffix_len > 255 && suffix_len < 255) {
             base.resize(name_at + 255 - suffix_len);
             if (!base.empty() && base.back() >= 0xd800 && base.back() <= 0xdbff) {
                 base.pop_back();
             }
         }
-        temp.path = base + suffix;
+        // The suffix can push a destination just under the limit past it.
+        temp.path = windows_long_path(base + suffix);
 
         int fd = -1;
         const errno_t error = _wsopen_s(&fd, temp.path.c_str(), _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY | _O_NOINHERIT,
@@ -652,14 +1019,20 @@ static std::string temp_sibling_base(const char * path, size_t suffix_len) {
 
 static bool open_temp_file(const char * path, TempFile & temp) {
     sweep_stale_temp_files(path);
-    std::string pattern = temp_sibling_base(path, std::strlen(".tmp.XXXXXX")) + ".tmp.XXXXXX";
-    std::vector<char> mutable_path(pattern.begin(), pattern.end());
-    mutable_path.push_back('\0');
-    const int fd = ::mkstemp(mutable_path.data());
+    int fd = -1;
+    for (int attempt = 0; attempt < 128 && fd < 0; ++attempt) {
+        const std::string suffix = next_temp_suffix();
+        const std::string candidate = temp_sibling_base(path, suffix.size()) + suffix;
+        fd = ::open(candidate.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            temp.path = candidate;
+        } else if (errno != EEXIST) {
+            return false;
+        }
+    }
     if (fd < 0) {
         return false;
     }
-    temp.path.assign(mutable_path.data());
 
     struct stat destination_stat;
     if (::stat(path, &destination_stat) == 0 && ::fchmod(fd, destination_stat.st_mode & 0777) != 0) {
@@ -723,9 +1096,12 @@ TempFile::~TempFile() {
     remove_temp_file(*this);
 }
 
-static bool flush_and_sync(std::FILE * stream) {
+static bool flush_and_sync(std::FILE * stream, bool durable = true) {
     if (std::fflush(stream) != 0) {
         return false;
+    }
+    if (!durable) {
+        return true;
     }
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
     if (g_test_data_fsync_fail.load()) {
@@ -777,15 +1153,15 @@ static bool rename_overwrite(const TempFile & temp, const char * dst) {
     if (!utf8_to_wide(dst, destination)) {
         return false;
     }
-    // A reader or scanner holding the destination open makes the replace
-    // fail transiently with access-denied or sharing-violation; retry with
-    // backoff, as upstream turbovec's rename_atomic does (#415).
+    // One replacing rename, as upstream turbovec's rename_atomic does:
+    // ReplaceFileW has failure modes that leave the destination missing.
+    // A reader or scanner holding the destination open makes it fail
+    // transiently with access-denied or sharing-violation; retry with
+    // backoff (#415).
     DWORD delay_ms = 1;
     for (int attempt = 0;; ++attempt) {
-        const bool ok = GetFileAttributesW(destination.c_str()) != INVALID_FILE_ATTRIBUTES ?
-            ReplaceFileW(destination.c_str(), temp.path.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr,
-                         nullptr) != 0 :
-            MoveFileExW(temp.path.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+        const bool ok = MoveFileExW(temp.path.c_str(), destination.c_str(),
+                                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
         if (ok) {
             return true;
         }
@@ -802,6 +1178,13 @@ static bool rename_overwrite(const TempFile & temp, const char * dst) {
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums) {
+    std::shared_lock<std::shared_mutex> lock(idx->mutex);
+    sums[0] = idx->state_hash_xor;
+    sums[1] = idx->state_hash_sum;
+    sums[2] = idx->state_hash_sum_rot;
+}
+
 extern "C" {
 int ggml_vec_index_test_can_address_array(size_t count, size_t element_size) {
     return can_address_array(count, element_size) ? 1 : 0;
@@ -944,15 +1327,19 @@ uint32_t index_state_crc32c(const ggml_vec_index & idx) {
     crc = crc32c_update_u64(crc, static_cast<uint64_t>(active_count(idx)));
     if (is_turbovec(idx)) {
         const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim));
-        const uint8_t * data = idx.turbovec_data.data();
         for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
             if (slot_is_active(idx, slot)) {
                 crc = crc32c_update_u32(crc, float_to_u32(idx.turbovec_scale[slot]));
             }
         }
-        for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
-            if (slot_is_active(idx, slot)) {
-                crc = crc32c_update(crc, data + slot * row_bytes, row_bytes);
+        std::vector<uint8_t> rows(32 * row_bytes);
+        std::vector<uint8_t> scratch(turbovec_rows_in_blocked(idx) ? turbovec_block_scratch_bytes(idx) : 0);
+        for (size_t first = 0; first < idx.slot_to_id.size(); first += 32) {
+            turbovec_block_rows_packed(idx, first / 32, rows.data(), scratch.data());
+            for (size_t slot = first; slot < std::min(first + 32, idx.slot_to_id.size()); ++slot) {
+                if (slot_is_active(idx, slot)) {
+                    crc = crc32c_update(crc, rows.data() + (slot - first) * row_bytes, row_bytes);
+                }
             }
         }
     } else if (is_q4(idx)) {
@@ -1005,7 +1392,7 @@ static uint64_t rotl64(uint64_t v, int shift) {
     return (v << shift) | (v >> (64 - shift));
 }
 
-uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot) {
+uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot, const uint8_t * turbovec_row) {
     uint32_t crc0 = 0xffffffffu;
     uint32_t crc1 = 0x82f63b78u;
     auto update_u32 = [&](uint32_t v) {
@@ -1026,7 +1413,11 @@ uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot) {
     if (is_turbovec(idx)) {
         const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, dim_sz);
         update_u32(float_to_u32(idx.turbovec_scale[slot]));
-        update_bytes(idx.turbovec_data.data() + slot * row_bytes, row_bytes);
+        uint8_t row[kTurboVecMaxDim / 2];
+        if (turbovec_row == nullptr) {
+            turbovec_row = turbovec_row_packed_ptr(idx, slot, row);
+        }
+        update_bytes(turbovec_row, row_bytes);
     } else if (is_q4(idx)) {
         update_u32(float_to_u32(idx.q4_scale[slot]));
         const size_t row_bytes = q4_row_bytes(dim_sz);
@@ -1047,6 +1438,96 @@ void add_state_hash(ggml_vec_index & idx, uint64_t hash) {
     idx.state_hash_xor ^= hash;
     idx.state_hash_sum += hash;
     idx.state_hash_sum_rot += rotl64(hash, 17);
+}
+
+namespace {
+
+// The three state-hash sums over a set of slots, in any order.
+struct StateHashSums {
+    uint64_t hash_xor = 0;
+    uint64_t sum = 0;
+    uint64_t sum_rot = 0;
+
+    void add(uint64_t hash) {
+        hash_xor ^= hash;
+        sum += hash;
+        sum_rot += rotl64(hash, 17);
+    }
+
+    void add(const StateHashSums & other) {
+        hash_xor ^= other.hash_xor;
+        sum += other.sum;
+        sum_rot += other.sum_rot;
+    }
+};
+
+// Slots per parallel task of a state-hash pass (a multiple of 32, so a task
+// reads whole blocks of the blocked cache).
+constexpr size_t kStateHashSlotsPerTask = 2048;
+
+// Sums the hashes of the active slots [first, last) over n_threads; rows,
+// when given, are the packed rows of those slots, and otherwise rows come
+// out of the blocked cache a block at a time when the index keeps them only
+// there.
+StateHashSums state_hash_sums(const ggml_vec_index & idx, size_t first, size_t last, const uint8_t * rows, int n_threads) {
+    const size_t n_tasks = last > first ? (last - first + kStateHashSlotsPerTask - 1) / kStateHashSlotsPerTask : 0;
+    const bool blocked = rows == nullptr && turbovec_rows_in_blocked(idx) && first % 32 == 0;
+    const size_t row_bytes = is_turbovec(idx) ? turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim)) : 0;
+    std::vector<StateHashSums> partial(n_tasks);
+    parallel_for(n_tasks, n_threads, [&](size_t task, size_t) {
+        const size_t begin = first + task * kStateHashSlotsPerTask;
+        const size_t end = std::min(last, begin + kStateHashSlotsPerTask);
+        StateHashSums & sums = partial[task];
+        if (blocked) {
+            std::vector<uint8_t> scratch(turbovec_block_scratch_bytes(idx));
+            std::vector<uint8_t> block_rows(32 * row_bytes);
+            for (size_t block_first = begin; block_first < end; block_first += 32) {
+                turbovec_block_rows_packed(idx, block_first / 32, block_rows.data(), scratch.data());
+                for (size_t slot = block_first; slot < std::min(block_first + 32, end); ++slot) {
+                    if (slot_is_active(idx, slot)) {
+                        sums.add(slot_state_hash(idx, slot, block_rows.data() + (slot - block_first) * row_bytes));
+                    }
+                }
+            }
+            return;
+        }
+        for (size_t slot = begin; slot < end; ++slot) {
+            if (slot_is_active(idx, slot)) {
+                sums.add(slot_state_hash(idx, slot, rows == nullptr ? nullptr : rows + (slot - first) * row_bytes));
+            }
+        }
+    });
+    StateHashSums total;
+    for (const StateHashSums & sums : partial) {
+        total.add(sums);
+    }
+    return total;
+}
+
+void apply_state_hash_sums(ggml_vec_index & idx, const StateHashSums & sums) {
+    idx.state_hash_xor ^= sums.hash_xor;
+    idx.state_hash_sum += sums.sum;
+    idx.state_hash_sum_rot += sums.sum_rot;
+}
+
+}  // namespace
+
+void add_state_hash_range(ggml_vec_index & idx, size_t first, size_t last, const uint8_t * rows) {
+    if (idx.n_threads > 1) {
+        // An add hashes its rows after committing them, so this must not
+        // fail: without memory for the threaded pass, hash row by row.
+        try {
+            apply_state_hash_sums(idx, state_hash_sums(idx, first, last, rows, idx.n_threads));
+            return;
+        } catch (...) {
+        }
+    }
+    const size_t row_bytes = is_turbovec(idx) ? turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim)) : 0;
+    for (size_t slot = first; slot < last; ++slot) {
+        if (slot_is_active(idx, slot)) {
+            add_state_hash(idx, slot_state_hash(idx, slot, rows == nullptr ? nullptr : rows + (slot - first) * row_bytes));
+        }
+    }
 }
 
 void remove_state_hash(ggml_vec_index & idx, uint64_t hash) {
@@ -1116,6 +1597,42 @@ void rebuild_state_hash(ggml_vec_index & idx) {
     idx.state_hash_xor = 0;
     idx.state_hash_sum = 0;
     idx.state_hash_sum_rot = 0;
+    if (idx.n_threads > 1) {
+        // Callers rebuild after committing a change, so this must not fail:
+        // without memory for the threaded pass, fall back to the one below.
+        try {
+            apply_state_hash_sums(idx, state_hash_sums(idx, 0, idx.slot_to_id.size(), nullptr, idx.n_threads));
+            idx.state_hash_valid = true;
+            return;
+        } catch (...) {
+        }
+    }
+    std::vector<uint8_t> rows;
+    std::vector<uint8_t> scratch;
+    if (turbovec_rows_in_blocked(idx)) {
+        try {
+            scratch.resize(turbovec_block_scratch_bytes(idx));
+            rows.resize(32 * turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim)));
+        } catch (const std::bad_alloc &) {
+            // Callers rebuild after committing a change, so this must not
+            // fail: fall back to reading row by row.
+            rows.clear();
+        }
+    }
+    if (!rows.empty()) {
+        // Rows come out of the blocked cache a block at a time.
+        const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim));
+        for (size_t first = 0; first < idx.slot_to_id.size(); first += 32) {
+            turbovec_block_rows_packed(idx, first / 32, rows.data(), scratch.data());
+            for (size_t slot = first; slot < std::min(first + 32, idx.slot_to_id.size()); ++slot) {
+                if (slot_is_active(idx, slot)) {
+                    add_state_hash(idx, slot_state_hash(idx, slot, rows.data() + (slot - first) * row_bytes));
+                }
+            }
+        }
+        idx.state_hash_valid = true;
+        return;
+    }
     for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
         if (slot_is_active(idx, slot)) {
             add_state_hash(idx, slot_state_hash(idx, slot));
@@ -3149,7 +3666,7 @@ static bool seek_to(std::FILE * stream, uint64_t offset) {
 // the two fixed-size header slots is skipped with a seek, so filesystems
 // with sparse-file support store it as a hole; the bytes read back are the
 // same as upstream's.
-int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image) {
+int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image, bool durable) {
     const uint64_t image_size = turbovec_v8_image_size(image);
 
     test_maybe_throw_bad_alloc();
@@ -3171,12 +3688,24 @@ int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image) {
         !write_bytes(f, image.header0.data(), image.header0.size())) {
         return fail_io();
     }
-    if (!image.units.empty()) {
-        if (!seek_to(f, units_at) || !write_bytes(f, image.units.data(), image.units.size())) {
+    if (image.n_units != 0) {
+        // Units go out in chunks of about 1 MiB, built as they are written.
+        const size_t per_chunk = std::max<size_t>(1, (size_t{ 1 } << 20) / image.unit_len);
+        std::vector<uint8_t> chunk(std::min(per_chunk, image.n_units) * image.unit_len);
+        if (!seek_to(f, units_at)) {
             return fail_io();
         }
+        for (size_t first = 0; first < image.n_units; first += per_chunk) {
+            const size_t count = std::min(per_chunk, image.n_units - first);
+            for (size_t i = 0; i < count; ++i) {
+                image.unit(first + i, chunk.data() + i * image.unit_len);
+            }
+            if (!write_bytes(f, chunk.data(), count * image.unit_len)) {
+                return fail_io();
+            }
+        }
     }
-    if (!set_file_size(f, image_size) || !flush_and_sync(f)) {
+    if (!set_file_size(f, image_size) || !flush_and_sync(f, durable)) {
         return fail_io();
     }
     const int close_result = std::fclose(temp.stream);
@@ -3189,16 +3718,16 @@ int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image) {
         return fail_io();
     }
     temp.path.clear();
-    if (!fsync_parent_dir(path)) {
+    if (durable && !fsync_parent_dir(path)) {
         return GGML_VEC_INDEX_E_NOT_DURABLE;
     }
     return GGML_VEC_INDEX_OK;
 }
 
-static int write_turbovec_v8_unlocked(ggml_vec_index_t * idx, const char * path) {
+static int write_turbovec_v8_unlocked(ggml_vec_index_t * idx, const char * path, bool durable) {
     TurboVecV8Image image;
     turbovec_v8_build_image(*idx, image);
-    return turbovec_v8_write_file(path, image);
+    return turbovec_v8_write_file(path, image, durable);
 }
 
 static std::FILE * open_existing_rw(const char * path) {
@@ -3290,7 +3819,7 @@ int ggml_vec_index_sync(ggml_vec_index_t * idx, const char * path) {
     }
 }
 
-static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * path) {
+static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * path, bool durable = true) {
     try {
         if (idx == nullptr || path == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -3303,7 +3832,7 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
             if (!has_vector_storage(*idx) || idx->turbovec_scale.size() != idx->slot_to_id.size()) {
                 return GGML_VEC_INDEX_E_INTERNAL;
             }
-            return write_turbovec_v8_unlocked(idx, path);
+            return write_turbovec_v8_unlocked(idx, path, durable);
         }
         if (active_count(*idx) > std::numeric_limits<uint32_t>::max()) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -3501,7 +4030,7 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
             !write_u32_le(f, vectors_crc ^ 0xffffffffu) || !write_u32_le(f, ids_crc ^ 0xffffffffu)) {
             return fail_io();
         }
-        if (!flush_and_sync(f)) {
+        if (!flush_and_sync(f, durable)) {
             return fail_io();
         }
         const int close_result = std::fclose(temp.stream);
@@ -3514,7 +4043,7 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
             return fail_io();
         }
         temp.path.clear();
-        if (!fsync_parent_dir(path)) {
+        if (durable && !fsync_parent_dir(path)) {
             return GGML_VEC_INDEX_E_NOT_DURABLE;
         }
         return GGML_VEC_INDEX_OK;
@@ -3525,8 +4054,12 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
     }
 }
 
-int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
-    if (idx == nullptr) {
+int ggml_vec_index_write_with_durability(
+        ggml_vec_index_t * idx,
+        const char * path,
+        enum ggml_vec_index_durability durability) {
+    if (idx == nullptr ||
+        (durability != GGML_VEC_INDEX_DURABILITY_DURABLE && durability != GGML_VEC_INDEX_DURABILITY_FAST)) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     try {
@@ -3534,14 +4067,20 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
         if (idx->delta_log_bound) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        const int status = ggml_vec_index_write_unlocked(idx, path);
-        if (status == GGML_VEC_INDEX_OK || status == GGML_VEC_INDEX_E_NOT_DURABLE) {
+        const bool durable = durability == GGML_VEC_INDEX_DURABILITY_DURABLE;
+        const int status = ggml_vec_index_write_unlocked(idx, path, durable);
+        // A delta log starts from a snapshot that is on stable storage.
+        if (durable && (status == GGML_VEC_INDEX_OK || status == GGML_VEC_INDEX_E_NOT_DURABLE)) {
             idx->delta_log_start_allowed = true;
         }
         return status;
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
     }
+}
+
+int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
+    return ggml_vec_index_write_with_durability(idx, path, GGML_VEC_INDEX_DURABILITY_DURABLE);
 }
 
 static bool supports_bytes(const ggml_vec_index & idx) {
@@ -3569,10 +4108,11 @@ int ggml_vec_index_to_bytes(const ggml_vec_index_t * idx, uint8_t ** out_bytes, 
         if (bytes == nullptr) {
             return GGML_VEC_INDEX_E_OOM;
         }
-        std::memcpy(bytes, image.superblock.data(), image.superblock.size());
-        std::memcpy(bytes + image.superblock.size(), image.header0.data(), image.header0.size());
-        if (!image.units.empty()) {
-            std::memcpy(bytes + image.superblock.size() + 2 * image.header_len, image.units.data(), image.units.size());
+        try {
+            turbovec_v8_fill_image(image, bytes);
+        } catch (...) {
+            std::free(bytes);
+            throw;
         }
         *out_bytes = bytes;
         *out_size = size;
@@ -4169,7 +4709,8 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                 idx->turbovec_bits,
                 dim,
                 idx->turbovec_blocked_data,
-                idx->turbovec_blocked_n_blocks);
+                idx->turbovec_blocked_n_blocks,
+                turbovec_layout(*idx));
         }
 
         rebuild_state_hash(*idx);

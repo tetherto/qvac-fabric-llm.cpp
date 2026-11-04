@@ -399,6 +399,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     return cur;
 }
 
+// the QSA layers attend through the k-pool selection, see build_attn_qsa
+static bool qwen4exp_has_qsa(const llama_hparams & hparams, const llama_memory_context_i * mctx) {
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
+
+    return mctx_hyb->get_idx() != nullptr && hparams.indexer_kpool > 0;
+}
+
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t hc = hparams.dsv4_hc_mult;
@@ -408,7 +415,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto * inp = build_inp_mem_hybrid();
+    // the QSA selection is built from the whole-cache kq_mask, so the QSA path keeps the dense mask (no kv_rows)
+    // TODO: drop once the selection is built without the kq_mask (upstream #31243)
+    auto * inp = build_inp_mem_hybrid(!qwen4exp_has_qsa(hparams, mctx));
 
     // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
     // the indexer cache inside it is absent when the GGUF has no indexer tensors
@@ -565,7 +574,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     res->add_input(std::move(inp));
 
-    auto * inp_hyb = build_inp_mem_hybrid();
+    auto * inp_hyb = build_inp_mem_hybrid(!qwen4exp_has_qsa(hparams, mctx));
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
 
     // the draft memory has no recurrent layer, but its input still has to be allocated
@@ -912,7 +921,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     }
 
     // the selection already carries the causal mask, and it comes in the mask layout
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->self_attn_mask.cnv;
     GGML_ASSERT(ggml_are_same_shape(sel, kq_mask));
     cb(sel, "kq_mask_qsa", il);
 
@@ -920,7 +929,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, nullptr, n_sel, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
@@ -945,7 +954,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
-    ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
+    ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->self_attn_mask.cnv, sections, il) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]

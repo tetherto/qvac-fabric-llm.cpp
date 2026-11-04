@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   linux:
-    runs-on: [self-hosted, Linux, CPU]
+    runs-on: qvac-ubuntu2204-x64
     steps:
       - uses: actions/checkout@v6
         with:
