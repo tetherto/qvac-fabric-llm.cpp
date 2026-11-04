@@ -91,8 +91,6 @@ int main() {
         if (!dev) { fprintf(stderr, "Metal unavailable\n"); return 77; }
         ggml_backend_metal_set_custom_serial(start_tag, execute_start);
         ggml_backend_metal_set_custom_serial(finish_tag, execute_finish);
-        // Cleaning up the legacy experiment must not remove library registrations.
-        ggml_backend_metal_set_custom2(nullptr, nullptr);
         bool first = false, second = false;
         std::thread a([&] { @autoreleasepool { first = run(dev); } });
         std::thread b([&] { @autoreleasepool { second = run(dev); } });

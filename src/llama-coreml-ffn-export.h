@@ -1,9 +1,10 @@
 #pragma once
 
-// Load-time export of the FFN sidecar: no conversion step for users. A template made by make_template.py holds the
-// int8 Core ML program for one channel count; for each layer and channel range the runtime writes weights/weight.bin
-// from the GGUF (per-channel symmetric int8, computed like coremltools so the packages match an offline export),
-// compiles the package and keeps the compiled model in a cache keyed by the GGUF and the range.
+// Load-time export of the FFN sidecar: no conversion step for users. A template made by
+// llama-coreml-ffn-templates/make_template.py holds the int8 Core ML program for one channel count; for each layer and
+// channel range the runtime writes weights/weight.bin from the GGUF (per-channel symmetric int8, computed like
+// coremltools so the packages match an offline export), compiles the package and keeps the compiled model in a cache
+// keyed by the GGUF and the range.
 
 #include "ggml.h"
 #include "gguf.h"

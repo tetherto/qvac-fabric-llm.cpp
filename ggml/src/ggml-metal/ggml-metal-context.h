@@ -29,7 +29,7 @@ void             ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph 
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev);
 void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
 
-#if defined(GGML_METAL_FFN_EXPERIMENT) || defined(GGML_METAL_CUSTOM_OPS)
+#ifdef GGML_METAL_CUSTOM_OPS
 void ggml_metal_shared_event(ggml_metal_t ctx, void * event, uint64_t value, bool wait);
 #endif
 

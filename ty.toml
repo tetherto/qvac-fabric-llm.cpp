@@ -37,10 +37,7 @@ not-subscriptable = "ignore"
 [[overrides]]
 include = [
     "./examples/embedding-coreml/export_coreml.py",
-    "./examples/ffn-coreml/export_ffn.py",
-    "./examples/ffn-coreml/export_sidecar.py",
-    "./examples/ffn-coreml/palettize_ffn.py",
-    "./examples/ffn-coreml/make_template.py",
+    "./src/llama-coreml-ffn-templates/make_template.py",
 ]
 
 [overrides.rules]

@@ -2642,17 +2642,6 @@ struct llama_model_qwen35 : public llama_model_base {
                     ggml_tensor * input,
                             int   il);
 
-#ifdef LLAMA_FFN_COREML_EXPERIMENT
-        // two interleaved 512-token halves of a 1024-token microbatch, see qwen35.cpp
-        ggml_tensor * build_halves(llm_graph_input_mem_hybrid * inp, ggml_tensor * inpL, ggml_tensor * inp_pos, int * sections);
-        ggml_tensor * build_half_attn(llm_graph_input_attn_kv * inp, ggml_tensor * cur, ggml_tensor * pos, int * sections, int h, int il);
-        ggml_tensor * build_half_attn_linear(llm_graph_input_rs * inp, ggml_tensor * cur, int h, int il);
-
-        // DeltaNet state handed from the first half to the second within a layer
-        ggml_tensor * half_conv_tail = nullptr;
-        ggml_tensor * half_ssm_state = nullptr;
-#endif
-
         const llama_model & model;
     };
 
