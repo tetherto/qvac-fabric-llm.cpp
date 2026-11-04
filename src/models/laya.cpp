@@ -263,13 +263,13 @@ llama_model_laya::graph::graph(const llama_model & model, const llm_graph_params
         ggml_build_forward_expand(gf, Vcur);
 
         // the no-cache mask is padded to 256 KV rows: pad K and V with zeros like build_attn does
-        ggml_tensor * kq_mask = inp_attn->get_kq_mask();
+        ggml_tensor * kq_mask = inp_attn->self_attn_mask.cnv;
         const int64_t n_kv_pad = kq_mask->ne[0] - Kcur->ne[2];
 
         Kcur = ggml_pad(ctx0, Kcur, 0, 0, n_kv_pad, 0);
         Vcur = ggml_pad(ctx0, Vcur, 0, 0, n_kv_pad, 0);
 
-        cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, kq_mask, nullptr, nullptr, 0,
+        cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, kq_mask, nullptr, nullptr, nullptr, 0,
                 1.0f/sqrtf(float(n_embd_head)), il);
         cb(cur, "decision_kqv_out", il);
 

@@ -168,8 +168,17 @@ if (TARGET ggml-vector-index)
     target_compile_features(test-vector-index PRIVATE cxx_std_17)
     # Golden inputs are rebuilt bit for bit: no fused multiply-adds and no
     # fast-math from the toolchain.
-    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    # Same options as ggml-vector-index (ggml/src/ggml-vector-index/CMakeLists.txt).
+    set(TEST_VECTOR_INDEX_FP_OPTIONS "")
+    if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        set(TEST_VECTOR_INDEX_FP_OPTIONS "/fp:precise")
+        if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            list(APPEND TEST_VECTOR_INDEX_FP_OPTIONS "/clang:-ffp-contract=off")
+        endif()
+    elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         set(TEST_VECTOR_INDEX_FP_OPTIONS -fno-fast-math -ffp-contract=off)
+    elseif (MSVC)
+        set(TEST_VECTOR_INDEX_FP_OPTIONS "/fp:precise")
     endif()
     target_compile_options(test-vector-index PRIVATE ${TEST_VECTOR_INDEX_FP_OPTIONS})
     target_include_directories(test-vector-index PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
@@ -185,10 +194,17 @@ if (TARGET ggml-vector-index)
     target_include_directories(test-vector-index-hooks PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     target_compile_definitions(test-vector-index-hooks PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
     target_link_libraries(test-vector-index-hooks PRIVATE ggml-vector-index-test)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
+        (LLAMA_SANITIZE_THREAD OR GGML_SANITIZE_THREAD))
+        target_link_options(test-vector-index-hooks PRIVATE -fno-sanitize-link-c++-runtime)
+    endif()
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS test-vector-index-hooks RUNTIME)
     endif()
     llama_test(test-vector-index-hooks ARGS --internal-hooks)
+    if (LLAMA_SANITIZE_THREAD OR GGML_SANITIZE_THREAD)
+        set_tests_properties(test-vector-index-hooks PROPERTIES ENVIRONMENT "TSAN_OPTIONS=die_after_fork=0")
+    endif()
     # The full suite again, against the hooks build, so checks that need
     # internal access (rotation and golden hashes) run alongside it.
     llama_test(test-vector-index-hooks NAME test-vector-index-hooks-full)
@@ -440,6 +456,20 @@ if (GGML_WEBGPU AND NOT EMSCRIPTEN)
     set_tests_properties(test-webgpu-trig-range PROPERTIES SKIP_RETURN_CODE 77)
     llama_build_and_test(test-webgpu-mul-mat-prec-f32.cpp)
     set_tests_properties(test-webgpu-mul-mat-prec-f32 PROPERTIES SKIP_RETURN_CODE 77)
+    # Every WebGPU device that registers must compute; with the Vulkan drivers
+    # hidden Dawn offers only its Null adapter, which the backend must refuse,
+    # leaving the CPU as the best backend. ggml_backend_load_all() loads the
+    # WebGPU backend only when GGML_WEBGPU_AUTOLOAD=1, so both runs opt in.
+    llama_build_and_test(test-webgpu-null-adapter.cpp)
+    set_tests_properties(test-webgpu-null-adapter PROPERTIES ENVIRONMENT "GGML_WEBGPU_AUTOLOAD=1")
+    if (GGML_BACKEND_DL)
+        add_dependencies(test-webgpu-null-adapter ggml-webgpu)
+    endif()
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        llama_test(test-webgpu-null-adapter NAME test-webgpu-null-adapter-no-driver ARGS --expect-no-device)
+        set_tests_properties(test-webgpu-null-adapter-no-driver PROPERTIES ENVIRONMENT
+            "GGML_WEBGPU_AUTOLOAD=1;VK_ICD_FILENAMES=/nonexistent/no-vulkan-driver.json;VK_DRIVER_FILES=/nonexistent/no-vulkan-driver.json")
+    endif()
     llama_build(test-webgpu-registry.cpp)
     if (GGML_BACKEND_DL)
         target_compile_definitions(test-webgpu-registry PRIVATE TEST_WEBGPU_DL)
@@ -533,6 +563,8 @@ add_executable(test-hexagon-dma-reader test-hexagon-dma-reader.cpp)
 llama_test(test-hexagon-dma-reader)
 
 llama_build(test-backend-ops.cpp LINK ggml)
+
+llama_build_and_test(test-backend-memory.cpp LINK ggml)
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 
@@ -628,6 +660,28 @@ llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-laya.cpp)
 
+# XDNA NPU. Self-skipping when no XDNA device is registered.
+if (GGML_XDNA)
+    # Load, run and free a model several times in one process (#293).
+    llama_build_and_test(test-xdna-reload.cpp       LABEL "model")
+    # Graphs the backend rewrites, against the CPU backend. Needs the device,
+    # no model.
+    llama_build_and_test(test-xdna-graph.cpp)
+    # Two llama contexts computing at once (-m model.gguf).
+    llama_build_and_test(test-xdna-contexts.cpp     LABEL "model")
+    # A sequence's state saved and restored around other tokens (-m model.gguf).
+    llama_build_and_test(test-xdna-state.cpp        LABEL "model")
+    # Every thread's CPU mask unchanged by the pinned host decode (-m model.gguf).
+    llama_build_and_test(test-xdna-affinity.cpp     LABEL "model")
+    # The host-only backend tests are built with the backend
+    # (ggml/src/ggml-xdna/CMakeLists.txt); they need no model and no device.
+    foreach(t test-xdna-repack test-xdna-head-rows test-xdna-match)
+        if (TARGET ${t})
+            add_test(NAME ${t} COMMAND ${t} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+        endif()
+    endforeach()
+endif()
+
 if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()
@@ -643,6 +697,12 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     target_include_directories(test-quantize-fns PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     llama_build_and_test(test-quantize-perf.cpp LINK ggml)
     llama_build_and_test(test-rope.cpp LINK ggml)
+    find_package(Threads REQUIRED)
+    llama_build_and_test(test-tbq-init.cpp LINK ggml Threads::Threads)
+    target_include_directories(test-tbq-init PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    llama_test(test-tbq-init NAME test-tbq-init-correction)
+    set_tests_properties(test-tbq-init PROPERTIES ENVIRONMENT "GGML_TQ_NORM_CORRECTION=0")
+    set_tests_properties(test-tbq-init-correction PROPERTIES ENVIRONMENT "GGML_TQ_NORM_CORRECTION=1")
     llama_build_and_test(test-gdn-deferred.cpp LINK ggml)
     llama_build_and_test(test-col2im-1d.cpp LINK ggml)
     llama_build_and_test(test-conv-1d.cpp LINK ggml)
@@ -724,6 +784,10 @@ if (TARGET gguf-model-data)
 endif()
 
 if (GGML_OPENCL)
+    llama_build_and_test(test-opencl-buffer-type-init.cpp)
+    set_tests_properties(test-opencl-buffer-type-init PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build_and_test(test-opencl-add-strided-row.cpp)
+    set_tests_properties(test-opencl-add-strided-row PROPERTIES SKIP_RETURN_CODE 77)
     llama_build_and_test(test-opencl-mul-mat-sum-range.cpp)
     set_tests_properties(test-opencl-mul-mat-sum-range PROPERTIES
         SKIP_RETURN_CODE 77
