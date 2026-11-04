@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-coreml-ffn-impl.h"
 
 #ifdef LLAMA_USE_COREML
 #include "llama-coreml-impl.h"
@@ -278,7 +279,7 @@ llama_context::llama_context(
     }
 
     if (params.ctx_other_share_compute && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr &&
-        &params.ctx_other->get_model() == &model &&
+        &params.ctx_other->get_model() == &model && !params.ctx_other->coreml_ffn &&
         cparams.n_seq_max == 1 && params.ctx_other->n_seq_max() == 1) {
         ctx_compute = params.ctx_other->compute_state;
         params.ctx_other->compute_share_source = true;
@@ -647,6 +648,8 @@ llama_context::~llama_context() {
     compute_state.reset();
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    coreml_ffn.reset();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1720,7 +1723,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (!llama_coreml_ffn_check(coreml_ffn.get())) { status = GGML_STATUS_FAILED; }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3053,6 +3057,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.coreml_ffn  =*/ !cparams.training && !cparams.training_ctx && !cparams.cb_eval && ctx_compute.expired() && !compute_share_source ? coreml_ffn.get() : nullptr,
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ hdmd->rot.empty() && hdmd->inv.empty() ? nullptr : hdmd.get(),
         /*.samplers    =*/ sampling.samplers,

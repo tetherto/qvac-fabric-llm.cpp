@@ -17,6 +17,7 @@
 #include "gguf.h"
 #include "uint8-buff-stream.h"
 
+#include <filesystem>
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
@@ -482,7 +483,25 @@ struct llama_model * llama_model_load_from_file(
     std::vector<std::string> splits = {};
     try {
         llama_model_loader ml = create_disk_fileloader(path_model, splits, params);
-        return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, /*file*/ nullptr, params);
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
+            llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, /*file*/ nullptr, params),
+            llama_model_free);
+        if (model && ml.files.size() == 1) {
+            std::error_code ec;
+            const auto path = std::filesystem::canonical(path_model, ec);
+            if (!ec) {
+                const auto size = std::filesystem::file_size(path, ec);
+                if (!ec) {
+                    const auto modified = std::filesystem::last_write_time(path, ec);
+                    if (!ec) {
+                        model->source_path = path.string();
+                        model->source_size = size;
+                        model->source_mtime = modified.time_since_epoch().count();
+                    }
+                }
+            }
+        }
+        return model.release();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
         return nullptr;
