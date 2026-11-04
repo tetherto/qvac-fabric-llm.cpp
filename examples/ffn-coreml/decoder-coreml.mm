@@ -1,13 +1,11 @@
 #include "ffn-coreml-common.h"
 #include "ffn-coreml-hook.h"
-#include "ffn-coreml-otf.h"
 #include "ggml-metal.h"
 #include "llama-ext.h"
 
 #import <Metal/Metal.h>
 
 #include <cstdlib>
-#include <deque>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -17,12 +15,6 @@
 static bool profile_enabled = false;
 static bool direct_input = false;
 static bool gpu_resident = false;
-
-// FFN_COREML_INGRAPH: the Metal share of each FFN runs as ordinary graph nodes on views of the model's own weights, so
-// it needs no weight copy and no per-layer buffers; only the ANE share goes through custom nodes
-static const bool ingraph_mode = std::getenv("FFN_COREML_INGRAPH") != nullptr;
-// rows of the Core ML programs; the in-graph path cuts larger microbatches into chunks of this size
-static const int ingraph_tokens = 512;
 
 // FFN_COREML_ASYNC: the resident path hands each ANE call to a serial worker instead of blocking the graph thread.
 // The GPU signals ane_ready when the FFN input is written; the worker waits for it, predicts, then signals ane_done,
@@ -67,10 +59,25 @@ struct stage_profile {
     }
 };
 
-static MLMultiArray * decoder_output(id<MLFeatureProvider> result, int tokens = 512) {
+static MLMultiArray * decoder_output(id<MLFeatureProvider> result) {
     MLMultiArray * y = [result featureValueForName:@"y"].multiArrayValue;
-    require(y && y.dataType == MLMultiArrayDataTypeFloat32 && y.shape.count == 2 && y.shape[0].intValue == tokens && y.shape[1].intValue == 5120, "unexpected decoder FFN output");
+    require(y && y.dataType == MLMultiArrayDataTypeFloat32 && y.shape.count == 2 && y.shape[0].intValue == 512 && y.shape[1].intValue == 5120, "unexpected decoder FFN output");
     return y;
+}
+
+// a 512 x 5120 Core ML array on the memory of a Metal tensor
+static MLMultiArray * bind_rows(void * data) {
+    NSError * failure = nil;
+    MLMultiArray * array = [[MLMultiArray alloc] initWithDataPointer:data shape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
+    require(array, failure ? failure.localizedDescription.UTF8String : "Core ML array binding failed");
+    return array;
+}
+
+static MLDictionaryFeatureProvider * bind_input(MLMultiArray * x) {
+    NSError * failure = nil;
+    MLDictionaryFeatureProvider * features = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": x} error:&failure];
+    require(features, failure ? failure.localizedDescription.UTF8String : "Core ML input provider failed");
+    return features;
 }
 
 static MLModel * decoder_load_compiled(NSURL * url) {
@@ -81,53 +88,6 @@ static MLModel * decoder_load_compiled(NSURL * url) {
     require(model, failure ? failure.localizedDescription.UTF8String : "decoder Core ML load failed");
     return model;
 }
-
-// FFN_COREML_OTF=<Metal channels>x<packages>: write the sidecar from the GGUF at load time (ffn-coreml-otf.h) instead
-// of reading prepared assets. Each package takes an equal share of the remaining channels; its template comes from
-// FFN_COREML_TEMPLATES (int8-c<channels>), compiled models are cached under FFN_COREML_CACHE (default ~/Library/Caches/ffn-coreml)
-struct otf_config {
-    int metal = 0, packages = 0;
-    otf_template tmpl;
-    std::filesystem::path cache;
-    double export_s = 0, compile_s = 0, load_s = 0;
-    int created = 0;
-
-    bool enabled() const { return packages > 0; }
-
-    void init(const std::string & gguf) {
-        const char * value = std::getenv("FFN_COREML_OTF");
-        if (!value) { return; }
-        require(sscanf(value, "%dx%d", &metal, &packages) == 2 && metal > 0 && metal % 256 == 0 && packages >= 1 && packages <= 2 &&
-                (17408 - metal) % packages == 0, "FFN_COREML_OTF must be <Metal channels>x<1 or 2 packages>");
-        const char * templates = std::getenv("FFN_COREML_TEMPLATES");
-        require(templates, "FFN_COREML_OTF needs FFN_COREML_TEMPLATES");
-        tmpl.load(std::filesystem::path(templates) / ("int8-c" + std::to_string((17408 - metal) / packages)));
-        const char * root = std::getenv("FFN_COREML_CACHE");
-        cache = otf_cache_dir(root ? std::filesystem::path(root) : std::filesystem::path(std::getenv("HOME")) / "Library/Caches/ffn-coreml", gguf, tmpl);
-        printf("ffn_coreml_otf metal_channels=%d packages=%d template=%s cache=%s\n", metal, packages, tmpl.dir.c_str(), cache.c_str());
-    }
-
-    void load(const std::string & gguf, int layer, MLModel * __strong & first, MLModel * __strong & second) {
-        otf_layer weights;
-        bool read = false;
-        auto get = [&]() -> const otf_layer & {
-            if (!read) { weights.read(gguf, layer); read = true; }
-            return weights;
-        };
-        for (int p = 0; p < packages; ++p) {
-            double e = 0, c = 0;
-            NSURL * url = otf_compiled(tmpl, cache, layer, metal + p * tmpl.channels, get, e, c);
-            const auto t0 = std::chrono::steady_clock::now();
-            (p == 0 ? first : second) = decoder_load_compiled(url);
-            load_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            export_s += e;
-            compile_s += c;
-            created += e > 0;
-        }
-    }
-};
-
-static otf_config otf;
 
 static MLModel * decoder_load(const std::string & assets, const char * name, int layer, temporary_model & compiled) {
     NSError * failure = nil;
@@ -158,21 +118,14 @@ static MLModel * decoder_load(const std::string & assets, const char * name, int
 
 struct decoder_ffn;
 
-// custom op userdata: stage -1 runs the whole FFN, 0 starts it and 1 finishes it (two-half microbatches);
-// 2 and 3 start and finish the ANE share of an in-graph FFN (FFN_COREML_INGRAPH)
+// custom op userdata: stage -1 runs the whole FFN, 0 starts it and 1 finishes it (two-half microbatches)
 struct ffn_call {
     decoder_ffn * runtime;
     int stage;
 };
 
 struct decoder_ffn {
-    ffn_call call[5] = {{this, -1}, {this, 0}, {this, 1}, {this, 2}, {this, 3}};
-    bool ingraph = false;
-    int metal_channels = 0;
-    // in-graph: Core ML output backings for each start-node buffer they were created for, and the async values of
-    // started chunks, finished in order
-    std::map<const void *, std::pair<MLPredictionOptions *, MLPredictionOptions *>> outputs;
-    std::deque<uint64_t> started;
+    ffn_call call[3] = {{this, -1}, {this, 0}, {this, 1}};
     // async value of the started call, finished by the next stage 1 call
     uint64_t pending = 0;
     // Core ML inputs bound to the Metal buffers they were created for
@@ -204,61 +157,9 @@ struct decoder_ffn {
         if (error.empty()) { error = message; }
     }
 
-    void predict(bool resident = false) {
-        if (!direct_input && !resident) { memcpy(input.dataPointer, x.data(), x.size() * sizeof(float)); }
-        profile.end(3);
-        __block id<MLFeatureProvider> second = nil;
-        __block NSError * second_failure = nil;
-        dispatch_group_t group = dispatch_group_create();
-        if (model2) {
-            MLModel * other = model2;
-            MLDictionaryFeatureProvider * inputs = features;
-            dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-                @autoreleasepool {
-                    NSError * failure = nil;
-                    second = [other predictionFromFeatures:inputs error:&failure];
-                    second_failure = failure;
-                }
-            });
-        }
-        NSError * failure = nil;
-        id<MLFeatureProvider> result = [model predictionFromFeatures:features error:&failure];
-        dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
-        profile.end(4);
-        require(result, failure ? failure.localizedDescription.UTF8String : "Core ML prediction failed");
-        require(!model2 || second, second_failure ? second_failure.localizedDescription.UTF8String : "second Core ML prediction failed");
-        MLMultiArray * y = decoder_output(result);
-        MLMultiArray * y2 = model2 ? decoder_output(second) : nil;
-        const float * values = static_cast<const float *>(y.dataPointer);
-        const float * values2 = y2 ? static_cast<const float *>(y2.dataPointer) : nullptr;
-        size_t row_stride = y.strides[0].unsignedLongLongValue, column_stride = y.strides[1].unsignedLongLongValue;
-        size_t row_stride2 = y2 ? y2.strides[0].unsignedLongLongValue : 0, column_stride2 = y2 ? y2.strides[1].unsignedLongLongValue : 0;
-        for (int t = 0; t < 512; ++t) {
-            for (int h = 0; h < 5120; ++h) {
-                float value = values[t * row_stride + h * column_stride];
-                if (values2) { value += values2[t * row_stride2 + h * column_stride2]; }
-                value *= inverse_scale;
-                if (!std::isfinite(value)) { throw std::runtime_error("non-finite integrated FFN output"); }
-                partial[t * 5120 + h] = value;
-            }
-        }
-    }
-
-    void adopt(id<MLFeatureProvider> result, ggml_tensor * target) { adopt_into(result, static_cast<float *>(target->data)); }
-
-    void adopt_into(id<MLFeatureProvider> result, float * out, int tokens = 512) {
-        MLMultiArray * y = decoder_output(result, tokens);
-        if (y.dataPointer == out) { return; }
-        ++backing_fallbacks;
-        const float * values = static_cast<const float *>(y.dataPointer);
-        size_t row_stride = y.strides[0].unsignedLongLongValue, column_stride = y.strides[1].unsignedLongLongValue;
-        for (int t = 0; t < tokens; ++t) {
-            for (int h = 0; h < 5120; ++h) { out[t * 5120 + h] = values[t * row_stride + h * column_stride]; }
-        }
-    }
-
-    // both packages at once (the two ANEs), outputs into out (and the next ingraph_tokens x 5120 for the second package)
-    void predict_into(MLDictionaryFeatureProvider * inputs, MLPredictionOptions * first, MLPredictionOptions * second_options, float * out) {
+    // both packages at once (the two ANEs); Core ML writes the outputs into the backings of the options, if any
+    std::pair<id<MLFeatureProvider>, id<MLFeatureProvider>> predict_both(MLDictionaryFeatureProvider * inputs, MLPredictionOptions * first,
+                                                                         MLPredictionOptions * second_options) {
         __block id<MLFeatureProvider> second = nil;
         __block NSError * second_failure = nil;
         dispatch_group_t group = dispatch_group_create();
@@ -277,33 +178,49 @@ struct decoder_ffn {
         dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
         require(result, failure ? failure.localizedDescription.UTF8String : "Core ML prediction failed");
         require(!model2 || second, second_failure ? second_failure.localizedDescription.UTF8String : "second Core ML prediction failed");
-        adopt_into(result, out, ingraph_tokens);
-        if (model2) { adopt_into(second, out + ingraph_tokens * 5120, ingraph_tokens); }
+        return {result, second};
+    }
+
+    void predict(bool resident = false) {
+        if (!direct_input && !resident) { memcpy(input.dataPointer, x.data(), x.size() * sizeof(float)); }
+        profile.end(3);
+        MLPredictionOptions * none = [[MLPredictionOptions alloc] init];
+        const auto results = predict_both(features, none, none);
+        profile.end(4);
+        MLMultiArray * y = decoder_output(results.first);
+        MLMultiArray * y2 = model2 ? decoder_output(results.second) : nil;
+        const float * values = static_cast<const float *>(y.dataPointer);
+        const float * values2 = y2 ? static_cast<const float *>(y2.dataPointer) : nullptr;
+        size_t row_stride = y.strides[0].unsignedLongLongValue, column_stride = y.strides[1].unsignedLongLongValue;
+        size_t row_stride2 = y2 ? y2.strides[0].unsignedLongLongValue : 0, column_stride2 = y2 ? y2.strides[1].unsignedLongLongValue : 0;
+        for (int t = 0; t < 512; ++t) {
+            for (int h = 0; h < 5120; ++h) {
+                float value = values[t * row_stride + h * column_stride];
+                if (values2) { value += values2[t * row_stride2 + h * column_stride2]; }
+                value *= inverse_scale;
+                if (!std::isfinite(value)) { throw std::runtime_error("non-finite integrated FFN output"); }
+                partial[t * 5120 + h] = value;
+            }
+        }
+    }
+
+    void adopt(id<MLFeatureProvider> result, ggml_tensor * target) {
+        float * out = static_cast<float *>(target->data);
+        MLMultiArray * y = decoder_output(result);
+        if (y.dataPointer == out) { return; }
+        ++backing_fallbacks;
+        const float * values = static_cast<const float *>(y.dataPointer);
+        size_t row_stride = y.strides[0].unsignedLongLongValue, column_stride = y.strides[1].unsignedLongLongValue;
+        for (int t = 0; t < 512; ++t) {
+            for (int h = 0; h < 5120; ++h) { out[t * 5120 + h] = values[t * row_stride + h * column_stride]; }
+        }
     }
 
     void predict_backed(MLDictionaryFeatureProvider * inputs, bool timed = true) {
-        __block id<MLFeatureProvider> second = nil;
-        __block NSError * second_failure = nil;
-        dispatch_group_t group = dispatch_group_create();
-        if (model2) {
-            MLModel * other = model2;
-            MLPredictionOptions * other_options = options2;
-            dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-                @autoreleasepool {
-                    NSError * failure = nil;
-                    second = [other predictionFromFeatures:inputs options:other_options error:&failure];
-                    second_failure = failure;
-                }
-            });
-        }
-        NSError * failure = nil;
-        id<MLFeatureProvider> result = [model predictionFromFeatures:inputs options:options error:&failure];
-        dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+        const auto results = predict_both(inputs, options, options2);
         if (timed) { profile.end(4); }
-        require(result, failure ? failure.localizedDescription.UTF8String : "Core ML prediction failed");
-        require(!model2 || second, second_failure ? second_failure.localizedDescription.UTF8String : "second Core ML prediction failed");
-        adopt(result, join.ane);
-        if (model2) { adopt(second, join.ane2); }
+        adopt(results.first, join.ane);
+        if (model2) { adopt(results.second, join.ane2); }
     }
 
     void execute(float * output, bool inputs_ready = false) {
@@ -350,59 +267,33 @@ struct decoder_ffn {
             return;
         }
         NSError * failure = nil;
-        int gpu_channels = 0, ane_channels = 0, ane2_channels = 0;
-        double scale = 1;
-        if (otf.enabled()) {
-            otf.load(gguf, layer, model, model2);
-            gpu_channels = otf.metal;
-            ane_channels = otf.tmpl.channels;
-            ane2_channels = model2 ? otf.tmpl.channels : 0;
-        } else {
-            model = decoder_load(assets, "ffn-512", layer, compiled);
-            NSDictionary * metadata = model.modelDescription.metadata[MLModelCreatorDefinedKey];
-            gpu_channels = [metadata[@"channel_start"] intValue];
-            ane_channels = [metadata[@"channel_count"] intValue];
-            scale = [metadata[@"output_scale"] doubleValue];
-            require([metadata[@"source_layer"] intValue] == layer, "wrong integrated FFN package");
-            NSFileManager * files = [NSFileManager defaultManager];
-            NSString * second = [NSString stringWithFormat:@"%s/ffn-512-1", assets.c_str()];
-            if ([files fileExistsAtPath:[second stringByAppendingString:@".mlpackage"]] ||
-                (std::getenv("FFN_COREML_CACHE_COMPILED") && [files fileExistsAtPath:[[second stringByAppendingString:@".mlmodelc"] stringByResolvingSymlinksInPath]])) {
-                model2 = decoder_load(assets, "ffn-512-1", layer, compiled2);
-                NSDictionary * metadata2 = model2.modelDescription.metadata[MLModelCreatorDefinedKey];
-                ane2_channels = [metadata2[@"channel_count"] intValue];
-                require([metadata2[@"source_layer"] intValue] == layer && [metadata2[@"channel_start"] intValue] == gpu_channels + ane_channels &&
-                        [metadata2[@"output_scale"] doubleValue] == scale && ane2_channels > 0, "second FFN package must follow the first");
-            }
+        model = decoder_load(assets, "ffn-512", layer, compiled);
+        NSDictionary * metadata = model.modelDescription.metadata[MLModelCreatorDefinedKey];
+        int gpu_channels = [metadata[@"channel_start"] intValue];
+        int ane_channels = [metadata[@"channel_count"] intValue];
+        int ane2_channels = 0;
+        double scale = [metadata[@"output_scale"] doubleValue];
+        NSFileManager * files = [NSFileManager defaultManager];
+        NSString * second = [NSString stringWithFormat:@"%s/ffn-512-1", assets.c_str()];
+        if ([files fileExistsAtPath:[second stringByAppendingString:@".mlpackage"]] ||
+            (std::getenv("FFN_COREML_CACHE_COMPILED") && [files fileExistsAtPath:[[second stringByAppendingString:@".mlmodelc"] stringByResolvingSymlinksInPath]])) {
+            model2 = decoder_load(assets, "ffn-512-1", layer, compiled2);
+            NSDictionary * metadata2 = model2.modelDescription.metadata[MLModelCreatorDefinedKey];
+            ane2_channels = [metadata2[@"channel_count"] intValue];
+            require([metadata2[@"source_layer"] intValue] == layer && [metadata2[@"channel_start"] intValue] == gpu_channels + ane_channels &&
+                    [metadata2[@"output_scale"] doubleValue] == scale && ane2_channels > 0, "second FFN package must follow the first");
         }
-        require(gpu_channels > 0 && gpu_channels % 256 == 0 && ane_channels > 0 && gpu_channels + ane_channels + ane2_channels == 17408, "wrong integrated FFN package");
+        require([metadata[@"source_layer"] intValue] == layer && gpu_channels > 0 && gpu_channels % 256 == 0 && ane_channels > 0 && gpu_channels + ane_channels + ane2_channels == 17408, "wrong integrated FFN package");
         require(scale == 1 || scale == 16, "unsupported integrated output scale");
         inverse_scale = 1.0 / scale;
-        metal_channels = gpu_channels;
-        if (ingraph_mode) {
-            require(gpu_resident && ane_async::get().enabled && scale == 1, "FFN_COREML_INGRAPH needs FFN_COREML_GPU_RESIDENT, FFN_COREML_ASYNC and output scale 1");
-            ingraph = true;
-            // load the ANE programs now rather than during the first prompt; the pool frees the warm-up arrays
-            // (about 30 MB per layer) here instead of at the end of the caller's pool
-            @autoreleasepool {
-                MLMultiArray * zeros = [[MLMultiArray alloc] initWithShape:@[@(ingraph_tokens), @5120] dataType:MLMultiArrayDataTypeFloat32 error:&failure];
-                require(zeros, "warm-up input allocation failed");
-                memset(zeros.dataPointer, 0, size_t(ingraph_tokens) * 5120 * sizeof(float));
-                MLDictionaryFeatureProvider * warm = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": zeros} error:&failure];
-                require(warm && [model predictionFromFeatures:warm error:&failure] && (!model2 || [model2 predictionFromFeatures:warm error:&failure]), "warm-up prediction failed");
-            }
-            printf("decoder_layer=%d in_graph=1 metal_channels=%d coreml_channels=%d coreml2_channels=%d\n", layer, gpu_channels, ane_channels, ane2_channels);
-            return;
-        }
         prefix.init(gguf, assets, layer, 512, false, gpu_channels, true, direct_input);
         if (direct_input) {
-            input = [[MLMultiArray alloc] initWithDataPointer:prefix.input->data shape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
+            input = bind_rows(prefix.input->data);
         } else {
             input = [[MLMultiArray alloc] initWithShape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 error:&failure];
+            require(input, "integrated FFN input allocation failed");
         }
-        require(input, "integrated FFN input allocation failed");
-        features = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": input} error:&failure];
-        require(features, "integrated FFN provider failed");
+        features = bind_input(input);
         printf("decoder_layer=%d metal_channels=%d coreml_channels=%d coreml2_channels=%d output_scale=%.0f\n", layer, gpu_channels, ane_channels, ane2_channels, scale);
         // on by default for the resident path; FFN_COREML_OUTPUT_BACKING=0 keeps the CPU copy
         const char * backing_env = std::getenv("FFN_COREML_OUTPUT_BACKING");
@@ -411,11 +302,8 @@ struct decoder_ffn {
         if (backed) {
             auto backing = [&](ggml_tensor * target) {
                 require(ggml_backend_metal_tensor_is_shared(target), "output backing requires shared Metal storage");
-                NSError * failure = nil;
-                MLMultiArray * array = [[MLMultiArray alloc] initWithDataPointer:target->data shape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
-                require(array, "output backing allocation failed");
                 MLPredictionOptions * result = [[MLPredictionOptions alloc] init];
-                result.outputBackings = @{@"y": array};
+                result.outputBackings = @{@"y": bind_rows(target->data)};
                 return result;
             };
             options = backing(join.ane);
@@ -447,27 +335,18 @@ struct decoder_state {
     }
 };
 
-// layers listed in <assets>/layers.txt; with FFN_COREML_OTF and no list, every layer
+// layers listed in <assets>/layers.txt
 static void load_layers(decoder_state & state, const std::string & gguf, const std::string & assets) {
     std::vector<int> layers;
     std::ifstream selected(std::filesystem::path(assets) / "layers.txt");
     int layer;
     while (selected >> layer) { layers.push_back(layer); }
-    if (layers.empty() && otf.enabled()) {
-        for (layer = 0; layer < 64; ++layer) { layers.push_back(layer); }
-    }
     require(!layers.empty(), "no selected layers in layers.txt");
-    const auto start = std::chrono::steady_clock::now();
     for (int l : layers) {
         require(l >= 0 && l < 64 && !state.layers.count(l), "invalid selected layer");
         auto runtime = std::make_unique<decoder_ffn>();
         runtime->init(gguf, (std::filesystem::path(assets) / ("layer" + std::to_string(l))).string(), l, state.metal_reference);
         state.layers.emplace(l, std::move(runtime));
-    }
-    if (otf.enabled()) {
-        printf("ffn_coreml_otf layers=%zu packages_created=%d export_s=%.1f compile_s=%.1f load_s=%.1f setup_s=%.1f\n", layers.size(), otf.created,
-               otf.export_s, otf.compile_s, otf.load_s, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
-        fflush(stdout);
     }
 }
 
@@ -514,13 +393,7 @@ static void ane_start(ggml_backend_t backend, decoder_ffn & runtime, const ggml_
     bind_resident_tensor(runtime.prefix.residual, residual);
     require(ggml_backend_graph_compute_async(backend, runtime.prefix.graph) == GGML_STATUS_SUCCESS, "resident Metal prefix failed");
     __strong MLDictionaryFeatureProvider * & inputs = runtime.inputs[src->data];
-    if (!inputs) {
-        NSError * failure = nil;
-        MLMultiArray * x = [[MLMultiArray alloc] initWithDataPointer:src->data shape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
-        require(x, "resident Core ML input binding failed");
-        inputs = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": x} error:&failure];
-        require(inputs, "resident Core ML provider failed");
-    }
+    if (!inputs) { inputs = bind_input(bind_rows(src->data)); }
     decoder_ffn * worker = &runtime;
     MLDictionaryFeatureProvider * features = inputs;
     id<MTLSharedEvent> ready = async.ready, done = async.done;
@@ -576,11 +449,8 @@ static bool decoder_resident_compute(ggml_backend_t backend, ggml_tensor * dst, 
             if (!runtime.full_metal) {
                 require(ggml_backend_metal_tensor_is_shared(src), "Core ML input must use shared Metal storage");
                 if (runtime.input.dataPointer != src->data) {
-                    NSError * failure = nil;
-                    runtime.input = [[MLMultiArray alloc] initWithDataPointer:src->data shape:@[@512, @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
-                    require(runtime.input, "resident Core ML input binding failed");
-                    runtime.features = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": runtime.input} error:&failure];
-                    require(runtime.features, "resident Core ML provider failed");
+                    runtime.input = bind_rows(src->data);
+                    runtime.features = bind_input(runtime.input);
                 }
                 if (runtime.backed) { runtime.predict_backed(runtime.features); } else { runtime.predict(true); }
                 runtime.profile.end(5);
@@ -603,16 +473,20 @@ static bool decoder_resident_compute(ggml_backend_t backend, ggml_tensor * dst, 
     }
 }
 
+// a partial microbatch (or second half) of at least FFN_COREML_PAD_MIN rows is padded with zero rows to the 512 rows of
+// the Core ML programs; smaller ones stay on Metal
+static int pad_min() {
+    static const int value = std::getenv("FFN_COREML_PAD_MIN") ? std::atoi(std::getenv("FFN_COREML_PAD_MIN")) : 256;
+    return value;
+}
+
 static ggml_tensor * decoder_build(ggml_context * ctx, ggml_tensor * input, ggml_tensor * residual, int layer, void * userdata) {
     auto & state = *static_cast<decoder_state *>(userdata);
     auto found = state.layers.find(layer);
-    if (found == state.layers.end() || found->second->ingraph || input->type != GGML_TYPE_F32 || input->ne[0] != 5120 || input->ne[2] != 1 || input->ne[3] != 1) { return nullptr; }
-    // a partial microbatch of at least FFN_COREML_PAD_MIN rows is padded with zero rows to the 512 rows of the
-    // Core ML programs; smaller ones stay on Metal
-    static const int pad_min = std::getenv("FFN_COREML_PAD_MIN") ? std::atoi(std::getenv("FFN_COREML_PAD_MIN")) : 256;
+    if (found == state.layers.end() || input->type != GGML_TYPE_F32 || input->ne[0] != 5120 || input->ne[2] != 1 || input->ne[3] != 1) { return nullptr; }
     const int rows = input->ne[1];
     if (rows == 512) { return ggml_map_custom2(ctx, input, residual, decoder_compute, 1, &found->second->call[0]); }
-    if (!gpu_resident || rows > 1024 || (rows < 512 && rows < pad_min)) { return nullptr; }
+    if (!gpu_resident || rows > 1024 || (rows < 512 && rows < pad_min())) { return nullptr; }
     auto padded_call = [&](ggml_tensor * x, ggml_tensor * r) {
         const int n = x->ne[1];
         auto * out = ggml_map_custom2(ctx, ggml_pad(ctx, x, 0, 512 - n, 0, 0), ggml_pad(ctx, r, 0, 512 - n, 0, 0), decoder_compute, 1, &found->second->call[0]);
@@ -631,16 +505,14 @@ static ggml_tensor * decoder_split_build(ggml_context * ctx, ggml_tensor * input
     static const bool metal = std::getenv("FFN_COREML_HALVES_METAL") != nullptr;
     auto & state = *static_cast<decoder_state *>(userdata);
     auto found = state.layers.find(layer);
-    if (metal || found == state.layers.end() || found->second->ingraph || !gpu_resident || !ane_async::get().enabled || !found->second->backed) { return nullptr; }
+    if (metal || found == state.layers.end() || !gpu_resident || !ane_async::get().enabled || !found->second->backed) { return nullptr; }
     if (stage == 1) {
         // a half that started on Metal finishes there too
         return input->op == GGML_OP_MAP_CUSTOM2 ? ggml_map_custom2(ctx, input, input, decoder_compute, 1, &found->second->call[2]) : nullptr;
     }
-    // a short second half is padded to the 512 rows of the Core ML programs, or stays on Metal below FFN_COREML_PAD_MIN
-    static const int pad_min = std::getenv("FFN_COREML_PAD_MIN") ? std::atoi(std::getenv("FFN_COREML_PAD_MIN")) : 256;
     const int rows = input->ne[1];
     require(input->type == GGML_TYPE_F32 && input->ne[0] == 5120 && rows <= 512, "split FFN half must be at most 512 x 5120");
-    if (rows < pad_min) { return nullptr; }
+    if (rows < pad_min()) { return nullptr; }
     if (rows < 512) {
         input = ggml_pad(ctx, input, 0, 512 - rows, 0, 0);
         residual = ggml_pad(ctx, residual, 0, 512 - rows, 0, 0);
@@ -648,174 +520,17 @@ static ggml_tensor * decoder_split_build(ggml_context * ctx, ggml_tensor * input
     return ggml_map_custom2(ctx, input, residual, decoder_compute, 1, &found->second->call[1]);
 }
 
-// In-graph FFN (FFN_COREML_INGRAPH). start hands the input to the ANEs, whose partial outputs land in its buffer; the
-// Metal share runs as normal nodes meanwhile; finish makes the GPU wait for the ANEs and sums their partials. finish
-// also takes the input, so the allocator keeps it until the ANEs have read it
-static void ingraph_cpu(ggml_tensor *, int, int, void *) {
-    GGML_ABORT("the Core ML FFN sidecar runs only on Metal");
-}
-
-static int pad_min() {
-    static const int value = std::getenv("FFN_COREML_PAD_MIN") ? std::atoi(std::getenv("FFN_COREML_PAD_MIN")) : 256;
-    return value;
-}
-
-// A microbatch goes to the ANEs in chunks of the programs' 512 rows. The last chunk is padded with
-// zero rows, or below FFN_COREML_PAD_MIN rows its ANE share is computed on Metal from views of the remaining channels
-static ggml_tensor * ingraph_build(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * input, ggml_tensor * residual,
-                                   ggml_tensor * gate, ggml_tensor * up, ggml_tensor * down, int layer, void * userdata) {
-    auto & state = *static_cast<decoder_state *>(userdata);
-    auto found = state.layers.find(layer);
-    if (found == state.layers.end() || !found->second->ingraph || input->type != GGML_TYPE_F32 || input->ne[0] != 5120 ||
-        input->ne[2] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input)) {
-        return nullptr;
-    }
-    auto & runtime = *found->second;
-    const int t = ingraph_tokens;
-    const int rows = input->ne[1];
-    if (rows < pad_min()) { return nullptr; }
-    const int64_t m = runtime.metal_channels;
-    const int chunks = rows / t + (rows % t >= pad_min() ? 1 : 0);
-
-    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> started;
-    for (int c = 0; c < chunks; ++c) {
-        const int n = std::min(t, rows - c * t);
-        ggml_tensor * x = ggml_view_2d(ctx, input, 5120, n, input->nb[1], c * t * input->nb[1]);
-        if (n < t) { x = ggml_pad(ctx, x, 0, t - n, 0, 0); }
-        ggml_tensor * start = ggml_custom_4d(ctx, GGML_TYPE_F32, 5120, t, runtime.model2 ? 2 : 1, 1, &x, 1, ingraph_cpu, 1, &runtime.call[3]);
-        ggml_build_forward_expand(gf, start);
-        started.emplace_back(start, x);
-    }
-
-    // Metal share, channels [0, m), of every row
-    ggml_tensor * g = ggml_mul_mat(ctx, ggml_view_2d(ctx, gate, gate->ne[0], m, gate->nb[1], 0), input);
-    ggml_tensor * u = ggml_mul_mat(ctx, ggml_view_2d(ctx, up, up->ne[0], m, up->nb[1], 0), input);
-    ggml_tensor * d = ggml_mul_mat(ctx, ggml_view_2d(ctx, down, m, down->ne[1], down->nb[1], 0), ggml_swiglu_split(ctx, g, u));
-
-    ggml_tensor * ane = nullptr;
-    for (int c = 0; c < chunks; ++c) {
-        ggml_tensor * args[2] = {started[c].first, started[c].second};
-        ggml_tensor * part = ggml_custom_4d(ctx, GGML_TYPE_F32, 5120, t, 1, 1, args, 2, ingraph_cpu, 1, &runtime.call[4]);
-        const int n = std::min(t, rows - c * t);
-        if (n < t) { part = ggml_view_2d(ctx, part, 5120, n, part->nb[1], 0); }
-        ane = ane ? ggml_concat(ctx, ane, part, 1) : part;
-    }
-    if (chunks * t < rows) {
-        // the rows after the last chunk: channels [m, end) on Metal too
-        const int64_t first = int64_t(chunks) * t, n = rows - first, rest = gate->ne[1] - m;
-        ggml_tensor * x = ggml_view_2d(ctx, input, 5120, n, input->nb[1], first * input->nb[1]);
-        ggml_tensor * gt = ggml_mul_mat(ctx, ggml_view_2d(ctx, gate, gate->ne[0], rest, gate->nb[1], m * gate->nb[1]), x);
-        ggml_tensor * ut = ggml_mul_mat(ctx, ggml_view_2d(ctx, up, up->ne[0], rest, up->nb[1], m * up->nb[1]), x);
-        ggml_tensor * dt = ggml_mul_mat(ctx, ggml_view_2d(ctx, down, rest, down->ne[1], down->nb[1], ggml_row_size(down->type, m)), ggml_swiglu_split(ctx, gt, ut));
-        ane = ane ? ggml_concat(ctx, ane, dt, 1) : dt;
-    }
-    return ggml_add(ctx, ggml_add(ctx, d, residual), ane);
-}
-
-static void bind_data(ggml_tensor * target, ggml_backend_buffer_t buffer, void * data) {
-    target->buffer = buffer;
-    target->data = data;
-}
-
-static bool ingraph_execute(ggml_backend_t backend, ggml_tensor * dst, void * userdata) {
-    auto & call = *static_cast<ffn_call *>(userdata);
-    auto & runtime = *call.runtime;
-    auto & async = ane_async::get();
-    @autoreleasepool {
-        try {
-            if (call.stage == 2) {
-                const ggml_tensor * x = dst->src[0];
-                require(ggml_backend_metal_tensor_is_shared(x) && ggml_backend_metal_tensor_is_shared(dst), "in-graph FFN buffers must use shared Metal storage");
-                const uint64_t value = ++async.seq;
-                runtime.started.push_back(value);
-                ggml_backend_metal_shared_event(backend, (__bridge void *) async.ready, value, false);
-                __strong MLDictionaryFeatureProvider * & inputs = runtime.inputs[x->data];
-                if (!inputs) {
-                    NSError * failure = nil;
-                    MLMultiArray * array = [[MLMultiArray alloc] initWithDataPointer:x->data shape:@[@(ingraph_tokens), @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
-                    require(array, "in-graph Core ML input binding failed");
-                    inputs = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": array} error:&failure];
-                    require(inputs, "in-graph Core ML provider failed");
-                }
-                auto & backings = runtime.outputs[dst->data];
-                if (!backings.first) {
-                    auto backing = [&](float * data) {
-                        NSError * failure = nil;
-                        MLMultiArray * array = [[MLMultiArray alloc] initWithDataPointer:data shape:@[@(ingraph_tokens), @5120] dataType:MLMultiArrayDataTypeFloat32 strides:@[@5120, @1] deallocator:nil error:&failure];
-                        require(array, "in-graph output backing failed");
-                        MLPredictionOptions * options = [[MLPredictionOptions alloc] init];
-                        options.outputBackings = @{@"y": array};
-                        return options;
-                    };
-                    backings.first = backing(static_cast<float *>(dst->data));
-                    if (runtime.model2) { backings.second = backing(static_cast<float *>(dst->data) + ingraph_tokens * 5120); }
-                }
-                decoder_ffn * worker = &runtime;
-                MLDictionaryFeatureProvider * features = inputs;
-                MLPredictionOptions * first = backings.first, * second = backings.second;
-                float * out = static_cast<float *>(dst->data);
-                id<MTLSharedEvent> ready = async.ready, done = async.done;
-                dispatch_async(async.queue, ^{
-                    @autoreleasepool {
-                        if (![ready waitUntilSignaledValue:value timeoutMS:60000]) {
-                            worker->fail("timed out waiting for the FFN input");
-                        } else {
-                            try { worker->predict_into(features, first, second, out); } catch (const std::exception & failure) { worker->fail(failure.what()); }
-                        }
-                        done.signaledValue = value;
-                    }
-                });
-                return true;
-            }
-            // chunks finish in the order they started
-            require(call.stage == 3 && !runtime.started.empty(), "in-graph FFN finish without a started call");
-            ggml_backend_metal_shared_event(backend, (__bridge void *) async.done, runtime.started.front(), true);
-            runtime.started.pop_front();
-            // one join graph for every layer: dst = first partial + second partial (zeros with one package)
-            static metal_join * join = nullptr;
-            if (!join) {
-                join = new metal_join;
-                join->init(backend, 5120, ingraph_tokens);
-            }
-            const ggml_tensor * start = dst->src[0];
-            bind_data(join->gpu, start->buffer, start->data);
-            if (runtime.model2) { bind_data(join->ane, start->buffer, static_cast<float *>(start->data) + ingraph_tokens * 5120); }
-            bind_data(join->output, dst->buffer, dst->data);
-            require(ggml_backend_graph_compute_async(backend, join->graph) == GGML_STATUS_SUCCESS, "in-graph FFN join failed");
-            ++runtime.calls;
-            return true;
-        } catch (const std::exception & failure) {
-            runtime.fail(failure.what());
-            fprintf(stderr, "in-graph FFN failed: %s\n", failure.what());
-            return false;
-        }
-    }
-}
-
 static void set_builders(bool split, decoder_state * state) {
     static const bool halves = std::getenv("LLAMA_QWEN35_HALVES") != nullptr;
     llama_ffn_coreml_set_builder(split ? decoder_build : nullptr, split ? state : nullptr);
     // the all-Metal reference (quality-metal) keeps the normal graph
     llama_ffn_coreml_set_split_builder(split && halves && !state->metal_reference ? decoder_split_build : nullptr, split ? state : nullptr);
-    llama_ffn_coreml_set_graph_builder(split && ingraph_mode && !state->metal_reference ? ingraph_build : nullptr, split ? state : nullptr);
 }
 
 // prompt tokens per llama_decode call and microbatch (FFN_COREML_UBATCH, 512 or 1024)
 static int chunk_tokens() {
     static const int chunk = std::getenv("FFN_COREML_UBATCH") ? std::atoi(std::getenv("FFN_COREML_UBATCH")) : 512;
     return chunk;
-}
-
-// Core ML calls per offloaded layer for a prompt: one per microbatch, or with FFN_COREML_INGRAPH one per chunk
-// (a last chunk below FFN_COREML_PAD_MIN rows stays on Metal)
-static uint64_t offload_calls(int length) {
-    if (!ingraph_mode) { return length / 512; }
-    uint64_t calls = 0;
-    for (int offset = 0; offset < length; offset += chunk_tokens()) {
-        const int n = std::min(chunk_tokens(), length - offset);
-        calls += n / ingraph_tokens + (n % ingraph_tokens >= pad_min() ? 1 : 0);
-    }
-    return calls;
 }
 
 static llama_context * make_context(llama_model * model, int context, decoder_state & state, bool split) {
@@ -926,7 +641,7 @@ static void request(llama_context * ctx, decoder_state & state, const std::vecto
     }
     uint64_t decode_calls = state.calls() - after_prompt;
     require(decode_calls == 0, "Core ML unexpectedly ran during token decoding");
-    uint64_t expected = (mode == "split" || mode == "hook-metal") && !std::getenv("FFN_COREML_HALVES_METAL") ? state.layers.size() * offload_calls(length) : 0;
+    uint64_t expected = (mode == "split" || mode == "hook-metal") && !std::getenv("FFN_COREML_HALVES_METAL") ? state.layers.size() * (length / 512) : 0;
     require(after_prompt - before == expected, "unexpected number of integrated FFN calls");
     printf("request mode=%s prompt_tokens=%d generated=%d repetition=%d pp_ms=%.6f pp_tps=%.6f ttft_ms=%.6f decode_ms=%.6f decode_tps=%.6f total_ms=%.6f output_tps=%.6f offload_calls=%llu decode_offload_calls=%llu\n",
            mode.c_str(), length, generated, repetition, pp_ms, length * 1000.0 / pp_ms, ttft_ms, decode_ms,
@@ -992,7 +707,7 @@ static void quality(llama_model * model, decoder_state & state, const std::vecto
             nll_split += lb - b[label];
         }
     }
-    require(std::getenv("FFN_COREML_HALVES_METAL") || state.calls() - before == state.layers.size() * offload_calls(length), "quality did not use intended offload layers");
+    require(std::getenv("FFN_COREML_HALVES_METAL") || state.calls() - before == state.layers.size() * (length / 512), "quality did not use intended offload layers");
     bool screen_pass = kl_sum / length <= 0.001 && std::exp((nll_split - nll_metal) / length) <= 1.01;
     printf("quality prompt_tokens=%d mean_kl=%.9f max_kl=%.9f top1_agreement=%.9f metal_nll=%.9f split_nll=%.9f metal_ppl=%.9f split_ppl=%.9f offload_calls=%llu screen_pass=%d reference_custom=%d\n",
            length, kl_sum / length, kl_max, double(agreement) / length, nll_metal / length, nll_split / length,
@@ -1013,7 +728,6 @@ int main(int argc, char ** argv) {
             gpu_resident = std::getenv("FFN_COREML_GPU_RESIDENT") != nullptr;
             if (gpu_resident) {
                 ggml_backend_metal_set_custom2(decoder_compute, decoder_resident_compute);
-                ggml_backend_metal_set_custom(ingraph_cpu, ingraph_execute);
             }
             printf("gpu_resident=%d\n", int(gpu_resident));
             if (gpu_resident) { printf("resident_profile_stages=producer_wait,bind,prefix_submit,input_bind,predict,output_convert,unused,join_input,join_submit,unused\n"); }
@@ -1030,8 +744,7 @@ int main(int argc, char ** argv) {
             std::string item;
             while (std::getline(list, item, ',')) {
                 int n = std::stoi(item);
-                // the in-graph sidecar also takes partial microbatches
-                require(n >= 512 && n <= 8192 && (ingraph_mode || n % chunk_tokens() == 0), "prompt length must be a multiple of the microbatch in 512..8192");
+                require(n >= 512 && n <= 8192 && n % chunk_tokens() == 0, "prompt length must be a multiple of the microbatch in 512..8192");
                 lengths.push_back(n);
             }
             require(!lengths.empty(), "no prompt lengths");
@@ -1046,7 +759,6 @@ int main(int argc, char ** argv) {
             printf("decoder_mode=%s batch_threads=%d decode_threads=20\n", mode.c_str(), state.batch_threads);
             state.metal_reference = mode == "hook-metal" || mode == "quality-metal" || mode == "resident-metal";
             if (mode != "metal" && mode != "quality-self") {
-                otf.init(argv[1]);
                 load_layers(state, argv[1], argv[2]);
             }
             auto * device = ggml_backend_dev_by_name("MTL0");
@@ -1077,7 +789,6 @@ int main(int argc, char ** argv) {
             state.layers.clear();
             if (gpu_resident) {
                 ggml_backend_metal_set_custom2(nullptr, nullptr);
-                ggml_backend_metal_set_custom(nullptr, nullptr);
             }
             llama_backend_free();
         } catch (const std::exception & failure) {

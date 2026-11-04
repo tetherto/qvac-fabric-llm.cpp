@@ -10,7 +10,6 @@
 #include "ggml-metal-tuning.h"
 
 #include <mutex>
-#include <mutex>
 #include <string>
 
 #define GGML_METAL_NAME "MTL"
@@ -569,33 +568,22 @@ void ggml_backend_metal_shared_event(ggml_backend_t backend, void * event, uint6
 struct metal_custom_op {
     ggml_custom_op_t tag;
     ggml_metal_custom2_execute execute;
-    bool serial;
 };
 static std::mutex custom_mutex;
 static std::vector<metal_custom_op> custom_ops;
 
-static void metal_set_custom(ggml_custom_op_t tag, ggml_metal_custom2_execute execute, bool serial) {
+void ggml_backend_metal_set_custom_serial(ggml_custom_op_t tag, ggml_metal_custom2_execute execute) {
     std::lock_guard<std::mutex> lock(custom_mutex);
     if (!tag) {
-        for (auto it = custom_ops.begin(); it != custom_ops.end();) {
-            if (it->serial == serial) { it = custom_ops.erase(it); } else { ++it; }
-        }
+        custom_ops.clear();
         return;
     }
     for (auto it = custom_ops.begin(); it != custom_ops.end(); ++it) {
         if (it->tag != tag) { continue; }
-        if (execute) { *it = {tag, execute, serial}; } else { custom_ops.erase(it); }
+        if (execute) { it->execute = execute; } else { custom_ops.erase(it); }
         return;
     }
-    if (execute) { custom_ops.push_back({tag, execute, serial}); }
-}
-
-void ggml_backend_metal_set_custom(ggml_custom_op_t tag, ggml_metal_custom2_execute execute) {
-    metal_set_custom(tag, execute, false);
-}
-
-void ggml_backend_metal_set_custom_serial(ggml_custom_op_t tag, ggml_metal_custom2_execute execute) {
-    metal_set_custom(tag, execute, true);
+    if (execute) { custom_ops.push_back({tag, execute}); }
 }
 
 // executor and userdata of a registered experiment op (MAP_CUSTOM2 or CUSTOM), or nullptr
@@ -612,7 +600,7 @@ static ggml_metal_custom2_execute ggml_backend_metal_experiment_op(const ggml_te
         for (const auto & entry : custom_ops) {
             if (params.fun != entry.tag) { continue; }
             *userdata = params.userdata;
-            if (serial) { *serial = entry.serial; }
+            if (serial) { *serial = true; }
             return entry.execute;
         }
     }

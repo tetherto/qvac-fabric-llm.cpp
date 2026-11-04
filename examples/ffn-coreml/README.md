@@ -54,7 +54,7 @@ build-coreml/bin/llama-coreml-ffn model.gguf /application/writable/cache "Your p
 
 Opt-in Core ML sidecar for Qwen3.8-27B prefill on Apple Silicon: part of each prefill FFN runs on the Neural Engines while Metal runs the rest. Normal builds do not enable the hooks; build from `examples/ffn-coreml` (below).
 
-The recommended setup is the in-graph sidecar with load-time export, see [Load-time export and the in-graph sidecar](#load-time-export-and-the-in-graph-sidecar): no conversion step, any microbatch size, multi-sequence batches and speculative decoding. The other sections document the asset-based runtime it grew from, a 24-layer experiment from `temp-11259` (`be6e387b9`). The recorded runs and experiment notes are on branch `feat/coreml-qwen-3.8` (`examples/ffn-coreml/results`, `RESULTS.md`, `EXPERIMENTS.md`).
+The recommended setup is the in-graph sidecar with load-time export, which started here and is now the library integration above (`--coreml-ffn`), see [Load-time export and the in-graph sidecar](#load-time-export-and-the-in-graph-sidecar): no conversion step, any microbatch size, multi-sequence batches and speculative decoding. The other sections document the asset-based runtime it grew from, a 24-layer experiment from `temp-11259` (`be6e387b9`). The recorded runs and experiment notes are on branch `feat/coreml-qwen-3.8` (`examples/ffn-coreml/results`, `RESULTS.md`, `EXPERIMENTS.md`).
 
 ## Validated configuration
 
@@ -127,11 +127,13 @@ Because the Neural Engines no longer hold the GPU up, the overlap pairs with a l
 
 ## Load-time export and the in-graph sidecar
 
-`FFN_COREML_OTF=<Metal channels>x<packages>` (for example `8192x2`) builds the Core ML side from the GGUF when the model loads, so there is no conversion step and no assets folder. A weight-free int8 template per channel count ([templates](../../src/llama-coreml-ffn-templates), made by `make_template.py` with coremltools) holds the program. For each layer and package the runtime dequantizes the FFN weights from the GGUF, quantizes them per channel to int8 the way coremltools does (the `weight.bin` is byte-identical to a coremltools export), writes the package, compiles it and caches the compiled model under `FFN_COREML_CACHE` (default `~/Library/Caches/ffn-coreml`). The cache key is the GGUF path, size and modification time and the template. Set `FFN_COREML_TEMPLATES` to the templates folder. On M3 Ultra with the Q4_0 GGUF, a cold start of the 128 programs takes 92 s (export 24.5 s, compile 2.6 s, load 60 s); a cached start takes 3-7 s. `llama-server-coreml` takes `FFN_COREML_OTF` in place of `FFN_COREML_ASSETS`.
+Both now live in the library (`src/llama-coreml-ffn.mm`, `src/llama-coreml-ffn-export.h`), used through `--coreml-ffn` or `llama_set_coreml_ffn`; the harness and `llama-server-coreml` keep only the asset-based runtime and the half-batch overlap. The measurements in this section were taken with the harness's earlier copy of the in-graph sidecar (`FFN_COREML_OTF`, `FFN_COREML_INGRAPH`).
 
-`FFN_COREML_INGRAPH=1` (with `FFN_COREML_GPU_RESIDENT=1 FFN_COREML_ASYNC=1`) puts the sidecar into the model graph. The Metal share of each FFN runs as ordinary graph nodes on views of the model's own weights, so there is no weight copy and there are no per-layer prefix and join graphs. Two custom nodes, run by the Metal backend (`ggml_backend_metal_set_custom`), bracket it: start signals the serial worker to run the Neural Engine share on the node's input, finish waits for it and adds the partial outputs. The GPU runs the Metal share while the Neural Engines work. A microbatch of more than 512 rows goes to the Neural Engines in 512-row calls; a last chunk of at least `FFN_COREML_PAD_MIN` rows is padded, a smaller one has its Neural Engine share computed on Metal. Any microbatch size, multi-sequence batches and speculative decoding take this path, which the half-batch overlap does not.
+The Core ML side is built from the GGUF when the sidecar is configured, so there is no conversion step and no assets folder. A weight-free int8 template per channel count ([templates](../../src/llama-coreml-ffn-templates), made by `make_template.py` with coremltools from the program `export_ffn.py` builds) holds the program. For each layer and package the runtime dequantizes the FFN weights from the GGUF, quantizes them per channel to int8 the way coremltools does (the `weight.bin` is byte-identical to a coremltools export), writes the package, compiles it and caches the compiled model. On M3 Ultra with the Q4_0 GGUF, a cold start of the 128 programs took 92 s (export 24.5 s, compile 2.6 s, load 60 s); a cached start took 3-7 s.
 
-Harness prefill (`split`, Q4_0, M3 Ultra, 8192 Metal channels and 2 x 4608, without the attention kernel, 3 repetitions):
+The Metal share of each FFN runs as ordinary graph nodes on views of the model's own weights, so there is no weight copy and there are no per-layer prefix and join graphs. Custom start and finish nodes bracket the Neural Engine share, which the GPU overlaps with the Metal share. A microbatch of more than 512 rows goes to the Neural Engines in 512-row calls; a last chunk of at least 256 rows is padded, a smaller one has its Neural Engine share computed on Metal. Any microbatch size, multi-sequence batches and speculative decoding take this path, which the half-batch overlap does not.
+
+Harness prefill (`split` with the in-graph sidecar, Q4_0, M3 Ultra, 8192 Metal channels and 2 x 4608, without the attention kernel, 3 repetitions):
 
 | Microbatch | Metal 2048 / 8192 tokens | In-graph 2048 / 8192 tokens |
 | --- | ---: | ---: |
@@ -141,17 +143,7 @@ Harness prefill (`split`, Q4_0, M3 Ultra, 8192 Metal channels and 2 x 4608, with
 
 Programs with 1024 rows were slower than 512-row chunks (485.1 / 459.0 at microbatch 2048) and are not kept. Peak process footprint was 6.2-6.8 GB, against 18.0 GB for the runtime with its own Metal weight copies and 1.4-1.8 GB for Metal alone. Quality on held-out text: over 13 repository windows mean NLL change -0.00006 nats/token and KL 0.00017; at microbatch 2048 the logits are identical to microbatch 512; partial chunks (a padded 300-row microbatch, a 100-row Metal tail, a padded chunk inside a 1024-row microbatch) had mean KL 0.00009-0.00010.
 
-```sh
-cmake -S examples/ffn-coreml -B build-ffn-coreml -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON \
-  -DFFN_COREML_DECODER_EXPERIMENT=ON -DFFN_COREML_SERVER=ON
-cmake --build build-ffn-coreml --target llama-server-coreml -j 8
-
-FFN_COREML_OTF=8192x2 FFN_COREML_TEMPLATES=src/llama-coreml-ffn-templates FFN_COREML_INGRAPH=1 \
-FFN_COREML_GPU_RESIDENT=1 FFN_COREML_ASYNC=1 FFN_COREML_SINGLE_ENCODER=1 \
-  build-ffn-coreml/llama-server-coreml -m Qwen3.8-27B-Q4_0.gguf -ngl 99 -fa on -ub 2048
-```
-
-Through `llama-server-coreml` with the attention kernel from `feat/metal-fa-prefill-d256` and `-ub 2048`, single-request prefill (engine-bench client) measured 420 / 448 / 429 tok/s at about 1k / 4.4k / 21k tokens, against about 331-335 for Metal alone; 431-449 tok/s with MTP and DFlash2, where the half-batch overlap stays off (about 365); and 148 tok/s total at 16 concurrent requests. In no-speculation, MTP and DFlash2 modes the first 64 generated tokens were identical to Metal alone on three prompts of 784 to 2322 tokens, with the same draft acceptance.
+Through `llama-server-coreml` (in-graph sidecar) with the attention kernel from `feat/metal-fa-prefill-d256` and `-ub 2048`, single-request prefill (engine-bench client) measured 420 / 448 / 429 tok/s at about 1k / 4.4k / 21k tokens, against about 331-335 for Metal alone; 431-449 tok/s with MTP and DFlash2, where the half-batch overlap stays off (about 365); and 148 tok/s total at 16 concurrent requests. In no-speculation, MTP and DFlash2 modes the first 64 generated tokens were identical to Metal alone on three prompts of 784 to 2322 tokens, with the same draft acceptance.
 
 ## Held-out quality gate
 
