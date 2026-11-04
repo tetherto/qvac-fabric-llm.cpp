@@ -283,6 +283,13 @@ void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
     const size_t bytes = ggml_nbytes(overwrite);
     const size_t half = bytes / 2;
     const size_t row = ggml_row_size(type, 256);
+    if (std::strncmp(ggml_backend_name(backend), "HTP", 3) == 0) {
+        const size_t allocated = ggml_backend_buft_get_alloc_size(ggml_backend_buffer_get_type(buffer), overwrite);
+        const bool needs_canonical = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+        check(needs_canonical ? allocated >= 2 * bytes : allocated < 2 * bytes,
+              "REPACK canonical storage is missing from the buffer allocation or duplicated for a reversible type");
+        ++checks;
+    }
     std::vector<float> values(256 * 32);
     std::vector<uint8_t> a(bytes), b(bytes), actual(bytes), expected(bytes);
     for (size_t i = 0; i < values.size(); ++i) {
@@ -308,6 +315,10 @@ void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
     expected = a;
     ggml_backend_tensor_set(overwrite, a.data(), 0, bytes);
     verify(overwrite, "full");
+    std::vector<uint8_t> slice(row + 3);
+    ggml_backend_tensor_get(overwrite, slice.data(), row / 2 + 1, slice.size());
+    check(std::equal(slice.begin(), slice.end(), a.begin() + row / 2 + 1), "REPACK partial byte readback changed");
+    ++checks;
     std::copy(b.begin() + half, b.end(), expected.begin() + half);
     for (int repeat = 0; repeat < 2; ++repeat) {
         ggml_backend_tensor_set(overwrite, b.data() + half, half, half);
