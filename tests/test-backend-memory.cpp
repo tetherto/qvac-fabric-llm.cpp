@@ -260,7 +260,8 @@ void check_runtime_repack(ggml_backend_t backend, ggml_type type,
     std::vector<uint8_t> expected = a;
     std::copy(b.begin() + half, b.end(), expected.begin() + half);
     ggml_backend_tensor_set(alias, b.data() + half, half, half);
-    check_repack_matmul(backend, alias, expected, "runtime-alias-partial", checks);
+    // Hexagon rejects quantized views as matmul inputs; compute through their canonical owner.
+    check_repack_matmul(backend, weights, expected, "runtime-alias-partial", checks);
     ggml_backend_tensor_get(weights, actual.data(), 0, actual.size());
     check(actual == expected, "runtime REPACK partial update lost untouched bytes");
     ++checks;
@@ -365,7 +366,8 @@ void check_repack_type(ggml_backend_t backend, ggml_type type, int & checks) {
     verify(overwrite, "alias-partial-write", true);
     expected = b;
     ggml_backend_tensor_set(overwrite, b.data(), 0, half);
-    verify(alias, "alias-base-update", true);
+    verify(alias, "alias-base-update");
+    check_repack_matmul(backend, overwrite, expected, "alias-base-update", checks);
     ggml_backend_buffer_clear(buffer, 0);
     ggml_backend_tensor_get(overwrite, expected.data(), 0, bytes);
     verify(alias, "alias-clear");
