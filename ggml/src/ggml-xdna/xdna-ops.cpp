@@ -177,10 +177,16 @@ struct xdna_gemm_geom {
 
 }  // namespace
 
-// Pick the prefill M block for an op: the available block that minimizes the
-// byte cost of re-streaming B per submission vs. padding the batch to whole
-// blocks (A fill + accumulator work on the padded rows). Returns 0 when
-// nothing fits.
+// The byte cost of an op on block Mk: B re-streamed per submission against the
+// batch padded to whole blocks (A fill + accumulator work on the padded rows).
+static int64_t block_cost(int Mk, int M, int K, int N, int eb) {
+    const int64_t nblk = ((int64_t) M + Mk - 1) / Mk;
+    const int64_t pad  = nblk * Mk - M;
+    return nblk * (int64_t) K * N * eb + pad * ((int64_t) K * eb + (int64_t) N * 4);
+}
+
+// Pick the prefill M block for an op: the available block of least cost.
+// Returns 0 when nothing fits.
 static int pick_prefill_block(const xdna_ops *                             ops,
                               int                                          M,
                               int                                          K,
@@ -192,9 +198,7 @@ static int pick_prefill_block(const xdna_ops *                             ops,
         if (route.find(Mk) == route.end()) {
             continue;
         }
-        const int64_t nblk = ((int64_t) M + Mk - 1) / Mk;
-        const int64_t pad  = nblk * Mk - M;
-        const int64_t cost = nblk * (int64_t) K * N * eb + pad * ((int64_t) K * eb + (int64_t) N * 4);
+        const int64_t cost = block_cost(Mk, M, K, N, eb);
         if (best_b == 0 || cost < best_cost) {
             best_b    = Mk;
             best_cost = cost;
@@ -203,10 +207,30 @@ static int pick_prefill_block(const xdna_ops *                             ops,
     return (int) best_b;
 }
 
+static int64_t xdna_block_key(bool want_i8, int M) {
+    return (int64_t) M * 2 + (want_i8 ? 1 : 0);
+}
+
+// The block xdna_ops_plan_blocks gave the op's route and row count, else the op's own pick.
+static int planned_block(const xdna_ops *                             ops,
+                         int                                          M,
+                         int                                          K,
+                         int                                          N,
+                         bool                                         want_i8,
+                         const std::unordered_map<int, std::string> & route) {
+    auto it = ops->plan_block.find(xdna_block_key(want_i8, M));
+    if (it != ops->plan_block.end() && route.count(it->second)) {
+        return it->second;
+    }
+    return pick_prefill_block(ops, M, K, N, want_i8 ? 1 : 2, route);
+}
+
+static void gemm_note_block(int M, int Mk, bool want_i8);
+
 // Pick the geometry for an op: the decode M32 geometry below GEMM_M_BIG_MIN,
-// otherwise the cheapest prefill M block <= M that has an artifact for the
-// chosen route (bf16 or native int8). Falls back to the decode geometry when
-// no prefill block is available.
+// otherwise the planned (else the cheapest) prefill M block that has an
+// artifact for the chosen route (bf16 or native int8). Falls back to the
+// decode geometry when no prefill block is available.
 static xdna_gemm_geom xdna_pick_geom(const xdna_ops * ops, int M, int K, int N, bool want_i8) {
     xdna_gemm_geom g;
     g.tiles  = ops->gemm_tiles;
@@ -216,7 +240,7 @@ static xdna_gemm_geom xdna_pick_geom(const xdna_ops * ops, int M, int K, int N, 
     }
     const std::unordered_map<int, std::string> & route = want_i8 ? ops->i8_xclbin : ops->pref_xclbin;
     const int                                    eb    = want_i8 ? 1 : 2;
-    const int                                    Mk    = pick_prefill_block(ops, M, K, N, eb, route);
+    const int                                    Mk    = planned_block(ops, M, K, N, want_i8, route);
     if (Mk > 0) {
         const xdna_gemm_tiles t = prefill_tiles_for(Mk, eb);
         if (t.rtp_base > 0) {
@@ -503,6 +527,7 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
     const xdna_gemm_geom    geom  = xdna_pick_geom(ops, M, K, N, /* want_i8 */ true);
     const xdna_gemm_tiles & tiles = geom.tiles;
     const int               Mk    = tiles.M;
+    gemm_note_block(M, Mk, /* want_i8 */ true);
 
     const int                       n_mb     = (M + Mk - 1) / Mk;
     // The raw int32 C is folded straight into dst by d_a * d_w. A K that spans
@@ -797,6 +822,23 @@ static std::atomic<int> g_test_lose_times{ 0 };
 static std::atomic<int> g_gemm_reruns{ 0 };
 // Test hook (xdna_ops_test_gemm_count): bf16 GEMM calls, one a group or a lone projection.
 static std::atomic<int> g_gemm_calls{ 0 };
+// Test hook (xdna_ops_test_block_switches): the prefill block and route of the last GEMM call, and its changes.
+static std::atomic<int64_t> g_gemm_last_block{ 0 };
+static std::atomic<int>     g_gemm_block_switches{ 0 };
+
+static void gemm_note_block(int M, int Mk, bool want_i8) {
+    if (M < GEMM_M_BIG_MIN) {
+        return;
+    }
+    const int64_t prev = g_gemm_last_block.exchange(xdna_block_key(want_i8, Mk));
+    if (prev != 0 && prev != xdna_block_key(want_i8, Mk)) {
+        g_gemm_block_switches++;
+    }
+}
+
+int xdna_ops_test_block_switches(void) {
+    return g_gemm_block_switches;
+}
 
 void xdna_ops_test_lose_c_lines(int blocks, int times) {
     g_test_lose_times  = times;
@@ -950,6 +992,7 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * const * nodes, int
     const xdna_gemm_geom    geom  = xdna_pick_geom(ops, M, K, N, /* want_i8 */ false);
     const xdna_gemm_tiles & tiles = geom.tiles;
     const int               Mk    = tiles.M;  // baked M block of the selected geometry
+    gemm_note_block(M, Mk, /* want_i8 */ false);
 
     // B is a persistent BO with the packed [K x N] weights; each K run's
     // stream points into it via its K offset, so no per-call weight copy.
@@ -1573,6 +1616,79 @@ void xdna_ops_plan_gemm(xdna_ops * ops, const struct ggml_cgraph * cgraph) {
             }
         }
         first = last;
+    }
+}
+
+// --- one prefill block a graph ------------------------------------------------
+//
+// Each prefill block is its own xclbin, and a GEMM on another block than the one before pays a hardware-context
+// switch (GEMM_SWITCH_MS), far above what one block saves over another in bytes. The GEMMs of one route and row
+// count therefore share the block whose cost summed over them is least.
+
+namespace {
+
+// A GEMM's reduction depth and columns, the shape the block cost reads.
+struct block_gemm {
+    int K;
+    int N;
+};
+
+}  // namespace
+
+static bool gemm_takes_block(const xdna_ops * ops, const struct ggml_tensor * node) {
+    return node->op == GGML_OP_MUL_MAT && node->src[1]->ne[1] >= GEMM_M_BIG_MIN && !ops->gemv_group_of.count(node) &&
+           !xdna_pgemm_shape_supported(node) && gemm_supported(ops, node);
+}
+
+static std::unordered_map<int64_t, std::vector<block_gemm>> block_gemms_of(const xdna_ops *           ops,
+                                                                           const struct ggml_cgraph * cgraph) {
+    std::unordered_map<int64_t, std::vector<block_gemm>> by_key;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (gemm_takes_block(ops, node)) {
+            const int64_t key = xdna_block_key(xdna_int8_eligible(ops, node), (int) node->src[1]->ne[1]);
+            by_key[key].push_back({ (int) node->src[1]->ne[0], (int) node->src[0]->ne[1] });
+        }
+    }
+    return by_key;
+}
+
+static int64_t gemms_block_cost(int Mk, int M, int eb, const std::vector<block_gemm> & gemms) {
+    int64_t cost = 0;
+    for (const block_gemm & g : gemms) {
+        cost += block_cost(Mk, M, g.K, g.N, eb);
+    }
+    return cost;
+}
+
+static int least_cost_block(const xdna_ops * ops, int M, bool want_i8, const std::vector<block_gemm> & gemms) {
+    const std::unordered_map<int, std::string> & route = want_i8 ? ops->i8_xclbin : ops->pref_xclbin;
+    const int                                    eb    = want_i8 ? 1 : 2;
+    int                                          best  = 0;
+    int64_t                                      best_cost = 0;
+    for (int Mk : ops->pref_blocks) {  // descending
+        if (!route.count(Mk)) {
+            continue;
+        }
+        const int64_t cost = gemms_block_cost(Mk, M, eb, gemms);
+        if (best == 0 || cost < best_cost) {
+            best      = Mk;
+            best_cost = cost;
+        }
+    }
+    return best;
+}
+
+void xdna_ops_plan_blocks(xdna_ops * ops, const struct ggml_cgraph * cgraph) {
+    ops->plan_block.clear();
+    if (xdna_env_int("GGML_XDNA_GEMM_ONE_BLOCK", 1) == 0) {
+        return;
+    }
+    for (const auto & kv : block_gemms_of(ops, cgraph)) {
+        const int Mk = least_cost_block(ops, (int) (kv.first / 2), (kv.first & 1) != 0, kv.second);
+        if (Mk > 0) {
+            ops->plan_block[kv.first] = Mk;
+        }
     }
 }
 

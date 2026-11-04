@@ -70,6 +70,9 @@
 // to put the gate on the activation's curve and, larger, in its tails. Two
 // sizes: EmbeddingGemma 2's (512, 2048) and Qwen3.5-4B's (2560, 9216).
 //
+// Two bf16 projections of one row count whose own cheapest prefill blocks
+// differ run on one block: computed again, the graph changes block no time.
+//
 // Every intermediate is cleared before each backend runs, so a node read
 // before it was written shows as zeros instead of as the other backend's
 // result. Skips (exit 0) when no XDNA device is registered.
@@ -1019,6 +1022,64 @@ static bool test_group_matches_one_by_one(ggml_backend_t npu, const std::vector<
     return same && runs;
 }
 
+typedef int (*block_switch_fn)(void);
+
+static const float CHAIN_SCALE = 0.5f;
+
+// x (1024 x M) through a bf16 projection onto 512 columns, and its result, scaled on the host as a layer's norm stands
+// between its projections, through another onto 512: above 1024 rows the first one's own cheapest block is the 2048 one
+// and the second one's the 512 one.
+static norm_graph build_block_chain(ggml_backend_t be, int64_t M) {
+    const int64_t    K = 1024, N = 512;
+    norm_graph       g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * w1    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_BF16, K, N);
+    ggml_tensor * w2    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_BF16, N, N);
+    g.inputs            = { x, w1, w2 };
+    ggml_tensor * y     = ggml_mul_mat(g.ctx, w1, x);
+    ggml_tensor * z     = ggml_mul_mat(g.ctx, w2, ggml_scale(g.ctx, y, CHAIN_SCALE));
+    g.gf                = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, z);
+    g.checked = { y, z };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
+// The chain's two GEMMs share one block: a second compute, which starts from the block the first left, changes
+// block no time. Two GEMM calls show that the array, not the host, ran it.
+static bool test_one_block_a_graph(ggml_backend_t npu, ggml_backend_t cpu, int64_t M, double tol) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(npu));
+    auto switches = (block_switch_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_block_switches");
+    auto calls    = (gemm_count_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_gemm_count");
+    if (!switches || !calls) {
+        std::printf("test-xdna-graph: the backend has no block switch or GEMM call count\n");
+        return false;
+    }
+    norm_graph                      want_g = build_block_chain(cpu, M);
+    norm_graph                      got_g  = build_block_chain(npu, M);
+    std::vector<std::vector<float>> want, got;
+    bool                            ok        = run(want_g, cpu, want) && run(got_g, npu, got);
+    const int                       calls0    = calls();
+    const int                       switches0 = switches();
+    ok                                        = ok && run(got_g, npu, got);
+    const int ran     = calls() - calls0;
+    const int changed = switches() - switches0;
+    double    worst   = 0;
+    for (size_t i = 0; ok && i < got.size(); i++) {
+        worst = std::max(worst, nmse(want[i], got[i]));
+    }
+    const bool passed = ok && ran == 2 && changed == 0 && worst < tol;
+    std::printf("MUL_MAT BF16 chain K 1024 then 512, M %-4lld: GEMM calls %d, block changes %d, worst nmse %.3g %s\n",
+                (long long) M, ran, changed, ok ? worst : INFINITY, passed ? "ok" : "FAIL");
+    ggml_backend_buffer_free(want_g.buf);
+    ggml_backend_buffer_free(got_g.buf);
+    ggml_free(want_g.ctx);
+    ggml_free(got_g.ctx);
+    return passed;
+}
+
 // x (K x M) through Q8_0 projections of `ns[i]` rows each, an RMS_NORM after every one and the
 // results joined in that order, as a graph expanded from its output places them: projection,
 // norm, next projection. Nodes are allocated in `ops_be`, or left to the scheduler when null.
@@ -1583,6 +1644,10 @@ int main(void) {
             passed = test_group(npu, cpu, ns, M, tol, GGML_TYPE_BF16) && passed;
             passed = test_group_matches_one_by_one(npu, ns, M) && passed;
         }
+    }
+    // two bf16 projections whose own cheapest blocks differ share one: 1029 rows just past 1024, 1188 a batch
+    for (int64_t M : { 1029, 1188 }) {
+        passed = test_one_block_a_graph(npu, cpu, M, tol) && passed;
     }
     for (bool group_on : { true, false }) {
         passed = test_group_order(npu, cpu, between::nothing, group_on, 200, tol, GGML_TYPE_BF16) && passed;
