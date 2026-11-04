@@ -39,8 +39,9 @@ struct xdna_ops {
     // Two GEMM families. Decode: M=32, native bf16 r=4, exact - used for ops
     // with M < GEMM_M_BIG_MIN. Prefill: one or more baked M blocks (the M64
     // base; larger blocks when their artifacts are built), bfp16-emulated r=8
-    // (2x mmul), selected per op as the block that minimizes the weighted
-    // pad/weight-stream cost. Quantized (Q4_K/Q5_K/Q6_K) prefill weights
+    // (2x mmul), the block that minimizes the weighted pad/weight-stream cost:
+    // one per graph for all the GEMMs of a route and row count
+    // (xdna_ops_plan_blocks), per op when unplanned. Quantized (Q4_K/Q5_K/Q6_K) prefill weights
     // additionally route to the native int8 GEMM (1 B/val) when an int8
     // artifact for the chosen block is present.
     xdna_gemm_tiles                      gemm_tiles;          // decode geometry (default)
@@ -50,6 +51,7 @@ struct xdna_ops {
     std::vector<int>                     pref_blocks;  // baked M blocks, descending
     std::unordered_map<int, std::string> pref_xclbin;  // block -> bf16 stem
     std::unordered_map<int, std::string> i8_xclbin;    // block -> int8 stem
+    std::unordered_map<int64_t, int>     plan_block;   // route and row count -> block (xdna_ops_plan_blocks)
 
     // Packed-weight cache: tensor data pointer + K + N -> device BO holding the
     // transposed [K_pad x N] bf16 weights (K_pad = K rounded up to a whole
@@ -184,6 +186,11 @@ void xdna_ops_plan_gemv(xdna_ops *                                             o
 // that. Call once per prefill graph, after xdna_ops_plan_gemv.
 void xdna_ops_plan_gemm(xdna_ops * ops, const struct ggml_cgraph * cgraph);
 
+// Give the GEMMs of `cgraph` that share a route and a row count one prefill block. Each block is its own xclbin, so
+// blocks that alternate pay a hardware-context switch at every change (GGML_XDNA_GEMM_ONE_BLOCK=0: each op picks its
+// own). Call once per graph, before the other plans.
+void xdna_ops_plan_blocks(xdna_ops * ops, const struct ggml_cgraph * cgraph);
+
 // Whether a chunk of a prefill (more than one row) is quicker run whole on the host than as commands of the array, within the
 // rows the host's cost fits cover (GGML_XDNA_HOST_CHUNK=0: never). It clears the plan of xdna_ops_plan_gemm.
 bool xdna_ops_plan_chunk(xdna_ops * ops, const struct ggml_cgraph * cgraph);
@@ -224,7 +231,9 @@ bool xdna_ops_compute(xdna_ops * ops, struct ggml_tensor * node);
 bool xdna_ops_finalize(xdna_ops * ops);
 
 // Test hooks, reached through the registry's proc addresses: the next `blocks` folded bf16 GEMM blocks have their first C
-// line poisoned again `times` times each, as a write that did not land would leave it; the re-runs so far.
+// line poisoned again `times` times each, as a write that did not land would leave it; the re-runs so far; the bf16
+// GEMM calls so far; the changes of prefill block between consecutive GEMM calls so far.
 void xdna_ops_test_lose_c_lines(int blocks, int times);
 int  xdna_ops_test_rerun_count(void);
 int  xdna_ops_test_gemm_count(void);
+int  xdna_ops_test_block_switches(void);

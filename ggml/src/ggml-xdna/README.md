@@ -21,7 +21,7 @@ for the GEMV). The route depends on the number of activation rows `M`:
 | :-- | :-- |
 | 1 | decode GEMV (`kernels/gemv_q4.py` + `kernels/gemv-q4.cc`): the weights stay quantized in DDR and the group parameters are applied to the accumulator; `Q5_K`/`Q6_K` `attn_qkv` and `attn_v` are taken at 4 bits by default (see [4-bit decode weights](#4-bit-decode-weights-on-by-default)) |
 | 2..63 | decode GEMM, the M32 block (`kernels/gemm.py`, native bf16 r=4) |
-| >= 64 | prefill GEMM, the cheapest baked M block; bf16 for `F16`/`BF16`/`Q4_K`, and the native int8 route (1 B/value) for `Q4_K`/`Q5_K`/`Q6_K` |
+| >= 64 | prefill GEMM on a baked M block, one for all the graph's GEMMs of a route and row count: the block of least summed cost, since each block is its own xclbin and a change of block costs a hardware-context switch; bf16 for `F16`/`BF16`/`Q4_K`, and the native int8 route (1 B/value) for `Q4_K`/`Q5_K`/`Q6_K` |
 
 The GEMM artifacts are compiled at K1024/N2048 but the runtime drives any `K`
 that is a multiple of 64 and any `N` that is a multiple of 512 (the stream
@@ -252,22 +252,20 @@ above.
 
 | file | input | CPU ms | CPU J | XDNA ms | XDNA J |
 | :-- | :-- | --: | --: | --: | --: |
-| Q8_0 | one 15-token query (`host`) | 7.2 | 0.39 | 7.6 | 0.39 |
-| Q8_0 | one 41-token text (`host`) | 13.6 | 0.59 | 14.5 | 0.61 |
-| Q8_0 | one 67-token text (`host`) | 28.7 | 1.37 | 20.2 | 0.87 |
-| Q8_0 | one 132-token text | 42.1 | 2.39 | 42.0 | 1.79 |
-| Q8_0 | one 912-token text | 242.4 | 24.4 | 145.7 | 7.38 |
-| Q8_0 | eight texts, 1188 tokens, one batch | 357.6 | 42.5 | 174.1 | 9.69 |
-| BF16 | one 15-token query (`host`) | 6.5 | 0.50 | 7.6 | 0.34 |
-| BF16 | one 132-token text (`host`) | 40.7 | 2.28 | 27.7 | 1.18 |
-| BF16 | one 912-token text | 196.7 | 15.8 | 166.0 | 8.46 |
-| BF16 | eight texts, 1188 tokens, one batch | 288.3 | 28.9 | 433.6 | 19.6 |
+| Q8_0 | one 15-token query (`host`) | 7.2 | 0.44 | 8.4 | 0.49 |
+| Q8_0 | one 41-token text (`host`) | 13.4 | 0.62 | 13.7 | 0.59 |
+| Q8_0 | one 67-token text (`host`) | 28.4 | 1.38 | 20.2 | 0.87 |
+| Q8_0 | one 132-token text | 42.0 | 2.42 | 41.1 | 1.73 |
+| Q8_0 | one 912-token text | 247.1 | 24.9 | 145.1 | 7.32 |
+| Q8_0 | eight texts, 1188 tokens, one batch | 351.2 | 41.7 | 174.9 | 9.83 |
+| BF16 | one 15-token query (`host`) | 6.8 | 0.52 | 7.3 | 0.34 |
+| BF16 | one 132-token text (`host`) | 41.8 | 2.31 | 26.3 | 1.08 |
+| BF16 | one 912-token text | 196.2 | 15.4 | 165.6 | 8.42 |
+| BF16 | eight texts, 1188 tokens, one batch | 288.7 | 28.9 | 199.2 | 11.2 |
 
 A pass the rule runs on the host is quicker than the CPU backend's at 67
 tokens and more, and up to 1.2 times slower on the shortest inputs, where
 `--device none` is the quicker choice.
-The BF16 batch of 1188 tokens is slower than the CPU: see
-[Known limits](#known-limits).
 
 ## How it works
 
@@ -559,6 +557,7 @@ report, not for tuning: every one costs more time or energy than the default.
 | `GGML_XDNA_HOST_CHUNK` | a prefill chunk whose array commands cost more than the host's products runs whole on the host as CPU graphs (see [The host or the array](#the-host-or-the-array)); `0` keeps it on the array |
 | `GGML_XDNA_PGEMM_HOST` | in a chunk that keeps array work, a pgemm command of 2 to 128 rows whose products the host does quicker runs on the host; `0` keeps it on the array |
 | `GGML_XDNA_GEMM_GROUP` | projections of one activation on the bf16 GEMM (Q, K and V; gate and up) run as one GEMM, each output into its own node |
+| `GGML_XDNA_GEMM_ONE_BLOCK` | the GEMMs of one route and row count in a graph run on one prefill M block, the one of least summed cost; `0` lets each op pick its own, and every change of block costs a hardware-context switch |
 | `GGML_XDNA_GDN_MM` | the prefill gated delta rule on the array |
 | `GGML_XDNA_GDN_IN` | the prefill GDN's conv input, norms and state copy fed straight into the array |
 | `GGML_XDNA_FA_MM` | the prefill attention on the array: `0` the host, `2` the array whatever the size |
@@ -666,7 +665,3 @@ Diagnostics - nothing is measured unless they are set:
   its full-attention layers (heads of 512, one KV head) at any length: the
   prefill attention kernel takes heads of 256 over 2 KV heads, and each call
   pays two hardware-context switches.
-- A bf16 GEMM of more than 1024 rows is far slower than one just under: a
-  BF16 EmbeddingGemma 2 text of 1029 tokens takes 420 ms a pass against 180
-  ms at 1016 tokens, and one of 1185 tokens 466 ms against the CPU backend's
-  305 ms. The cause is not identified.
