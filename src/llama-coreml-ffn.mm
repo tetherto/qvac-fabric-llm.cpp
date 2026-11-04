@@ -288,9 +288,18 @@ bool llama_coreml_ffn_check(llama_coreml_ffn * runtime) {
     if (runtime->sequence == runtime->checked_sequence && !runtime->failed.load()) { return true; }
     dispatch_sync(runtime->queue, ^{});
     runtime->checked_sequence = runtime->sequence;
+    // a graph that stopped between a start and its finish leaves that start queued; the next finish must not wait on it
+    bool stopped = false;
+    for (auto & layer : runtime->layers) {
+        stopped = stopped || !layer->started.empty();
+        layer->started.clear();
+    }
     std::lock_guard<std::mutex> lock(runtime->error_mutex);
-    if (runtime->error.empty()) { return true; }
+    if (runtime->error.empty()) { return !stopped; }
     LLAMA_LOG_ERROR("Core ML FFN: %s\n", runtime->error.c_str());
+    // only the ubatch that ran the failed call fails
+    runtime->error.clear();
+    runtime->failed.store(false);
     return false;
 }
 

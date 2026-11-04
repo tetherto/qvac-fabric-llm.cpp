@@ -37,7 +37,7 @@ The initial implementation supports the 64-layer, 5120-hidden, 17408-FFN Qwen3.8
 
 Each context owns its models, serial worker, events and pending calls. Two contexts may be used independently; calls on one context must follow the existing caller-side synchronization contract. Configuration waits for outstanding graph work, invalidates graphs containing old runtime pointers, and replaces the old sidecar only after successful setup. Cache entries are shared on disk, and concurrent compilation uses separate staging paths. Compiled weights are keyed by the source path, size and modification time, the template program and layout, and the channel range. Do not modify the GGUF while configuring it.
 
-Each chunk starts a prediction with shared Metal input/output buffers. An identity custom op holds the input alive and inserts the GPU wait, then ordinary graph nodes add the Core ML partials. There are no hidden join graphs or cached bindings to scheduler allocations. Prediction errors are checked before encode/decode returns success; an error fails the request, whose sidecar must be disabled and KV state discarded before retrying.
+Each chunk starts a prediction with shared Metal input/output buffers. An identity custom op holds the input alive and inserts the GPU wait, then ordinary graph nodes add the Core ML partials. There are no hidden join graphs or cached bindings to scheduler allocations. Prediction errors are checked before encode/decode returns success; an error fails only that request, whose KV state must be discarded, and later requests use the sidecar again.
 
 A small application using only the public library API is built as `llama-coreml-ffn` when examples are enabled:
 

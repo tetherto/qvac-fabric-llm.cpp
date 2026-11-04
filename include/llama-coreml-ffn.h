@@ -24,7 +24,7 @@ LLAMA_API bool llama_supports_coreml_ffn(void);
 // Configuration is context-owned; failure preserves the previous configuration.
 // Active LoRA adapters, training and small batches use the normal FFN.
 // The caller must serialize configuration and inference on the same context.
-// Prediction failure makes encode/decode fail; disable the sidecar and discard that request's KV state.
+// A prediction failure fails that encode/decode only; discard that request's KV state, later calls use the sidecar again.
 LLAMA_API bool llama_set_coreml_ffn(
         struct llama_context * ctx, const struct llama_coreml_ffn_params * params,
         char * error, size_t error_size);
