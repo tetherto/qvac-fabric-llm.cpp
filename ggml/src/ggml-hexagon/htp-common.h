@@ -67,16 +67,48 @@ static inline void ggml_hexagon_tensor_clear_flags(struct ggml_tensor * t, uint3
     t->extra = (void *) (uintptr_t) (ggml_hexagon_tensor_get_flags(t) & ~flags);
 }
 
+bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b);
+
+static inline bool htp_needs_canonical_tail(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_F16:
+            return false;
+        default:
+            return true;
+    }
+}
+
+static inline bool htp_can_store_tiled(const struct ggml_tensor * tensor) {
+    return htp_is_tiled_weight_tensor(tensor) &&
+           (tensor->op == GGML_OP_NONE || !htp_needs_canonical_tail(tensor->type));
+}
+
+static inline uint32_t htp_owned_flags(const struct ggml_tensor * tensor) {
+    const auto * owner = htp_repack_owner(tensor);
+    if (!owner->buffer || !ggml_backend_buffer_is_hexagon(owner->buffer)) {
+        return 0;
+    }
+    return ggml_hexagon_tensor_get_flags(owner);
+}
+
 static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t) {
     return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_FUSEABLE) != 0;
 }
 
 static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
-    return (ggml_hexagon_tensor_get_flags(htp_repack_owner(t)) & HTP_TENSOR_TILED) != 0;
+    return (htp_owned_flags(t) & HTP_TENSOR_TILED) != 0;
 }
 
 static inline bool ggml_hexagon_tensor_can_tile(const struct ggml_tensor * t) {
-    if (opt_rt_repack == 0) {
+    if (opt_rt_repack == 0 || !htp_can_store_tiled(t)) {
+        return false;
+    }
+    if (t->buffer && !ggml_backend_buffer_is_hexagon(t->buffer)) {
         return false;
     }
     if (t->buffer) {
@@ -85,7 +117,7 @@ static inline bool ggml_hexagon_tensor_can_tile(const struct ggml_tensor * t) {
             return false;
         }
     }
-    return htp_is_tiled_weight_tensor(t);
+    return true;
 }
 
 static inline bool ggml_hexagon_tensor_will_tile(const struct ggml_tensor * t) {
@@ -132,8 +164,6 @@ size_t       htp_session_vtcm_size(const struct ggml_hexagon_session * sess);
 uint32_t     htp_session_n_hvx(const struct ggml_hexagon_session * sess);
 uint32_t     htp_session_n_hmx(const struct ggml_hexagon_session * sess);
 uint32_t     htp_session_mdev_count(const struct ggml_hexagon_session * sess);
-
-bool         ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b);
 
 htp_op_code  htp_op_remap(const struct ggml_tensor * t);
 

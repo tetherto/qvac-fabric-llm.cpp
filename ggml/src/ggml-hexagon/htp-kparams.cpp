@@ -1778,8 +1778,7 @@ static bool htp_kparams_solve_set_rows(
     const struct ggml_tensor * dst  = op->src[2] ? op->src[2] : op;
 
     const auto * owner = htp_repack_owner(dst);
-    const uint32_t owner_flags = owner->buffer && ggml_backend_buffer_is_hexagon(owner->buffer) ?
-        ggml_hexagon_tensor_get_flags(owner) : 0;
+    const uint32_t owner_flags = htp_owned_flags(dst);
     if (htp_is_tiled_weight_type(dst->type) &&
         ((owner_flags & HTP_TENSOR_TILED) ||
          (owner->buffer && ggml_backend_buffer_get_usage(owner->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS))) {
