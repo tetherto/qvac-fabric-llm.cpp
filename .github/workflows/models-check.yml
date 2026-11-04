@@ -126,7 +126,7 @@ jobs:
   metal:
     needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
