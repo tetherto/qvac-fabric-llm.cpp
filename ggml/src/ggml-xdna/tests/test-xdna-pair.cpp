@@ -9,6 +9,8 @@
 // 32, as the host and the epilogue do, so it differs from the device only by
 // rounding and, for Q6_K, by the 8-bit form's merged group scales (nmse ~1e-5):
 // a broken pass reads as garbage, not as a small error.
+// Host-only first: the uncapped chunk bound, and the row-mode tiles of a GDN
+// z projection that reuses qkv's row (no side rows, the gates unchanged).
 // Skips the device cases (exit 0) when no NPU or no fused artifact is found.
 
 #include "../xdna-gemv.h"
@@ -26,6 +28,13 @@ static constexpr float  CODE_MAX  = 127.0f;
 static constexpr float  W_SCALE   = 0.02f;
 static constexpr double NMSE_MAX  = 1e-4;  // against the int8 reference
 static constexpr int    BOUND_K   = 2048;  // any K the fused split takes
+static constexpr int    ROW_D     = 2560;  // the 4B's residual width
+static constexpr int    ROW_Z     = 4096;  // its z: 32 value heads of 128
+static constexpr int    ROW_GATES = 32;    // gate rows the in-projection's prologues take
+static constexpr float  ROW_EPS   = 1e-6f;
+static constexpr int    ACT_WORDS = XDNA_GEMV_ACT_TILE / 4;
+static constexpr int    SIDE_WORD = ACT_WORDS - 6;  // side objects a tile takes (act-att.cc)
+static constexpr int    EMIT_WORD = ACT_WORDS - 7;  // objects it emits
 
 struct pair_case {
     const char * what;
@@ -195,6 +204,45 @@ static bool check_uncapped_bound(void) {
     return ok;
 }
 
+// The words of `a` and `b` that differ, as tile * ACT_WORDS + word.
+static std::vector<size_t> differing_words(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
+    std::vector<size_t> out;
+    const int32_t *     wa = (const int32_t *) a.data();
+    const int32_t *     wb = (const int32_t *) b.data();
+    for (size_t i = 0; i < a.size() / 4; i++) {
+        if (wa[i] != wb[i]) {
+            out.push_back(i);
+        }
+    }
+    return out;
+}
+
+// With reuse_row only the first tile's side and emit counts change, to zero,
+// and the last tile still takes the gates. The geometry is the 4B z's
+// (xdna_rec_inproj_pack_one).
+static bool check_reused_row(void) {
+    const xdna_gemv_geom g = xdna_gemv_variant(GGML_TYPE_Q4_K, ROW_D, ROW_Z, false, XDNA_GEMV_SPLIT_FUSED);
+    std::vector<uint8_t> full(g.act_bytes()), reused(g.act_bytes());
+    if (!g.valid() || !xdna_gemv_row_act(g, full.data(), ROW_EPS, true, 0, ROW_GATES) ||
+        !xdna_gemv_row_act(g, reused.data(), ROW_EPS, true, 0, ROW_GATES, true)) {
+        std::printf("FAIL: reused row: the tiles do not build\n");
+        return false;
+    }
+    const size_t              first      = ACT_WORDS;  // tile 1: chunk 0's first, after the header
+    const size_t              gate       = (size_t) g.n_out() * g.n_tiles() * ACT_WORDS;
+    const std::vector<size_t> diff       = differing_words(full, reused);
+    const int32_t *           wr         = (const int32_t *) reused.data();
+    const bool                only_first = diff == std::vector<size_t>{ first + EMIT_WORD, first + SIDE_WORD };
+    const bool                none_first = wr[first + SIDE_WORD] == 0 && wr[first + EMIT_WORD] == 0;
+    const bool                gates_kept =
+        wr[gate + SIDE_WORD] == 1 + ROW_GATES * ROW_D / XDNA_ROW_GATE_VALUES && wr[gate + EMIT_WORD] == 1;
+    const bool ok = g.n_out() * g.n_tiles() > 1 && only_first && none_first && gates_kept;
+    std::printf("%s: reused row (D %d, %d tiles, %zu words differ, first tile %d/%d, gate tile %d/%d)\n",
+                ok ? "ok  " : "FAIL", ROW_D, g.n_out() * g.n_tiles(), diff.size(), wr[first + SIDE_WORD],
+                wr[first + EMIT_WORD], wr[gate + SIDE_WORD], wr[gate + EMIT_WORD]);
+    return ok;
+}
+
 static int count_failures(xdna_kernel_pool * pool) {
     std::mt19937 rng(42);
     int          failures = 0;
@@ -207,6 +255,10 @@ static int count_failures(xdna_kernel_pool * pool) {
 int main(void) {
     if (!check_uncapped_bound()) {
         std::printf("test-xdna-pair: the uncapped bound is wrong\n");
+        return 1;
+    }
+    if (!check_reused_row()) {
+        std::printf("test-xdna-pair: a reused row's tiles are wrong\n");
         return 1;
     }
     const std::string stem = xdna_gemv_stem(XDNA_GEMV_SPLIT_FUSED);
