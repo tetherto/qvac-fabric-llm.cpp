@@ -448,13 +448,16 @@ bool xdna_row_gates_ok(int64_t d, int gates);
 // row is not D = n_tiles * k_tile with xdna_res_width_ok(D).
 // `gates` > 0 (a GDN in-projection: 32) makes the last tile of the last chunk
 // take the gates' constants and weight rows (xdna_row_gates_ok) and emit x's
-// tails (act-att.cc).
+// tails (act-att.cc). With `reuse_row` the first tile takes no side rows and
+// emits nothing: the prologue still holds the row, quantized alike, from the
+// projection before this one, and xdna_seq_row_gates sends the gates alone.
 bool xdna_gemv_row_act(const xdna_gemv_geom & geom,
                        uint8_t *              dst,
                        float                  eps,
                        bool                   res,
                        int32_t                last_flags,
-                       int                    gates = 0);
+                       int                    gates     = 0,
+                       bool                   reuse_row = false);
 
 // The prologue's side streams for a row-mode input (act-att.cc mode 4):
 // acc, the residual and gamma to the prologue, h back to `h_off`. Rows are
@@ -491,6 +494,17 @@ void xdna_seq_row_io_gates(struct xdna_seq * seq,
                            uint32_t          x_off,
                            uint32_t          x_stride,
                            uint32_t          x_heads);
+
+// Only the gates and x's tails of xdna_seq_row_io_gates, for a row the
+// prologue already holds (xdna_gemv_row_act's `reuse_row`).
+void xdna_seq_row_gates(struct xdna_seq * seq,
+                        int               ab_arg,
+                        uint32_t          ab_off,
+                        uint32_t          ab_words,
+                        int               x_arg,
+                        uint32_t          x_off,
+                        uint32_t          x_stride,
+                        uint32_t          x_heads);
 
 // True when this pair's first phase reads raw tiles, so the dispatch before it
 // can drain into them; and the buffer those tiles live in.
