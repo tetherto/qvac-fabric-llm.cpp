@@ -6859,6 +6859,8 @@ void check_turbovec_1x_load_staged_off() {
         std::vector<uint64_t> staged_ids;
         search(plain, staged_scores, staged_ids);
         const std::vector<uint8_t> plain_bytes = snapshot(plain);
+        uint64_t plain_sums[3] = {};
+        state_hash_for_test(plain, plain_sums);
         CHECK(ggml_vec_index_turbovec_set_staged(plain, 0) == GGML_VEC_INDEX_OK);
         caches(plain, planes, packed, sign);
         CHECK(!planes && !packed && sign == 0);
@@ -6882,8 +6884,12 @@ void check_turbovec_1x_load_staged_off() {
         for (ggml_vec_index_t * idx : { from_file, from_bytes }) {
             caches(idx, planes, packed, sign);
             CHECK(!planes && !packed && sign == 0);
-            // The snapshot layout depends on the row count, not on staged search.
+            // The snapshot layout depends on the row count, not on staged search,
+            // and the state hash summed while loading matches a rebuilt one.
             CHECK(snapshot(idx) == plain_bytes);
+            uint64_t sums[3] = {};
+            state_hash_for_test(idx, sums);
+            CHECK(sums[0] == plain_sums[0] && sums[1] == plain_sums[1] && sums[2] == plain_sums[2]);
             std::vector<float> scores;
             std::vector<uint64_t> got;
             search(idx, scores, got);

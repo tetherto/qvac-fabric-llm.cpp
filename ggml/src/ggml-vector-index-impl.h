@@ -1222,6 +1222,11 @@ void turbovec_blocked_set_row_seq(ggml_vec_index & idx, size_t slot, const uint8
 // `seq_into_native`). The block must lie inside the cache.
 void turbovec_block_seq(const ggml_vec_index & idx, size_t block, uint8_t * seq_blocked);
 void turbovec_blocked_set_block_seq(ggml_vec_index & idx, size_t block, const uint8_t * seq_blocked);
+// Writes blocks [first_block, first_block + n_blocks) of the blocked cache
+// from their packed rows, 32 per block in slot order, with the conversion
+// `repack_turbovec_codes` uses. The blocks must lie inside the cache.
+void turbovec_blocked_set_blocks_packed(
+    ggml_vec_index & idx, size_t first_block, size_t n_blocks, const uint8_t * packed_rows);
 // Writes n_new packed rows into the blocked cache from first_slot on.
 void turbovec_blocked_append(ggml_vec_index & idx, const uint8_t * packed, size_t first_slot, size_t n_new);
 // The sign planes of rows [first_slot, n_vectors) into the sign blocked
