@@ -219,7 +219,8 @@ struct xdna_gemv_seq_opts {
     // times over, after the header, instead of a copy per chunk.
     bool                       act_replay        = false;
     // With act_replay, where the header tile sits when it is not just before
-    // the body: a header the host writes, beside a body the array drains.
+    // the body (bytes into the activation's argument, not from act_off): a
+    // header the host writes, beside a body the array drains.
     int64_t                    act_hdr_off       = -1;
     // Bisecting an appended stream: 1 = weights only, 2 = and the activation,
     // 3 = and the output descriptors but no wait, 0 = the whole thing.

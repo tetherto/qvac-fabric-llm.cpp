@@ -547,8 +547,12 @@ xrt::run * xdna_att_layer_start(xdna_att_layer * l, const xdna_att_layer_in & in
             (const void *) in.cosv, (const void *) in.sinv, in.n_valid, in.n_rot);
         return nullptr;
     }
-    if (in.pos_b != l->pos_b ||
-        !xdna_att_layer_fits(in.kbo, in.koff, in.vbo, in.voff, in.n_valid, in.pos_b, l->groups)) {
+    if (in.pos_b != l->pos_b) {
+        GGML_LOG_ERROR("%s: the cache's position stride is %zu bytes, the layer's %zu\n", "xdna-att-layer", in.pos_b,
+                       l->pos_b);
+        return nullptr;
+    }
+    if (!xdna_att_layer_fits(in.kbo, in.koff, in.vbo, in.voff, in.n_valid, in.pos_b, l->groups)) {
         GGML_LOG_ERROR("%s: %d positions do not fit the K/V cache buffers\n", "xdna-att-layer", in.n_valid);
         return nullptr;
     }
