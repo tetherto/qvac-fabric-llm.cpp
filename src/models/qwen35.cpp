@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-coreml-ffn-impl.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -191,12 +192,21 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
-        // Dense FFN layer - without residual connection
-        cur = build_layer_ffn(attn_post_norm, il);
-        cb(cur, "ffn_out", il);
+        const auto & layer = model.layers[il];
+        ggml_tensor * coreml_out = (!loras || loras->empty()) && !hdmd && !layer.ffn_gate_s && !layer.ffn_up_s && !layer.ffn_down_s
+            ? llama_coreml_ffn_build(coreml_ffn, ctx0, gf, attn_post_norm, ffn_residual,
+                    layer.ffn_gate, layer.ffn_up, layer.ffn_down, il)
+            : nullptr;
+        if (coreml_out) {
+            cur = coreml_out;
+        } else {
+            // Dense FFN layer - without residual connection
+            cur = build_layer_ffn(attn_post_norm, il);
+            cb(cur, "ffn_out", il);
 
-        // Residual connection for FFN - add to the tensor from before post_attention_layernorm
-        cur = ggml_add(ctx0, cur, ffn_residual);
+            // Residual connection for FFN - add to the tensor from before post_attention_layernorm
+            cur = ggml_add(ctx0, cur, ffn_residual);
+        }
         cb(cur, "post_ffn", il);
 
         cur = build_cvec(cur, il);

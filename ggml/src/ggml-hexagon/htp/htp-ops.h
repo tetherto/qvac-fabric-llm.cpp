@@ -116,6 +116,7 @@ enum htp_op_code {
     HTP_OP_IM2COL_3D,
     HTP_OP_HADAMARD,
     HTP_OP_SNAKE,
+    HTP_OP_CONV_TAPS_F32,
 
     HTP_OP_INVALID
 };
