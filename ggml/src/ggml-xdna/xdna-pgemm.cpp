@@ -359,6 +359,44 @@ uint32_t w_send_packet(uint32_t r) {
     return MT_BD_PKT | (W_PKT_PAIR0 + r) << MT_BD_PKT_ID_SHIFT;
 }
 
+// Both A streams: the slab's header, then its half of `nmb` blocks, `rounds` times
+void a_streams(xdna_seq * seq, int nmb, uint32_t a_blk, uint32_t h_off, uint32_t a_off, uint32_t rounds) {
+    for (int h = 0; h < 2; h++) {
+        xdna_bd bd = linear_bd(HDR_BYTES / 4);
+        xdna_seq_blockwrite(seq, A_COL0 + h, 0, 0, &bd);
+        xdna_seq_ddr_patch(seq, A_COL0 + h, 0, 0, 1, h_off + (uint32_t) h * HDR_BYTES);
+        xdna_seq_push_queue(seq, A_COL0 + h, 0, 0, xdna_dma_dir::MM2S, 0, false, 0);
+        bd = linear_bd((uint32_t) nmb * a_blk / 4);
+        xdna_seq_blockwrite(seq, A_COL0 + h, 0, 1, &bd);
+        xdna_seq_ddr_patch(seq, A_COL0 + h, 0, 1, 1, a_off + (uint32_t) h * (nmb + 1) * a_blk);
+        xdna_seq_push_queue(seq, A_COL0 + h, 0, 1, xdna_dma_dir::MM2S, 0, false, rounds - 1);
+    }
+}
+
+// Column c's fused C of chunk ch's block b, a chain of four from shim BD id0: a core's object is its 64 rows x 32 bf16
+// of columns ch 512 + c 64 + r 32 (K step ch 8 + c, pair-swapped in the odd half), then 4 KB that land on the next
+// block's rows; the column's four in the join's order (r, mb) = (i / 2, i % 2)
+void fused_c_task(xdna_seq * seq, const c_dest & cd, int c, int ch, int b, uint32_t id0) {
+    for (uint32_t i = 0; i < 4; i++) {
+        const uint32_t r = i / 2, mb = i % 2;
+        const uint32_t st = (uint32_t) (ch * 8 + c) ^ mb;
+        xdna_bd        bd;
+        bd.buf_len   = 2048;
+        bd.d0_size   = 16;
+        bd.d0_stride = 1;
+        bd.d1_size   = MB;
+        bd.d1_stride = KS / 2;
+        bd.d2_stride = cd.a_blk / 4;
+        bd.ax_cache  = 2;
+        bd.next_bd   = id0 + i + 1;
+        bd.use_next  = i < 3;
+        xdna_seq_blockwrite(seq, c, 0, id0 + i, &bd);
+        xdna_seq_ddr_patch(seq, c, 0, id0 + i, 2, cd.half[mb] + (uint32_t) b * cd.a_blk + (st * MB * KS + r * 32) * 2);
+    }
+    xdna_seq_issue_token(seq, c, 0, xdna_dma_dir::S2MM, 0, 0xF);
+    xdna_seq_push_queue(seq, c, 0, id0, xdna_dma_dir::S2MM, 0, true, 0);
+}
+
 // The stream for `nmb` M blocks of a weight of geometry `g` and plan `wp`,
 // the slab's A headers at byte `h_off` of argument 1 and its halves at
 // `a_off` (each nmb blocks).
@@ -386,17 +424,7 @@ std::vector<uint32_t> build_seq(const xdna_gemv_geom & g,
             mt_set_lock(&seq, c, W_LOCK0 + 2 * k + 1, 0);
         }
     }
-    // A: the header, then the slab's half, once a chunk
-    for (int h = 0; h < 2; h++) {
-        xdna_bd bd = linear_bd(HDR_BYTES / 4);
-        xdna_seq_blockwrite(&seq, A_COL0 + h, 0, 0, &bd);
-        xdna_seq_ddr_patch(&seq, A_COL0 + h, 0, 0, 1, h_off + (uint32_t) h * HDR_BYTES);
-        xdna_seq_push_queue(&seq, A_COL0 + h, 0, 0, xdna_dma_dir::MM2S, 0, false, 0);
-        bd = linear_bd((uint32_t) nmb * a_blk / 4);
-        xdna_seq_blockwrite(&seq, A_COL0 + h, 0, 1, &bd);
-        xdna_seq_ddr_patch(&seq, A_COL0 + h, 0, 1, 1, a_off + (uint32_t) h * (nmb + 1) * a_blk);
-        xdna_seq_push_queue(&seq, A_COL0 + h, 0, 1, xdna_dma_dir::MM2S, 0, false, (uint32_t) nch - 1);
-    }
+    a_streams(&seq, nmb, a_blk, h_off, a_off, (uint32_t) nch);
     // W from DDR: replayed, each column's whole stream once; streamed, a
     // chunk once per block
     int  w_pushed = 0;
@@ -476,31 +504,8 @@ std::vector<uint32_t> build_seq(const xdna_gemv_geom & g,
             }
         }
         if (cd.fused) {
-            // a core's object is its 64 rows x 32 bf16 of columns ch 512 +
-            // c 64 + r 32 (K step ch 8 + c, pair-swapped in the odd half),
-            // then 4 KB that land on the next block's rows; the column's four
-            // in the join's order (r, mb) = (i / 2, i % 2), a chain of four
             for (int c = 0; c < COLS; c++) {
-                const uint32_t id0 = SH_BD_C + 4 * (uint32_t) (c_e % C_RING);
-                for (uint32_t i = 0; i < 4; i++) {
-                    const uint32_t r = i / 2, mb = i % 2;
-                    const uint32_t st = (uint32_t) (ch * 8 + c) ^ mb;
-                    xdna_bd        bd;
-                    bd.buf_len   = 2048;
-                    bd.d0_size   = 16;
-                    bd.d0_stride = 1;
-                    bd.d1_size   = MB;
-                    bd.d1_stride = KS / 2;
-                    bd.d2_stride = cd.a_blk / 4;
-                    bd.ax_cache  = 2;
-                    bd.next_bd   = id0 + i + 1;
-                    bd.use_next  = i < 3;
-                    xdna_seq_blockwrite(&seq, c, 0, id0 + i, &bd);
-                    xdna_seq_ddr_patch(&seq, c, 0, id0 + i, 2,
-                                       cd.half[mb] + (uint32_t) b * cd.a_blk + (st * MB * KS + r * 32) * 2);
-                }
-                xdna_seq_issue_token(&seq, c, 0, xdna_dma_dir::S2MM, 0, 0xF);
-                xdna_seq_push_queue(&seq, c, 0, id0, xdna_dma_dir::S2MM, 0, true, 0);
+                fused_c_task(&seq, cd, c, ch, b, SH_BD_C + 4 * (uint32_t) (c_e % C_RING));
             }
             c_e++;
             return;
@@ -984,17 +989,10 @@ bool pgemm_call(xdna_kernel_pool *  pool,
         std::memset(ah, 0, h_total);
         for (int sl = 0; sl < n_sl; sl++) {
             for (int h = 0; h < 2; h++) {
-                int32_t  words[8] = { blocks_of(sl) * nch,    g.n_tiles(),  q8 ? 1 : 0, steps, steps / 2, glu ? 1 : 2,
-                                     mode,                   steps / 2 - 1 };
-                uint16_t hb[16];                     // (a memcpy: read through a uint16_t
-                std::memcpy(hb, words, sizeof(hb));  // pointer, the ints are dead stores)
-                // the header goes through the MemTile's tiling too: its bf16
-                // j (row j / 8 of the first 8 x 8 sub-tile) is sent from
-                // row j / 8, column j % 8 of the (64 x 64) object
-                uint16_t * hdr = ah + (size_t) (sl * 2 + h) * HDR_BYTES / 2;
-                for (int j = 0; j < 16; j++) {
-                    hdr[(j / 8) * KS + j % 8] = hb[j];
-                }
+                int32_t words[HDR_WORDS] = { blocks_of(sl) * nch, g.n_tiles(), q8 ? 1 : 0, steps, steps / 2,
+                                             glu ? 1 : 2,         mode,        steps / 2 - 1 };
+                // the header goes through the MemTile's tiling too
+                write_tiled_words(words, HDR_WORDS, ah + (size_t) (sl * 2 + h) * HDR_BYTES / 2);
             }
         }
         if (!xdna_buffer_sync_to_device_range(al->bo, h_total, 0)) {
