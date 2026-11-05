@@ -108,9 +108,12 @@ xdna_wfmt xdna_wfmt_gemv_for(enum ggml_type type);
 
 // The type a decode GEMV packs `w` as: its own, or Q4_K for a Q5_K/Q6_K
 // weight chosen for the 4-bit form (re-quantized at load, see
-// xdna_wfmt_repack_row_as). GGML_XDNA_W4 is the choice, a comma-separated
-// list of tensor names without ".weight" ("blk.3.ffn_down") or roles, which
-// match every layer ("ffn_down"); unset, it is "attn_qkv,attn_v", and set
-// empty, nothing is. ssm_out is never chosen: the gated stage's
-// activation layout for it is fixed at build time (GGML_XDNA_GATED_FMT).
+// xdna_wfmt_repack_row_as). `w4` is the choice, GGML_XDNA_W4's value: a
+// comma-separated list of tensor names without ".weight" ("blk.3.ffn_down")
+// or roles, which match every layer ("ffn_down"); null (unset) is
+// "attn_qkv", and empty is nothing. ssm_out is never chosen: the gated
+// stage's activation layout for it is fixed at build time (GGML_XDNA_GATED_FMT).
+enum ggml_type xdna_gemv_type_w4(const struct ggml_tensor * w, const char * w4);
+
+// xdna_gemv_type_w4 with the process's GGML_XDNA_W4, read once.
 enum ggml_type xdna_gemv_type_of(const struct ggml_tensor * w);
