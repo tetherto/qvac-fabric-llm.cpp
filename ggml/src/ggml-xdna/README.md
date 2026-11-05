@@ -294,7 +294,9 @@ the backend looks for are the same value: an artifact built from other sources i
 invisible (and reported) rather than driven. The tag covers the Python designs
 and the knobs, not the backend's own stream builders - those can change without a
 kernel rebuild. A build that does not generate kernels compiles the committed
-`xdna-design-tag.h` in this directory instead.
+`xdna-design-tag.h` in this directory instead; `test-xdna-design-tag` (ctest)
+fails when it is not the tag of the sources at the default
+`GGML_XDNA_GATED_FMT=1`.
 
 The `.insts.bin` files are reference copies. The runtime builds its own TXN
 instruction streams in C++ (`xdna-seq.cpp`, `xdna-seq-attn.cpp`,
