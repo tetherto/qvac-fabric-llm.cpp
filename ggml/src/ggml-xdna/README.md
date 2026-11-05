@@ -92,7 +92,7 @@ path for a model the fused design does cover.
 | `SSM_CONV`, from 64 tokens | `kernels/conv.py` | opt-in, `GGML_XDNA_CONV=1`; the host is cheaper and is what runs otherwise |
 | the prefill GDN's conv input | `kernels/gdn_conv.py` | opt-in, `GGML_XDNA_GDN_CONV=1`; the host is faster (pp512 1900 against 1680 t/s on the 0.8B) and is what runs otherwise |
 | `GATED_DELTA_NET`, from 144 tokens a sequence | `kernels/gdn_mm.py` | on, `GGML_XDNA_GDN_MM=0` for the host; below 144 the host is quicker at less energy a token |
-| `FLASH_ATTN_EXT` of 2 KV heads and D = 256, from 64M visible (query, key, head) triples a call (8M where ggml-cpu's op would run it) | `kernels/attn_mm.py` | on, `GGML_XDNA_FA_MM=0` for the host, `=2` for the array whatever the size; below that the host is quicker: a call pays two hardware-context switches (~5 ms) |
+| `FLASH_ATTN_EXT` of 2 KV heads and D = 256 without a K/V row list (`ggml_flash_attn_ext_rows`), from 64M visible (query, key, head) triples a call (8M where ggml-cpu's op would run it) | `kernels/attn_mm.py` | on, `GGML_XDNA_FA_MM=0` for the host, `=2` for the array whatever the size; below that the host is quicker: a call pays two hardware-context switches (~5 ms) |
 
 ### Everything else
 
