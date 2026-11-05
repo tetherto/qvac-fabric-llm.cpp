@@ -13245,8 +13245,10 @@ struct test_lightning_indexer : public test_case {
         return fused ? ggml_op_desc(t) : "LIGHTNING_INDEXER_FALLBACK";
     }
 
+    // the GPU kernels round Q and K to F16, which puts the NMSE at 0.5-3e-7;
+    // over fewer than 128 outputs it varies up to ~150x between runs
     double max_nmse_err() override {
-        return 1e-6;
+        return kv * nb * ns < 128 ? 1e-4 : 1e-6;
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
