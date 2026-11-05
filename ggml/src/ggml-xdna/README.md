@@ -169,9 +169,10 @@ decode, every `Q5_K` or `Q6_K` weight named `attn_qkv` is re-quantized to
 `Q4_K` from its dequantized values when it is packed, and the fused recurrent
 layers stream it at 4 bits (q4g32) instead of the exact 8-bit form. It buys the
 most decode speed per unit of accuracy lost. Teacher-forced decode KLD against
-the CPU over 511 tokens, and tg512 with `GGML_XDNA_FUSED_WIDE=1`, on Qwen3.5
-Q4_K_M (the CPU's own one-token decode scores 0.0029 on the 9B, 0.0018 on the
-4B, 0.0053 on the 2B and 0.0043 on the 0.8B):
+the CPU over 511 tokens, and tg512 with `GGML_XDNA_FUSED_WIDE=1` (measured
+before the z row reuse), on Qwen3.5 Q4_K_M (the CPU's own one-token decode
+scores 0.0029 on the 9B, 0.0018 on the 4B, 0.0053 on the 2B and 0.0043 on the
+0.8B):
 
 | model | weights at 4 bits | KLD | t/s | J a token, above idle / total |
 | :-- | :-- | --: | --: | --: |
