@@ -410,8 +410,8 @@ bool shapes_supported(const ggml_tensor * node, geometry * geo, int64_t * n_toke
     const ggml_tensor * q = node->src[0];
     const ggml_tensor * k = node->src[1];
     const ggml_tensor * v = node->src[2];
-    if (!q || !k || !v || node->src[4]) {
-        return false;  // sinks
+    if (!q || !k || !v || node->src[4] || node->src[5]) {
+        return false;  // sinks, or a list of K/V rows (ggml_flash_attn_ext_rows)
     }
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
         node->type != GGML_TYPE_F32) {
