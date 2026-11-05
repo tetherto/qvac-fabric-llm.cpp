@@ -75,7 +75,9 @@ if (DEFINED CACHE{XDNA_GATED_FMT} AND NOT DEFINED CACHE{GGML_XDNA_GATED_FMT})
     set(GGML_XDNA_GATED_FMT "${XDNA_GATED_FMT}" CACHE STRING
         "ggml-xdna: gated activation layout baked into the fused layer (0 = 4-bit, for a Q4_K ssm_out; 1 = 8-bit, for Q5_K/Q6_K)")
 endif()
-set(GGML_XDNA_GATED_FMT 1 CACHE STRING
+# the layout the committed xdna-design-tag.h is tagged at (test-xdna-design-tag)
+set(GGML_XDNA_GATED_FMT_DEFAULT 1 CACHE INTERNAL "")
+set(GGML_XDNA_GATED_FMT ${GGML_XDNA_GATED_FMT_DEFAULT} CACHE STRING
     "ggml-xdna: gated activation layout baked into the fused layer (0 = 4-bit, for a Q4_K ssm_out; 1 = 8-bit, for Q5_K/Q6_K)")
 set(XDNA_TILE_K 64)         # per-core K tile (larger = fewer C reloads per call)
 set(XDNA_TILE_N 64)         # per-core N tile (wider = longer B DDR bursts)
