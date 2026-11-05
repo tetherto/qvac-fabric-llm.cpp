@@ -94,6 +94,9 @@ static std::unique_ptr<llama_model> make_test_model(enum llama_rope_type rope_ty
     hparams.rope_freq_scale_train = 1.0f;
     hparams.rope_sections        = { 16, 24, 24, 0 };
 
+    // the cache reads the per-layer FP8 cache scales
+    model->layers.resize(hparams.n_layer_all);
+
     return model;
 }
 
