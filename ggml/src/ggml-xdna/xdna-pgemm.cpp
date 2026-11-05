@@ -1666,14 +1666,16 @@ namespace {
 
 // the segments of a group: projection i's objects follow the previous ones'
 // and it is written to its own node, all of them in one BO. False when a node
-// is not in one, or its allocation lacks the rows the call writes.
+// is not in one, its allocation lacks the rows the call writes, or they end
+// past what a segment's offset reaches.
 bool group_dst(struct ggml_tensor * const * mm, int n, size_t out_rows, pg_dst & ov) {
     int obj = 0;
     for (int i = 0; i < n; i++) {
         size_t              off = 0;
         xdna_buffer *       bo  = xdna_host_bo_of(mm[i]->data, &off);
         const ggml_tensor * t   = mm[i];
-        if (!bo || (ov.bo && bo != ov.bo) || t->nb[1] != t->ne[0] * sizeof(float) || !out_room(t, out_rows)) {
+        if (!bo || (ov.bo && bo != ov.bo) || t->nb[1] != t->ne[0] * sizeof(float) || !out_room(t, out_rows) ||
+            !xdna_pgemm_seg_in_reach(off, out_rows, (size_t) t->ne[0])) {
             return false;
         }
         c_seg sg;

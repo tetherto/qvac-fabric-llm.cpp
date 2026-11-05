@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include <vector>
 
@@ -141,3 +142,11 @@ bool xdna_pgemm_group_supported(struct ggml_tensor * const * mm, int n);
 // The same by the shape alone, for graph_optimize, which runs outside any compute: the plan of the previous one does not enter.
 bool xdna_pgemm_group_shape_supported(struct ggml_tensor * const * mm, int n);
 bool xdna_pgemm_run_group(struct xdna_kernel_pool * pool, struct ggml_tensor * const * mm, int n);
+
+// What a group member's 32-bit byte offset into its BO reaches.
+static const uint64_t XDNA_PGEMM_SEG_REACH = 1ull << 32;
+
+// Whether `rows` rows of `ldc` floats from byte `off` of a BO end within what that offset reaches.
+static inline bool xdna_pgemm_seg_in_reach(size_t off, size_t rows, size_t ldc) {
+    return off + rows * ldc * sizeof(float) < XDNA_PGEMM_SEG_REACH;
+}
