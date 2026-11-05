@@ -218,7 +218,8 @@ void xdna_kernel_pool_release_buffer(xdna_kernel_pool * pool, xdna_buffer * buf)
 
 // --- test hook -------------------------------------------------------------
 
-// The outputs the array writes and the host reads back, by the site that hands them to it.
+// The outputs the array writes, by the site that hands them to it: the host reads them back, except a fused GEMM's
+// layout ("pgemm-fused"), which the array's next projection reads.
 enum xdna_out_site {
     XDNA_OUT_PGEMM,
     XDNA_OUT_ATTN_MM,
@@ -226,13 +227,18 @@ enum xdna_out_site {
     XDNA_OUT_ATT,
     XDNA_OUT_HEAD,
     XDNA_OUT_PFX_ATTN,
+    XDNA_OUT_PGEMM_FUSED,
     XDNA_OUT_SITES
 };
 
 // Test hook (ggml_backend_xdna_test_dirty_output): with `arm`, the next output of `site` ("pgemm", "attn-mm", "gdn-mm",
-// "att", "head", "pfx-attn") is filled with NaN by plain stores, its lines left dirty, before the site flushes it.
-// Returns the outputs of the site filled so far, -1 for a site it does not know.
+// "att", "head", "pfx-attn", "pgemm-fused") is filled with NaN by plain stores, its lines left dirty, before the site
+// flushes it. Returns the outputs of the site filled so far, -1 for a site it does not know.
 int xdna_test_dirty_output(const char * site, int arm);
 
 // [offset, offset + bytes) of `buf`, the output `site` hands the array, filled as above when the site is armed.
 void xdna_test_dirty_if_armed(xdna_out_site site, xdna_buffer * buf, size_t bytes, size_t offset);
+
+// After the array wrote that output: what is still dirty of the site's fill is written back now, as an eviction would,
+// for a site whose output the host never reads back.
+void xdna_test_land_dirty(xdna_out_site site, xdna_buffer * buf, size_t bytes, size_t offset);

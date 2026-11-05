@@ -699,6 +699,13 @@ static int xdna_test_glu_fold_count(void) {
     return g_glu_folds;
 }
 
+// Test hook (ggml_backend_xdna_test_glux_count): the GELU(MUL_MAT) * x the array wrote as its projection's A (GLU_X).
+static std::atomic<int> g_glux_runs{ 0 };
+
+static int xdna_test_glux_count(void) {
+    return g_glux_runs;
+}
+
 // Test hooks (ggml_backend_xdna_test_pfx_row_count, _fallbacks, _fail): the sliding attentions that ran on the row
 // command's inputs, the ones that fell back to the host's at the attention, and how many more are made to.
 static std::atomic<int> g_pfx_rows{ 0 };
@@ -4204,7 +4211,10 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // And when the SWIGLU's one reader is the next projection on the array
     // (xdna_pgemm_glu_fused_supported), the cores write it as that
     // projection's A directly (glu_to_a), the merged design's only GLU output.
-    std::unordered_set<const struct ggml_tensor *> glu_fused, glu_to_a;
+    // A GELU(MUL_MAT) * x whose one reader is such a projection runs the same
+    // way at the MUL (xdna_pgemm_glux_supported): the MUL_MAT and the GELU are
+    // skipped, which needs their outputs to have no other reader.
+    std::unordered_set<const struct ggml_tensor *> glu_fused, glu_to_a, glux;
     if (g_glue_n_tokens > 1) {
         std::unordered_map<const struct ggml_tensor *, int>                        uses;
         std::unordered_map<const struct ggml_tensor *, const struct ggml_tensor *> reader;
@@ -4245,6 +4255,22 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             if (to_a) {
                 glu_to_a.insert(node);
             }
+        }
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            struct ggml_tensor * node = cgraph->nodes[i];
+            if (uses[node] != 1 || (node->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                !xdna_pgemm_glux_supported(node, reader[node]) || !xdna_takes_pgemm(&ctx->ops, reader[node])) {
+                continue;
+            }
+            struct ggml_tensor * act = node->src[0];
+            struct ggml_tensor * mm  = act->src[0];
+            if (!in_graph.count(act) || !in_graph.count(mm) || uses[act] != 1 || uses[mm] != 1 ||
+                ((act->flags | mm->flags) & GGML_TENSOR_FLAG_OUTPUT) || consumed.count(act) || consumed.count(mm)) {
+                continue;
+            }
+            consumed.insert(act);
+            consumed.insert(mm);
+            glux.insert(node);
         }
     }
 
@@ -5122,6 +5148,29 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                     !xdna_ops_finalize(&ctx->ops) || !xdna_glue_host_run(&ctx->ops, node)) {
                     return GGML_STATUS_FAILED;
                 }
+            }
+            continue;
+        }
+        if (glux.count(node)) {
+            // x's producer may still be in the glue batch
+            if (!glue_batch.empty() && !xdna_glue_flush(&ctx->ops, glue_batch)) {
+                return GGML_STATUS_FAILED;
+            }
+            if (!xdna_ops_finalize(&ctx->ops)) {
+                return GGML_STATUS_FAILED;
+            }
+            xdna_pending_wait(ctx);
+            bool ok;
+            {
+                xdna_prof::section_timer st("prefill: pgemm glu_x");
+                ok = xdna_pgemm_run_glux(ctx->ops.pool, node);
+            }
+            if (ok) {
+                g_glux_runs++;
+            } else if (!xdna_ops_compute(&ctx->ops, node->src[0]->src[0]) || !xdna_ops_finalize(&ctx->ops) ||
+                       !xdna_glue_host_run(&ctx->ops, node->src[0]) || !xdna_glue_host_run(&ctx->ops, node)) {
+                // that was the projection, then the host's GELU and MUL
+                return GGML_STATUS_FAILED;
             }
             continue;
         }
@@ -6015,6 +6064,9 @@ static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const c
     }
     if (std::strcmp(name, "ggml_backend_xdna_test_glu_fold_count") == 0) {
         return (void *) xdna_test_glu_fold_count;
+    }
+    if (std::strcmp(name, "ggml_backend_xdna_test_glux_count") == 0) {
+        return (void *) xdna_test_glux_count;
     }
     if (std::strcmp(name, "ggml_backend_xdna_test_pfx_row_count") == 0) {
         return (void *) xdna_test_pfx_row_count;

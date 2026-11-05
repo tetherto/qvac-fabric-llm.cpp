@@ -496,4 +496,19 @@ void ggml_xdna_pg_out(const float * acc, float * out, const int32_t * cnt) {
     }
 }
 
+#ifdef PG_LOAD_X
+// x (64 rows x 32 columns, row-major f32 at the head of the W buffer) as the accumulator's up half, the sub-tile order
+// the mmul leaves: with the up weights zero, mode 1 or 2 then applies act(gate) * x
+void ggml_xdna_pg_load_x(const uint8_t * w, float * acc) {
+    constexpr int SUB = 64, CB = 8, HB = CB / 2, ROWS = 64, COLS_X = 32, LANES = 8;
+    const float * x = (const float *) w;
+    for (int row = 0; row < ROWS; row++) {
+        float * dst = acc + ((row / LANES) * CB + HB) * SUB + (row % LANES) * LANES;
+        for (int cb = 0; cb < HB; cb++) {
+            aie::store_v(dst + cb * SUB, aie::load_v<LANES>(x + row * COLS_X + cb * LANES));
+        }
+    }
+}
+#endif
+
 }  // extern "C"
