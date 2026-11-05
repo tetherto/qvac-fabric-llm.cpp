@@ -107,8 +107,11 @@ __attribute__((noinline)) void exp2_block(const float * xp, bfloat16 * out, int 
     }
 }
 
-// The exponents of a tile, then the weights (P^T).
+// The exponents of a tile, then the weights (P^T). With FA_X_IN_SCORES they go in the second half of the core's own
+// score object, which its pair never reads (kernels/pfx.py's score objects are twice the scores).
+#ifndef FA_X_IN_SCORES
 alignas(64) float g_x[FA_R * FA_NK];
+#endif
 
 // The key row k of element (k, c) of an (8 x 8) tile, for the visibility mask.
 alignas(64) const int32_t g_krow[64] = {
@@ -207,6 +210,9 @@ void fa_scores(const bfloat16 * q, const bfloat16 * kv, float * s) {
 // The same correction goes into the output and the sum, so it cancels in the
 // final division whatever its rounding.
 void fa_update(const float * s_own, const float * s_nb, float * o, bfloat16 * p, float * ml) {
+#ifdef FA_X_IN_SCORES
+    float * const g_x = const_cast<float *>(s_own) + R * NK;
+#endif
     const int32_t k0 = g_k0;
     g_k0 += NK;
     if (g_skip) {

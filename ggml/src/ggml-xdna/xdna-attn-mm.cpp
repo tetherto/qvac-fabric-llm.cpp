@@ -5,6 +5,7 @@
 #include "xdna-host-attn.h"
 #include "xdna-match.h"
 #include "xdna-norm.h"
+#include "xdna-pfx-attn.h"
 #include "xdna-prof.h"
 #include "xdna-runtime.h"
 #include "xdna-seq.h"
@@ -416,7 +417,7 @@ bool shapes_supported(const ggml_tensor * node, geometry * geo, int64_t * n_toke
 // the node), 2 the array whatever the size (tests, bisection).
 bool xdna_attn_mm_supported(const ggml_tensor * node) {
     const int mode = xdna_env_int("GGML_XDNA_FA_MM", 1);
-    if (!node || node->op != GGML_OP_FLASH_ATTN_EXT || mode == 0 || !artifact_present()) {
+    if (!node || node->op != GGML_OP_FLASH_ATTN_EXT || mode == 0 || !(xdna_pfx_attn_active() || artifact_present())) {
         return false;
     }
     geometry geo;
@@ -527,6 +528,23 @@ void unpack_o(ggml_tensor *    node,
     }
 }
 
+// The node on the merged design's attention mode (xdna-pfx-attn.cpp), the GEMM's hardware context.
+bool run_pfx(xdna_kernel_pool * pool, ggml_tensor * node, const geometry & geo, const mask_rows & mr, int64_t n_tokens) {
+    xdna_pfx_attn_job job;
+    job.q        = node->src[0];
+    job.k        = node->src[1];
+    job.v        = node->src[2];
+    job.out      = node;
+    job.lo       = mr.lo.data();
+    job.hi       = mr.hi.data();
+    job.n_tokens = n_tokens;
+    job.n_kv     = mr.n_kv;
+    job.hg       = geo.hg;
+    job.q_scale  = q_scale_of(node);
+    xdna_prof::section_timer st("prefill: pfx attention");
+    return xdna_pfx_attn_run(pool, job);
+}
+
 }  // namespace
 
 bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
@@ -545,6 +563,9 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         return false;
     }
     const mask_rows & mr = *mrp;
+    if (xdna_pfx_attn_active()) {
+        return run_pfx(pool, node, geo, mr, n_tokens);
+    }
     // the keys up to the last any row sees; past them llama's padding
     const int64_t     n_kv  = mr.n_kv;
     const int         npass = (int) ((n_tokens + geo.pass - 1) / geo.pass);

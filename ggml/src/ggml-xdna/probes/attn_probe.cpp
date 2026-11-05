@@ -87,6 +87,7 @@ int main(int argc, char ** argv) {
         vr = v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, D, n_kv, KV);
     }
     ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, N);
+    ggml_set_input(m);  // the array route reads only a graph input's mask
     ggml_tensor * o = ggml_flash_attn_ext(ctx, q, k, v, m, scale, 0.0f, 0.0f);
     ggml_prec_set_acc(o, GGML_PREC_F32);
     std::vector<ggml_tensor *> weights;
