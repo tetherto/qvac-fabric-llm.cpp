@@ -843,6 +843,22 @@ if (GGML_METAL)
     set_tests_properties(test-metal-glu-alias PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+find_package(Threads REQUIRED)
+add_executable(test-hexagon-runtime-info test-hexagon-runtime-info.cpp)
+target_compile_features(test-hexagon-runtime-info PRIVATE cxx_std_17)
+target_link_libraries(test-hexagon-runtime-info PRIVATE Threads::Threads)
+llama_test(test-hexagon-runtime-info)
+set_tests_properties(test-hexagon-runtime-info PROPERTIES TIMEOUT 30)
+
+foreach(hexagon_test test-hexagon-runtime-info-device test-hexagon-conv-taps)
+    add_executable(${hexagon_test} ${hexagon_test}.cpp)
+    target_link_libraries(${hexagon_test} PRIVATE ggml)
+    llama_test(${hexagon_test})
+    set_tests_properties(${hexagon_test} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+endforeach()
+
+set_tests_properties(test-hexagon-conv-taps PROPERTIES ENVIRONMENT "GGML_HEXAGON_DMA64=0")
+
 llama_build_and_test(test-coreml-ffn.cpp LINK llama)
 if (LLAMA_COREML_FFN)
     add_executable(test-metal-custom test-metal-custom.mm)

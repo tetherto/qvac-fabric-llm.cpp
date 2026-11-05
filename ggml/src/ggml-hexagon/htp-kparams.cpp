@@ -14,6 +14,7 @@
 
 htp_op_code htp_op_remap(const struct ggml_tensor * t) {
     switch (t->op) {
+        case GGML_OP_CUSTOM:          return HTP_OP_CONV_TAPS_F32;
         case GGML_OP_FLASH_ATTN_EXT:  return HTP_OP_FLASH_ATTN_EXT;
         case GGML_OP_MUL_MAT:         return htp_is_hadamard(t) ? HTP_OP_HADAMARD : HTP_OP_MUL_MAT;
         case GGML_OP_MUL_MAT_ID:      return HTP_OP_MUL_MAT_ID;
@@ -3398,6 +3399,70 @@ static bool htp_snake_tensor_fits(const struct ggml_tensor * t) {
     return true;
 }
 
+void htp_conv_taps_cpu(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const auto * w = dst->src[0];
+    const auto * x = dst->src[1];
+    const int step = int(reinterpret_cast<intptr_t>(userdata));
+    const int64_t first = step < 0 ? w->ne[2] - 1 : 0;
+    for (int64_t r = ith; r < dst->ne[1]; r += nth) {
+        float * out = reinterpret_cast<float *>(static_cast<uint8_t *>(dst->data) + r * dst->nb[1]);
+        for (int64_t c = 0; c < dst->ne[0]; ++c) {
+            float total = 0.0f;
+            for (int64_t t = 0; t < w->ne[2]; ++t) {
+                const auto * weights = reinterpret_cast<const ggml_fp16_t *>(
+                    static_cast<const uint8_t *>(w->data) + t * w->nb[2] + c * w->nb[1]);
+                const auto * input = reinterpret_cast<const float *>(
+                    static_cast<const uint8_t *>(x->data) + (first + r + t * step) * x->nb[1]);
+                float product = 0.0f;
+                for (int64_t k = 0; k < w->ne[0]; ++k) {
+                    const volatile float term = ggml_fp16_to_fp32(weights[k]) * input[k];
+                    product += term;
+                }
+                const volatile float rounded = product;
+                total = t == 0 ? rounded : total + rounded;
+            }
+            out[c] = total;
+        }
+    }
+}
+
+static bool htp_kparams_solve_conv_taps(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_conv_taps_params * p
+) {
+    if (op->op != GGML_OP_CUSTOM) return false;
+    ggml_custom_op_params custom;
+    memcpy(&custom, op->op_params, sizeof(custom));
+    if (custom.fun != htp_conv_taps_cpu) return false;
+    const auto * w = op->src[0];
+    const auto * x = op->src[1];
+    if (!w || !x || w->type != GGML_TYPE_F16 || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        w->ne[0] < 64 || w->ne[0] % 32 || w->ne[1] < 4 || w->ne[1] % 4 ||
+        w->ne[2] < 2 || w->ne[2] > HTP_CONV_TAPS_MAX_TAPS || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 ||
+        op->ne[2] != 1 || op->ne[3] != 1 || op->ne[0] != w->ne[1] || x->ne[0] != w->ne[0] ||
+        op->ne[1] <= 0 || !ggml_is_contiguous(w) || !ggml_is_contiguous(x) || !ggml_is_contiguous(op)) return false;
+    for (int i = 2; i < GGML_MAX_SRC; ++i) if (op->src[i]) return false;
+    const intptr_t encoded = reinterpret_cast<intptr_t>(custom.userdata);
+    if (encoded != -1 && (encoded < 1 || encoded > HTP_CONV_TAPS_MAX_STEP)) return false;
+    const int step = int(encoded);
+    const int distance = step < 0 ? -step : step;
+    const uint32_t n_threads = htp_session_n_threads(sess);
+    const uint64_t vtcm_size = htp_session_vtcm_size(sess);
+    if (x->ne[1] < op->ne[1] + (w->ne[2] - 1) * distance || n_threads == 0) return false;
+
+    if (opt_dma64 || htp_session_mdev_count(sess) != 1 || ggml_nbytes(w) > UINT32_MAX ||
+        ggml_nbytes(x) > UINT32_MAX || ggml_nbytes(op) > UINT32_MAX) return false;
+    const uint64_t working_bytes = uint64_t(w->nb[2]) + uint64_t(x->nb[1]) * op->ne[1] + ggml_nbytes(op);
+    if (working_bytes <= vtcm_size) return false;
+
+    const uint64_t worker_bytes = (uint64_t(HTP_CONV_TAPS_TILE_ROWS) * op->ne[0] * sizeof(float) + HTP_CONV_TAPS_ALIGNMENT - 1) & ~uint64_t(HTP_CONV_TAPS_ALIGNMENT - 1);
+    const uint64_t total = worker_bytes * n_threads;
+    if (total > vtcm_size || total > UINT32_MAX) return false;
+    *p = {step, uint32_t(step < 0 ? w->ne[2] - 1 : 0), HTP_CONV_TAPS_TILE_ROWS, uint32_t(worker_bytes), uint32_t(total)};
+    return true;
+}
+
 static bool htp_kparams_solve_snake(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -4317,6 +4382,9 @@ bool htp_kparams_solve(
 
         case HTP_OP_SNAKE:
             return htp_kparams_invoke<htp_kparams_solve_snake>(sess, op, kparams);
+
+        case HTP_OP_CONV_TAPS_F32:
+            return htp_kparams_invoke<htp_kparams_solve_conv_taps>(sess, op, kparams);
 
         default:
             if (htp_op_is_unary(opcode)) {
