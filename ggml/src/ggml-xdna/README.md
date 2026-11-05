@@ -711,6 +711,11 @@ Diagnostics - nothing is measured unless they are set:
 - All llama contexts in a process share one backend context. Their graph
   computes take turns on it (the array runs one command stream at a time
   anyway), and one context's support queries wait for another's compute.
+- The first decode call sets up every fused layer: it packs the layer's weights
+  into the fused formats, builds the layer's instruction stream and loads its
+  kernel. This takes about 3.2 s on Qwen3.5-4B and 6.4 s on Qwen3.5-9B, in that
+  call only (`llama-bench` tg numbers exclude it). An attention layer also
+  builds one more kernel the first time its K/V span reaches a new task count.
 - The device reports itself to the scheduler as an integrated GPU: its buffers
   are host memory, and the free memory it reports is the system's
   `MemAvailable`, which the CPU and any other device on host memory draw from
