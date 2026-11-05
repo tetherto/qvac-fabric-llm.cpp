@@ -28,7 +28,10 @@ bool pack_stage(const struct ggml_tensor * const * ws,
     if (!ws || n_w <= 0 || !ws[0]) {
         return false;
     }
-    out.geom = xdna_gemv_variant(xdna_gemv_type_of(ws[0]), K, N, epilogue, split);
+    // The fused split drains each output stream through one strided descriptor,
+    // so its chunk count is not bound to the descriptor file.
+    const bool uncapped = split == XDNA_GEMV_SPLIT_FUSED;
+    out.geom            = xdna_gemv_variant(xdna_gemv_type_of(ws[0]), K, N, epilogue, split, uncapped);
     if (!out.geom.valid()) {
         return false;
     }

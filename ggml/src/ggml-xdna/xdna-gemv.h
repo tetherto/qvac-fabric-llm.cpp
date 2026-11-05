@@ -78,8 +78,8 @@ struct xdna_gemv_geom {
     // Set when this dispatch runs on the merged layer artifact: it changes the
     // K tile, the artifact it loads and where its transfers meet the shim.
     bool fused_v  = false;
-    // Past the chunk count one dispatch was sized for (xdna_gemv_max_chunks):
-    // the output descriptors are reused chunk after chunk (the head, 243).
+    // Past xdna_gemv_max_chunks, up to xdna_gemv_max_uncapped_chunks: outputs reuse
+    // their descriptors or drain through one strided one (the head 243, a 9B FFN 24).
     bool uncapped = false;
 
     int rows() const { return rows_v; }
@@ -150,6 +150,9 @@ struct xdna_gemv_geom {
 
 // Output chunks one dispatch can carry, limited by the shim descriptor ids.
 int xdna_gemv_max_chunks(void);
+
+// Output chunks an uncapped dispatch can carry, limited by its replay and wrap counts.
+int xdna_gemv_max_uncapped_chunks(void);
 
 // Artifact stem of the design one array split runs on. The warm path needs it
 // before any geometry is known; the geometry's own stem() derives from it.
