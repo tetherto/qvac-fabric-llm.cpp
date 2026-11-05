@@ -1,8 +1,9 @@
 #pragma once
 
 // A full-attention layer of Qwen3.5's decode as one dispatch of the fused
-// layer design, from the normed input to l_out, for one head group of eight
-// query heads over two kv heads (the 0.8B and 2B) or two (the 4B and 9B):
+// layer design, from the normed input to l_out, for one head group - eight
+// query heads over two kv heads, the 0.8B's and 2B's - or two (the 4B's and
+// 9B's):
 //
 //   qkv       q|gate, k, v in one pool GEMV, drained to a scratch buffer
 //   prepare   the prologue tile (act-att.cc) norms q and k, rotates them with
@@ -19,6 +20,8 @@
 // from the residual rows and the post-attention residual and norm, so the
 // host writes nothing but the rope table.
 
+#include "xdna-att.h"
+
 #include <xrt/xrt_kernel.h>
 
 #include <cstddef>
@@ -34,9 +37,9 @@ struct xdna_att_layer_w {
     const ggml_tensor * wv        = nullptr;  // [D x 512 a head group]
     const ggml_tensor * gq        = nullptr;  // attn_q_norm, f32 [256]
     const ggml_tensor * gk        = nullptr;  // attn_k_norm, f32 [256]
-    const ggml_tensor * attn_norm = nullptr;  // f32 [1024], the input's norm
+    const ggml_tensor * attn_norm = nullptr;  // f32 [D], the input's norm
     const ggml_tensor * wo        = nullptr;  // [2048 a head group x D]
-    const ggml_tensor * post      = nullptr;  // post_attention_norm, f32 [1024]
+    const ggml_tensor * post      = nullptr;  // post_attention_norm, f32 [D]
     const ggml_tensor * gate      = nullptr;
     const ggml_tensor * up        = nullptr;
     const ggml_tensor * down      = nullptr;
@@ -56,7 +59,7 @@ struct xdna_att_layer_in {
     size_t        koff     = 0;
     xdna_buffer * vbo      = nullptr;
     size_t        voff     = 0;
-    size_t        pos_b    = 1024;
+    size_t        pos_b    = xdna_att_geom::POS_B;
     int           n_valid  = 0;        // positions, this one (row n_valid - 1) included
     int           n_rot    = 0;        // rotated dims, a multiple of 32, <= 256
     const float * cosv     = nullptr;  // n_rot / 2 each, for this position

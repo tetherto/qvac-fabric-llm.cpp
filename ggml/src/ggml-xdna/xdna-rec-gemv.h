@@ -16,8 +16,8 @@
 // One artifact serves every shape here, so ssm_out, the gate/up activation and
 // the down projection are three dispatches on one context. The FFN's
 // nonlinearity closes on the cores (the epilogue), so the gate and up halves
-// never come back to the host; only the residual adds stay here, 1024 floats
-// each.
+// never come back to the host; only the residual adds stay here, a residual
+// row (d floats) each.
 
 #include "xdna-gemv.h"
 
