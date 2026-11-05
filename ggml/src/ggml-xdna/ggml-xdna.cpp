@@ -776,7 +776,8 @@ struct ggml_backend_xdna_context {
     // Stateless, so one per layer serves every sequence.
     std::map<int, struct xdna_rec_tail *>                        tails;
     // Decode attention on the pool, and how far each layer's K and V rows
-    // have been flushed to the device (reset by any multi-token graph).
+    // have been flushed to the device (reset by any multi-token graph and by
+    // any host write into a cache, xdna_att_unflush).
     struct xdna_att *                                            att = nullptr;
     std::map<const void *, int>                                  att_flushed;
     // Whole attention layers as one dispatch, per layer; null once one
@@ -1267,6 +1268,77 @@ static void xdna_tail_scan(const ggml_cgraph * cgraph, std::vector<xdna_tail_pla
 
 xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset);
 
+// Test hook (ggml_backend_xdna_test_stale_kv): armed, the K/V rows the host next writes outside a graph reach the next
+// decode attention as a dirty line over stale memory would: right in the cache, NaN in memory, until a flush.
+struct xdna_stale_kv {
+    std::atomic<bool>                      armed{ false };
+    std::atomic<int>                       planted{ 0 };
+    std::mutex                             mtx;
+    std::vector<std::pair<char *, size_t>> ranges;
+};
+
+static xdna_stale_kv g_stale_kv;
+
+// 1 arms, 0 disarms and drops the rows not planted yet (their buffer may be gone); the count of plants either way.
+static int xdna_test_stale_kv(int arm) {
+    std::lock_guard<std::mutex> lock(g_stale_kv.mtx);
+    g_stale_kv.armed = arm != 0;
+    if (!arm) {
+        g_stale_kv.ranges.clear();
+    }
+    return g_stale_kv.planted;
+}
+
+static bool xdna_is_kv_cache(const ggml_tensor * t) {
+    return strncmp(t->name, "cache_k_l", 9) == 0 || strncmp(t->name, "cache_v_l", 9) == 0;
+}
+
+static void xdna_stale_kv_note(const ggml_tensor * t, size_t offset, size_t size) {
+    if (!g_stale_kv.armed || !xdna_is_kv_cache(t)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_stale_kv.mtx);
+    g_stale_kv.ranges.push_back({ (char *) t->data + offset, size });
+}
+
+static bool xdna_stale_kv_plant_range(char * p, size_t n) {
+    size_t        off = 0;
+    xdna_buffer * bo  = xdna_host_bo_of(p, &off);
+    if (!bo) {
+        return false;
+    }
+    std::vector<char> keep(p, p + n);
+    std::fill_n(p, n, (char) 0xff);  // NaN in f32, f16 and bf16 alike
+    if (!xdna_buffer_sync_to_device_range(bo, n, off)) {
+        return false;
+    }
+    memcpy(p, keep.data(), n);
+    return true;
+}
+
+static bool xdna_stale_kv_plant_ranges(const std::vector<std::pair<char *, size_t>> & ranges) {
+    bool ok = true;
+    for (const auto & r : ranges) {
+        ok = xdna_stale_kv_plant_range(r.first, r.second) && ok;
+    }
+    return ok;
+}
+
+static void xdna_stale_kv_plant(void) {
+    if (!g_stale_kv.armed) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_stale_kv.mtx);
+    if (g_stale_kv.ranges.empty()) {
+        return;
+    }
+    if (xdna_stale_kv_plant_ranges(g_stale_kv.ranges)) {
+        g_stale_kv.planted++;
+    }
+    g_stale_kv.ranges.clear();
+    g_stale_kv.armed = false;
+}
+
 // Decode flash attention on the pool (xdna-att.h). GGML_XDNA_ATTN=0 leaves
 // it to the host.
 static bool xdna_att_on(void) {
@@ -1324,6 +1396,7 @@ static bool xdna_att_try(ggml_backend_xdna_context * ctx, ggml_tensor * n) {
     }
     // The rows the host wrote since the last flush of this layer: one a
     // token, or all of them after a prefill.
+    xdna_stale_kv_plant();
     int & fl = ctx->att_flushed[k->data];
     if (fl > n_valid) {
         fl = 0;
@@ -1777,6 +1850,7 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
     }
     // The rows the host wrote since the last flush (a prefill), as the pool
     // attention does.
+    xdna_stale_kv_plant();
     int & fl = ctx->att_flushed[k->data];
     if (fl > n_valid - 1) {
         fl = 0;
@@ -5202,6 +5276,17 @@ static void * xdna_hb_base(ggml_backend_buffer_t buffer) {
     return ((xdna_buffer *) buffer->context)->data;
 }
 
+// A host write into a cache outside a graph (a state restore): the decode attention flushes its rows from the first again.
+static void xdna_att_unflush(ggml_backend_buffer_t buffer) {
+    if (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_ANY) {
+        return;  // weights and graph buffers hold no cache
+    }
+    ggml_backend_xdna_context *           ctx  = ggml_xdna_device_context();
+    const char *                          base = (const char *) xdna_hb_base(buffer);
+    std::lock_guard<std::recursive_mutex> lock(ctx->compute_mutex);
+    ctx->att_flushed.erase(ctx->att_flushed.lower_bound(base), ctx->att_flushed.lower_bound(base + buffer->size));
+}
+
 // The fused decode keeps a sequence's recurrent state on the array between
 // tokens; its cache rows hold it only once it is written back (a graph of
 // another context, or one that reads those rows). Reads and writes from
@@ -5265,7 +5350,7 @@ static void xdna_hb_memset(ggml_backend_buffer_t buffer,
                            uint8_t               value,
                            size_t                offset,
                            size_t                size) {
-    GGML_UNUSED(buffer);
+    xdna_att_unflush(buffer);
     xdna_rec_follow_io((char *) tensor->data + offset, size, true);
     memset((char *) tensor->data + offset, value, size);
 }
@@ -5275,10 +5360,11 @@ static void xdna_hb_set(ggml_backend_buffer_t buffer,
                         const void *          data,
                         size_t                offset,
                         size_t                size) {
-    GGML_UNUSED(buffer);
+    xdna_att_unflush(buffer);
     xdna_rec_follow_io(data, size, false);  // a copy out of another seeded row
     xdna_rec_follow_io((char *) tensor->data + offset, size, true);
     memcpy((char *) tensor->data + offset, data, size);
+    xdna_stale_kv_note(tensor, offset, size);
 }
 
 static void xdna_hb_get(ggml_backend_buffer_t      buffer,
@@ -5292,8 +5378,8 @@ static void xdna_hb_get(ggml_backend_buffer_t      buffer,
 }
 
 static bool xdna_hb_cpy(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
-    GGML_UNUSED(buffer);
     if (ggml_backend_buffer_is_host(src->buffer)) {
+        xdna_att_unflush(buffer);
         xdna_rec_follow_io(src->data, ggml_nbytes(src), false);
         xdna_rec_follow_io(dst->data, ggml_nbytes(src), true);
         memcpy(dst->data, src->data, ggml_nbytes(src));
@@ -5303,6 +5389,7 @@ static bool xdna_hb_cpy(ggml_backend_buffer_t buffer, const struct ggml_tensor *
 }
 
 static void xdna_hb_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    xdna_att_unflush(buffer);
     xdna_rec_follow_io(xdna_hb_base(buffer), buffer->size, true);
     memset(xdna_hb_base(buffer), value, buffer->size);
 }
@@ -5500,6 +5587,9 @@ static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const c
     }
     if (std::strcmp(name, "ggml_backend_xdna_test_dirty_output") == 0) {
         return (void *) xdna_test_dirty_output;
+    }
+    if (std::strcmp(name, "ggml_backend_xdna_test_stale_kv") == 0) {
+        return (void *) xdna_test_stale_kv;
     }
     return NULL;
 }
