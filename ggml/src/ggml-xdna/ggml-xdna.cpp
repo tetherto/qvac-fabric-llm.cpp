@@ -13,6 +13,8 @@
 #include "xdna-match.h"
 #include "xdna-norm.h"
 #include "xdna-ops.h"
+#include "xdna-pfx-attn.h"
+#include "xdna-pfx-row.h"
 #include "xdna-pgemm.h"
 #include "xdna-prof.h"
 #include "xdna-rec-gemv.h"
@@ -695,6 +697,32 @@ static std::atomic<int> g_glu_folds{ 0 };
 
 static int xdna_test_glu_fold_count(void) {
     return g_glu_folds;
+}
+
+// Test hooks (ggml_backend_xdna_test_pfx_row_count, _fallbacks, _fail): the sliding attentions that ran on the row
+// command's inputs, the ones that fell back to the host's at the attention, and how many more are made to.
+static std::atomic<int> g_pfx_rows{ 0 };
+static std::atomic<int> g_pfx_row_fallbacks{ 0 };
+static std::atomic<int> g_pfx_row_fail{ 0 };
+
+static int xdna_test_pfx_row_count(void) {
+    return g_pfx_rows;
+}
+
+static int xdna_test_pfx_row_fallbacks(void) {
+    return g_pfx_row_fallbacks;
+}
+
+static void xdna_test_pfx_row_fail(int attentions) {
+    g_pfx_row_fail = attentions;
+}
+
+static bool xdna_test_pfx_row_take_fail(void) {
+    if (g_pfx_row_fail <= 0) {
+        return false;
+    }
+    g_pfx_row_fail--;
+    return true;
 }
 
 static enum ggml_status xdna_host_chunk_run(struct ggml_cgraph * cgraph) {
@@ -3550,6 +3578,342 @@ static bool xdna_takes_pgemm(const xdna_ops * ops, const struct ggml_tensor * t)
     return xdna_ops_supported(ops, t) && ops->gemv_group_of.count(t) == 0 && xdna_pgemm_supported(t);
 }
 
+// --- the sliding attentions whose Q, K and V the row command writes (GGML_XDNA_PFX_ROW) ---
+
+using xdna_readers_map = std::unordered_map<const struct ggml_tensor *, std::vector<const struct ggml_tensor *>>;
+
+// The row command's heads (xdna-pfx-row.h): D dims, all of them rotated
+static constexpr int64_t XDNA_ROW_HEAD_DIM = 256;
+static constexpr int64_t XDNA_ROW_Q_HEADS  = 4;
+static constexpr int64_t XDNA_ROW_KV_HEADS = 2;
+// ggml_rope_impl's op_params: ints, then the floats from freq_base on
+static constexpr int XDNA_ROPE_N_DIMS = 1, XDNA_ROPE_MODE = 2, XDNA_ROPE_N_CTX_ORIG = 4, XDNA_ROPE_FREQ_BASE = 5,
+                     XDNA_ROPE_FREQ_SCALE = 6, XDNA_ROPE_EXT_FACTOR = 7, XDNA_ROPE_ATTN_FACTOR = 8, XDNA_ROPE_BETA_FAST = 9,
+                     XDNA_ROPE_BETA_SLOW = 10, XDNA_ROPE_N_OFFS = 15, XDNA_ROPE_PARAMS = 16;
+// ggml_pad_ext's op_params: the left and right pads of each dim, then circular
+static constexpr int XDNA_PAD_PARAMS = 9, XDNA_PAD_RIGHT_2 = 5;
+
+// The attention's sources back to the projections, as build_attn leaves them for a model with no KV cache
+enum xdna_row_q_node { RQ_PERMUTE, RQ_VIEW, RQ_ROPE, RQ_MUL, RQ_NORM, RQ_RESHAPE, RQ_MM, RQ_N };
+enum xdna_row_k_node { RK_CAST, RK_PERMUTE, RK_PAD, RK_ROPE, RK_MUL, RK_NORM, RK_RESHAPE, RK_MM, RK_N };
+enum xdna_row_v_node { RV_CAST, RV_PERMUTE, RV_PAD, RV_NORM, RV_RESHAPE, RV_MM, RV_N };
+
+static const enum ggml_op XDNA_ROW_Q_OPS[RQ_N] = { GGML_OP_PERMUTE, GGML_OP_VIEW,     GGML_OP_ROPE,   GGML_OP_MUL,
+                                                   GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+static const enum ggml_op XDNA_ROW_K_OPS[RK_N] = { GGML_OP_CPY, GGML_OP_PERMUTE,  GGML_OP_PAD,     GGML_OP_ROPE,
+                                                   GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+static const enum ggml_op XDNA_ROW_V_OPS[RV_N] = { GGML_OP_CPY,      GGML_OP_PERMUTE, GGML_OP_PAD,
+                                                   GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+
+// A sliding attention planned onto the row command (xdna_attn_mm_run_rows)
+struct xdna_row_chain {
+    struct ggml_tensor *              fa      = nullptr;
+    struct ggml_tensor *              q[RQ_N] = {};
+    struct ggml_tensor *              k[RK_N] = {};
+    struct ggml_tensor *              v[RV_N] = {};
+    size_t                            group   = 0;  // the projections' prefill GEMM group
+    std::vector<struct ggml_tensor *> host;         // the nodes the command replaces, in graph order
+};
+
+// t and its first sources while their ops are ops[0], ops[1], ...
+static bool xdna_src_chain(struct ggml_tensor * t, const enum ggml_op * ops, int n, struct ggml_tensor ** out) {
+    for (int i = 0; i < n; i++) {
+        if (!t || t->op != ops[i]) {
+            return false;
+        }
+        out[i] = t;
+        t      = t->src[0];
+    }
+    return true;
+}
+
+static bool xdna_is_head_permute(const struct ggml_tensor * t) {
+    static const int32_t AXES[] = { 0, 2, 1, 3 };
+    return std::memcmp(t->op_params, AXES, sizeof(AXES)) == 0;
+}
+
+// a view of the whole of its source as it is
+static bool xdna_is_whole_view(const struct ggml_tensor * t) {
+    return t->view_offs == 0 && ggml_are_same_shape(t, t->src[0]) && ggml_are_same_stride(t, t->src[0]);
+}
+
+// the [D, heads, n] RESHAPE of an F32 projection of heads x D rows
+static bool xdna_is_head_split(const struct ggml_tensor * rs, const struct ggml_tensor * mm, int64_t heads) {
+    return mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) && mm->ne[0] == heads * XDNA_ROW_HEAD_DIM &&
+           rs->ne[0] == XDNA_ROW_HEAD_DIM && rs->ne[1] == heads && rs->ne[2] == mm->ne[1] && rs->ne[3] == 1;
+}
+
+// a MUL by an F32 weight row of D in this device's buffers
+static bool xdna_is_norm_weight(const struct ggml_tensor * mul) {
+    const struct ggml_tensor * w = mul->src[1];
+    return w && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[0] == XDNA_ROW_HEAD_DIM &&
+           ggml_nrows(w) == 1 && xdna_weight_here(w) && ggml_are_same_shape(mul, mul->src[0]);
+}
+
+// neox over all D dims at I32 positions, no frequency factors and no offset
+static bool xdna_is_row_rope(const struct ggml_tensor * r) {
+    const int32_t *            p   = (const int32_t *) r->op_params;
+    const struct ggml_tensor * pos = r->src[1];
+    return p[XDNA_ROPE_N_DIMS] == XDNA_ROW_HEAD_DIM && p[XDNA_ROPE_MODE] == GGML_ROPE_TYPE_NEOX &&
+           p[XDNA_ROPE_N_OFFS] == 0 && !r->src[2] && pos && pos->type == GGML_TYPE_I32 && ggml_is_contiguous(pos) &&
+           pos->ne[0] == r->ne[2];
+}
+
+// build_attn's zero keys up to the mask's
+static bool xdna_is_key_pad(const struct ggml_tensor * pad) {
+    int32_t want[XDNA_PAD_PARAMS]  = {};
+    want[XDNA_PAD_RIGHT_2]         = (int32_t) (pad->ne[2] - pad->src[0]->ne[2]);
+    return pad->ne[2] >= pad->src[0]->ne[2] && std::memcmp(pad->op_params, want, sizeof(want)) == 0;
+}
+
+// llama's F32 -> F16 ggml_cast: a CPY into its own result
+static bool xdna_is_f16_cast(const struct ggml_tensor * c) {
+    return c->type == GGML_TYPE_F16 && c->src[1] == c && ggml_is_contiguous(c);
+}
+
+static bool xdna_row_q_ok(struct ggml_tensor * const * q) {
+    return xdna_is_head_permute(q[RQ_PERMUTE]) && xdna_is_whole_view(q[RQ_VIEW]) && xdna_is_row_rope(q[RQ_ROPE]) &&
+           xdna_is_norm_weight(q[RQ_MUL]) && xdna_is_head_split(q[RQ_RESHAPE], q[RQ_MM], XDNA_ROW_Q_HEADS);
+}
+
+static bool xdna_row_k_ok(struct ggml_tensor * const * k) {
+    return xdna_is_f16_cast(k[RK_CAST]) && xdna_is_head_permute(k[RK_PERMUTE]) && xdna_is_key_pad(k[RK_PAD]) &&
+           xdna_is_row_rope(k[RK_ROPE]) && xdna_is_norm_weight(k[RK_MUL]) &&
+           xdna_is_head_split(k[RK_RESHAPE], k[RK_MM], XDNA_ROW_KV_HEADS);
+}
+
+static bool xdna_row_v_ok(struct ggml_tensor * const * v) {
+    return xdna_is_f16_cast(v[RV_CAST]) && xdna_is_head_permute(v[RV_PERMUTE]) && xdna_is_key_pad(v[RV_PAD]) &&
+           xdna_is_head_split(v[RV_RESHAPE], v[RV_MM], XDNA_ROW_KV_HEADS);
+}
+
+static float xdna_param_f32(const struct ggml_tensor * t, int i) {
+    float f;
+    std::memcpy(&f, (const int32_t *) t->op_params + i, sizeof(f));
+    return f;
+}
+
+// one activation, one RoPE, one eps
+static bool xdna_row_sides_agree(const xdna_row_chain & c) {
+    const struct ggml_tensor * x  = c.q[RQ_MM]->src[1];
+    const struct ggml_tensor * rq = c.q[RQ_ROPE];
+    const struct ggml_tensor * rk = c.k[RK_ROPE];
+    const float                eps = xdna_param_f32(c.q[RQ_NORM], 0);
+    return c.k[RK_MM]->src[1] == x && c.v[RV_MM]->src[1] == x && rq->src[1] == rk->src[1] &&
+           std::memcmp(rq->op_params, rk->op_params, XDNA_ROPE_PARAMS * sizeof(int32_t)) == 0 &&
+           xdna_param_f32(c.k[RK_NORM], 0) == eps && xdna_param_f32(c.v[RV_NORM], 0) == eps;
+}
+
+// fa's Q, K and V chains back to their projections, in the shapes and parameters the row command takes
+static bool xdna_row_chain_of(struct ggml_tensor * fa, xdna_row_chain * c) {
+    c->fa = fa;
+    return xdna_src_chain(fa->src[0], XDNA_ROW_Q_OPS, RQ_N, c->q) &&
+           xdna_src_chain(fa->src[1], XDNA_ROW_K_OPS, RK_N, c->k) &&
+           xdna_src_chain(fa->src[2], XDNA_ROW_V_OPS, RV_N, c->v) && xdna_row_q_ok(c->q) && xdna_row_k_ok(c->k) &&
+           xdna_row_v_ok(c->v) && xdna_row_sides_agree(*c);
+}
+
+static std::vector<struct ggml_tensor *> xdna_row_replaced(const xdna_row_chain & c) {
+    return { c.q[RQ_NORM], c.q[RQ_MUL],  c.q[RQ_ROPE],  c.k[RK_NORM], c.k[RK_MUL], c.k[RK_ROPE],
+             c.k[RK_PAD],  c.k[RK_CAST], c.v[RV_NORM], c.v[RV_PAD],  c.v[RV_CAST] };
+}
+
+// u's readers into the views of t to follow, and the rest
+static void xdna_sort_readers(const std::vector<const struct ggml_tensor *> & rd,
+                              const struct ggml_tensor *                     t,
+                              std::vector<const struct ggml_tensor *> &      views,
+                              std::vector<const struct ggml_tensor *> &      out) {
+    for (const struct ggml_tensor * r : rd) {
+        if (r != t) {
+            (ggml_xdna_is_view_op(r->op) ? views : out).push_back(r);
+        }
+    }
+}
+
+// the nodes that read t through views, other than t itself (a ggml_cast reads its own result)
+static std::vector<const struct ggml_tensor *> xdna_real_readers(const xdna_readers_map &   readers,
+                                                                 const struct ggml_tensor * t) {
+    std::vector<const struct ggml_tensor *> out, todo = { t };
+    while (!todo.empty()) {
+        const struct ggml_tensor * u = todo.back();
+        todo.pop_back();
+        const auto it = readers.find(u);
+        if (it != readers.end()) {
+            xdna_sort_readers(it->second, t, todo, out);
+        }
+    }
+    return out;
+}
+
+static bool xdna_read_only_by(const xdna_readers_map & readers, const struct ggml_tensor * t, const struct ggml_tensor * r) {
+    const std::vector<const struct ggml_tensor *> rd = xdna_real_readers(readers, t);
+    return !rd.empty() && std::all_of(rd.begin(), rd.end(), [r](const struct ggml_tensor * x) { return x == r; });
+}
+
+// each replaced node read by the next of its chain only, the chain's last by the attention only
+static bool xdna_row_readers_ok(const xdna_readers_map & readers, const xdna_row_chain & c) {
+    const std::pair<const struct ggml_tensor *, const struct ggml_tensor *> links[] = {
+        { c.q[RQ_NORM], c.q[RQ_MUL] }, { c.q[RQ_MUL], c.q[RQ_ROPE] }, { c.q[RQ_ROPE], c.fa },
+        { c.k[RK_NORM], c.k[RK_MUL] }, { c.k[RK_MUL], c.k[RK_ROPE] }, { c.k[RK_ROPE], c.k[RK_PAD] },
+        { c.k[RK_PAD], c.k[RK_CAST] }, { c.k[RK_CAST], c.fa },        { c.v[RV_NORM], c.v[RV_PAD] },
+        { c.v[RV_PAD], c.v[RV_CAST] }, { c.v[RV_CAST], c.fa },
+    };
+    return std::all_of(std::begin(links), std::end(links),
+                       [&](const auto & l) { return xdna_read_only_by(readers, l.first, l.second); });
+}
+
+// bytes t's allocation spans: a projection's holds the rows past its own the array writes
+static size_t xdna_alloc_bytes(const struct ggml_tensor * t) {
+    return t->buffer ? ggml_backend_buffer_get_alloc_size(t->buffer, t) : ggml_nbytes(t);
+}
+
+static bool xdna_overlaps_any(const struct ggml_tensor * n, const std::vector<struct ggml_tensor *> & guarded) {
+    const char * n0 = (const char *) n->data;
+    const char * n1 = n0 + xdna_alloc_bytes(n);
+    return std::any_of(guarded.begin(), guarded.end(), [&](const struct ggml_tensor * t) {
+        const char * t0 = (const char *) t->data;
+        return t0 && t0 < n1 && n0 < t0 + xdna_alloc_bytes(t);
+    });
+}
+
+// No node computed between nodes begin and end writes into `guarded`; `skipped` ones are not computed there
+template <typename Skipped>
+static bool xdna_window_clear(const struct ggml_cgraph *               cgraph,
+                              int                                      begin,
+                              int                                      end,
+                              const std::vector<struct ggml_tensor *> & guarded,
+                              Skipped                                  skipped) {
+    for (int i = begin + 1; i < end; i++) {
+        const struct ggml_tensor * n = cgraph->nodes[i];
+        if (!skipped(n) && !ggml_xdna_is_view_op(n->op) && n->data && xdna_overlaps_any(n, guarded)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A matched chain the graph lets the command replace: its nodes this graph's own, free and able to fall back to the host,
+// one prefill GEMM group, single readers, and nothing computed between the group and the attention over what it reads
+template <typename Groups>
+static bool xdna_row_chain_plannable(xdna_row_chain &                                              c,
+                                const struct ggml_cgraph *                                    cgraph,
+                                const xdna_readers_map &                                      readers,
+                                const std::unordered_map<const struct ggml_tensor *, int> &   node_at,
+                                const std::unordered_set<const struct ggml_tensor *> &        consumed,
+                                const std::unordered_map<const struct ggml_tensor *, size_t> & group_of,
+                                const Groups &                                                mm_groups) {
+    c.host = xdna_row_replaced(c);
+    const bool own = std::all_of(c.host.begin(), c.host.end(), [&](const struct ggml_tensor * t) {
+        return node_at.count(t) && !consumed.count(t) && !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && xdna_glue_claims(t);
+    });
+    const auto g = group_of.find(c.q[RQ_MM]);
+    if (!own || g == group_of.end() || mm_groups[g->second].bf16 || group_of.count(c.k[RK_MM]) == 0 ||
+        group_of.count(c.v[RV_MM]) == 0 || group_of.at(c.k[RK_MM]) != g->second ||
+        group_of.at(c.v[RV_MM]) != g->second || !xdna_row_readers_ok(readers, c)) {
+        return false;
+    }
+    c.group = g->second;
+    std::sort(c.host.begin(), c.host.end(),
+              [&](const struct ggml_tensor * a, const struct ggml_tensor * b) { return node_at.at(a) < node_at.at(b); });
+    std::vector<struct ggml_tensor *> guarded = c.host;
+    guarded.insert(guarded.end(), { c.q[RQ_MM], c.k[RK_MM], c.v[RV_MM] });
+    const auto skipped = [&](const struct ggml_tensor * n) {
+        const auto ng = group_of.find(n);
+        return consumed.count(n) || std::find(c.host.begin(), c.host.end(), n) != c.host.end() ||
+               (ng != group_of.end() && ng->second == c.group);
+    };
+    return xdna_window_clear(cgraph, node_at.at(mm_groups[c.group].mm[0]), node_at.at(c.fa), guarded, skipped);
+}
+
+// The sliding attentions of the graph whose chains the row command can replace, keyed by the attention
+template <typename Groups>
+static std::unordered_map<const struct ggml_tensor *, xdna_row_chain> xdna_plan_row_chains(
+    const xdna_ops *                                              ops,
+    const struct ggml_cgraph *                                    cgraph,
+    const xdna_readers_map &                                      readers,
+    const std::unordered_map<const struct ggml_tensor *, int> &   node_at,
+    const std::unordered_set<const struct ggml_tensor *> &        consumed,
+    const std::unordered_map<const struct ggml_tensor *, size_t> & group_of,
+    const Groups &                                                mm_groups) {
+    std::unordered_map<const struct ggml_tensor *, xdna_row_chain> chains;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * fa = cgraph->nodes[i];
+        xdna_row_chain       c;
+        if (fa->op == GGML_OP_FLASH_ATTN_EXT && xdna_ops_supported(ops, fa) && xdna_row_chain_of(fa, &c) &&
+            xdna_row_chain_plannable(c, cgraph, readers, node_at, consumed, group_of, mm_groups)) {
+            chains[fa] = c;
+        }
+    }
+    return chains;
+}
+
+// The replaced nodes skipped where they stand; Q's and K's norm with its MUL on the norm-mul pass if the attention
+// falls back, as the norm-mul plan would have put them
+static void xdna_consume_row_chains(const std::unordered_map<const struct ggml_tensor *, xdna_row_chain> & chains,
+                                    std::unordered_set<const struct ggml_tensor *> &                     consumed) {
+    for (const auto & fc : chains) {
+        const xdna_row_chain & c = fc.second;
+        consumed.insert(c.host.begin(), c.host.end());
+        g_norm_mul.insert(c.q[RQ_NORM]);
+        g_norm_mul.insert(c.k[RK_NORM]);
+    }
+}
+
+// The prefill GEMM groups whose projections a planned row command reads
+static std::unordered_set<size_t> xdna_row_chain_groups(
+    const std::unordered_map<const struct ggml_tensor *, xdna_row_chain> & chains) {
+    std::unordered_set<size_t> groups;
+    for (const auto & fc : chains) {
+        groups.insert(fc.second.group);
+    }
+    return groups;
+}
+
+static xdna_pfx_row_rope xdna_row_rope_of(const struct ggml_tensor * rope) {
+    const int32_t *   p = (const int32_t *) rope->op_params;
+    xdna_pfx_row_rope r;
+    r.n_dims      = p[XDNA_ROPE_N_DIMS];
+    r.n_ctx_orig  = p[XDNA_ROPE_N_CTX_ORIG];
+    r.freq_base   = xdna_param_f32(rope, XDNA_ROPE_FREQ_BASE);
+    r.freq_scale  = xdna_param_f32(rope, XDNA_ROPE_FREQ_SCALE);
+    r.ext_factor  = xdna_param_f32(rope, XDNA_ROPE_EXT_FACTOR);
+    r.attn_factor = xdna_param_f32(rope, XDNA_ROPE_ATTN_FACTOR);
+    r.beta_fast   = xdna_param_f32(rope, XDNA_ROPE_BETA_FAST);
+    r.beta_slow   = xdna_param_f32(rope, XDNA_ROPE_BETA_SLOW);
+    return r;
+}
+
+// The row job of c's projections, which the group wrote into one BO
+static bool xdna_row_job_of(const xdna_row_chain & c, xdna_pfx_row_job * job) {
+    xdna_buffer * bo = xdna_host_bo_of(c.q[RQ_MM]->data, &job->q_off);
+    if (!bo || xdna_host_bo_of(c.k[RK_MM]->data, &job->k_off) != bo ||
+        xdna_host_bo_of(c.v[RV_MM]->data, &job->v_off) != bo) {
+        return false;
+    }
+    job->src      = bo;
+    job->n_tokens = c.q[RQ_MM]->ne[1];
+    job->pos      = (const int32_t *) c.q[RQ_ROPE]->src[1]->data;
+    job->rope     = xdna_row_rope_of(c.q[RQ_ROPE]);
+    job->eps      = xdna_param_f32(c.q[RQ_NORM], 0);
+    job->q_norm   = (const float *) c.q[RQ_MUL]->src[1]->data;
+    job->k_norm   = (const float *) c.k[RK_MUL]->src[1]->data;
+    return true;
+}
+
+// The attention on the row command's inputs, unless what the command reads is not there: the group did not write the
+// projections this call (their rows past the tokens are then not zero), or not into one BO
+static xdna_attn_rows_result xdna_row_attention(xdna_ops *             ops,
+                                                const xdna_row_chain & c,
+                                                bool                   group_ran,
+                                                xdna_pfx_row_tables &  tables) {
+    xdna_pfx_row_job job;
+    if (xdna_test_pfx_row_take_fail() || !group_ran || !xdna_row_job_of(c, &job)) {
+        return xdna_attn_rows_result::refused;
+    }
+    xdna_prof::section_timer st("prefill: flash attention");
+    return xdna_attn_mm_run_rows(ops->pool, c.fa, job, tables);
+}
+
 static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx, struct ggml_cgraph * cgraph) {
     if (!ctx->device) {
         return GGML_STATUS_SUCCESS;
@@ -4184,6 +4548,12 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     std::unordered_map<const struct ggml_tensor *, const struct ggml_tensor *> gated_a;
     std::unordered_map<const struct ggml_tensor *, int>                        node_at;  // node index in graph order
     std::unordered_set<const struct ggml_tensor *>                             gate_a;
+    // the sliding attentions on the row command (GGML_XDNA_PFX_ROW), the groups of their projections and the ones that
+    // wrote them this call, and the RoPE tables the layers share, given back with the call
+    std::unordered_map<const struct ggml_tensor *, xdna_row_chain> row_chains;
+    std::unordered_set<size_t>                                     row_groups;
+    std::vector<bool>                                              group_ran(mm_groups.size(), false);
+    xdna_pfx_row_tables                                            row_tables;
     g_norm_mul.clear();
     xdna_gdn_mm_keep_clear();
     xdna_attn_mm_keep_clear();
@@ -4347,6 +4717,13 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                     xdna_attn_mm_keep(fa);
                 }
             }
+        }
+        // a sliding attention's Q and K norms and RoPE and V's norm, their pads and f16 casts: on the row command at
+        // the attention, straight into its inputs; planned before the norm-mul pairs, which then skip them
+        if (xdna_env_int("GGML_XDNA_PFX_ROW", 0) != 0 && xdna_pfx_attn_active()) {
+            row_chains = xdna_plan_row_chains(&ctx->ops, cgraph, readers, node_at, consumed, group_of, mm_groups);
+            row_groups = xdna_row_chain_groups(row_chains);
+            xdna_consume_row_chains(row_chains, consumed);
         }
         // the rest of the norms: the MUL by the weight in the same pass
         // (xdna_norm_mul_fast, in the glue batch)
@@ -4584,9 +4961,12 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             if (mm_groups[gr->second].bf16) {
                 ok = xdna_ops_compute_group(&ctx->ops, mm.data(), (int) mm.size());
             } else {
+                // the row command reads the outputs' rows up to its last key tile
+                const int                pad_tile = row_groups.count(gr->second) ? xdna_pfx_layout::NK : 0;
                 xdna_prof::section_timer st("prefill: pgemm group");
-                ok = xdna_pgemm_run_group(ctx->ops.pool, mm.data(), (int) mm.size());
+                ok = xdna_pgemm_run_group(ctx->ops.pool, mm.data(), (int) mm.size(), pad_tile);
             }
+            group_ran[gr->second] = ok;
             // one at a time where the node's place is
             for (size_t k = 0; !ok && k < mm.size(); k++) {
                 if (!xdna_ops_compute(&ctx->ops, mm[k])) {
@@ -4596,6 +4976,34 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             continue;
         }
         if (consumed.count(node)) {
+            continue;
+        }
+        auto rc = row_chains.find(node);
+        if (rc != row_chains.end()) {
+            if (!glue_batch.empty() && !xdna_glue_flush(&ctx->ops, glue_batch)) {
+                return GGML_STATUS_FAILED;
+            }
+            if (!xdna_ops_finalize(&ctx->ops)) {
+                return GGML_STATUS_FAILED;
+            }
+            xdna_pending_wait(ctx);
+            const xdna_row_chain &      c = rc->second;
+            const xdna_attn_rows_result r = xdna_row_attention(&ctx->ops, c, group_ran[c.group], row_tables);
+            if (r == xdna_attn_rows_result::failed) {
+                return GGML_STATUS_FAILED;
+            }
+            if (r == xdna_attn_rows_result::done) {
+                g_pfx_rows++;
+                continue;
+            }
+            // the chain as llama built it, then the attention as without the row command
+            g_pfx_row_fallbacks++;
+            xdna_prof::section_timer          fallback_st("prefill: pfx row fallback");
+            std::vector<struct ggml_tensor *> chain = c.host;
+            if (!xdna_glue_flush(&ctx->ops, chain) || !xdna_ops_compute(&ctx->ops, node)) {
+                xdna_ops_finalize(&ctx->ops);
+                return GGML_STATUS_FAILED;
+            }
             continue;
         }
         if (gate_a.count(node)) {
@@ -5607,6 +6015,15 @@ static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const c
     }
     if (std::strcmp(name, "ggml_backend_xdna_test_glu_fold_count") == 0) {
         return (void *) xdna_test_glu_fold_count;
+    }
+    if (std::strcmp(name, "ggml_backend_xdna_test_pfx_row_count") == 0) {
+        return (void *) xdna_test_pfx_row_count;
+    }
+    if (std::strcmp(name, "ggml_backend_xdna_test_pfx_row_fallbacks") == 0) {
+        return (void *) xdna_test_pfx_row_fallbacks;
+    }
+    if (std::strcmp(name, "ggml_backend_xdna_test_pfx_row_fail") == 0) {
+        return (void *) xdna_test_pfx_row_fail;
     }
     return NULL;
 }

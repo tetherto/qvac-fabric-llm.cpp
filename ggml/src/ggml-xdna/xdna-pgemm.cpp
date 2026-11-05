@@ -891,6 +891,18 @@ bool sync_segs(const pg_dst & ov, size_t rows, bool to_device) {
     return ok;
 }
 
+// rows [M, `tile` x ceil(M / tile)) of every segment to the device: a later command reads them from DRAM, where no
+// dirty line may land over the zeros the array writes there
+bool sync_tile_pad(const pg_dst & ov, size_t M, size_t tile) {
+    const size_t rows = (M + tile - 1) / tile * tile;
+    bool         ok   = true;
+    for (const c_seg & x : ov.segs) {
+        ok = ok && xdna_buffer_sync_to_device_range(ov.bo, (rows - M) * x.ldc * sizeof(float),
+                                                    x.off + M * x.ldc * sizeof(float));
+    }
+    return ok;
+}
+
 // whether `node`'s allocation holds `rows` rows of its output: its own, or
 // the rows past them that its buffer type reserved (xdna_pgemm_out_bytes)
 bool out_room(const ggml_tensor * node, size_t rows) {
@@ -1685,13 +1697,19 @@ bool group_dst(struct ggml_tensor * const * mm, int n, size_t out_rows, pg_dst &
 
 }  // namespace
 
-bool xdna_pgemm_run_group(xdna_kernel_pool * pool, struct ggml_tensor * const * mm, int n) {
+bool xdna_pgemm_run_group(xdna_kernel_pool * pool, struct ggml_tensor * const * mm, int n, int pad_tile) {
     std::lock_guard<std::mutex> lock(g_pg.mtx);
     const int                   M        = (int) ggml_nrows(mm[0]->src[1]);
     const size_t                out_rows = ((size_t) M + MBLK - 1) / MBLK * MBLK;
     pg_dst                      ov;
-    if (!group_dst(mm, n, out_rows, ov) || !segs_fit(ov, out_rows)) {
+    if (!group_dst(mm, n, out_rows, ov) || !segs_fit(ov, out_rows) || pad_tile < 0 || pad_tile > MBLK) {
         return false;
+    }
+    if (pad_tile > 0) {
+        xdna_prof::section_timer st("prefill: pgemm: pad flush");
+        if (!sync_tile_pad(ov, (size_t) M, (size_t) pad_tile)) {
+            return false;
+        }
     }
     std::vector<const ggml_tensor *> w;
     int                              cols = 0;
