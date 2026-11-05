@@ -1354,6 +1354,10 @@ bool xdna_res_width_ok(int64_t d) {
     return d > 0 && d % XDNA_ROW_SIDE_FLOATS == 0 && d <= XDNA_RES_MAX_D;
 }
 
+bool xdna_row_gates_ok(int64_t d, int gates) {
+    return gates > 0 && d % XDNA_ROW_GATE_PIECE == 0 && (int64_t) gates * d % XDNA_ROW_GATE_VALUES == 0;
+}
+
 void xdna_seq_row_io(xdna_seq * seq,
                      int        d,
                      int        res_arg,
@@ -1460,7 +1464,7 @@ bool xdna_gemv_row_act(const xdna_gemv_geom & geom, uint8_t * dst, float eps, bo
     constexpr int AW = XDNA_GEMV_ACT_TILE / 4;
     const int     nt = geom.n_tiles();
     const int     D  = geom.K;
-    if (!dst || nt * geom.k_tile() != D || !xdna_res_width_ok(D) || (gates && D % XDNA_ROW_GATE_VALUES != 0)) {
+    if (!dst || nt * geom.k_tile() != D || !xdna_res_width_ok(D) || (gates && !xdna_row_gates_ok(D, gates))) {
         return false;
     }
     const int32_t fmt_word = geom.fmt == XDNA_WFMT_Q4G32 ? 0 : 1;
@@ -1491,7 +1495,7 @@ bool xdna_gemv_row_act(const xdna_gemv_geom & geom, uint8_t * dst, float eps, bo
             // that chunk while the prologue computes them
             if (gates && c == geom.n_out() - 1 && k == nt - 1) {
                 t[510] = 1;
-                t[AW - 6] += 1 + gates * (D / XDNA_ROW_GATE_VALUES);
+                t[AW - 6] += 1 + gates * D / XDNA_ROW_GATE_VALUES;
                 t[AW - 7] += 1;
             }
         }

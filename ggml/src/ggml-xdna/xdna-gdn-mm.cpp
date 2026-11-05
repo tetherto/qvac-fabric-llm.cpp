@@ -43,11 +43,34 @@ constexpr int          IN_N       = 2 * C * DK + C * DV + FX_N * 2;  // bf16 an 
 constexpr int          O_N        = C * DV;                          // f32 an output object
 constexpr int          N_STATE_IN = 4, N_STATE_OUT = 8;
 constexpr float        LS_MIN         = -32.0f;
+// The largest range of a chunk's 2^(gam - mid) the core forms exactly: exp2_f32's lowest exponent (-126), less
+// 0.1, as the host's sum (chunk_range) can differ from the core's emulated f32 one by about 3e-4.
+constexpr float        EXP_RANGE      = 125.9f;
+// A gate's floor (natural log; 15 log2 units) in a chunk past EXP_RANGE: its range is then 8 x 15 = 120 at most.
+constexpr float        G_MIN          = -10.4f;
+// The largest shift the core's int16 shift << 7 holds; a shift of 254 or more flushes every finite bf16 already.
+constexpr int32_t      SHIFT_MAX      = 255;
 constexpr int64_t      GDN_MIN_TOKENS = 144;  // a sequence's tokens in the ubatch (see xdna_gdn_mm_supported)
+constexpr int          MAX_RUNS       = 2;    // runs of H value heads a node may take
 
 // element (r, c) of a (rows x cols) matrix in 8 x 8 tiles
 inline size_t t8(int r, int c, int cols) {
     return ((size_t) (r / 8) * (cols / 8) + c / 8) * 64 + (size_t) (r % 8) * 8 + c % 8;
+}
+
+// A chunk's range as gdn_factors forms it from the gates gate_at(0 .. C - 1) (natural log): gam the inclusive
+// prefix sum of g log2(e) in prefix16's order, the larger of gam[0] - mid and mid - gam[C - 1], mid = gam[C / 2].
+template <typename F> float chunk_range(F gate_at) {
+    float gam[C];
+    for (int t = 0; t < C; t++) {
+        gam[t] = gate_at(t) * (float) M_LOG2E;
+    }
+    for (int k = 1; k < C; k <<= 1) {
+        for (int t = C - 1; t >= k; t--) {
+            gam[t] += gam[t - k];
+        }
+    }
+    return std::max(gam[0] - gam[C / 2], gam[C / 2] - gam[C - 1]);
 }
 
 struct runner {
@@ -144,11 +167,13 @@ bool xdna_gdn_mm_supported(const ggml_tensor * node) {
             return false;
         }
     }
-    if (q->ne[0] != S || q->ne[1] != H || k->ne[0] != S || k->ne[1] != H || v->ne[0] != S || v->ne[1] != H ||
-        g->ne[0] != 1 || b->ne[0] != 1) {
+    // H q/k groups and a run of H value heads, or several (value head h on
+    // group h % H, ggml's)
+    if (q->ne[0] != S || q->ne[1] != H || k->ne[0] != S || k->ne[1] != H || v->ne[0] != S || v->ne[1] % H != 0 ||
+        v->ne[1] / H > MAX_RUNS || g->ne[0] != 1 || b->ne[0] != 1 || g->ne[1] != v->ne[1] || b->ne[1] != v->ne[1]) {
         return false;  // the per-head scalar gate only (no KDA vectors)
     }
-    if (s->ne[0] != S || s->ne[1] != S || s->ne[2] != H || v->ne[3] != 1 || s->ne[3] != 1 || q->ne[3] != 1 ||
+    if (s->ne[0] != S || s->ne[1] != S || s->ne[2] != v->ne[1] || v->ne[3] != 1 || s->ne[3] != 1 || q->ne[3] != 1 ||
         k->ne[3] != 1 || ggml_get_op_params_i32(node, 0) != 1) {
         return false;  // one sequence, one snapshot
     }
@@ -157,6 +182,10 @@ bool xdna_gdn_mm_supported(const ggml_tensor * node) {
         return false;
     }
     return true;
+}
+
+bool xdna_gdn_mm_one_run(const ggml_tensor * node) {
+    return node && node->src[2] && node->src[2]->ne[1] == H;
 }
 
 bool xdna_gdn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
@@ -171,6 +200,7 @@ bool xdna_gdn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     const int                   nch   = (n_tok + C - 1) / C;
     const int                   nx    = 1 + N_STATE_IN + nch;
     const int                   no    = nch + N_STATE_OUT;
+    const int                   n_vh  = (int) v->ne[1];
 
     if (!g_gm.kern) {
         g_gm.kern = xdna_kernel_find(pool->device, STEM);
@@ -189,176 +219,195 @@ bool xdna_gdn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         g_gm.kept_bo = nullptr;
         g_gm.kept    = nullptr;
     }
-    const bool keep     = std::find(g_gm.keep.begin(), g_gm.keep.end(), node) != g_gm.keep.end();
-    const bool prepared = g_gm.prep == node && g_gm.prep_cap >= COLS * x_col * 2;
+    const bool one_run  = xdna_gdn_mm_one_run(node);
+    const bool keep     = one_run && std::find(g_gm.keep.begin(), g_gm.keep.end(), node) != g_gm.keep.end();
+    const bool prepared = one_run && g_gm.prep == node && g_gm.prep_cap >= COLS * x_col * 2;
     g_gm.prep           = nullptr;
     xdna_buffer * bo_x  = prepared ? g_gm.prep_bo : xdna_kernel_pool_acquire_buffer(pool, COLS * x_col * 2);
     xdna_buffer * bo_o  = xdna_kernel_pool_acquire_buffer(pool, COLS * o_col * 4);
     if (!bo_x || !bo_o || !bo_x->data || !bo_o->data) {
         return false;
     }
-    // no dirty line of the output may land over what the array writes
-    xdna_test_dirty_if_armed(XDNA_OUT_GDN_MM, bo_o, COLS * o_col * 4, 0);
-    if (!xdna_buffer_sync_to_device_range(bo_o, COLS * o_col * 4, 0)) {
-        return false;
-    }
 
-    // each head's gates in log2 units, their chunk sums, log2 sigma before
-    // each chunk and the renormalizations
-    auto gate = [&](int t, int h) -> float {
-        return t < n_tok ? *(const float *) ((const char *) g->data + t * g->nb[2] + h * g->nb[1]) : 0.0f;
-    };
-    auto betaf = [&](int t, int h) -> float {
-        return t < n_tok ? *(const float *) ((const char *) b->data + t * b->nb[2] + h * b->nb[1]) : 0.0f;
-    };
-    std::vector<float>   ls_at((size_t) H * (nch + 1));
-    std::vector<int32_t> shift((size_t) H * nch);
-    for (int h = 0; h < H; h++) {
-        float ls = 0.0f;
-        for (int c = 0; c < nch; c++) {
-            ls_at[(size_t) h * (nch + 1) + c] = ls;
-            float sum                         = 0.0f;
-            for (int t = 0; t < C; t++) {
-                sum += gate(c * C + t, h) * (float) M_LOG2E;
-            }
-            float     ls_new            = ls + sum;
-            const int e                 = ls_new < LS_MIN ? (int) (-ls_new) : 0;
-            shift[(size_t) h * nch + c] = e;
-            ls                          = ls_new + (float) e;
-        }
-        ls_at[(size_t) h * (nch + 1) + nch] = ls;
-    }
-
-    // A job is one head's object: the head's two cores (value halves) share
-    // K, Q and the exponents, so those are worked out once. Each object is
-    // built in local memory and copied into the BO whole.
-    uint16_t * xh = (uint16_t *) bo_x->data;
-#pragma omp parallel for num_threads(xdna_chunk_threads())
-    for (int job = 0; job < COLS * 2 * nx; job++) {
-        const int            col = job / (2 * nx), p = (job / nx) % 2, ob = job % nx;
-        const int            hd = 2 * col + p;
-        alignas(64) uint16_t buf[2][IN_N];
-        if (!prepared || ob == 0) {
-            std::memset(buf, 0, sizeof(buf));
-        } else {
-            // only the exponents' part is sent from here
-            constexpr size_t kqv = 2 * C * DK + C * DV;
-            std::memset(buf[0] + kqv, 0, (IN_N - kqv) * 2);
-        }
-        auto obj = [&](int half) {
-            return xh + (size_t) col * x_col + ((size_t) ob * 4 + (size_t) 2 * p + half) * IN_N;
+    // A run takes the array's H value heads from hb: their v, gates and
+    // state, and the q and k of their groups.
+    const auto run_heads = [&](int hb) -> bool {
+        // each head's gates in log2 units (G_MIN at least in a chunk past
+        // EXP_RANGE), their chunk sums, log2 sigma before each chunk and the
+        // renormalizations (SHIFT_MAX at most)
+        auto gate_in = [&](int t, int h) -> float {
+            return t < n_tok ? *(const float *) ((const char *) g->data + t * g->nb[2] + (hb + h) * g->nb[1]) : 0.0f;
         };
-        if (ob == 0) {
-            // the chunks; sigma after the last, the new state's factor (a
-            // head's two cores the same)
-            const int32_t nch32 = nch;
-            const float   sigma = std::exp2(ls_at[(size_t) hd * (nch + 1) + nch]);
-            std::memcpy(buf[0], &nch32, sizeof(nch32));
-            std::memcpy((char *) buf[0] + sizeof(nch32), &sigma, sizeof(sigma));
-            std::memcpy(obj(0), buf[0], sizeof(buf[0]));
-            std::memcpy(obj(1), buf[0], sizeof(buf[0]));
-            continue;
-        }
-        if (ob <= N_STATE_IN) {
-            // the state as ggml keeps it (s is M[j][i] = S[i][j]): each core
-            // its 64 value columns, 16 of them (rows of 128 f32) an object
-            const float * sm = (const float *) ((const char *) s->data + hd * s->nb[2]);
-            for (int half = 0; half < 2; half++) {
-                std::memcpy(obj(half), sm + (size_t) (half * DV + (ob - 1) * 16) * S, (size_t) 16 * S * sizeof(float));
+        std::vector<uint8_t> floored((size_t) H * nch);
+        auto                 gate = [&](int t, int h) -> float {
+            const float x = gate_in(t, h);
+            return floored[(size_t) h * nch + t / C] ? std::max(G_MIN, x) : x;
+        };
+        auto betaf = [&](int t, int h) -> float {
+            return t < n_tok ? *(const float *) ((const char *) b->data + t * b->nb[2] + (hb + h) * b->nb[1]) : 0.0f;
+        };
+        std::vector<float>   ls_at((size_t) H * (nch + 1));
+        std::vector<int32_t> shift((size_t) H * nch);
+        for (int h = 0; h < H; h++) {
+            float ls = 0.0f;
+            for (int c = 0; c < nch; c++) {
+                floored[(size_t) h * nch + c] = chunk_range([&](int t) { return gate_in(c * C + t, h); }) > EXP_RANGE;
+                ls_at[(size_t) h * (nch + 1) + c] = ls;
+                float sum                         = 0.0f;
+                for (int t = 0; t < C; t++) {
+                    sum += gate(c * C + t, h) * (float) M_LOG2E;
+                }
+                float     ls_new            = ls + sum;
+                const int e                 = ls_new < LS_MIN ? (int) (-ls_new) : 0;
+                shift[(size_t) h * nch + c] = std::min(e, SHIFT_MAX);
+                ls                          = ls_new + (float) e;
             }
-            continue;
+            ls_at[(size_t) h * (nch + 1) + nch] = ls;
         }
-        const int  c  = ob - 1 - N_STATE_IN;
-        uint16_t * ko = buf[0];
-        uint16_t * qo = buf[0] + (size_t) C * DK;
-        float *    fx = (float *) (buf[0] + (size_t) 2 * C * DK + (size_t) C * DV);
-        for (int tt = 0; tt < C && !prepared; tt++) {
-            const int t = c * C + tt;
-            if (t >= n_tok) {
+
+        // A job is one head's object: the head's two cores (value halves) share
+        // K, Q and the exponents, so those are worked out once. Each object is
+        // built in local memory and copied into the BO whole.
+        uint16_t * xh = (uint16_t *) bo_x->data;
+#pragma omp parallel for num_threads(xdna_chunk_threads())
+        for (int job = 0; job < COLS * 2 * nx; job++) {
+            const int            col = job / (2 * nx), p = (job / nx) % 2, ob = job % nx;
+            const int            hd = 2 * col + p;
+            const int            hk = (hb + hd) % H;  // its q/k group
+            alignas(64) uint16_t buf[2][IN_N];
+            if (!prepared || ob == 0) {
+                std::memset(buf, 0, sizeof(buf));
+            } else {
+                // only the exponents' part is sent from here
+                constexpr size_t kqv = 2 * C * DK + C * DV;
+                std::memset(buf[0] + kqv, 0, (IN_N - kqv) * 2);
+            }
+            auto obj = [&](int half) {
+                return xh + (size_t) col * x_col + ((size_t) ob * 4 + (size_t) 2 * p + half) * IN_N;
+            };
+            if (ob == 0) {
+                // the chunks; sigma after the last, the new state's factor (a
+                // head's two cores the same)
+                const int32_t nch32 = nch;
+                const float   sigma = std::exp2(ls_at[(size_t) hd * (nch + 1) + nch]);
+                std::memcpy(buf[0], &nch32, sizeof(nch32));
+                std::memcpy((char *) buf[0] + sizeof(nch32), &sigma, sizeof(sigma));
+                std::memcpy(obj(0), buf[0], sizeof(buf[0]));
+                std::memcpy(obj(1), buf[0], sizeof(buf[0]));
                 continue;
             }
-            const float * kr = (const float *) ((const char *) k->data + t * k->nb[2] + hd * k->nb[1]);
-            const float * qr = (const float *) ((const char *) q->data + t * q->nb[2] + hd * q->nb[1]);
-            const float * vr = (const float *) ((const char *) v->data + t * v->nb[2] + hd * v->nb[1]);
-            for (int d8 = 0; d8 < DK; d8 += 8) {
-                uint16_t * kd = ko + t8(tt, d8, DK);
-                uint16_t * qd = qo + t8(tt, d8, DK);
-                for (int j = 0; j < 8; j++) {
-                    kd[j] = xdna_bf16(kr[d8 + j]);
-                    qd[j] = xdna_bf16(qr[d8 + j]);
+            if (ob <= N_STATE_IN) {
+                // the state as ggml keeps it (s is M[j][i] = S[i][j]): each core
+                // its 64 value columns, 16 of them (rows of 128 f32) an object
+                const float * sm = (const float *) ((const char *) s->data + (hb + hd) * s->nb[2]);
+                for (int half = 0; half < 2; half++) {
+                    std::memcpy(obj(half), sm + (size_t) (half * DV + (ob - 1) * 16) * S,
+                                (size_t) 16 * S * sizeof(float));
                 }
+                continue;
             }
-            for (int half = 0; half < 2; half++) {
-                uint16_t * vo = buf[half] + (size_t) 2 * C * DK;
-                for (int d8 = 0; d8 < DV; d8 += 8) {
-                    uint16_t * vd = vo + t8(tt, d8, DV);
+            const int  c  = ob - 1 - N_STATE_IN;
+            uint16_t * ko = buf[0];
+            uint16_t * qo = buf[0] + (size_t) C * DK;
+            float *    fx = (float *) (buf[0] + (size_t) 2 * C * DK + (size_t) C * DV);
+            for (int tt = 0; tt < C && !prepared; tt++) {
+                const int t = c * C + tt;
+                if (t >= n_tok) {
+                    continue;
+                }
+                const float * kr = (const float *) ((const char *) k->data + t * k->nb[2] + hk * k->nb[1]);
+                const float * qr = (const float *) ((const char *) q->data + t * q->nb[2] + hk * q->nb[1]);
+                const float * vr = (const float *) ((const char *) v->data + t * v->nb[2] + (hb + hd) * v->nb[1]);
+                for (int d8 = 0; d8 < DK; d8 += 8) {
+                    uint16_t * kd = ko + t8(tt, d8, DK);
+                    uint16_t * qd = qo + t8(tt, d8, DK);
                     for (int j = 0; j < 8; j++) {
-                        vd[j] = xdna_bf16(vr[half * DV + d8 + j]);
+                        kd[j] = xdna_bf16(kr[d8 + j]);
+                        qd[j] = xdna_bf16(qr[d8 + j]);
+                    }
+                }
+                for (int half = 0; half < 2; half++) {
+                    uint16_t * vo = buf[half] + (size_t) 2 * C * DK;
+                    for (int d8 = 0; d8 < DV; d8 += 8) {
+                        uint16_t * vd = vo + t8(tt, d8, DV);
+                        for (int j = 0; j < 8; j++) {
+                            vd[j] = xdna_bf16(vr[half * DV + d8 + j]);
+                        }
                     }
                 }
             }
+            // what the core works its factors out of (gdn_factors): the gates,
+            // beta, log2 sigma before and after the chunk's renormalization and
+            // its shift
+            for (int tt = 0; tt < C; tt++) {
+                fx[tt]     = gate(c * C + tt, hd);
+                fx[C + tt] = betaf(c * C + tt, hd);
+            }
+            fx[(size_t) 2 * C]          = ls_at[(size_t) hd * (nch + 1) + c];
+            fx[2 * C + 1]               = ls_at[(size_t) hd * (nch + 1) + c + 1];
+            ((int32_t *) fx)[2 * C + 2] = shift[(size_t) hd * nch + c];
+            if (prepared) {
+                // K, Q and V are in place: only the exponents
+                constexpr size_t kqv = 2 * C * DK + C * DV;
+                std::memcpy(obj(0) + kqv, buf[0] + kqv, (IN_N - kqv) * 2);
+                std::memcpy(obj(1) + kqv, buf[0] + kqv, (IN_N - kqv) * 2);
+                continue;
+            }
+            // the other half: the same K, Q and exponents
+            std::memcpy(buf[1], buf[0], (size_t) 2 * C * DK * 2);
+            std::memcpy(buf[1] + (size_t) 2 * C * DK + (size_t) C * DV, buf[0] + (size_t) 2 * C * DK + (size_t) C * DV,
+                        (size_t) FX_N * 4);
+            std::memcpy(obj(0), buf[0], sizeof(buf[0]));
+            std::memcpy(obj(1), buf[1], sizeof(buf[1]));
         }
-        // what the core works its factors out of (gdn_factors): the gates,
-        // beta, log2 sigma before and after the chunk's renormalization and
-        // its shift
-        for (int tt = 0; tt < C; tt++) {
-            fx[tt]     = gate(c * C + tt, hd);
-            fx[C + tt] = betaf(c * C + tt, hd);
+        // the pool's BO may be larger
+        if (!xdna_buffer_sync_to_device_range(bo_x, COLS * x_col * 2, 0)) {
+            return false;
         }
-        fx[(size_t) 2 * C]          = ls_at[(size_t) hd * (nch + 1) + c];
-        fx[2 * C + 1]               = ls_at[(size_t) hd * (nch + 1) + c + 1];
-        ((int32_t *) fx)[2 * C + 2] = shift[(size_t) hd * nch + c];
-        if (prepared) {
-            // K, Q and V are in place: only the exponents
-            constexpr size_t kqv = 2 * C * DK + C * DV;
-            std::memcpy(obj(0) + kqv, buf[0] + kqv, (IN_N - kqv) * 2);
-            std::memcpy(obj(1) + kqv, buf[0] + kqv, (IN_N - kqv) * 2);
-            continue;
+        // no dirty line of the output may land over what the array writes
+        xdna_test_dirty_if_armed(XDNA_OUT_GDN_MM, bo_o, COLS * o_col * 4, 0);
+        if (!xdna_buffer_sync_to_device_range(bo_o, COLS * o_col * 4, 0)) {
+            return false;
         }
-        // the other half: the same K, Q and exponents
-        std::memcpy(buf[1], buf[0], (size_t) 2 * C * DK * 2);
-        std::memcpy(buf[1] + (size_t) 2 * C * DK + (size_t) C * DV, buf[0] + (size_t) 2 * C * DK + (size_t) C * DV,
-                    (size_t) FX_N * 4);
-        std::memcpy(obj(0), buf[0], sizeof(buf[0]));
-        std::memcpy(obj(1), buf[1], sizeof(buf[1]));
-    }
-    // the pool's BO may be larger
-    if (!xdna_buffer_sync_to_device_range(bo_x, COLS * x_col * 2, 0)) {
-        return false;
-    }
 
-    xdna_buffer * args[2] = { bo_x, bo_o };
-    xrt::run      run     = xdna_kernel_run_start(g_gm.kern, args, 2);
-    const bool    run_ok  = xdna_run_wait(run);
-    const bool    ok      = run_ok && xdna_buffer_sync_from_device_range(bo_o, COLS * o_col * 4, 0);
-    if (ok) {
-        const float * oh    = (const float *) bo_o->data;
-        float *       attn  = (float *) node->data;
-        float *       s_out = attn + (size_t) S * H * n_tok;
+        xdna_buffer * args[2] = { bo_x, bo_o };
+        xrt::run      run     = xdna_kernel_run_start(g_gm.kern, args, 2);
+        const bool    run_ok  = xdna_run_wait(run);
+        const bool    ok      = run_ok && xdna_buffer_sync_from_device_range(bo_o, COLS * o_col * 4, 0);
+        if (ok) {
+            const float * oh    = (const float *) bo_o->data;
+            float *       attn  = (float *) node->data;
+            float *       s_out = attn + (size_t) S * n_vh * n_tok;
 #pragma omp parallel for num_threads(xdna_chunk_threads())
-        for (int job = 0; job < COLS * 4; job++) {
-            const int col = job / 4, i = job % 4;
-            const int hd = 2 * col + i / 2, half = i % 2;
-            for (int c = 0; c < nch && !keep; c++) {
-                const float * ob = oh + (size_t) col * o_col + ((size_t) c * 4 + i) * O_N;
-                for (int tt = 0; tt < C; tt++) {
-                    const int t = c * C + tt;
-                    if (t >= n_tok) {
-                        break;
+            for (int job = 0; job < COLS * 4; job++) {
+                const int col = job / 4, i = job % 4;
+                const int hd = 2 * col + i / 2, half = i % 2;
+                for (int c = 0; c < nch && !keep; c++) {
+                    const float * ob = oh + (size_t) col * o_col + ((size_t) c * 4 + i) * O_N;
+                    for (int tt = 0; tt < C; tt++) {
+                        const int t = c * C + tt;
+                        if (t >= n_tok) {
+                            break;
+                        }
+                        // the core leaves its value half of each token as a row
+                        std::memcpy(attn + ((size_t) t * n_vh + hb + hd) * S + (size_t) half * DV,
+                                    ob + (size_t) tt * DV, DV * sizeof(float));
                     }
-                    // the core leaves its value half of each token as a row
-                    std::memcpy(attn + ((size_t) t * H + hd) * S + (size_t) half * DV, ob + (size_t) tt * DV,
-                                DV * sizeof(float));
+                }
+                // the state, as ggml keeps it: 8 value columns an object
+                const float * st = oh + (size_t) col * o_col + (size_t) nch * 4 * O_N;
+                float *       sm = s_out + (size_t) (hb + hd) * S * S;
+                for (int p = 0; p < N_STATE_OUT; p++) {
+                    std::memcpy(sm + (size_t) (half * DV + p * 8) * S, st + ((size_t) p * 4 + i) * O_N,
+                                (size_t) O_N * sizeof(float));
                 }
             }
-            // the state, as ggml keeps it: 8 value columns an object
-            const float * st = oh + (size_t) col * o_col + (size_t) nch * 4 * O_N;
-            float *       sm = s_out + (size_t) hd * S * S;
-            for (int p = 0; p < N_STATE_OUT; p++) {
-                std::memcpy(sm + (size_t) (half * DV + p * 8) * S, st + ((size_t) p * 4 + i) * O_N,
-                            (size_t) O_N * sizeof(float));
-            }
         }
+        return ok;
+    };
+    bool ok = true;
+    for (int hb = 0; ok && hb < n_vh; hb += H) {
+        ok = run_heads(hb);
     }
     if (!prepared) {
         xdna_kernel_pool_release_buffer(pool, bo_x);

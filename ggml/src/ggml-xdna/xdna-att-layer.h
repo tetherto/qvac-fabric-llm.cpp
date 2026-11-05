@@ -1,14 +1,15 @@
 #pragma once
 
 // A full-attention layer of Qwen3.5's decode as one dispatch of the fused
-// layer design, from the normed input to l_out:
+// layer design, from the normed input to l_out, for one head group of eight
+// query heads over two kv heads (the 0.8B and 2B) or two (the 4B and 9B):
 //
 //   qkv       q|gate, k, v in one pool GEMV, drained to a scratch buffer
 //   prepare   the prologue tile (act-att.cc) norms q and k, rotates them with
 //             the host's cos/sin, tiles q for the pool and writes this
 //             position's K and V rows into llama's cache
-//   attention the pool over the cache (attn-dec.cc), sixteen partial states
-//             drained to the scratch buffer
+//   attention the pool over the cache (attn-dec.cc), a run a head group, each
+//             run's sixteen partial states drained to the scratch buffer
 //   combine   the prologue tile folds the partials, divides, gates and
 //             quantizes attn_output's activation
 //   tail      attn_output drained into the FFN's raw tiles, then the FFN
@@ -28,13 +29,13 @@ struct xdna_buffer;
 struct xdna_kernel_pool;
 
 struct xdna_att_layer_w {
-    const ggml_tensor * wq        = nullptr;  // [1024 x 4096]: per head q then gate
-    const ggml_tensor * wk        = nullptr;  // [1024 x 512]
-    const ggml_tensor * wv        = nullptr;  // [1024 x 512]
+    const ggml_tensor * wq        = nullptr;  // [D x 4096 a head group]: per head q then gate
+    const ggml_tensor * wk        = nullptr;  // [D x 512 a head group]
+    const ggml_tensor * wv        = nullptr;  // [D x 512 a head group]
     const ggml_tensor * gq        = nullptr;  // attn_q_norm, f32 [256]
     const ggml_tensor * gk        = nullptr;  // attn_k_norm, f32 [256]
     const ggml_tensor * attn_norm = nullptr;  // f32 [1024], the input's norm
-    const ggml_tensor * wo        = nullptr;  // [2048 x 1024]
+    const ggml_tensor * wo        = nullptr;  // [2048 a head group x D]
     const ggml_tensor * post      = nullptr;  // post_attention_norm, f32 [1024]
     const ggml_tensor * gate      = nullptr;
     const ggml_tensor * up        = nullptr;
@@ -49,11 +50,13 @@ struct xdna_att_layer_in {
     // its outputs h_attn and the FFN's land in A and F, h and the mixer
     // output in H and S.
     xdna_buffer * res      = nullptr;
-    // Position 0 of the layer's K and V cache (f16, 1024 B a position).
+    // Position 0 of the layer's K and V cache (f16, `pos_b` a position: 512 B
+    // a kv head).
     xdna_buffer * kbo      = nullptr;
     size_t        koff     = 0;
     xdna_buffer * vbo      = nullptr;
     size_t        voff     = 0;
+    size_t        pos_b    = 1024;
     int           n_valid  = 0;        // positions, this one (row n_valid - 1) included
     int           n_rot    = 0;        // rotated dims, a multiple of 32, <= 256
     const float * cosv     = nullptr;  // n_rot / 2 each, for this position
@@ -69,7 +72,12 @@ int xdna_att_layer_max_positions(void);
 
 // Whether the chunks of `n_valid` positions lie inside the cache buffers: the
 // last chunk is read whole, so near the end of a cache it runs past it.
-bool xdna_att_layer_fits(const xdna_buffer * kbo, size_t koff, const xdna_buffer * vbo, size_t voff, int n_valid);
+bool xdna_att_layer_fits(const xdna_buffer * kbo,
+                         size_t              koff,
+                         const xdna_buffer * vbo,
+                         size_t              voff,
+                         int                 n_valid,
+                         size_t              pos_b);
 
 // Run the layer: A = h + attn_output(attention(rms_norm(h))), F = FFN(A),
 // with h = F + A on entry, in `in.res`. False when the dispatch cannot be

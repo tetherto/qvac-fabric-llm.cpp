@@ -102,7 +102,8 @@ void xdna_att_free(xdna_att * a) {
 namespace {
 
 // The whole dispatch for `n_chunks` chunks a core in `n_task` BD chains.
-std::vector<uint32_t> build(const xdna_att * a, int n_task, int n_chunks, size_t koff, size_t voff, bool kv_same) {
+std::vector<uint32_t>
+build(const xdna_att * a, int n_task, int n_chunks, size_t koff, size_t voff, bool kv_same, size_t pos_b) {
     xdna_seq   seq;
     uint32_t   next[XDNA_SEQ_MAX_COLS] = {};
     const auto take                    = [&](int col) {
@@ -145,7 +146,7 @@ std::vector<uint32_t> build(const xdna_att * a, int n_task, int n_chunks, size_t
         chain[c] = next[e.col];
         next[e.col] += 6;
     }
-    emit_chunks(seq, a->w, a->tb, n_task, n_chunks, chain, koff, voff, argv);
+    emit_chunks(seq, a->w, a->tb, n_task, n_chunks, chain, koff, voff, argv, pos_b);
     for (int s = 0; s < a->n_o; s++) {
         xdna_seq_wait_token(&seq, a->o[s].col, 0, xdna_dma_dir::S2MM, a->o[s].ch);
     }
@@ -162,7 +163,8 @@ bool xdna_att_run(xdna_att *    a,
                   const float * q,
                   float         scale,
                   int           n_valid,
-                  float *       out) {
+                  float *       out,
+                  size_t        pos_b) {
     if (!a || !kbo || !vbo || !q || !out || !kbo->data || !vbo->data || n_valid <= 0 ||
         n_valid > xdna_att_max_positions()) {
         GGML_LOG_ERROR("%s: attention: bad call: a buffer is null or unmapped (k=%p v=%p q=%p out=%p n_valid=%d)\n",
@@ -173,12 +175,13 @@ bool xdna_att_run(xdna_att *    a,
     const int n_chunks = xdna_att_geom::chunk_count(n_valid);
     const int n_task   = xdna_att_geom::task_count(n_chunks);
     // every chunk the cores are sent has to be inside the buffers
-    if (!xdna_att_geom::fits(kbo->bytes, koff, vbo->bytes, voff, n_valid)) {
+    if (pos_b < POS_B || pos_b % POS_B != 0 ||
+        !xdna_att_geom::fits(kbo->bytes, koff, vbo->bytes, voff, n_valid, pos_b)) {
         GGML_LOG_ERROR("%s: attention: %d positions do not fit the K/V cache buffers\n", "xdna-att", n_valid);
         return false;
     }
     const bool                  same  = kbo == vbo;
-    const std::vector<uint32_t> words = build(a, n_task, n_chunks, koff, voff, same);
+    const std::vector<uint32_t> words = build(a, n_task, n_chunks, koff, voff, same, pos_b);
     xdna_att::variant &         v     = a->var[n_task];
     if (!v.kern) {
         char name[32];

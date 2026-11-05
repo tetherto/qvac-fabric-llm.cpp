@@ -45,6 +45,10 @@
 // keys, so a causal, a bidirectional or a banded mask, packed sequences and
 // the cache rows before a ubatch are all the same to the design. A pass streams
 // the tiles that hold any key one of its rows sees.
+//
+// A layer of more KV heads (the 4B's and 9B's 16 query heads over 4) runs as
+// one call a group of KVH KV heads and their query heads, each over the
+// shared K/V copy.
 
 namespace {
 
@@ -52,7 +56,8 @@ using namespace xdna_attn_mask;
 
 constexpr const char * STEM    = "attn_mm_c8";
 constexpr int          COLS    = 8;
-constexpr int          KVH     = 2;            // KV heads
+constexpr int          KVH     = 2;            // KV heads a call (a KV head group)
+constexpr int          GROUPS  = 2;            // KV head groups a layer at most (the 4B's and 9B's 4 KV heads)
 constexpr int          D       = 256;
 constexpr int          DH      = 128;          // a core's half of D
 constexpr int          R       = 32;           // rows a pair
@@ -321,19 +326,15 @@ std::vector<uint32_t> build_seq(const std::vector<pass_tiles> & passes, int64_t 
     return xdna_seq_build(&seq);
 }
 
-// Keys [0, n_kv) of both KV heads into the tile layout, whole tiles; the
+// Keys [0, n_kv) of KV head group kg's two KV heads into the tile layout, whole tiles; the
 // rest of the last tile zero (finite: every query before them masks them).
 // Rows convert in vectors, then scatter into the tiles.
-void pack_kv(const ggml_tensor * k,
-             const ggml_tensor * v,
-             uint16_t *          dst,
-             int64_t             cap_tiles,
-             int64_t             n_kv) {
+void pack_kv(const ggml_tensor * k, const ggml_tensor * v, uint16_t * dst, int64_t cap_tiles, int64_t n_kv, int kg) {
     const int64_t t1 = (n_kv + NK - 1) / NK;
 #pragma omp parallel for collapse(2) num_threads(xdna_chunk_threads())
     for (int64_t t = 0; t < t1; t++) {
         for (int s = 0; s < 4; s++) {
-            const int            g = s / 2, h = s % 2;
+            const int            g = KVH * kg + s / 2, h = s % 2;
             uint16_t *           o  = dst + ((size_t) s * cap_tiles + t) * KV_OBJ;
             uint16_t *           ov = o + (size_t) NK * DH;
             alignas(64) uint16_t kb[NK][DH];
@@ -387,7 +388,7 @@ float q_scale_of(const ggml_tensor * node) {
     return params[0];
 }
 
-bool shapes_supported(const ggml_tensor * node, geometry * geo, int64_t * n_tokens, int64_t * n_kv) {
+bool shapes_supported(const ggml_tensor * node, geometry * geo, int * groups, int64_t * n_tokens, int64_t * n_kv) {
     if (!xdna_fa_plain(node)) {
         return false;  // sinks, or K/V row lists
     }
@@ -398,17 +399,18 @@ bool shapes_supported(const ggml_tensor * node, geometry * geo, int64_t * n_toke
         node->type != GGML_TYPE_F32) {
         return false;
     }
-    // q is [D, n_tokens, n_head], k/v are [D, n_kv, n_head_kv]
-    if (q->ne[0] != D || q->ne[3] != 1 || k->ne[0] != D || v->ne[0] != D || k->ne[2] != KVH || v->ne[2] != KVH ||
-        k->ne[1] != v->ne[1] || k->ne[3] != 1 || v->ne[3] != 1) {
+    // q is [D, n_tokens, n_head], k/v are [D, n_kv, n_head_kv]: whole KV head groups
+    if (q->ne[0] != D || q->ne[3] != 1 || k->ne[0] != D || v->ne[0] != D || k->ne[2] % KVH != 0 ||
+        k->ne[2] / KVH > GROUPS || v->ne[2] != k->ne[2] || k->ne[1] != v->ne[1] || k->ne[3] != 1 || v->ne[3] != 1) {
         return false;
     }
+    *groups = (int) (k->ne[2] / KVH);
     if (q->nb[0] != sizeof(float) || k->nb[0] != sizeof(uint16_t) || v->nb[0] != sizeof(uint16_t)) {
         return false;
     }
     *n_tokens = q->ne[1];
     *n_kv     = k->ne[1];
-    return geometry_of(q->ne[2], geo) && *n_tokens >= FA_MIN_TOKENS && *n_kv >= 1;
+    return q->ne[2] % *groups == 0 && geometry_of(q->ne[2] / *groups, geo) && *n_tokens >= FA_MIN_TOKENS && *n_kv >= 1;
 }
 
 }  // namespace
@@ -422,11 +424,15 @@ bool xdna_attn_mm_supported(const ggml_tensor * node) {
         return false;
     }
     geometry geo;
+    int      groups;
     int64_t  n_tokens, n_kv;
-    if (!shapes_supported(node, &geo, &n_tokens, &n_kv)) {
+    if (!shapes_supported(node, &geo, &groups, &n_tokens, &n_kv)) {
         return false;
     }
-    const int64_t n_head = (int64_t) geo.hg * KVH;
+    if (groups > 1 && xdna_pfx_attn_active()) {
+        return false;  // the merged design takes one group of KVH
+    }
+    const int64_t n_head = (int64_t) geo.hg * KVH * groups;
     const int64_t bound  = xdna_host_attn_supported(node) ? FA_MIN_PAIR_HEADS_HOST_KERNEL : FA_MIN_PAIR_HEADS_CPU_OP;
     // the most it can see, before the mask is scanned
     if (mode != 2 && n_tokens * n_kv * n_head < bound) {
@@ -446,13 +452,14 @@ namespace {
 // Q for the columns: per column the header, then per pass and core Q half^T of
 // its 32 rows and the pass trailer; past the ubatch the rows are zero and
 // see the first key of the pass.
-void pack_q(const ggml_tensor *            q,
-            uint16_t *                     qh,
-            const geometry &               geo,
-            const mask_rows &              mr,
+void pack_q(const ggml_tensor *             q,
+            uint16_t *                      qh,
+            const geometry &                geo,
+            const mask_rows &               mr,
             const std::vector<pass_tiles> & passes,
-            float                          qs,
-            int64_t                        n_tokens) {
+            float                           qs,
+            int64_t                         n_tokens,
+            int                             kg) {
     const int     npass = (int) passes.size();
     const size_t  q_col = (size_t) (1 + npass) * 4 * Q_OBJ;  // bf16 a column
 #pragma omp parallel for num_threads(xdna_chunk_threads())
@@ -480,10 +487,10 @@ void pack_q(const ggml_tensor *            q,
                 const int     hh = row / geo.pp;
                 const int64_t t  = (int64_t) p * geo.pass + (int64_t) pidx * geo.pp + row % geo.pp;
                 if (t < n_tokens) {
-                    xdna_scaled_bf16_row(
-                        (const float *) ((const char *) q->data + t * q->nb[1] + (geo.hg * g + hh) * q->nb[2]) +
-                            (size_t) h * DH,
-                        qs, qb[row], DH);
+                    xdna_scaled_bf16_row((const float *) ((const char *) q->data + t * q->nb[1] +
+                                                          (geo.hg * (KVH * kg + g) + hh) * q->nb[2]) +
+                                             (size_t) h * DH,
+                                         qs, qb[row], DH);
                     tr[2 + row]     = mr.lo[t];
                     tr[2 + R + row] = mr.hi[t];
                 } else {
@@ -503,11 +510,7 @@ void pack_q(const ggml_tensor *            q,
 
 // O into dst, [D, n_head, n_tokens]: the MemTile leaves each core's rows as
 // rows.
-void unpack_o(ggml_tensor *    node,
-              const float *    ob,
-              const geometry & geo,
-              int              npass,
-              int64_t          n_tokens) {
+void unpack_o(ggml_tensor * node, const float * ob, const geometry & geo, int npass, int64_t n_tokens, int kg) {
     const size_t o_col = (size_t) npass * 4 * O_OBJ;  // f32 a column
 #pragma omp parallel for num_threads(xdna_chunk_threads())
     for (int cp = 0; cp < COLS * npass; cp++) {
@@ -520,7 +523,7 @@ void unpack_o(ggml_tensor *    node,
                 if (t >= n_tokens) {
                     continue;
                 }
-                float * dst = (float *) ((char *) node->data + (geo.hg * g + row / geo.pp) * node->nb[1] +
+                float * dst = (float *) ((char *) node->data + (geo.hg * (KVH * kg + g) + row / geo.pp) * node->nb[1] +
                                          t * node->nb[2]) +
                               (size_t) h * DH;
                 std::memcpy(dst, o + (size_t) row * DH, DH * sizeof(float));
@@ -562,6 +565,79 @@ bool rows_into(xdna_kernel_pool *        pool,
     return xdna_pfx_row_run_tables(pool, r, tables);
 }
 
+// One KV head group's call: its keys into the shared K/V copy, its query heads' Q, the run, and its heads of O unless the
+// output stays where the array wrote it.
+bool run_group(xdna_kernel_pool *              pool,
+               ggml_tensor *                   node,
+               const geometry &                geo,
+               const mask_rows &               mr,
+               const std::vector<pass_tiles> & passes,
+               xdna_buffer *                   bo_q,
+               xdna_buffer *                   bo_o,
+               int64_t                         n_tokens,
+               bool                            keep,
+               int                             kg) {
+    const int    npass = (int) passes.size();
+    const size_t q_col = (size_t) (1 + npass) * 4 * Q_OBJ;  // bf16 a column
+    const size_t o_col = (size_t) npass * 4 * O_OBJ;        // f32 a column
+    kv_cache &   kc    = g_am.kv;
+    // the tiles past n_kv that a pass streams are zero from the allocation
+    // or a longer earlier call's keys - finite either way, and masked
+    {
+        xdna_prof::section_timer st("prefill: attn kv pack");
+        pack_kv(node->src[1], node->src[2], (uint16_t *) kc.bo->data, kc.cap_tiles, mr.n_kv, kg);
+        if (!sync_kv_tiles(kc.bo, kc.cap_tiles, (mr.n_kv + NK - 1) / NK)) {
+            return false;
+        }
+    }
+    // no dirty line of the output may land over what the array writes
+    xdna_test_dirty_if_armed(XDNA_OUT_ATTN_MM, bo_o, COLS * o_col * 4, 0);
+    if (!xdna_buffer_sync_to_device_range(bo_o, COLS * o_col * 4, 0)) {
+        return false;
+    }
+    {
+        xdna_prof::section_timer q_st("prefill: attn q pack");
+        pack_q(node->src[0], (uint16_t *) bo_q->data, geo, mr, passes, (float) (M_LOG2E * q_scale_of(node)), n_tokens,
+               kg);
+        // the pool's BO may be larger
+        if (!xdna_buffer_sync_to_device_range(bo_q, COLS * q_col * 2, 0)) {
+            return false;
+        }
+    }
+    xdna_buffer * args[3] = { bo_q, kc.bo, bo_o };
+    bool          ok;
+    {
+        xdna_prof::section_timer run_st("prefill: attn run");
+        xrt::run                 run    = xdna_kernel_run_start(g_am.kern, args, 3);
+        const bool               run_ok = xdna_run_wait(run);
+        ok                              = run_ok && xdna_buffer_sync_from_device_range(bo_o, COLS * o_col * 4, 0);
+    }
+    if (ok && !keep) {
+        xdna_prof::section_timer o_st("prefill: attn unpack");
+        unpack_o(node, (const float *) bo_o->data, geo, npass, n_tokens, kg);
+    }
+    return ok;
+}
+
+// Every KV head group of the node, one call each, in order.
+bool run_groups(xdna_kernel_pool *              pool,
+                ggml_tensor *                   node,
+                const geometry &                geo,
+                const mask_rows &               mr,
+                const std::vector<pass_tiles> & passes,
+                xdna_buffer *                   bo_q,
+                xdna_buffer *                   bo_o,
+                int64_t                         n_tokens,
+                bool                            keep,
+                int                             groups) {
+    for (int kg = 0; kg < groups; kg++) {
+        if (!run_group(pool, node, geo, mr, passes, bo_q, bo_o, n_tokens, keep, kg)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 xdna_attn_rows_result xdna_attn_mm_run_rows(xdna_kernel_pool *       pool,
@@ -570,8 +646,10 @@ xdna_attn_rows_result xdna_attn_mm_run_rows(xdna_kernel_pool *       pool,
                                             xdna_pfx_row_tables &    tables) {
     std::lock_guard<std::mutex> lock(g_am.mtx);
     geometry                    geo;
+    int                         groups;
     int64_t                     n_tokens, n_kv_view;
-    if (!xdna_pfx_attn_active() || !shapes_supported(node, &geo, &n_tokens, &n_kv_view) || row.n_tokens != n_tokens) {
+    if (!xdna_pfx_attn_active() || !shapes_supported(node, &geo, &groups, &n_tokens, &n_kv_view) || groups != 1 ||
+        row.n_tokens != n_tokens) {
         return xdna_attn_rows_result::refused;
     }
     const std::shared_ptr<const mask_rows> mrp = mask_of(node->src[3], n_kv_view, n_tokens);
@@ -592,12 +670,10 @@ xdna_attn_rows_result xdna_attn_mm_run_rows(xdna_kernel_pool *       pool,
 
 bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     std::lock_guard<std::mutex> lock(g_am.mtx);
-    const ggml_tensor *         q = node->src[0];
-    const ggml_tensor *         k = node->src[1];
-    const ggml_tensor *         v = node->src[2];
     geometry                    geo;
+    int                         groups;
     int64_t                     n_tokens, n_kv_view;
-    if (!shapes_supported(node, &geo, &n_tokens, &n_kv_view)) {
+    if (!shapes_supported(node, &geo, &groups, &n_tokens, &n_kv_view)) {
         return false;
     }
     const std::shared_ptr<const mask_rows> mrp = mask_of(node->src[3], n_kv_view, n_tokens);
@@ -607,11 +683,9 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     }
     const mask_rows & mr = *mrp;
     if (xdna_pfx_attn_active()) {
-        return run_pfx(pool, node, geo, mr, n_tokens);
+        return groups == 1 && run_pfx(pool, node, geo, mr, n_tokens);
     }
-    // the keys up to the last any row sees; past them llama's padding
-    const int64_t     n_kv  = mr.n_kv;
-    const int         npass = (int) ((n_tokens + geo.pass - 1) / geo.pass);
+    const int npass = (int) ((n_tokens + geo.pass - 1) / geo.pass);
 
     const std::vector<pass_tiles> passes = tiles_of_passes(mr, geo, n_tokens, npass);
     const int64_t                 t_need = tiles_reached(passes);
@@ -639,16 +713,6 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     if (!kc.bo->data) {
         return false;
     }
-    uint16_t * kvh = (uint16_t *) kc.bo->data;
-    // the tiles past n_kv that a pass streams are zero from the allocation
-    // or a longer earlier call's keys - finite either way, and masked
-    {
-        xdna_prof::section_timer st("prefill: attn kv pack");
-        pack_kv(k, v, kvh, kc.cap_tiles, n_kv);
-        if (!sync_kv_tiles(kc.bo, kc.cap_tiles, (n_kv + NK - 1) / NK)) {
-            return false;
-        }
-    }
 
     const std::vector<uint32_t> insts = build_seq(passes, kc.cap_tiles);
     if (!xdna_kernel_bind_insts(pool->device, g_am.kern, insts.data(), insts.size())) {
@@ -661,7 +725,8 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         g_am.kept    = nullptr;
     }
     // the kept rows are read in Qwen3.5's layout of 8 heads over 2 groups
-    const bool    keep  = geo.hg == 4 && std::find(g_am.keep.begin(), g_am.keep.end(), node) != g_am.keep.end();
+    const bool keep =
+        groups == 1 && geo.hg == 4 && std::find(g_am.keep.begin(), g_am.keep.end(), node) != g_am.keep.end();
     const size_t  q_col = (size_t) (1 + npass) * 4 * Q_OBJ;  // bf16 a column
     const size_t  o_col = (size_t) npass * 4 * O_OBJ;        // f32 a column
     xdna_buffer * bo_q  = xdna_kernel_pool_acquire_buffer(pool, COLS * q_col * 2);
@@ -669,33 +734,7 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     if (!bo_q || !bo_o || !bo_q->data || !bo_o->data) {
         return false;
     }
-    // no dirty line of the output may land over what the array writes
-    xdna_test_dirty_if_armed(XDNA_OUT_ATTN_MM, bo_o, COLS * o_col * 4, 0);
-    if (!xdna_buffer_sync_to_device_range(bo_o, COLS * o_col * 4, 0)) {
-        return false;
-    }
-
-    {
-        xdna_prof::section_timer q_st("prefill: attn q pack");
-        pack_q(q, (uint16_t *) bo_q->data, geo, mr, passes, (float) (M_LOG2E * q_scale_of(node)), n_tokens);
-        // the pool's BO may be larger
-        if (!xdna_buffer_sync_to_device_range(bo_q, COLS * q_col * 2, 0)) {
-            return false;
-        }
-    }
-
-    xdna_buffer * args[3] = { bo_q, kc.bo, bo_o };
-    bool          ok;
-    {
-        xdna_prof::section_timer run_st("prefill: attn run");
-        xrt::run                 run    = xdna_kernel_run_start(g_am.kern, args, 3);
-        const bool               run_ok = xdna_run_wait(run);
-        ok                              = run_ok && xdna_buffer_sync_from_device_range(bo_o, COLS * o_col * 4, 0);
-    }
-    if (ok && !keep) {
-        xdna_prof::section_timer o_st("prefill: attn unpack");
-        unpack_o(node, (const float *) bo_o->data, geo, npass, n_tokens);
-    }
+    const bool ok = run_groups(pool, node, geo, mr, passes, bo_q, bo_o, n_tokens, keep, groups);
     xdna_kernel_pool_release_buffer(pool, bo_q);
     if (ok && keep) {
         g_am.kept      = node;

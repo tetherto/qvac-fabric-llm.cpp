@@ -740,6 +740,12 @@ if (GGML_XDNA)
     llama_build_and_test(test-xdna-affinity.cpp     LABEL "model")
     # An embedding model's layer outputs and pooled embeddings against the CPU (-m model.gguf).
     llama_build_and_test(test-xdna-embedding.cpp    LABEL "model")
+    # A model's recurrent layers, prefill and decode, against the CPU backend
+    # (-m model.gguf; probes/gdn_widen_model.py makes one of 32 value heads).
+    llama_build_and_test(test-xdna-gdn.cpp          LABEL "model")
+    # A fused decode watched through an eval callback against the unwatched
+    # one (-m model.gguf).
+    llama_build_and_test(test-xdna-observe.cpp      LABEL "model")
     # The host-only backend tests are built with the backend
     # (ggml/src/ggml-xdna/CMakeLists.txt); they need no model and no device.
     foreach(t test-xdna-repack test-xdna-head-rows test-xdna-match test-xdna-mark test-xdna-seq test-xdna-seg-reach
@@ -757,10 +763,13 @@ if (GGML_XDNA)
     else()
         message(STATUS "test-xdna-design-tag: no Python 3 interpreter, test not registered")
     endif()
-    # The FFN pair on the device against the CPU, self-skipping; no model.
-    if (TARGET test-xdna-pair)
-        add_test(NAME test-xdna-pair COMMAND test-xdna-pair)
-    endif()
+    # The FFN pair and the fused attention layer on the device against the
+    # CPU, self-skipping; no model.
+    foreach(t test-xdna-pair test-xdna-att-layer)
+        if (TARGET ${t})
+            add_test(NAME ${t} COMMAND ${t})
+        endif()
+    endforeach()
 endif()
 
 if (APPLE)

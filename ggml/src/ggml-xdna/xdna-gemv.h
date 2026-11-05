@@ -412,9 +412,10 @@ int32_t xdna_gemv_pair_last_flags(const xdna_gemv_pair * p);
 // The residual rows the layers hand each other in DDR (act-att.cc's row
 // mode): h, the attention/mixer output, h_attn and the FFN output, one row
 // of the model's width each, XDNA_RES_MAX_D floats apart, in one buffer every
-// layer's dispatch binds.
+// layer's dispatch binds. A projection drains its padded N into a row (the
+// 4B's 2560 as 3072), which fits: N pads to whole passes of 1024.
 enum {
-    XDNA_RES_MAX_D = 2048,
+    XDNA_RES_MAX_D = 4096,
     XDNA_RES_H     = 0,  // byte offsets
     XDNA_RES_S     = 1 * XDNA_RES_MAX_D * 4,
     XDNA_RES_A     = 2 * XDNA_RES_MAX_D * 4,
@@ -423,15 +424,21 @@ enum {
 };
 
 // The prologue's row objects (act-att.cc): a side object carries 512 floats
-// or 1024 bf16 values of a gate row, an emitted object 256 floats.
+// or 1024 bf16 values of the gate rows (laid end to end, the prologue takes a
+// row in pieces of half that), an emitted object 256 floats.
 enum {
     XDNA_ROW_SIDE_FLOATS = 512,
     XDNA_ROW_GATE_VALUES = 1024,
+    XDNA_ROW_GATE_PIECE  = XDNA_ROW_GATE_VALUES / 2,
     XDNA_ROW_EMIT_FLOATS = 256,
 };
 
 // A residual width the row mode takes: whole side objects, no wider than a row.
 bool xdna_res_width_ok(int64_t d);
+
+// Whether `gates` rows of width `d` go through the prologue: whole pieces a
+// row, and whole gate objects in all.
+bool xdna_row_gates_ok(int64_t d, int gates);
 
 // Row-mode activation tiles for `geom` into `dst` (geom.act_bytes()): the
 // count header, then every chunk's tiles in DDR (no replay: only the first
@@ -440,8 +447,8 @@ bool xdna_res_width_ok(int64_t d);
 // row, so the cores see an ordinary activation. False when the geometry's
 // row is not D = n_tiles * k_tile with xdna_res_width_ok(D).
 // `gates` > 0 (a GDN in-projection: 32) makes the last tile of the last chunk
-// take the gates' constants and weight rows (D / XDNA_ROW_GATE_VALUES objects
-// a row, so D has to be a multiple of that) and emit x's tails (act-att.cc).
+// take the gates' constants and weight rows (xdna_row_gates_ok) and emit x's
+// tails (act-att.cc).
 bool xdna_gemv_row_act(const xdna_gemv_geom & geom,
                        uint8_t *              dst,
                        float                  eps,
