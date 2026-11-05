@@ -189,6 +189,11 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CCCL::CCCL)
     endif()
 
+    if (GGML_CUDA_NVRTC_FUSION)
+        add_compile_definitions(GGML_CUDA_NVRTC_FUSION)
+        target_link_libraries(ggml-cuda PRIVATE CUDA::nvrtc CUDA::cuda_driver)
+    endif()
+
     # cuBLASLt is a transitive dependency of cuBLAS, but FP8 matmuls call its API directly.
     if (GGML_STATIC)
         if (WIN32)
