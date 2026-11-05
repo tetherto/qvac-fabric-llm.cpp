@@ -56,9 +56,9 @@ inline int task_count(int n_chunks) {
 // The chunks of `n_valid` positions have to lie inside the cache buffers: the
 // last chunk is read whole, so near the end of a cache it runs past it.
 // `pos_b` is the cache's position stride: POS_B, or a multiple of it with
-// more kv heads than a run takes.
-inline bool fits(size_t kbytes, size_t koff, size_t vbytes, size_t voff, int n_valid, size_t pos_b = POS_B) {
-    const size_t span = ((size_t) chunk_count(n_valid) * ROUND - 1) * pos_b + POS_B;
+// more kv heads than a run takes. Head group g reads from koff + g * POS_B.
+inline bool fits(size_t kbytes, size_t koff, size_t vbytes, size_t voff, int n_valid, size_t pos_b, int groups = 1) {
+    const size_t span = ((size_t) chunk_count(n_valid) * ROUND - 1) * pos_b + (size_t) groups * POS_B;
     return koff + span <= kbytes && voff + span <= vbytes && koff + span <= UINT32_MAX && voff + span <= UINT32_MAX;
 }
 

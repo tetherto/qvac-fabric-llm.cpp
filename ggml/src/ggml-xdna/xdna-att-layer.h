@@ -70,14 +70,16 @@ struct xdna_att_layer_in {
 // Positions one dispatch can take.
 int xdna_att_layer_max_positions(void);
 
-// Whether the chunks of `n_valid` positions lie inside the cache buffers: the
-// last chunk is read whole, so near the end of a cache it runs past it.
+// Whether the chunks of `n_valid` positions of each of `groups` head groups
+// lie inside the cache buffers: the last chunk is read whole, so near the end
+// of a cache it runs past it.
 bool xdna_att_layer_fits(const xdna_buffer * kbo,
                          size_t              koff,
                          const xdna_buffer * vbo,
                          size_t              voff,
                          int                 n_valid,
-                         size_t              pos_b);
+                         size_t              pos_b,
+                         int                 groups);
 
 // Run the layer: A = h + attn_output(attention(rms_norm(h))), F = FFN(A),
 // with h = F + A on entry, in `in.res`. False when the dispatch cannot be
