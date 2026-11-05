@@ -1334,8 +1334,7 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size_n(
 
     size_t total = 0;
     for (const auto & item : plan) {
-        const size_t size = ggml_backend_buft_get_buffer_alloc_size(buft, item.size);
-        total = size > SIZE_MAX - total ? SIZE_MAX : total + size;
+        total += item.size;
     }
     return total;
 }
@@ -3202,9 +3201,6 @@ static void ggml_backend_hexagon_device_get_props(ggml_backend_dev_t dev, struct
     props->name        = ggml_backend_hexagon_device_get_name(dev);
     props->description = ggml_backend_hexagon_device_get_description(dev);
     props->type        = ggml_backend_hexagon_device_get_type(dev);
-    // FastRPC tensor buffers and host allocations compete for system RAM.
-    // A zero capacity query is unknown capacity, not a separate zero-byte pool.
-    props->memory_unified = true;
     ggml_backend_hexagon_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ true,
