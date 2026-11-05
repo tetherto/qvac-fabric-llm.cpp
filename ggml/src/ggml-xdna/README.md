@@ -75,10 +75,10 @@ of 6.4 J, and the 9B Q8_0 from 6.4 to 12.4 t/s at 4.7 instead of 10.5 J.
 
 The fused layers decode these Q4_K_M models slower than that host decode, for
 less package energy (tg512 in one session, J a token above idle, then in
-total): the 2B at 30.0 against 63.6 t/s and 0.51 against 0.82 J (0.91 against
-1.01), the 4B at 12.3 against 29.8 t/s and 1.10 against 1.93 J (2.07 against
-2.34), and the 9B at 7.6 against 18.6 t/s and 1.77 against 2.78 J (3.34
-against 3.42). `GGML_XDNA_FUSED_WIDE=0` restores the faster host decode.
+total): the 2B at 30.0 against 64.0 t/s and 0.51 against 0.82 J (0.91 against
+1.01), the 4B at 12.3 against 29.9 t/s and 1.07 against 1.92 J (2.07 against
+2.31), and the 9B at 7.6 against 18.6 t/s and 1.77 against 2.76 J (3.33
+against 3.40). `GGML_XDNA_FUSED_WIDE=0` restores the faster host decode.
 
 `GGML_XDNA_HOST_DECODE_THREADS=0` keeps that decode on the array per op: the
 recurrent bodies (conv, GDN, norms, GLU) run on the host, the projections on
