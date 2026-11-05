@@ -130,9 +130,10 @@ bool xdna_att_layer_fits(const xdna_buffer * kbo,
                          const xdna_buffer * vbo,
                          size_t              voff,
                          int                 n_valid,
-                         size_t              pos_b) {
+                         size_t              pos_b,
+                         int                 groups) {
     return kbo && vbo && n_valid > 0 && n_valid <= xdna_att_layer_max_positions() &&
-           xdna_att_geom::fits(kbo->bytes, koff, vbo->bytes, voff, n_valid, pos_b);
+           xdna_att_geom::fits(kbo->bytes, koff, vbo->bytes, voff, n_valid, pos_b, groups);
 }
 
 void xdna_att_layer_free(xdna_att_layer * l) {
@@ -546,7 +547,8 @@ xrt::run * xdna_att_layer_start(xdna_att_layer * l, const xdna_att_layer_in & in
             (const void *) in.cosv, (const void *) in.sinv, in.n_valid, in.n_rot);
         return nullptr;
     }
-    if (in.pos_b != l->pos_b || !xdna_att_layer_fits(in.kbo, in.koff, in.vbo, in.voff, in.n_valid, in.pos_b)) {
+    if (in.pos_b != l->pos_b ||
+        !xdna_att_layer_fits(in.kbo, in.koff, in.vbo, in.voff, in.n_valid, in.pos_b, l->groups)) {
         GGML_LOG_ERROR("%s: %d positions do not fit the K/V cache buffers\n", "xdna-att-layer", in.n_valid);
         return nullptr;
     }
