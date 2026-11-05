@@ -5498,6 +5498,9 @@ static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const c
     if (std::strcmp(name, "ggml_backend_xdna_test_attn_kv_copies") == 0) {
         return (void *) xdna_attn_mm_kv_copies;
     }
+    if (std::strcmp(name, "ggml_backend_xdna_test_dirty_output") == 0) {
+        return (void *) xdna_test_dirty_output;
+    }
     return NULL;
 }
 
