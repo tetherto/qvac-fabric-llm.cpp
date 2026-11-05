@@ -48,13 +48,14 @@ bool mask_ok(const ggml_tensor * m, int64_t n_kv, int64_t n_q) {
                   m->ne[2] == 1 && m->ne[3] == 1);
 }
 
-// No ALiBi, no softcap, no sinks, one sequence, f32 accumulation.
+// No ALiBi, no softcap, no sinks, no list of K/V rows (ggml_flash_attn_ext_rows), one sequence, f32 accumulation.
 bool options_ok(const ggml_tensor * n, float * scale) {
     float params[3];
     std::memcpy(params, n->op_params, sizeof(params));
     *scale          = params[0];
     const int prec  = (int) ggml_flash_attn_ext_get_prec(n);
-    return !n->src[4] && params[1] == 0.0f && params[2] == 0.0f && (prec == GGML_PREC_DEFAULT || prec == GGML_PREC_F32);
+    return !n->src[4] && !n->src[5] && params[1] == 0.0f && params[2] == 0.0f &&
+           (prec == GGML_PREC_DEFAULT || prec == GGML_PREC_F32);
 }
 
 bool layout_ok(const ggml_tensor * n, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v) {
