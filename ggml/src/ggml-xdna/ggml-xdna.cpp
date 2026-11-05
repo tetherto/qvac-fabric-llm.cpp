@@ -1459,7 +1459,8 @@ static bool xdna_att_on(void) {
 
 // The shapes the pool's attention takes: Qwen3.5's full-attention decode, one
 // head group of eight query heads over two kv heads, or two (the 4B and 9B),
-// its keys the cache's own rows (no list of rows: ggml_flash_attn_ext_rows).
+// its keys the cache's own rows: no K/V row list, or one that names those rows
+// (xdna_att_rows_shape_ok, then xdna_att_rows_identity at run time).
 static constexpr int64_t XDNA_ATT_D        = 256;
 static constexpr int64_t XDNA_ATT_GROUP_H  = 8;  // query heads a pool run takes
 static constexpr int64_t XDNA_ATT_GQA      = 4;  // query heads a kv head serves
@@ -1467,7 +1468,9 @@ static constexpr int64_t XDNA_ATT_MAX_GRPS = 2;
 
 static bool xdna_att_eligible(const ggml_tensor * n) {
     const ggml_tensor *q = n->src[0], *k = n->src[1], *v = n->src[2], *m = n->src[3];
-    if (!xdna_fa_plain(n) || !m) {
+    // no sinks (src[4])
+    if (n->op != GGML_OP_FLASH_ATTN_EXT || !q || !k || !v || !m || n->src[4] ||
+        !xdna_att_rows_shape_ok(n->src[5], m, k)) {
         return false;
     }
     const int64_t h   = q->ne[2];
@@ -1522,7 +1525,7 @@ static bool xdna_att_try(ggml_backend_xdna_context * ctx, ggml_tensor * n) {
             return false;
         }
     }
-    if (n_valid <= 0 || n_valid > xdna_att_max_positions()) {
+    if (n_valid <= 0 || n_valid > xdna_att_max_positions() || !xdna_att_rows_identity(n, n_valid)) {
         return false;
     }
     size_t        koff = 0, voff = 0;
@@ -1890,7 +1893,8 @@ static bool xdna_attl_ready(ggml_backend_xdna_context * ctx, const xdna_attl_pla
     size_t        koff = 0, voff = 0;
     xdna_buffer * kbo = xdna_host_bo_reach(p.n_fa->src[1]->data, xdna_att_reach(p.n_fa->src[1]->nb[1]), &koff);
     xdna_buffer * vbo = xdna_host_bo_reach(p.n_fa->src[2]->data, xdna_att_reach(p.n_fa->src[2]->nb[1]), &voff);
-    if (n_valid <= 0 || !kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, p.n_fa->src[1]->nb[1])) {
+    if (n_valid <= 0 || !xdna_att_rows_identity(p.n_fa, n_valid) || !kbo || !vbo ||
+        !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, p.n_fa->src[1]->nb[1])) {
         return false;
     }
     // the token's row is the last visible cell of its stream: the view's
@@ -1931,7 +1935,7 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
     }
     const ggml_tensor *k = fa->src[1], *v = fa->src[2];
     const int          n_valid = xdna_attl_valid(fa);
-    if (n_valid <= 0 || n_valid > xdna_att_layer_max_positions()) {
+    if (n_valid <= 0 || n_valid > xdna_att_layer_max_positions() || !xdna_att_rows_identity(fa, n_valid)) {
         return false;
     }
     // this token's K and V go to row n_valid - 1 of its stream: the one row

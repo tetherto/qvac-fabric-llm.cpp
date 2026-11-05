@@ -102,8 +102,8 @@ static int check_row_crop(ggml_context * ctx) {
     return count_failures(cases);
 }
 
-// The attention kernels read K/V as the leading cells of the view, so a node with
-// sinks or with K/V row lists (ggml_flash_attn_ext_rows) stays on the host.
+// The prefill attention kernels read K/V as the leading cells of the view, so a node
+// with sinks or with K/V row lists (ggml_flash_attn_ext_rows) stays on the host.
 static int check_fa_plain(ggml_context * ctx) {
     const float   scale = 1.0f / 16.0f;
     ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HEAD_DIM, N_BATCH, N_HEAD, 1);
@@ -128,6 +128,50 @@ static int check_fa_plain(ggml_context * ctx) {
         { "attention over K/V row lists stays on the host", xdna_fa_plain(fa_rows), false },
         { "an add is not attention", xdna_fa_plain(add), false },
         { "no node is not attention", xdna_fa_plain(nullptr), false },
+    };
+    return count_failures(cases);
+}
+
+static bool att_rows_shape_ok(const ggml_tensor * fa) {
+    return xdna_att_rows_shape_ok(fa->src[5], fa->src[3], fa->src[1]);
+}
+
+// The decode routes take a row list naming the leading cells. They scan K/V's rows of mask columns, so a list wider
+// than K/V stays on the host whatever its first entries say: a visible column past those can name any cell.
+static int check_att_rows(ggml_context * ctx) {
+    static constexpr int64_t N_VALID  = 300;  // the cells one sequence holds
+    static constexpr int64_t N_BEHIND = 200;  // the cells of a sequence ahead of it
+
+    const float   scale   = 1.0f / 16.0f;
+    ggml_tensor * q       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HEAD_DIM, 1, N_HEAD, 1);
+    ggml_tensor * k       = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HEAD_DIM, N_KV, N_HEAD_KV, 1);
+    ggml_tensor * v       = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HEAD_DIM, N_KV, N_HEAD_KV, 1);
+    ggml_tensor * k_half  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HEAD_DIM, N_KV / 2, N_HEAD_KV, 1);
+    ggml_tensor * v_half  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HEAD_DIM, N_KV / 2, N_HEAD_KV, 1);
+    ggml_tensor * mask    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, N_KV, 1);
+    ggml_tensor * rows    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N_KV, 1);
+    ggml_tensor * shifted = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N_KV, 1);
+
+    int32_t leading[N_KV];
+    int32_t behind[N_KV];
+    for (int j = 0; j < N_KV; j++) {
+        leading[j] = j < N_VALID ? j : -1;
+        behind[j]  = j < N_VALID ? j + N_BEHIND : -1;
+    }
+    rows->data    = leading;
+    shifted->data = behind;
+
+    ggml_tensor * fa_equal   = ggml_flash_attn_ext_rows(ctx, q, k, v, mask, rows, scale, 0.0f, 0.0f);
+    ggml_tensor * fa_shifted = ggml_flash_attn_ext_rows(ctx, q, k, v, mask, shifted, scale, 0.0f, 0.0f);
+    ggml_tensor * fa_wide    = ggml_flash_attn_ext_rows(ctx, q, k_half, v_half, mask, rows, scale, 0.0f, 0.0f);
+    ggml_tensor * fa_no_list = ggml_flash_attn_ext(ctx, q, k_half, v_half, mask, scale, 0.0f, 0.0f);
+
+    const bool_case cases[] = {
+        { "a list as wide as K/V passes the shape check", att_rows_shape_ok(fa_equal), true },
+        { "a list wider than K/V does not", att_rows_shape_ok(fa_wide), false },
+        { "without a list a mask may be wider than K/V", att_rows_shape_ok(fa_no_list), true },
+        { "an equal-width list of the leading cells is an identity", xdna_att_rows_identity(fa_equal, N_VALID), true },
+        { "a list behind another sequence's cells is not", xdna_att_rows_identity(fa_shifted, N_VALID), false },
     };
     return count_failures(cases);
 }
@@ -259,7 +303,8 @@ int main(void) {
     const ggml_init_params params = { ggml_tensor_overhead() * MAX_TENSORS, nullptr, true };
     ggml_context *         ctx    = ggml_init(params);
     const int              failures = check_state_gather(ctx) + check_row_crop(ctx) + check_fa_plain(ctx) +
-                                      check_fused_weights(ctx) + check_layer_census(ctx) + check_census_keeps_name();
+                                      check_att_rows(ctx) + check_fused_weights(ctx) + check_layer_census(ctx) +
+                                      check_census_keeps_name();
     ggml_free(ctx);
     if (failures) {
         std::printf("test-xdna-match: %d failures\n", failures);

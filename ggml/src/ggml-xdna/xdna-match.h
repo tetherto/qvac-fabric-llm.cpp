@@ -26,13 +26,42 @@ static inline ggml_tensor * xdna_skip_row_crop(ggml_tensor * t) {
     return crop ? t->src[0] : t;
 }
 
-// A FLASH_ATTN_EXT the attention kernels can take: q, k and v, no sinks
+// A FLASH_ATTN_EXT the prefill attention kernels can take: q, k and v, no sinks
 // (src[4]) and no K/V row lists (src[5], ggml_flash_attn_ext_rows). The kernels
 // read each head's keys and values as the leading cells of the K/V view; with
-// row lists, mask column i stands for cache row kv_rows[i] instead.
+// row lists, mask column i stands for cache row kv_rows[i] instead. The decode
+// routes take an identity list (xdna_att_eligible).
 static inline bool xdna_fa_plain(const ggml_tensor * n) {
     return n && n->op == GGML_OP_FLASH_ATTN_EXT && n->src[0] && n->src[1] && n->src[2] && !n->src[4] &&
            !n->src[5];
+}
+
+// A K/V row list (src[5], ggml_flash_attn_ext_rows) of one slice, one cache
+// cell a mask column; xdna_att_rows_identity checks its values at run time.
+// The decode routes scan k's ne[1] mask columns, so a list must be exactly as
+// wide: a visible column past those could name any cell.
+static inline bool xdna_att_rows_shape_ok(const ggml_tensor * rows, const ggml_tensor * m, const ggml_tensor * k) {
+    return !rows || (rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows) && rows->ne[0] == m->ne[0] &&
+                     rows->ne[1] == 1 && m->ne[0] == k->ne[1]);
+}
+
+// The pool reads the first n_valid cache cells: a row list has to name
+// exactly those, as one sequence's list over the cells from 0 does.
+static inline bool xdna_att_rows_identity(const ggml_tensor * fa, int n_valid) {
+    const ggml_tensor * r = fa->src[5];
+    if (!r) {
+        return true;
+    }
+    const int32_t * rows = (const int32_t *) r->data;
+    if (!rows) {
+        return false;
+    }
+    for (int j = 0; j < n_valid; j++) {
+        if (rows[j] != j) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Whether `name` ends in `suffix`.

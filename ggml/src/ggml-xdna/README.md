@@ -554,6 +554,16 @@ OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-server -m model.gguf \
   attention from `MUL_MAT` and `SOFT_MAX`, which run on the host: about half
   the decode speed on the 0.8B, with ten times the host work. The backend
   logs a warning once when it sees that.
+- Without `-np`, llama-server runs four slots over one unified KV cache, and
+  llama gives each attention a list of its sequence's cache cells
+  (`ggml_flash_attn_ext_rows`). The NPU runs a single-token decode attention
+  when that list is the cells from 0 up, with no gap. Requests that run one at
+  a time get such a list, because the server clears an idle slot's cells when
+  a new task starts. While two requests overlap, the server puts the tokens of
+  both in one batch, and the host runs that batch's attention. The later
+  request's cells follow the earlier one's, so its decode attention stays on
+  the host until it ends. With `-np 1` the cache is not unified and llama
+  gives no list, so every request's decode attention runs on the NPU.
 
 ### Environment
 
