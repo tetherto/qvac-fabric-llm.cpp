@@ -3435,6 +3435,9 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // The fused sessions' device state goes back into llama's cache before any route reads or rewrites it, a chunk that runs
     // whole on the host included.
     xdna_rec_follow_cache(ctx, cgraph);
+    // The last graph's GEMV groups name nodes whose addresses this graph's may reuse; xdna_ops_plan_gemv plans this one's.
+    ctx->ops.gemv_groups.clear();
+    ctx->ops.gemv_group_of.clear();
     xdna_ops_plan_blocks(&ctx->ops, cgraph);
 
     // A prefill whose commands would cost more than the host's products runs whole on the host. A decode, one token a sequence
