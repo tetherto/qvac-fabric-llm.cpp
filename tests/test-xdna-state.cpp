@@ -15,6 +15,10 @@
 // some decoded tokens, and a new prompt after the sequence was cleared (the fused sessions carry the state on the array and
 // llama's cache only sees it when a graph that reads it follows it). The logits after every batch and every decoded token
 // are compared with a run of the same steps with the chunk rule off (GGML_XDNA_HOST_CHUNK=0), fed the same tokens.
+//
+// The straight run's logits after its last prompt token and after each greedy token are also compared with a CPU-only run
+// of the same steps, fed its tokens: the runs above take the same routes on both sides, so a route that is wrong the same
+// way every time passes them.
 #include "llama.h"
 
 #include <cmath>
@@ -118,6 +122,25 @@ static bool decode_steps(llama_context * ctx, int nv, int n, trace & tr, const s
     return true;
 }
 
+constexpr int STRAIGHT_TOKENS = 16;
+
+// The prompt but its last token in one batch, then the last token, then STRAIGHT_TOKENS tokens, greedy or `forced`: the logits
+// after the last token and after each one decoded.
+static trace straight(llama_model * model, std::vector<llama_token> & p, int nv, const std::vector<llama_token> * forced) {
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx                = 1024;
+    llama_context * ctx     = llama_init_from_model(model, cp);
+    trace           tr;
+    size_t          k = 0;
+    llama_decode(ctx, llama_batch_get_one(p.data(), (int) p.size() - 1));
+    if (llama_decode(ctx, llama_batch_get_one(&p.back(), 1)) == 0) {
+        snapshot(ctx, nv, { -1 }, tr);
+        decode_steps(ctx, nv, STRAIGHT_TOKENS, tr, forced, k);
+    }
+    llama_free(ctx);
+    return tr;
+}
+
 static trace follow_up(llama_model * model, const llama_vocab * v, int nv, const std::vector<llama_token> * forced,
                        const host_chunk_count_fn chunks) {
     llama_context_params cp = llama_context_default_params();
@@ -219,23 +242,22 @@ static double nmse(const std::vector<float> & want, const std::vector<float> & g
 
 // The logits of the run against the reference, after every step: the array and the host differ by their roundings (1e-4 or so
 // of the logits' energy), a sequence that went on from the wrong state by order one.
-static bool same_logits(const char * what, const trace & want, const trace & got) {
-    constexpr double TOL = 2e-2;
-    double           worst = 0.0;
-    size_t           at    = 0;
+static bool same_logits(const char * what, const trace & want, const trace & got, double tol = 2e-2) {
+    double worst = 0.0;
+    size_t at    = 0;
     if (want.logits.size() != got.logits.size()) {
         std::printf("%s: %zu snapshots against %zu\n", what, want.logits.size(), got.logits.size());
         return false;
     }
     for (size_t i = 0; i < want.logits.size(); i++) {
         const double e = nmse(want.logits[i], got.logits[i]);
-        if (e > worst) {
-            worst = e;
+        if (!std::isfinite(e) || e > worst) {  // a NaN logit too
+            worst = std::isfinite(e) ? e : INFINITY;
             at    = i;
         }
     }
-    std::printf("%s: worst nmse %.3g at step %zu of %zu (limit %.0e)\n", what, worst, at, want.logits.size(), TOL);
-    return worst < TOL;
+    std::printf("%s: worst nmse %.3g at step %zu of %zu (limit %.0e)\n", what, worst, at, want.logits.size(), tol);
+    return worst < tol;
 }
 
 static bool check_follow_up(llama_model * model, const llama_vocab * v, int nv, const host_chunk_count_fn chunks) {
@@ -258,6 +280,23 @@ static bool check_four_sequences(llama_model * model, const llama_vocab * v, int
     const bool  ok  = same_logits("four sequences, a decode step each", want, got);
     std::printf("host chunks in the decode steps: %d\n", got.decode_chunks);
     return ok && got.decode_chunks == 0;
+}
+
+static llama_model * load_on_cpu(const char * model_path) {
+    llama_model_params mp      = llama_model_default_params();
+    ggml_backend_dev_t none[1] = { nullptr };
+    mp.devices                 = none;
+    mp.n_gpu_layers            = 0;
+    llama_model * cpu          = llama_model_load_from_file(model_path, mp);
+    if (!cpu) {
+        std::printf("the CPU-only model did not load\n");
+    }
+    return cpu;
+}
+
+// The straight run's steps on the CPU alone, fed the straight run's tokens: its logits against the run's.
+static bool check_cpu_reference(llama_model * cpu, std::vector<llama_token> & p, int nv, const trace & npu) {
+    return cpu && same_logits("straight run against the CPU", straight(cpu, p, nv, &npu.tokens), npu);
 }
 
 int main(int argc, char ** argv) {
@@ -303,11 +342,8 @@ int main(int argc, char ** argv) {
     const int n_head = (int) p.size() - 1;
     llama_token last = p.back();
 
-    llama_context * ref = llama_init_from_model(model, cp);
-    llama_decode(ref, llama_batch_get_one(p.data(), n_head));
-    llama_decode(ref, llama_batch_get_one(&last, 1));
-    const std::vector<llama_token> want = gen(ref, nv, 16);
-    llama_free(ref);
+    const trace                    straight_run = straight(model, p, nv, nullptr);
+    const std::vector<llama_token> & want       = straight_run.tokens;
 
     llama_context * ctx = llama_init_from_model(model, cp);
     llama_decode(ctx, llama_batch_get_one(p.data(), n_head));
@@ -319,7 +355,7 @@ int main(int argc, char ** argv) {
     llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
     const size_t set = llama_state_seq_set_data(ctx, st.data(), st.size(), 0);
     llama_decode(ctx, llama_batch_get_one(&last, 1));
-    const std::vector<llama_token> got = gen(ctx, nv, 16);
+    const std::vector<llama_token> got = gen(ctx, nv, STRAIGHT_TOKENS);
     llama_free(ctx);
     std::printf("state %zu bytes, restored %zu\n", st.size(), set);
 
@@ -330,6 +366,11 @@ int main(int argc, char ** argv) {
     const host_chunk_count_fn chunks = host_chunk_counter(xdna_device());
     bool                      ok     = want == got;
     if (getenv("ON_CPU") == nullptr) {
+        llama_model * cpu = load_on_cpu(model_path);
+        ok                = check_cpu_reference(cpu, p, nv, straight_run) && ok;
+        if (cpu) {
+            llama_model_free(cpu);
+        }
         ok = check_follow_up(model, v, nv, chunks) && ok;
         ok = check_four_sequences(model, v, nv, chunks) && ok;
     }
