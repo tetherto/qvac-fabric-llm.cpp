@@ -49,8 +49,8 @@ def to_f32(t: gguf.ReaderTensor) -> np.ndarray:
 
 def head_rows(n_heads: int, shift_lo: int, shift_hi: int) -> np.ndarray:
     """For each new head, the old head it takes its weights from."""
-    return np.array([(h + shift_lo) % n_heads for h in range(n_heads)] +
-                    [(h + shift_hi) % n_heads for h in range(n_heads)])
+    return np.array([(h + shift_lo) % n_heads for h in range(n_heads)]
+                    + [(h + shift_hi) % n_heads for h in range(n_heads)])
 
 
 def widen(name: str, w: np.ndarray, n_vh: int, n_qk: int, args: argparse.Namespace) -> np.ndarray:
