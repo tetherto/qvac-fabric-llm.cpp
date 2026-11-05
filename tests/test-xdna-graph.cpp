@@ -36,6 +36,8 @@
 // finite values, masks with rows and columns past the queries and keys, and on
 // its portable kernels (GGML_XDNA_HOST_FA=2). Two attentions of one graph whose
 // mask a node rewrites in place between them each get their own mask's answer.
+// An attention through a list of cache rows (ggml_flash_attn_ext_rows), which
+// no route of the backend reads, is ggml-cpu's op on every route.
 //
 // BF16 and F16 weight projections, which no quantized route carries, through
 // the bf16 GEMM: an M that fits the decode block, one that takes several
@@ -563,6 +565,134 @@ static bool test_fa_computed_masks(ggml_backend_t npu, ggml_backend_t cpu, fa_ro
     unsetenv("GGML_XDNA_FA_MM");
     unsetenv("GGML_XDNA_HOST_FA");
     return ok;
+}
+
+// An attention through a list of cache rows (ggml_flash_attn_ext_rows), the rows backwards: no route of the backend reads the
+// list, so the host kernel, the array (GGML_XDNA_FA_MM=2) and the decode pool each leave it to ggml-cpu's op, bit for bit. The
+// same decode without the list shows the pool runs there.
+static const int FA_ROWS_CACHE = 768;  // the cache's rows and the list's: both pad to one multiple of 256
+static const int FA_ROWS_CTX   = 400;  // keys a prompt's first token sees before its own
+static const int FA_ROWS_HEADS = 8;
+
+struct fa_rows_case {
+    const char * name;
+    fa_route     route;
+    int          n_tokens;
+    bool         rows;     // through the list; else ggml_flash_attn_ext on the cache rows in order
+    bool         on_pool;  // the decode pool runs it
+};
+
+struct fa_rows_graph {
+    ggml_context *             ctx = nullptr;
+    ggml_backend_buffer_t      buf = nullptr;
+    ggml_cgraph *              gf  = nullptr;
+    std::vector<ggml_tensor *> in;  // q, the K cache, the V cache, the mask, the row list, a projection's two inputs
+    ggml_tensor *              out = nullptr;
+};
+
+// in the device's buffers: the decode pool reads K and V only from there
+static fa_rows_graph build_fa_rows(ggml_backend_buffer_type_t buft, const fa_rows_case & c) {
+    fa_rows_graph    g;
+    const int64_t    D  = FA_HEAD_DIM;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.in                = { ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, D, FA_ROWS_HEADS, c.n_tokens),
+                            ggml_new_tensor_3d(g.ctx, GGML_TYPE_F16, D, FA_KV_HEADS, FA_ROWS_CACHE),
+                            ggml_new_tensor_3d(g.ctx, GGML_TYPE_F16, D, FA_KV_HEADS, FA_ROWS_CACHE),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, FA_ROWS_CACHE, c.n_tokens),
+                            ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, FA_ROWS_CACHE),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, 64),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, c.n_tokens) };
+    ggml_set_input(g.in[3]);
+    ggml_tensor * q = ggml_permute(g.ctx, g.in[0], 0, 2, 1, 3);
+    ggml_tensor * k = ggml_permute(g.ctx, g.in[1], 0, 2, 1, 3);
+    ggml_tensor * v = ggml_permute(g.ctx, g.in[2], 0, 2, 1, 3);
+    const float   scale = 0.0625f;
+    g.out = c.rows ? ggml_flash_attn_ext_rows(g.ctx, q, k, v, g.in[3], g.in[4], scale, 0.0f, 0.0f) :
+                     ggml_flash_attn_ext(g.ctx, q, k, v, g.in[3], scale, 0.0f, 0.0f);
+    ggml_prec_set_acc(g.out, GGML_PREC_F32);
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, g.out);
+    ggml_build_forward_expand(g.gf, ggml_mul_mat(g.ctx, g.in[5], g.in[6]));
+    g.buf = ggml_backend_alloc_ctx_tensors_from_buft(g.ctx, buft);
+    return g;
+}
+
+// token t sees list columns [0, FA_ROWS_CTX + t]: causal over the list, the keys of its context first
+static std::vector<ggml_fp16_t> fa_rows_mask(int n_tokens) {
+    std::vector<ggml_fp16_t> m((size_t) FA_ROWS_CACHE * n_tokens, ggml_fp32_to_fp16(-INFINITY));
+    for (int t = 0; t < n_tokens; t++) {
+        std::fill_n(m.begin() + (size_t) t * FA_ROWS_CACHE, FA_ROWS_CTX + t + 1, ggml_fp32_to_fp16(0.0f));
+    }
+    return m;
+}
+
+static std::vector<int32_t> fa_rows_backwards(void) {
+    std::vector<int32_t> rows(FA_ROWS_CACHE);
+    for (int i = 0; i < FA_ROWS_CACHE; i++) {
+        rows[i] = FA_ROWS_CACHE - 1 - i;
+    }
+    return rows;
+}
+
+static void set_fa_rows_inputs(fa_rows_graph & g, const fa_rows_case & c) {
+    std::mt19937                    rng(77);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (int i = 0; i < 3; i++) {
+        set_normal(g.in[i], rng, nd);
+    }
+    const std::vector<ggml_fp16_t> mask = fa_rows_mask(c.n_tokens);
+    const std::vector<int32_t>     rows = fa_rows_backwards();
+    ggml_backend_tensor_set(g.in[3], mask.data(), 0, ggml_nbytes(g.in[3]));
+    ggml_backend_tensor_set(g.in[4], rows.data(), 0, ggml_nbytes(g.in[4]));
+    for (size_t i = 5; i < g.in.size(); i++) {
+        std::vector<float> f(ggml_nelements(g.in[i]), 0.5f);
+        ggml_backend_tensor_set(g.in[i], f.data(), 0, ggml_nbytes(g.in[i]));
+    }
+}
+
+static bool run_fa_rows(fa_rows_graph & g, const fa_rows_case & c, ggml_backend_t be, std::vector<float> & res) {
+    ggml_backend_buffer_clear(g.buf, 0);
+    set_fa_rows_inputs(g, c);
+    if (ggml_backend_graph_compute(be, g.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    res = get_f32(g.out);
+    return true;
+}
+
+static void free_rows_graph(fa_rows_graph & g) {
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
+}
+
+static bool test_fa_kv_rows(ggml_backend_t npu, ggml_backend_t cpu, ggml_backend_buffer_type_t buft) {
+    const fa_rows_case cases[] = {
+        { "prompt, the host kernel",          FA_ROUTE_HOST,  300, true,  false },
+        { "prompt, the array (FA_MM=2)",      FA_ROUTE_ARRAY, 300, true,  false },
+        { "decode",                           FA_ROUTE_HOST,  1,   true,  false },
+        { "decode, no list: the pool",        FA_ROUTE_HOST,  1,   false, true },
+    };
+    setenv("GGML_XDNA_HOST_FA", "1", 1);
+    // every graph kept to the end: the pool syncs a cache's rows to the device once by its address, which a freed one hands on
+    std::vector<fa_rows_graph> graphs;
+    bool                       passed = true;
+    for (const fa_rows_case & c : cases) {
+        set_fa_route(c.route);
+        graphs.push_back(build_fa_rows(buft, c));
+        std::vector<float> want, got;
+        const bool computed = run_fa_rows(graphs.back(), c, cpu, want) && run_fa_rows(graphs.back(), c, npu, got);
+        const double e      = computed ? nmse(want, got) : INFINITY;
+        const bool   ok     = computed && (c.on_pool ? e > 0.0 && e < FA_ARRAY_NMSE_MAX : e == 0.0);
+        passed              = passed && ok;
+        std::printf("FLASH_ATTN_EXT kv_rows, %-30s nmse %.3g %s\n", c.name, e, ok ? "ok" : "FAIL");
+    }
+    for (fa_rows_graph & g : graphs) {
+        free_rows_graph(g);
+    }
+    unsetenv("GGML_XDNA_FA_MM");
+    unsetenv("GGML_XDNA_HOST_FA");
+    return passed;
 }
 
 // Where a projection is expected to run: either, the host (the CPU backend's own
@@ -1548,6 +1678,7 @@ int main(void) {
     for (fa_route route : { FA_ROUTE_HOST, FA_ROUTE_ARRAY }) {
         passed = test_fa_computed_masks(npu, cpu, route) && passed;
     }
+    passed = test_fa_kv_rows(npu, cpu, ggml_backend_dev_buffer_type(dev)) && passed;
 
     const gemm_case gemm_cases[] = {
         { "decode block",     GGML_TYPE_BF16, 15,  { { 512, 1024 }, { 1024, 512 } } },

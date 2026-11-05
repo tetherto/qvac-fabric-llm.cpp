@@ -1276,7 +1276,8 @@ static bool xdna_att_on(void) {
     return v;
 }
 
-// The shapes the pool's attention takes: Qwen3.5's full-attention decode.
+// The shapes the pool's attention takes: Qwen3.5's full-attention decode, its
+// keys the cache's own rows (no list of rows: ggml_flash_attn_ext_rows).
 static bool xdna_att_eligible(const ggml_tensor * n) {
     const ggml_tensor *q = n->src[0], *k = n->src[1], *v = n->src[2], *m = n->src[3];
     if (!xdna_fa_plain(n) || !m) {
