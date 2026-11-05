@@ -25,7 +25,9 @@
 // decode on its pool, reading the cache where llama keeps it (the XDNA
 // device's host buffers). And prefill attention over a K/V row list
 // (ggml_flash_attn_ext_rows): the mmul reads K/V in mask order, so the backend
-// has to leave it to the host, which follows the list.
+// has to leave it to the host, which follows the list. A decode over the list
+// of one sequence in the cells from 0 (the identity) stays on the pool; one
+// over a sequence behind another's cells goes to the host.
 //
 // A prompt's gated delta net at the 4B/9B's width (32 value heads over 16 q/k
 // groups, two runs of the array), twice: with one head decaying ~1e-10 a token,
@@ -64,6 +66,7 @@ static constexpr int64_t FA_KV        = 1024;
 static constexpr int64_t FA_DEC_CTX   = 512;
 static constexpr int64_t FA_DEC_VALID = 300;
 static constexpr float   FA_SCALE     = 0.0625f;
+static constexpr int32_t FA_ROW_SHIFT = 200;  // the first cell of a sequence behind another's
 
 // The gated delta net case: a prompt over the array's minimum, the 4B's heads,
 // one head's gates (natural log) far under the floor and the others' range
@@ -157,6 +160,16 @@ static std::vector<uint8_t> reversed_rows(int64_t n) {
         r[(size_t) i] = (int32_t) (n - 1 - i);
     }
     return to_bytes(r);
+}
+
+// llama's list for one sequence whose n_valid cells start at `first`: the
+// cells in order, then -1 padding
+static std::vector<int32_t> sequence_rows(int64_t n, int64_t n_valid, int32_t first) {
+    std::vector<int32_t> r((size_t) n, -1);
+    for (int64_t i = 0; i < n_valid; i++) {
+        r[(size_t) i] = first + (int32_t) i;
+    }
+    return r;
 }
 
 // K x M activations, an N x K Q4_K projection; side_reader adds SQR(sum)
@@ -353,8 +366,13 @@ static norm_graph build_attention(ggml_backend_t be, int64_t heads, int64_t n_to
 }
 
 // Decode attention of `heads` query heads on llama's cache layout: a position
-// holds every kv head's row, the view steps over them
-static norm_graph build_decode_attention(ggml_backend_t be, int64_t heads, int64_t n_ctx, int64_t n_valid) {
+// holds every kv head's row, the view steps over them; with `rows`, over that
+// K/V row list (ggml_flash_attn_ext_rows)
+static norm_graph build_decode_attention(ggml_backend_t               be,
+                                         int64_t                      heads,
+                                         int64_t                      n_ctx,
+                                         int64_t                      n_valid,
+                                         const std::vector<int32_t> * rows = nullptr) {
     norm_graph       g;
     const int64_t    kvh = heads / FA_GQA;
     ggml_init_params ip  = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
@@ -366,8 +384,10 @@ static norm_graph build_decode_attention(ggml_backend_t be, int64_t heads, int64
     ggml_tensor * k      = ggml_view_3d(g.ctx, kc, FA_HEAD_DIM, n_ctx, kvh, kc->nb[1], hb, 0);
     ggml_tensor * v      = ggml_view_3d(g.ctx, vc, FA_HEAD_DIM, n_ctx, kvh, vc->nb[1], hb, 0);
     ggml_tensor * mask   = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, n_ctx, 1, 1, 1);
+    ggml_tensor * list   = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, n_ctx, 1);
     g.inputs             = { q, kc, vc };
-    ggml_tensor * out    = ggml_flash_attn_ext(g.ctx, q, k, v, mask, FA_SCALE, 0.0f, 0.0f);
+    ggml_tensor * out    = rows ? ggml_flash_attn_ext_rows(g.ctx, q, k, v, mask, list, FA_SCALE, 0.0f, 0.0f) :
+                                  ggml_flash_attn_ext(g.ctx, q, k, v, mask, FA_SCALE, 0.0f, 0.0f);
     ggml_set_name(out, "attn");
     g.gf = ggml_new_graph(g.ctx);
     ggml_build_forward_expand(g.gf, out);
@@ -375,6 +395,9 @@ static norm_graph build_decode_attention(ggml_backend_t be, int64_t heads, int64
     g.fixed   = {
         { mask, prefix_mask(n_ctx, n_valid) }
     };
+    if (rows) {
+        g.fixed.push_back({ list, to_bytes(*rows) });
+    }
     g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, be);
     return g;
 }
@@ -529,6 +552,28 @@ static bool check_one(norm_graph &   g,
     return true;
 }
 
+// A row-list decode on the CPU and on the NPU, and where it ran: the host
+// computes it as the CPU backend does (nmse 0), the pool does not; the
+// line names the route the nmse shows
+static bool check_rows_route(norm_graph &   g,
+                             ggml_backend_t cpu,
+                             ggml_backend_t npu,
+                             const char *   what,
+                             double         tol,
+                             bool           on_pool,
+                             bool *         passed) {
+    std::vector<std::vector<float>> want, got;
+    if (!run(g, cpu, want) || !run(g, npu, got)) {
+        return false;
+    }
+    const double e  = nmse(want[0], got[0]);
+    const bool   ok = e < tol && (e > 0) == on_pool;
+    *passed         = *passed && ok;
+    std::printf("%-26s %-5s nmse %.3g on the %s %s\n", what, ggml_get_name(g.checked[0]), e, e > 0 ? "pool" : "host",
+                ok ? "ok" : "FAIL");
+    return true;
+}
+
 // value head h's nmse over its columns of every token's output and its state
 static double gdn_head_nmse(const std::vector<float> & ref, const std::vector<float> & got, int64_t h) {
     std::vector<float> r, o;
@@ -584,12 +629,24 @@ static bool check_attention(ggml_backend_t cpu, ggml_backend_t npu, double tol, 
     norm_graph p2 = build_attention(cpu, 2 * FA_GROUP, FA_TOKENS, FA_KV, false);
     ran           = ran && check_one(p2, cpu, npu, "FLASH_ATTN_EXT prefill 16/4", tol, passed);
     free_graph(p2);
+    const std::vector<int32_t> identity = sequence_rows(FA_DEC_CTX, FA_DEC_VALID, 0);
+    const std::vector<int32_t> shifted  = sequence_rows(FA_DEC_CTX, FA_DEC_VALID, FA_ROW_SHIFT);
+
     norm_graph d1 = build_decode_attention(npu, FA_GROUP, FA_DEC_CTX, FA_DEC_VALID);
     norm_graph d2 = build_decode_attention(npu, 2 * FA_GROUP, FA_DEC_CTX, FA_DEC_VALID);
+    norm_graph r1 = build_decode_attention(npu, FA_GROUP, FA_DEC_CTX, FA_DEC_VALID, &identity);
+    norm_graph r2 = build_decode_attention(npu, 2 * FA_GROUP, FA_DEC_CTX, FA_DEC_VALID, &identity);
+    norm_graph rs = build_decode_attention(npu, FA_GROUP, FA_DEC_CTX, FA_DEC_VALID, &shifted);
     ran           = ran && check_one(d1, cpu, npu, "FLASH_ATTN_EXT decode 8/2", tol, passed);
     ran           = ran && check_one(d2, cpu, npu, "FLASH_ATTN_EXT decode 16/4", tol, passed);
+    ran           = ran && check_rows_route(r1, cpu, npu, "decode identity rows 8/2", tol, true, passed);
+    ran           = ran && check_rows_route(r2, cpu, npu, "decode identity rows 16/4", tol, true, passed);
+    ran           = ran && check_rows_route(rs, cpu, npu, "decode shifted rows 8/2", tol, false, passed);
     free_graph(d1);
     free_graph(d2);
+    free_graph(r1);
+    free_graph(r2);
+    free_graph(rs);
     return ran;
 }
 
