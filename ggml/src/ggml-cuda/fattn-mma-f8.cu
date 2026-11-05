@@ -529,11 +529,7 @@ static void ggml_cuda_flash_attn_ext_f8_case(ggml_backend_cuda_context & ctx, gg
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
     const size_t nbytes_shared = 2*FATTN_F8_BK*D + 2*D*FATTN_F8_BK + 2*FATTN_F8_BQ*FATTN_F8_BK*sizeof(half) + FATTN_F8_BQ*sizeof(float);
-    static bool smem_set[GGML_CUDA_MAX_DEVICES] = {false};
-    if (!smem_set[ctx.device]) {
-        CUDA_CHECK(cudaFuncSetAttribute(flash_attn_ext_f8<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared));
-        smem_set[ctx.device] = true;
-    }
+    CUDA_SET_SHARED_MEMORY_LIMIT((flash_attn_ext_f8<D>), nbytes_shared);
 
     flash_attn_ext_f8<D><<<dim3(ntiles, Q->ne[2], n_s), FATTN_F8_NW*WARP_SIZE, nbytes_shared, stream>>>(
         (const char *) Q->data, K8, Vt.ptr, (const half *) mask->data, KV_max.ptr, (float *) dst->data,
