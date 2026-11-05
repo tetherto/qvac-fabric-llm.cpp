@@ -27,6 +27,10 @@ constexpr uint32_t     MT_CTRL_PKT = 26;       // the MemTiles' controller packe
 constexpr uint32_t     W_PKT_PAIR0 = 0;
 constexpr uint32_t     MT_BD_PKT   = 1u << 31;  // MemTile BD word 0: the send starts with a packet header
 constexpr int          MT_BD_PKT_ID_SHIFT = 23;
+// MemTile BD word 1: the next descriptor of a chain
+constexpr int          MT_BD_NEXT_SHIFT = 20;
+constexpr uint32_t     MT_BD_USE_NEXT   = 1u << 19;
+constexpr int          MT_BD_NONE       = -1;
 // MemTile descriptors the static program leaves free (it uses 0-5, 24-29):
 // S2MM 5's ring, MM2S 4's, MM2S 5's
 constexpr uint32_t     MT_BD_S2MM  = 40;
@@ -49,6 +53,7 @@ constexpr int          HW_ROW_ON     = 9;   // row command: a row-op core's C ob
 constexpr int          HW_A_DRAIN    = 10;  // attention command: the A objects a row-op core lets pass
 constexpr int          HW_ATTN_DRAIN = 11;  // row command: the A objects an attention core lets pass
 constexpr int          HW_ROW_SETUP  = 12;  // row command: a row-op core's setup objects
+constexpr int          HW_X_ON       = 13;  // GEMM: the x objects a block takes on W (GLU_X)
 
 // A MemTile access pattern as kernels/pgemm.py writes dims_to_stream and dims_from_stream: (size, stride) a dim,
 // outermost first, in elements
@@ -128,7 +133,7 @@ inline void mt_set_lock(xdna_seq * seq, uint32_t col, uint32_t id, uint32_t valu
 
 // A linear descriptor of `words` at byte `addr` of the MemTile, taking lock
 // `acq` at `acq_val` or more and releasing `rel` by `rel_val`; `pkt` is the
-// packet header field of word 0 (0: none)
+// packet header field of word 0 (0: none), `next` the descriptor it chains to
 inline void mt_bd(xdna_seq * seq,
                   uint32_t   col,
                   uint32_t   id,
@@ -138,14 +143,16 @@ inline void mt_bd(xdna_seq * seq,
                   uint32_t   acq_val,
                   uint32_t   rel,
                   uint32_t   rel_val,
-                  uint32_t   pkt = 0) {
+                  uint32_t   pkt  = 0,
+                  int        next = MT_BD_NONE) {
     seq->n_instr++;
     seq->ops.push_back(xdna_txn::OP_BLOCKWRITE);
     seq->ops.push_back(0);
     seq->ops.push_back(xdna_txn::tile_reg(col, 1, 0xA0000 + id * 0x20));
     seq->ops.push_back(xdna_txn::SZ_BLOCKWRITE * 4);
     seq->ops.push_back(words | pkt);
-    seq->ops.push_back(0x20000 + addr / 4);
+    seq->ops.push_back((next == MT_BD_NONE ? 0 : (uint32_t) next << MT_BD_NEXT_SHIFT | MT_BD_USE_NEXT) + 0x20000 +
+                       addr / 4);
     for (int k = 0; k < 5; k++) {
         seq->ops.push_back(0);
     }
