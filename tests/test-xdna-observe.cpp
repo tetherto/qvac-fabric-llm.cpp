@@ -203,8 +203,6 @@ int main(int argc, char ** argv) {
             model_path = argv[i + 1];
         }
     }
-    // the fused decode for every residual width it takes, not only 1024
-    setenv("GGML_XDNA_FUSED_WIDE", "1", 0);
     // static: the backend may still log after main returns
     static log_state st;
     llama_log_set(on_log, &st);

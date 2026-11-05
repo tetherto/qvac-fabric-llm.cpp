@@ -19,7 +19,22 @@ static constexpr int64_t N_KV          = 512;   // K/V view cells
 static constexpr int64_t N_BATCH       = 64;    // prefill tokens
 static constexpr int64_t QK_ROW        = 256;   // one K-quant block: the shortest row a quantized weight takes
 static constexpr int64_t W_ROWS        = 4;
-static constexpr int     MAX_TENSORS   = 64;
+static constexpr int     MAX_TENSORS   = 128;
+
+// The layer shapes the fused decode runs (ggml-xdna.cpp xdna_fused_layer_shapes): Qwen3.5's convolutions of 16 and
+// 32 value heads, attention heads of 256 and query widths of 8 and 16 heads.
+static constexpr int64_t           CONV_KERNEL = 4;
+static constexpr int64_t           HEAD_SIZE   = 256;
+static constexpr xdna_fused_shapes SHAPES      = {
+    { 6144, 8192, 2048 },
+    HEAD_SIZE,
+    { 2048, 4096, 2048 }
+};
+static constexpr int64_t CONV_32     = 8192;  // the 4B/9B's
+static constexpr int64_t CONV_24     = 7168;  // 24 value heads: one and a half passes
+static constexpr int64_t QUERY_32    = 8192;  // 32 heads of 256
+static constexpr int64_t DENSE_HEAD  = 128;   // a Qwen3 dense model's
+static constexpr int64_t DENSE_QUERY = 4096;  // its 32 heads of 128
 
 struct match_case {
     const char *        what;
@@ -87,8 +102,8 @@ static int check_row_crop(ggml_context * ctx) {
     return count_failures(cases);
 }
 
-// The attention kernels read K/V as the leading cells of the view, so a node with
-// sinks or with K/V row lists (ggml_flash_attn_ext_rows) stays on the host.
+// The prefill attention kernels read K/V as the leading cells of the view, so a node
+// with sinks or with K/V row lists (ggml_flash_attn_ext_rows) stays on the host.
 static int check_fa_plain(ggml_context * ctx) {
     const float   scale = 1.0f / 16.0f;
     ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HEAD_DIM, N_BATCH, N_HEAD, 1);
@@ -113,6 +128,50 @@ static int check_fa_plain(ggml_context * ctx) {
         { "attention over K/V row lists stays on the host", xdna_fa_plain(fa_rows), false },
         { "an add is not attention", xdna_fa_plain(add), false },
         { "no node is not attention", xdna_fa_plain(nullptr), false },
+    };
+    return count_failures(cases);
+}
+
+static bool att_rows_shape_ok(const ggml_tensor * fa) {
+    return xdna_att_rows_shape_ok(fa->src[5], fa->src[3], fa->src[1]);
+}
+
+// The decode routes take a row list naming the leading cells. They scan K/V's rows of mask columns, so a list wider
+// than K/V stays on the host whatever its first entries say: a visible column past those can name any cell.
+static int check_att_rows(ggml_context * ctx) {
+    static constexpr int64_t N_VALID  = 300;  // the cells one sequence holds
+    static constexpr int64_t N_BEHIND = 200;  // the cells of a sequence ahead of it
+
+    const float   scale   = 1.0f / 16.0f;
+    ggml_tensor * q       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HEAD_DIM, 1, N_HEAD, 1);
+    ggml_tensor * k       = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HEAD_DIM, N_KV, N_HEAD_KV, 1);
+    ggml_tensor * v       = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HEAD_DIM, N_KV, N_HEAD_KV, 1);
+    ggml_tensor * k_half  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HEAD_DIM, N_KV / 2, N_HEAD_KV, 1);
+    ggml_tensor * v_half  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HEAD_DIM, N_KV / 2, N_HEAD_KV, 1);
+    ggml_tensor * mask    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, N_KV, 1);
+    ggml_tensor * rows    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N_KV, 1);
+    ggml_tensor * shifted = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N_KV, 1);
+
+    int32_t leading[N_KV];
+    int32_t behind[N_KV];
+    for (int j = 0; j < N_KV; j++) {
+        leading[j] = j < N_VALID ? j : -1;
+        behind[j]  = j < N_VALID ? j + N_BEHIND : -1;
+    }
+    rows->data    = leading;
+    shifted->data = behind;
+
+    ggml_tensor * fa_equal   = ggml_flash_attn_ext_rows(ctx, q, k, v, mask, rows, scale, 0.0f, 0.0f);
+    ggml_tensor * fa_shifted = ggml_flash_attn_ext_rows(ctx, q, k, v, mask, shifted, scale, 0.0f, 0.0f);
+    ggml_tensor * fa_wide    = ggml_flash_attn_ext_rows(ctx, q, k_half, v_half, mask, rows, scale, 0.0f, 0.0f);
+    ggml_tensor * fa_no_list = ggml_flash_attn_ext(ctx, q, k_half, v_half, mask, scale, 0.0f, 0.0f);
+
+    const bool_case cases[] = {
+        { "a list as wide as K/V passes the shape check", att_rows_shape_ok(fa_equal), true },
+        { "a list wider than K/V does not", att_rows_shape_ok(fa_wide), false },
+        { "without a list a mask may be wider than K/V", att_rows_shape_ok(fa_no_list), true },
+        { "an equal-width list of the leading cells is an identity", xdna_att_rows_identity(fa_equal, N_VALID), true },
+        { "a list behind another sequence's cells is not", xdna_att_rows_identity(fa_shifted, N_VALID), false },
     };
     return count_failures(cases);
 }
@@ -151,11 +210,101 @@ static int check_fused_weights(ggml_context * ctx) {
     return count_failures(cases);
 }
 
+// A weight `name` of ne0 x ne1, and a node that reads it.
+static ggml_tensor * read_shaped(ggml_context * ctx, const char * name, int64_t ne0, int64_t ne1) {
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+    ggml_set_name(w, name);
+    return ggml_scale(ctx, w, 1.0f);
+}
+
+struct census_case {
+    const char *        what;
+    xdna_layer_census   got;
+    bool                recurrent;
+    bool                whole;
+    const char *        foreign;  // the name the census keeps, empty when none
+};
+
+template <size_t N>
+static xdna_layer_census census_of(const ggml_tensor * const (&nodes)[N], xdna_layer_census c = {}) {
+    xdna_layer_census_add(c, nodes, (int) N, SHAPES);
+    return c;
+}
+
+template <size_t N> static int count_census_failures(const census_case (&cases)[N]) {
+    int failures = 0;
+    for (const census_case & c : cases) {
+        const bool ok = c.got.recurrent == c.recurrent && c.got.whole == c.whole && c.got.foreign == c.foreign;
+        std::printf("%s: %s\n", ok ? "ok  " : "FAIL", c.what);
+        failures += ok ? 0 : 1;
+    }
+    return failures;
+}
+
+// Which decode chunks show layers the fused decode runs: Qwen3.5's dense ones, and not a dense Qwen3, a mixture of
+// experts or other head counts; a chunk split off a layer tells nothing until the rest comes.
+static int check_layer_census(ggml_context * ctx) {
+    ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, QK_ROW, 1);
+    ggml_tensor * conv16 = read_shaped(ctx, "blk.0.ssm_conv1d.weight", CONV_KERNEL, CONV_CHANNELS);
+    ggml_tensor * conv32 = read_shaped(ctx, "blk.0.ssm_conv1d.weight", CONV_KERNEL, CONV_32);
+    ggml_tensor * conv24 = read_shaped(ctx, "blk.0.ssm_conv1d.weight", CONV_KERNEL, CONV_24);
+    ggml_tensor * gate   = read_weight(ctx, GGML_TYPE_Q4_K, "blk.0.ffn_gate.weight", x);
+    ggml_tensor * up     = read_weight(ctx, GGML_TYPE_Q4_K, "blk.0.ffn_up.weight", x);
+    ggml_tensor * down   = read_weight(ctx, GGML_TYPE_Q6_K, "blk.0.ffn_down.weight", x);
+    ggml_tensor * k_norm = read_shaped(ctx, "blk.3.attn_k_norm.weight", HEAD_SIZE, 1);
+    ggml_tensor * out8   = read_shaped(ctx, "blk.3.attn_output.weight", SHAPES.query.min, D_MODEL);
+    ggml_tensor * out16  = read_shaped(ctx, "blk.3.attn_output.weight", SHAPES.query.max, D_MODEL);
+    ggml_tensor * out32  = read_shaped(ctx, "blk.3.attn_output.weight", QUERY_32, D_MODEL);
+    ggml_tensor * dk     = read_shaped(ctx, "blk.0.attn_k_norm.weight", DENSE_HEAD, 1);
+    ggml_tensor * dout   = read_shaped(ctx, "blk.0.attn_output.weight", DENSE_QUERY, D_MODEL);
+    ggml_tensor * router = read_weight(ctx, GGML_TYPE_F32, "blk.0.ffn_gate_inp.weight", x);
+    ggml_tensor * exps   = read_shaped(ctx, "blk.0.ffn_gate_exps.weight", QK_ROW, W_ROWS);
+    ggml_tensor * l_out  = ggml_scale(ctx, x, 1.0f);
+    ggml_set_name(l_out, "l_out-3");
+
+    const ggml_tensor * small[]  = { conv16, gate, up, down, k_norm, out8, l_out };
+    const ggml_tensor * wide[]   = { conv32, gate, up, down, k_norm, out16, l_out };
+    const ggml_tensor * dense[]  = { dk, dout, gate, up, down, l_out };
+    const ggml_tensor * moe[]    = { conv32, router, exps, k_norm, out16, l_out };
+    const ggml_tensor * heads[]  = { conv24, gate, up, down, l_out };
+    const ggml_tensor * query[]  = { conv16, gate, up, down, k_norm, out32, l_out };
+    const ggml_tensor * before[] = { k_norm, out8 };
+    const ggml_tensor * after[]  = { conv16 };
+
+    const census_case cases[] = {
+        { "Qwen3.5 0.8B/2B layers are run", census_of(small), true, true, "" },
+        { "Qwen3.5 4B/9B layers are run", census_of(wide), true, true, "" },
+        { "a dense Qwen3 has no recurrent layer", census_of(dense), false, true, ggml_get_name(dk->src[0]) },
+        { "a mixture of experts' router is not run", census_of(moe), true, true, ggml_get_name(router->src[0]) },
+        { "24 value heads are not run", census_of(heads), false, true, ggml_get_name(conv24->src[0]) },
+        { "32 query heads are not run", census_of(query), true, true, ggml_get_name(out32->src[0]) },
+        { "a split-off attention tells nothing", census_of(before), false, false, "" },
+        { "the next chunk's recurrent layer adds up", census_of(after, census_of(before)), true, false, "" },
+    };
+    return count_census_failures(cases);
+}
+
+// The census keeps the name of the weight it found, not the tensor: the warning reads it after the chunk's graph,
+// when the tensor may be gone.
+static int check_census_keeps_name(void) {
+    static constexpr char   ROUTER[] = "blk.0.ffn_gate_inp.weight";
+    const ggml_init_params  params   = { ggml_tensor_overhead() * W_ROWS, nullptr, true };
+    ggml_context *          ctx      = ggml_init(params);
+    ggml_tensor *           x        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, QK_ROW, 1);
+    const ggml_tensor *     nodes[]  = { read_weight(ctx, GGML_TYPE_F32, ROUTER, x) };
+    const xdna_layer_census c        = census_of(nodes);
+    ggml_free(ctx);
+    const bool ok = c.foreign == ROUTER;
+    std::printf("%s: %s\n", ok ? "ok  " : "FAIL", "the foreign weight's name outlives its graph");
+    return ok ? 0 : 1;
+}
+
 int main(void) {
     const ggml_init_params params = { ggml_tensor_overhead() * MAX_TENSORS, nullptr, true };
     ggml_context *         ctx    = ggml_init(params);
-    const int              failures =
-            check_state_gather(ctx) + check_row_crop(ctx) + check_fa_plain(ctx) + check_fused_weights(ctx);
+    const int              failures = check_state_gather(ctx) + check_row_crop(ctx) + check_fa_plain(ctx) +
+                                      check_att_rows(ctx) + check_fused_weights(ctx) + check_layer_census(ctx) +
+                                      check_census_keeps_name();
     ggml_free(ctx);
     if (failures) {
         std::printf("test-xdna-match: %d failures\n", failures);

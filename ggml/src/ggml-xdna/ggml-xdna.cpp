@@ -781,6 +781,14 @@ struct xdna_model_objs {
     struct xdna_buffer *                                         res        = nullptr;
 };
 
+// A model's decode route (xdna_wants_host_decode): what its decode chunks showed of its layers, and, once a chunk
+// with a layer norm could tell, whether the fused designs leave its decode to the host.
+struct xdna_model_route {
+    xdna_layer_census layers;
+    bool              known  = false;
+    bool              misfit = false;
+};
+
 // Process-wide context shared by all backend instances.
 struct ggml_backend_xdna_context {
     xdna_device *      device = nullptr;
@@ -878,9 +886,8 @@ struct ggml_backend_xdna_context {
     std::map<const void *, xdna_model_objs> parked;
     // Models already told their buffers did not fit (one warning each).
     std::set<const void *>                 warned_mem;
-    // Whether each model's residual stream is wider than the fused designs'
-    // (xdna_wants_host_decode), once a chunk with a layer norm said so.
-    std::map<const void *, bool>           model_misfit;
+    // Each model's decode route (xdna_wants_host_decode).
+    std::map<const void *, xdna_model_route> model_route;
     // The node the dispatch loop is on, so the exception boundary in
     // ggml_backend_xdna_graph_compute can name it. Null outside a graph.
     const struct ggml_tensor * cur_node   = nullptr;
@@ -961,13 +968,13 @@ static bool xdna_head_node(const ggml_tensor * n) {
            ggml_nelements(n) == n->src[0]->ne[1];
 }
 
-// The residual width the fused layers take by default.
+// The residual width the fused layers keep to with GGML_XDNA_FUSED_WIDE=0.
 static constexpr int64_t XDNA_FUSED_D = 1024;
 
-// GGML_XDNA_FUSED_WIDE=1: the fused layers also take a wider residual stream
-// (up to XDNA_RES_MAX_D), whose decode otherwise runs on the host.
+// The fused layers also take a wider residual stream (xdna_res_width_ok),
+// unless GGML_XDNA_FUSED_WIDE=0 leaves its decode to the host.
 static bool xdna_fused_wide(void) {
-    static const bool v = xdna_env_int("GGML_XDNA_FUSED_WIDE", 0) != 0;
+    static const bool v = xdna_env_int("GGML_XDNA_FUSED_WIDE", 1) != 0;
     return v;
 }
 
@@ -1452,7 +1459,8 @@ static bool xdna_att_on(void) {
 
 // The shapes the pool's attention takes: Qwen3.5's full-attention decode, one
 // head group of eight query heads over two kv heads, or two (the 4B and 9B),
-// its keys the cache's own rows (no list of rows: ggml_flash_attn_ext_rows).
+// its keys the cache's own rows: no K/V row list, or one that names those rows
+// (xdna_att_rows_shape_ok, then xdna_att_rows_identity at run time).
 static constexpr int64_t XDNA_ATT_D        = 256;
 static constexpr int64_t XDNA_ATT_GROUP_H  = 8;  // query heads a pool run takes
 static constexpr int64_t XDNA_ATT_GQA      = 4;  // query heads a kv head serves
@@ -1460,7 +1468,9 @@ static constexpr int64_t XDNA_ATT_MAX_GRPS = 2;
 
 static bool xdna_att_eligible(const ggml_tensor * n) {
     const ggml_tensor *q = n->src[0], *k = n->src[1], *v = n->src[2], *m = n->src[3];
-    if (!xdna_fa_plain(n) || !m) {
+    // no sinks (src[4])
+    if (n->op != GGML_OP_FLASH_ATTN_EXT || !q || !k || !v || !m || n->src[4] ||
+        !xdna_att_rows_shape_ok(n->src[5], m, k)) {
         return false;
     }
     const int64_t h   = q->ne[2];
@@ -1515,7 +1525,7 @@ static bool xdna_att_try(ggml_backend_xdna_context * ctx, ggml_tensor * n) {
             return false;
         }
     }
-    if (n_valid <= 0 || n_valid > xdna_att_max_positions()) {
+    if (n_valid <= 0 || n_valid > xdna_att_max_positions() || !xdna_att_rows_identity(n, n_valid)) {
         return false;
     }
     size_t        koff = 0, voff = 0;
@@ -1884,7 +1894,8 @@ static bool xdna_attl_ready(ggml_backend_xdna_context * ctx, const xdna_attl_pla
     size_t        koff = 0, voff = 0;
     xdna_buffer * kbo = xdna_host_bo_reach(p.n_fa->src[1]->data, xdna_att_reach(p.n_fa->src[1]->nb[1]), &koff);
     xdna_buffer * vbo = xdna_host_bo_reach(p.n_fa->src[2]->data, xdna_att_reach(p.n_fa->src[2]->nb[1]), &voff);
-    if (n_valid <= 0 || !kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, p.n_fa->src[1]->nb[1])) {
+    if (n_valid <= 0 || !xdna_att_rows_identity(p.n_fa, n_valid) || !kbo || !vbo ||
+        !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, p.n_fa->src[1]->nb[1])) {
         return false;
     }
     // the token's row is the last visible cell of its stream: the view's
@@ -1925,7 +1936,7 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
     }
     const ggml_tensor *k = fa->src[1], *v = fa->src[2];
     const int          n_valid = xdna_attl_valid(fa);
-    if (n_valid <= 0 || n_valid > xdna_att_layer_max_positions()) {
+    if (n_valid <= 0 || n_valid > xdna_att_layer_max_positions() || !xdna_att_rows_identity(fa, n_valid)) {
         return false;
     }
     // this token's K and V go to row n_valid - 1 of its stream: the one row
@@ -2118,9 +2129,9 @@ static const char * xdna_misfit_route(void) {
                "the recurrent layers run on the host, the projections and the attention pool keep the NPU";
 }
 
-// The fused designs take a residual width of 1024, and with
-// GGML_XDNA_FUSED_WIDE=1 any up to XDNA_RES_MAX_D (xdna_fused_width); a chunk
-// without a layer norm (d == 0) leaves the choice to one that has it.
+// The fused designs take a residual width up to XDNA_RES_MAX_D, or only 1024
+// with GGML_XDNA_FUSED_WIDE=0 (xdna_fused_width); a chunk without a layer norm
+// (d == 0) leaves the choice to one that has it.
 static bool xdna_width_fits(int64_t d) {
     if (d == 0 || xdna_fused_width(d)) {
         return true;
@@ -2128,10 +2139,17 @@ static bool xdna_width_fits(int64_t d) {
     static bool said = false;
     if (!said) {
         said = true;
-        GGML_LOG_WARN("%s: the fused decode layers take a %d-wide residual stream%s, this model's is %d: %s\n",
-                      "ggml-xdna", (int) XDNA_FUSED_D,
-                      xdna_res_width_ok(d) ? " (GGML_XDNA_FUSED_WIDE=1 takes this one too)" : "", (int) d,
-                      xdna_misfit_route());
+        if (xdna_fused_wide()) {
+            GGML_LOG_WARN(
+                "%s: the fused decode layers take a residual width of a multiple of %d up to %d, this "
+                "model's is %d: %s\n",
+                "ggml-xdna", (int) XDNA_ROW_SIDE_FLOATS, (int) XDNA_RES_MAX_D, (int) d, xdna_misfit_route());
+        } else {
+            GGML_LOG_WARN(
+                "%s: with GGML_XDNA_FUSED_WIDE=0 the fused decode layers take a %d-wide residual stream, "
+                "this model's is %d: %s\n",
+                "ggml-xdna", (int) XDNA_FUSED_D, (int) d, xdna_misfit_route());
+        }
     }
     return false;
 }
@@ -2159,18 +2177,70 @@ static bool xdna_rec_fits(const ggml_cgraph * cgraph) {
     return xdna_width_fits(xdna_rec_width(cgraph)) && xdna_weights_fit(cgraph);
 }
 
-// A decode (one token a sequence) of a model the fused designs do not cover runs whole
-// on the host; the verdict is kept per model, as a chunk without a layer norm cannot tell.
+// The layer shapes the fused designs run (xdna_layer_census_add): the core's convolution of one pass of value heads
+// up to MAX_PASSES, and the pool's attention of one head group up to XDNA_ATT_MAX_GRPS.
+static const xdna_fused_shapes & xdna_fused_layer_shapes(void) {
+    using namespace xdna_rec_pack;
+    static constexpr int64_t       group = XDNA_ATT_GROUP_H * XDNA_ATT_D;
+    static const xdna_fused_shapes s     = {
+        { channels(NVH), channels(MAX_PASSES * NVH), (int64_t) NVH * SV },
+        XDNA_ATT_D,
+        { group,         XDNA_ATT_MAX_GRPS * group,  group              },
+    };
+    return s;
+}
+
+// Whether a model's layers tell yet if the fused designs run them. At 1024 they are not asked, as before the wider
+// designs; a wider model's tell once a chunk showed a recurrent layer, a layer the designs do not run or a whole layer.
+static bool xdna_layers_known(int64_t d, const xdna_layer_census & c) {
+    return d == XDNA_FUSED_D || c.recurrent || !c.foreign.empty() || c.whole;
+}
+
+// Whether the fused designs run a model of residual width `d` with these layers (at 1024 not asked): a wider one
+// needs a recurrent layer they run and no layer they do not; one warning names what is missing.
+static bool xdna_layers_fit(int64_t d, const xdna_layer_census & c) {
+    if (d == XDNA_FUSED_D || (c.recurrent && c.foreign.empty())) {
+        return true;
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        if (c.recurrent) {
+            GGML_LOG_WARN(
+                "%s: the fused decode layers take Qwen3.5's gated delta net and attention layers with a "
+                "dense FFN, this model's %s is outside them: %s\n",
+                "ggml-xdna", c.foreign.c_str(), xdna_misfit_route());
+        } else {
+            GGML_LOG_WARN(
+                "%s: the fused decode layers take Qwen3.5's gated delta net and attention layers with a "
+                "dense FFN, this model's offloaded layers have no gated delta net: %s\n",
+                "ggml-xdna", xdna_misfit_route());
+        }
+    }
+    return false;
+}
+
+// A decode (one token a sequence) of a model the fused designs do not cover runs whole on the host, with host
+// decode threads. The verdict is kept per model, as a chunk without a layer norm cannot tell, and a wider model's
+// waits until its layers tell; it is reached without threads too, so the same warning names the misfit.
 static bool xdna_wants_host_decode(ggml_backend_xdna_context * ctx, const ggml_cgraph * cgraph) {
-    if (g_glue_n_seq_tokens != 1 || xdna_host_decode_threads() == 0) {
+    if (g_glue_n_seq_tokens != 1) {
         return false;
     }
+    xdna_model_route & r = ctx->model_route[ctx->cur_model];
+    xdna_layer_census_add(r.layers, cgraph->nodes, cgraph->n_nodes, xdna_fused_layer_shapes());
     const int64_t d = xdna_rec_width(cgraph);
     if (d != 0) {
-        ctx->model_misfit[ctx->cur_model] = !xdna_width_fits(d) || !xdna_weights_fit(cgraph);
+        const bool told = xdna_layers_known(d, r.layers);
+        if (!xdna_width_fits(d) || (told && !xdna_layers_fit(d, r.layers)) || !xdna_weights_fit(cgraph)) {
+            r.known  = true;
+            r.misfit = true;
+        } else if (told) {
+            r.known  = true;
+            r.misfit = false;
+        }
     }
-    const auto it = ctx->model_misfit.find(ctx->cur_model);
-    return it != ctx->model_misfit.end() && it->second;
+    return xdna_host_decode_threads() > 0 && r.known && r.misfit;
 }
 
 static constexpr char XDNA_SYSFS_CPU[]      = "/sys/devices/system/cpu/cpu";
@@ -3456,7 +3526,7 @@ static void xdna_model_use(ggml_backend_xdna_context * ctx, const void * model) 
 // releases it.
 static void xdna_model_drop(ggml_backend_xdna_context * ctx, const void * model) {
     std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
-    ctx->model_misfit.erase(model);
+    ctx->model_route.erase(model);
     if (model == ctx->cur_model) {
         xdna_model_objs_free(ctx);
         return;
@@ -3517,7 +3587,7 @@ static void xdna_release_model_state(ggml_backend_xdna_context * ctx) {
     }
     ctx->parked.clear();
     ctx->cur_model = nullptr;
-    ctx->model_misfit.clear();
+    ctx->model_route.clear();
     xdna_att_free(ctx->att);
     ctx->att = nullptr;
     ctx->att_flushed.clear();

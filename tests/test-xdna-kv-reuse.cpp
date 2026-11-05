@@ -194,9 +194,7 @@ static int run_rounds(llama_model *                    model,
 }
 
 int main(int argc, char ** argv) {
-    const args arg = parse_args(argc, argv);
-    // the fused decode for every residual width it takes, not only 1024
-    setenv("GGML_XDNA_FUSED_WIDE", "1", 0);
+    const args       arg = parse_args(argc, argv);
     // static: the backend may still log after main returns
     static log_state st;
     llama_log_set(on_log, &st);
