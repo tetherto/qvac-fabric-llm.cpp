@@ -197,6 +197,11 @@ bool xdna_gdn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     if (!bo_x || !bo_o || !bo_x->data || !bo_o->data) {
         return false;
     }
+    // no dirty line of the output may land over what the array writes
+    xdna_test_dirty_if_armed(XDNA_OUT_GDN_MM, bo_o, COLS * o_col * 4, 0);
+    if (!xdna_buffer_sync_to_device_range(bo_o, COLS * o_col * 4, 0)) {
+        return false;
+    }
 
     // each head's gates in log2 units, their chunk sums, log2 sigma before
     // each chunk and the renormalizations

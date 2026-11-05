@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -545,13 +546,14 @@ bool xdna_buffer_sync_from_device_range(xdna_buffer * buf, size_t bytes, size_t 
 
 // --- reading what the array wrote ------------------------------------------
 //
-// A dispatch reports completion before the last of its DMA writes is readable,
-// and a read taken in that window hands back - and caches - the previous
-// contents of the buffer. There is no host-side barrier for it: the completion
-// is honest, and the cache ioctl above does nothing on this platform for a
-// host_only BO. So the read has to tell a landed write from a pending one, and
-// that is what the pattern is for: mark the range before the dispatch, read
-// until the mark is gone.
+// The array's writes are not coherent with the host's caches. On this platform
+// (XRT's KMQ shim) bo.sync is a clflush of the range in both directions, with
+// no fence after it and no driver ioctl, so a sync from the device writes back
+// any line the host left dirty there, over what the array wrote: a sync to the
+// device before the dispatch keeps such lines off a range the array writes.
+// A dispatch has also been seen to report completion before the last of its
+// DMA writes was readable. Where that matters, mark the range before the
+// dispatch and read until the mark is gone.
 
 // Reading back what the device wrote: up to XDNA_SETTLE_PASSES checks for the
 // mark, XDNA_SETTLE_PAUSE pause instructions apart, and XDNA_SETTLE_US of spin
@@ -1435,4 +1437,41 @@ void xdna_kernel_pool_release_buffer(xdna_kernel_pool * pool, xdna_buffer * buf)
         xdna_buffer_free(pool->pool[lru].buf);
         pool->pool.erase(pool->pool.begin() + (std::ptrdiff_t) lru);
     }
+}
+
+namespace {
+
+const char * const OUT_SITE_NAMES[XDNA_OUT_SITES] = { "pgemm", "attn-mm", "gdn-mm", "att", "head" };
+std::atomic<bool>  g_out_armed[XDNA_OUT_SITES];
+std::atomic<int>   g_out_filled[XDNA_OUT_SITES];
+
+int out_site_of(const char * name) {
+    for (int s = 0; s < XDNA_OUT_SITES; s++) {
+        if (name && std::strcmp(name, OUT_SITE_NAMES[s]) == 0) {
+            return s;
+        }
+    }
+    return -1;
+}
+
+}  // namespace
+
+int xdna_test_dirty_output(const char * site, int arm) {
+    const int s = out_site_of(site);
+    if (s < 0) {
+        return -1;
+    }
+    if (arm) {
+        g_out_armed[s] = true;
+    }
+    return g_out_filled[s];
+}
+
+void xdna_test_dirty_if_armed(xdna_out_site site, xdna_buffer * buf, size_t bytes, size_t offset) {
+    if (!g_out_armed[site].exchange(false) || !buf || !buf->data || offset >= buf->bytes) {
+        return;
+    }
+    const size_t n = std::min(bytes, buf->bytes - offset) / sizeof(float);
+    std::fill_n((float *) ((uint8_t *) buf->data + offset), n, std::numeric_limits<float>::quiet_NaN());
+    g_out_filled[site]++;
 }

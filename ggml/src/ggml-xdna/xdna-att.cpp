@@ -224,6 +224,11 @@ bool xdna_att_run(xdna_att *    a,
     if (!xdna_buffer_sync_to_device(a->act)) {
         return false;
     }
+    // no dirty line of the output may land over what the array writes
+    xdna_test_dirty_if_armed(XDNA_OUT_ATT, a->out, a->out->bytes, 0);
+    if (!xdna_buffer_sync_to_device(a->out)) {
+        return false;
+    }
 
     if (!xdna_run_restart(v.run) || !xdna_run_wait(v.run)) {
         return false;

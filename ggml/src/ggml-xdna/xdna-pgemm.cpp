@@ -1125,6 +1125,12 @@ bool pgemm_call(xdna_kernel_pool *  pool,
     for (int i = 0; ok && !direct && i < 2 && i < n_sl; i++) {
         bo_c[i] = xdna_kernel_pool_acquire_buffer(pool, c_bytes);
         ok      = bo_c[i] != nullptr;
+        if (ok) {
+            // no dirty line of the staging may land over what the array writes: its first slab, its largest
+            const size_t written = (size_t) blocks_of(i) * MBLK * ldc_s * 4;
+            xdna_test_dirty_if_armed(XDNA_OUT_PGEMM, bo_c[i], written, 0);
+            ok = xdna_buffer_sync_to_device_range(bo_c[i], written, 0);
+        }
     }
     trim_seqs();
     buf_st.stop();
