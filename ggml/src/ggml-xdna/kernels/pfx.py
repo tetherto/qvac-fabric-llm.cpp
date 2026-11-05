@@ -8,10 +8,12 @@
 #
 #   A core's program is pgemm's core loop, then the attention or the row-op
 #   loop. Header words 0-7 are pgemm's; word 8 gates the attention (its calls),
-#   word 9 the row ops (their blocks), word 10 in an attention command the A
-#   objects the row-op cores let pass. pgemm's host writes 0 there, so the
-#   backend runs its GEMMs through pgemm's runner, with the W path's pair ids
-#   set, when GGML_XDNA_PFX=1 loads this artifact (pfx_c8) in pgemm_c8's place.
+#   word 9 the row command (a row-op core's C objects), word 10 in an attention
+#   command the A objects the row-op cores let pass, word 11 in a row command
+#   the A objects the attention cores let pass, word 12 a row-op core's setup
+#   objects. pgemm's host writes 0 there, so the backend runs its GEMMs through
+#   pgemm's runner, with the W path's pair ids set, when GGML_XDNA_PFX=1 loads
+#   this artifact (pfx_c8) in pgemm_c8's place.
 #   One program for every mode does not fit a core's 16 KB of program memory
 #   (probes/pfx_s1.py), so the row-op columns are whole columns: the attention
 #   pairs rows (2, 3) and (4, 5) of a column.
@@ -26,6 +28,8 @@
 # at once; each core's Q comes on W under its own packet id. O accumulates in
 # the GEMM's accumulator and leaves as its two column halves, two C objects a
 # pass; the pair's score halves cross through the GEMM's neighbour fifos.
+# A row command's blocks come on W under each row-op core's own packet id, one
+# head of 8 positions, and their cos and sin on the A broadcast.
 from __future__ import annotations
 
 import argparse
@@ -54,6 +58,9 @@ HDR_WORDS = 16
 FA_WORDS = 8
 ATTN_ON, ROW_ON = 8, 9                  # header words that gate the modes
 A_DRAIN = 10                            # attention commands: A objects a row-op core lets pass (row ops are off)
+ATTN_DRAIN = 11                         # row commands: A objects an attention core lets pass
+ROW_SETUP = 12                          # row commands: setup objects a row-op core takes on W
+ROW_BLOCKS = 2                          # row blocks a C object
 ROW_COLS = (3, 7)                       # the row-op columns
 STACK = {"attn": 0xE00, "row": 0xB00}
 # PFX_STACK_PROBE=1 builds every core with a stack too small, so aiecc's check reports what each one needs.
@@ -132,7 +139,8 @@ def kernels() -> dict:
         fa_update=attn("fa_update_p", [b_ty, b_ty, acc_ty, c_ty, ml_ty]),
         fa_pv=attn("fa_pv", [c_ty, a_ty, acc_ty]),
         fa_end=attn("fa_end", [acc_ty, ml_ty]),
-        row=row("ggml_xdna_rowop", [a_ty, t_ty, c_ty, n_ty]),
+        row_setup=row("ggml_xdna_row_setup", [t_ty, acc_ty]),
+        row=row("ggml_xdna_rowop", [t_ty, a_ty, c_ty, acc_ty]),
     )
 
 
@@ -213,29 +221,46 @@ def attn_mode(p):
             c_out.release(1)
 
 
-def attn_drain(p):
-    """A row-op core's part of an attention command: the A broadcast reaches it too, so it lets the objects pass."""
-    for _ in range_(p["cnt"][A_DRAIN]):
+def drain_a(p, word: int):
+    """Header word `word`'s count of A objects let pass: the A broadcast reaches every core of a parity."""
+    for _ in range_(p["cnt"][word]):
         p["a_in"].acquire(1)
         p["a_in"].release(1)
 
 
+def attn_drain(p):
+    """A row-op core's part of an attention command."""
+    drain_a(p, A_DRAIN)
+
+
+def attn_tail_drain(p):
+    """An attention core's part of a row command: the blocks' cos and sin objects."""
+    drain_a(p, ATTN_DRAIN)
+
+
 def row_mode(p):
-    """One block of rows a step: the rows on A, the second input on the W tile, the result as C."""
+    """The row command: the setup object on W, then a block a step, its rows on W and its cos and sin on A, into
+    half of a C object."""
+    a_in, wb, wp, wc, acc = p["a_in"], p["wb"], p["wp"], p["wc"], p["acc"]
+    for _ in range_(p["cnt"][ROW_SETUP]):
+        wc.acquire(1)
+        p["row_setup"](wb, acc)
+        wp.release(1)
     for _ in range_(p["cnt"][ROW_ON]):
-        aa = p["a_in"].acquire(1)
-        p["wc"].acquire(1)
         cc = p["c_out"].acquire(1)
-        p["row"](aa, p["wb"], cc, p["cnt"])
+        for _ in range_(ROW_BLOCKS):
+            tt = a_in.acquire(1)
+            wc.acquire(1)
+            p["row"](wb, tt, cc, acc)
+            wp.release(1)
+            a_in.release(1)
         p["c_out"].release(1)
-        p["wp"].release(1)
-        p["a_in"].release(1)
 
 
 GEMM_ARGS = ["wb", "wp", "wc", "a_in", "c_out", "x_own", "x_nb", "zero", "mm", "hdr", "exp", "out", "acc", "cnt", "par"]
 ROLE_ARGS = {"attn": ["fa_hdr", "fa_pass", "fa_scores", "fa_update", "fa_pv", "fa_end", "ml", "cfa"],
-             "row": ["row"]}
-ROLE_MODES = {"attn": [attn_mode], "row": [attn_drain, row_mode]}
+             "row": ["row_setup", "row"]}
+ROLE_MODES = {"attn": [attn_mode, attn_tail_drain], "row": [attn_drain, row_mode]}
 
 
 def make_core(role: str):
