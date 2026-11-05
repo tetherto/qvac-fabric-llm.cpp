@@ -38,6 +38,11 @@
 // mask a node rewrites in place between them each get their own mask's answer.
 // An attention through a list of cache rows (ggml_flash_attn_ext_rows), which
 // no route of the backend reads, is ggml-cpu's op on every route.
+// A ubatch on the array whose first token refills a freed cell below the keys
+// the prompt before it packed sees that cell's new key, whether its rows see
+// their keys causally or all of them.
+// Attentions whose K and V the graph casts, at inputs of different lengths,
+// leave the array holding no more K/V copies than the first one did.
 //
 // BF16 and F16 weight projections, which no quantized route carries, through
 // the bf16 GEMM: an M that fits the decode block, one that takes several
@@ -695,6 +700,180 @@ static bool test_fa_kv_rows(ggml_backend_t npu, ggml_backend_t cpu, ggml_backend
     }
     unsetenv("GGML_XDNA_FA_MM");
     unsetenv("GGML_XDNA_HOST_FA");
+    return passed;
+}
+
+// The array packs a prompt's keys, cells [0, 600), and a decode writes cell 600; the next ubatch's first token refills freed
+// cell 300 and the rest follow 600. Every query looks for cell 300's new key, so a copy that kept its old key shows; the rows see
+// their keys causally (each still ending at the tail) or all of them.
+static const int   FA_REFILL_CACHE  = 1024;
+static const int   FA_REFILL_PROMPT = 600;
+static const int   FA_REFILL_CELL   = 300;
+static const int   FA_REFILL_TOKENS = 100;
+static const int   FA_REFILL_HEADS  = 8;
+static const float FA_REFILL_SCALE  = 0.0625f;
+static const float FA_REFILL_KEY    = 0.5f;  // the refilled key, along the queries: a score of 8, every other one ~0.25
+static const float FA_REFILL_VALUE  = 3.0f;
+
+struct fa_cache {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor *         k   = nullptr;  // [D, KV heads, cells], f16
+    ggml_tensor *         v   = nullptr;
+};
+
+static fa_cache new_fa_cache(ggml_backend_t cpu) {
+    fa_cache         c;
+    ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
+    c.ctx               = ggml_init(ip);
+    c.k                 = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, FA_HEAD_DIM, FA_KV_HEADS, FA_REFILL_CACHE);
+    c.v                 = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, FA_HEAD_DIM, FA_KV_HEADS, FA_REFILL_CACHE);
+    c.buf               = ggml_backend_alloc_ctx_tensors(c.ctx, cpu);
+    return c;
+}
+
+// cells [c0, c1) of K and V at random, small keys
+static void fill_cells(const fa_cache & c, int c0, int c1, uint32_t seed) {
+    std::mt19937                    rng(seed);
+    std::normal_distribution<float> nk(0.0f, 0.25f), nv(0.0f, 1.0f);
+    const size_t                    row = (size_t) FA_HEAD_DIM * FA_KV_HEADS;
+    std::vector<ggml_fp16_t>        k((c1 - c0) * row), v((c1 - c0) * row);
+    for (size_t i = 0; i < k.size(); i++) {
+        k[i] = ggml_fp32_to_fp16(nk(rng));
+        v[i] = ggml_fp32_to_fp16(nv(rng));
+    }
+    ggml_backend_tensor_set(c.k, k.data(), (size_t) c0 * c.k->nb[2], k.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(c.v, v.data(), (size_t) c0 * c.v->nb[2], v.size() * sizeof(ggml_fp16_t));
+}
+
+// the queries and the refilled key: +-1 by dimension
+static float refill_sign(int d) {
+    return d % 3 == 0 ? -1.0f : 1.0f;
+}
+
+static void refill_cell(const fa_cache & c) {
+    const size_t             row = (size_t) FA_HEAD_DIM * FA_KV_HEADS;
+    std::vector<ggml_fp16_t> k(row), v(row, ggml_fp32_to_fp16(FA_REFILL_VALUE));
+    for (size_t i = 0; i < row; i++) {
+        k[i] = ggml_fp32_to_fp16(FA_REFILL_KEY * refill_sign((int) (i % FA_HEAD_DIM)));
+    }
+    ggml_backend_tensor_set(c.k, k.data(), (size_t) FA_REFILL_CELL * c.k->nb[2], row * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(c.v, v.data(), (size_t) FA_REFILL_CELL * c.v->nb[2], row * sizeof(ggml_fp16_t));
+}
+
+// n_tokens queries over the whole cache; in[0] the queries, in[1] the mask, in[2], in[3] a projection beside it
+static fa_rows_graph build_fa_on_cache(ggml_backend_t cpu, const fa_cache & c, int n_tokens) {
+    fa_rows_graph    g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.in                = { ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, FA_HEAD_DIM, FA_REFILL_HEADS, n_tokens),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, FA_REFILL_CACHE, n_tokens),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, 64),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, n_tokens) };
+    ggml_set_input(g.in[1]);
+    ggml_tensor * q = ggml_permute(g.ctx, g.in[0], 0, 2, 1, 3);
+    ggml_tensor * k = ggml_permute(g.ctx, c.k, 0, 2, 1, 3);
+    ggml_tensor * v = ggml_permute(g.ctx, c.v, 0, 2, 1, 3);
+    g.out           = ggml_flash_attn_ext(g.ctx, q, k, v, g.in[1], FA_REFILL_SCALE, 0.0f, 0.0f);
+    ggml_prec_set_acc(g.out, GGML_PREC_F32);
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, g.out);
+    ggml_build_forward_expand(g.gf, ggml_mul_mat(g.ctx, g.in[2], g.in[3]));
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+// row t sees cells [0, last(t)]
+static void set_refill_inputs(fa_rows_graph & g, int n_tokens, int last0, bool causal) {
+    std::vector<float> q(ggml_nelements(g.in[0]));
+    for (size_t i = 0; i < q.size(); i++) {
+        q[i] = refill_sign((int) (i % FA_HEAD_DIM));
+    }
+    ggml_backend_tensor_set(g.in[0], q.data(), 0, ggml_nbytes(g.in[0]));
+    std::vector<ggml_fp16_t> m((size_t) FA_REFILL_CACHE * n_tokens, ggml_fp32_to_fp16(-INFINITY));
+    for (int t = 0; t < n_tokens; t++) {
+        const int last = causal ? last0 + t : last0 + n_tokens - 1;
+        std::fill_n(m.begin() + (size_t) t * FA_REFILL_CACHE, last + 1, ggml_fp32_to_fp16(0.0f));
+    }
+    ggml_backend_tensor_set(g.in[1], m.data(), 0, ggml_nbytes(g.in[1]));
+    for (size_t i = 2; i < g.in.size(); i++) {
+        std::vector<float> f(ggml_nelements(g.in[i]), 0.5f);
+        ggml_backend_tensor_set(g.in[i], f.data(), 0, ggml_nbytes(g.in[i]));
+    }
+}
+
+static bool run_refill(fa_rows_graph & g, ggml_backend_t be, int n_tokens, int last0, bool causal, std::vector<float> * res) {
+    set_refill_inputs(g, n_tokens, last0, causal);
+    if (ggml_backend_graph_compute(be, g.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    *res = get_f32(g.out);
+    return true;
+}
+
+// the second ubatch on the array after the first prompt packed the cache, against the CPU
+static bool test_fa_refill(ggml_backend_t npu, ggml_backend_t cpu, bool causal) {
+    set_fa_route(FA_ROUTE_ARRAY);
+    fa_cache c = new_fa_cache(cpu);
+    fill_cells(c, 0, FA_REFILL_CACHE, 11);
+    fa_rows_graph      prompt = build_fa_on_cache(cpu, c, FA_REFILL_PROMPT);
+    fa_rows_graph      next   = build_fa_on_cache(cpu, c, FA_REFILL_TOKENS);
+    std::vector<float> first, want, got;
+    bool               ok = run_refill(prompt, npu, FA_REFILL_PROMPT, 0, true, &first);
+    // the decode's token in cell 600, the ubatch's in 300 and from 601 on
+    fill_cells(c, FA_REFILL_PROMPT, FA_REFILL_PROMPT + FA_REFILL_TOKENS, 12);
+    refill_cell(c);
+    ok = ok && run_refill(next, cpu, FA_REFILL_TOKENS, FA_REFILL_PROMPT, causal, &want) &&
+         run_refill(next, npu, FA_REFILL_TOKENS, FA_REFILL_PROMPT, causal, &got);
+    const double e      = ok ? nmse(want, got) : INFINITY;
+    const bool   passed = ok && e > FA_ARRAY_NMSE_MIN && e < FA_ARRAY_NMSE_MAX;
+    std::printf("FLASH_ATTN_EXT array, a ubatch refilling cell %d after a prompt, %-13s nmse %.3g %s\n", FA_REFILL_CELL,
+                causal ? "causal" : "bidirectional", e, passed ? "ok" : "FAIL");
+    free_rows_graph(prompt);
+    free_rows_graph(next);
+    ggml_backend_buffer_free(c.buf);
+    ggml_free(c.ctx);
+    unsetenv("GGML_XDNA_FA_MM");
+    return passed;
+}
+
+typedef int (*kv_copies_fn)(void);
+
+// An attention whose K and V the graph casts (a model with no KV cache, EmbeddingGemma 2 above the array's bound) at inputs of
+// different lengths, every graph kept so each K has an address of its own: the array keeps no K/V copy per address.
+static const int FA_COPIES_LENGTHS[] = { 600, 700, 800, 900 };
+
+static bool test_fa_kv_copies(ggml_backend_t npu, ggml_backend_t cpu) {
+    auto copies = (kv_copies_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_attn_kv_copies");
+    if (!copies) {
+        std::printf("test-xdna-graph: the backend has no K/V copy count\n");
+        return false;
+    }
+    set_fa_route(FA_ROUTE_ARRAY);
+    setenv("GGML_XDNA_HOST_FA", "1", 1);
+    std::vector<norm_graph> graphs;
+    bool                    results_ok = true;
+    int                     first = -1, last = -1;
+    for (int n_tokens : FA_COPIES_LENGTHS) {
+        const fa_case c = { "cast K and V", FA_ROUTE_ARRAY, 4, n_tokens, 0, 1, 1, FA_BAND, 512, 1.0f, false, true,
+                            FA_HEAD_DIM, FA_KV_HEADS, false, 1, 0, 0, 0, false, true };
+        graphs.push_back(build_fa(cpu, c));
+        std::vector<float> want, got;
+        results_ok = results_ok && run_fa(graphs.back(), c, cpu, want) && run_fa(graphs.back(), c, npu, got) &&
+                     fa_result_ok(c, nmse(want, got));
+        last  = copies();
+        first = first < 0 ? last : first;
+    }
+    for (norm_graph & g : graphs) {
+        free_graph(g);
+    }
+    unsetenv("GGML_XDNA_FA_MM");
+    unsetenv("GGML_XDNA_HOST_FA");
+    const bool passed = results_ok && last == first;
+    std::printf("FLASH_ATTN_EXT K and V cast, %zu lengths on the array: %d K/V copies after the first, %d after the last, "
+                "results %s %s\n",
+                std::size(FA_COPIES_LENGTHS), first, last, results_ok ? "ok" : "WRONG", passed ? "ok" : "FAIL");
     return passed;
 }
 
@@ -1865,6 +2044,10 @@ int main(void) {
         passed = test_fa_computed_masks(npu, cpu, route) && passed;
     }
     passed = test_fa_kv_rows(npu, cpu, ggml_backend_dev_buffer_type(dev)) && passed;
+    for (bool causal : { true, false }) {
+        passed = test_fa_refill(npu, cpu, causal) && passed;
+    }
+    passed = test_fa_kv_copies(npu, cpu) && passed;
 
     const gemm_case gemm_cases[] = {
         { "decode block",     GGML_TYPE_BF16, 15,  { { 512, 1024 }, { 1024, 512 } } },
