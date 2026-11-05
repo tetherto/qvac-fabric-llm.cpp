@@ -19,7 +19,7 @@ for the GEMV). The route depends on the number of activation rows `M`:
 
 | M | route |
 | :-- | :-- |
-| 1 | decode GEMV (`kernels/gemv_q4.py` + `kernels/gemv-q4.cc`): the weights stay quantized in DDR and the group parameters are applied to the accumulator; `Q5_K`/`Q6_K` `attn_qkv` and `attn_v` are taken at 4 bits by default (see [4-bit decode weights](#4-bit-decode-weights-on-by-default)) |
+| 1 | decode GEMV (`kernels/gemv_q4.py` + `kernels/gemv-q4.cc`): the weights stay quantized in DDR and the group parameters are applied to the accumulator; in the fused layers a `Q5_K`/`Q6_K` `attn_qkv` is taken at 4 bits by default (see [4-bit decode weights](#4-bit-decode-weights-on-by-default)) |
 | 2..63 | decode GEMM, the M32 block (`kernels/gemm.py`, native bf16 r=4) |
 | >= 64 | prefill GEMM on a baked M block, one for all the graph's GEMMs of a route and row count: the block of least summed cost, since each block is its own xclbin and a change of block costs a hardware-context switch; bf16 for `F16`/`BF16`/`Q4_K`, and the native int8 route (1 B/value) for `Q4_K`/`Q5_K`/`Q6_K` |
 
@@ -356,24 +356,38 @@ lifetime, keyed by the tensor's data pointer and shape.
 #### 4-bit decode weights (on by default)
 
 One step is lossy, and it is on by default by design: for the single-token
-decode, every `Q5_K` or `Q6_K` weight named `attn_qkv` or `attn_v` is
-re-quantized to `Q4_K` from its dequantized values when it is packed, and the
-decode GEMV streams it at 4 bits (q4g32) instead of the exact 8-bit form. That
-applies wherever the decode runs those weights: the fused recurrent and
-attention layers and the per-op GEMV. These two tensors buy the most decode
-speed per unit of accuracy lost. On Qwen3.5-0.8B Q4_K_M, decode goes from 47.5
-to 52.4 t/s at a 1k context, and the decode KLD against the CPU from 0.0051 to
-0.0122. Greedy text can differ from the exact form where two tokens are close.
+decode, every `Q5_K` or `Q6_K` weight named `attn_qkv` is re-quantized to
+`Q4_K` from its dequantized values when it is packed, and the fused recurrent
+layers stream it at 4 bits (q4g32) instead of the exact 8-bit form. It buys the
+most decode speed per unit of accuracy lost. Teacher-forced decode KLD against
+the CPU over 511 tokens, and tg512 with `GGML_XDNA_FUSED_WIDE=1`, on Qwen3.5
+Q4_K_M (the CPU's own one-token decode scores 0.0029 on the 9B, 0.0018 on the
+4B, 0.0053 on the 2B and 0.0043 on the 0.8B):
+
+| model | weights at 4 bits | KLD | t/s | J a token, above idle / total |
+| :-- | :-- | --: | --: | --: |
+| 9B | `attn_qkv` (default) | 0.0061 | 7.42 | 1.73 / 3.42 |
+| 9B | none (`GGML_XDNA_W4=`) | 0.0033 | 7.17 | 1.77 / 3.53 |
+| 4B | `attn_qkv` (default) | 0.0047 | 11.99 | 1.11 / 2.11 |
+| 4B | none (`GGML_XDNA_W4=`) | 0.0028 | 11.57 | 1.15 / 2.18 |
+| 2B | `attn_qkv` (default) | 0.0097 | 30.09 | 0.51 / 0.91 |
+| 0.8B | `attn_qkv` (default) | 0.0099 | 58.63 | 0.25 / 0.46 |
+
+Greedy text can differ from the exact form where two tokens are close.
+`attn_v` is not worth it: a fused attention layer streams q|gate, k and v in
+one format, and with `attn_v` at 4 bits as well the 9B reaches KLD 0.0091 for
+1.5% more t/s and no less energy above idle.
 
 It does not touch:
-- the prefill GEMM, which takes every weight in its own format (4 bits there
-  would cost prefill KLD 0.0041 -> 0.0105);
+- the per-op decode GEMV, which takes every weight in its own format;
+- the prefill GEMM, which does the same (4 bits there would cost prefill KLD
+  0.0041 -> 0.0105);
 - `Q4_K` tensors, which are 4-bit already;
 - `ssm_out`;
 - the weights in the model file.
 
 `GGML_XDNA_W4` controls it:
-- unset: `attn_qkv,attn_v`, the default above;
+- unset: `attn_qkv`, the default above;
 - set and empty (`GGML_XDNA_W4=`): every weight keeps its exact 8-bit form, at
   the slower decode;
 - a comma-separated list (`GGML_XDNA_W4=attn_v`): the `Q5_K`/`Q6_K` weights it
@@ -529,7 +543,7 @@ For users - a trade-off, a size or a location:
 
 | variable | default | effect |
 | :-- | :-- | :-- |
-| `GGML_XDNA_W4` | `attn_qkv,attn_v` | the `Q5_K`/`Q6_K` weights the decode GEMV takes at 4 bits, a lossy default (see [4-bit decode weights](#4-bit-decode-weights-on-by-default)); empty keeps them at 8 bits |
+| `GGML_XDNA_W4` | `attn_qkv` | the `Q5_K`/`Q6_K` weights the fused decode layers take at 4 bits, a lossy default (see [4-bit decode weights](#4-bit-decode-weights-on-by-default)); empty keeps them at 8 bits |
 | `GGML_XDNA_HEAD` | 0 | `1` runs the decode's vocabulary projection on the array instead of the host: lossy (see `GGML_XDNA_HEAD_EXACT_ROWS`) and slower on the 0.8B, with fewer host threads busy |
 | `GGML_XDNA_HEAD_EXACT_ROWS` | 65536 | with `GGML_XDNA_HEAD=1`, the vocabulary rows the decode head keeps at 8 bits, from row 0 (a byte-pair vocabulary's most frequent tokens); the rest are 4-bit. Head KLD against the CPU's Q6_K head on the 0.8B: 0.0052 at 65536, 0.0165 with `0` (all 4-bit) |
 | `GGML_XDNA_TOKEN` | 1 | how a token's queued runs go to the device: `1` as one joined command, `t > 1` at most `t` runs a command, `0` a command each - slightly faster decode at a higher package power (24.0 W at 50.9 t/s against 18.0 W at ~48 t/s with the default, 1k context) |
