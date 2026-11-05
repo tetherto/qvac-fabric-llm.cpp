@@ -6922,11 +6922,11 @@ void check_turbovec_1x_load_staged_off() {
     // a plain load across a chunk boundary: fewer rows than one block, an
     // exact multiple of the chunk, and full chunks followed by tail rows.
     constexpr int kLoadChunkBlocks = 64;
-    constexpr int kBlockRows = 32;
-    constexpr int kChunkRows = kLoadChunkBlocks * kBlockRows;
-    constexpr int kTailRows = 5;
+    constexpr int kBlockRows       = 32;
+    constexpr int kChunkRows       = kLoadChunkBlocks * kBlockRows;
+    constexpr int kTailRows        = 5;
     for (const int n_case : { kTailRows, 2 * kChunkRows, 2 * kChunkRows + kTailRows }) {
-        const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, static_cast<size_t>(n_case), dim);
+        const std::vector<float>    rows    = tv1x_rows(kTv1xSeedDb, static_cast<size_t>(n_case), dim);
         const std::vector<uint64_t> row_ids = tv1x_ids(static_cast<size_t>(n_case));
         for (const int bits : { 2, 4 }) {
             auto * src = ggml_vec_index_create_turbovec(dim, bits);
@@ -6944,8 +6944,7 @@ void check_turbovec_1x_load_staged_off() {
 
             ggml_vec_index_t * off = nullptr;
             CHECK(ggml_vec_index_from_bytes_with_flags(
-                      bytes.data(), bytes.size(), GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF, &off) ==
-                  GGML_VEC_INDEX_OK);
+                      bytes.data(), bytes.size(), GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF, &off) == GGML_VEC_INDEX_OK);
             uint64_t sums[3] = {};
             state_hash_for_test(off, sums);
             CHECK(sums[0] == plain_sums[0] && sums[1] == plain_sums[1] && sums[2] == plain_sums[2]);
