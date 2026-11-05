@@ -6,6 +6,7 @@
 #include "ggml.h"
 
 #include <cstring>
+#include <string>
 
 // The GET_ROWS that reads a recurrent state: the node itself, or the gather of
 // all n_rs states whose first rows build_rs hands out as a view at offset 0.
@@ -69,4 +70,83 @@ static inline const ggml_tensor * xdna_fused_uncovered(const ggml_tensor * const
         }
     }
     return nullptr;
+}
+
+// Widths at which the fused decode runs a weight: `min`, then every `step` up to `max`.
+struct xdna_width_range {
+    int64_t min, max, step;
+};
+
+static inline bool xdna_width_in(const xdna_width_range & r, int64_t v) {
+    return v >= r.min && v <= r.max && (v - r.min) % r.step == 0;
+}
+
+// The layer shapes the fused decode runs: a recurrent layer's convolution channels (ssm_conv1d ne[1]), an attention
+// layer's head size (attn_k_norm ne[0]) and query width (attn_output ne[0]).
+struct xdna_fused_shapes {
+    xdna_width_range conv;
+    int64_t          head;
+    xdna_width_range query;
+};
+
+// What a model's decode chunks showed of its layers against the ones the fused decode runs (xdna_layer_census_add).
+struct xdna_layer_census {
+    bool        recurrent = false;  // a recurrent layer of a shape it runs
+    bool        whole     = false;  // a whole layer went by: its output, l_out-N
+    std::string foreign;            // the name of the first weight of a layer it does not run, kept past its graph
+};
+
+static constexpr char XDNA_LAYER_OUT[] = "l_out-";
+
+// Whether weight `w` is of a layer the fused decode does not run: an FFN weight other than the dense gate, up and
+// down (a mixture of experts' router, experts and shared expert), or a shape outside `s`.
+static inline bool xdna_layer_foreign(const ggml_tensor * w, const xdna_fused_shapes & s) {
+    const char * name = ggml_get_name(w);
+    if (strncmp(name, "blk.", 4) != 0) {
+        return false;
+    }
+    if (strstr(name, ".ffn_")) {
+        return !xdna_name_ends(name, ".ffn_gate.weight") && !xdna_name_ends(name, ".ffn_up.weight") &&
+               !xdna_name_ends(name, ".ffn_down.weight");
+    }
+    if (xdna_name_ends(name, ".ssm_conv1d.weight")) {
+        return !xdna_width_in(s.conv, w->ne[1]);
+    }
+    if (xdna_name_ends(name, ".attn_k_norm.weight")) {
+        return w->ne[0] != s.head;
+    }
+    if (xdna_name_ends(name, ".attn_output.weight")) {
+        return !xdna_width_in(s.query, w->ne[0]);
+    }
+    return false;
+}
+
+static inline void xdna_layer_census_weight(xdna_layer_census & c, const ggml_tensor * w, const xdna_fused_shapes & s) {
+    if (w->op != GGML_OP_NONE) {
+        return;
+    }
+    if (xdna_layer_foreign(w, s)) {
+        if (c.foreign.empty()) {
+            c.foreign = ggml_get_name(w);
+        }
+        return;
+    }
+    c.recurrent = c.recurrent || xdna_name_ends(ggml_get_name(w), ".ssm_conv1d.weight");
+}
+
+static inline void xdna_layer_census_node(xdna_layer_census & c, const ggml_tensor * n, const xdna_fused_shapes & s) {
+    c.whole = c.whole || strncmp(ggml_get_name(n), XDNA_LAYER_OUT, sizeof(XDNA_LAYER_OUT) - 1) == 0;
+    for (int k = 0; k < GGML_MAX_SRC && n->src[k]; k++) {
+        xdna_layer_census_weight(c, n->src[k], s);
+    }
+}
+
+// Adds a decode chunk's nodes to `c`. A model's chunks add up, so a graph an eval callback splits tells the same.
+static inline void xdna_layer_census_add(xdna_layer_census &         c,
+                                         const ggml_tensor * const * nodes,
+                                         int                         n_nodes,
+                                         const xdna_fused_shapes &   s) {
+    for (int i = 0; i < n_nodes; i++) {
+        xdna_layer_census_node(c, nodes[i], s);
+    }
 }
