@@ -684,6 +684,9 @@ if (GGML_XDNA)
     # A fused decode watched through an eval callback against the unwatched
     # one (-m model.gguf).
     llama_build_and_test(test-xdna-observe.cpp      LABEL "model")
+    # A context made after another was freed, while a third stays alive, against
+    # the third's tokens (-m model.gguf [-c n_ctx]).
+    llama_build_and_test(test-xdna-kv-reuse.cpp     LABEL "model")
     # The host-only backend tests are built with the backend
     # (ggml/src/ggml-xdna/CMakeLists.txt); they need no model and no device.
     foreach(t test-xdna-repack test-xdna-head-rows test-xdna-match test-xdna-mark test-xdna-seq test-xdna-seg-reach
