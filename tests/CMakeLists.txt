@@ -738,10 +738,13 @@ if (GGML_XDNA)
     else()
         message(STATUS "test-xdna-design-tag: no Python 3 interpreter, test not registered")
     endif()
-    # The FFN pair on the device against the CPU, self-skipping; no model.
-    if (TARGET test-xdna-pair)
-        add_test(NAME test-xdna-pair COMMAND test-xdna-pair)
-    endif()
+    # The FFN pair and the fused attention layer on the device against the
+    # CPU, self-skipping; no model.
+    foreach(t test-xdna-pair test-xdna-att-layer)
+        if (TARGET ${t})
+            add_test(NAME ${t} COMMAND ${t})
+        endif()
+    endforeach()
 endif()
 
 if (APPLE)

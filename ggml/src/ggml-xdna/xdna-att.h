@@ -2,9 +2,10 @@
 
 // Decode attention on the fused layer's GEMV pool (kernels/attn-dec.cc): one
 // query token of Qwen3.5's full-attention layers - eight query heads over two
-// kv heads of 256 - against llama's f16 KV cache, read where it lies in the
-// backend's host BOs. The sixteen pool cores each take every sixteenth chunk
-// of five positions; their partial softmax states are combined here.
+// kv heads of 256 a run, a head group; sixteen query heads over four take two
+// runs - against llama's f16 KV cache, read where it lies in the backend's
+// host BOs. The sixteen pool cores each take every sixteenth chunk of five
+// positions; their partial softmax states are combined here.
 
 #include "xdna-gemv.h"
 #include "xdna-seq.h"
@@ -30,7 +31,7 @@ static constexpr int CORES    = 16;
 static constexpr int PIECES   = 33;
 static constexpr int PIECE    = 64;              // floats
 static constexpr int ST       = PIECES * PIECE;  // a core's partial state, floats
-static constexpr int POS_B    = KVH * D * 2;     // one position of K (or V), f16
+static constexpr int POS_B    = KVH * D * 2;     // one position of a head group's K (or V), f16
 static constexpr int ROUND    = CORES * P;
 static constexpr int TASK     = 64;              // chunks one BD chain covers
 static constexpr int MAX_TASK = 16;
@@ -54,8 +55,10 @@ inline int task_count(int n_chunks) {
 
 // The chunks of `n_valid` positions have to lie inside the cache buffers: the
 // last chunk is read whole, so near the end of a cache it runs past it.
-inline bool fits(size_t kbytes, size_t koff, size_t vbytes, size_t voff, int n_valid) {
-    const size_t span = (size_t) chunk_count(n_valid) * ROUND * POS_B;
+// `pos_b` is the cache's position stride: POS_B, or a multiple of it with
+// more kv heads than a run takes.
+inline bool fits(size_t kbytes, size_t koff, size_t vbytes, size_t voff, int n_valid, size_t pos_b = POS_B) {
+    const size_t span = ((size_t) chunk_count(n_valid) * ROUND - 1) * pos_b + POS_B;
     return koff + span <= kbytes && voff + span <= vbytes && koff + span <= UINT32_MAX && voff + span <= UINT32_MAX;
 }
 
@@ -70,6 +73,17 @@ inline void lin(xdna_bd & bd, size_t bytes, uint32_t off) {
     bd.ax_cache  = 2;
 }
 
+// A chunk's P positions of one head group: one run, or P runs a position
+// stride apart in a cache holding more kv heads than the group.
+inline void chunk_bd(xdna_bd & bd, size_t pos_b, uint32_t off) {
+    lin(bd, (size_t) P * POS_B, off);
+    if (pos_b != POS_B) {
+        bd.d0_size   = POS_B / 4;
+        bd.d1_size   = P;
+        bd.d1_stride = (uint32_t) (pos_b / 4);
+    }
+}
+
 // The pool's read of the cache, one BD chain a column over `n_chunks` chunks.
 inline void emit_chunks(xdna_seq &           seq,
                         const xdna_gemv_ep * w,
@@ -79,7 +93,8 @@ inline void emit_chunks(xdna_seq &           seq,
                         const uint32_t *     chain,
                         size_t               koff,
                         size_t               voff,
-                        int                  argv) {
+                        int                  argv,
+                        size_t               pos_b = POS_B) {
     const size_t pad = tb - (size_t) 2 * P * POS_B;
     for (int t = 0; t < n_task; t++) {
         const int cnt = std::min(TASK, n_chunks - t * TASK);
@@ -94,11 +109,11 @@ inline void emit_chunks(xdna_seq &           seq,
                 const size_t   pos = (size_t) t * TASK * ROUND + (size_t) (2 * c + r) * P;
                 const uint32_t b0  = chain[c] + 3 * r;
                 xdna_bd        bk, bv, bp;
-                lin(bk, (size_t) P * POS_B, (uint32_t) (koff + pos * POS_B));
-                lin(bv, (size_t) P * POS_B, (uint32_t) (voff + pos * POS_B));
+                chunk_bd(bk, pos_b, (uint32_t) (koff + pos * pos_b));
+                chunk_bd(bv, pos_b, (uint32_t) (voff + pos * pos_b));
                 lin(bp, pad, 0);
                 bk.iter_size = bv.iter_size = TASK;
-                bk.iter_stride = bv.iter_stride = (uint32_t) ((size_t) ROUND * POS_B / 4);
+                bk.iter_stride = bv.iter_stride = (uint32_t) ((size_t) ROUND * pos_b / 4);
                 bk.next_bd                      = b0 + 1;
                 bk.use_next                     = true;
                 bv.next_bd                      = b0 + 2;
@@ -132,10 +147,11 @@ void       xdna_att_free(xdna_att * a);
 int xdna_att_max_positions(void);
 
 // out[h * 256 + d] = softmax(scale * q_h . K) V for the first n_valid cache
-// positions. `k` / `v` are the BO and byte offset of position 0 of the layer's
-// K and V (position stride 1024 B, kv-head stride 512 B, f16). The caller has
-// synced the rows the host wrote. False when the dispatch cannot be built or
-// run - the caller falls back.
+// positions, one head group: eight query heads over two kv heads. `k` / `v`
+// are the BO and byte offset of the group's first kv head at position 0 of the
+// layer's K and V (kv-head stride 512 B, position stride `pos_b`, f16). The
+// caller has synced the rows the host wrote. False when the dispatch cannot be
+// built or run - the caller falls back.
 bool xdna_att_run(xdna_att *           a,
                   struct xdna_buffer * kbo,
                   size_t               koff,
@@ -144,4 +160,5 @@ bool xdna_att_run(xdna_att *           a,
                   const float *        q,
                   float                scale,
                   int                  n_valid,
-                  float *              out);
+                  float *              out,
+                  size_t               pos_b = xdna_att_geom::POS_B);
