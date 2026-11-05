@@ -69,20 +69,13 @@ static ggml_backend_buft_alloc_buffer_n_plan_t ggml_backend_buft_alloc_buffer_n_
         size_t this_size = 0;
         struct ggml_tensor * t = tensors[i];
         if (t->data == NULL && t->view_src == NULL) {
-            const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
-            if (alloc_size > SIZE_MAX - (alignment - 1)) {
-                // unrepresentable: one plan item that no allocator can satisfy
-                plan.clear();
-                plan.push_back({ SIZE_MAX, 0, n_tensors });
-                return plan;
-            }
-            this_size = GGML_PAD(alloc_size, alignment);
+            this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
         }
 
         // flush the current buffer if adding this tensor would exceed max_size
         // views need no allocation, but must remain in the range to be initialized,
         // even when the preceding tensor exceeds the backend's preferred buffer size
-        if (this_size > 0 && cur_buf_size > 0 && (cur_buf_size > max_size || this_size > max_size - cur_buf_size)) {
+        if (this_size > 0 && cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
             plan.push_back({ cur_buf_size, first, i });
             cur_buf_size = this_size;
             first        = i;
@@ -168,15 +161,13 @@ static ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_n_default(ggml_backe
 }
 
 // default implementation of get_alloc_size_n
-// returns the total reported size of the buffers that alloc_buffer_n_default would allocate for the given tensors,
-// each payload chunk converted to its physical size; SIZE_MAX when the aggregate is unrepresentable
+// returns the total size that alloc_buffer_n_default would allocate for the given tensors
 static size_t ggml_backend_buft_get_alloc_size_n_default(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors) {
     const ggml_backend_buft_alloc_buffer_n_plan_t plan = ggml_backend_buft_alloc_buffer_n_plan(buft, tensors, n_tensors);
 
     size_t total = 0;
     for (const ggml_backend_buft_alloc_buffer_n_plan_item & item : plan) {
-        const size_t size = ggml_backend_buft_get_buffer_alloc_size(buft, item.size);
-        total = size > SIZE_MAX - total ? SIZE_MAX : total + size;
+        total += item.size;
     }
     return total;
 }
