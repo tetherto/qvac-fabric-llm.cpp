@@ -1514,6 +1514,11 @@ static bool xdna_att_rows_identity(const ggml_tensor * fa, int n_valid) {
     return true;
 }
 
+// The head groups of a decode attention: a pool run each.
+static int xdna_att_groups(const ggml_tensor * fa) {
+    return (int) (fa->src[0]->ne[2] / XDNA_ATT_GROUP_H);
+}
+
 // One pool run a head group: its kv heads `k->nb[2]` apart inside a position.
 static bool xdna_att_run_groups(xdna_att *    att,
                                 xdna_buffer * kbo,
@@ -1919,7 +1924,7 @@ static bool xdna_attl_ready(ggml_backend_xdna_context * ctx, const xdna_attl_pla
     xdna_buffer * kbo = xdna_host_bo_reach(p.n_fa->src[1]->data, xdna_att_reach(p.n_fa->src[1]->nb[1]), &koff);
     xdna_buffer * vbo = xdna_host_bo_reach(p.n_fa->src[2]->data, xdna_att_reach(p.n_fa->src[2]->nb[1]), &voff);
     if (n_valid <= 0 || !xdna_att_rows_identity(p.n_fa, n_valid) || !kbo || !vbo ||
-        !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, p.n_fa->src[1]->nb[1])) {
+        !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, p.n_fa->src[1]->nb[1], xdna_att_groups(p.n_fa))) {
         return false;
     }
     // the token's row is the last visible cell of its stream: the view's
@@ -1991,7 +1996,7 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
     size_t        koff = 0, voff = 0;
     xdna_buffer * kbo = xdna_host_bo_reach(k->data, xdna_att_reach(k->nb[1]), &koff);
     xdna_buffer * vbo = xdna_host_bo_reach(v->data, xdna_att_reach(v->nb[1]), &voff);
-    if (!kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, pos_b)) {
+    if (!kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, pos_b, xdna_att_groups(fa))) {
         return false;
     }
     std::vector<float> cosv, sinv;
