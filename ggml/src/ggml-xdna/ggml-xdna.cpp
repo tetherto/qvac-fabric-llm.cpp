@@ -4823,8 +4823,9 @@ static bool xdna_can_move_up(const struct ggml_cgraph * graph, const xdna_node_p
     return xdna_inputs_ready_at(pos, mm, head) && xdna_no_writer_between(graph, head, at, mm);
 }
 
+// whatever its rows: a decode's graph orders as the prompt's whose reservation it reuses
 static bool xdna_group_candidate(const struct ggml_tensor * t) {
-    return t->op == GGML_OP_MUL_MAT && !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && t->src[1] && t->src[1]->ne[1] > 1;
+    return t->op == GGML_OP_MUL_MAT && !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && t->src[1];
 }
 
 // positions of the group candidates that read one activation, by activation

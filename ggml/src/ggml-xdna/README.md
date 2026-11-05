@@ -195,8 +195,10 @@ Q8_0 and BF16 files) runs without a model-specific path:
   output into its own node (`GGML_XDNA_PGEMM_GROUP=0`: one GEMM each). ggml
   places K and V after Q's norm and RoPE, so the backend's `graph_optimize`
   moves the projections of one activation up behind the first, before the
-  scheduler allocates the graph. All but the last end on a whole 512 columns,
-  and every node must lie in one of the backend's buffers. On the bf16 GEMM, a
+  scheduler allocates the graph, whatever its rows: a decode's graph keeps the
+  node order of the prompt's whose allocation it reuses. All but the last end
+  on a whole 512 columns, and every node must lie in one of the backend's
+  buffers. On the bf16 GEMM, a
   layer's Q, K and V and its gate and up run as one GEMM the same way, their
   weights packed side by side along N (`GGML_XDNA_GEMM_GROUP=0`: one GEMM
   each).

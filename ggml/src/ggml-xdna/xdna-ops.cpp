@@ -1388,14 +1388,13 @@ static bool gemm_uses_i8(const xdna_ops * ops, const struct ggml_tensor * op) {
     return gemm_quantized_type(op->src[0]->type) && op->src[1]->ne[1] >= GEMM_M_BIG_MIN && !ops->i8_xclbin.empty();
 }
 
-// The GEMM's checks of shape, type and geometry on a route, none of a
-// compute's plans.
-static bool gemm_shape_supported(const xdna_ops * ops, const struct ggml_tensor * op, bool use_i8) {
+// The GEMM's checks of shape, type and geometry on a route at M rows, none of
+// a compute's plans.
+static bool gemm_shape_supported(const xdna_ops * ops, const struct ggml_tensor * op, int M, bool use_i8) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     const int                  K    = (int) src1->ne[0];
     const int                  N    = (int) src0->ne[1];
-    const int                  M    = (int) src1->ne[1];
     const bool                 is_q = gemm_quantized_type(src0->type);
     // The stream is always built for the baked M block, so the geometry check
     // is on the block M; op M is tiled into blocks.
@@ -1482,18 +1481,24 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     if (use_bf16 && ops->gemm_host.count(op) != 0) {
         return false;
     }
-    return gemm_shape_supported(ops, op, use_i8);
+    return gemm_shape_supported(ops, op, M, use_i8);
 }
 
-// The bf16 GEMM takes `node` by its shape alone. graph_optimize asks this
-// outside any compute; the compute groups again with its own plans.
+// The rows the bf16 GEMM's shape rules are asked at for graph_optimize: every
+// block shares the route's K and N rules, and below the int8 route's rows a
+// Q4_K weight is the route's, so a prompt and a decode of one layer order alike.
+static const int GEMM_SHAPE_ROWS = 1;
+
+// The bf16 GEMM takes `node` by its shape alone, at some row count.
+// graph_optimize asks this outside any compute; the compute groups again with
+// its own plans and rows.
 static bool gemm_bf16_shape_supported(const xdna_ops * ops, const struct ggml_tensor * node) {
     if (node->op != GGML_OP_MUL_MAT || !node->src[0] || !node->src[1] || ops->gemm_xclbin_decode.empty() ||
         node->src[1]->ne[1] <= 0) {
         return false;
     }
-    return !xdna_pgemm_shape_supported(node) && !gemm_uses_i8(ops, node) && gemm_bf16_type(node->src[0]->type) &&
-           gemm_shape_supported(ops, node, false);
+    return !xdna_pgemm_shape_supported(node) && gemm_bf16_type(node->src[0]->type) &&
+           gemm_shape_supported(ops, node, GEMM_SHAPE_ROWS, false);
 }
 
 // --- bf16 GEMM or host ------------------------------------------------------
@@ -1900,11 +1905,12 @@ static bool gemm_group_members_ok(const xdna_ops * ops, struct ggml_tensor * con
     return true;
 }
 
-static bool gemm_group_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n, gemm_member_fn member) {
+// at M rows: the group's own in a compute, GEMM_SHAPE_ROWS for graph_optimize
+static bool gemm_group_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n, int M,
+                                 gemm_member_fn member) {
     if (n < 2 || xdna_env_int("GGML_XDNA_GEMM_GROUP", 1) == 0 || !gemm_group_members_ok(ops, mm, n, member)) {
         return false;
     }
-    const int            M    = (int) mm[0]->src[1]->ne[1];
     const int            K    = (int) mm[0]->src[1]->ne[0];
     const int            N    = gemm_group_cols(mm, n);
     const xdna_gemm_geom geom = xdna_pick_geom(ops, M, K, N, /* want_i8 */ false);
@@ -1914,11 +1920,11 @@ static bool gemm_group_supported(const xdna_ops * ops, struct ggml_tensor * cons
 // --- public API -------------------------------------------------------------
 
 bool xdna_ops_gemm_group_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n) {
-    return gemm_group_supported(ops, mm, n, gemm_on_bf16_design);
+    return gemm_group_supported(ops, mm, n, (int) mm[0]->src[1]->ne[1], gemm_on_bf16_design);
 }
 
 bool xdna_ops_gemm_group_shape_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n) {
-    return gemm_group_supported(ops, mm, n, gemm_bf16_shape_supported);
+    return gemm_group_supported(ops, mm, n, GEMM_SHAPE_ROWS, gemm_bf16_shape_supported);
 }
 
 bool xdna_ops_compute_group(xdna_ops * ops, struct ggml_tensor * const * mm, int n) {
