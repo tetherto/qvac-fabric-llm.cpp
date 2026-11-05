@@ -1,6 +1,7 @@
 #include "xdna-attn-mm.h"
 
 #include "ggml-impl.h"
+#include "xdna-match.h"
 #include "xdna-norm.h"
 #include "xdna-runtime.h"
 #include "xdna-seq.h"
@@ -293,12 +294,12 @@ bool xdna_attn_mm_supported(const ggml_tensor * node) {
     if (!node || node->op != GGML_OP_FLASH_ATTN_EXT || xdna_env_int("GGML_XDNA_FA_MM", 1) == 0 || !artifact_present()) {
         return false;
     }
+    if (!xdna_fa_plain(node)) {
+        return false;  // sinks, or K/V row lists
+    }
     const ggml_tensor * q = node->src[0];
     const ggml_tensor * k = node->src[1];
     const ggml_tensor * v = node->src[2];
-    if (!q || !k || !v || node->src[4]) {
-        return false;  // sinks
-    }
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
         node->type != GGML_TYPE_F32) {
         return false;
