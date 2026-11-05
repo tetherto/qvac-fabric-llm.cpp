@@ -2742,7 +2742,10 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
         s->aq.resize(KGATE);
     }
 
-    const float * hres = !s->cap_hres.empty() ? s->cap_hres.data() : xdna_rec_tdata(p.n_hres, D);
+    // The capture is this graph's only when the residual's producer is in it; a graph an eval
+    // callback split before the layer would otherwise read the previous token's.
+    const bool    captured = p.i_cap_hres >= 0 && !s->cap_hres.empty();
+    const float * hres     = captured ? s->cap_hres.data() : xdna_rec_tdata(p.n_hres, D);
     if (!hres) {
         GGML_LOG_ERROR("%s: fused layer %d: bad residual input\n", "ggml-xdna", p.il);
         return false;
