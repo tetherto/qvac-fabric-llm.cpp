@@ -10,6 +10,8 @@
 // attn_mm's (xdna-attn-mm.cpp, which hands the node over once its mask is
 // read).
 
+#include "xdna-pfx-layout.h"
+
 #include <cstdint>
 
 struct ggml_tensor;
@@ -34,5 +36,22 @@ struct xdna_pfx_attn_job {
     float               q_scale  = 0.0f;
 };
 
-// Run it to completion and write out.
+// Run it to completion and write out: xdna_pfx_attn_prepare, _pack, _run_io, _release.
 bool xdna_pfx_attn_run(xdna_kernel_pool * pool, const xdna_pfx_attn_job & job);
+
+// The objects the host owns, into `parent` laid out as xdna_pfx_attn_geometry: both A streams' headers, every W
+// object's trailer, and zero Q in the W objects whose positions start at or past the last tile's end.
+void xdna_pfx_attn_host_objects(const xdna_pfx_attn_job & job, uint8_t * parent);
+
+// One node's objects from prepare to run, so that another command (the row command, xdna-pfx-row.h) can write Q, K
+// and V^T into them on the array.
+struct xdna_pfx_attn_io;
+
+// Plan the passes, take the buffers and write the host's objects; job's q, k and v are not read. Null on failure.
+xdna_pfx_attn_io *        xdna_pfx_attn_prepare(xdna_kernel_pool * pool, const xdna_pfx_attn_job & job);
+const xdna_pfx_attn_dst & xdna_pfx_attn_dst_of(const xdna_pfx_attn_io * io);
+// The host path's Q, K and V^T objects from job's q, k and v.
+bool                      xdna_pfx_attn_pack(xdna_pfx_attn_io * io);
+// Run on io's objects and write job.out.
+bool                      xdna_pfx_attn_run_io(xdna_kernel_pool * pool, xdna_pfx_attn_io * io);
+void                      xdna_pfx_attn_release(xdna_kernel_pool * pool, xdna_pfx_attn_io * io);

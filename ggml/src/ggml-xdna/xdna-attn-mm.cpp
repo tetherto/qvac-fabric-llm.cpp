@@ -6,6 +6,7 @@
 #include "xdna-match.h"
 #include "xdna-norm.h"
 #include "xdna-pfx-attn.h"
+#include "xdna-pfx-row.h"
 #include "xdna-prof.h"
 #include "xdna-runtime.h"
 #include "xdna-seq.h"
@@ -528,8 +529,7 @@ void unpack_o(ggml_tensor *    node,
     }
 }
 
-// The node on the merged design's attention mode (xdna-pfx-attn.cpp), the GEMM's hardware context.
-bool run_pfx(xdna_kernel_pool * pool, ggml_tensor * node, const geometry & geo, const mask_rows & mr, int64_t n_tokens) {
+xdna_pfx_attn_job pfx_job_of(ggml_tensor * node, const geometry & geo, const mask_rows & mr, int64_t n_tokens) {
     xdna_pfx_attn_job job;
     job.q        = node->src[0];
     job.k        = node->src[1];
@@ -541,11 +541,54 @@ bool run_pfx(xdna_kernel_pool * pool, ggml_tensor * node, const geometry & geo, 
     job.n_kv     = mr.n_kv;
     job.hg       = geo.hg;
     job.q_scale  = q_scale_of(node);
+    return job;
+}
+
+// The node on the merged design's attention mode (xdna-pfx-attn.cpp), the GEMM's hardware context.
+bool run_pfx(xdna_kernel_pool * pool, ggml_tensor * node, const geometry & geo, const mask_rows & mr, int64_t n_tokens) {
     xdna_prof::section_timer st("prefill: pfx attention");
-    return xdna_pfx_attn_run(pool, job);
+    return xdna_pfx_attn_run(pool, pfx_job_of(node, geo, mr, n_tokens));
+}
+
+// The attention's objects with Q, K and V^T from the row command; false when the command did not write them
+bool rows_into(xdna_kernel_pool *        pool,
+               xdna_pfx_attn_io *        io,
+               const xdna_pfx_attn_job & job,
+               const xdna_pfx_row_job &  row,
+               xdna_pfx_row_tables &     tables) {
+    xdna_pfx_row_job r = row;
+    r.q_scale          = (float) (M_LOG2E * job.q_scale);
+    r.dst              = &xdna_pfx_attn_dst_of(io);
+    return xdna_pfx_row_run_tables(pool, r, tables);
 }
 
 }  // namespace
+
+xdna_attn_rows_result xdna_attn_mm_run_rows(xdna_kernel_pool *       pool,
+                                            ggml_tensor *            node,
+                                            const xdna_pfx_row_job & row,
+                                            xdna_pfx_row_tables &    tables) {
+    std::lock_guard<std::mutex> lock(g_am.mtx);
+    geometry                    geo;
+    int64_t                     n_tokens, n_kv_view;
+    if (!xdna_pfx_attn_active() || !shapes_supported(node, &geo, &n_tokens, &n_kv_view) || row.n_tokens != n_tokens) {
+        return xdna_attn_rows_result::refused;
+    }
+    const std::shared_ptr<const mask_rows> mrp = mask_of(node->src[3], n_kv_view, n_tokens);
+    if (!mrp || mrp->n_kv != n_tokens) {
+        return xdna_attn_rows_result::refused;
+    }
+    xdna_prof::section_timer st("prefill: pfx attention");
+    const xdna_pfx_attn_job  job   = pfx_job_of(node, geo, *mrp, n_tokens);
+    xdna_pfx_attn_io *       io    = xdna_pfx_attn_prepare(pool, job);
+    const bool               wrote = io && rows_into(pool, io, job, row, tables);
+    const bool               ran   = wrote && xdna_pfx_attn_run_io(pool, io);
+    xdna_pfx_attn_release(pool, io);
+    if (!wrote) {
+        return xdna_attn_rows_result::refused;
+    }
+    return ran ? xdna_attn_rows_result::done : xdna_attn_rows_result::failed;
+}
 
 bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     std::lock_guard<std::mutex> lock(g_am.mtx);
