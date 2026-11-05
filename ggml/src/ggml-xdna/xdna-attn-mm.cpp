@@ -296,8 +296,8 @@ bool xdna_attn_mm_supported(const ggml_tensor * node) {
     const ggml_tensor * q = node->src[0];
     const ggml_tensor * k = node->src[1];
     const ggml_tensor * v = node->src[2];
-    if (!q || !k || !v || node->src[4]) {
-        return false;  // sinks
+    if (!q || !k || !v || node->src[4] || node->src[5]) {
+        return false;  // sinks, per-slice K/V rows
     }
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
         node->type != GGML_TYPE_F32) {
