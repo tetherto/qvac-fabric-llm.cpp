@@ -10,6 +10,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "llama-coreml-ffn.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1450,6 +1451,26 @@ common_init_result_ptr common_init_from_model_and_params(llama_model* model, com
             COM_WRN("%s", "Core ML is unavailable in this build; enable -DLLAMA_COREML=ON; using ggml\n");
         } else if (!llama_set_coreml_model(lctx, params.coreml_model.c_str(), params.coreml_max_inflight)) {
             COM_WRN("%s", "Core ML embedding sidecar could not be configured; using ggml\n");
+        }
+    }
+
+    if (params.coreml_ffn) {
+        if (!llama_supports_coreml_ffn()) {
+            COM_WRN("%s", "Core ML FFN is unavailable in this build; enable -DLLAMA_COREML=ON; using Metal\n");
+        } else {
+            auto ffn_params = llama_coreml_ffn_default_params();
+            const std::string cache = params.coreml_ffn_cache.empty() ? (fs_get_cache_directory() / "coreml-ffn").string() : params.coreml_ffn_cache;
+            ffn_params.cache_dir = cache.c_str();
+            if (params.coreml_ffn_packages > 0) {
+                ffn_params.metal_channels = params.coreml_ffn_metal;
+                ffn_params.n_packages     = params.coreml_ffn_packages;
+            }
+            COM_INF("Core ML FFN: trying split %dx%d with cache %s (the first run compiles the programs, about 1-2 minutes)\n",
+                ffn_params.metal_channels, ffn_params.n_packages, cache.c_str());
+            char error[512];
+            if (!llama_set_coreml_ffn(lctx, &ffn_params, error, sizeof(error))) {
+                COM_WRN("Core ML FFN could not be enabled: %s; using Metal\n", error);
+            }
         }
     }
 

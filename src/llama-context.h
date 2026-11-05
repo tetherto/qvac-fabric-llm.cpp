@@ -20,6 +20,8 @@
 
 struct llama_model;
 struct llama_coreml_embedding;
+struct llama_coreml_ffn;
+struct llama_coreml_ffn_params;
 class llama_batch_allocr;
 class llama_moe_cache;
 
@@ -127,6 +129,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     bool set_coreml_model(const char * directory, int32_t max_inflight);
+    bool set_coreml_ffn(const llama_coreml_ffn_params * params, char * error, size_t error_size);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_embeddings_layer_inp_pos_min(llama_seq_id seq_id, llama_pos pos_min);
@@ -341,6 +344,7 @@ private:
 
     llama_memory_ptr memory;
     std::unique_ptr<llama_coreml_embedding, void (*)(llama_coreml_embedding *)> coreml{nullptr, nullptr};
+    std::unique_ptr<llama_coreml_ffn, void (*)(llama_coreml_ffn *)> coreml_ffn{nullptr, nullptr};
     bool coreml_contract_matches() const;
     bool coreml_ubatch_eligible() const;
     bool run_coreml_probe(llama_coreml_embedding * candidate);

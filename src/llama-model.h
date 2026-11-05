@@ -732,6 +732,11 @@ struct llama_model {
 
     std::string name = "n/a";
 
+    // Disk source identity for derived runtime caches. Empty for buffers or split GGUFs.
+    std::string source_path;
+    uint64_t source_size = 0;
+    int64_t source_mtime = 0;
+
     llama_hparams hparams = {};
     llama_vocab   vocab;
 

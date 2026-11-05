@@ -58,17 +58,12 @@ jobs:
   cuda:
     needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: "hf-jobs-t4-medium:cuda13"
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
-
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y cmake time python3 python3-venv python3-pip
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
@@ -131,7 +126,7 @@ jobs:
   metal:
     needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -172,7 +167,7 @@ jobs:
 
   rocm:
     needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
+    if: false  # No matching AMD GPU hardware.
     runs-on: [self-hosted, Linux, gfx1201, 1accel]
     container: "rocm/dev-ubuntu-24.04:7.2.4-complete"
 
@@ -248,17 +243,12 @@ jobs:
   vulkan-nvidia:
     needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: "hf-jobs-t4-small:ubuntu26_04"
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
-
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y build-essential cmake libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan-dev glslc spirv-headers vulkan-tools mesa-vulkan-drivers libglvnd0 libgl1 libglx0 libegl1 libgles2 time python3 python3-venv python3-pip
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
@@ -316,7 +306,7 @@ jobs:
 
   vulkan-amd:
     needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
+    if: false  # No matching AMD GPU hardware.
     runs-on: [self-hosted, Linux, gfx1201, 1accel]
     container: "ubuntu:26.04"
 
@@ -387,17 +377,12 @@ jobs:
   webgpu-nvidia:
     needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: "hf-jobs-t4-small:ubuntu26_04"
+    runs-on: qvac-ubuntu2404-x64-gpu
 
     steps:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
-
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y build-essential cmake libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan1 mesa-vulkan-drivers libglvnd0 libgl1 libglx0 libegl1 libgles2 time python3 python3-venv python3-pip
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24

@@ -1,6 +1,18 @@
 #include "ggml-impl.h"
 #include "ggml-tbq-quants.h"
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 // ====================== TurboQuant (Zandieh et al., ICLR 2026) ======================
 //
 // Algorithm 1 (TurboQuant_mse): rotation + Lloyd-Max scalar quantization + bit-packing
@@ -90,8 +102,11 @@ static void tq_rng_seed(tq_rng_t * rng, uint64_t seed) {
 #define TQ_SIGN_SEED_64  43
 static float   tq_signs_128[QK_TQ];
 static float   tq_signs_64[QK_TQ_64];
-static int32_t tq_signs_128_ready = 0;
-static int32_t tq_signs_64_ready  = 0;
+#define QJL_SIGN_SEED_128 137
+#define QJL_SIGN_SEED_64  139
+static float qjl_signs_128[QK_TQ];
+static float qjl_signs_64[QK_TQ_64];
+static int tq_norm_correction;
 
 static void tq_generate_signs(float * signs, int d, uint64_t seed) {
     tq_rng_t rng;
@@ -101,13 +116,40 @@ static void tq_generate_signs(float * signs, int d, uint64_t seed) {
     }
 }
 
+static void tq_initialize_tables(void) {
+    tq_generate_signs(tq_signs_128, QK_TQ, TQ_SIGN_SEED_128);
+    tq_generate_signs(tq_signs_64, QK_TQ_64, TQ_SIGN_SEED_64);
+    tq_generate_signs(qjl_signs_128, QK_TQ, QJL_SIGN_SEED_128);
+    tq_generate_signs(qjl_signs_64, QK_TQ_64, QJL_SIGN_SEED_64);
+    const char * env = getenv("GGML_TQ_NORM_CORRECTION");
+    tq_norm_correction = env && env[0] == '1';
+}
+
+#if defined(_WIN32)
+static BOOL CALLBACK tq_initialize_once(PINIT_ONCE once, PVOID parameter, PVOID * context) {
+    GGML_UNUSED(once);
+    GGML_UNUSED(parameter);
+    GGML_UNUSED(context);
+    tq_initialize_tables();
+    return TRUE;
+}
+#endif
+
+static void tq_ensure_initialized(void) {
+#if defined(_WIN32)
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    const BOOL initialized = InitOnceExecuteOnce(&once, tq_initialize_once, NULL, NULL);
+    GGML_ASSERT(initialized);
+#else
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    const int result = pthread_once(&once, tq_initialize_tables);
+    GGML_ASSERT(result == 0);
+#endif
+}
+
 static const float * tq_get_signs(int d) {
-    if (d == QK_TQ) {
-        if (!tq_signs_128_ready) { tq_generate_signs(tq_signs_128, QK_TQ, TQ_SIGN_SEED_128); tq_signs_128_ready = 1; }
-        return tq_signs_128;
-    }
-    if (!tq_signs_64_ready) { tq_generate_signs(tq_signs_64, QK_TQ_64, TQ_SIGN_SEED_64); tq_signs_64_ready = 1; }
-    return tq_signs_64;
+    tq_ensure_initialized();
+    return d == QK_TQ ? tq_signs_128 : tq_signs_64;
 }
 
 const float * tq3_codebook_for(int d) {
@@ -200,12 +242,8 @@ void tq_compute_boundaries(const float * cb, float * boundaries, int n) {
 // This minimizes ||x - alpha*c||^2 and corrects quantization's norm shrinkage.
 // Controlled by GGML_TQ_NORM_CORRECTION env var (checked once, cached).
 static int tq_norm_correction_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char * env = getenv("GGML_TQ_NORM_CORRECTION");
-        cached = (env && env[0] == '1') ? 1 : 0;
-    }
-    return cached;
+    tq_ensure_initialized();
+    return tq_norm_correction;
 }
 
 // Shared TQ3 quantize: normalize + binary-search + packed 3-bit write
@@ -504,22 +542,9 @@ size_t quantize_pq4_0_64(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 //   correction = sqrt(pi/2) / m * ||r_k|| * sum_j( sign_k_j * (R * q)_j )
 // where R is the same structured random projection applied on-the-fly to the query.
 
-// Use distinct seeds from the main Hadamard signs to get independent projections.
-#define QJL_SIGN_SEED_128 137
-#define QJL_SIGN_SEED_64  139
-
-static float   qjl_signs_128[QK_TQ];
-static float   qjl_signs_64[QK_TQ_64];
-static int32_t qjl_signs_128_ready = 0;
-static int32_t qjl_signs_64_ready  = 0;
-
 static const float * qjl_get_signs(int d) {
-    if (d == QK_TQ) {
-        if (!qjl_signs_128_ready) { tq_generate_signs(qjl_signs_128, QK_TQ, QJL_SIGN_SEED_128); qjl_signs_128_ready = 1; }
-        return qjl_signs_128;
-    }
-    if (!qjl_signs_64_ready) { tq_generate_signs(qjl_signs_64, QK_TQ_64, QJL_SIGN_SEED_64); qjl_signs_64_ready = 1; }
-    return qjl_signs_64;
+    tq_ensure_initialized();
+    return d == QK_TQ ? qjl_signs_128 : qjl_signs_64;
 }
 
 // Apply QJL projection in-place: buf = H * D_qjl * buf
