@@ -11,9 +11,11 @@
 #   word 9 the row command (a row-op core's C objects), word 10 in an attention
 #   command the A objects the row-op cores let pass, word 11 in a row command
 #   the A objects the attention cores let pass, word 12 a row-op core's setup
-#   objects. pgemm's host writes 0 there, so the backend runs its GEMMs through
-#   pgemm's runner, with the W path's pair ids set, when GGML_XDNA_PFX=1 loads
-#   this artifact (pfx_c8) in pgemm_c8's place.
+#   objects, word 13 in a GEMM the x objects a block takes on W before its K
+#   loop, as the accumulator's up half (GLU_X: the GLU of the gate and x, the
+#   weight's up half zero). pgemm's host writes 0 there, so the backend runs
+#   its GEMMs through pgemm's runner, with the W path's pair ids set, when
+#   GGML_XDNA_PFX=1 loads this artifact (pfx_c8) in pgemm_c8's place.
 #   One program for every mode does not fit a core's 16 KB of program memory
 #   (probes/pfx_s1.py), so the row-op columns are whole columns: the attention
 #   pairs rows (2, 3) and (4, 5) of a column.
@@ -60,6 +62,7 @@ ATTN_ON, ROW_ON = 8, 9                  # header words that gate the modes
 A_DRAIN = 10                            # attention commands: A objects a row-op core lets pass (row ops are off)
 ATTN_DRAIN = 11                         # row commands: A objects an attention core lets pass
 ROW_SETUP = 12                          # row commands: setup objects a row-op core takes on W
+X_ON = 13                               # GEMMs: x objects a block takes on W (0 or 1)
 ROW_BLOCKS = 2                          # row blocks a C object
 ROW_COLS = (3, 7)                       # the row-op columns
 STACK = {"attn": 0xE00, "row": 0xB00}
@@ -123,7 +126,7 @@ def external(src: str, flags: list, tag: str):
 
 
 def kernels() -> dict:
-    gemm = external(gemm_source(), pg._flags, "pfxexp")
+    gemm = external(gemm_source(), pg._flags + ["-DPG_LOAD_X"], "pfxexp")
     attn = external(am._src, am._flags + ATTN_MM_RENAMES + ATTN_FLAGS, "pfxatt")
     row = external(kernelsrc.load(_here / "rowop.cc"), [], "pfxrow")
     mm = akernels.mm(MB, KS, NC, input_dtype=bf16, output_dtype=np.float32, vectorized=True,
@@ -133,6 +136,7 @@ def kernels() -> dict:
         hdr=gemm("ggml_xdna_pg_hdr_p", [a_ty, n_ty, np.int32]),
         exp=gemm("ggml_xdna_expand_pair", [t_ty, b_ty, n_ty]),
         out=gemm("ggml_xdna_pg_out", [acc_ty, c_ty, n_ty]),
+        load_x=gemm("ggml_xdna_pg_load_x", [t_ty, acc_ty]),
         fa_hdr=attn("fa_hdr", [a_ty, nfa_ty]),
         fa_pass=attn("fa_pass", [acc_ty, ml_ty, nfa_ty, t_ty]),
         fa_scores=attn("fa_scores", [t_ty, a_ty, b_ty]),
@@ -174,6 +178,10 @@ def gemm_mode(p):
 
     for _ in range_(cnt[0]):
         p["zero"](acc)
+        for _ in range_(cnt[X_ON]):
+            wc.acquire(1)
+            p["load_x"](wb, acc)
+            wp.release(1)
         for _ in range_(cnt[1]):
             wc.acquire(1)
             for _ in range_(cnt[7]):
@@ -257,7 +265,8 @@ def row_mode(p):
         p["c_out"].release(1)
 
 
-GEMM_ARGS = ["wb", "wp", "wc", "a_in", "c_out", "x_own", "x_nb", "zero", "mm", "hdr", "exp", "out", "acc", "cnt", "par"]
+GEMM_ARGS = ["wb", "wp", "wc", "a_in", "c_out", "x_own", "x_nb", "zero", "mm", "hdr", "exp", "out", "load_x", "acc",
+             "cnt", "par"]
 ROLE_ARGS = {"attn": ["fa_hdr", "fa_pass", "fa_scores", "fa_update", "fa_pv", "fa_end", "ml", "cfa"],
              "row": ["row_setup", "row"]}
 ROLE_MODES = {"attn": [attn_mode, attn_tail_drain], "row": [attn_drain, row_mode]}

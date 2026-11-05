@@ -1441,9 +1441,11 @@ void xdna_kernel_pool_release_buffer(xdna_kernel_pool * pool, xdna_buffer * buf)
 
 namespace {
 
-const char * const OUT_SITE_NAMES[XDNA_OUT_SITES] = { "pgemm", "attn-mm", "gdn-mm", "att", "head", "pfx-attn" };
+const char * const OUT_SITE_NAMES[XDNA_OUT_SITES] = { "pgemm", "attn-mm",  "gdn-mm",     "att",
+                                                      "head",  "pfx-attn", "pgemm-fused" };
 std::atomic<bool>  g_out_armed[XDNA_OUT_SITES];
 std::atomic<int>   g_out_filled[XDNA_OUT_SITES];
+std::atomic<bool>  g_out_landing[XDNA_OUT_SITES];  // filled, not yet landed (xdna_test_land_dirty)
 
 int out_site_of(const char * name) {
     for (int s = 0; s < XDNA_OUT_SITES; s++) {
@@ -1474,4 +1476,11 @@ void xdna_test_dirty_if_armed(xdna_out_site site, xdna_buffer * buf, size_t byte
     const size_t n = std::min(bytes, buf->bytes - offset) / sizeof(float);
     std::fill_n((float *) ((uint8_t *) buf->data + offset), n, std::numeric_limits<float>::quiet_NaN());
     g_out_filled[site]++;
+    g_out_landing[site] = true;
+}
+
+void xdna_test_land_dirty(xdna_out_site site, xdna_buffer * buf, size_t bytes, size_t offset) {
+    if (g_out_landing[site].exchange(false)) {
+        (void) xdna_buffer_sync_to_device_range(buf, bytes, offset);
+    }
 }
