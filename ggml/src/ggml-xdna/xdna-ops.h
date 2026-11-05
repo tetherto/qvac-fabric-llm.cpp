@@ -213,8 +213,9 @@ bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op);
 // own node.
 bool xdna_ops_gemm_group_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n);
 
-// The same by shape, type and geometry alone, none of a compute's plans:
-// graph_optimize runs outside any compute, which groups again with its plans.
+// The same by shape, type and geometry alone, at any row count and none of a
+// compute's plans: graph_optimize runs outside any compute, which groups again
+// with its plans and rows.
 bool xdna_ops_gemm_group_shape_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n);
 
 // Submit the projections of a supported group as one GEMM; xdna_ops_finalize
