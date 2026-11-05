@@ -63,7 +63,9 @@
 // moves them next to each other so that one call can run them. The scheduler
 // computes the graph, and so does the CPU. A projection stays where it is when
 // a node between writes into its activation in place, or when its weight is
-// a node of the graph computed after the first projection.
+// a node of the graph computed after the first projection. The order is the
+// same at every row count, a decode's one included: a scheduler reserved for a
+// prompt computes the layer at 1, 2 and 64 rows without reserving again.
 //
 // A prompt's FFN, down(GLU(gate(x), up(x))) with SWIGLU and with GEGLU: the
 // backend runs the gate and up projections and the activation as one call,
@@ -1476,6 +1478,112 @@ static bool test_group_order_after_host_plan(ggml_backend_t npu, ggml_backend_t 
     return passed;
 }
 
+// A layer's Q, K and V behind per-head norms through one scheduler reserved for a prompt, as llama reserves it, then at a
+// decode's, a short prompt's and the prompt's rows: the allocator matches a graph against its reservation node by node, so the
+// order graph_optimize leaves must not depend on the rows.
+static const int64_t LAYER_HEAD_DIM = 64;
+static const int64_t LAYER_PROMPT   = 64;
+
+static ordered_graph build_layer(ggml_backend_t leaf_be, ggml_backend_t ops_be, const std::vector<int64_t> & ns, int64_t M,
+                                 enum ggml_type wtype) {
+    const int64_t    K = 512;
+    ordered_graph    g;
+    ggml_init_params lp = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_init_params op = { ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, true };
+    g.leaf              = ggml_init(lp);
+    g.ops               = ggml_init(op);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.leaf, GGML_TYPE_F32, K, M);
+    g.inputs.inputs     = { x };
+    g.gf                = ggml_new_graph(g.ops);
+    for (int64_t n : ns) {
+        ggml_tensor * w = ggml_new_tensor_2d(g.leaf, wtype, K, n);
+        g.inputs.inputs.push_back(w);
+        ggml_tensor * mm = ggml_mul_mat(g.ops, w, x);
+        g.mm.push_back(mm);
+        ggml_tensor * norm = ggml_rms_norm(g.ops, ggml_reshape_3d(g.ops, mm, LAYER_HEAD_DIM, n / LAYER_HEAD_DIM, M), 1e-6f);
+        g.out              = g.out ? ggml_concat(g.ops, g.out, norm, 1) : norm;
+    }
+    ggml_build_forward_expand(g.gf, g.out);
+    g.leaf_buf = ggml_backend_alloc_ctx_tensors(g.leaf, leaf_be);
+    if (ops_be) {
+        g.ops_buf = ggml_backend_alloc_ctx_tensors(g.ops, ops_be);
+    }
+    return g;
+}
+
+// a re-reservation the scheduler did not expect: the same backends and the same graph size
+static void count_unexpected_realloc(ggml_backend_sched_t, ggml_cgraph *, bool backend_ids_changed, bool graph_size_changed,
+                                     void * user_data) {
+    if (!backend_ids_changed && !graph_size_changed) {
+        (*(int *) user_data)++;
+    }
+}
+
+static std::vector<ggml_tensor *> graph_nodes(ggml_cgraph * gf) {
+    std::vector<ggml_tensor *> nodes;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        nodes.push_back(ggml_graph_node(gf, i));
+    }
+    return nodes;
+}
+
+// each node's place in `expanded`, in the order the graph holds them now
+static std::vector<int> places_in(ggml_cgraph * gf, const std::vector<ggml_tensor *> & expanded) {
+    std::vector<int> places;
+    for (const ggml_tensor * t : graph_nodes(gf)) {
+        places.push_back((int) (std::find(expanded.begin(), expanded.end(), t) - expanded.begin()));
+    }
+    return places;
+}
+
+// the layer at M rows through `sched`: the order graph_optimize left, and the output's nmse against the CPU
+static bool run_layer(ggml_backend_sched_t sched, ggml_backend_t npu, ggml_backend_t cpu, enum ggml_type wtype, int64_t M,
+                      std::vector<int> * places, double * e) {
+    const std::vector<int64_t> ns     = { 1024, 512, 512 };
+    ordered_graph              want_g = build_layer(cpu, cpu, ns, M, wtype);
+    ordered_graph              got_g  = build_layer(npu, nullptr, ns, M, wtype);
+    set_inputs(want_g.inputs, 1234);
+    set_inputs(got_g.inputs, 1234);
+    const std::vector<ggml_tensor *> expanded = graph_nodes(got_g.gf);
+    ggml_backend_sched_reset(sched);
+    const bool ok = ggml_backend_graph_compute(cpu, want_g.gf) == GGML_STATUS_SUCCESS &&
+                    ggml_backend_sched_alloc_graph(sched, got_g.gf) &&
+                    ggml_backend_sched_graph_compute(sched, got_g.gf) == GGML_STATUS_SUCCESS;
+    *places = places_in(got_g.gf, expanded);
+    *e      = ok ? nmse(get_f32(want_g.out), get_f32(got_g.out)) : INFINITY;
+    free_ordered(want_g);
+    free_ordered(got_g);
+    return ok;
+}
+
+static bool test_group_order_rows(ggml_backend_t npu, ggml_backend_t cpu, enum ggml_type wtype, double tol) {
+    ggml_backend_t       backends[2] = { npu, cpu };
+    ggml_backend_sched_t sched       = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    int                  unexpected  = 0;
+    ggml_backend_sched_set_realloc_callback(sched, count_unexpected_realloc, &unexpected);
+    ordered_graph reserve_g = build_layer(npu, nullptr, { 1024, 512, 512 }, LAYER_PROMPT, wtype);
+    bool          ok        = ggml_backend_sched_reserve(sched, reserve_g.gf);
+    free_ordered(reserve_g);
+    std::vector<int> first_places;
+    bool             same  = true;
+    double           worst = 0;
+    for (int64_t M : { (int64_t) 1, (int64_t) 2, LAYER_PROMPT, (int64_t) 1 }) {
+        std::vector<int> places;
+        double           e = INFINITY;
+        ok                 = ok && run_layer(sched, npu, cpu, wtype, M, &places, &e);
+        first_places       = first_places.empty() ? places : first_places;
+        same               = same && places == first_places;
+        worst              = std::max(worst, e);
+    }
+    const bool passed = ok && same && unexpected == 0 && worst < tol;
+    std::printf("MUL_MAT %-4s Q K V at 1, 2 and %lld rows after a prompt's reservation: order %s, %d unexpected "
+                "re-reservations, worst nmse %.3g %s\n",
+                ggml_type_name(wtype), (long long) LAYER_PROMPT, same ? "the same" : "DIFFERS", unexpected,
+                ok ? worst : INFINITY, passed ? "ok" : "FAIL");
+    ggml_backend_sched_free(sched);
+    return passed;
+}
+
 // Qwen3.5-0.8B's residual and FFN widths, and a short prompt's rows
 static constexpr int64_t CROP_EMBD   = 1024;
 static constexpr int64_t CROP_FFN    = 3584;
@@ -1785,6 +1893,9 @@ int main(void) {
     }
     for (between what : { between::writer, between::weight_view }) {
         passed = test_group_order(npu, cpu, what, true, 200, tol, GGML_TYPE_BF16) && passed;
+    }
+    for (enum ggml_type wtype : { GGML_TYPE_Q8_0, GGML_TYPE_BF16 }) {
+        passed = test_group_order_rows(npu, cpu, wtype, tol) && passed;
     }
 
     for (ggml_glu_op op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
