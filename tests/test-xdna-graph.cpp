@@ -111,9 +111,9 @@
 // before it was written shows as zeros instead of as the other backend's
 // result. Skips (exit 0) when no XDNA device is registered.
 
-#include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml.h"
 
 #include <algorithm>
 #include <cmath>
@@ -124,7 +124,17 @@
 #include <map>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
+
+// Qwen3.5's full-attention layers (xdna-attn-mm.cpp), past the pair count up
+// to which the host runs a prefill attention
+static constexpr int64_t FA_HEAD_DIM = 256;
+static constexpr int64_t FA_HEADS    = 8;
+static constexpr int64_t FA_KV_HEADS = 2;
+static constexpr int64_t FA_TOKENS   = 512;
+static constexpr int64_t FA_KV       = 1024;
+static constexpr float   FA_SCALE    = 0.0625f;
 
 static ggml_backend_dev_t xdna_device(void) {
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -171,7 +181,33 @@ struct norm_graph {
     std::vector<ggml_tensor *> checked;  // compared, in graph order
     int32_t                    out_row = 0;  // what an I32 input (the output-row crop) selects
     float                      act_scale = 1.0f;  // of the f32 inputs
+    std::vector<std::pair<ggml_tensor *, std::vector<uint8_t>>> fixed;  // set as given, after the inputs
 };
+
+template <typename T> static std::vector<uint8_t> to_bytes(const std::vector<T> & v) {
+    const uint8_t * b = (const uint8_t *) v.data();
+    return std::vector<uint8_t>(b, b + v.size() * sizeof(T));
+}
+
+// causal over n_kv keys: every key before the ubatch, then each token's own prefix
+static std::vector<uint8_t> causal_mask(int64_t n_kv, int64_t n_tokens) {
+    const int64_t            n_past = n_kv - n_tokens;
+    std::vector<ggml_fp16_t> m((size_t) (n_kv * n_tokens));
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t j = 0; j < n_kv; j++) {
+            m[(size_t) (t * n_kv + j)] = ggml_fp32_to_fp16(j <= n_past + t ? 0.0f : -INFINITY);
+        }
+    }
+    return to_bytes(m);
+}
+
+static std::vector<uint8_t> reversed_rows(int64_t n) {
+    std::vector<int32_t> r((size_t) n);
+    for (int64_t i = 0; i < n; i++) {
+        r[(size_t) i] = (int32_t) (n - 1 - i);
+    }
+    return to_bytes(r);
+}
 
 // K x M activations, an N x K Q4_K projection; side_reader adds SQR(sum)
 // through a second projection, built first so it is ordered before the norm
@@ -243,6 +279,9 @@ static void set_inputs(norm_graph & g, uint32_t seed) {
             ggml_backend_tensor_set(t, q.data(), 0, q.size());
         }
     }
+    for (const auto & f : g.fixed) {
+        ggml_backend_tensor_set(f.first, f.second.data(), 0, f.second.size());
+    }
 }
 
 // clear everything, then the inputs, and compute on `be`
@@ -282,9 +321,6 @@ static norm_graph build_one_token(ggml_backend_t cpu, int64_t K, int64_t N) {
 }
 
 enum fa_mask { FA_CAUSAL, FA_FULL, FA_BAND, FA_HOLES, FA_BIAS, FA_EMPTY_ROWS };
-
-static const int FA_KV_HEADS = 2;
-static const int FA_HEAD_DIM = 256;
 
 // the array's bf16 answers to ~2e-4, the host kernel's f32 to ~1e-13, ggml-cpu's own op exactly
 static const double FA_ARRAY_NMSE_MIN = 1e-6;
@@ -2605,6 +2641,30 @@ static bool test_dirty_fused(ggml_backend_t npu, ggml_backend_t cpu) {
     return passed;
 }
 
+// the K/V rows in reverse, so attention that ignores the list sees other keys
+static norm_graph build_attention_rows(ggml_backend_t cpu, int64_t n_tokens, int64_t n_kv) {
+    norm_graph       g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * q     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, FA_HEAD_DIM, n_tokens, FA_HEADS, 1);
+    ggml_tensor * k     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, FA_HEAD_DIM, n_kv, FA_KV_HEADS, 1);
+    ggml_tensor * v     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, FA_HEAD_DIM, n_kv, FA_KV_HEADS, 1);
+    ggml_tensor * mask  = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, n_kv, n_tokens, 1, 1);
+    ggml_tensor * rows  = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, n_kv, 1);
+    g.inputs            = { q, k, v };
+    ggml_tensor * out   = ggml_flash_attn_ext_rows(g.ctx, q, k, v, mask, rows, FA_SCALE, 0.0f, 0.0f);
+    ggml_set_name(out, "attn");
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.fixed   = {
+        { mask, causal_mask(n_kv, n_tokens) },
+        { rows, reversed_rows(n_kv) }
+    };
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
 int main(void) {
     // read once a process: the vocabulary projection of test_dirty_outputs on the array; no other case names one
     setenv("GGML_XDNA_HEAD", "1", 1);
@@ -2883,6 +2943,21 @@ int main(void) {
     }
 
     passed = check_cropped_ffn(cpu, npu, ggml_backend_dev_buffer_type(dev), tol) && passed;
+    {
+        norm_graph                      g = build_attention_rows(cpu, FA_TOKENS, FA_KV);
+        std::vector<std::vector<float>> want, got;
+        if (!run(g, cpu, want) || !run(g, npu, got)) {
+            std::printf("test-xdna-graph: compute failed\n");
+            return 1;
+        }
+        const double e  = nmse(want[0], got[0]);
+        const bool   ok = e < tol;
+        passed          = passed && ok;
+        std::printf("FLASH_ATTN_EXT kv_rows     %-5s nmse %.3g %s\n", ggml_get_name(g.checked[0]), e,
+                    ok ? "ok" : "FAIL");
+        ggml_backend_buffer_free(g.buf);
+        ggml_free(g.ctx);
+    }
     passed = test_glux_cases(npu, cpu) && passed;
 
     // a new backend context drops the weights the earlier cases packed
