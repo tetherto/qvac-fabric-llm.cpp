@@ -2,13 +2,14 @@
 // epilogue, then the down projection on the tiles the first phase drained -
 // against a CPU reference. The down projection runs in one pass (the 0.8B's
 // 1024-wide FFN) and in two (the 2B's 2048-wide one, whose second phase
-// replays its tiles and drains through one strided descriptor a stream).
+// replays its tiles and drains through one strided descriptor a stream). The
+// 4B's and 9B's first phase runs past the descriptor file's chunk cap (18, 24).
 //
 // The reference quantizes the input and the silu product to int8 in groups of
 // 32, as the host and the epilogue do, so it differs from the device only by
 // rounding and, for Q6_K, by the 8-bit form's merged group scales (nmse ~1e-5):
 // a broken pass reads as garbage, not as a small error.
-// Skips (exit 0) when no NPU or no fused artifact is found.
+// Skips the device cases (exit 0) when no NPU or no fused artifact is found.
 
 #include "../xdna-gemv.h"
 #include "ggml.h"
@@ -24,6 +25,7 @@ static constexpr int    ACT_GROUP = 32;  // values one int8 scale covers
 static constexpr float  CODE_MAX  = 127.0f;
 static constexpr float  W_SCALE   = 0.02f;
 static constexpr double NMSE_MAX  = 1e-4;  // against the int8 reference
+static constexpr int    BOUND_K   = 2048;  // any K the fused split takes
 
 struct pair_case {
     const char * what;
@@ -32,9 +34,11 @@ struct pair_case {
 };
 
 static const pair_case CASES[] = {
-    { "0.8B FFN, down in one pass",      1024, 3584, 1024, GGML_TYPE_Q6_K },
-    { "2B FFN, Q4_K down in two passes", 2048, 6144, 2048, GGML_TYPE_Q4_K },
-    { "2B FFN, Q6_K down in two passes", 2048, 6144, 2048, GGML_TYPE_Q6_K },
+    { "0.8B FFN, down in one pass",                          1024, 3584,  1024, GGML_TYPE_Q6_K },
+    { "2B FFN, Q4_K down in two passes",                     2048, 6144,  2048, GGML_TYPE_Q4_K },
+    { "2B FFN, Q6_K down in two passes",                     2048, 6144,  2048, GGML_TYPE_Q6_K },
+    { "4B FFN, 18-chunk gate|up, Q4_K down in three passes", 2560, 9216,  2560, GGML_TYPE_Q4_K },
+    { "9B FFN, 24-chunk gate|up, Q6_K down in four passes",  4096, 12288, 4096, GGML_TYPE_Q6_K },
 };
 
 // A [K x N] ggml weight: N rows of K, quantized from normal values.
@@ -132,8 +136,9 @@ static bool run_case(xdna_kernel_pool * pool, const pair_case & c, std::mt19937 
     make_weight(wu, GGML_TYPE_Q4_K, c.K, c.F, rng);
     make_weight(wd, c.down, c.F, c.N, rng);
 
-    const xdna_gemv_geom g1 = xdna_gemv_variant(GGML_TYPE_Q4_K, c.K, 2 * c.F, true, XDNA_GEMV_SPLIT_FUSED);
-    const xdna_gemv_geom g2 = xdna_gemv_variant(c.down, c.F, c.N, false, XDNA_GEMV_SPLIT_FUSED);
+    // Uncapped, as the layers stage it (xdna-rec-gemv.cpp's pack_stage).
+    const xdna_gemv_geom g1 = xdna_gemv_variant(GGML_TYPE_Q4_K, c.K, 2 * c.F, true, XDNA_GEMV_SPLIT_FUSED, true);
+    const xdna_gemv_geom g2 = xdna_gemv_variant(c.down, c.F, c.N, false, XDNA_GEMV_SPLIT_FUSED, true);
     std::vector<int32_t> colmap;
     xdna_gemv_colmap(g1, colmap);
     const ggml_tensor *  gu[2] = { &wg.t, &wu.t };
@@ -172,6 +177,24 @@ static bool run_case(xdna_kernel_pool * pool, const pair_case & c, std::mt19937 
     return ok;
 }
 
+// A fused Q4_K geometry of `n` output columns, uncapped as the layers stage it.
+static xdna_gemv_geom fused_geom(int64_t n) {
+    return xdna_gemv_variant(GGML_TYPE_Q4_K, BOUND_K, n, false, XDNA_GEMV_SPLIT_FUSED, true);
+}
+
+// Valid at xdna_gemv_max_uncapped_chunks chunks and not one chunk past it.
+static bool check_uncapped_bound(void) {
+    const xdna_gemv_geom one   = fused_geom(1);
+    const int64_t        chunk = one.chunk();
+    const int64_t        max   = xdna_gemv_max_uncapped_chunks();
+    const bool           at    = fused_geom(max * chunk).valid();
+    const bool           past  = fused_geom((max + 1) * chunk).valid();
+    const bool           ok    = one.valid() && at && !past;
+    std::printf("%s: uncapped bound %lld chunks (valid at it %d, past it %d)\n", ok ? "ok  " : "FAIL", (long long) max,
+                at, past);
+    return ok;
+}
+
 static int count_failures(xdna_kernel_pool * pool) {
     std::mt19937 rng(42);
     int          failures = 0;
@@ -182,6 +205,10 @@ static int count_failures(xdna_kernel_pool * pool) {
 }
 
 int main(void) {
+    if (!check_uncapped_bound()) {
+        std::printf("test-xdna-pair: the uncapped bound is wrong\n");
+        return 1;
+    }
     const std::string stem = xdna_gemv_stem(XDNA_GEMV_SPLIT_FUSED);
     if (xdna_artifact_find(stem.c_str(), false).xclbin.empty()) {
         std::printf("test-xdna-pair: no %s artifact, skipped\n", stem.c_str());
