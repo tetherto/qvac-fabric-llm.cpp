@@ -1865,6 +1865,13 @@ static bool xdna_host_decode_pin(void) {
 #endif
 }
 
+// Where the decode of a model the fused layers do not take runs.
+static const char * xdna_misfit_route(void) {
+    return xdna_host_decode_threads() > 0 ?
+               "its decode runs on the host" :
+               "the recurrent layers run on the host, the projections and the attention pool keep the NPU";
+}
+
 // The fused designs take a residual width of 1024, and with
 // GGML_XDNA_FUSED_WIDE=1 any up to XDNA_RES_MAX_D (xdna_fused_width); a chunk
 // without a layer norm (d == 0) leaves the choice to one that has it.
@@ -1878,15 +1885,32 @@ static bool xdna_width_fits(int64_t d) {
         GGML_LOG_WARN("%s: the fused decode layers take a %d-wide residual stream%s, this model's is %d: %s\n",
                       "ggml-xdna", (int) XDNA_FUSED_D,
                       xdna_res_width_ok(d) ? " (GGML_XDNA_FUSED_WIDE=1 takes this one too)" : "", (int) d,
-                      xdna_host_decode_threads() > 0 ?
-                          "its decode runs on the host" :
-                          "the recurrent layers run on the host, the projections and the attention pool keep the NPU");
+                      xdna_misfit_route());
+    }
+    return false;
+}
+
+// The fused layers read only their own weight formats (xdna_fused_weight_ok); a chunk with any other is
+// left to the same route as a width they do not take, and one warning names the first such weight.
+static bool xdna_weights_fit(const ggml_cgraph * cgraph) {
+    const ggml_tensor * w = xdna_fused_uncovered(cgraph->nodes, cgraph->n_nodes, xdna_rec_pack::GATED_FMT);
+    if (!w) {
+        return true;
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        GGML_LOG_WARN(
+            "%s: the fused decode layers read ssm_out as %s, the FFN's gate and up as Q4_K and its down as "
+            "Q4_K or Q6_K; this model's %s is %s: %s\n",
+            "ggml-xdna", xdna_rec_pack::GATED_FMT == 0 ? "Q4_K" : "Q5_K or Q6_K", ggml_get_name(w),
+            ggml_type_name(w->type), xdna_misfit_route());
     }
     return false;
 }
 
 static bool xdna_rec_fits(const ggml_cgraph * cgraph) {
-    return xdna_width_fits(xdna_rec_width(cgraph));
+    return xdna_width_fits(xdna_rec_width(cgraph)) && xdna_weights_fit(cgraph);
 }
 
 // A decode (one token a sequence) of a model the fused designs do not cover runs whole
@@ -1897,7 +1921,7 @@ static bool xdna_wants_host_decode(ggml_backend_xdna_context * ctx, const ggml_c
     }
     const int64_t d = xdna_rec_width(cgraph);
     if (d != 0) {
-        ctx->model_misfit[ctx->cur_model] = !xdna_width_fits(d);
+        ctx->model_misfit[ctx->cur_model] = !xdna_width_fits(d) || !xdna_weights_fit(cgraph);
     }
     const auto it = ctx->model_misfit.find(ctx->cur_model);
     return it != ctx->model_misfit.end() && it->second;
@@ -2618,9 +2642,8 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
 
         // The whole recurrent layer runs on the fused design only when the
         // quantized weight set matches its native layouts (Q4_K/Q5_K/Q6_K
-        // ssm_out, Q4_K gate/up, Q4_K/Q6_K down). A mismatch is a hard error
-        // here: the fused path is the only NPU route for the recurrent layers,
-        // there is no scalar fused fallback.
+        // ssm_out, Q4_K gate/up, Q4_K/Q6_K down). xdna_weights_fit keeps any
+        // other set off this path; this error is the backstop.
         if ((p.w_so->type != GGML_TYPE_Q4_K && p.w_so->type != GGML_TYPE_Q5_K && p.w_so->type != GGML_TYPE_Q6_K) ||
             p.w_gate->type != GGML_TYPE_Q4_K || p.w_up->type != GGML_TYPE_Q4_K ||
             (p.w_down->type != GGML_TYPE_Q4_K && p.w_down->type != GGML_TYPE_Q6_K)) {
