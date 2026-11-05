@@ -8,9 +8,12 @@
 // The reference is float, so it differs from the device by the int8
 // activations, the bf16 q and attention and the f16 cache (nmse ~1e-4 on
 // attn_output); a wrong head group or row reads as nmse ~1.
+// The cache-reach check runs on the host first: a cache that ends inside the
+// second head group's last chunk has to be refused.
 // Skips (exit 0) when no NPU or no fused artifact is found.
 
 #include "../xdna-att-layer.h"
+#include "../xdna-att.h"
 #include "../xdna-gemv.h"
 #include "../xdna-runtime.h"
 #include "ggml.h"
@@ -32,6 +35,8 @@ static constexpr float  SCALE    = 0.0625f;
 static constexpr float  W_SCALE  = 0.02f;
 static constexpr float  ROPE_B   = 1e7f;
 static constexpr double NMSE_MAX = 1e-2;
+// the 4B/9B's position stride: four kv heads, two head groups
+static constexpr size_t REACH_POS_B = (size_t) 4 * HD * sizeof(ggml_fp16_t);
 
 struct layer_case {
     const char * what;
@@ -378,6 +383,27 @@ static bool run_case(xdna_kernel_pool * pool, const layer_case & c, std::mt19937
     return ok;
 }
 
+// Whether the layer takes K and V buffers of `bytes` each for `groups` head
+// groups at the 4B/9B's position stride.
+static bool reach_fits(size_t bytes, int groups) {
+    xdna_buffer kb, vb;
+    kb.bytes = bytes;
+    vb.bytes = bytes;
+    return xdna_att_layer_fits(&kb, 0, &vb, 0, N_VALID, REACH_POS_B, groups);
+}
+
+// Head group g reads its last chunk up to `last` + (g + 1) * POS_B: a cache
+// that ends below group 1's reach fits one group, not two.
+static bool check_group_reach(void) {
+    const size_t last   = ((size_t) xdna_att_geom::chunk_count(N_VALID) * xdna_att_geom::ROUND - 1) * REACH_POS_B;
+    const size_t reach1 = last + xdna_att_geom::POS_B;
+    const size_t reach2 = last + 2 * (size_t) xdna_att_geom::POS_B;
+    const bool   ok =
+        reach_fits(reach1, 1) && !reach_fits(reach1, 2) && !reach_fits(reach2 - 1, 2) && reach_fits(reach2, 2);
+    std::printf("%s: a cache that ends between the head groups' reach is refused\n", ok ? "ok  " : "FAIL");
+    return ok;
+}
+
 static int count_failures(xdna_kernel_pool * pool) {
     std::mt19937 rng(7);
     int          failures = 0;
@@ -388,6 +414,10 @@ static int count_failures(xdna_kernel_pool * pool) {
 }
 
 int main(void) {
+    if (!check_group_reach()) {
+        std::printf("test-xdna-att-layer: 1 failure\n");
+        return 1;
+    }
     const std::string stem = xdna_gemv_stem(XDNA_GEMV_SPLIT_FUSED);
     if (xdna_artifact_find(stem.c_str(), false).xclbin.empty()) {
         std::printf("test-xdna-att-layer: no %s artifact, skipped\n", stem.c_str());
