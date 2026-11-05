@@ -12,7 +12,12 @@ static constexpr int64_t N_CELLS       = 4;     // recurrent cache cells
 static constexpr int64_t N_RS          = 2;     // the ubatch's sequence and one extra cell
 static constexpr int64_t D_ATTN        = 2048;  // a Qwen3.5 attention layer's output projection input
 static constexpr int64_t D_MODEL       = 1024;  // its residual width
-static constexpr int     MAX_TENSORS   = 32;
+static constexpr int64_t HEAD_DIM      = 256;   // a Qwen3.5 full-attention layer's head size
+static constexpr int64_t N_HEAD        = 8;     // its query heads
+static constexpr int64_t N_HEAD_KV     = 2;     // its K/V heads
+static constexpr int64_t N_KV          = 512;   // K/V view cells
+static constexpr int64_t N_BATCH       = 64;    // prefill tokens
+static constexpr int     MAX_TENSORS   = 48;
 
 struct match_case {
     const char *        what;
@@ -20,9 +25,15 @@ struct match_case {
     const ggml_tensor * want;
 };
 
-template <size_t N> static int count_failures(const match_case (&cases)[N]) {
+struct bool_case {
+    const char * what;
+    bool         got;
+    bool         want;
+};
+
+template <typename C, size_t N> static int count_failures(const C (&cases)[N]) {
     int failures = 0;
-    for (const match_case & c : cases) {
+    for (const C & c : cases) {
         const bool ok = c.got == c.want;
         std::printf("%s: %s\n", ok ? "ok  " : "FAIL", c.what);
         failures += ok ? 0 : 1;
@@ -74,10 +85,40 @@ static int check_row_crop(ggml_context * ctx) {
     return count_failures(cases);
 }
 
+// The attention kernels read K/V as the leading cells of the view, so a node with
+// sinks or with K/V row lists (ggml_flash_attn_ext_rows) stays on the host.
+static int check_fa_plain(ggml_context * ctx) {
+    const float   scale = 1.0f / 16.0f;
+    ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HEAD_DIM, N_BATCH, N_HEAD, 1);
+    ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HEAD_DIM, N_KV, N_HEAD_KV, 1);
+    ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HEAD_DIM, N_KV, N_HEAD_KV, 1);
+    ggml_tensor * mask  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, N_KV, N_BATCH);
+    ggml_tensor * fa    = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+
+    ggml_tensor * sinks    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, N_HEAD);
+    ggml_tensor * fa_sinks = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_add_sinks(fa_sinks, sinks);
+
+    // a row list as long as the view: every shape the kernels check still matches
+    ggml_tensor * kv_rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N_KV, 1);
+    ggml_tensor * fa_rows = ggml_flash_attn_ext_rows(ctx, q, k, v, mask, kv_rows, scale, 0.0f, 0.0f);
+
+    ggml_tensor * add = ggml_add(ctx, q, q);
+
+    const bool_case cases[] = {
+        { "plain attention goes to the kernels", xdna_fa_plain(fa), true },
+        { "attention with sinks stays on the host", xdna_fa_plain(fa_sinks), false },
+        { "attention over K/V row lists stays on the host", xdna_fa_plain(fa_rows), false },
+        { "an add is not attention", xdna_fa_plain(add), false },
+        { "no node is not attention", xdna_fa_plain(nullptr), false },
+    };
+    return count_failures(cases);
+}
+
 int main(void) {
     const ggml_init_params params = { ggml_tensor_overhead() * MAX_TENSORS, nullptr, true };
     ggml_context *         ctx    = ggml_init(params);
-    const int              failures = check_state_gather(ctx) + check_row_crop(ctx);
+    const int              failures = check_state_gather(ctx) + check_row_crop(ctx) + check_fa_plain(ctx);
     ggml_free(ctx);
     if (failures) {
         std::printf("test-xdna-match: %d failures\n", failures);

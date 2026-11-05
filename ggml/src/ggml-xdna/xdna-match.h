@@ -22,3 +22,12 @@ static inline ggml_tensor * xdna_skip_row_crop(ggml_tensor * t) {
                       ggml_nrows(t->src[0]) == 1;
     return crop ? t->src[0] : t;
 }
+
+// A FLASH_ATTN_EXT the attention kernels can take: q, k and v, no sinks
+// (src[4]) and no K/V row lists (src[5], ggml_flash_attn_ext_rows). The kernels
+// read each head's keys and values as the leading cells of the K/V view; with
+// row lists, mask column i stands for cache row kv_rows[i] instead.
+static inline bool xdna_fa_plain(const ggml_tensor * n) {
+    return n && n->op == GGML_OP_FLASH_ATTN_EXT && n->src[0] && n->src[1] && n->src[2] && !n->src[4] &&
+           !n->src[5];
+}
