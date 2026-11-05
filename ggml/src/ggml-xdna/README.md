@@ -687,6 +687,10 @@ Diagnostics - nothing is measured unless they are set:
   output then differs from the host's by about 3e-5 relative. On the test
   prompt this touches only layer 8 head 15 of the 4B and the 9B; every other
   chunk runs as before.
+- An eval callback (`llama-eval-callback`, `imatrix`) that watches a recurrent
+  layer's `final_output` or `linear_attn_out` in a prefill splits the graph
+  between the gated norm and `ssm_out`, and the array's outputs at those
+  tensors come back empty, so the tool reads garbage there.
 - The host-built instruction streams and the RTP/shim constants follow the
   mlir-aie placement. The design tag does not cover the toolchain version, so a
   toolchain bump has to be paired with re-reading those constants.
