@@ -27,6 +27,12 @@
 // (ggml_flash_attn_ext_rows): the mmul reads K/V in mask order, so the backend
 // has to leave it to the host, which follows the list.
 //
+// A prompt's gated delta net at the 4B/9B's width (32 value heads over 16 q/k
+// groups, two runs of the array), twice: with one head decaying ~1e-10 a token,
+// as the 4B's layer 8 head 15 does (its chunk factors must stay in range,
+// xdna-gdn-mm.cpp G_MIN), and with one that turns that fast after a chunk that
+// leaves it just above the renormalization point (its shift, SHIFT_MAX).
+//
 // Every intermediate is cleared before each backend runs, so a node read
 // before it was written shows as zeros instead of as the other backend's
 // result. Skips (exit 0) when no XDNA device is registered.
@@ -54,6 +60,22 @@ static constexpr int64_t FA_KV        = 1024;
 static constexpr int64_t FA_DEC_CTX   = 512;
 static constexpr int64_t FA_DEC_VALID = 300;
 static constexpr float   FA_SCALE     = 0.0625f;
+
+// The gated delta net case: a prompt over the array's minimum, the 4B's heads,
+// one head's gates (natural log) far under the floor and the others' range
+static constexpr int64_t GDN_S         = 128;
+static constexpr int64_t GDN_GROUPS    = 16;
+static constexpr int64_t GDN_V_HEADS   = 32;
+static constexpr int64_t GDN_TOKENS    = 163;
+static constexpr int64_t GDN_FAST_HEAD = 15;
+static constexpr float   GDN_FAST_GATE = -23.0f;
+static constexpr float   GDN_GATE_LO   = -2.0f;
+static constexpr float   GDN_GATE_HI   = -0.05f;
+static constexpr float   GDN_BETA_LO   = 0.1f;
+static constexpr float   GDN_BETA_HI   = 0.9f;
+static constexpr int64_t GDN_CHUNK     = 16;      // tokens a chunk on the array
+static constexpr int64_t GDN_EDGE_HEAD = 23;
+static constexpr float   GDN_EDGE_GATE = -1.36f;  // a chunk of it sums to -31.4 log2, just above LS_MIN
 
 static ggml_backend_dev_t xdna_device(void) {
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -348,6 +370,76 @@ static norm_graph build_decode_attention(ggml_backend_t be, int64_t heads, int64
     return g;
 }
 
+// n rows of GDN_S values, uniform in [-1, 1), each scaled to unit length (the
+// model's L2 norm of q and k) when `unit`
+static std::vector<float> gdn_rows(std::mt19937 & rng, int64_t n, bool unit) {
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::vector<float>                    v((size_t) (n * GDN_S));
+    for (float & x : v) {
+        x = u(rng);
+    }
+    for (int64_t r = 0; unit && r < n; r++) {
+        double ss = 0;
+        for (int64_t i = 0; i < GDN_S; i++) {
+            ss += (double) v[(size_t) (r * GDN_S + i)] * v[(size_t) (r * GDN_S + i)];
+        }
+        for (int64_t i = 0; i < GDN_S; i++) {
+            v[(size_t) (r * GDN_S + i)] /= (float) std::sqrt(ss);
+        }
+    }
+    return v;
+}
+
+// a value a token and value head, uniform in [lo, hi)
+static std::vector<float> gdn_uniform(std::mt19937 & rng, float lo, float hi) {
+    std::uniform_real_distribution<float> u(lo, hi);
+    std::vector<float>                    v((size_t) (GDN_TOKENS * GDN_V_HEADS));
+    for (float & x : v) {
+        x = u(rng);
+    }
+    return v;
+}
+
+// the gates (natural log) in [GDN_GATE_LO, GDN_GATE_HI), but `head`'s: `first`
+// over its first `n_first` tokens, GDN_FAST_GATE after
+static std::vector<float> gdn_gates(std::mt19937 & rng, int64_t head, int64_t n_first, float first) {
+    std::vector<float> v = gdn_uniform(rng, GDN_GATE_LO, GDN_GATE_HI);
+    for (int64_t t = 0; t < GDN_TOKENS; t++) {
+        v[(size_t) (t * GDN_V_HEADS + head)] = t < n_first ? first : GDN_FAST_GATE;
+    }
+    return v;
+}
+
+// One prefill GATED_DELTA_NET from a zero state, its gates from gdn_gates(head,
+// n_first, first); its inputs fixed, so both backends see the same gates
+static norm_graph build_gdn(ggml_backend_t be, int64_t head, int64_t n_first, float first) {
+    norm_graph       g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * q     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, GDN_S, GDN_GROUPS, GDN_TOKENS, 1);
+    ggml_tensor * k     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, GDN_S, GDN_GROUPS, GDN_TOKENS, 1);
+    ggml_tensor * v     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, GDN_S, GDN_V_HEADS, GDN_TOKENS, 1);
+    ggml_tensor * gate  = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, 1, GDN_V_HEADS, GDN_TOKENS, 1);
+    ggml_tensor * beta  = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, 1, GDN_V_HEADS, GDN_TOKENS, 1);
+    ggml_tensor * s     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, GDN_S, GDN_S, GDN_V_HEADS, 1);
+    ggml_tensor * out   = ggml_gated_delta_net(g.ctx, q, k, v, gate, beta, s, 1);
+    ggml_set_name(out, "gdn");
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    std::mt19937 rng(1234);
+    g.fixed = {
+        { q, to_bytes(gdn_rows(rng, GDN_GROUPS * GDN_TOKENS, true)) },
+        { k, to_bytes(gdn_rows(rng, GDN_GROUPS * GDN_TOKENS, true)) },
+        { v, to_bytes(gdn_rows(rng, GDN_V_HEADS * GDN_TOKENS, false)) },
+        { gate, to_bytes(gdn_gates(rng, head, n_first, first)) },
+        { beta, to_bytes(gdn_uniform(rng, GDN_BETA_LO, GDN_BETA_HI)) },
+        { s, to_bytes(std::vector<float>((size_t) (GDN_S * GDN_S * GDN_V_HEADS), 0.0f)) },
+    };
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
 static void free_graph(norm_graph & g) {
     ggml_backend_buffer_free(g.buf);
     ggml_free(g.ctx);
@@ -369,6 +461,47 @@ static bool check_one(norm_graph &   g,
     const bool   ok = e < tol;
     *passed         = *passed && ok;
     std::printf("%-26s %-5s nmse %.3g %s\n", what, ggml_get_name(g.checked[0]), e, ok ? "ok" : "FAIL");
+    return true;
+}
+
+// value head h's nmse over its columns of every token's output and its state
+static double gdn_head_nmse(const std::vector<float> & ref, const std::vector<float> & got, int64_t h) {
+    std::vector<float> r, o;
+    for (int64_t t = 0; t < GDN_TOKENS; t++) {
+        const size_t at = (size_t) ((t * GDN_V_HEADS + h) * GDN_S);
+        r.insert(r.end(), ref.begin() + at, ref.begin() + at + GDN_S);
+        o.insert(o.end(), got.begin() + at, got.begin() + at + GDN_S);
+    }
+    const size_t st = (size_t) (GDN_TOKENS * GDN_V_HEADS * GDN_S + h * GDN_S * GDN_S);
+    r.insert(r.end(), ref.begin() + st, ref.begin() + st + GDN_S * GDN_S);
+    o.insert(o.end(), got.begin() + st, got.begin() + st + GDN_S * GDN_S);
+    return nmse(r, o);
+}
+
+// The GDN graph on the CPU and on the NPU, head by head: a head decaying fast
+// carries a small share of the whole output, which one nmse would not see
+static bool check_gdn(norm_graph &   g,
+                      ggml_backend_t cpu,
+                      ggml_backend_t npu,
+                      const char *   what,
+                      double         tol,
+                      bool *         passed) {
+    std::vector<std::vector<float>> want, got;
+    if (!run(g, cpu, want) || !run(g, npu, got)) {
+        return false;
+    }
+    bool    ok    = true;
+    int64_t worst = 0;
+    double  e_max = 0;
+    for (int64_t h = 0; h < GDN_V_HEADS; h++) {
+        const double e = gdn_head_nmse(want[0], got[0], h);
+        ok             = ok && e < tol;
+        worst          = e > e_max ? h : worst;
+        e_max          = std::fmax(e_max, e);
+    }
+    *passed = *passed && ok;
+    std::printf("%-26s %-5s worst head %lld nmse %.3g %s\n", what, ggml_get_name(g.checked[0]), (long long) worst,
+                e_max, ok ? "ok" : "FAIL");
     return true;
 }
 
@@ -457,6 +590,18 @@ int main(void) {
         std::printf("test-xdna-graph: compute failed\n");
         return 1;
     }
+    norm_graph gdn = build_gdn(cpu, GDN_FAST_HEAD, 0, GDN_FAST_GATE);
+    if (!check_gdn(gdn, cpu, npu, "GATED_DELTA_NET fast head", tol, &passed)) {
+        std::printf("test-xdna-graph: compute failed\n");
+        return 1;
+    }
+    free_graph(gdn);
+    gdn = build_gdn(cpu, GDN_EDGE_HEAD, GDN_CHUNK, GDN_EDGE_GATE);
+    if (!check_gdn(gdn, cpu, npu, "GATED_DELTA_NET shift edge", tol, &passed)) {
+        std::printf("test-xdna-graph: compute failed\n");
+        return 1;
+    }
+    free_graph(gdn);
 
     ggml_backend_free(npu);
     ggml_backend_free(cpu);

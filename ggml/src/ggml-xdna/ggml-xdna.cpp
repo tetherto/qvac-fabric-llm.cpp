@@ -951,6 +951,15 @@ struct xdna_rec_session {
     std::vector<float>   cap_qkv, cap_conv, cap_ss, cap_hres, cap_act;
 };
 
+// Floats of a session's ssm state and conv history rows in llama's cache.
+static size_t xdna_rec_state_n(const xdna_rec_session * s) {
+    return (size_t) xdna_rec_pack::state_floats(s->host.n_vh);
+}
+
+static size_t xdna_rec_conv_n(const xdna_rec_session * s) {
+    return (size_t) 3 * xdna_rec_pack::channels(s->host.n_vh);
+}
+
 namespace {
 
 // Per-graph plan of one fused layer: the node indices/tensors the fused run
@@ -987,7 +996,32 @@ struct xdna_rec_plan {
     // two MUL_MATs never run.
     ggml_tensor * n_act      = nullptr;
     int           i_cap_act  = -1;
+    int           n_vh       = 0;  // value heads (xdna_rec_layer_heads)
 };
+
+// The value heads of a GDN state row of n floats, 0 when the core runs none.
+int xdna_rec_state_heads(int64_t n) {
+    using namespace xdna_rec_pack;
+    for (int p = 1; p <= MAX_PASSES; p++) {
+        if (n == state_floats(p * NVH)) {
+            return p * NVH;
+        }
+    }
+    return 0;
+}
+
+// A layer's value heads off its tensors, 0 when they disagree or the core
+// does not run that many: the convolution's channels, the state row and the
+// gates.
+int xdna_rec_layer_heads(const xdna_rec_plan & p) {
+    using namespace xdna_rec_pack;
+    const int n_vh = (int) (p.w_conv->ne[1] / SV) - 2 * NKG;
+    if (!heads_ok(n_vh) || p.w_conv->ne[1] != channels(n_vh) || xdna_rec_state_heads(p.n_sstate->ne[0]) != n_vh ||
+        ggml_nelements(p.n_gate) != n_vh || ggml_nelements(p.n_beta) != n_vh) {
+        return 0;
+    }
+    return n_vh;
+}
 
 }  // namespace
 
@@ -2091,7 +2125,7 @@ static bool xdna_rec_scan(ggml_backend_xdna_context *  ctx,
             m[il].n_resid = const_cast<ggml_tensor *>(n);
         }
         // cache_s read (GET_ROWS over the state cell), the ssm seed.
-        if (n->op == GGML_OP_GET_ROWS && n->ne[0] == xdna_rec_pack::state_floats() && n->ne[1] == 1) {
+        if (n->op == GGML_OP_GET_ROWS && xdna_rec_state_heads(n->ne[0]) > 0 && n->ne[1] == 1) {
             const ggml_tensor * r = n->src[0];
             if (r && ggml_get_name(r)) {
                 const char * src_name = ggml_get_name(r);
@@ -2116,6 +2150,10 @@ static bool xdna_rec_scan(ggml_backend_xdna_context *  ctx,
         // Single-token, single-sequence decode only (qkv rows == 1).
         if (p.n_qkv->ne[1] != 1 || p.n_qkv->ne[2] != 1 || p.n_qkv->ne[3] != 1) {
             continue;
+        }
+        p.n_vh = xdna_rec_layer_heads(p);
+        if (p.n_vh == 0) {
+            continue;  // a head count the core does not run
         }
         int maxi          = 0;
         // Both projections read the same normed row; it is the fire's input
@@ -2365,8 +2403,8 @@ static void xdna_rec_follow_cache(ggml_backend_xdna_context * ctx, const ggml_cg
         }
         ggml_tensor * ts = cache_s[il];
         ggml_tensor * tr = cache_r[il];
-        const size_t  ns = (size_t) xdna_rec_pack::state_floats();
-        const size_t  nr = (size_t) 3 * xdna_rec_pack::CH;
+        const size_t  ns = xdna_rec_state_n(s);
+        const size_t  nr = xdna_rec_conv_n(s);
         if (ts->type != GGML_TYPE_F32 || tr->type != GGML_TYPE_F32 || !ts->data || !tr->data ||
             ggml_nbytes(ts) < (size_t) (row + 1) * ns * sizeof(float) ||
             ggml_nbytes(tr) < (size_t) (row + 1) * nr * sizeof(float)) {
@@ -2436,14 +2474,14 @@ static bool xdna_rows_f32(const ggml_tensor * w, std::vector<float> & out) {
 }
 
 // The GDN gates' pieces off the graph: gate = softplus(W_a x + dt) * a and
-// beta = sigmoid(W_b x), the weights with NVH rows of the row length each.
+// beta = sigmoid(W_b x), the weights with a row of the row length a value head.
 static bool xdna_gates_of(const xdna_rec_plan & p,
                           std::vector<float> &  wa,
                           std::vector<float> &  wb,
                           std::vector<float> &  dt,
                           std::vector<float> &  a) {
-    using namespace xdna_rec_pack;
-    const ggml_tensor * g = p.n_gate;
+    const int64_t       nvh = p.n_vh;
+    const ggml_tensor * g   = p.n_gate;
     if (!g || g->op != GGML_OP_MUL || !xdna_rec_is_leaf(g->src[1]) || !p.n_beta) {
         return false;
     }
@@ -2462,13 +2500,31 @@ static bool xdna_gates_of(const xdna_rec_plan & p,
     }
     const ggml_tensor * mb = xdna_under_views(sg->src[0]);
     if (!ma || !mb || !p.n_act || ma->op != GGML_OP_MUL_MAT || mb->op != GGML_OP_MUL_MAT ||
-        ma->src[0]->ne[0] != p.n_act->ne[0] || ma->src[0]->ne[1] != NVH || mb->src[0]->ne[0] != p.n_act->ne[0] ||
-        mb->src[0]->ne[1] != NVH || ma->src[1] != p.n_act || mb->src[1] != p.n_act ||
-        ggml_nelements(add->src[1]) != NVH || ggml_nelements(g->src[1]) != NVH) {
+        ma->src[0]->ne[0] != p.n_act->ne[0] || ma->src[0]->ne[1] != nvh || mb->src[0]->ne[0] != p.n_act->ne[0] ||
+        mb->src[0]->ne[1] != nvh || ma->src[1] != p.n_act || mb->src[1] != p.n_act ||
+        ggml_nelements(add->src[1]) != nvh || ggml_nelements(g->src[1]) != nvh) {
         return false;
     }
     return xdna_rows_f32(ma->src[0], wa) && xdna_rows_f32(mb->src[0], wb) && xdna_rows_f32(add->src[1], dt) &&
            xdna_rows_f32(g->src[1], a);
+}
+
+// The layer's in-projection at the head of its stream: one GEMV for a layer
+// of one pass, qkv and z apart past it.
+static bool xdna_rec_set_inproj(xdna_rec_core * core, const xdna_rec_plan & p) {
+    using namespace xdna_rec_pack;
+    const ggml_tensor * wq = p.n_qkv->src[0];
+    const ggml_tensor * wz = p.n_z->src[0];
+    if (p.n_vh > NVH) {
+        xdna_gemv_geom       gq, gz;
+        std::vector<uint8_t> pq, pz;
+        return wq->ne[1] == channels(p.n_vh) && wz->ne[1] == (int64_t) p.n_vh * SV &&
+               xdna_rec_inproj_pack_one(wq, gq, pq) && xdna_rec_inproj_pack_one(wz, gz, pz) &&
+               xdna_rec_core_set_inproj_split(core, gq, pq, gz, pz);
+    }
+    xdna_rec_inproj ip;
+    return xdna_rec_inproj_pack(wq, wz, ip) && ip.n_qkv == channels(p.n_vh) && ip.n_z == p.n_vh * SV &&
+           xdna_rec_core_set_inproj(core, ip.geom, ip.packed);
 }
 
 static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
@@ -2500,8 +2556,8 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
     const int64_t row = xdna_rec_seq_row(p);
     if (s->seeded && !xdna_rec_holds(ctx, s, row)) {
         xdna_pending_wait(ctx);
-        const size_t ns = (size_t) state_floats();
-        const size_t nr = (size_t) 3 * CH;
+        const size_t ns = xdna_rec_state_n(s);
+        const size_t nr = xdna_rec_conv_n(s);
         if (!s->own_s || !s->own_r || s->row < 0 || s->own_s_b < (size_t) (s->row + 1) * ns * sizeof(float) ||
             s->own_r_b < (size_t) (s->row + 1) * nr * sizeof(float) ||
             !xdna_rec_core_read_state(s->core, s->own_r + (size_t) s->row * nr, s->own_s + (size_t) s->row * ns)) {
@@ -2521,18 +2577,19 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
     // valid, so they are read live from their tensors.
     const bool    inproj = p.n_act != nullptr;
     const float * act    = inproj && !s->cap_act.empty() ? s->cap_act.data() : nullptr;
-    const float * qkv    = inproj ? nullptr : !s->cap_qkv.empty() ? s->cap_qkv.data() : xdna_rec_tdata(p.n_qkv, CH);
-    const float * z      = inproj ? nullptr : xdna_rec_tdata(p.n_z, (int64_t) NVH * SV);
-    const float * gate   = xdna_rec_tdata(p.n_gate, NVH);
-    const float * beta   = xdna_rec_tdata(p.n_beta, NVH);
+    const int64_t ch_n   = channels(p.n_vh);
+    const float * qkv    = inproj ? nullptr : !s->cap_qkv.empty() ? s->cap_qkv.data() : xdna_rec_tdata(p.n_qkv, ch_n);
+    const float * z      = inproj ? nullptr : xdna_rec_tdata(p.n_z, (int64_t) p.n_vh * SV);
+    const float * gate   = xdna_rec_tdata(p.n_gate, p.n_vh);
+    const float * beta   = xdna_rec_tdata(p.n_beta, p.n_vh);
     if ((inproj ? !act : (!qkv || !z)) || !gate || !beta) {
         GGML_LOG_ERROR("%s: fused layer %d: bad input tensors\n", "ggml-xdna", p.il);
         return false;
     }
 
     if (!s->seeded) {
-        const float * ch = !s->cap_conv.empty() ? s->cap_conv.data() : xdna_rec_tdata(p.n_convst, (int64_t) 3 * CH);
-        const float * st = !s->cap_ss.empty() ? s->cap_ss.data() : xdna_rec_tdata(p.n_sstate, state_floats());
+        const float * ch = !s->cap_conv.empty() ? s->cap_conv.data() : xdna_rec_tdata(p.n_convst, 3 * ch_n);
+        const float * st = !s->cap_ss.empty() ? s->cap_ss.data() : xdna_rec_tdata(p.n_sstate, state_floats(p.n_vh));
         if (!ch || !st) {
             GGML_LOG_ERROR("%s: fused layer %d: no recurrent state to seed\n", "ggml-xdna", p.il);
             return false;
@@ -2541,6 +2598,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
         // keeps the session's device objects and only reloads its state.
         const bool create   = s->core == nullptr;
         s->host.il          = p.il;
+        s->host.n_vh        = p.n_vh;
         s->host.w_conv      = (const float *) p.w_conv->data;
         s->host.w_ssm_norm  = (const float *) p.w_gamma->data;
         s->host.w_post_norm = (const float *) p.w_post->data;
@@ -2586,7 +2644,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
         }
 
         xdna_rec_pack_begin(s->host, ch, qkv, s->feed0);
-        xdna_rec_geom                     g = xdna_rec_pack_geom(D);
+        xdna_rec_geom                     g = xdna_rec_pack_geom(D, p.n_vh);
         // the layer's buffers join the token's command (xdna_run_submit)
         std::unique_ptr<xdna_arena_scope> arena;
         if (create) {
@@ -2617,9 +2675,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
             // and the same hardware context; this makes them one stream, so the
             // array pays its fixed per-phase cost once instead of twice.
             if (inproj) {
-                xdna_rec_inproj ip;
-                if (!xdna_rec_inproj_pack(p.n_qkv->src[0], p.n_z->src[0], ip) || ip.n_qkv != CH || ip.n_z != NVH * SV ||
-                    !xdna_rec_core_set_inproj(s->core, ip.geom, ip.packed)) {
+                if (!xdna_rec_set_inproj(s->core, p)) {
                     GGML_LOG_ERROR(
                         "%s: fused layer %d: the in-projection (%s, %s) "
                         "does not split into the core's inputs; "
@@ -2693,7 +2749,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
     }
 
     xdna_prof::section_timer st_pre("layer: host pre (pack_x + ffn prep_raw)");
-    xdna_rec_pack_x(gate, beta, s->x);
+    xdna_rec_pack_x(gate, beta, s->x, p.n_vh);
     const int t = s->core->token;
 
     // With the projection draining into the FFN's tiles, the host's half of
@@ -3707,7 +3763,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
         };
         for (int i = 0; i < cgraph->n_nodes; i++) {
             struct ggml_tensor * gd = cgraph->nodes[i];
-            if (gd->op != GGML_OP_GATED_DELTA_NET || !xdna_gdn_mm_supported(gd)) {
+            if (gd->op != GGML_OP_GATED_DELTA_NET || !xdna_gdn_mm_supported(gd) || !xdna_gdn_mm_one_run(gd)) {
                 continue;
             }
             l2_of                q2, k2;
@@ -4092,18 +4148,18 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             if (s && node->type == GGML_TYPE_F32 && node->data) {
                 switch (c.kind) {
                     case 0:  // qkv
-                        s->cap_qkv.resize(xdna_rec_pack::CH);
-                        std::memcpy(s->cap_qkv.data(), node->data, xdna_rec_pack::CH * sizeof(float));
+                        s->cap_qkv.resize((size_t) xdna_rec_pack::channels(c.p->n_vh));
+                        std::memcpy(s->cap_qkv.data(), node->data, s->cap_qkv.size() * sizeof(float));
                         break;
                     case 1:  // conv seed (only consumed at the one-time seed)
                         if (reseed) {
-                            s->cap_conv.resize((size_t) 3 * xdna_rec_pack::CH);
-                            std::memcpy(s->cap_conv.data(), node->data, (size_t) 3 * xdna_rec_pack::CH * sizeof(float));
+                            s->cap_conv.resize((size_t) 3 * xdna_rec_pack::channels(c.p->n_vh));
+                            std::memcpy(s->cap_conv.data(), node->data, s->cap_conv.size() * sizeof(float));
                         }
                         break;
                     case 2:
                         {  // ssm seed (only consumed at the one-time seed)
-                            const int64_t n = xdna_rec_pack::state_floats();
+                            const int64_t n = xdna_rec_pack::state_floats(c.p->n_vh);
                             if (reseed) {
                                 s->cap_ss.resize((size_t) n);
                                 std::memcpy(s->cap_ss.data(), node->data, (size_t) n * sizeof(float));
@@ -4788,13 +4844,16 @@ static void xdna_rec_follow_io(const void * p, size_t n, bool write) {
     std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
     const char * const a0     = (const char *) p;
     const char * const a1     = a0 + n;
-    const size_t       ns     = (size_t) xdna_rec_pack::state_floats();
-    const size_t       nr     = (size_t) 3 * xdna_rec_pack::CH;
     bool               waited = false;
     const auto         visit  = [&](std::map<std::pair<int, int64_t>, xdna_rec_session *> & rec) {
         for (auto & kv : rec) {
             xdna_rec_session * s = kv.second;
-            if (!s || !s->seeded || !s->own_s || !s->own_r || s->row < 0 ||
+            if (!s) {
+                continue;
+            }
+            const size_t ns = xdna_rec_state_n(s);
+            const size_t nr = xdna_rec_conv_n(s);
+            if (!s->seeded || !s->own_s || !s->own_r || s->row < 0 ||
                 s->own_s_b < (size_t) (s->row + 1) * ns * sizeof(float) ||
                 s->own_r_b < (size_t) (s->row + 1) * nr * sizeof(float)) {
                 continue;
