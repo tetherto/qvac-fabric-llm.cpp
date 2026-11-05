@@ -51,6 +51,9 @@ struct xdna_buffer {
     // joined stream names instead of this buffer.
     xdna_buffer * root     = nullptr;
     size_t        root_off = 0;
+    // Unique in the process: a run bound to this buffer is keyed by it, since a
+    // freed buffer's address comes back for the next one.
+    uint64_t      gen      = 0;
 };
 
 // Pool of kernels: holds the artifact stems found in the search dirs and the

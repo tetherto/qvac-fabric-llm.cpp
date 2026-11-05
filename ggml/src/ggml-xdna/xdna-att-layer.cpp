@@ -100,9 +100,10 @@ struct xdna_att_layer {
     struct variant {
         xdna_kernel *              kern = nullptr;
         xrt::run                   run;
-        xdna_buffer *              kbo = nullptr;
-        xdna_buffer *              vbo = nullptr;
-        xdna_buffer *              res = nullptr;
+        // the generations of the K, V and residual buffers the run is bound to
+        uint64_t                   kgen = 0;
+        uint64_t                   vgen = 0;
+        uint64_t                   rgen = 0;
         std::vector<xdna_buffer *> args;  // the run's, for a joined token stream
     };
 
@@ -574,14 +575,17 @@ xrt::run * xdna_att_layer_start(xdna_att_layer * l, const xdna_att_layer_in & in
     if (!xdna_kernel_rewrite_insts(v.kern, words.data(), words.size())) {
         return nullptr;  // xdna-runtime names the stream and the reason
     }
-    if (v.kbo != in.kbo || v.vbo != in.vbo || v.res != in.res) {
+    if (v.kgen != in.kbo->gen || v.vgen != in.vbo->gen || v.rgen != in.res->gen) {
         xdna_buffer * args[8] = { in.kbo, l->act, l->ids, l->r, in.vbo, l->wbuf, xdna_gemv_pair_act_buf(l->rg->ffn),
                                   in.res };
         v.run                 = xdna_kernel_run_make(v.kern, args, 8);
         v.args.assign(args, args + 8);
-        v.kbo = in.kbo;
-        v.vbo = in.vbo;
-        v.res = in.res;
+        v.kgen = in.kbo->gen;
+        v.vgen = in.vbo->gen;
+        v.rgen = in.res->gen;
+        GGML_LOG_DEBUG("%s: layer %p binds K %p and V %p (buffers %llu and %llu)\n", "xdna-att-layer", (void *) l,
+                       (void *) in.kbo, (void *) in.vbo, (unsigned long long) in.kbo->gen,
+                       (unsigned long long) in.vbo->gen);
     }
     // The two row inputs' tiles carry their norms' epsilon: written once.
     if (in.eps_attn != l->eps_attn || in.eps_post != l->eps_post) {
