@@ -18,7 +18,8 @@
 //
 // The straight run's logits after its last prompt token and after each greedy token are also compared with a CPU-only run
 // of the same steps, fed its tokens: the runs above take the same routes on both sides, so a route that is wrong the same
-// way every time passes them.
+// way every time passes them. So is a longer sequence's state restored after a shorter one was decoded: the restore writes
+// cache rows below the ones that decode left on the device, and a test hook keeps them stale in memory until a flush.
 #include "llama.h"
 
 #include <cmath>
@@ -74,6 +75,16 @@ typedef int (*host_chunk_count_fn)(void);
 static host_chunk_count_fn host_chunk_counter(ggml_backend_dev_t dev) {
     return dev ? (host_chunk_count_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
                                                                          "ggml_backend_xdna_test_host_chunk_count") :
+                 nullptr;
+}
+
+typedef int (*stale_kv_fn)(int arm);
+
+// The backend's hook that leaves the K/V rows the host next writes stale in memory until a flush, and counts the times it
+// did; null on a backend without it.
+static stale_kv_fn stale_kv_hook(ggml_backend_dev_t dev) {
+    return dev ? (stale_kv_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+                                                                 "ggml_backend_xdna_test_stale_kv") :
                  nullptr;
 }
 
@@ -142,6 +153,59 @@ static trace straight(llama_model * model, std::vector<llama_token> & p, int nv,
     size_t          k = 0;
     llama_decode(ctx, llama_batch_get_one(p.data(), (int) p.size() - 1));
     if (llama_decode(ctx, llama_batch_get_one(&p.back(), 1)) == 0) {
+        snapshot(ctx, nv, { -1 }, tr);
+        decode_steps(ctx, nv, STRAIGHT_TOKENS, tr, forced, k);
+    }
+    llama_free(ctx);
+    return tr;
+}
+
+constexpr int RESTORE_LONG_TOKENS  = 150;
+constexpr int RESTORE_SHORT_TOKENS = 90;
+constexpr int RESTORE_SHORT_STEPS =
+    10;  // decoded after the short prompt: its rows on the device stop below the long one's
+
+// the first `n` tokens of `text` repeated
+static std::vector<llama_token> tokens_of(const llama_vocab * v, const std::string & text, int n) {
+    std::string              s;
+    std::vector<llama_token> t;
+    while ((int) t.size() < n) {
+        s += text;
+        t = tokenize(v, s, true);
+    }
+    t.resize(n);
+    return t;
+}
+
+// A long prompt's sequence saved and cleared, a short prompt prefilled and decoded RESTORE_SHORT_STEPS tokens and cleared,
+// the long one restored (llama_state_seq_set_data, with `stale` armed when given), then one more of its tokens and
+// STRAIGHT_TOKENS greedy or `forced`: the logits after each.
+static trace restore_longer(llama_model *                    model,
+                            const llama_vocab *              v,
+                            int                              nv,
+                            const std::vector<llama_token> * forced,
+                            const stale_kv_fn                stale) {
+    llama_context_params cp      = llama_context_default_params();
+    cp.n_ctx                     = 1024;
+    llama_context *          ctx = llama_init_from_model(model, cp);
+    llama_memory_t           mem = llama_get_memory(ctx);
+    std::vector<llama_token> longp =
+        tokens_of(v, "Thirteen horses crossed a quiet river at dawn. ", RESTORE_LONG_TOKENS);
+    std::vector<llama_token> shortp = tokens_of(v, "A short note on caches and the array. ", RESTORE_SHORT_TOKENS);
+    llama_decode(ctx, llama_batch_get_one(longp.data(), (int) longp.size()));
+    std::vector<uint8_t> st(llama_state_seq_get_size(ctx, 0));
+    llama_state_seq_get_data(ctx, st.data(), st.size(), 0);
+    llama_memory_seq_rm(mem, 0, -1, -1);
+    llama_decode(ctx, llama_batch_get_one(shortp.data(), (int) shortp.size()));
+    gen(ctx, nv, RESTORE_SHORT_STEPS);
+    llama_memory_seq_rm(mem, 0, -1, -1);
+    if (stale) {
+        stale(1);
+    }
+    llama_state_seq_set_data(ctx, st.data(), st.size(), 0);
+    trace  tr;
+    size_t k = 0;
+    if (llama_decode(ctx, llama_batch_get_one(&longp.front(), 1)) == 0) {
         snapshot(ctx, nv, { -1 }, tr);
         decode_steps(ctx, nv, STRAIGHT_TOKENS, tr, forced, k);
     }
@@ -307,6 +371,18 @@ static bool check_cpu_reference(llama_model * cpu, std::vector<llama_token> & p,
     return cpu && same_logits("straight run against the CPU", straight(cpu, p, nv, &npu.tokens), npu);
 }
 
+// The restored rows left stale in memory once (the hook's count), so only a flush of every one of them reads them right.
+static bool check_restore_longer(llama_model * model, llama_model * cpu, const llama_vocab * v, int nv) {
+    const stale_kv_fn stale   = stale_kv_hook(xdna_device());
+    const int         planted = stale ? stale(0) : 0;
+    const trace       got     = restore_longer(model, v, nv, nullptr, stale);
+    const int         left    = stale ? stale(0) - planted : 0;
+    std::printf("restores left stale in memory: %d\n", left);
+    const bool ok = cpu && same_logits("a longer state restored after a shorter decode, against the CPU",
+                                       restore_longer(cpu, v, nv, &got.tokens, nullptr), got);
+    return ok && left == 1;
+}
+
 int main(int argc, char ** argv) {
     const char * model_path = nullptr;
     for (int i = 1; i + 1 < argc; i++) {
@@ -376,6 +452,7 @@ int main(int argc, char ** argv) {
     if (getenv("ON_CPU") == nullptr) {
         llama_model * cpu = load_on_cpu(model_path);
         ok                = check_cpu_reference(cpu, p, nv, straight_run) && ok;
+        ok                = check_restore_longer(model, cpu, v, nv) && ok;
         if (cpu) {
             llama_model_free(cpu);
         }
