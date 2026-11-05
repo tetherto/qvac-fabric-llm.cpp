@@ -215,6 +215,9 @@ struct xdna_gemv_seq_opts {
     // The activation's body (the K tiles) is in DDR once and queued n_out
     // times over, after the header, instead of a copy per chunk.
     bool                       act_replay        = false;
+    // With act_replay, where the header tile sits when it is not just before
+    // the body: a header the host writes, beside a body the array drains.
+    int64_t                    act_hdr_off       = -1;
     // Bisecting an appended stream: 1 = weights only, 2 = and the activation,
     // 3 = and the output descriptors but no wait, 0 = the whole thing.
     int                        stages            = 0;
@@ -404,25 +407,38 @@ void xdna_gemv_pair_mark_out(xdna_gemv_pair * p);
 int32_t xdna_gemv_pair_last_flags(const xdna_gemv_pair * p);
 
 // The residual rows the layers hand each other in DDR (act-att.cc's row
-// mode): h, the attention/mixer output, h_attn and the FFN output, D floats
-// each, in one buffer every layer's dispatch binds.
+// mode): h, the attention/mixer output, h_attn and the FFN output, one row
+// of the model's width each, XDNA_RES_MAX_D floats apart, in one buffer every
+// layer's dispatch binds.
 enum {
-    XDNA_RES_D     = 1024,
+    XDNA_RES_MAX_D = 2048,
     XDNA_RES_H     = 0,  // byte offsets
-    XDNA_RES_S     = 1 * XDNA_RES_D * 4,
-    XDNA_RES_A     = 2 * XDNA_RES_D * 4,
-    XDNA_RES_F     = 3 * XDNA_RES_D * 4,
-    XDNA_RES_BYTES = 4 * XDNA_RES_D * 4,
+    XDNA_RES_S     = 1 * XDNA_RES_MAX_D * 4,
+    XDNA_RES_A     = 2 * XDNA_RES_MAX_D * 4,
+    XDNA_RES_F     = 3 * XDNA_RES_MAX_D * 4,
+    XDNA_RES_BYTES = 4 * XDNA_RES_MAX_D * 4,
 };
+
+// The prologue's row objects (act-att.cc): a side object carries 512 floats
+// or 1024 bf16 values of a gate row, an emitted object 256 floats.
+enum {
+    XDNA_ROW_SIDE_FLOATS = 512,
+    XDNA_ROW_GATE_VALUES = 1024,
+    XDNA_ROW_EMIT_FLOATS = 256,
+};
+
+// A residual width the row mode takes: whole side objects, no wider than a row.
+bool xdna_res_width_ok(int64_t d);
 
 // Row-mode activation tiles for `geom` into `dst` (geom.act_bytes()): the
 // count header, then every chunk's tiles in DDR (no replay: only the first
 // tile of the first chunk takes the side rows - acc, the residual when
 // `res`, gamma - and emits h). The prologue quantizes the norm of the whole
 // row, so the cores see an ordinary activation. False when the geometry's
-// row is not D = n_tiles * k_tile with D a multiple of 512.
+// row is not D = n_tiles * k_tile with xdna_res_width_ok(D).
 // `gates` > 0 (a GDN in-projection: 32) makes the last tile of the last chunk
-// take the gates' constants and weight rows and emit x's tails (act-att.cc).
+// take the gates' constants and weight rows (D / XDNA_ROW_GATE_VALUES objects
+// a row, so D has to be a multiple of that) and emit x's tails (act-att.cc).
 bool xdna_gemv_row_act(const xdna_gemv_geom & geom,
                        uint8_t *              dst,
                        float                  eps,
@@ -432,11 +448,12 @@ bool xdna_gemv_row_act(const xdna_gemv_geom & geom,
 
 // The prologue's side streams for a row-mode input (act-att.cc mode 4):
 // acc, the residual and gamma to the prologue, h back to `h_off`. Rows are
-// XDNA_RES_D floats; acc, the residual and h in argument `res_arg`, gamma in
+// `d` floats; acc, the residual and h in argument `res_arg`, gamma in
 // `g_arg`. Uses the side channel's descriptors 11-13 and the output's 14, so
 // it has to come after whatever used them has been waited for, and
 // xdna_seq_row_wait after the projection that takes the row.
 void xdna_seq_row_io(struct xdna_seq * seq,
+                     int               d,
                      int               res_arg,
                      uint32_t          acc_off,
                      uint32_t          hres_off,
@@ -450,6 +467,7 @@ void xdna_seq_row_wait(struct xdna_seq * seq);
 // words a head `x_stride` words apart from `x_off` of `x_arg` - the object's
 // other 208 words into the `x_junk` words that follow x.
 void xdna_seq_row_io_gates(struct xdna_seq * seq,
+                           int               d,
                            int               res_arg,
                            uint32_t          acc_off,
                            uint32_t          hres_off,

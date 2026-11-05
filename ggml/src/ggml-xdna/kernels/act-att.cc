@@ -31,22 +31,24 @@
 // Row (mode 4: the activation tiles of a projection whose input is a norm of
 // the residual stream, so nothing of the layer boundary is the host's):
 //   main  word 517 the tile's index in its chunk, 516 the code format (0
-//         q4g32, 1 q8g16), 515 the row length D, 514 eps (f32), 513 whether a
-//         residual is added
+//         q4g32, 1 q8g16), 515 the row length D (up to 2048), 514 eps (f32),
+//         513 whether a residual is added
 //   side  the first tile only: acc (D floats, the previous projection's
 //         drain), the residual (D floats) when word 513 says so, gamma (D
 //         floats); 512 floats an object
 //   emit  the first tile only: h = acc + residual, D floats, 256 an object -
 //         the residual stream's next value
-//   out   tile k of rms_norm(h) * gamma, quantized as the host would pack it
-//         (every later tile and every replayed chunk quantizes from the row)
+//   out   tile k of rms_norm(h) * gamma, quantized as the host would pack it.
+//         The first tile quantizes every tile, a gamma object at a time;
+//         every later tile and every replayed chunk is a copy
 //   gates word 512 rows (a GDN layer's in-projection: 32). The first tile
 //         keeps x as bf16 for them; the last tile of the last chunk (word 510
 //         set) takes one object of constants (dt[16], a[16], the scale) and
-//         the rows of ssm_alpha then ssm_beta, bf16, one an object, and emits
-//         x's per-head tails - exp(softplus(alpha + dt) * a), sigmoid(beta),
-//         the scale - in the first 48 words of its one object. By then the
-//         pool is on the last chunk: the gates cost the projection nothing.
+//         the rows of ssm_alpha then ssm_beta, bf16, D / 1024 objects a row,
+//         and emits x's per-head tails - exp(softplus(alpha + dt) * a),
+//         sigmoid(beta), the scale - in the first 48 words of its one object.
+//         By then the pool is on the last chunk: the gates cost the
+//         projection nothing.
 
 #include "xdna-math.h"
 
@@ -58,8 +60,9 @@ using xdna::sc_mul;
 using xdna::sc_pos;
 using xdna::vec_mul;
 
-#define AA_SIDE_WORDS 512  // a side object: 2048 B
-#define AA_EMIT_WORDS 256  // an emitted object: 1024 B
+#define AA_SIDE_WORDS  512   // a side object: 2048 B
+#define AA_EMIT_WORDS  256   // an emitted object: 1024 B
+#define AA_GATE_VALUES 1024  // bf16 values of a gate row in a side object
 #define AA_NS_W       (ACT_TILE / 4 - 6)
 #define AA_NE_W       (ACT_TILE / 4 - 7)
 #define AA_MODE_W     518
@@ -71,19 +74,21 @@ using xdna::vec_mul;
 #define AA_CORES 16
 #define AA_ML    64   // m[2][16] l[2][16] at its head
 
+void quant_tile(const float * x, int n, int grp, int8_t * code);
+
 namespace {
 
 alignas(64) float aa_gk[AA_D];                    // k norm's gamma
 alignas(64) float aa_cos[128], aa_sin[128];
 alignas(64) bfloat16 aa_qt[AA_G * AA_D];          // the q tile being built
 alignas(64) int32_t aa_kv[2][AA_EMIT_WORDS];      // this position's K and V rows, f16
-alignas(64) float aa_o[AA_H * AA_D];              // combine: o, the partial layout
-alignas(64) float aa_out[AA_H * AA_D];            // combine: the gated output, h*256+d
+alignas(64) float aa_o[AA_H * AA_D];              // combine: o, the partial layout; row: h
+alignas(64) float aa_out[AA_H * AA_D];            // combine: the gated output, h*256+d; row: the tiles, x as bf16
 alignas(64) float aa_ml[AA_CORES * AA_ML];        // combine: every core's m and l
 aie::vector<bfloat16, 16> aa_cb[AA_CORES][2][2];  // combine: a core's coefficients, heads 0-1 and 2-3 of a group
 alignas(64) float aa_il[16];                      // combine: 1 / l per head
 alignas(64) const int32_t aa_lane[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
-alignas(64) float aa_y[2 * AA_D];                 // a head or two, normed and rotated
+alignas(64) float aa_y[2 * AA_D];                 // a head or two, normed and rotated; row: a side object of x
 alignas(64) bfloat16 aa_yb[AA_D];
 int   aa_side, aa_emit;
 float aa_r;                                   // row: the norm's 1 / rms
@@ -252,33 +257,85 @@ __attribute__((noinline, minsize)) void gdn_tails(void) {
     }
 }
 
+// A row tile's payload in words, rounded to 64 bytes: the copy out of the
+// cache is 512-bit loads, and one at 32 mod 64 reads the wrong words.
+inline int row_tile_words(int q8) {
+    const int kt  = q8 ? K_TILE_Q8 : K_TILE_Q4;
+    const int grp = q8 ? Q8_GROUP : Q4_GROUP;
+    return ((kt + 8 * (kt / grp)) / 4 + 15) & ~15;
+}
+
+// x as bf16 for the gates' dot products: the end of aa_out, past the tiles.
+inline bfloat16 * row_xb(int D) {
+    return (bfloat16 *) (aa_out + AA_H * AA_D - D / 2);
+}
+
+// x = h / rms * gamma over the gamma object at j, into aa_y: its tiles
+// quantized into the cache in aa_out, and its bf16 copy when the row has
+// gates. A whole row of x does not fit beside h at D = 2048.
+__attribute__((noinline, minsize)) void row_x(const float * gamma, int j, const int32_t * in) {
+    const float * h = aa_o;
+    float *       x = aa_y;
+#pragma clang loop unroll(disable)
+    for (int k = 0; k < AA_SIDE_WORDS; k += 16) {
+        const auto v = vec_mul(aie::load_v<16>(h + j + k), bcf(aa_r));
+        aie::store_v(x + k, vec_mul(v, aie::load_v<16>(gamma + k)));
+    }
+    const int q8    = in[516];
+    const int kt    = q8 ? K_TILE_Q8 : K_TILE_Q4;
+    const int grp   = q8 ? Q8_GROUP : Q4_GROUP;
+    const int tw    = row_tile_words(q8);
+    int32_t * cache = (int32_t *) aa_out;
+#pragma clang loop unroll(disable)
+    for (int t = 0; t < AA_SIDE_WORDS / kt; t++) {
+        quant_tile(x + t * kt, kt, grp, (int8_t *) (cache + (j / kt + t) * tw));
+    }
+    if (in[512] > 0) {
+        bfloat16 *               xb = row_xb(in[515]) + j;
+        aie::accum<accfloat, 16> a;
+#pragma clang loop unroll(disable)
+        for (int k = 0; k < AA_SIDE_WORDS; k += 16) {
+            a.from_vector(aie::load_v<16>(x + k), 0);
+            aie::store_v(xb + k, a.template to_vector<bfloat16>());
+        }
+    }
+}
+
 // The row's side objects: acc into h, the residual onto it, then gamma - at
-// its first object the norm's reduction, then x = h / rms * gamma. h is the
-// first D floats of aa_o, x the next D.
+// its first object the norm's reduction, then x a gamma object at a time
+// (row_x). h is the first D floats of aa_o.
 __attribute__((noinline, minsize)) void row_side(const float * s, int i, const int32_t * in) {
-    const int D   = in[515];
-    const int n   = D / AA_SIDE_WORDS;
-    const int res = in[513];
-    float *   h = aa_o, *x = aa_o + D;
+    const int D    = in[515];
+    const int n    = D / AA_SIDE_WORDS;
+    const int res  = in[513];
+    float *   h    = aa_o;
     const int nrow = in[510] ? 0 : (res ? 3 : 2) * n;  // the gates' tile takes only them
     if (i >= nrow) {
-        // the gates: constants, then one weight row an object
-        const int r = i - nrow - 1;
-        if (r < 0) {
+        // the gates: constants, then D / AA_GATE_VALUES objects a weight row
+        const int o = i - nrow - 1;
+        if (o < 0) {
 #pragma clang loop unroll(disable)
             for (int k = 0; k < 48; k += 16) {
                 aie::store_v(aa_gc + k, aie::load_v<16>(s + k));
             }
             return;
         }
-        const bfloat16 *         xb  = (const bfloat16 *) (aa_out + 1024);
+        const int                npr = D / AA_GATE_VALUES;
+        const int                r = o / npr, seg = o % npr;
+        const bfloat16 *         xb  = row_xb(D) + seg * AA_GATE_VALUES;
         const bfloat16 *         w   = (const bfloat16 *) s;
         aie::accum<accfloat, 16> acc = aie::zeros<accfloat, 16>();
-        for (int k = 0; k < D; k += 16) {
+#pragma clang loop unroll(disable)
+        for (int k = 0; k < AA_GATE_VALUES; k += 16) {
             acc = aie::mac(acc, aie::load_v<16>(xb + k), aie::load_v<16>(w + k));
         }
-        aa_ab[r] = aie::reduce_add(acc.to_vector<float>(0));
-        if (r == in[512] - 1) {
+        const float dot = aie::reduce_add(acc.to_vector<float>(0));
+        if (seg == 0) {
+            aa_ab[r] = dot;
+        } else {
+            aa_ab[r] = sc_add(aa_ab[r], dot);
+        }
+        if (r == in[512] - 1 && seg == npr - 1) {
             gdn_tails();
         }
         return;
@@ -307,21 +364,7 @@ __attribute__((noinline, minsize)) void row_side(const float * s, int i, const i
         }
         aa_r = sc_div(1.0f, aie::sqrt(sc_add(sc_div(aie::reduce_add(ss), sc_i2f(D)), as_f(in[514]))));
     }
-#pragma clang loop unroll(disable)
-    for (int k = 0; k < AA_SIDE_WORDS; k += 16) {
-        const auto v = vec_mul(aie::load_v<16>(h + j + k), bcf(aa_r));
-        aie::store_v(x + j + k, vec_mul(v, aie::load_v<16>(s + k)));
-    }
-    if (in[512] > 0 && i == nrow - 1) {
-        // the gates' dot products read x as bf16
-        bfloat16 *               xb = (bfloat16 *) (aa_out + 1024);
-        aie::accum<accfloat, 16> t;
-#pragma clang loop unroll(disable)
-        for (int k = 0; k < D; k += 16) {
-            t.from_vector(aie::load_v<16>(x + k), 0);
-            aie::store_v(xb + k, t.template to_vector<bfloat16>());
-        }
-    }
+    row_x(s, j, in);
 }
 
 }  // namespace
@@ -469,23 +512,12 @@ __attribute__((minsize)) void act_att_tile(const int32_t * in, int32_t * out) {
         aie::store_v(out + i, aie::zeros<int32, 16>());
     }
     if (in[AA_MODE_W] == 4) {
-        // The row is quantized once, at the tile that took it, into a
-        // compact copy of every tile's codes and group parameters (aa_out,
-        // which only the combine uses); every tile of every chunk is a copy.
-        const int q8    = in[516];
-        const int kt    = q8 ? K_TILE_Q8 : K_TILE_Q4;
-        const int grp   = q8 ? Q8_GROUP : Q4_GROUP;
-        // a tile's payload in words, rounded to 64 bytes: the copy below is
-        // 512-bit loads, and one at 32 mod 64 reads the wrong words
-        const int tw    = ((kt + 8 * (kt / grp)) / 4 + 15) & ~15;
-        int32_t * cache = (int32_t *) aa_out;
-        if (in[AA_NS_W] > 0 && !in[510]) {
-#pragma clang loop unroll(disable)
-            for (int t = 0; t < in[515] / kt; t++) {
-                quant_tile(aa_o + in[515] + t * kt, kt, grp, (int8_t *) (cache + t * tw));
-            }
-        }
-        const int32_t * src = cache + in[517] * tw;
+        // The row was quantized once, by the tile that took it (row_x), into
+        // a compact copy of every tile's codes and group parameters (aa_out,
+        // which only the combine uses otherwise); every tile of every chunk
+        // is a copy.
+        const int       tw  = row_tile_words(in[516]);
+        const int32_t * src = (const int32_t *) aa_out + in[517] * tw;
 #pragma clang loop unroll(disable)
         for (int i = 0; i < tw; i += 16) {
             aie::store_v(out + i, aie::load_v<16>(src + i));

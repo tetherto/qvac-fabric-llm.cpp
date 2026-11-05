@@ -77,6 +77,7 @@ struct xdna_att_layer {
     size_t             tb = 0;
     xdna_gemv_ep       w[XDNA_GEMV_COLS], a, o[XDNA_GEMV_COLS];
     int                n_o = 0;
+    int                d   = 0;                 // the residual width
 
     size_t w_o = 0, w_ffn = 0;                  // weight offsets
     size_t a_qkv = 0, a_att = 0, a_const = 0, a_o = 0, a_gattn = 0, a_gpost = 0, a_size = 0;
@@ -135,19 +136,20 @@ void xdna_att_layer_free(xdna_att_layer * l) {
 
 xdna_att_layer * xdna_att_layer_create(xdna_kernel_pool * pool, const xdna_att_layer_w & wt) {
     if (!pool || !wt.wq || !wt.wk || !wt.wv || !wt.gq || !wt.gk || !wt.wo || !wt.post || !wt.attn_norm ||
-        wt.attn_norm->type != GGML_TYPE_F32 || ggml_nelements(wt.attn_norm) != XDNA_RES_D ||
-        wt.wq->ne[0] != XDNA_RES_D || !wt.gate || !wt.up || !wt.down) {
+        wt.attn_norm->type != GGML_TYPE_F32 || !xdna_res_width_ok(wt.wq->ne[0]) ||
+        ggml_nelements(wt.attn_norm) != wt.wq->ne[0] || !wt.gate || !wt.up || !wt.down) {
         return nullptr;
     }
     const int64_t K = wt.wq->ne[0];
     if (wt.wq->ne[1] != (int64_t) 2 * H * D || wt.wk->ne[1] != (int64_t) KVH * D || wt.wv->ne[1] != (int64_t) KVH * D ||
-        wt.wk->ne[0] != K || wt.wv->ne[0] != K || wt.wo->ne[0] != (int64_t) H * D || wt.gq->type != GGML_TYPE_F32 ||
-        wt.gk->type != GGML_TYPE_F32 || wt.post->type != GGML_TYPE_F32 || ggml_nelements(wt.gq) != D ||
-        ggml_nelements(wt.gk) != D || ggml_nelements(wt.post) != wt.wo->ne[1]) {
+        wt.wk->ne[0] != K || wt.wv->ne[0] != K || wt.wo->ne[0] != (int64_t) H * D || wt.wo->ne[1] != K ||
+        wt.gq->type != GGML_TYPE_F32 || wt.gk->type != GGML_TYPE_F32 || wt.post->type != GGML_TYPE_F32 ||
+        ggml_nelements(wt.gq) != D || ggml_nelements(wt.gk) != D || ggml_nelements(wt.post) != K) {
         return nullptr;
     }
     std::unique_ptr<xdna_att_layer, xdna_att_layer_deleter> l(new xdna_att_layer);
     l->pool = pool;
+    l->d    = (int) K;
     l->rg   = xdna_rec_gemv_create(pool, wt.wo, wt.gate, wt.up, wt.down);
     if (!l->rg || !l->rg->ffn || !xdna_gemv_pair_raw_act(l->rg->ffn)) {
         return nullptr;
@@ -179,7 +181,7 @@ xdna_att_layer * xdna_att_layer_create(xdna_kernel_pool * pool, const xdna_att_l
     l->tb   = l->gatt.tile_bytes();
     xdna_gemv_endpoints(l->gatt, l->w, &l->a, l->o, &l->n_o);
     if (!l->gatt.valid() || l->tb < (size_t) 2 * P * POS_B + 4 || l->n_o * 2 != XDNA_GEMV_COLS ||
-        so->geom.n_tiles() * so->geom.k_tile() != H * D || so->geom.n_out() != 1 || so->geom.fmt != XDNA_WFMT_Q4G32 ||
+        so->geom.n_tiles() * so->geom.k_tile() != H * D || so->geom.n_real != K || so->geom.fmt != XDNA_WFMT_Q4G32 ||
         so->geom.k_tile() != 256) {
         return nullptr;
     }
@@ -195,8 +197,8 @@ xdna_att_layer * xdna_att_layer_create(xdna_kernel_pool * pool, const xdna_att_l
     l->a_const          = l->a_att + (size_t) 3 * ACTT;
     l->a_o              = xdna_align_up(l->a_const + (size_t) SIDE_W * 4);
     l->a_gattn          = xdna_align_up(l->a_o + so->geom.act_bytes());
-    l->a_gpost          = l->a_gattn + (size_t) XDNA_RES_D * sizeof(float);
-    l->a_size           = l->a_gpost + (size_t) XDNA_RES_D * sizeof(float);
+    l->a_gpost          = l->a_gattn + (size_t) K * sizeof(float);
+    l->a_size           = l->a_gpost + (size_t) K * sizeof(float);
     l->act              = xdna_buffer_alloc(l->dev, l->a_size);
     l->ids              = xdna_buffer_alloc(l->dev, (size_t) CORES * l->tb);
     l->r                = xdna_buffer_alloc(l->dev, R_SIZE);
@@ -230,11 +232,13 @@ xdna_att_layer * xdna_att_layer_create(xdna_kernel_pool * pool, const xdna_att_l
     // The combine's activation is fixed: the projection's count header, which
     // takes the gate while the pool runs the attention, then eight tiles the
     // prologue fills - the first takes the partial states, every one
-    // quantizes its head.
+    // quantizes its head. A pass past the first has its own copy of the
+    // tiles, none of which takes the partials again: a replay of the first
+    // pass's would ask for them twice, and the second ask never drains.
     uint8_t * a = (uint8_t *) l->act->data;
     std::memset(a, 0, l->a_size);
-    std::memcpy(a + l->a_gattn, wt.attn_norm->data, (size_t) XDNA_RES_D * sizeof(float));
-    std::memcpy(a + l->a_gpost, wt.post->data, (size_t) XDNA_RES_D * sizeof(float));
+    std::memcpy(a + l->a_gattn, wt.attn_norm->data, (size_t) K * sizeof(float));
+    std::memcpy(a + l->a_gpost, wt.post->data, (size_t) K * sizeof(float));
     int32_t * hdr = (int32_t *) (a + l->a_o);
     hdr[0]        = so->geom.n_tiles();
     hdr[1]        = so->geom.n_out();
@@ -242,15 +246,18 @@ xdna_att_layer * xdna_att_layer_create(xdna_kernel_pool * pool, const xdna_att_l
     hdr[W_NS]     = H / 2;
     hdr[AW - 1]   = 0;
     hdr[AW - 2]   = F_ATT;
-    for (int k = 0; k < so->geom.n_tiles(); k++) {
-        int32_t * t = (int32_t *) (a + l->a_o + (size_t) (1 + k) * ACTT);
-        t[517]      = k;
-        t[W_MODE]   = 2;
-        t[W_NPART]  = N_PART;
-        t[W_NS]     = k == 0 ? N_PART : 0;
-        t[W_NE]     = 0;
-        t[AW - 1]   = 0;  // q4g32 codes
-        t[AW - 2]   = F_ATT;
+    const int nt  = so->geom.n_tiles();
+    for (int c = 0; c < so->geom.n_out(); c++) {
+        for (int k = 0; k < nt; k++) {
+            int32_t * t = (int32_t *) (a + l->a_o + (size_t) (1 + c * nt + k) * ACTT);
+            t[517]      = k;
+            t[W_MODE]   = 2;
+            t[W_NPART]  = N_PART;
+            t[W_NS]     = c == 0 && k == 0 ? N_PART : 0;
+            t[W_NE]     = 0;
+            t[AW - 1]   = 0;  // q4g32 codes
+            t[AW - 2]   = F_ATT;
+        }
     }
     l->ffn_out.resize((size_t) ffn->g2.n_real);
     return l.release();
@@ -269,7 +276,7 @@ build(const xdna_att_layer * l, int n_task, int n_chunks, int row, size_t koff, 
     // 1. q|gate, k, v into the scratch. Its input is the prologue's row:
     //    h = F + A into H, rms_norm(h) * gamma into the tiles.
     const auto row_io = [&](uint32_t acc, uint32_t hres, int g_arg, uint32_t g_off, uint32_t h_out) {
-        xdna_seq_row_io(&seq, ARG_RES, acc, hres, g_arg, g_off, h_out);
+        xdna_seq_row_io(&seq, l->d, ARG_RES, acc, hres, g_arg, g_off, h_out);
     };
     const auto row_wait = [&]() {
         xdna_seq_row_wait(&seq);

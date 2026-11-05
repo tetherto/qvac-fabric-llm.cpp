@@ -54,7 +54,7 @@ int64_t feed_blocks() {
 
 }  // namespace xdna_rec_pack
 
-xdna_rec_geom xdna_rec_pack_geom(void) {
+xdna_rec_geom xdna_rec_pack_geom(int64_t d_out) {
     using namespace xdna_rec_pack;
     xdna_rec_geom g;
     g.feed_bytes        = feed_blocks() * FEEDN * (int64_t) sizeof(float);
@@ -67,7 +67,7 @@ xdna_rec_geom xdna_rec_pack_geom(void) {
     g.state_bytes       = state_floats() * (int64_t) sizeof(float);
     g.azg_bytes         = (int64_t) NVH * AZGN * sizeof(float);
     g.out_bytes         = OUTN;
-    g.d_out             = D_OUT;
+    g.d_out             = d_out;
     return g;
 }
 
@@ -367,13 +367,14 @@ bool xdna_rec_core_set_rows(xdna_rec_core * core,
                             const float *   gamma_post,
                             float           eps_post) {
     if (!core || !core->inproj || core->so_fused || !res || !gamma_attn || !gamma_post ||
-        core->in_geom.K != XDNA_RES_D) {
+        !xdna_res_width_ok(core->in_geom.K)) {
         return false;
     }
     core->rows = true;
     core->res  = res;
-    core->g_attn.assign(gamma_attn, gamma_attn + XDNA_RES_D);
-    core->g_post.assign(gamma_post, gamma_post + XDNA_RES_D);
+    core->d    = core->in_geom.K;
+    core->g_attn.assign(gamma_attn, gamma_attn + core->d);
+    core->g_post.assign(gamma_post, gamma_post + core->d);
     core->eps_attn = eps_attn;
     core->eps_post = eps_post;
     return true;
@@ -385,11 +386,13 @@ bool xdna_rec_core_set_gates(xdna_rec_core * core,
                              const float *   dt,
                              const float *   a) {
     using namespace xdna_rec_pack;
-    if (!core || !core->rows || core->so_fused || !w_alpha || !w_beta || !dt || !a) {
+    if (!core || !core->rows || core->so_fused || !w_alpha || !w_beta || !dt || !a ||
+        core->d % XDNA_ROW_GATE_VALUES != 0) {
         return false;
     }
-    // [constants: dt[16], a[16], the scale, padded to 512 words | 32 rows]
-    const size_t n = (size_t) 512 * 4 + (size_t) 2 * NVH * XDNA_RES_D * 2;
+    // [constants: dt[16], a[16], the scale, padded to a side object | 32 rows]
+    const size_t d = (size_t) core->d;
+    const size_t n = (size_t) XDNA_ROW_SIDE_FLOATS * 4 + (size_t) 2 * NVH * d * 2;
     core->ab.assign(n, 0);
     float * c = (float *) core->ab.data();
     for (int h = 0; h < NVH; h++) {
@@ -397,10 +400,10 @@ bool xdna_rec_core_set_gates(xdna_rec_core * core,
         c[NVH + h] = a[h];
     }
     c[(size_t) 2 * NVH] = 1.0f / std::sqrt((float) SV);
-    uint16_t * w        = (uint16_t *) (core->ab.data() + (size_t) 512 * 4);
-    for (size_t i = 0; i < (size_t) NVH * XDNA_RES_D; i++) {
-        w[i]                             = xdna_bf16(w_alpha[i]);
-        w[(size_t) NVH * XDNA_RES_D + i] = xdna_bf16(w_beta[i]);
+    uint16_t * w        = (uint16_t *) (core->ab.data() + (size_t) XDNA_ROW_SIDE_FLOATS * 4);
+    for (size_t i = 0; i < (size_t) NVH * d; i++) {
+        w[i]                    = xdna_bf16(w_alpha[i]);
+        w[(size_t) NVH * d + i] = xdna_bf16(w_beta[i]);
     }
     core->gates = true;
     return true;
@@ -539,16 +542,16 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool, xdna_g
         if (core->rows) {
             // its input: h = F + A into H, rms_norm(h) * gamma into its tiles
             core->g_attn_off = xdna_align_up(core->in_a_off + core->in_geom.act_bytes(), 4096);
-            core->g_post_off = core->g_attn_off + (size_t) XDNA_RES_D * sizeof(float);
+            core->g_post_off = core->g_attn_off + (size_t) core->d * sizeof(float);
             if (core->gates) {
                 using namespace xdna_rec_pack;
                 // after the in-projection's weights, which follow ssm_out's
                 core->ab_off = xdna_align_up(core->in_w_off + core->in_geom.weight_bytes(), 4096);
-                xdna_seq_row_io_gates(&head, 9, XDNA_RES_F, XDNA_RES_A, 7, (uint32_t) core->g_attn_off, XDNA_RES_H, 6,
-                                      (uint32_t) core->ab_off, (uint32_t) (core->ab.size() / 4), 1,
+                xdna_seq_row_io_gates(&head, core->d, 9, XDNA_RES_F, XDNA_RES_A, 7, (uint32_t) core->g_attn_off,
+                                      XDNA_RES_H, 6, (uint32_t) core->ab_off, (uint32_t) (core->ab.size() / 4), 1,
                                       (uint32_t) (3 * SV * 4), (uint32_t) HEADNORM, (uint32_t) NVH);
             } else {
-                xdna_seq_row_io(&head, 9, XDNA_RES_F, XDNA_RES_A, 7, (uint32_t) core->g_attn_off, XDNA_RES_H);
+                xdna_seq_row_io(&head, core->d, 9, XDNA_RES_F, XDNA_RES_A, 7, (uint32_t) core->g_attn_off, XDNA_RES_H);
             }
         }
         if (!build_inproj_head(core, &head)) {
@@ -606,6 +609,14 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool, xdna_g
     opt.act_off = 0;
     opt.o_arg   = 8;
     opt.out_off = 0;
+    // A wider model's ssm_out is more than one pass. The gated stage writes
+    // its tiles once, and a header that says one pass, so the passes replay
+    // its tiles behind a header the host writes past them.
+    const size_t so_hdr_off = (size_t) (1 + so->geom.n_tiles()) * XDNA_GEMV_ACT_TILE;
+    if (so->geom.n_out() > 1) {
+        opt.act_replay  = true;
+        opt.act_hdr_off = (int64_t) so_hdr_off;
+    }
     // With the transition on the array, argument 8 is not an output buffer at
     // all - it is the FFN's activation, and the projection drains one stream
     // into each of its tiles. A stream carries og*rows*n_core = 256 columns
@@ -617,7 +628,7 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool, xdna_g
         opt.o_arg       = 9;
         opt.out_off     = XDNA_RES_S;
         core->so_to_act = true;
-    } else if (ffn && xdna_gemv_pair_raw_act(ffn)) {
+    } else if (ffn && xdna_gemv_pair_raw_act(ffn) && so->geom.n_out() == 1) {
         opt.out_off           = XDNA_GEMV_ACT_TILE;
         opt.out_stream_stride = XDNA_GEMV_ACT_TILE;
         core->so_to_act       = true;
@@ -653,7 +664,7 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool, xdna_g
         if (core->rows) {
             // its input: h_attn = H + S into A, rms_norm(h_attn) * gamma
             // into its tiles, per chunk in DDR; its output into F
-            xdna_seq_row_io(&seq, 9, XDNA_RES_S, XDNA_RES_H, 7, (uint32_t) core->g_post_off, XDNA_RES_A);
+            xdna_seq_row_io(&seq, core->d, 9, XDNA_RES_S, XDNA_RES_H, 7, (uint32_t) core->g_post_off, XDNA_RES_A);
             po.o_arg      = 9;
             po.o_base     = XDNA_RES_F;
             po.act_replay = false;
@@ -711,7 +722,7 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool, xdna_g
         // One buffer per argument, both projections in it.
         const size_t ffn_wb = core->ffn_fused ? ffn->w2_off + ffn->g2.weight_bytes() : 0;
         const size_t wn     = core->ffn_fused ? ffn_w_off + ffn_wb : core->in_w_off + core->in_geom.weight_bytes();
-        const size_t an     = core->rows ? core->g_post_off + (size_t) XDNA_RES_D * sizeof(float) :
+        const size_t an     = core->rows ? core->g_post_off + (size_t) core->d * sizeof(float) :
                                            core->in_a_off + core->in_geom.act_bytes();
         core->w6            = xdna_buffer_alloc(core->dev, wn);
         core->a7            = xdna_buffer_alloc(core->dev, an);
@@ -761,6 +772,10 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool, xdna_g
             tl[XDNA_GEMV_ACT_TILE / 4 - 1] = so->geom.fmt == XDNA_WFMT_Q4G32 ? 0 : 1;
             tl[XDNA_GEMV_ACT_TILE / 4 - 2] = (t == so->geom.n_tiles() && so->geom.epilogue) ? 1 : 0;
         }
+        if (opt.act_replay) {
+            // the replayed passes' header, which the gated stage never writes
+            std::memcpy(m + so_hdr_off, hdr, XDNA_GEMV_ACT_TILE);
+        }
         if (!xdna_buffer_sync_to_device(ab)) {
             fuse_so_release(core);
             return false;
@@ -777,8 +792,8 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool, xdna_g
                 fuse_so_release(core);
                 return false;
             }
-            std::memcpy(a7m + core->g_attn_off, core->g_attn.data(), (size_t) XDNA_RES_D * 4);
-            std::memcpy(a7m + core->g_post_off, core->g_post.data(), (size_t) XDNA_RES_D * 4);
+            std::memcpy(a7m + core->g_attn_off, core->g_attn.data(), (size_t) core->d * sizeof(float));
+            std::memcpy(a7m + core->g_post_off, core->g_post.data(), (size_t) core->d * sizeof(float));
             if (!xdna_buffer_sync_to_device(core->a7) || !xdna_buffer_sync_to_device(ffn->a)) {
                 fuse_so_release(core);
                 return false;

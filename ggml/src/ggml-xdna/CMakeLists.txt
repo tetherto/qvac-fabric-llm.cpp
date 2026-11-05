@@ -570,4 +570,11 @@ if (GGML_XDNA_BUILD_TESTS)
     target_include_directories(test-xdna-pfx-row PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
     target_link_libraries(test-xdna-pfx-row PRIVATE ggml-base XRT::xrt_coreutil
                           $<TARGET_NAME_IF_EXISTS:OpenMP::OpenMP_CXX>)
+    # On the device, self-skipping without one: the FFN pair against a CPU
+    # reference. It links the backend, which a GGML_BACKEND_DL build cannot.
+    if (NOT GGML_BACKEND_DL)
+        add_executable(test-xdna-pair tests/test-xdna-pair.cpp)
+        target_include_directories(test-xdna-pair PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        target_link_libraries(test-xdna-pair PRIVATE ggml-xdna ggml-base XRT::xrt_coreutil)
+    endif()
 endif()
