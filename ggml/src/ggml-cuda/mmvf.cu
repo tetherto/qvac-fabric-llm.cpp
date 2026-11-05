@@ -10,9 +10,8 @@ static __device__ __forceinline__ nv_bfloat162 mmvf_f8x2_e4m3_to_bf162(__nv_fp8x
 #if CUDART_VERSION >= 13040
     return static_cast<nv_bfloat162>(__nv_cvt_fp8x2_to_bf162raw(x, __NV_E4M3));
 #else
-    return make_bfloat162(
-        static_cast<nv_bfloat16>(ggml_cuda_f8_e4m3_to_fp32(x & 0xFF)),
-        static_cast<nv_bfloat16>(ggml_cuda_f8_e4m3_to_fp32(x >> 8)));
+    // one packed e4m3x2 -> f16x2 conversion (a single instruction from sm_89 on), then exact f16 -> f32 -> bf16
+    return __float22bfloat162_rn(__half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(x, __NV_E4M3))));
 #endif
 }
 #endif
@@ -341,7 +340,57 @@ static __global__ void mul_mat_vec_f(
         nv_bfloat162 sum_bf[ncols_dst] = {};
         nv_bfloat162 sum_bf_gate[ncols_dst] = {};
 
-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        // 8 weights (8 bytes) and 8 activations (16 bytes) per load when the rows allow it: with one 2-byte weight load
+        // per iteration too few bytes are in flight and the kernel is latency bound, 2.7x slower than Q8_0 on the H100
+        const bool vec8 = ncols2 % 4 == 0 && stride_col_y2 % 4 == 0 && (uintptr_t) x % 8 == 0 && (uintptr_t) y % 16 == 0 &&
+            (!use_gate || (uintptr_t) gate_x % 8 == 0);
+        if (vec8) {
+            const uint2 * x8      = reinterpret_cast<const uint2 *>(x);
+            const uint2 * gate_x8 = reinterpret_cast<const uint2 *>(gate_x);
+            const uint4 * y8      = reinterpret_cast<const uint4 *>(y);
+            const int ncols8 = ncols2/4;
+            const int stride_col_y8 = stride_col_y2/4;
+
+#pragma unroll 4
+            for (int col8 = tid; col8 < ncols8; col8 += block_size) {
+                const uint2 xv = x8[col8];
+                nv_bfloat162 tmpx[4];
+                tmpx[0] = mmvf_f8x2_e4m3_to_bf162(xv.x & 0xFFFF);
+                tmpx[1] = mmvf_f8x2_e4m3_to_bf162(xv.x >> 16);
+                tmpx[2] = mmvf_f8x2_e4m3_to_bf162(xv.y & 0xFFFF);
+                tmpx[3] = mmvf_f8x2_e4m3_to_bf162(xv.y >> 16);
+                nv_bfloat162 tmpx_gate[4] = {};
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        const uint2 gv = gate_x8[col8];
+                        tmpx_gate[0] = mmvf_f8x2_e4m3_to_bf162(gv.x & 0xFFFF);
+                        tmpx_gate[1] = mmvf_f8x2_e4m3_to_bf162(gv.x >> 16);
+                        tmpx_gate[2] = mmvf_f8x2_e4m3_to_bf162(gv.y & 0xFFFF);
+                        tmpx_gate[3] = mmvf_f8x2_e4m3_to_bf162(gv.y >> 16);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const uint4 yv = y8[j*stride_col_y8 + col8];
+                    const nv_bfloat162 * tmpy = reinterpret_cast<const nv_bfloat162 *>(&yv);
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        sum_bf[j] = __hfma2(tmpx[k], tmpy[k], sum_bf[j]);
+                    }
+
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+#pragma unroll
+                            for (int k = 0; k < 4; ++k) {
+                                sum_bf_gate[j] = __hfma2(tmpx_gate[k], tmpy[k], sum_bf_gate[j]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int col2 = vec8 ? ncols2 : tid; col2 < ncols2; col2 += block_size) {
             const nv_bfloat162 tmpx = mmvf_f8x2_e4m3_to_bf162(x2[col2]);
             nv_bfloat162 tmpx_gate = {};
             if constexpr (has_fusion) {
@@ -549,6 +598,11 @@ void launch_mul_mat_vec_f_cuda(
     int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
     int64_t max_block_size  = 256;
     if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
+        max_block_size = 128;
+    }
+    // FP8 rows are short in bytes (5-6 KiB for a 27B model): smaller blocks keep more rows in flight per SM, which
+    // decodes 8% faster on the H100 than 256 threads
+    if constexpr (std::is_same_v<T, ggml_fp8_e4m3_t>) {
         max_block_size = 128;
     }
     for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
@@ -1034,6 +1088,14 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
             }
             return ne11 <= MMVF_MAX_BATCH_SIZE;
         case GGML_TYPE_F8_E4M3:
+            // MMVF reads the src1 columns once per weight row; with fast memory the cuBLASLt FP8 GEMM, which reads
+            // each weight once for all columns, is faster from 3 columns on (H100) or 5 (RTX 5090)
+            if (cc == GGML_CUDA_CC_HOPPER) {
+                return ne11 <= 2;
+            }
+            if (cc == GGML_CUDA_CC_BLACKWELL) {
+                return ne11 <= 4;
+            }
             return ne11 <= MMVF_MAX_BATCH_SIZE;
         default:
             return false;

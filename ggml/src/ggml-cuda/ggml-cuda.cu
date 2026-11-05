@@ -2954,8 +2954,9 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
             }
-        } else if (src0->type == GGML_TYPE_F8_E4M3 &&
-                ggml_cuda_should_use_mmvf(src0, cc, WARP_SIZE, dst->ne[2])) {
+        } else if (src0->type == GGML_TYPE_F8_E4M3) {
+            // FP8 MUL_MAT_ID keeps MMVF up to MMVF_MAX_BATCH_SIZE tokens on every GPU: the lower per-GPU limits of
+            // ggml_cuda_should_use_mmvf are for MUL_MAT, where cuBLASLt takes over without synchronizing
             return false;
         } else if (src0->type != GGML_TYPE_F8_E4M3 && GGML_CUDA_CC_IS_AMD(cc)) {
             return false;
@@ -2996,8 +2997,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
-            } else if (src0->type == GGML_TYPE_F8_E4M3 &&
-                    ggml_cuda_should_use_mmvf(src0, cc, WARP_SIZE, ne2)) {
+            } else if (src0->type == GGML_TYPE_F8_E4M3) {
                 ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                 return;
             } else {
