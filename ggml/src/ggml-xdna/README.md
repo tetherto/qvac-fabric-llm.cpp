@@ -60,10 +60,13 @@ recurrent state stays on the device between tokens.
 
 It covers one weight set: `Q4_K` for the FFN gate and up, `Q4_K`/`Q5_K`/`Q6_K`
 for `ssm_out`, `Q4_K`/`Q6_K` for the FFN down, plus a `GGML_XDNA_GATED_FMT` that
-matches the `ssm_out` layout. Anything else is refused with an error rather
-than run on the wrong kernels; the refusal names the weight set. The way on is
-to requantize `ssm_out` (see Build). `GGML_XDNA_FUSED_LAYER=0` is a bisection
-switch, not a way to run a model this layer refuses.
+matches the `ssm_out` layout. A model with any other format in those weights
+is not handed to the fused layers: one warning names the first such weight, and
+its decode runs as for a width they do not take (below). When `ssm_out` is the
+only such weight - a stock `Qwen/Qwen3.5-0.8B Q4_K_M` leaves half of its
+`ssm_out` at `Q8_0` - requantizing it is the way onto the fused path (see
+Build). `GGML_XDNA_FUSED_LAYER=0` is a bisection switch, not a way to run such
+a model on the fused layers.
 
 The layers take the residual width from the model; the residual rows the
 layers hand each other are sized for 4096 (`XDNA_RES_MAX_D`). By default they
@@ -435,9 +438,10 @@ prefill kernels); the fused layer never fires there.
   Verified against mlir-aie 1.4.3: the RTP buffer bases in `xdna-seq.h` are read
   back from that toolchain's placement, so a version bump needs them re-read
   from a freshly compiled project (the header says which values).
-- For a Qwen3.5 decode, a model the fused decode path covers (see above). A
-  refused quantization is not run by setting `GGML_XDNA_FUSED_LAYER=0`;
-  requantize `ssm_out` (see Build). An embedding model does not decode and
+- For the fused decode, a model whose weight set it covers (see above); any
+  other decodes as a model of a width it does not take, on the host by default.
+  Requantizing `ssm_out` (see Build) moves a model onto the fused path when it
+  is the only weight outside the set. An embedding model does not decode and
   needs none of this.
 
 ## Build
@@ -465,24 +469,25 @@ cmake --build build -j$(nproc)
 - `GGML_XDNA_GATED_FMT` (default 1) selects the activation layout the gated
   stage writes: `0` is the 4-bit form for a `Q4_K` `ssm_out`, `1` the 8-bit form
   for `Q5_K`/`Q6_K`. It is compiled into the artifact and into the backend, and
-  the backend refuses a model whose `ssm_out` needs the other one. Which type a
+  a model whose `ssm_out` needs the other one decodes on the host instead, with
+  a warning that names the tensor. Which type a
   quant ends up with is a property of the quant, not of its name:
   `llama-quantize ... Q4_K_M` built from this tree leaves `ssm_out` at `Q4_K`
   (so the fused layer needs `-DGGML_XDNA_GATED_FMT=0`), while other `Q4_K_M`
   conversions leave it at `Q5_K` (the default). Check the model with
-  `llama-gguf model.gguf r n | grep ssm_out`, or read the refusal the backend
+  `llama-gguf model.gguf r n | grep ssm_out`, or read the warning the backend
   prints. To keep the default `GATED_FMT=1`, requantize that one tensor:
 
   ```sh
   llama-quantize --tensor-type ssm_out=q5_K model-f16.gguf out.gguf Q4_K_M
   ```
 
-  A `ssm_out` outside `Q4_K`/`Q5_K`/`Q6_K` is refused whatever `GATED_FMT` is -
-  a stock `Qwen/Qwen3.5-0.8B Q4_K_M` leaves half of them at `Q8_0` and prints
-  `unsupported fused weight set (so=q8_0 gate=q4_K up=q4_K down=q6_K)`. The
-  `--tensor-type ssm_out=q5_K` recipe above is the way onto the fused path.
-  `GGML_XDNA_FUSED_LAYER=0` does not run this model. It only moves a model the
-  fused layer accepts onto the per-op kernels, for a bisection.
+  A `ssm_out` outside `Q4_K`/`Q5_K`/`Q6_K` is not taken whatever `GATED_FMT` is
+  - a stock `Qwen/Qwen3.5-0.8B Q4_K_M` leaves half of them at `Q8_0`, and its
+  decode runs on the host. The `--tensor-type ssm_out=q5_K` recipe above is the
+  way onto the fused path. `GGML_XDNA_FUSED_LAYER=0` does not change that: it
+  only moves a model the fused layer takes onto the per-op kernels, for a
+  bisection.
 
 Artifacts, all in the build output directory (`build/bin` by default):
 
@@ -551,7 +556,7 @@ For users - a trade-off, a size or a location:
 | `GGML_XDNA_SPIN_US` | 0 | poll this many microseconds for completion before blocking; `-1` polls until it completes |
 | `GGML_XDNA_GLUE_THREADS` | 4 | host threads for the ops the backend runs on the host in a decode-sized chunk, except the vocabulary projection, which takes 12 (at most `GGML_XDNA_GLUE_THREADS_BIG`) |
 | `GGML_XDNA_GLUE_THREADS_BIG` | 16 | the same, for a chunk of 32 tokens or more |
-| `GGML_XDNA_HOST_DECODE_THREADS` | one a core | host threads for the decode of a model wider than the fused layers (see [The fused decode recurrent layer](#the-fused-decode-recurrent-layer)): one on every allowed core when they are pinned, 8 when they are not; `0` runs that decode per op on the array, slower at more energy a token |
+| `GGML_XDNA_HOST_DECODE_THREADS` | one a core | host threads for the decode of a model the fused layers do not take, by its width or its weight set (see [The fused decode recurrent layer](#the-fused-decode-recurrent-layer)): one on every allowed core when they are pinned, 8 when they are not; `0` runs that decode per op on the array, slower at more energy a token |
 | `GGML_XDNA_HOST_DECODE_PIN` | 1 | in an OpenMP build, pins those threads one a core, filling one L3 domain before the next, and hands every borrowed thread its CPU mask back after each decode; `0` leaves 8 threads to the OS, slower (the 4B: 18.7 against 30.1 t/s) |
 | `GGML_XDNA_FUSED_WIDE` | 0 | `1` runs the decode of a model with a residual width above 1024, up to 2048 and a multiple of 512 (Qwen3.5-2B), on the fused layers instead of the host (see [The fused decode recurrent layer](#the-fused-decode-recurrent-layer)) |
 | `GGML_XDNA_ARENA_MB` | 256 | size of each chunk of the device-buffer arena, in MiB |
@@ -568,7 +573,7 @@ report, not for tuning: every one costs more time or energy than the default.
 
 | variable | `0` turns off |
 | :-- | :-- |
-| `GGML_XDNA_FUSED_LAYER` | the fused decode layers (the per-op path runs). It does not run a model the fused layer refuses |
+| `GGML_XDNA_FUSED_LAYER` | the fused decode layers (the per-op path runs). A model whose weight set they do not take decodes on the host either way |
 | `GGML_XDNA_GEMV_GROUP` | the decode projections outside the fused layer, on the array |
 | `GGML_XDNA_GEMV_PROMOTE` | merging a decode GEMV group of mixed weight formats into one dispatch |
 | `GGML_XDNA_QUEUE` | queuing the fused layers: each one is waited for |
@@ -609,25 +614,22 @@ Diagnostics - nothing is measured unless they are set:
 - **`fused_layer.xclbin is present but not built for design tag ...`** - the
   artifacts and the backend are out of sync. Rebuild both:
   `cmake --build build --target ggml-xdna-kernels && cmake --build build`.
-- **`ssm_out is ..., which needs the ...-bit activation layout, but the kernels
-  were built with GATED_FMT=...`** - the model and the kernel build disagree.
-  Reconfigure with the `-DGGML_XDNA_GATED_FMT` the message names and rebuild
+- **`the fused decode layers read ssm_out as ...; this model's ... is ...: its
+  decode runs on the host`** - a weight the fused kernels do not read: the
+  model decodes on the host instead of the fused layers. For a
+  `Q4_K` `ssm_out` reconfigure with `-DGGML_XDNA_GATED_FMT=0` and rebuild
   (`cmake --build build --target ggml-xdna-kernels && cmake --build build`), or
-  requantize `ssm_out` to the other form (see Build). The refusal stops the
-  first decode graph, so prefill still runs and, under `llama-bench`, all that
-  shows is `llama_bench: error: failed to run gen warmup`.
+  requantize `ssm_out` to `Q5_K` (see Build); a `Q8_0` one takes the
+  requantize, e.g.
+  `llama-quantize --tensor-type ssm_out=q5_K model-f16.gguf out.gguf Q4_K_M`.
+  An FFN outside `Q4_K` gate/up and `Q4_K`/`Q6_K` down has no rebuild that
+  takes it.
 - **The fused layer is not used at all** - no tagged `fused_layer` artifact was
   found (check the build output dir and the tag the build stamped, also written
   to `<build>/ggml/src/ggml-xdna/xdna-design-tag.h`), or
   `GGML_XDNA_FUSED_LAYER=0` is set. The flag is a bisection switch for a model
   the fused layer accepts: that decode then uses the per-op kernels. A model
-  the layer refuses is not this case.
-- **`unsupported fused weight set (...)`** - the model's quantization is outside
-  the set the fused kernels were built for and no `GATED_FMT` value covers it
-  (a `Q8_0` `ssm_out` is the common case). Requantize the tensor, e.g.
-  `llama-quantize --tensor-type ssm_out=q5_K model-f16.gguf out.gguf Q4_K_M`.
-  The failure has the same shape as the layout mismatch above.
-  `GGML_XDNA_FUSED_LAYER=0` is not a way to run this model.
+  whose weight set the layer does not take prints the warning above instead.
 - **No NPU** - with no accel device bound to `amdxdna`, or none the process
   can read and write, the backend lists no device. Listing the device does not
   open it: the first use does (a model placed on it, or its backend
