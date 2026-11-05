@@ -45,12 +45,17 @@ than run on the wrong kernels; the refusal names the weight set. The way on is
 to requantize `ssm_out` (see Build). `GGML_XDNA_FUSED_LAYER=0` is a bisection
 switch, not a way to run a model this layer refuses.
 
-The designs are also built for one residual width (1024, `XDNA_RES_D`). A model
-whose residual stream is wider - Qwen3.5-2B is 2048, the 4B 2560, the 9B 4096 -
-cannot be handed a recurrent layer at all, and one warning names the width when
-it happens. Its prefill keeps the array as far as the kernels take its shapes.
-Its decode (one token a sequence) runs whole on the host instead, because the
-decode GEMV streams weights at ~31 GB/s, less than the host's cores draw.
+The layers take the residual width from the model; the residual rows the
+layers hand each other are sized for 2048 (`XDNA_RES_MAX_D`). By default they
+take a width of 1024, the 0.8B's. `GGML_XDNA_FUSED_WIDE=1` also gives them any
+wider stream up to 2048 that is a multiple of 512 - Qwen3.5-2B is 2048 - whose
+projections then take more than one pass of the pool (the FFN's down
+projection, `ssm_out` and the attention output each two at 2048). Without it,
+and for any wider model - the 4B is 2560, the 9B 4096 - the model is not handed
+a recurrent layer at all, and one warning names the width when it happens. Its
+prefill keeps the array as far as the kernels take its shapes. Its decode (one
+token a sequence) runs whole on the host instead, because the decode GEMV
+streams weights at ~31 GB/s, less than the host's cores draw.
 One thread on every allowed core computes it, pinned one a core
 (`GGML_XDNA_HOST_DECODE_THREADS` sets another count); unpinned, 8 threads do.
 Against the array's per-op decode on a Ryzen AI MAX+ 395 (16 cores, with
@@ -339,6 +344,7 @@ For users - a trade-off, a size or a location:
 | `GGML_XDNA_GLUE_THREADS_BIG` | 16 | the same, for a chunk of 32 tokens or more |
 | `GGML_XDNA_HOST_DECODE_THREADS` | one a core | host threads for the decode of a model wider than the fused layers (see [The fused decode recurrent layer](#the-fused-decode-recurrent-layer)): one on every allowed core when they are pinned, 8 when they are not; `0` runs that decode per op on the array, slower at more energy a token |
 | `GGML_XDNA_HOST_DECODE_PIN` | 1 | in an OpenMP build, pins those threads one a core, filling one L3 domain before the next, and hands every borrowed thread its CPU mask back after each decode; `0` leaves 8 threads to the OS, slower (the 4B: 18.7 against 30.1 t/s) |
+| `GGML_XDNA_FUSED_WIDE` | 0 | `1` runs the decode of a model with a residual width above 1024, up to 2048 and a multiple of 512 (Qwen3.5-2B), on the fused layers instead of the host (see [The fused decode recurrent layer](#the-fused-decode-recurrent-layer)) |
 | `GGML_XDNA_ARENA_MB` | 256 | size of each chunk of the device-buffer arena, in MiB |
 | `GGML_XDNA_CONV` | 0 | `1` runs the standalone prefill `SSM_CONV` on the array; the host is cheaper, which is why it is off |
 | `GGML_XDNA_GDN_CONV` | 0 | `1` computes the prefill GDN's conv input on the array; the host is faster, which is why it is off |
@@ -436,9 +442,9 @@ Diagnostics - nothing is measured unless they are set:
 ## Known limits
 
 - The fused decode layer is written around one geometry - 6144 conv channels,
-  1024 `d_out`, 16 value heads of 128, a 262144-float recurrent state - and the
-  designs are compiled for it, so another GDN model needs the designs rebuilt
-  and the constants in `xdna-rec.h` revisited.
+  16 value heads of 128, a 262144-float recurrent state, a residual width of
+  at most 2048 - and the designs are compiled for it, so another GDN model
+  needs the designs rebuilt and the constants in `xdna-rec.h` revisited.
 - The host-built instruction streams and the RTP/shim constants follow the
   mlir-aie placement. The design tag does not cover the toolchain version, so a
   toolchain bump has to be paired with re-reading those constants.
