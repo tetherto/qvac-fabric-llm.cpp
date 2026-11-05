@@ -17,7 +17,9 @@ static constexpr int64_t N_HEAD        = 8;     // its query heads
 static constexpr int64_t N_HEAD_KV     = 2;     // its K/V heads
 static constexpr int64_t N_KV          = 512;   // K/V view cells
 static constexpr int64_t N_BATCH       = 64;    // prefill tokens
-static constexpr int     MAX_TENSORS   = 48;
+static constexpr int64_t QK_ROW        = 256;   // one K-quant block: the shortest row a quantized weight takes
+static constexpr int64_t W_ROWS        = 4;
+static constexpr int     MAX_TENSORS   = 64;
 
 struct match_case {
     const char *        what;
@@ -115,10 +117,45 @@ static int check_fa_plain(ggml_context * ctx) {
     return count_failures(cases);
 }
 
+// A weight `name` of `type`, and the MUL_MAT that reads it.
+static ggml_tensor * read_weight(ggml_context * ctx, ggml_type type, const char * name, ggml_tensor * x) {
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, type, QK_ROW, W_ROWS);
+    ggml_set_name(w, name);
+    return ggml_mul_mat(ctx, w, x);
+}
+
+// The weights the fused decode reads in its own formats, and the first it does not.
+static int check_fused_weights(ggml_context * ctx) {
+    ggml_tensor *       x         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, QK_ROW, 1);
+    ggml_tensor *       gate      = read_weight(ctx, GGML_TYPE_Q4_K, "blk.0.ffn_gate.weight", x);
+    ggml_tensor *       up        = read_weight(ctx, GGML_TYPE_Q4_K, "blk.0.ffn_up.weight", x);
+    ggml_tensor *       down      = read_weight(ctx, GGML_TYPE_Q6_K, "blk.0.ffn_down.weight", x);
+    ggml_tensor *       so6       = read_weight(ctx, GGML_TYPE_Q6_K, "blk.0.ssm_out.weight", x);
+    ggml_tensor *       so4       = read_weight(ctx, GGML_TYPE_Q4_K, "blk.1.ssm_out.weight", x);
+    ggml_tensor *       qkv8      = read_weight(ctx, GGML_TYPE_Q8_0, "blk.0.attn_qkv.weight", x);
+    ggml_tensor *       down8     = read_weight(ctx, GGML_TYPE_Q8_0, "blk.3.ffn_down.weight", x);
+    ggml_tensor *       gate8     = read_weight(ctx, GGML_TYPE_Q8_0, "blk.3.ffn_gate.weight", x);
+    const ggml_tensor * covered[] = { gate, up, down, so6, qkv8 };
+    const ggml_tensor * stock[]   = { qkv8, gate8, up, down8 };
+    const ggml_tensor * q4_so[]   = { gate, so4 };
+
+    const match_case cases[] = {
+        { "the Q4_K_M set reads, an 8-bit layout",      xdna_fused_uncovered(covered,   5, 1), nullptr       },
+        { "a Q6_K ssm_out needs the 8-bit layout",      xdna_fused_uncovered(covered,   5, 0), so6->src[0]   },
+        { "a Q4_K ssm_out reads with the 4-bit layout", xdna_fused_uncovered(q4_so,     2, 0), nullptr       },
+        { "a Q4_K ssm_out needs the 4-bit layout",      xdna_fused_uncovered(q4_so,     2, 1), so4->src[0]   },
+        { "a Q8_0 FFN is the first weight not read",    xdna_fused_uncovered(stock,     4, 1), gate8->src[0] },
+        { "a Q8_0 FFN down is not read",                xdna_fused_uncovered(&stock[2], 2, 1), down8->src[0] },
+        { "a Q8_0 attn_qkv is not a fused-set weight",  xdna_fused_uncovered(stock,     1, 1), nullptr       },
+    };
+    return count_failures(cases);
+}
+
 int main(void) {
     const ggml_init_params params = { ggml_tensor_overhead() * MAX_TENSORS, nullptr, true };
     ggml_context *         ctx    = ggml_init(params);
-    const int              failures = check_state_gather(ctx) + check_row_crop(ctx) + check_fa_plain(ctx);
+    const int              failures =
+            check_state_gather(ctx) + check_row_crop(ctx) + check_fa_plain(ctx) + check_fused_weights(ctx);
     ggml_free(ctx);
     if (failures) {
         std::printf("test-xdna-match: %d failures\n", failures);
