@@ -523,11 +523,14 @@ if (GGML_XDNA_BUILD_TESTS)
     target_link_libraries(test-xdna-head-rows PRIVATE XRT::xrt_coreutil)
     add_executable(test-xdna-match tests/test-xdna-match.cpp)
     target_link_libraries(test-xdna-match PRIVATE ggml-base)
-    # On the device, self-skipping without one: the FFN pair against a CPU
-    # reference. It links the backend, which a GGML_BACKEND_DL build cannot.
+    # On the device, self-skipping without one: the FFN pair and the fused
+    # attention layer against a CPU reference. They link the backend, which a
+    # GGML_BACKEND_DL build cannot.
     if (NOT GGML_BACKEND_DL)
-        add_executable(test-xdna-pair tests/test-xdna-pair.cpp)
-        target_include_directories(test-xdna-pair PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
-        target_link_libraries(test-xdna-pair PRIVATE ggml-xdna ggml-base XRT::xrt_coreutil)
+        foreach(t test-xdna-pair test-xdna-att-layer)
+            add_executable(${t} tests/${t}.cpp)
+            target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+            target_link_libraries(${t} PRIVATE ggml-xdna ggml-base XRT::xrt_coreutil)
+        endforeach()
     endif()
 endif()

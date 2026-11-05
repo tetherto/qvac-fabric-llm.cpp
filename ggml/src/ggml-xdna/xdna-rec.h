@@ -267,7 +267,7 @@ bool xdna_rec_core_set_rows(xdna_rec_core *      core,
 // And the gates, from the same row: alpha = W_a x, beta = W_b x (NVH rows of
 // D each, f32), dt and a (NVH each) - x's per-head tails (exp(gate), beta,
 // the scale) become the prologue's, and the host writes x no more. False
-// when D is not a whole number of gate objects (XDNA_ROW_GATE_VALUES).
+// when the rows do not go through the prologue (xdna_row_gates_ok).
 bool xdna_rec_core_set_gates(xdna_rec_core * core,
                              const float *   w_alpha,
                              const float *   w_beta,

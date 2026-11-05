@@ -595,9 +595,9 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
                                               Buffer(PRO_CNT_TY, name="proC")],
                               tile=Tile(pro_col, pro_row),
                               stack_size=0x1300,
-                              # act-att.cc's state: the combine's o and its
-                              # output, the q tile, the K/V rows, the gates
-                              data_size=33792)]
+                              # act-att.cc's state: one arena for the row at
+                              # D 4096, the combine or the prepare, and the gates
+                              data_size=34816)]
         a_cons = a_q
 
     if PAIR:

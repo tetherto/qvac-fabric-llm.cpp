@@ -46,7 +46,7 @@ to requantize `ssm_out` (see Build). `GGML_XDNA_FUSED_LAYER=0` is a bisection
 switch, not a way to run a model this layer refuses.
 
 The layers take the residual width from the model; the residual rows the
-layers hand each other are sized for 2048 (`XDNA_RES_MAX_D`). By default they
+layers hand each other are sized for 4096 (`XDNA_RES_MAX_D`). By default they
 take a width of 1024, the 0.8B's. `GGML_XDNA_FUSED_WIDE=1` also gives them any
 wider stream up to 2048 that is a multiple of 512 - Qwen3.5-2B is 2048 - whose
 projections then take more than one pass of the pool (the FFN's down

@@ -1166,21 +1166,55 @@ static bool xdna_att_on(void) {
     return v;
 }
 
-// The shapes the pool's attention takes: Qwen3.5's full-attention decode.
+// The shapes the pool's attention takes: Qwen3.5's full-attention decode, one
+// head group of eight query heads over two kv heads, or two (the 4B and 9B).
+static constexpr int64_t XDNA_ATT_D        = 256;
+static constexpr int64_t XDNA_ATT_GROUP_H  = 8;  // query heads a pool run takes
+static constexpr int64_t XDNA_ATT_GQA      = 4;  // query heads a kv head serves
+static constexpr int64_t XDNA_ATT_MAX_GRPS = 2;
+
 static bool xdna_att_eligible(const ggml_tensor * n) {
     const ggml_tensor *q = n->src[0], *k = n->src[1], *v = n->src[2], *m = n->src[3];
     // no sinks (src[4]), no per-slice K/V rows (src[5], ggml_flash_attn_ext_rows)
     if (n->op != GGML_OP_FLASH_ATTN_EXT || !q || !k || !v || !m || n->src[4] || n->src[5]) {
         return false;
     }
+    const int64_t h   = q->ne[2];
+    const int64_t kvh = h / XDNA_ATT_GQA;
+    const size_t  hb  = (size_t) XDNA_ATT_D * sizeof(ggml_fp16_t);  // a kv head's row
+    if (h % XDNA_ATT_GROUP_H != 0 || h / XDNA_ATT_GROUP_H < 1 || h / XDNA_ATT_GROUP_H > XDNA_ATT_MAX_GRPS) {
+        return false;
+    }
     float par[3];
     memcpy(par, n->op_params, sizeof(par));
-    return par[1] == 0.0f && par[2] == 0.0f && q->type == GGML_TYPE_F32 && q->ne[0] == 256 && q->ne[1] == 1 &&
-           q->ne[2] == 8 && q->ne[3] == 1 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && k->ne[0] == 256 &&
-           k->ne[2] == 2 && v->ne[0] == 256 && v->ne[2] == 2 && k->ne[3] == 1 && v->ne[3] == 1 &&
-           k->ne[1] == v->ne[1] && k->nb[0] == 2 && k->nb[1] == 1024 && k->nb[2] == 512 && v->nb[0] == 2 &&
-           v->nb[1] == 1024 && v->nb[2] == 512 && m->type == GGML_TYPE_F16 && m->ne[0] >= k->ne[1] &&
-           n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) && ggml_nelements(n) == (int64_t) 256 * 8;
+    return par[1] == 0.0f && par[2] == 0.0f && q->type == GGML_TYPE_F32 && q->ne[0] == XDNA_ATT_D && q->ne[1] == 1 &&
+           q->ne[3] == 1 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && k->ne[0] == XDNA_ATT_D &&
+           k->ne[2] == kvh && v->ne[0] == XDNA_ATT_D && v->ne[2] == kvh && k->ne[3] == 1 && v->ne[3] == 1 &&
+           k->ne[1] == v->ne[1] && k->nb[0] == 2 && k->nb[1] == kvh * hb && k->nb[2] == hb && v->nb[0] == 2 &&
+           v->nb[1] == kvh * hb && v->nb[2] == hb && m->type == GGML_TYPE_F16 && m->ne[0] >= k->ne[1] &&
+           n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) && ggml_nelements(n) == XDNA_ATT_D * h;
+}
+
+// One pool run a head group: its kv heads `k->nb[2]` apart inside a position.
+static bool xdna_att_run_groups(xdna_att *    att,
+                                xdna_buffer * kbo,
+                                size_t        koff,
+                                xdna_buffer * vbo,
+                                size_t        voff,
+                                const float * q,
+                                float         scale,
+                                int           n_valid,
+                                float *       out,
+                                int64_t       h,
+                                size_t        pos_b) {
+    const size_t grp_b = (size_t) xdna_att_geom::POS_B;
+    for (int64_t g = 0; g < h / XDNA_ATT_GROUP_H; g++) {
+        const size_t qo = (size_t) (g * XDNA_ATT_GROUP_H * XDNA_ATT_D);
+        if (!xdna_att_run(att, kbo, koff + g * grp_b, vbo, voff + g * grp_b, q + qo, scale, n_valid, out + qo, pos_b)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool xdna_att_try(ggml_backend_xdna_context * ctx, ggml_tensor * n) {
@@ -1214,28 +1248,30 @@ static bool xdna_att_try(ggml_backend_xdna_context * ctx, ggml_tensor * n) {
     }
     // The rows the host wrote since the last flush of this layer: one a
     // token, or all of them after a prefill.
-    int & fl = ctx->att_flushed[k->data];
+    const size_t pos_b = k->nb[1];
+    int &        fl    = ctx->att_flushed[k->data];
     if (fl > n_valid) {
         fl = 0;
     }
     if (n_valid > fl) {
-        const size_t b0 = (size_t) fl * 1024, nb = (size_t) (n_valid - fl) * 1024;
+        const size_t b0 = (size_t) fl * pos_b, nb = (size_t) (n_valid - fl) * pos_b;
         if (!xdna_buffer_sync_to_device_range(kbo, nb, koff + b0) ||
             !xdna_buffer_sync_to_device_range(vbo, nb, voff + b0)) {
             return false;
         }
         fl = n_valid;
     }
-    float qc[8 * 256];
-    for (int h = 0; h < 8; h++) {
-        memcpy(qc + (size_t) h * 256, (const char *) q->data + h * q->nb[2], 256 * sizeof(float));
+    const int64_t h = q->ne[2];
+    float         qc[XDNA_ATT_MAX_GRPS * XDNA_ATT_GROUP_H * XDNA_ATT_D];
+    for (int64_t i = 0; i < h; i++) {
+        memcpy(qc + i * XDNA_ATT_D, (const char *) q->data + i * q->nb[2], XDNA_ATT_D * sizeof(float));
     }
     float scale;
     memcpy(&scale, n->op_params, sizeof(float));
     xdna_prof::section_timer st_att(n_valid <= 1024 ? "att: pool run (<=1k)" :
                                     n_valid <= 4096 ? "att: pool run (<=4k)" :
                                                       "att: pool run (>4k)");
-    return xdna_att_run(ctx->att, kbo, koff, vbo, voff, qc, scale, n_valid, (float *) n->data);
+    return xdna_att_run_groups(ctx->att, kbo, koff, vbo, voff, qc, scale, n_valid, (float *) n->data, h, pos_b);
 }
 
 // Run one attention tail and write attn_residual and l_out.
@@ -1562,7 +1598,7 @@ static bool xdna_attl_ready(ggml_backend_xdna_context * ctx, const xdna_attl_pla
     size_t        koff = 0, voff = 0;
     xdna_buffer * kbo = xdna_host_bo_of(p.n_fa->src[1]->data, &koff);
     xdna_buffer * vbo = xdna_host_bo_of(p.n_fa->src[2]->data, &voff);
-    if (n_valid <= 0 || !kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid)) {
+    if (n_valid <= 0 || !kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, p.n_fa->src[1]->nb[1])) {
         return false;
     }
     // the token's row is the last visible cell of its stream: the view's
@@ -1611,10 +1647,11 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
     // indices are global across streams, the view starts at its stream)
     const ggml_tensor * views[2] = { k, v };
     const ggml_tensor * srs[2]   = { p.n_srk, p.n_srv };
+    const size_t        pos_b    = k->nb[1];
     for (int i = 0; i < 2; i++) {
         const ggml_tensor *sr = srs[i], *idx = sr->src[1];
         if (!idx || ggml_nelements(idx) != 1 || sr->src[0]->ne[1] != 1 ||
-            sr->src[0]->ne[0] * sr->src[0]->ne[2] != 512 || sr->nb[1] != 1024) {
+            sr->src[0]->ne[0] * sr->src[0]->ne[2] != k->ne[0] * k->ne[2] || sr->nb[1] != pos_b) {
             return false;
         }
         const size_t  off = (size_t) ((const char *) views[i]->data - (const char *) sr->data);
@@ -1633,7 +1670,7 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
     size_t        koff = 0, voff = 0;
     xdna_buffer * kbo = xdna_host_bo_of(k->data, &koff);
     xdna_buffer * vbo = xdna_host_bo_of(v->data, &voff);
-    if (!kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid)) {
+    if (!kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, pos_b)) {
         return false;
     }
     std::vector<float> cosv, sinv;
@@ -1672,7 +1709,7 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
         fl = 0;
     }
     if (n_valid - 1 > fl) {
-        const size_t b0 = (size_t) fl * 1024, nb = (size_t) (n_valid - 1 - fl) * 1024;
+        const size_t b0 = (size_t) fl * pos_b, nb = (size_t) (n_valid - 1 - fl) * pos_b;
         if (!xdna_buffer_sync_to_device_range(kbo, nb, koff + b0) ||
             !xdna_buffer_sync_to_device_range(vbo, nb, voff + b0)) {
             return false;
@@ -1709,6 +1746,7 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
     in.koff     = koff;
     in.vbo      = vbo;
     in.voff     = voff;
+    in.pos_b    = pos_b;
     in.n_valid  = n_valid;
     in.n_rot    = n_rot;
     in.cosv     = cosv.data();

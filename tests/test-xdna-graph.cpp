@@ -20,9 +20,12 @@
 // prefill graph, on both routes, with the SwiGLU folded into the GEMM and not.
 // The fused route runs one-row projections off the prefill GEMM, so no fusion
 // may leave the norm or the SwiGLU only in such a projection's A.
-// Prefill attention over a K/V row list (ggml_flash_attn_ext_rows), in the
-// shape the NPU's prefill attention takes: that design reads K/V in mask
-// order, so the backend has to leave it to the host, which follows the list.
+// Qwen3.5's attention at one and two head groups (eight query heads over two
+// kv heads a group: the 0.8B/2B, the 4B/9B): prefill on the NPU's mmul, the
+// decode on its pool, reading the cache where llama keeps it (the XDNA
+// device's host buffers). And prefill attention over a K/V row list
+// (ggml_flash_attn_ext_rows): the mmul reads K/V in mask order, so the backend
+// has to leave it to the host, which follows the list.
 //
 // Every intermediate is cleared before each backend runs, so a node read
 // before it was written shows as zeros instead of as the other backend's
@@ -40,14 +43,17 @@
 #include <utility>
 #include <vector>
 
-// Qwen3.5's full-attention layers (xdna-attn-mm.cpp), past the pair count up
-// to which the host runs a prefill attention
-static constexpr int64_t FA_HEAD_DIM = 256;
-static constexpr int64_t FA_HEADS    = 8;
-static constexpr int64_t FA_KV_HEADS = 2;
-static constexpr int64_t FA_TOKENS   = 512;
-static constexpr int64_t FA_KV       = 1024;
-static constexpr float   FA_SCALE    = 0.0625f;
+// Qwen3.5's full-attention layers (xdna-attn-mm.cpp, xdna-att.h): prefill
+// past the pair count up to which the host runs it, decode over a part of the
+// cache that ends inside a chunk of the pool's
+static constexpr int64_t FA_HEAD_DIM  = 256;
+static constexpr int64_t FA_GROUP     = 8;  // query heads a head group
+static constexpr int64_t FA_GQA       = 4;  // query heads a kv head serves
+static constexpr int64_t FA_TOKENS    = 512;
+static constexpr int64_t FA_KV        = 1024;
+static constexpr int64_t FA_DEC_CTX   = 512;
+static constexpr int64_t FA_DEC_VALID = 300;
+static constexpr float   FA_SCALE     = 0.0625f;
 
 static ggml_backend_dev_t xdna_device(void) {
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -101,6 +107,15 @@ static std::vector<uint8_t> causal_mask(int64_t n_kv, int64_t n_tokens) {
         for (int64_t j = 0; j < n_kv; j++) {
             m[(size_t) (t * n_kv + j)] = ggml_fp32_to_fp16(j <= n_past + t ? 0.0f : -INFINITY);
         }
+    }
+    return to_bytes(m);
+}
+
+// the first n_valid of n_kv keys, for one query
+static std::vector<uint8_t> prefix_mask(int64_t n_kv, int64_t n_valid) {
+    std::vector<ggml_fp16_t> m((size_t) n_kv);
+    for (int64_t j = 0; j < n_kv; j++) {
+        m[(size_t) j] = ggml_fp32_to_fp16(j < n_valid ? 0.0f : -INFINITY);
     }
     return to_bytes(m);
 }
@@ -278,28 +293,106 @@ static bool check_cropped_ffn(ggml_backend_t cpu, ggml_backend_t npu, ggml_backe
     return passed;
 }
 
-// the K/V rows in reverse, so attention that ignores the list sees other keys
-static norm_graph build_attention_rows(ggml_backend_t cpu, int64_t n_tokens, int64_t n_kv) {
+// Prefill attention of `heads` query heads; with `rows`, over the K/V rows in
+// reverse, so attention that ignores the list sees other keys
+static norm_graph build_attention(ggml_backend_t be, int64_t heads, int64_t n_tokens, int64_t n_kv, bool rows) {
     norm_graph       g;
     ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
     g.ctx               = ggml_init(ip);
-    ggml_tensor * q     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, FA_HEAD_DIM, n_tokens, FA_HEADS, 1);
-    ggml_tensor * k     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, FA_HEAD_DIM, n_kv, FA_KV_HEADS, 1);
-    ggml_tensor * v     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, FA_HEAD_DIM, n_kv, FA_KV_HEADS, 1);
+    ggml_tensor * q     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, FA_HEAD_DIM, n_tokens, heads, 1);
+    ggml_tensor * k     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, FA_HEAD_DIM, n_kv, heads / FA_GQA, 1);
+    ggml_tensor * v     = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, FA_HEAD_DIM, n_kv, heads / FA_GQA, 1);
     ggml_tensor * mask  = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, n_kv, n_tokens, 1, 1);
-    ggml_tensor * rows  = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, n_kv, 1);
+    ggml_tensor * list  = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, n_kv, 1);
     g.inputs            = { q, k, v };
-    ggml_tensor * out   = ggml_flash_attn_ext_rows(g.ctx, q, k, v, mask, rows, FA_SCALE, 0.0f, 0.0f);
+    ggml_tensor * out   = rows ? ggml_flash_attn_ext_rows(g.ctx, q, k, v, mask, list, FA_SCALE, 0.0f, 0.0f) :
+                                 ggml_flash_attn_ext(g.ctx, q, k, v, mask, FA_SCALE, 0.0f, 0.0f);
     ggml_set_name(out, "attn");
     g.gf = ggml_new_graph(g.ctx);
     ggml_build_forward_expand(g.gf, out);
     g.checked = { out };
     g.fixed   = {
-        { mask, causal_mask(n_kv, n_tokens) },
-        { rows, reversed_rows(n_kv) }
+        { mask, causal_mask(n_kv, n_tokens) }
     };
-    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    if (rows) {
+        g.fixed.push_back({ list, reversed_rows(n_kv) });
+    }
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, be);
     return g;
+}
+
+// Decode attention of `heads` query heads on llama's cache layout: a position
+// holds every kv head's row, the view steps over them
+static norm_graph build_decode_attention(ggml_backend_t be, int64_t heads, int64_t n_ctx, int64_t n_valid) {
+    norm_graph       g;
+    const int64_t    kvh = heads / FA_GQA;
+    ggml_init_params ip  = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    g.ctx                = ggml_init(ip);
+    ggml_tensor * q      = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, FA_HEAD_DIM, 1, heads, 1);
+    ggml_tensor * kc     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, FA_HEAD_DIM * kvh, n_ctx);
+    ggml_tensor * vc     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, FA_HEAD_DIM * kvh, n_ctx);
+    const size_t  hb     = FA_HEAD_DIM * sizeof(ggml_fp16_t);
+    ggml_tensor * k      = ggml_view_3d(g.ctx, kc, FA_HEAD_DIM, n_ctx, kvh, kc->nb[1], hb, 0);
+    ggml_tensor * v      = ggml_view_3d(g.ctx, vc, FA_HEAD_DIM, n_ctx, kvh, vc->nb[1], hb, 0);
+    ggml_tensor * mask   = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, n_ctx, 1, 1, 1);
+    g.inputs             = { q, kc, vc };
+    ggml_tensor * out    = ggml_flash_attn_ext(g.ctx, q, k, v, mask, FA_SCALE, 0.0f, 0.0f);
+    ggml_set_name(out, "attn");
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.fixed   = {
+        { mask, prefix_mask(n_ctx, n_valid) }
+    };
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
+static void free_graph(norm_graph & g) {
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
+}
+
+// The graph on the CPU and on the NPU, its one checked node compared; false
+// when either compute fails.
+static bool check_one(norm_graph &   g,
+                      ggml_backend_t cpu,
+                      ggml_backend_t npu,
+                      const char *   what,
+                      double         tol,
+                      bool *         passed) {
+    std::vector<std::vector<float>> want, got;
+    if (!run(g, cpu, want) || !run(g, npu, got)) {
+        return false;
+    }
+    const double e  = nmse(want[0], got[0]);
+    const bool   ok = e < tol;
+    *passed         = *passed && ok;
+    std::printf("%-26s %-5s nmse %.3g %s\n", what, ggml_get_name(g.checked[0]), e, ok ? "ok" : "FAIL");
+    return true;
+}
+
+// Every attention case; the decode graphs all stay allocated until each has
+// run, so none reuses another's cache memory (the pool keeps which rows of a
+// cache it has flushed, by address).
+static bool check_attention(ggml_backend_t cpu, ggml_backend_t npu, double tol, bool * passed) {
+    bool       ran = true;
+    norm_graph rl  = build_attention(cpu, FA_GROUP, FA_TOKENS, FA_KV, true);
+    ran            = ran && check_one(rl, cpu, npu, "FLASH_ATTN_EXT kv_rows", tol, passed);
+    free_graph(rl);
+    norm_graph p1 = build_attention(cpu, FA_GROUP, FA_TOKENS, FA_KV, false);
+    ran           = ran && check_one(p1, cpu, npu, "FLASH_ATTN_EXT prefill 8/2", tol, passed);
+    free_graph(p1);
+    norm_graph p2 = build_attention(cpu, 2 * FA_GROUP, FA_TOKENS, FA_KV, false);
+    ran           = ran && check_one(p2, cpu, npu, "FLASH_ATTN_EXT prefill 16/4", tol, passed);
+    free_graph(p2);
+    norm_graph d1 = build_decode_attention(npu, FA_GROUP, FA_DEC_CTX, FA_DEC_VALID);
+    norm_graph d2 = build_decode_attention(npu, 2 * FA_GROUP, FA_DEC_CTX, FA_DEC_VALID);
+    ran           = ran && check_one(d1, cpu, npu, "FLASH_ATTN_EXT decode 8/2", tol, passed);
+    ran           = ran && check_one(d2, cpu, npu, "FLASH_ATTN_EXT decode 16/4", tol, passed);
+    free_graph(d1);
+    free_graph(d2);
+    return ran;
 }
 
 int main(void) {
@@ -360,20 +453,9 @@ int main(void) {
     unsetenv("GGML_XDNA_FUSED_LAYER");
 
     passed = check_cropped_ffn(cpu, npu, ggml_backend_dev_buffer_type(dev), tol) && passed;
-    {
-        norm_graph                      g = build_attention_rows(cpu, FA_TOKENS, FA_KV);
-        std::vector<std::vector<float>> want, got;
-        if (!run(g, cpu, want) || !run(g, npu, got)) {
-            std::printf("test-xdna-graph: compute failed\n");
-            return 1;
-        }
-        const double e  = nmse(want[0], got[0]);
-        const bool   ok = e < tol;
-        passed          = passed && ok;
-        std::printf("FLASH_ATTN_EXT kv_rows     %-5s nmse %.3g %s\n", ggml_get_name(g.checked[0]), e,
-                    ok ? "ok" : "FAIL");
-        ggml_backend_buffer_free(g.buf);
-        ggml_free(g.ctx);
+    if (!check_attention(cpu, npu, tol, &passed)) {
+        std::printf("test-xdna-graph: compute failed\n");
+        return 1;
     }
 
     ggml_backend_free(npu);

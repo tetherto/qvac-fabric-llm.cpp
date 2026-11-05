@@ -11,10 +11,11 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // Host side of kernels/attn_mm.py. Three arguments:
@@ -35,8 +36,9 @@ namespace {
 
 constexpr const char * STEM    = "attn_mm_c8";
 constexpr int          COLS    = 8;
-constexpr int          H       = 8;            // query heads
-constexpr int          KVH     = 2;            // KV heads
+constexpr int          H       = 8;            // query heads a call (a head group)
+constexpr int          KVH     = 2;            // KV heads a call
+constexpr int          GROUPS  = 2;            // head groups a layer at most (the 4B and 9B: 16 / 4)
 constexpr int          D       = 256;
 constexpr int          DH      = 128;          // a core's half of D
 constexpr int          R       = 32;           // rows a pair
@@ -67,14 +69,14 @@ struct kv_cache {
     uint64_t      print     = 0;  // of the keys packed (kv_print)
 };
 
-// A fingerprint of keys [0, n): the rows 0 and n - 1 of both KV heads, so a
-// copy packed for another sequence - one whose later ubatches the host ran -
-// is not taken for this one's.
-uint64_t kv_print(const ggml_tensor * k, int64_t n) {
+// A fingerprint of keys [0, n): the rows 0 and n - 1 of head group hg's KV
+// heads, so a copy packed for another sequence - one whose later ubatches the
+// host ran - is not taken for this one's.
+uint64_t kv_print(const ggml_tensor * k, int64_t n, int hg) {
     uint64_t h = 1469598103934665603ull;
     for (int64_t j : { (int64_t) 0, n - 1 }) {
-        for (int g = 0; g < 2; g++) {
-            const uint16_t * r = (const uint16_t *) ((const char *) k->data + j * k->nb[1] + g * k->nb[2]);
+        for (int g = 0; g < KVH; g++) {
+            const uint16_t * r = (const uint16_t *) ((const char *) k->data + j * k->nb[1] + (KVH * hg + g) * k->nb[2]);
             for (int d = 0; d < 64; d++) {
                 h = (h ^ r[d]) * 1099511628211ull;
             }
@@ -86,7 +88,7 @@ uint64_t kv_print(const ggml_tensor * k, int64_t n) {
 struct runner {
     std::mutex                                 mtx;
     xdna_kernel *                              kern = nullptr;
-    std::unordered_map<const void *, kv_cache> kv;
+    std::map<std::pair<const void *, int>, kv_cache> kv;  // by the cache and the head group
     // the nodes whose output stays in their output buffer (xdna_attn_mm_keep),
     // and the last such run's
     std::vector<const ggml_tensor *>           keep;
@@ -237,21 +239,22 @@ std::vector<uint32_t> build_seq(int npass, int64_t p0, int64_t cap_tiles) {
     return xdna_seq_build(&seq);
 }
 
-// Keys [j0, n_kv) of both KV heads into the tile layout, whole tiles (the
-// keys of the first one before j0 again, the same values); the rest of the
-// last tile zero (finite: every query before them masks them). Rows convert
-// in vectors, then scatter into the tiles.
+// Keys [j0, n_kv) of head group hg's two KV heads into the tile layout, whole
+// tiles (the keys of the first one before j0 again, the same values); the rest
+// of the last tile zero (finite: every query before them masks them). Rows
+// convert in vectors, then scatter into the tiles.
 void pack_kv(const ggml_tensor * k,
              const ggml_tensor * v,
              uint16_t *          dst,
              int64_t             cap_tiles,
              int64_t             j0,
-             int64_t             n_kv) {
+             int64_t             n_kv,
+             int                 hg) {
     const int64_t t0 = j0 / NK, t1 = (n_kv + NK - 1) / NK;
 #pragma omp parallel for collapse(2) num_threads(xdna_host_threads())
     for (int64_t t = t0; t < t1; t++) {
         for (int s = 0; s < 4; s++) {
-            const int            g = s / 2, h = s % 2;
+            const int            g = KVH * hg + s / 2, h = s % 2;
             uint16_t *           o  = dst + ((size_t) s * cap_tiles + t) * KV_OBJ;
             uint16_t *           ov = o + (size_t) NK * DH;
             alignas(64) uint16_t kb[NK][DH];
@@ -303,9 +306,10 @@ bool xdna_attn_mm_supported(const ggml_tensor * node) {
         node->type != GGML_TYPE_F32) {
         return false;
     }
-    // q is [D, n_tokens, n_head], k/v are [D, n_kv, n_head_kv]
-    if (q->ne[0] != D || q->ne[2] != H || q->ne[3] != 1 || k->ne[0] != D || v->ne[0] != D || k->ne[2] != KVH ||
-        v->ne[2] != KVH || k->ne[1] != v->ne[1]) {
+    // q is [D, n_tokens, n_head], k/v are [D, n_kv, n_head_kv]: whole head groups
+    const int64_t hg = q->ne[2] / H;
+    if (q->ne[0] != D || q->ne[2] % H != 0 || hg < 1 || hg > GROUPS || q->ne[3] != 1 || k->ne[0] != D ||
+        v->ne[0] != D || k->ne[2] != KVH * hg || v->ne[2] != KVH * hg || k->ne[1] != v->ne[1]) {
         return false;
     }
     const int64_t n_tokens = q->ne[1];
@@ -329,8 +333,10 @@ bool xdna_attn_mm_supported(const ggml_tensor * node) {
     return mask_past(node->src[3], n_kv, n_tokens) >= 0;
 }
 
-bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
-    std::lock_guard<std::mutex> lock(g_am.mtx);
+namespace {
+
+// One head group's call: query heads H hg .. H hg + 7 over KV heads KVH hg, + 1.
+bool run_group(xdna_kernel_pool * pool, ggml_tensor * node, int hg) {
     const ggml_tensor *         q        = node->src[0];
     const ggml_tensor *         k        = node->src[1];
     const ggml_tensor *         v        = node->src[2];
@@ -354,9 +360,9 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
 
     // K/V: this layer's copy, grown to the pass's last tile; a ubatch packs
     // its own rows, and all of them when the sequence starts over
-    kv_cache & kc = g_am.kv[k->data];
+    kv_cache & kc = g_am.kv[{ k->data, hg }];
     // a copy that ends where this ubatch starts, of this sequence's keys
-    int64_t    j0 = (p0 > 0 && kc.packed == p0 && kc.print == kv_print(k, p0)) ? p0 : 0;
+    int64_t    j0 = (p0 > 0 && kc.packed == p0 && kc.print == kv_print(k, p0, hg)) ? p0 : 0;
     if (!kc.bo || kc.cap_tiles < t_need) {
         if (kc.bo) {
             xdna_buffer_free(kc.bo);
@@ -373,7 +379,7 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         return false;
     }
     uint16_t * kvh = (uint16_t *) kc.bo->data;
-    pack_kv(k, v, kvh, kc.cap_tiles, j0, n_kv);
+    pack_kv(k, v, kvh, kc.cap_tiles, j0, n_kv, hg);
     // the tiles past n_kv that a pass streams are zero from the allocation
     // or a longer earlier sequence - finite either way, and masked
     const int64_t t0 = j0 / NK, t1 = (n_kv + NK - 1) / NK;
@@ -384,7 +390,7 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         }
     }
     kc.packed = n_kv;
-    kc.print  = kv_print(k, n_kv);
+    kc.print  = kv_print(k, n_kv, hg);
 
     const std::vector<uint32_t> insts = build_seq(npass, p0, kc.cap_tiles);
     if (!xdna_kernel_bind_insts(pool->device, g_am.kern, insts.data(), insts.size())) {
@@ -396,7 +402,8 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         g_am.kept_bo = nullptr;
         g_am.kept    = nullptr;
     }
-    const bool    keep  = std::find(g_am.keep.begin(), g_am.keep.end(), node) != g_am.keep.end();
+    // kept in place for one head group's layers only (xdna_attn_mm_row)
+    const bool    keep  = q->ne[2] == H && std::find(g_am.keep.begin(), g_am.keep.end(), node) != g_am.keep.end();
     const size_t  q_col = (size_t) (1 + npass) * 4 * Q_OBJ;  // bf16 a column
     const size_t  o_col = (size_t) npass * 4 * O_OBJ;        // f32 a column
     xdna_buffer * bo_q  = xdna_kernel_pool_acquire_buffer(pool, COLS * q_col * 2);
@@ -432,7 +439,7 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
                 const int64_t t  = (int64_t) p * PASS + (int64_t) pidx * 8 + row % 8;
                 if (t < n_tokens) {
                     xdna_scaled_bf16_row(
-                        (const float *) ((const char *) q->data + t * q->nb[1] + (4 * g + hh) * q->nb[2]) +
+                        (const float *) ((const char *) q->data + t * q->nb[1] + (H * hg + 4 * g + hh) * q->nb[2]) +
                             (size_t) h * DH,
                         qs, qb[row], DH);
                 } else {
@@ -469,8 +476,9 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
                     if (t >= n_tokens) {
                         continue;
                     }
-                    float * dst = (float *) ((char *) node->data + (4 * g + row / 8) * node->nb[1] + t * node->nb[2]) +
-                                  (size_t) h * DH;
+                    float * dst =
+                        (float *) ((char *) node->data + (H * hg + 4 * g + row / 8) * node->nb[1] + t * node->nb[2]) +
+                        (size_t) h * DH;
                     // the MemTile leaves the core's rows as rows
                     std::memcpy(dst, o + (size_t) row * DH, DH * sizeof(float));
                 }
@@ -488,6 +496,19 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         xdna_kernel_pool_release_buffer(pool, bo_o);
     }
     return ok;
+}
+
+}  // namespace
+
+bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
+    std::lock_guard<std::mutex> lock(g_am.mtx);
+    const int                   groups = (int) (node->src[0]->ne[2] / H);
+    for (int hg = 0; hg < groups; hg++) {
+        if (!run_group(pool, node, hg)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void xdna_attn_mm_graph_begin(void) {

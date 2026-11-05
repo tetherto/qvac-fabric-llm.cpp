@@ -387,7 +387,7 @@ bool xdna_rec_core_set_gates(xdna_rec_core * core,
                              const float *   a) {
     using namespace xdna_rec_pack;
     if (!core || !core->rows || core->so_fused || !w_alpha || !w_beta || !dt || !a ||
-        core->d % XDNA_ROW_GATE_VALUES != 0) {
+        !xdna_row_gates_ok(core->d, 2 * NVH)) {
         return false;
     }
     // [constants: dt[16], a[16], the scale, padded to a side object | 32 rows]

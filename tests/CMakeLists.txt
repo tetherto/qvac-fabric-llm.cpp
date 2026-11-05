@@ -680,10 +680,13 @@ if (GGML_XDNA)
             add_test(NAME ${t} COMMAND ${t} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
         endif()
     endforeach()
-    # The FFN pair on the device against the CPU, self-skipping; no model.
-    if (TARGET test-xdna-pair)
-        add_test(NAME test-xdna-pair COMMAND test-xdna-pair)
-    endif()
+    # The FFN pair and the fused attention layer on the device against the
+    # CPU, self-skipping; no model.
+    foreach(t test-xdna-pair test-xdna-att-layer)
+        if (TARGET ${t})
+            add_test(NAME ${t} COMMAND ${t})
+        endif()
+    endforeach()
 endif()
 
 if (APPLE)
