@@ -43,6 +43,10 @@
 // their keys causally or all of them.
 // Attentions whose K and V the graph casts, at inputs of different lengths,
 // leave the array holding no more K/V copies than the first one did.
+// An output the array writes and the host reads back, left dirty in the host's
+// cache with NaN before the array gets it, reads what the array wrote: a
+// prefill GEMM's staging, the vocabulary projection, the prefill attention, a
+// decode's attention on the pool and GATED_DELTA_NET.
 //
 // BF16 and F16 weight projections, which no quantized route carries, through
 // the bf16 GEMM: an M that fits the decode block, one that takes several
@@ -99,6 +103,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <random>
 #include <string>
@@ -1908,7 +1913,197 @@ static bool check_cropped_ffn(ggml_backend_t cpu, ggml_backend_t npu, ggml_backe
     return passed;
 }
 
+// One output of each site that hands the array a buffer the host reads back, filled with NaN by plain stores and left dirty
+// in the host's cache before the site gives it to the array (ggml_backend_xdna_test_dirty_output): a site that flushes it
+// first reads what the array wrote; one that does not reads the NaN its read-back sync writes back over it. Each case checks
+// the site filled exactly the one output, so a case its site never ran in cannot pass.
+typedef int (*dirty_output_fn)(const char * site, int arm);
+
+static const int     DIRTY_GEMM_ROWS    = 128;  // one block of a large product: the array's (test_pgemm_host_rule)
+static const int64_t DIRTY_GEMM_K       = 1024;
+static const int64_t DIRTY_GEMM_N       = 4096;
+static const int64_t DIRTY_HEAD_VOCAB   = 65536;  // the dirt shows at this many rows without the flush, not at 4096
+static const int     DIRTY_FA_TOKENS    = 600;
+static const int     GDN_TOKENS         = 144;    // the fewest of one sequence the array's GATED_DELTA_NET takes
+static const int     GDN_HEADS          = 16;
+static const int     GDN_DIM            = 128;
+static const double  GDN_ARRAY_NMSE_MAX = 1e-3;  // the array's bf16: 7e-6 on these inputs
+
+// `filled` -1: a compute failed
+static bool dirty_result_ok(const char *               site,
+                            int                        filled,
+                            const std::vector<float> & want,
+                            const std::vector<float> & got,
+                            double                     max_nmse) {
+    const double e  = filled >= 0 ? nmse(want, got) : INFINITY;
+    const bool   ok = filled == 1 && e < max_nmse;
+    std::printf("dirty output before the array writes it, %-8s %d filled, nmse %.3g %s\n", site, filled, e,
+                ok ? "ok" : "FAIL");
+    return ok;
+}
+
+// the outputs `site` filled while the NPU ran a graph with the site's next output left dirty; -1 when a compute failed
+static int dirtied_run(dirty_output_fn dirty, const char * site, bool computed, const std::function<bool()> & run_npu) {
+    const int  before = dirty(site, 1);
+    const bool ok     = run_npu();
+    const int  after  = dirty(site, 0);
+    return computed && ok ? after - before : -1;
+}
+
+static bool dirty_pgemm(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu, double tol) {
+    norm_graph                      g = build_gemms(cpu, GGML_TYPE_Q8_0, DIRTY_GEMM_ROWS,
+                                                    {
+                                                        gemm_shape{ DIRTY_GEMM_K, DIRTY_GEMM_N }
+    });
+    std::vector<std::vector<float>> want, got;
+    const bool                      computed = run(g, cpu, want);
+    const int                       filled   = dirtied_run(dirty, "pgemm", computed, [&] { return run(g, npu, got); });
+    const bool                      ok = dirty_result_ok("pgemm", filled, filled >= 0 ? want[0] : std::vector<float>(),
+                                                         filled >= 0 ? got[0] : std::vector<float>(), tol);
+    free_graph(g);
+    return ok;
+}
+
+// the vocabulary projection of a decode on the array (GGML_XDNA_HEAD=1, set for the process in main)
+static bool dirty_head(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu, double tol) {
+    norm_graph g = build_one_token(cpu, DIRTY_GEMM_K, DIRTY_HEAD_VOCAB);
+    ggml_set_name(g.inputs[1], "output.weight");
+    std::vector<std::vector<float>> want, got;
+    const bool                      computed = run(g, cpu, want);
+    const int                       filled   = dirtied_run(dirty, "head", computed, [&] { return run(g, npu, got); });
+    const bool                      ok = dirty_result_ok("head", filled, filled >= 0 ? want[0] : std::vector<float>(),
+                                                         filled >= 0 ? got[0] : std::vector<float>(), tol);
+    free_graph(g);
+    return ok;
+}
+
+static bool dirty_attn_mm(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu) {
+    set_fa_route(FA_ROUTE_ARRAY);
+    fa_cache c = new_fa_cache(cpu);
+    fill_cells(c, 0, FA_REFILL_CACHE, 13);
+    fa_rows_graph      g = build_fa_on_cache(cpu, c, DIRTY_FA_TOKENS);
+    std::vector<float> want, got;
+    const bool         computed = run_refill(g, cpu, DIRTY_FA_TOKENS, 0, true, &want);
+    const int          filled =
+        dirtied_run(dirty, "attn-mm", computed, [&] { return run_refill(g, npu, DIRTY_FA_TOKENS, 0, true, &got); });
+    const bool ok = dirty_result_ok("attn-mm", filled, want, got, FA_ARRAY_NMSE_MAX);
+    free_rows_graph(g);
+    ggml_backend_buffer_free(c.buf);
+    ggml_free(c.ctx);
+    unsetenv("GGML_XDNA_FA_MM");
+    return ok;
+}
+
+// a decode's attention on the pool, its K and V in the device's buffers (test_fa_kv_rows' last case)
+static bool dirty_att(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu, ggml_backend_buffer_type_t buft) {
+    const fa_rows_case c = { "decode on the pool", FA_ROUTE_HOST, 1, false, true };
+    set_fa_route(c.route);
+    setenv("GGML_XDNA_HOST_FA", "1", 1);
+    fa_rows_graph      g = build_fa_rows(buft, c);
+    std::vector<float> want, got;
+    const bool         computed = run_fa_rows(g, c, cpu, want);
+    const int          filled   = dirtied_run(dirty, "att", computed, [&] { return run_fa_rows(g, c, npu, got); });
+    const bool         ok       = dirty_result_ok("att", filled, want, got, FA_ARRAY_NMSE_MAX);
+    free_rows_graph(g);
+    unsetenv("GGML_XDNA_FA_MM");
+    unsetenv("GGML_XDNA_HOST_FA");
+    return ok;
+}
+
+// GATED_DELTA_NET of one sequence in the shapes the array takes: q, k unit rows a head, v, the log decay g < 0, beta, s0
+static norm_graph build_gdn(ggml_backend_t cpu) {
+    norm_graph       g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.inputs            = { ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, GDN_DIM, GDN_HEADS, GDN_TOKENS, 1),
+                            ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, GDN_DIM, GDN_HEADS, GDN_TOKENS, 1),
+                            ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, GDN_DIM, GDN_HEADS, GDN_TOKENS, 1),
+                            ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, 1, GDN_HEADS, GDN_TOKENS, 1),
+                            ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, 1, GDN_HEADS, GDN_TOKENS, 1),
+                            ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, GDN_DIM, GDN_DIM, GDN_HEADS, 1) };
+    ggml_tensor * out =
+        ggml_gated_delta_net(g.ctx, g.inputs[0], g.inputs[1], g.inputs[2], g.inputs[3], g.inputs[4], g.inputs[5], 1);
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+static void set_unit_rows(ggml_tensor * t, std::mt19937 & rng) {
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float>              f(ggml_nelements(t));
+    for (size_t r = 0; r < f.size(); r += GDN_DIM) {
+        double sq = 0.0;
+        for (int d = 0; d < GDN_DIM; d++) {
+            f[r + d] = nd(rng);
+            sq += (double) f[r + d] * f[r + d];
+        }
+        for (int d = 0; d < GDN_DIM; d++) {
+            f[r + d] = (float) (f[r + d] / std::sqrt(sq));
+        }
+    }
+    ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
+}
+
+static void set_uniform(ggml_tensor * t, std::mt19937 & rng, float lo, float hi) {
+    std::uniform_real_distribution<float> u(lo, hi);
+    std::vector<float>                    f(ggml_nelements(t));
+    for (float & x : f) {
+        x = u(rng);
+    }
+    ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
+}
+
+static bool run_gdn(norm_graph & g, ggml_backend_t be, std::vector<float> & res) {
+    std::mt19937                    rng(21);
+    std::normal_distribution<float> nv(0.0f, 0.5f), ns(0.0f, 0.05f);
+    set_unit_rows(g.inputs[0], rng);
+    set_unit_rows(g.inputs[1], rng);
+    set_normal(g.inputs[2], rng, nv);
+    set_uniform(g.inputs[3], rng, -0.5f, -0.02f);
+    set_uniform(g.inputs[4], rng, 0.2f, 0.8f);
+    set_normal(g.inputs[5], rng, ns);
+    if (ggml_backend_graph_compute(be, g.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    res = get_f32(g.checked[0]);
+    return true;
+}
+
+static bool dirty_gdn_mm(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu) {
+    norm_graph         g = build_gdn(cpu);
+    std::vector<float> want, got;
+    const bool         computed = run_gdn(g, cpu, want);
+    const int          filled   = dirtied_run(dirty, "gdn-mm", computed, [&] { return run_gdn(g, npu, got); });
+    const bool         ok       = dirty_result_ok("gdn-mm", filled, want, got, GDN_ARRAY_NMSE_MAX);
+    free_graph(g);
+    return ok;
+}
+
+static bool test_dirty_outputs(ggml_backend_t npu, ggml_backend_t cpu, ggml_backend_buffer_type_t buft, double tol) {
+    auto dirty = (dirty_output_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_dirty_output");
+    if (!dirty) {
+        std::printf("test-xdna-graph: the backend has no dirty-output hook\n");
+        return false;
+    }
+    setenv("GGML_XDNA_PGEMM_HOST", "0", 1);
+    setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
+    bool passed = dirty_pgemm(dirty, npu, cpu, tol);
+    passed      = dirty_head(dirty, npu, cpu, tol) && passed;
+    passed      = dirty_attn_mm(dirty, npu, cpu) && passed;
+    // after a prefill: the pool flushes a cache's rows once by address until the next one
+    passed      = dirty_att(dirty, npu, cpu, buft) && passed;
+    passed      = dirty_gdn_mm(dirty, npu, cpu) && passed;
+    unsetenv("GGML_XDNA_PGEMM_HOST");
+    unsetenv("GGML_XDNA_HOST_CHUNK");
+    return passed;
+}
+
 int main(void) {
+    // read once a process: the vocabulary projection of test_dirty_outputs on the array; no other case names one
+    setenv("GGML_XDNA_HEAD", "1", 1);
     ggml_backend_load_all();
     ggml_backend_dev_t dev = xdna_device();
     if (!dev) {
@@ -2191,6 +2386,7 @@ int main(void) {
     passed = npu != nullptr && test_host_chunk_conv_kernels(npu, cpu) && passed;
     passed = npu != nullptr && test_group_order_after_host_plan(npu, cpu) && passed;
     passed = test_chunk_plan_after_decode(dev, cpu) && passed;
+    passed = npu != nullptr && test_dirty_outputs(npu, cpu, ggml_backend_dev_buffer_type(dev), tol) && passed;
 
     ggml_backend_free(npu);
     ggml_backend_free(cpu);
