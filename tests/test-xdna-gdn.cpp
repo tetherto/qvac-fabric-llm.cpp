@@ -16,7 +16,9 @@
 // its bound, a decode row's nmse over its bound, a later round's row off round
 // 0's by more than a row's floor, any error the backend logs (a fused layer that
 // gives up is an error) and when the fused decode built fewer sessions than the
-// model has recurrent layers. Skips (exit 0) without a model or an XDNA device.
+// model has recurrent layers - or, under the off-switch GGML_XDNA_FUSED_WIDE=0,
+// any for a model wider than 1024. Skips (exit 0) without a model or an XDNA
+// device.
 #include "llama.h"
 
 #include <algorithm>
@@ -36,6 +38,7 @@ static constexpr double FLOOR_MARGIN  = 3.0;
 static constexpr int    N_PROMPT_MIN  = 160;
 static constexpr int    N_DECODE      = 16;
 static constexpr int    N_ROUNDS      = 2;
+static constexpr int    FUSED_D       = 1024;  // the width GGML_XDNA_FUSED_WIDE=0 keeps the fused layers to
 
 static ggml_backend_dev_t xdna_device(void) {
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -157,6 +160,14 @@ static int n_recurrent(const llama_model * model) {
     return every > 0 ? (n - nextn) - (n - nextn) / every : 0;
 }
 
+// The fused sessions the NPU run builds: one a recurrent layer, none for a
+// model wider than FUSED_D under GGML_XDNA_FUSED_WIDE=0.
+static long expected_sessions(const llama_model * model, int n_rec) {
+    const char * wide = std::getenv("GGML_XDNA_FUSED_WIDE");
+    const bool   off  = wide && std::strtol(wide, nullptr, 10) == 0;
+    return off && llama_model_n_embd(model) != FUSED_D ? 0 : n_rec;
+}
+
 // The prompt with every token's logits, then N_DECODE tokens one at a time:
 // `feed` when given (the CPU's choices), else the greedy ones. Each row of
 // logits in `out`, in order.
@@ -222,8 +233,6 @@ int main(int argc, char ** argv) {
             model_path = argv[i + 1];
         }
     }
-    // the fused decode for every residual width it takes, not only 1024
-    setenv("GGML_XDNA_FUSED_WIDE", "1", 0);
     // static: the backend may still log after main returns
     static log_state st;
     llama_log_set(on_log, &st);
@@ -256,8 +265,9 @@ int main(int argc, char ** argv) {
         prompt.resize(
             llama_tokenize(v, text.c_str(), (int) text.size(), prompt.data(), (int) prompt.size(), true, false));
     }
-    const int n_rec = n_recurrent(cpu);
-    const int nv    = llama_vocab_n_tokens(v);  // v goes with the CPU model
+    const int  n_rec    = n_recurrent(cpu);
+    const long sessions = expected_sessions(cpu, n_rec);
+    const int  nv       = llama_vocab_n_tokens(v);  // v goes with the CPU model
 
     std::vector<llama_token>        fed, again;
     std::vector<std::vector<float>> want, got;
@@ -315,8 +325,9 @@ int main(int argc, char ** argv) {
                 top1_decode);
     llama_backend_free();
     const int errors_npu = st.errors - errors_cpu;
-    std::printf("recurrent layers %d, fused sessions %ld, backend errors %d\n", n_rec, st.sessions, errors_npu);
-    passed = passed && errors_npu == 0 && n_rec > 0 && st.sessions == n_rec;
+    std::printf("recurrent layers %d, fused sessions %ld (want %ld), backend errors %d\n", n_rec, st.sessions, sessions,
+                errors_npu);
+    passed = passed && errors_npu == 0 && n_rec > 0 && st.sessions == sessions;
     std::printf("test-xdna-gdn: %s\n", passed ? "passed" : "FAILED");
     return passed ? 0 : 1;
 }

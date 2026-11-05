@@ -33,6 +33,9 @@
 // xdna-gdn-mm.cpp G_MIN), and with one that turns that fast after a chunk that
 // leaves it just above the renormalization point (its shift, SHIFT_MAX).
 //
+// A dense layer's decode at the 2B's width, as a Qwen3 model's: the fused
+// layers do not run it, so it decodes on the host, which one warning says.
+//
 // Every intermediate is cleared before each backend runs, so a node read
 // before it was written shows as zeros instead of as the other backend's
 // result. Skips (exit 0) when no XDNA device is registered.
@@ -46,6 +49,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -76,6 +80,11 @@ static constexpr float   GDN_BETA_HI   = 0.9f;
 static constexpr int64_t GDN_CHUNK     = 16;      // tokens a chunk on the array
 static constexpr int64_t GDN_EDGE_HEAD = 23;
 static constexpr float   GDN_EDGE_GATE = -1.36f;  // a chunk of it sums to -31.4 log2, just above LS_MIN
+
+// A dense model's layer (no gated delta net) at the 2B's residual width, and
+// the line its host decode prints (ggml-xdna.cpp xdna_misfit_route)
+static constexpr int64_t DENSE_EMBD   = 2048;
+static constexpr char    HOST_ROUTE[] = "its decode runs on the host";
 
 static ggml_backend_dev_t xdna_device(void) {
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -445,6 +454,62 @@ static void free_graph(norm_graph & g) {
     ggml_free(g.ctx);
 }
 
+// One token through a dense layer's norm and output projection into its
+// l_out, the weights in a model's buffer: the backend keeps its route per
+// model, and freeing the buffer drops it.
+static norm_graph build_dense_decode(ggml_backend_buffer_type_t buft, int64_t K) {
+    norm_graph       g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, 1);
+    ggml_tensor * w     = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, K);
+    ggml_tensor * wo    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, K);
+    ggml_set_name(w, "blk.0.attn_norm.weight");
+    ggml_set_name(wo, "blk.0.attn_output.weight");
+    g.inputs           = { x, w, wo };
+    ggml_tensor * norm = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, x, 1e-6f), w);
+    ggml_tensor * out  = ggml_add(g.ctx, x, ggml_mul_mat(g.ctx, wo, norm));
+    ggml_set_name(out, "l_out-0");
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors_from_buft(g.ctx, buft);
+    ggml_backend_buffer_set_usage(g.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    return g;
+}
+
+static void capture_log(ggml_log_level level, const char * text, void * user) {
+    GGML_UNUSED(level);
+    static_cast<std::string *>(user)->append(text);
+    std::fputs(text, stderr);
+}
+
+// The dense decode on the CPU and on the NPU's default route: the host decode
+// line has to come, and the result is the CPU's.
+static bool check_dense_route(ggml_backend_t             cpu,
+                              ggml_backend_t             npu,
+                              ggml_backend_buffer_type_t buft,
+                              double                     tol,
+                              bool *                     passed) {
+    norm_graph                      g = build_dense_decode(buft, DENSE_EMBD);
+    std::vector<std::vector<float>> want, got;
+    std::string                     log;
+    ggml_log_set(capture_log, &log);
+    const bool ran = run(g, cpu, want) && run(g, npu, got);
+    ggml_log_set(nullptr, nullptr);
+    free_graph(g);
+    if (!ran) {
+        return false;
+    }
+    const double e    = nmse(want[0], got[0]);
+    const bool   host = log.find(HOST_ROUTE) != std::string::npos;
+    const bool   ok   = e < tol && host;
+    *passed           = *passed && ok;
+    std::printf("%-26s %-5s nmse %.3g, host decode line %s %s\n", "dense decode at 2048", "l_out", e,
+                host ? "seen" : "missing", ok ? "ok" : "FAIL");
+    return true;
+}
+
 // The graph on the CPU and on the NPU, its one checked node compared; false
 // when either compute fails.
 static bool check_one(norm_graph &   g,
@@ -546,6 +611,10 @@ int main(void) {
     // Q8_K on the CPU, which leaves them 1-2e-4 apart
     const double tol    = 1e-3;
     bool         passed = true;
+    if (!check_dense_route(cpu, npu, ggml_backend_dev_buffer_type(dev), tol, &passed)) {
+        std::printf("test-xdna-graph: compute failed\n");
+        return 1;
+    }
     for (bool side_reader : { false, true }) {
         norm_graph                      g = build(cpu, side_reader, 1024, 1024, 128);
         std::vector<std::vector<float>> want, got;
