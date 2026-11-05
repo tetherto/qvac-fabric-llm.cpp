@@ -685,6 +685,13 @@ if (GGML_XDNA)
             add_test(NAME ${t} COMMAND ${t} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
         endif()
     endforeach()
+    # The committed design tag header against the kernel sources at the default gated layout: Python, no IRON, no device.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME test-xdna-design-tag
+                 COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna/tests/test-xdna-design-tag.py
+                         ${GGML_XDNA_GATED_FMT_DEFAULT})
+    endif()
 endif()
 
 if (APPLE)
