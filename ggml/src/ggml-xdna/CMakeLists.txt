@@ -513,9 +513,9 @@ endif()
 # Host-only tests of what a device cannot check for itself: which weight
 # conversions the repacker accepts, how many head rows stay exact, which
 # nodes the graph planners take for the ones llama builds, what the mark that
-# tells a lost write from a landed one leaves behind, and how the GEMM stream
-# issues its sweeps. They
-# compile the backend sources they test directly and open no device.
+# tells a lost write from a landed one leaves behind, how the GEMM stream
+# issues its sweeps, and how far a grouped projection's output offset reaches.
+# They compile the backend sources they test directly and open no device.
 # tests/CMakeLists.txt adds them to ctest: testing is enabled there, after this
 # directory is configured.
 option(GGML_XDNA_BUILD_TESTS "ggml-xdna: build the host-only backend tests" ON)
@@ -534,4 +534,5 @@ if (GGML_XDNA_BUILD_TESTS)
     add_executable(test-xdna-mark tests/test-xdna-mark.cpp xdna-runtime.cpp)
     target_include_directories(test-xdna-mark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
     target_link_libraries(test-xdna-mark PRIVATE ggml-base XRT::xrt_coreutil)
+    add_executable(test-xdna-seg-reach tests/test-xdna-seg-reach.cpp)
 endif()
