@@ -358,6 +358,7 @@ static bool xdna_norm_mul_fast(const struct ggml_tensor * r, struct ggml_tensor 
     }
     float eps;
     memcpy(&eps, r->op_params, sizeof(float));
+    xdna_prof::section_timer st("prefill: norm mul");
     const float * wd = (const float *) w->data;
     const int64_t n0 = m->ne[0], n1 = m->ne[1], n2 = m->ne[2], n3 = m->ne[3];
 #pragma omp parallel for collapse(3) num_threads(xdna_glue_threads(true))
@@ -687,6 +688,13 @@ static std::atomic<int> g_host_chunks{ 0 };
 
 static int xdna_test_host_chunk_count(void) {
     return g_host_chunks;
+}
+
+// Test hook (ggml_backend_xdna_test_glu_fold_count): the GLUs the array ran folded into their gate and up GEMM.
+static std::atomic<int> g_glu_folds{ 0 };
+
+static int xdna_test_glu_fold_count(void) {
+    return g_glu_folds;
 }
 
 static enum ggml_status xdna_host_chunk_run(struct ggml_cgraph * cgraph) {
@@ -3744,7 +3752,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // their outputs to have no other reader.
     // And when the SWIGLU's one reader is the next projection on the array
     // (xdna_pgemm_glu_fused_supported), the cores write it as that
-    // projection's A directly (glu_to_a).
+    // projection's A directly (glu_to_a), the merged design's only GLU output.
     std::unordered_set<const struct ggml_tensor *> glu_fused, glu_to_a;
     if (g_glue_n_tokens > 1) {
         std::unordered_map<const struct ggml_tensor *, int>                        uses;
@@ -3765,7 +3773,10 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
         std::unordered_set<const struct ggml_tensor *> in_graph(cgraph->nodes, cgraph->nodes + cgraph->n_nodes);
         for (int i = 0; i < cgraph->n_nodes; i++) {
             struct ggml_tensor * node = cgraph->nodes[i];
-            if (!xdna_pgemm_glu_supported(node)) {
+            const bool           to_a = uses[node] == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                              xdna_pgemm_glu_fused_supported(node, reader[node]) &&
+                              xdna_takes_pgemm(&ctx->ops, reader[node]);
+            if (!to_a && !xdna_pgemm_glu_supported(node)) {
                 continue;
             }
             struct ggml_tensor * gate = node->src[0];
@@ -3780,8 +3791,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             consumed.insert(gate);
             consumed.insert(up);
             glu_fused.insert(node);
-            if (uses[node] == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-                xdna_pgemm_glu_fused_supported(node, reader[node]) && xdna_takes_pgemm(&ctx->ops, reader[node])) {
+            if (to_a) {
                 glu_to_a.insert(node);
             }
         }
@@ -4609,7 +4619,9 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                 ok = (glu_to_a.count(node) && xdna_pgemm_run_glu_fused(ctx->ops.pool, node)) ||
                      xdna_pgemm_run_glu(ctx->ops.pool, node);
             }
-            if (!ok) {
+            if (ok) {
+                g_glu_folds++;
+            } else {
                 // the two projections one at a time and the host's SwiGLU
                 if (!xdna_ops_compute(&ctx->ops, node->src[0]) || !xdna_ops_compute(&ctx->ops, node->src[1]) ||
                     !xdna_ops_finalize(&ctx->ops) || !xdna_glue_host_run(&ctx->ops, node)) {
@@ -5487,6 +5499,9 @@ static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const c
     }
     if (std::strcmp(name, "ggml_backend_xdna_test_stale_kv") == 0) {
         return (void *) xdna_test_stale_kv;
+    }
+    if (std::strcmp(name, "ggml_backend_xdna_test_glu_fold_count") == 0) {
+        return (void *) xdna_test_glu_fold_count;
     }
     return NULL;
 }

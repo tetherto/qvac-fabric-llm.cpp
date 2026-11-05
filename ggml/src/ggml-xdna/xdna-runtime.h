@@ -214,11 +214,19 @@ void xdna_kernel_pool_release_buffer(xdna_kernel_pool * pool, xdna_buffer * buf)
 // --- test hook -------------------------------------------------------------
 
 // The outputs the array writes and the host reads back, by the site that hands them to it.
-enum xdna_out_site { XDNA_OUT_PGEMM, XDNA_OUT_ATTN_MM, XDNA_OUT_GDN_MM, XDNA_OUT_ATT, XDNA_OUT_HEAD, XDNA_OUT_SITES };
+enum xdna_out_site {
+    XDNA_OUT_PGEMM,
+    XDNA_OUT_ATTN_MM,
+    XDNA_OUT_GDN_MM,
+    XDNA_OUT_ATT,
+    XDNA_OUT_HEAD,
+    XDNA_OUT_PFX_ATTN,
+    XDNA_OUT_SITES
+};
 
 // Test hook (ggml_backend_xdna_test_dirty_output): with `arm`, the next output of `site` ("pgemm", "attn-mm", "gdn-mm",
-// "att", "head") is filled with NaN by plain stores, its lines left dirty, before the site flushes it. Returns the outputs
-// of the site filled so far, -1 for a site it does not know.
+// "att", "head", "pfx-attn") is filled with NaN by plain stores, its lines left dirty, before the site flushes it.
+// Returns the outputs of the site filled so far, -1 for a site it does not know.
 int xdna_test_dirty_output(const char * site, int arm);
 
 // [offset, offset + bytes) of `buf`, the output `site` hands the array, filled as above when the site is armed.

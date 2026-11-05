@@ -1424,7 +1424,7 @@ void xdna_kernel_pool_release_buffer(xdna_kernel_pool * pool, xdna_buffer * buf)
 
 namespace {
 
-const char * const OUT_SITE_NAMES[XDNA_OUT_SITES] = { "pgemm", "attn-mm", "gdn-mm", "att", "head" };
+const char * const OUT_SITE_NAMES[XDNA_OUT_SITES] = { "pgemm", "attn-mm", "gdn-mm", "att", "head", "pfx-attn" };
 std::atomic<bool>  g_out_armed[XDNA_OUT_SITES];
 std::atomic<int>   g_out_filled[XDNA_OUT_SITES];
 

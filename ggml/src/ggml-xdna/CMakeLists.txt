@@ -12,6 +12,7 @@ ggml_add_backend_library(ggml-xdna
                          xdna-ops.cpp
                          xdna-pgemm.cpp
                          xdna-attn-mm.cpp
+                         xdna-pfx-attn.cpp
                          xdna-host-attn.cpp
                          xdna-gdn-mm.cpp
                          xdna-conv-prefill.cpp
@@ -278,6 +279,31 @@ if (GGML_XDNA_BUILD_KERNELS)
         VERBATIM
     )
     list(APPEND XDNA_ARTIFACTS ${PG_XCLBIN} ${PG_INSTS})
+
+    # The merged prefill design (pfx.py): pgemm's GEMM in its 8-bit tile form on
+    # every core, attn-mm.cc's attention on six columns and the row ops
+    # (rowop.cc) on two, so a layer runs in one hardware context.
+    # GGML_XDNA_PFX=1 loads it in pgemm_c8's place.
+    set(PFX_STEM "pfx_c8")
+    set(PFX_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PFX_STEM}.xclbin")
+    set(PFX_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PFX_STEM}.insts.bin")
+    add_custom_command(
+        OUTPUT ${PFX_XCLBIN} ${PFX_INSTS}
+        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/pfx.py"
+                -d npu2
+                --xclbin-path ${PFX_XCLBIN}
+                --insts-path ${PFX_INSTS}
+        DEPENDS "${GEMM_DIR}/pfx.py" "${GEMM_DIR}/rowop.cc" "${GEMM_DIR}/attn_mm.py" "${GEMM_DIR}/attn-mm.cc"
+                "${GEMM_DIR}/pgemm.py" "${GEMM_DIR}/gemm-expand.cc" ${XDNA_KERNEL_HEADERS}
+                "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/wfmt.py"
+                "${GEMM_DIR}/gemv-q4.cc" "${GEMM_DIR}/gemm-dequant.cc"
+                "${GEMM_DIR}/act-att.cc" "${GEMM_DIR}/attn-dec.cc"
+                "${GEMM_DIR}/gemv-merge.cc" "${GEMM_DIR}/gemv-zero.cc"
+        WORKING_DIRECTORY "${GEMM_DIR}"
+        COMMENT "ggml-xdna: compiling the merged prefill design"
+        VERBATIM
+    )
+    list(APPEND XDNA_ARTIFACTS ${PFX_XCLBIN} ${PFX_INSTS})
 
     # Prefill attention (attn_mm.py + attn-mm.cc):
     # the six full-attention layers on the mmul, the cores driven by a header

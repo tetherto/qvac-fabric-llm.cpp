@@ -79,7 +79,8 @@
 // A prompt's FFN, down(GLU(gate(x), up(x))) with SWIGLU and with GEGLU: the
 // backend runs the gate and up projections and the activation as one call,
 // writing the product straight into the down projection's input; with the
-// GLU a graph output it writes the product itself. Activations are scaled
+// GLU a graph output it writes the product itself (the host does, when the
+// merged design of GGML_XDNA_PFX is loaded). Activations are scaled
 // to put the gate on the activation's curve and, larger, in its tails. Two
 // sizes: EmbeddingGemma 2's (512, 2048) and Qwen3.5-4B's (2560, 9216).
 //
@@ -886,6 +887,18 @@ static bool test_fa_kv_copies(ggml_backend_t npu, ggml_backend_t cpu) {
 // product, bit for bit) or the array (a different order of summing, so not bit for bit).
 enum gemm_route { GEMM_ROUTE_ANY, GEMM_ROUTE_HOST, GEMM_ROUTE_ARRAY };
 
+// The merged prefill design loaded as pgemm_c8 (GGML_XDNA_PFX=1): 8-bit weight tiles only, and a GLU folded into
+// its GEMM written only as the next projection's A.
+static bool pfx_loaded() {
+    const char * v = std::getenv("GGML_XDNA_PFX");
+    return v && std::atoi(v) != 0;
+}
+
+// A weight type the prefill GEMM takes in the design that is loaded: the merged one's Q8_0 for Q4_K.
+static ggml_type pgemm_weight(ggml_type t) {
+    return pfx_loaded() && t == GGML_TYPE_Q4_K ? GGML_TYPE_Q8_0 : t;
+}
+
 struct gemm_shape {
     int64_t        K;
     int64_t        N;
@@ -908,7 +921,7 @@ static norm_graph build_gemms(ggml_backend_t cpu, enum ggml_type wtype, int64_t 
             a = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, sh.K, M);
             g.inputs.push_back(a);
         }
-        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, sh.wtype == GGML_TYPE_COUNT ? wtype : sh.wtype, sh.K, sh.N);
+        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, pgemm_weight(sh.wtype == GGML_TYPE_COUNT ? wtype : sh.wtype), sh.K, sh.N);
         g.inputs.push_back(w);
         ggml_tensor * out = ggml_mul_mat(g.ctx, w, a);
         ggml_set_name(out, (std::string("K") + std::to_string(sh.K) + " N" + std::to_string(sh.N)).c_str());
@@ -928,14 +941,14 @@ struct gemm_case {
     bool                    gemm_host_off  = false;  // GGML_XDNA_GEMM_HOST=0
 };
 
-// An N x K Q4_K projection of M tokens followed by a tensor of its own to guard,
+// An N x K projection of M tokens (Q4_K, or pgemm_weight's type) followed by a tensor of its own to guard,
 // allocated in `be`'s buffers
 static norm_graph build_projection(ggml_backend_t be, int64_t K, int64_t N, int64_t M, ggml_tensor ** guard) {
     norm_graph g;
     ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
     g.ctx               = ggml_init(ip);
     ggml_tensor * a     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
-    ggml_tensor * p     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, N);
+    ggml_tensor * p     = ggml_new_tensor_2d(g.ctx, pgemm_weight(GGML_TYPE_Q4_K), K, N);
     g.inputs            = { a, p };
     ggml_tensor * out   = ggml_mul_mat(g.ctx, p, a);
     ggml_set_name(out, "proj");
@@ -1225,17 +1238,29 @@ static norm_graph build_ffn(ggml_backend_t be, ggml_glu_op op, bool glu_is_outpu
     return g;
 }
 
+typedef int (*glu_fold_count_fn)(void);
+
+// The fold runs once a graph; the merged design leaves a GLU that is an output to the host.
 static bool test_ffn(ggml_backend_t npu, ggml_backend_t cpu, ggml_glu_op op, bool glu_is_output, int64_t K, int64_t F,
                      int64_t M, float scale, double tol) {
+    auto folds = (glu_fold_count_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_glu_fold_count");
+    if (!folds) {
+        std::printf("test-xdna-graph: the backend has no GLU fold count\n");
+        return false;
+    }
     norm_graph                      want_g = build_ffn(cpu, op, glu_is_output, K, F, M, scale);
     norm_graph                      got_g  = build_ffn(npu, op, glu_is_output, K, F, M, scale);
     std::vector<std::vector<float>> want, got;
+    const int                       before = folds();
     const bool                      ok = run(want_g, cpu, want) && run(got_g, npu, got);
+    const int                       fired  = folds() - before;
+    const int                       expect = pfx_loaded() && glu_is_output ? 0 : 1;
     const double                    e  = ok ? nmse(want[0], got[0]) : INFINITY;
-    const bool                      passed = ok && e < tol;
-    std::printf("%-6s %-4s K %-5lld F %-5lld M %-4lld scale %-5.2f nmse %.3g %s\n",
+    const bool                      passed = ok && e < tol && fired == expect;
+    std::printf("%-6s %-4s K %-5lld F %-5lld M %-4lld scale %-5.2f nmse %.3g, %d of %d folds %s\n",
                 op == GGML_GLU_OP_GEGLU ? "GEGLU" : "SWIGLU", glu_is_output ? "glu" : "down", (long long) K,
-                (long long) F, (long long) M, scale, e, passed ? "ok" : "FAIL");
+                (long long) F, (long long) M, scale, e, fired, expect, passed ? "ok" : "FAIL");
     ggml_backend_buffer_free(want_g.buf);
     ggml_backend_buffer_free(got_g.buf);
     ggml_free(want_g.ctx);
@@ -1969,7 +1994,9 @@ static bool dirty_head(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t
     return ok;
 }
 
+// the prefill attention on the route it takes: the merged design's with it loaded (GGML_XDNA_PFX)
 static bool dirty_attn_mm(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu) {
+    const char * site = pfx_loaded() ? "pfx-attn" : "attn-mm";
     set_fa_route(FA_ROUTE_ARRAY);
     fa_cache c = new_fa_cache(cpu);
     fill_cells(c, 0, FA_REFILL_CACHE, 13);
@@ -1977,8 +2004,8 @@ static bool dirty_attn_mm(dirty_output_fn dirty, ggml_backend_t npu, ggml_backen
     std::vector<float> want, got;
     const bool         computed = run_refill(g, cpu, DIRTY_FA_TOKENS, 0, true, &want);
     const int          filled =
-        dirtied_run(dirty, "attn-mm", computed, [&] { return run_refill(g, npu, DIRTY_FA_TOKENS, 0, true, &got); });
-    const bool ok = dirty_result_ok("attn-mm", filled, want, got, FA_ARRAY_NMSE_MAX);
+        dirtied_run(dirty, site, computed, [&] { return run_refill(g, npu, DIRTY_FA_TOKENS, 0, true, &got); });
+    const bool ok = dirty_result_ok(site, filled, want, got, FA_ARRAY_NMSE_MAX);
     free_rows_graph(g);
     ggml_backend_buffer_free(c.buf);
     ggml_free(c.ctx);
