@@ -82,6 +82,16 @@ bool xdna_pgemm_run_glu(struct xdna_kernel_pool * pool, struct ggml_tensor * glu
 bool xdna_pgemm_glu_fused_supported(const struct ggml_tensor * glu, const struct ggml_tensor * down);
 bool xdna_pgemm_run_glu_fused(struct xdna_kernel_pool * pool, struct ggml_tensor * glu);
 
+// GLU_X: a MUL of GELU(MUL_MAT) and x (`mul`; x f32 rows of the projection's
+// shape in one of the backend's buffers, EmbeddingGemma 2's per-layer input)
+// written by the cores in bf16 straight into the A layout of `proj`, the
+// MUL_MAT that reads it, in the merged design (GGML_XDNA_PGEMM_GLU_X=1: on).
+// The accumulator's up half starts as x, so the GELU epilogue of the fused
+// GLU applies gelu(gate) * x. Neither the MUL_MAT, the GELU nor the MUL is
+// written; the caller skips the first two and runs proj next.
+bool xdna_pgemm_glux_supported(const struct ggml_tensor * mul, const struct ggml_tensor * proj);
+bool xdna_pgemm_run_glux(struct xdna_kernel_pool * pool, struct ggml_tensor * mul);
+
 // An RMS_NORM's output times its weight (`mul`, the MUL of the norm and a
 // vector) laid out straight into the A layout of the MUL_MATs that read it
 // (GGML_XDNA_PGEMM_NORM_A=0: off), one pass over the norm's input: neither
