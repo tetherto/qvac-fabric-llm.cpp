@@ -629,7 +629,7 @@ uint64_t turbovec_v8_declared_size(std::istream & f, uint64_t file_size) {
     return std::min<uint64_t>(file_size, geo.unit_at(0) + n / kBlock * geo.unit_len());
 }
 
-ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error, TurboVecV8LoadInfo * info) {
+ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error, TurboVecV8LoadInfo * info, bool staged) {
     error = GGML_VEC_INDEX_E_IO;
     if (raw.size() < 12 || !turbovec_v8_magic(raw.data(), raw.size())) {
         error = GGML_VEC_INDEX_E_BAD_MAGIC;
@@ -768,10 +768,13 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
     const size_t packed_bytes = turbovec_row_bytes(geo.bits, geo.dim);
     const size_t nsg = planes_nsg(geo);
     const size_t low_row = static_cast<size_t>(geo.bits - 1) * nsg;
+    // Set before any rows decode, so an index loaded with staged search off
+    // is never promoted below and decodes like a small index.
+    idx->turbovec_staged_enabled = staged;
     // Rows decode straight into the blocked cache. An index the planes
     // layout will promote decodes into packed rows instead, which its staged
     // search reads, and builds the blocked cache from them.
-    const bool keep_packed = turbovec_planes_wanted(geo.bits, dim, n);
+    const bool keep_packed = staged && turbovec_planes_wanted(geo.bits, dim, n);
     idx->turbovec_packed_rows = keep_packed;
     if (keep_packed) {
         idx->turbovec_data.assign(n * packed_bytes, 0);

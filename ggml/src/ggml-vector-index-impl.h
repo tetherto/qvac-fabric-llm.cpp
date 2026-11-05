@@ -748,6 +748,10 @@ void turbovec_force_vm8_2bit_for_test(int mode);
 // small indexes included, so a test reaches the batch kernels.
 void turbovec_force_batches_for_test(int enabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
+// Whether the staged-search caches exist, and the bytes the sign planes still
+// hold allocated.
+void turbovec_staged_caches_for_test(
+    const ggml_vec_index_t * idx, bool * planes, bool * packed_rows, size_t * sign_capacity);
 // Staged searches so far whose sampled seed left the shortlist short, and
 // staged batch scan tasks run so far.
 int64_t turbovec_seed_short_count_for_test(void);
@@ -1162,7 +1166,10 @@ struct TurboVecV8LoadInfo {
     // File rows with redo ops in the adopted commit.
     std::vector<size_t> pending;
 };
-ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error, TurboVecV8LoadInfo * info);
+// `staged` false loads with staged search off and never builds its caches
+// (GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF).
+ggml_vec_index_t * turbovec_v8_load_image(
+    std::vector<uint8_t> raw, int & error, TurboVecV8LoadInfo * info, bool staged = true);
 
 // Positioned writes made durable together (one fsync per batch).
 using TurboVecWriteBatch = std::vector<std::pair<uint64_t, std::vector<uint8_t>>>;
