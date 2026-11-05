@@ -2,13 +2,15 @@
 
 // The data paths of the prefill GEMM's artifact (kernels/pgemm.py, and the
 // merged prefill design kernels/pfx.py built on them), shared by the runners
-// that build its streams: the GEMM (xdna-pgemm.cpp) and the attention mode of
-// the merged design (xdna-pfx-attn.cpp).
+// that build its streams: the GEMM (xdna-pgemm.cpp) and the attention and row
+// commands of the merged design (xdna-pfx-attn.cpp, xdna-pfx-row.cpp).
 
 #include "xdna-seq.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace xdna_pgemm_path {
 
@@ -39,6 +41,60 @@ constexpr uint32_t     SH_BD_C     = 4;
 
 constexpr const char * PGEMM_STEM = "pgemm_c8";
 constexpr const char * PFX_STEM   = "pfx_c8";
+
+// The merged design's header (kernels/pfx.py): the words a core copies out of its A stream's first object
+constexpr int          HDR_WORDS     = 16;
+constexpr int          HW_ATTN_ON    = 8;   // attention calls
+constexpr int          HW_ROW_ON     = 9;   // row command: a row-op core's C objects
+constexpr int          HW_A_DRAIN    = 10;  // attention command: the A objects a row-op core lets pass
+constexpr int          HW_ATTN_DRAIN = 11;  // row command: the A objects an attention core lets pass
+constexpr int          HW_ROW_SETUP  = 12;  // row command: a row-op core's setup objects
+
+// A MemTile access pattern as kernels/pgemm.py writes dims_to_stream and dims_from_stream: (size, stride) a dim,
+// outermost first, in elements
+struct mt_dim {
+    int size;
+    int stride;
+};
+
+constexpr int MT_DIMS = 4;
+
+// The memory element of the pattern's k-th stream element
+inline int mt_walk(const mt_dim (&dims)[MT_DIMS], int k) {
+    int at = 0;
+    for (int d = MT_DIMS - 1; d >= 0; d--) {
+        at += (k % dims[d].size) * dims[d].stride;
+        k /= dims[d].size;
+    }
+    return at;
+}
+
+// An A object (64 x 64 bf16) reaches the cores tiled by the A MemTile: the core's element j is the host object's
+// element a_tiled_index(j)
+constexpr int    A_OBJ_ELEMS            = 64 * 64;
+constexpr mt_dim A_TILING[MT_DIMS]      = { { 8, 512 }, { 8, 8 }, { 8, 64 }, { 8, 1 } };
+// The C join writes word e of a core's C object (64 x 32 f32) to word mt_walk(C_JOIN, e) of the core's part
+constexpr mt_dim C_JOIN[MT_DIMS]        = { { 8, 256 }, { 4, 8 }, { 8, 32 }, { 8, 1 } };
+
+inline int a_tiled_index(int j) {
+    return mt_walk(A_TILING, j);
+}
+
+// The host object `obj` the cores read as `core`
+inline void scatter_a_object(const uint16_t * core, uint16_t * obj) {
+    for (int j = 0; j < A_OBJ_ELEMS; j++) {
+        obj[a_tiled_index(j)] = core[j];
+    }
+}
+
+// `n_words` (<= HDR_WORDS) header words into A object `obj`, as the cores read them
+inline void write_tiled_words(const int32_t * words, int n_words, uint16_t * obj) {
+    uint16_t hb[2 * HDR_WORDS];
+    std::memcpy(hb, words, (size_t) n_words * sizeof(int32_t));
+    for (int j = 0; j < 2 * n_words; j++) {
+        obj[a_tiled_index(j)] = hb[j];
+    }
+}
 
 // GGML_XDNA_PFX=1 with the merged prefill design built (kernels/pfx.py): its GEMM expands only the 8-bit tile form
 // and writes the gated product only as the next projection's A (xdna-pgemm.cpp)
@@ -102,6 +158,20 @@ inline void mt_push(xdna_seq * seq, uint32_t col, uint32_t id, xdna_dma_dir dir,
     const uint32_t ctrl = (dir == xdna_dma_dir::MM2S ? 0xA0630 : 0xA0600) + ch * 8;
     xdna_seq_maskwrite(seq, col, 1, ctrl, MT_CTRL_PKT << 8, 0x1F00);
     xdna_seq_write(seq, col, 1, ctrl + 4, id | repeat << 16 | 1u << 31);
+}
+
+// Before a MemTile channel's next task: the oldest of the MT_Q in flight done
+inline void wait_mt_queue(xdna_seq * seq, uint32_t col, xdna_dma_dir dir, uint32_t ch, int pushed) {
+    if (pushed >= MT_Q) {
+        xdna_seq_wait_token(seq, col, 1, dir, ch);
+    }
+}
+
+// The tokens of a channel's last tasks not yet waited: the final `ring` of `pushed`
+inline void wait_last(xdna_seq * seq, uint32_t col, uint32_t row, xdna_dma_dir dir, uint32_t ch, int pushed, int ring) {
+    for (int k = std::max(0, pushed - ring); k < pushed; k++) {
+        xdna_seq_wait_token(seq, col, row, dir, ch);
+    }
 }
 
 }  // namespace xdna_pgemm_path

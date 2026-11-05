@@ -1,9 +1,9 @@
-# Per-row cost of the merged design's row ops (probes/rowop-s1.cc) on one core, from L1, no data movement:
-# each case calls ggml_xdna_rowop REP times inside one core's loop, at two REP counts, and the slope between them is
-# the cost of one call (the command's own floor cancels out). Sizes are EmbeddingGemma 2's.
+# Per-row cost of the merged design's row command kernel (kernels/rowop.cc) on one core, from L1, no data movement:
+# each case sets the core up once and calls ggml_xdna_rowop REP times inside one core's loop, at two REP counts, and the
+# slope between them is the cost of one call, a block of 8 rows (the command's own floor cancels out). Sizes are
+# EmbeddingGemma 2's.
 #   NPU_CACHE_HOME=$(mktemp -d) python probes/rowop_speed.py
 import hashlib
-import struct
 import sys
 import time
 from pathlib import Path
@@ -22,53 +22,64 @@ here = Path(__file__).resolve().parent
 sys.path.insert(0, str(here.parent / "kernels"))
 import kernelsrc  # noqa: E402
 
-N_MAX = 2048                       # floats a row buffer holds (n_ff)
-HDR_WORDS = 16
+D = 256
+BLOCK_ROWS = 8
+SETUP_BYTES = 10752                # a core's W buffer, which the setup object fills
+C_BF16 = 4096                      # a C object: two blocks
+ACC_F32 = 4096
+PARAM_WORDS = 16
+MODE_R1_BLOCK = 5
+RMS_EPS = 1e-6
+STACK = 0xB00                      # kernels/pfx.py's row-op stack
 REPS = (32, 256)
 RUNS = 10
-MODE_WORD, SIZE_WORD, ROT_WORD, SCALE_WORD, ROW_WORD, SCRATCH_WORD = 10, 11, 12, 13, 14, 15
-CASES = {                          # name: (mode, row size, rotated dims)
-    "R1 head norm + rope, D 256": (1, 256, 256),
-    "R1 head norm, D 256": (1, 256, 0),
-    "R2 post-norm + add + pre-norm, 512": (2, 512, 0),
-    "R4 gelu(gate) * x, 2048": (4, 2048, 0),
+CASES = {                          # name: rotated dims
+    "R1 block norm + rope, 8 x D 256": 256,
+    "R1 block norm, 8 x D 256": 0,
 }
 bf16 = ml_dtypes.bfloat16
-x_ty = np.ndarray[(N_MAX,), np.dtype[np.float32]]
-y_ty = np.ndarray[(4 * N_MAX,), np.dtype[np.float32]]
-o_ty = np.ndarray[(N_MAX,), np.dtype[bf16]]
-n_ty = np.ndarray[(HDR_WORDS,), np.dtype[np.int32]]
-src = kernelsrc.load(here / "rowop-s1.cc")
+x_ty = np.ndarray[(BLOCK_ROWS * D,), np.dtype[np.float32]]
+s_ty = np.ndarray[(SETUP_BYTES // 4,), np.dtype[np.int32]]
+t_ty = np.ndarray[(BLOCK_ROWS * D,), np.dtype[np.float32]]      # cos [8][128], then sin
+o_ty = np.ndarray[(C_BF16,), np.dtype[bf16]]
+a_ty = np.ndarray[(ACC_F32,), np.dtype[np.float32]]
+src = kernelsrc.load(here.parent / "kernels" / "rowop.cc")
 obj = "rowspd_" + hashlib.md5(src.encode()).hexdigest()[:8] + ".o"
 
 
-def header(mode: int, n: int, n_rot: int) -> np.ndarray:
-    h = np.zeros(HDR_WORDS, np.int32)
-    h[MODE_WORD], h[SIZE_WORD], h[ROT_WORD], h[ROW_WORD], h[SCRATCH_WORD] = mode, n, n_rot, 0, 3 * N_MAX
-    h[SCALE_WORD] = struct.unpack("<i", struct.pack("<f", 1.0))[0]
-    return h
+def setup_object(n_rot: int) -> np.ndarray:
+    """kernels/rowop.cc's parameters, and a norm weight of 1 as its bf16 split (hi 1, lo 0)."""
+    s = np.zeros(SETUP_BYTES // 4, np.int32)
+    s[:5] = [MODE_R1_BLOCK, D, n_rot, np.float32(1.0).view(np.int32), np.float32(RMS_EPS).view(np.int32)]
+    gs = np.zeros(2 * D, np.uint16)
+    gs[:D] = np.float32(1.0).view(np.uint32) >> 16
+    s[PARAM_WORDS:PARAM_WORDS + D] = gs.view(np.int32)
+    return s
 
 
 @iron.jit
-def spd(x: In, o: Out, *, MODE: CompileTime[int] = 2, N: CompileTime[int] = 512, ROT: CompileTime[int] = 0,
-        REP: CompileTime[int] = 32):
-    k = ExternalFunction("ggml_xdna_rowop", object_file_name=obj, source_string=src,
-                         arg_types=[x_ty, y_ty, o_ty, n_ty], include_dirs=_include_dirs())
+def spd(x: In, o: Out, *, ROT: CompileTime[int] = 256, REP: CompileTime[int] = 32):
+    mk = lambda name, types: ExternalFunction(name, object_file_name=obj, source_string=src, arg_types=types,
+                                              include_dirs=_include_dirs())
+    k_setup = mk("ggml_xdna_row_setup", [s_ty, a_ty])
+    k_row = mk("ggml_xdna_rowop", [x_ty, t_ty, o_ty, a_ty])
     fx = ObjectFifo(x_ty, name="fx", depth=1)
     fo = ObjectFifo(o_ty, name="fo", depth=1)
 
-    def body(xi, oo, row, y, cnt):
+    def body(xi, oo, setup, row, sb, tab, acc):
         xx = xi.acquire(1)
         out = oo.acquire(1)
+        setup(sb, acc)
         for _ in range_(REP):
-            row(xx, y, out, cnt)
+            row(xx, tab, out, acc)
         xi.release(1)
         oo.release(1)
 
-    w = Worker(body, fn_args=[fx.cons(), fo.prod(), k, Buffer(y_ty, name="y", initial_value=np.full(4 * N_MAX, 0.5,
-                                                                                                   np.float32)),
-                              Buffer(n_ty, name="cnt", initial_value=header(MODE, N, ROT))],
-               tile=Tile(0, 2), stack_size=0xB00)
+    w = Worker(body, fn_args=[fx.cons(), fo.prod(), k_setup, k_row,
+                              Buffer(s_ty, name="setup", initial_value=setup_object(ROT)),
+                              Buffer(t_ty, name="tab", initial_value=np.full(BLOCK_ROWS * D, 0.5, np.float32)),
+                              Buffer(a_ty, name="acc")],
+               tile=Tile(0, 2), stack_size=STACK)
 
     def seq(x_h, o_h, xi, oo):
         xi.fill(x_h)
@@ -78,24 +89,24 @@ def spd(x: In, o: Out, *, MODE: CompileTime[int] = 2, N: CompileTime[int] = 512,
     return Program(iron.get_current_device(), rt, workers=[w]).resolve_program()
 
 
-def best_us(mode: int, n: int, rot: int, rep: int, x, o) -> float:
-    spd(x, o, MODE=mode, N=n, ROT=rot, REP=rep)
+def best_us(rot: int, rep: int, x, o) -> float:
+    spd(x, o, ROT=rot, REP=rep)
     ts = []
     for _ in range(RUNS):
         t0 = time.perf_counter()
-        spd(x, o, MODE=mode, N=n, ROT=rot, REP=rep)
+        spd(x, o, ROT=rot, REP=rep)
         ts.append(time.perf_counter() - t0)
     return min(ts) * 1e6
 
 
 def main() -> None:
-    x = iron.tensor(np.linspace(-2.0, 2.0, N_MAX, dtype=np.float32), dtype=np.float32, device="npu")
-    o = iron.zeros((N_MAX,), dtype=bf16, device="npu")
-    for name, (mode, n, rot) in CASES.items():
-        lo, hi = (best_us(mode, n, rot, r, x, o) for r in REPS)
-        per = (hi - lo) / (REPS[1] - REPS[0])
-        print(f"{name}: {REPS[0]} calls {lo:.0f} us, {REPS[1]} calls {hi:.0f} us -> {per:.2f} us a row "
-              f"({n / per:.0f} values/us)")
+    x = iron.tensor(np.linspace(-2.0, 2.0, BLOCK_ROWS * D, dtype=np.float32), dtype=np.float32, device="npu")
+    o = iron.zeros((C_BF16,), dtype=bf16, device="npu")
+    for name, rot in CASES.items():
+        lo, hi = (best_us(rot, r, x, o) for r in REPS)
+        per = (hi - lo) / (REPS[1] - REPS[0]) / BLOCK_ROWS
+        print(f"{name}: {REPS[0]} calls {lo:.0f} us, {REPS[1]} calls {hi:.0f} us -> {per:.3f} us a row "
+              f"({D / per:.0f} values/us)")
 
 
 if __name__ == "__main__":
