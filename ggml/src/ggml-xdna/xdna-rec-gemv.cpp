@@ -331,8 +331,13 @@ xdna_rec_tail * xdna_rec_tail_create(xdna_kernel_pool *         pool,
     }
     xdna_gemv *      so        = t->gv->so;
     xdna_gemv_pair * ffn       = t->gv->ffn;
+    const int        d         = so->geom.n_real;  // the residual width
     const size_t     ffn_w_off = xdna_align_up(so->geom.weight_bytes());
     const size_t     ffn_wb    = ffn->w2_off + ffn->g2.weight_bytes();
+    if (!xdna_res_width_ok(d)) {
+        xdna_rec_tail_free(t.release());
+        return nullptr;
+    }
 
     // [attn_output -> S | the prologue's row: h_attn = H + S into A, the norm
     // into the FFN's tiles | gate+up -> down into F]: arguments 0 (weights),
@@ -355,7 +360,7 @@ xdna_rec_tail * xdna_rec_tail_create(xdna_kernel_pool *         pool,
     po.bd_base    = 0;
     po.act_replay = false;
     bool ok       = xdna_gemv_seq_build(&seq, so->geom, &o);
-    xdna_seq_row_io(&seq, 3, XDNA_RES_S, XDNA_RES_H, 1, (uint32_t) g_off, XDNA_RES_A);
+    xdna_seq_row_io(&seq, d, 3, XDNA_RES_S, XDNA_RES_H, 1, (uint32_t) g_off, XDNA_RES_A);
     ok = ok && xdna_gemv_seq_build_pair(&seq, ffn->g1, ffn->g2, ffn->w2_off, ffn->a2_off, &po);
     xdna_seq_row_wait(&seq);
     if (!ok) {
@@ -374,7 +379,7 @@ xdna_rec_tail * xdna_rec_tail_create(xdna_kernel_pool *         pool,
     snprintf(kname, sizeof(kname), "rec_tail_%016llx", (unsigned long long) h);
     t->kern = xdna_kernel_pool_get_built(pool, kname, so->geom.stem().c_str(), words.data(), words.size());
     t->w    = xdna_buffer_alloc(so->dev, ffn_w_off + ffn_wb);
-    t->a    = xdna_buffer_alloc(so->dev, g_off + (size_t) XDNA_RES_D * sizeof(float));
+    t->a    = xdna_buffer_alloc(so->dev, g_off + (size_t) d * sizeof(float));
     if (!t->kern || !t->w || !t->a) {
         xdna_rec_tail_free(t.release());
         return nullptr;
@@ -388,8 +393,8 @@ xdna_rec_tail * xdna_rec_tail_create(xdna_kernel_pool *         pool,
         return nullptr;
     }
     t->host_a.resize(so->geom.act_bytes());
-    std::memset(t->a->data, 0, g_off + (size_t) XDNA_RES_D * sizeof(float));
-    std::memcpy((uint8_t *) t->a->data + g_off, gamma, (size_t) XDNA_RES_D * sizeof(float));
+    std::memset(t->a->data, 0, g_off + (size_t) d * sizeof(float));
+    std::memcpy((uint8_t *) t->a->data + g_off, gamma, (size_t) d * sizeof(float));
     if (!xdna_buffer_sync_to_device(t->a)) {
         xdna_rec_tail_free(t.release());
         return nullptr;
@@ -429,20 +434,22 @@ bool xdna_rec_tail_run(xdna_rec_tail * t, const float * act, const float * hres,
         return false;
     }
     // the residual as the row the FFN's boundary reads
-    std::memcpy((uint8_t *) t->res->data + XDNA_RES_H, hres, (size_t) XDNA_RES_D * sizeof(float));
-    if (!xdna_buffer_sync_to_device_range(t->res, (size_t) XDNA_RES_D * sizeof(float), XDNA_RES_H)) {
+    const size_t d = (size_t) m->n_out;
+    std::memcpy((uint8_t *) t->res->data + XDNA_RES_H, hres, d * sizeof(float));
+    if (!xdna_buffer_sync_to_device_range(t->res, d * sizeof(float), XDNA_RES_H)) {
         return false;
     }
     if (!xdna_run_restart(t->run) || !xdna_run_wait(t->run)) {
         return false;
     }
-    std::vector<float> r2((size_t) 2 * XDNA_RES_D);
+    // A and F, a row apart
+    std::vector<float> r2(XDNA_RES_MAX_D + d);
     if (!xdna_buffer_read_settled(t->res, r2.data(), r2.size() * sizeof(float), XDNA_RES_A)) {
         return false;
     }
-    for (int i = 0; i < m->n_out; i++) {
-        h_attn[i] = r2[(size_t) i];
-        h_out[i]  = r2[(size_t) i] + r2[(size_t) XDNA_RES_D + (size_t) i];
+    for (size_t i = 0; i < d; i++) {
+        h_attn[i] = r2[i];
+        h_out[i]  = r2[i] + r2[XDNA_RES_MAX_D + i];
     }
     return true;
 }
