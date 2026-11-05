@@ -1190,6 +1190,13 @@ static void xdna_tail_scan(const ggml_cgraph * cgraph, std::vector<xdna_tail_pla
 }
 
 xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset);
+xdna_buffer * xdna_host_bo_reach(const void * p, size_t reach, size_t * offset);
+
+// What one pool run can address past a layer's K or V start: every position it
+// takes, and a head group's offset inside a position.
+static size_t xdna_att_reach(size_t pos_b) {
+    return ((size_t) xdna_att_max_positions() + 1) * pos_b;
+}
 
 // Decode flash attention on the pool (xdna-att.h). GGML_XDNA_ATTN=0 leaves
 // it to the host.
@@ -1269,8 +1276,8 @@ static bool xdna_att_try(ggml_backend_xdna_context * ctx, ggml_tensor * n) {
         return false;
     }
     size_t        koff = 0, voff = 0;
-    xdna_buffer * kbo = xdna_host_bo_of(k->data, &koff);
-    xdna_buffer * vbo = xdna_host_bo_of(v->data, &voff);
+    xdna_buffer * kbo = xdna_host_bo_reach(k->data, xdna_att_reach(k->nb[1]), &koff);
+    xdna_buffer * vbo = xdna_host_bo_reach(v->data, xdna_att_reach(v->nb[1]), &voff);
     if (!kbo || !vbo) {
         return false;
     }
@@ -1630,8 +1637,8 @@ static bool xdna_attl_ready(ggml_backend_xdna_context * ctx, const xdna_attl_pla
     }
     const int     n_valid = xdna_attl_valid(p.n_fa);
     size_t        koff = 0, voff = 0;
-    xdna_buffer * kbo = xdna_host_bo_of(p.n_fa->src[1]->data, &koff);
-    xdna_buffer * vbo = xdna_host_bo_of(p.n_fa->src[2]->data, &voff);
+    xdna_buffer * kbo = xdna_host_bo_reach(p.n_fa->src[1]->data, xdna_att_reach(p.n_fa->src[1]->nb[1]), &koff);
+    xdna_buffer * vbo = xdna_host_bo_reach(p.n_fa->src[2]->data, xdna_att_reach(p.n_fa->src[2]->nb[1]), &voff);
     if (n_valid <= 0 || !kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, p.n_fa->src[1]->nb[1])) {
         return false;
     }
@@ -1702,8 +1709,8 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
         return false;
     }
     size_t        koff = 0, voff = 0;
-    xdna_buffer * kbo = xdna_host_bo_of(k->data, &koff);
-    xdna_buffer * vbo = xdna_host_bo_of(v->data, &voff);
+    xdna_buffer * kbo = xdna_host_bo_reach(k->data, xdna_att_reach(k->nb[1]), &koff);
+    xdna_buffer * vbo = xdna_host_bo_reach(v->data, xdna_att_reach(v->nb[1]), &voff);
     if (!kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, pos_b)) {
         return false;
     }
@@ -4776,9 +4783,13 @@ static ggml_backend_t ggml_backend_xdna_device_init_backend(ggml_backend_dev_t d
 namespace {
 
 struct xdna_host_bo_entry {
-    xdna_buffer * bo;
-    size_t        bytes;
+    xdna_buffer *                   bo;
+    size_t                          bytes;
+    std::map<size_t, xdna_buffer *> views;  // by start (xdna_host_bo_reach)
 };
+
+// A view starts on a page.
+constexpr size_t XDNA_HOST_VIEW_ALIGN = 4096;
 
 }  // namespace
 
@@ -4792,12 +4803,10 @@ static std::map<uintptr_t, xdna_host_bo_entry> & xdna_host_bos(void) {
     return m;
 }
 
-// The BO a host pointer of this buffer type lies in, and its byte offset
-// there; null when the pointer is not in one.
-xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset) {
-    std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
-    auto &                      m  = xdna_host_bos();
-    auto                        it = m.upper_bound((uintptr_t) p);
+// The entry a host pointer lies in and its byte offset there, under xdna_host_bo_mu.
+static xdna_host_bo_entry * xdna_host_bo_entry_of(const void * p, size_t * offset) {
+    auto & m  = xdna_host_bos();
+    auto   it = m.upper_bound((uintptr_t) p);
     if (it == m.begin()) {
         return nullptr;
     }
@@ -4806,10 +4815,54 @@ xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset) {
     if (off >= it->second.bytes) {
         return nullptr;
     }
-    if (offset) {
-        *offset = (size_t) off;
+    *offset = (size_t) off;
+    return &it->second;
+}
+
+// The BO a host pointer of this buffer type lies in, and its byte offset
+// there; null when the pointer is not in one.
+xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset) {
+    std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
+    size_t                      off = 0;
+    xdna_host_bo_entry *        e   = xdna_host_bo_entry_of(p, &off);
+    if (e && offset) {
+        *offset = off;
     }
-    return it->second.bo;
+    return e ? e->bo : nullptr;
+}
+
+// As xdna_host_bo_of, for a run that addresses `reach` bytes from the pointer:
+// past a descriptor's 32-bit offset, a view of the BO from the pointer's page
+// instead, kept until the BO is freed.
+xdna_buffer * xdna_host_bo_reach(const void * p, size_t reach, size_t * offset) {
+    std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
+    size_t                      off = 0;
+    xdna_host_bo_entry *        e   = xdna_host_bo_entry_of(p, &off);
+    if (!e) {
+        return nullptr;
+    }
+    if (off + reach <= UINT32_MAX) {
+        *offset = off;
+        return e->bo;
+    }
+    const size_t base = off / XDNA_HOST_VIEW_ALIGN * XDNA_HOST_VIEW_ALIGN;
+    auto         it   = e->views.find(base);
+    if (it == e->views.end()) {
+        xdna_buffer * view = xdna_buffer_sub(e->bo, base, e->bytes - base);
+        if (!view) {
+            return nullptr;  // xdna-runtime names the view
+        }
+        it = e->views.emplace(base, view).first;
+    }
+    *offset = off - base;
+    return it->second;
+}
+
+static void xdna_host_bo_free_views(xdna_host_bo_entry & e) {
+    for (auto & kv : e.views) {
+        xdna_buffer_free(kv.second);
+    }
+    e.views.clear();
 }
 
 static void xdna_hb_free(ggml_backend_buffer_t buffer) {
@@ -4819,7 +4872,11 @@ static void xdna_hb_free(ggml_backend_buffer_t buffer) {
     }
     {
         std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
-        xdna_host_bos().erase((uintptr_t) bo->data);
+        auto                        it = xdna_host_bos().find((uintptr_t) bo->data);
+        if (it != xdna_host_bos().end()) {
+            xdna_host_bo_free_views(it->second);
+            xdna_host_bos().erase(it);
+        }
     }
     xdna_buffer_free(bo);
 }
@@ -4968,7 +5025,7 @@ static ggml_backend_buffer_t xdna_hbt_alloc(ggml_backend_buffer_type_t buft, siz
     }
     {
         std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
-        xdna_host_bos()[(uintptr_t) bo->data] = { bo, bo->bytes };
+        xdna_host_bos()[(uintptr_t) bo->data] = { bo, bo->bytes, {} };
     }
     return ggml_backend_buffer_init(buft, xdna_hb_iface, bo, size);
 }

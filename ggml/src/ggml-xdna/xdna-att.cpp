@@ -38,8 +38,9 @@ struct xdna_att {
     struct variant {
         xdna_kernel * kern = nullptr;
         xrt::run      run;
-        xdna_buffer * kbo = nullptr;
-        xdna_buffer * vbo = nullptr;
+        // the generations of the K and V buffers the run is bound to
+        uint64_t      kgen = 0;
+        uint64_t      vgen = 0;
     };
 
     std::map<int, variant> var;  // by task count
@@ -198,11 +199,13 @@ bool xdna_att_run(xdna_att *    a,
     if (!xdna_kernel_rewrite_insts(v.kern, words.data(), words.size())) {
         return false;  // xdna-runtime names the stream and the reason
     }
-    if (v.kbo != kbo || v.vbo != vbo) {
+    if (v.kgen != kbo->gen || v.vgen != vbo->gen) {
         xdna_buffer * args[5] = { kbo, a->act, a->ids, a->out, vbo };
         v.run                 = xdna_kernel_run_make(v.kern, args, 5);
-        v.kbo                 = kbo;
-        v.vbo                 = vbo;
+        v.kgen                = kbo->gen;
+        v.vgen                = vbo->gen;
+        GGML_LOG_DEBUG("%s: pool %p binds K %p and V %p (buffers %llu and %llu)\n", "xdna-att", (void *) &v,
+                       (void *) kbo, (void *) vbo, (unsigned long long) kbo->gen, (unsigned long long) vbo->gen);
     }
 
     // header, then heads 0-3 and 4-7 as bf16 with the scale folded in, tiled

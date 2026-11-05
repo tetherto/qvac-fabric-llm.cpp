@@ -357,6 +357,8 @@ static xdna_buffer * xdna_buffer_alloc_own(xdna_device * dev, size_t bytes);
 
 static std::atomic<int> g_alloc_failures{ 0 };
 
+static std::atomic<uint64_t> g_buffer_gen{ 0 };
+
 int xdna_buffer_alloc_failures(void) {
     return g_alloc_failures.load();
 }
@@ -410,6 +412,7 @@ xdna_buffer * xdna_buffer_alloc(xdna_device * dev, size_t bytes) {
 
 static xdna_buffer * xdna_buffer_alloc_own(xdna_device * dev, size_t bytes) {
     xdna_buffer * buf = new xdna_buffer;
+    buf->gen          = ++g_buffer_gen;
     try {
         buf->bo     = xrt::bo(dev->device, bytes, xrt::bo::flags::host_only, 0);
         buf->bytes  = bytes;
@@ -446,6 +449,7 @@ xdna_buffer * xdna_buffer_sub(xdna_buffer * parent, size_t offset, size_t bytes)
         return nullptr;
     }
     xdna_buffer * buf = new xdna_buffer;
+    buf->gen          = ++g_buffer_gen;
     try {
         buf->bo       = xrt::bo(parent->bo, bytes, offset);
         buf->bytes    = bytes;
