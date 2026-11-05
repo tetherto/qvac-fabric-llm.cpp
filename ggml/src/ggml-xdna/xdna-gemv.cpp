@@ -84,9 +84,10 @@ bool xdna_gemv_geom::valid() const {
     if (K % k_tile() || k_tile() % group() || K % XDNA_SB_VALUES) {
         return false;
     }
-    // One descriptor per chunk for the activations and one for the output,
-    // plus the weight descriptor, all inside the shim's 16 ids.
-    return N % chunk() == 0 && n_out() >= 1 && (uncapped || n_out() <= xdna_gemv_max_chunks());
+    // Capped: one descriptor per chunk for the activations and one for the
+    // output, plus the weight descriptor, all inside the shim's 16 ids.
+    const int max_chunks = uncapped ? xdna_gemv_max_uncapped_chunks() : xdna_gemv_max_chunks();
+    return N % chunk() == 0 && n_out() >= 1 && n_out() <= max_chunks;
 }
 
 std::string xdna_gemv_geom::stem() const {
@@ -168,6 +169,11 @@ namespace {
 // per chunk.
 constexpr int MAX_BD     = 16;
 constexpr int MAX_CHUNKS = MAX_BD - 2;
+// Uncapped: the activation body replays n_out - 1 times on the task queue's
+// 8-bit repeat count, and a joined stream drains through one 10-bit-wrap descriptor.
+constexpr int MAX_QUEUE_REPEAT    = 255;
+constexpr int MAX_BD_WRAP         = 1023;
+constexpr int MAX_UNCAPPED_CHUNKS = std::min(MAX_QUEUE_REPEAT + 1, MAX_BD_WRAP);
 
 // A contiguous transfer. The length field carries the whole thing and the
 // address-gen sizes are left at zero - a size of one would wrap the descriptor
@@ -201,6 +207,10 @@ void strided_bd(xdna_bd & bd, size_t d0_bytes, uint32_t d1, size_t stride_bytes,
 
 int xdna_gemv_max_chunks(void) {
     return MAX_CHUNKS;
+}
+
+int xdna_gemv_max_uncapped_chunks(void) {
+    return MAX_UNCAPPED_CHUNKS;
 }
 
 namespace {
