@@ -141,7 +141,8 @@ bool xdna_pgemm_run_pair(struct xdna_kernel_pool *  pool,
 bool xdna_pgemm_group_supported(struct ggml_tensor * const * mm, int n);
 // The same by the shape alone, for graph_optimize, which runs outside any compute: the plan of the previous one does not enter.
 bool xdna_pgemm_group_shape_supported(struct ggml_tensor * const * mm, int n);
-bool xdna_pgemm_run_group(struct xdna_kernel_pool * pool, struct ggml_tensor * const * mm, int n);
+// pad_tile > 0 (up to 128): the outputs' rows past M up to a multiple of it are read later from DRAM, as zero
+bool xdna_pgemm_run_group(struct xdna_kernel_pool * pool, struct ggml_tensor * const * mm, int n, int pad_tile = 0);
 
 // What a group member's 32-bit byte offset into its BO reaches.
 static const uint64_t XDNA_PGEMM_SEG_REACH = 1ull << 32;

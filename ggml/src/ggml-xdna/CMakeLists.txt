@@ -13,6 +13,7 @@ ggml_add_backend_library(ggml-xdna
                          xdna-pgemm.cpp
                          xdna-attn-mm.cpp
                          xdna-pfx-attn.cpp
+                         xdna-pfx-row.cpp
                          xdna-host-attn.cpp
                          xdna-gdn-mm.cpp
                          xdna-conv-prefill.cpp
@@ -542,8 +543,9 @@ endif()
 # conversions the repacker accepts, how many head rows stay exact, which
 # nodes the graph planners take for the ones llama builds, what the mark that
 # tells a lost write from a landed one leaves behind, how the GEMM stream
-# issues its sweeps, and how far a grouped projection's output offset reaches.
-# They compile the backend sources they test directly and open no device.
+# issues its sweeps, how far a grouped projection's output offset reaches, and
+# what the merged design's row command hands its cores. They compile the backend
+# sources they test directly and open no device.
 # tests/CMakeLists.txt adds them to ctest: testing is enabled there, after this
 # directory is configured.
 option(GGML_XDNA_BUILD_TESTS "ggml-xdna: build the host-only backend tests" ON)
@@ -563,4 +565,9 @@ if (GGML_XDNA_BUILD_TESTS)
     target_include_directories(test-xdna-mark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
     target_link_libraries(test-xdna-mark PRIVATE ggml-base XRT::xrt_coreutil)
     add_executable(test-xdna-seg-reach tests/test-xdna-seg-reach.cpp)
+    add_executable(test-xdna-pfx-row tests/test-xdna-pfx-row.cpp xdna-pfx-row.cpp xdna-pfx-attn.cpp xdna-seq.cpp
+                   xdna-runtime.cpp)
+    target_include_directories(test-xdna-pfx-row PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    target_link_libraries(test-xdna-pfx-row PRIVATE ggml-base XRT::xrt_coreutil
+                          $<TARGET_NAME_IF_EXISTS:OpenMP::OpenMP_CXX>)
 endif()

@@ -35,20 +35,18 @@ namespace {
 using namespace xdna_pgemm_path;
 
 constexpr int          ATTN_COLS[] = { 0, 1, 2, 4, 5, 6 };  // kernels/pfx.py: row ops on 3 and 7
-constexpr int          N_ACOLS     = 6;
-constexpr int          PAIRS       = 2 * N_ACOLS;
-constexpr int          KVH         = 2;
+constexpr int          N_ACOLS     = xdna_pfx_layout::ATTN_COLS;
+constexpr int          PAIRS       = xdna_pfx_layout::PAIRS;
+constexpr int          KVH         = xdna_pfx_layout::KVH;
 constexpr int          DH          = 128;           // a core's half of D
-constexpr int          R           = 32;            // rows a pair
-constexpr int          NK          = 32;            // keys a tile
+constexpr int          R           = xdna_pfx_layout::R;
+constexpr int          NK          = xdna_pfx_layout::NK;
 constexpr int          A_ELEMS     = 64 * 64;       // bf16 an A object: one K or V^T tile half
 constexpr int          TRAILER_POS = R * DH;        // bf16 offset of a Q object's trailer
-constexpr uint32_t     TB_BYTES    = 10752;         // a core's W buffer, the length of every W send
+constexpr int          TRAILER_I32 = 2 + 2 * R;     // first key, tiles, each row's first and last visible key
+constexpr uint32_t     TB_BYTES    = (uint32_t) xdna_pfx_layout::TB_BYTES;
 constexpr int          C_F32       = 64 * 32;       // f32 a C object
 constexpr int          O_OBJS      = 2;             // C objects a core's O half
-constexpr int          HDR_WORDS   = 16;            // kernels/pfx.py HDR_WORDS
-constexpr int          HW_ATTN_ON  = 8;
-constexpr int          HW_A_DRAIN  = 10;
 constexpr uint32_t     W_PKT_CORE0 = 2;             // kernels/pgemm.py W_PKT_CORE: core i's id is 2 + i
 constexpr int          W_SLOTS     = 2;             // MemTile slots of a pass's four Q objects
 constexpr uint32_t     SH_BD_A_HDR = 0;
@@ -100,23 +98,9 @@ std::vector<pass> plan_passes(const xdna_pfx_attn_job & job) {
 }
 
 // A stream: object 0 pgemm's header, 1 the attention header, then per KV head and tile its K, V^T.
-size_t kv_obj(int64_t n_tiles, int g, int64_t t) {
-    return 2 + ((size_t) g * (size_t) n_tiles + (size_t) t) * 2;
-}
-
-size_t a_stream_objs(int64_t n_tiles) {
-    return kv_obj(n_tiles, KVH, 0);
-}
-
-// A header object goes through the A MemTile's tiling like the tiles: the core's bf16 j is sent from row j / 8,
-// column j % 8 of the 64 x 64 object (as xdna-pgemm.cpp writes pgemm's).
-void write_tiled_words(const int32_t * words, int n_words, uint16_t * obj) {
-    uint16_t hb[2 * HDR_WORDS];
-    std::memcpy(hb, words, (size_t) n_words * sizeof(int32_t));
-    for (int j = 0; j < 2 * n_words; j++) {
-        obj[(j / 8) * 64 + j % 8] = hb[j];
-    }
-}
+using xdna_pfx_layout::a_stream_objs;
+using xdna_pfx_layout::kv_obj;
+using xdna_pfx_layout::w_obj_off;
 
 int32_t drained_objects(const std::vector<pass> & ps) {
     int32_t drain = 1;  // the attention header
@@ -184,12 +168,13 @@ void pack_kv(const xdna_pfx_attn_job & job, uint16_t * a, size_t stream_elems) {
     }
 }
 
-void pack_a(const xdna_pfx_attn_job & job, const std::vector<pass> & ps, uint16_t * a) {
-    const size_t stream_elems = a_stream_objs(tiles_of(job)) * A_ELEMS;
-    std::memset(a, 0, 2 * stream_elems * sizeof(uint16_t));
-    pack_headers(ps, a);
-    pack_headers(ps, a + stream_elems);
-    pack_kv(job, a, stream_elems);
+// Both A streams' header objects
+void a_headers_host(const std::vector<pass> & ps, uint16_t * a, size_t stream_elems) {
+    for (int h = 0; h < 2; h++) {
+        uint16_t * s = a + (size_t) h * stream_elems;
+        std::memset(s, 0, xdna_pfx_layout::HDR_OBJS * A_ELEMS * sizeof(uint16_t));
+        pack_headers(ps, s);
+    }
 }
 
 int64_t row_pos(const xdna_pfx_attn_job & job, const pass & p, int pidx, int row) {
@@ -201,21 +186,29 @@ int head_of(const xdna_pfx_attn_job & job, const pass & p, int row) {
     return job.hg * p.g + row / (R / job.hg);
 }
 
-// Core i's Q half^T and trailer: the first key the pass streams, its tiles, then each row's first and last
-// visible key; past the ubatch the rows are zero and see the first key.
-void pack_q_obj(const xdna_pfx_attn_job & job, const pass & p, int pidx, int h, uint16_t * o) {
-    const float   qs        = (float) (M_LOG2E * job.q_scale);
-    int32_t *     tr        = (int32_t *) (o + TRAILER_POS);
+// The trailer after a pair's Q rows: the first key the pass streams, its tiles, then each row's first and last
+// visible key; past the ubatch the rows see the first key.
+void write_trailer(const xdna_pfx_attn_job & job, const pass & p, int pidx, uint16_t * o) {
+    int32_t       tr[TRAILER_I32];
     const int32_t first_key = (int32_t) (p.tile_lo * NK);
     tr[0]                   = first_key;
     tr[1]                   = (int32_t) (p.tile_hi - p.tile_lo);
+    for (int row = 0; row < R; row++) {
+        const int64_t t = row_pos(job, p, pidx, row);
+        const bool    real = t < job.n_tokens;
+        tr[2 + row]     = real ? job.lo[t] : first_key;
+        tr[2 + R + row] = real ? job.hi[t] : first_key;
+    }
+    std::memcpy(o + TRAILER_POS, tr, sizeof(tr));
+}
+
+// Core i's Q half^T, scaled for exp2; past the ubatch the rows are zero.
+void pack_q_rows(const xdna_pfx_attn_job & job, const pass & p, int pidx, int h, uint16_t * o) {
+    const float          qs = (float) (M_LOG2E * job.q_scale);
     alignas(64) uint16_t qb[R][DH];
     for (int row = 0; row < R; row++) {
-        const int64_t t    = row_pos(job, p, pidx, row);
-        const bool    real = t < job.n_tokens;
-        tr[2 + row]        = real ? job.lo[t] : first_key;
-        tr[2 + R + row]    = real ? job.hi[t] : first_key;
-        if (!real) {
+        const int64_t t = row_pos(job, p, pidx, row);
+        if (t >= job.n_tokens) {
             std::memset(qb[row], 0, sizeof(qb[row]));
             continue;
         }
@@ -230,18 +223,39 @@ void pack_q_obj(const xdna_pfx_attn_job & job, const pass & p, int pidx, int h, 
     }
 }
 
-size_t w_obj_off(size_t npass, int ci, size_t p, int i) {
-    return (((size_t) ci * npass + p) * 4 + (size_t) i) * TB_BYTES;
+uint16_t * w_obj(uint8_t * w, size_t npass, int ci, size_t p, int i) {
+    return (uint16_t *) (w + w_obj_off(npass, ci, p, i));
 }
 
-void pack_w(const xdna_pfx_attn_job & job, const std::vector<pass> & ps, uint8_t * w) {
-    std::memset(w, 0, w_obj_off(ps.size(), N_ACOLS, 0, 0));
+void pack_w_rows(const xdna_pfx_attn_job & job, const std::vector<pass> & ps, uint8_t * w) {
 #pragma omp parallel for collapse(2) num_threads(xdna_chunk_threads())
     for (int ci = 0; ci < N_ACOLS; ci++) {
         for (size_t p = 0; p < ps.size(); p++) {
             for (int i = 0; i < 4; i++) {
-                pack_q_obj(job, ps[p], 2 * ci + i / 2, i % 2, (uint16_t *) (w + w_obj_off(ps.size(), ci, p, i)));
+                pack_q_rows(job, ps[p], 2 * ci + i / 2, i % 2, w_obj(w, ps.size(), ci, p, i));
             }
+        }
+    }
+}
+
+// Pass p's four W objects on attention column ci: trailers, and zero Q where the pair starts at or past `rows`
+void w_host_objs(const xdna_pfx_attn_job & job, const std::vector<pass> & ps, int ci, size_t p, int64_t rows,
+                 uint8_t * w) {
+    const int pidx = 2 * ci;
+    for (int i = 0; i < 4; i++) {
+        uint16_t * o = w_obj(w, ps.size(), ci, p, i);
+        write_trailer(job, ps[p], pidx + i / 2, o);
+        if (row_pos(job, ps[p], pidx + i / 2, 0) >= rows) {
+            std::memset(o, 0, TRAILER_POS * sizeof(uint16_t));
+        }
+    }
+}
+
+void w_host(const xdna_pfx_attn_job & job, const std::vector<pass> & ps, int64_t rows, uint8_t * w) {
+#pragma omp parallel for collapse(2) num_threads(xdna_chunk_threads())
+    for (int ci = 0; ci < N_ACOLS; ci++) {
+        for (size_t p = 0; p < ps.size(); p++) {
+            w_host_objs(job, ps, ci, p, rows, w);
         }
     }
 }
@@ -290,12 +304,6 @@ struct w_state {
     int mt_mm2s[2]  = { 0, 0 };
 };
 
-void wait_mt_queue(xdna_seq * seq, uint32_t c, xdna_dma_dir dir, uint32_t ch, int pushed) {
-    if (pushed >= MT_Q) {
-        xdna_seq_wait_token(seq, c, 1, dir, ch);
-    }
-}
-
 void w_shim_send(xdna_seq * seq, uint32_t c, uint32_t ddr_off, w_state & ws) {
     if (ws.shim_pushed >= W_RING) {
         xdna_seq_wait_token(seq, c, 0, xdna_dma_dir::MM2S, W_SHIM_CH);
@@ -331,12 +339,6 @@ void w_pass(xdna_seq * seq, size_t npass, int ci, size_t p, w_state & ws) {
     mt_push(seq, c, s2, xdna_dma_dir::S2MM, W_MT_S2MM, 0);
     ws.mt_s2mm++;
     w_core_sends(seq, c, at, e, f, ws);
-}
-
-void wait_last(xdna_seq * seq, uint32_t c, uint32_t row, xdna_dma_dir dir, uint32_t ch, int pushed, int ring) {
-    for (int k = std::max(0, pushed - ring); k < pushed; k++) {
-        xdna_seq_wait_token(seq, c, row, dir, ch);
-    }
 }
 
 void w_finish(xdna_seq * seq, int ci, const w_state & ws) {
@@ -434,48 +436,72 @@ xdna_kernel * kernel_of(xdna_device * dev) {
     return g_pfx.kern;
 }
 
-struct buffers {
-    xdna_buffer * w = nullptr, *a = nullptr, *c = nullptr, *sink = nullptr;
-    size_t        w_bytes = 0, a_bytes = 0, c_bytes = 0;
-};
-
-bool acquire(xdna_kernel_pool * pool, const xdna_pfx_attn_job & job, const std::vector<pass> & ps, buffers & b) {
-    b.w_bytes = w_obj_off(ps.size(), N_ACOLS, 0, 0);
-    b.a_bytes = 2 * a_stream_objs(tiles_of(job)) * A_ELEMS * 2;
-    b.c_bytes = N_ACOLS * c_col_f32(ps.size()) * 4;
-    b.w       = xdna_kernel_pool_acquire_buffer(pool, b.w_bytes);
-    b.a       = xdna_kernel_pool_acquire_buffer(pool, b.a_bytes);
-    b.c       = xdna_kernel_pool_acquire_buffer(pool, b.c_bytes);
-    b.sink    = xdna_kernel_pool_acquire_buffer(pool, SINK_BYTES);
-    return b.w && b.a && b.c && b.sink && b.w->data && b.a->data && b.c->data;
+bool hg_ok(int hg) {
+    return hg >= 1 && R % hg == 0 && (R / hg) % 8 == 0;
 }
 
-void release(xdna_kernel_pool * pool, buffers & b) {
-    for (xdna_buffer * x : { b.w, b.a, b.c, b.sink }) {
+void host_objects(const xdna_pfx_attn_job & job, const std::vector<pass> & ps, const xdna_pfx_attn_dst & d,
+                  uint8_t * parent) {
+    w_host(job, ps, d.n_tiles * NK, parent);
+    a_headers_host(ps, (uint16_t *) (parent + d.a_off), d.stream_bytes / sizeof(uint16_t));
+}
+
+}  // namespace
+
+// The W objects and A streams in one parent buffer (dst.bo), argument 0 and 1 as views of it
+struct xdna_pfx_attn_io {
+    xdna_pfx_attn_job job;
+    std::vector<pass> ps;
+    xdna_pfx_attn_dst dst;
+    xdna_buffer *     w = nullptr, *a = nullptr, *c = nullptr, *sink = nullptr;
+    size_t            c_bytes = 0;
+};
+
+namespace {
+
+bool acquire(xdna_kernel_pool * pool, xdna_pfx_attn_io & io) {
+    const xdna_pfx_attn_dst & d = io.dst;
+    io.c_bytes                  = N_ACOLS * c_col_f32(io.ps.size()) * 4;
+    io.dst.bo                   = xdna_kernel_pool_acquire_buffer(pool, d.a_off + d.a_bytes);
+    io.c                        = xdna_kernel_pool_acquire_buffer(pool, io.c_bytes);
+    io.sink                     = xdna_kernel_pool_acquire_buffer(pool, SINK_BYTES);
+    if (!io.dst.bo || !io.dst.bo->data || !io.c || !io.c->data || !io.sink) {
+        return false;
+    }
+    io.w = xdna_buffer_sub(io.dst.bo, 0, d.w_bytes);
+    io.a = xdna_buffer_sub(io.dst.bo, d.a_off, d.a_bytes);
+    return io.w && io.a;
+}
+
+void release_buffers(xdna_kernel_pool * pool, xdna_pfx_attn_io & io) {
+    xdna_buffer_free(io.w);
+    xdna_buffer_free(io.a);
+    for (xdna_buffer * x : { io.dst.bo, io.c, io.sink }) {
         if (x) {
             xdna_kernel_pool_release_buffer(pool, x);
         }
     }
 }
 
-bool pack_inputs(const xdna_pfx_attn_job & job, const std::vector<pass> & ps, const buffers & b) {
+bool pack_inputs(const xdna_pfx_attn_io & io) {
     xdna_prof::section_timer st("prefill: pfx attn pack");
-    pack_w(job, ps, (uint8_t *) b.w->data);
-    pack_a(job, ps, (uint16_t *) b.a->data);
-    return xdna_buffer_sync_to_device_range(b.w, b.w_bytes, 0) && xdna_buffer_sync_to_device_range(b.a, b.a_bytes, 0);
+    pack_w_rows(io.job, io.ps, (uint8_t *) io.w->data);
+    pack_kv(io.job, (uint16_t *) io.a->data, io.dst.stream_bytes / sizeof(uint16_t));
+    return xdna_buffer_sync_to_device_range(io.w, io.dst.w_bytes, 0) &&
+           xdna_buffer_sync_to_device_range(io.a, io.dst.a_bytes, 0);
 }
 
 // C comes from the pool, and a host line its last holder left dirty would be written back over what the array writes
 // by the readback's flush: C is flushed before the dispatch.
-bool run_stream(xdna_kernel * kern, const buffers & b) {
+bool run_stream(xdna_kernel * kern, const xdna_pfx_attn_io & io) {
     xdna_prof::section_timer st("prefill: pfx attn run");
-    xdna_buffer *            args[N_ARGS] = { b.w, b.a, b.c, b.sink };
-    xdna_test_dirty_if_armed(XDNA_OUT_PFX_ATTN, b.c, b.c_bytes, 0);
-    if (!xdna_buffer_sync_to_device_range(b.c, b.c_bytes, 0)) {
+    xdna_buffer *            args[N_ARGS] = { io.w, io.a, io.c, io.sink };
+    xdna_test_dirty_if_armed(XDNA_OUT_PFX_ATTN, io.c, io.c_bytes, 0);
+    if (!xdna_buffer_sync_to_device_range(io.c, io.c_bytes, 0)) {
         return false;
     }
     xrt::run run = xdna_kernel_run_start(kern, args, N_ARGS);
-    return xdna_run_wait(run) && xdna_buffer_sync_from_device_range(b.c, b.c_bytes, 0);
+    return xdna_run_wait(run) && xdna_buffer_sync_from_device_range(io.c, io.c_bytes, 0);
 }
 
 }  // namespace
@@ -484,26 +510,64 @@ bool xdna_pfx_attn_active(void) {
     return pfx_loaded();
 }
 
-bool xdna_pfx_attn_run(xdna_kernel_pool * pool, const xdna_pfx_attn_job & job) {
-    std::lock_guard<std::mutex> lock(g_pfx.mtx);
-    if (job.hg < 1 || R % job.hg != 0 || (R / job.hg) % 8 != 0) {
-        return false;
+void xdna_pfx_attn_host_objects(const xdna_pfx_attn_job & job, uint8_t * parent) {
+    host_objects(job, plan_passes(job), xdna_pfx_attn_geometry(job.n_tokens, job.n_kv, job.hg), parent);
+}
+
+xdna_pfx_attn_io * xdna_pfx_attn_prepare(xdna_kernel_pool * pool, const xdna_pfx_attn_job & job) {
+    if (!hg_ok(job.hg) || job.n_tokens <= 0 || job.n_kv <= 0) {
+        return nullptr;
     }
-    xdna_kernel * kern = kernel_of(pool->device);
+    xdna_pfx_attn_io * io = new xdna_pfx_attn_io;
+    io->job               = job;
+    io->ps                = plan_passes(job);
+    io->dst               = xdna_pfx_attn_geometry(job.n_tokens, job.n_kv, job.hg);
+    if (io->ps.size() != (size_t) (KVH * io->dst.npg) || !acquire(pool, *io)) {
+        xdna_pfx_attn_release(pool, io);
+        return nullptr;
+    }
+    xdna_prof::section_timer st("prefill: pfx attn prepare");
+    host_objects(io->job, io->ps, io->dst, (uint8_t *) io->dst.bo->data);
+    if (!xdna_buffer_sync_to_device_range(io->dst.bo, io->dst.a_off + io->dst.a_bytes, 0)) {
+        xdna_pfx_attn_release(pool, io);
+        return nullptr;
+    }
+    return io;
+}
+
+const xdna_pfx_attn_dst & xdna_pfx_attn_dst_of(const xdna_pfx_attn_io * io) {
+    return io->dst;
+}
+
+bool xdna_pfx_attn_pack(xdna_pfx_attn_io * io) {
+    return io && io->job.q && io->job.k && io->job.v && pack_inputs(*io);
+}
+
+bool xdna_pfx_attn_run_io(xdna_kernel_pool * pool, xdna_pfx_attn_io * io) {
+    std::lock_guard<std::mutex> lock(g_pfx.mtx);
+    xdna_kernel *               kern = io && io->job.out ? kernel_of(pool->device) : nullptr;
     if (!kern) {
         return false;
     }
-    const std::vector<pass>     ps    = plan_passes(job);
-    const std::vector<uint32_t> insts = build_seq(tiles_of(job), ps);
-    if (!xdna_kernel_bind_insts(pool->device, kern, insts.data(), insts.size())) {
+    const std::vector<uint32_t> insts = build_seq(io->dst.n_tiles, io->ps);
+    if (!xdna_kernel_bind_insts(pool->device, kern, insts.data(), insts.size()) || !run_stream(kern, *io)) {
         return false;  // xdna-runtime names the stream and the reason
     }
-    buffers b;
-    bool    ok = acquire(pool, job, ps, b) && pack_inputs(job, ps, b) && run_stream(kern, b);
-    if (ok) {
-        xdna_prof::section_timer st("prefill: pfx attn unpack");
-        unpack_o(job, ps, (const float *) b.c->data);
+    xdna_prof::section_timer st("prefill: pfx attn unpack");
+    unpack_o(io->job, io->ps, (const float *) io->c->data);
+    return true;
+}
+
+void xdna_pfx_attn_release(xdna_kernel_pool * pool, xdna_pfx_attn_io * io) {
+    if (io) {
+        release_buffers(pool, *io);
+        delete io;
     }
-    release(pool, b);
+}
+
+bool xdna_pfx_attn_run(xdna_kernel_pool * pool, const xdna_pfx_attn_job & job) {
+    xdna_pfx_attn_io * io = xdna_pfx_attn_prepare(pool, job);
+    const bool         ok = io && xdna_pfx_attn_pack(io) && xdna_pfx_attn_run_io(pool, io);
+    xdna_pfx_attn_release(pool, io);
     return ok;
 }

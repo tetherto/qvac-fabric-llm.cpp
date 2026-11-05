@@ -12,6 +12,8 @@
 
 struct ggml_tensor;
 struct xdna_kernel_pool;
+struct xdna_pfx_row_job;
+struct xdna_pfx_row_tables;
 
 // True when `node` is an attention the design covers (the mask is checked,
 // not assumed), large enough to repay the call, and the artifact is present.
@@ -19,6 +21,19 @@ bool xdna_attn_mm_supported(const struct ggml_tensor * node);
 
 // Run it to completion and write the f32 output.
 bool xdna_attn_mm_run(struct xdna_kernel_pool * pool, struct ggml_tensor * node);
+
+enum class xdna_attn_rows_result {
+    done,     // the output is written
+    refused,  // nothing is written: the node still runs as xdna_attn_mm_run runs it
+    failed,   // the attention failed on the inputs the row command wrote
+};
+
+// The same with Q, K and V^T written by the row command (xdna-pfx-row.h) from row's projections, its q, k and v not
+// read: on the merged design, when the keys the rows see end at the last token (the command's key tiles are the tokens').
+xdna_attn_rows_result xdna_attn_mm_run_rows(struct xdna_kernel_pool *      pool,
+                                            struct ggml_tensor *           node,
+                                            const struct xdna_pfx_row_job & row,
+                                            struct xdna_pfx_row_tables &   tables);
 
 // The output left where the array wrote it, for a reader that takes its
 // rows from there (xdna_pgemm_run_gate): planned per graph with
