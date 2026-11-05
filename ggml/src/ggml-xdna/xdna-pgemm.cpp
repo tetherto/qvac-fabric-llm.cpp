@@ -1,4 +1,5 @@
 #include "xdna-pgemm.h"
+#include "xdna-pgemm-path.h"
 
 #include "ggml-backend.h"
 #include "ggml-impl.h"
@@ -51,7 +52,35 @@
 
 namespace {
 
-constexpr const char * STEM        = "pgemm_c8";
+bool pfx_requested() {
+    return xdna_env_int("GGML_XDNA_PFX", 0) != 0;
+}
+
+// A build without the merged design's artifact keeps pgemm's own
+bool pfx_selected() {
+    return pfx_requested() && !xdna_artifact_find(xdna_pgemm_path::PFX_STEM, false).xclbin.empty();
+}
+
+// Said at the kernel load, not where the route is chosen: llama's fit probe
+// places the weights with only errors shown, and the choice is made once
+void warn_pfx_missing() {
+    if (pfx_requested() && !xdna_pgemm_path::pfx_loaded()) {
+        GGML_LOG_WARN("%s: GGML_XDNA_PFX=1, but %s is not built: the prefill runs on %s\n", "xdna-pgemm",
+                      xdna_pgemm_path::PFX_STEM, xdna_pgemm_path::PGEMM_STEM);
+    }
+}
+
+}  // namespace
+
+bool xdna_pgemm_path::pfx_loaded() {
+    static const bool loaded = pfx_selected();
+    return loaded;
+}
+
+namespace {
+
+using namespace xdna_pgemm_path;
+
 constexpr int          COLS        = 8;
 constexpr int          NC          = 64;             // output columns a core
 constexpr int          KS          = 64;             // K a step
@@ -59,7 +88,6 @@ constexpr int          MB          = 64;             // M rows a core
 constexpr int          MBLK        = 2 * MB;         // M rows a block
 constexpr int          CHUNK       = COLS * 2 * NC;  // 1024
 constexpr int          HDR_BYTES   = MB * KS * 2;
-constexpr int          A_COL0      = 6;              // the two A streams' shim columns
 // M blocks a run: the descriptor repeats are eight bits, and a slab bounds
 // the staging buffers. Slabs are as large as that allows: most calls find A
 // laid out already (norm, gate, GLU into A), so cutting a call finer to
@@ -87,25 +115,6 @@ constexpr int32_t      PG_MODE_PLAIN = 0;
 constexpr int32_t      PG_MODE_GLU   = 1;
 constexpr int32_t      PG_MODE_GLU_A = 2;
 constexpr int32_t      PG_MODE_GELU  = 4;
-// The weights' path, fixed by kernels/pgemm.py
-constexpr uint32_t     W_SHIM_CH   = 1;        // shim MM2S channel
-constexpr uint32_t     W_MT_S2MM   = 5;        // MemTile S2MM channel
-constexpr uint32_t     W_MT_MM2S   = 4;        // MemTile MM2S channel of GEMV tile r: 4 + r
-constexpr uint32_t     W_LOCK0     = 48;       // slot s: (empty, full) locks 48 + 2 s, + 1
-constexpr uint32_t     WS_ADDR     = 0x24000;  // the slot buffer, bytes into the MemTile
-constexpr size_t       WS_BYTES    = (size_t) 33 * 10752;
-constexpr uint32_t     MT_CTRL_PKT = 26;       // the MemTiles' controller packet id
-// MemTile descriptors the static program leaves free (it uses 0-5, 24-29):
-// S2MM 5's ring, MM2S 4's, MM2S 5's
-constexpr uint32_t     MT_BD_S2MM  = 40;
-constexpr uint32_t     MT_BD_MM2S0 = 16;
-constexpr uint32_t     MT_BD_MM2S1 = 44;
-// MemTile tasks in flight a channel: its queue holds about five and drops the
-// rest without a word
-constexpr int          MT_Q        = 4;
-// shim descriptors: 0 the A header, 1 the A body (columns 6, 7), 2-3 W, 4.. C
-constexpr uint32_t     SH_BD_W     = 2;
-constexpr uint32_t     SH_BD_C     = 4;
 
 // Where a weight's chunks sit in the MemTile: `G` tiles a group (of each
 // GEMV tile r), `ng` groups a chunk, `nslots` slots. When a whole chunk fits
@@ -250,7 +259,7 @@ struct runner {
 runner g_pg;
 
 bool artifact_present() {
-    static const bool present = !xdna_artifact_find(STEM, false).xclbin.empty();
+    static const bool present = !xdna_artifact_find(pgemm_stem(), false).xclbin.empty();
     return present;
 }
 
@@ -302,16 +311,6 @@ bool glu_gated(const ggml_tensor * glu) {
     return op == GGML_GLU_OP_SWIGLU || op == GGML_GLU_OP_GEGLU;
 }
 
-// A linear transfer of `words`, encoded as IRON writes one: unit strides
-// (a zero stride encodes as 0xFFFFF) and the AXI cache bits.
-xdna_bd linear_bd(uint32_t words) {
-    xdna_bd bd;
-    bd.buf_len   = words;
-    bd.d0_stride = bd.d1_stride = bd.d2_stride = 1;
-    bd.ax_cache                                = 2;
-    return bd;
-}
-
 // One projection's share of a call that writes several: its `nobj` objects of
 // 512 columns from the call's object `obj0` on go to `cols` columns of a
 // row-major (rows x ldc) f32 target at byte `off` of argument 2.
@@ -352,42 +351,12 @@ const c_seg * seg_of(const c_dest & cd, int s) {
     return nullptr;
 }
 
-// MemTile DMA (xdna_seq's descriptors are the shim's): a MemTile's own locks
-// and memory as its DMA addresses them, locks 64 on and words 0x20000 on.
-void mt_set_lock(xdna_seq * seq, uint32_t col, uint32_t id, uint32_t value) {
-    xdna_seq_write(seq, col, 1, 0xC0000 + id * 0x10, value);
-}
-
-// A linear descriptor of `words` at byte `addr` of the MemTile, taking lock
-// `acq` at `acq_val` or more and releasing `rel` by `rel_val`
-void mt_bd(xdna_seq * seq,
-           uint32_t   col,
-           uint32_t   id,
-           uint32_t   words,
-           uint32_t   addr,
-           uint32_t   acq,
-           uint32_t   acq_val,
-           uint32_t   rel,
-           uint32_t   rel_val) {
-    seq->n_instr++;
-    seq->ops.push_back(xdna_txn::OP_BLOCKWRITE);
-    seq->ops.push_back(0);
-    seq->ops.push_back(xdna_txn::tile_reg(col, 1, 0xA0000 + id * 0x20));
-    seq->ops.push_back(xdna_txn::SZ_BLOCKWRITE * 4);
-    seq->ops.push_back(words);
-    seq->ops.push_back(0x20000 + addr / 4);
-    for (int k = 0; k < 5; k++) {
-        seq->ops.push_back(0);
+// The packet header field of pair r's W sends, when the artifact routes W by packet id
+uint32_t w_send_packet(uint32_t r) {
+    if (!w_path_packet()) {
+        return 0;
     }
-    seq->ops.push_back(1u << 31 | (rel_val & 0x7F) << 24 | (64 + rel) << 16 | 1u << 15 | ((0u - acq_val) & 0x7F) << 8 |
-                       (64 + acq));
-}
-
-// Start MemTile task `id` on a channel, `repeat` more times, with a token
-void mt_push(xdna_seq * seq, uint32_t col, uint32_t id, xdna_dma_dir dir, uint32_t ch, uint32_t repeat) {
-    const uint32_t ctrl = (dir == xdna_dma_dir::MM2S ? 0xA0630 : 0xA0600) + ch * 8;
-    xdna_seq_maskwrite(seq, col, 1, ctrl, MT_CTRL_PKT << 8, 0x1F00);
-    xdna_seq_write(seq, col, 1, ctrl + 4, id | repeat << 16 | 1u << 31);
+    return MT_BD_PKT | (W_PKT_PAIR0 + r) << MT_BD_PKT_ID_SHIFT;
 }
 
 // The stream for `nmb` M blocks of a weight of geometry `g` and plan `wp`,
@@ -461,7 +430,7 @@ std::vector<uint32_t> build_seq(const xdna_gemv_geom & g,
             mt_push(&seq, c, MT_BD_S2MM + q, xdna_dma_dir::S2MM, W_MT_S2MM, 0);
             for (uint32_t r = 0; r < 2; r++) {
                 const uint32_t id = (r ? MT_BD_MM2S1 : MT_BD_MM2S0) + q;
-                mt_bd(&seq, c, id, gt * tb / 4, at + r * gt * tb, f, 1, e, 1);
+                mt_bd(&seq, c, id, gt * tb / 4, at + r * gt * tb, f, 1, e, 1, w_send_packet(r));
                 mt_push(&seq, c, id, xdna_dma_dir::MM2S, W_MT_MM2S + r, R - 1);
             }
         }
@@ -679,7 +648,8 @@ xdna_kernel * seq_kernel(xdna_kernel_pool * pool,
         return it->second.kern;
     }
     if (!g_pg.kern) {
-        g_pg.kern = xdna_kernel_find(pool->device, STEM);
+        warn_pfx_missing();
+        g_pg.kern = xdna_kernel_find(pool->device, pgemm_stem());
     }
     xdna_kernel * kern = xdna_kernel_clone(g_pg.kern);
     if (!kern) {
@@ -815,6 +785,9 @@ bool xdna_pgemm_shape_supported(const ggml_tensor * op) {
         return false;
     }
     const xdna_gemv_geom g = geom_of(w);
+    if (pfx_loaded() && g.fmt == XDNA_WFMT_Q4G32) {
+        return false;
+    }
     return g.valid() && g.K % KS == 0 && g.n_out() <= 256;
 }
 
@@ -1266,7 +1239,10 @@ bool xdna_pgemm_run_into(xdna_kernel_pool * pool, ggml_tensor * node, xdna_buffe
     return pgemm_call(pool, node->src[1], ws, node, (int) w->ne[1], false, &ov);
 }
 
-bool xdna_pgemm_glu_supported(const ggml_tensor * glu) {
+namespace {
+
+// The gate/up pairs the fold takes, whichever output it writes.
+bool glu_foldable(const ggml_tensor * glu) {
     if (!glu || glu->op != GGML_OP_GLU || !glu_gated(glu) || xdna_env_int("GGML_XDNA_PGEMM_GLU", 1) == 0 ||
         glu->type != GGML_TYPE_F32 || ggml_get_op_params_i32(glu, 1) != 0 || !ggml_is_contiguous(glu)) {
         return false;
@@ -1282,7 +1258,17 @@ bool xdna_pgemm_glu_supported(const ggml_tensor * glu) {
     return g.valid() && g.n_out() <= 256;
 }
 
+}  // namespace
+
+// The f32 gated product: the merged design writes it only as the next projection's A.
+bool xdna_pgemm_glu_supported(const ggml_tensor * glu) {
+    return !pfx_loaded() && glu_foldable(glu);
+}
+
 bool xdna_pgemm_run_glu(xdna_kernel_pool * pool, ggml_tensor * glu) {
+    if (!xdna_pgemm_glu_supported(glu)) {
+        return false;
+    }
     std::lock_guard<std::mutex> lock(g_pg.mtx);
     const ggml_tensor *         gate = glu->src[0];
     const ggml_tensor *         up   = glu->src[1];
@@ -1295,7 +1281,7 @@ bool xdna_pgemm_run_glu(xdna_kernel_pool * pool, ggml_tensor * glu) {
 }
 
 bool xdna_pgemm_glu_fused_supported(const ggml_tensor * glu, const ggml_tensor * down) {
-    return xdna_env_int("GGML_XDNA_PGEMM_GLU_A", 1) != 0 && xdna_pgemm_glu_supported(glu) && down &&
+    return xdna_env_int("GGML_XDNA_PGEMM_GLU_A", 1) != 0 && glu_foldable(glu) && down &&
            down->op == GGML_OP_MUL_MAT && down->src[1] == glu && xdna_pgemm_supported(down) &&
            glu->ne[0] % (CHUNK / 2) == 0 && glu->ne[0] == down->src[0]->ne[0];
 }

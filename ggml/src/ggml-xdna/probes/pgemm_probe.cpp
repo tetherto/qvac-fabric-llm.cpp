@@ -612,7 +612,7 @@ int main(int argc, char ** argv) {
     ggml_context *   ctx = ggml_init(ip);
     call_state       st;
     st.pool.device = dev;
-    g_pg.kern      = xdna_kernel_find(dev, STEM);
+    g_pg.kern      = xdna_kernel_find(dev, xdna_pgemm_path::PGEMM_STEM);
     if (!g_pg.kern) {
         std::fprintf(stderr, "no pgemm artifact\n");
         return 1;
