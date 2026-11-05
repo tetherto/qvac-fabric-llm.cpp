@@ -77,6 +77,10 @@
 // Two bf16 projections of one row count whose own cheapest prefill blocks
 // differ run on one block: computed again, the graph changes block no time.
 //
+// A prompt whose last layer is cropped to its output row, built in the graph
+// memory a decode of the same layers used before it, plans as on a fresh
+// context: the decode's GEMV groups do not follow the address into its plan.
+//
 // Every intermediate is cleared before each backend runs, so a node read
 // before it was written shows as zeros instead of as the other backend's
 // result. Skips (exit 0) when no XDNA device is registered.
@@ -226,6 +230,11 @@ static bool run(norm_graph & g, ggml_backend_t be, std::vector<std::vector<float
         res.push_back(get_f32(t));
     }
     return true;
+}
+
+static void free_graph(norm_graph & g) {
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
 }
 
 // one Q4_K projection of a single token, the same graph object every run
@@ -1478,6 +1487,83 @@ static bool test_group_order_after_host_plan(ggml_backend_t npu, ggml_backend_t 
     return passed;
 }
 
+// A prompt cropped to its last row (a Q4_K projection after Q8_0 layers) built in the graph memory a decode of the same layers
+// used, as llama reuses it: the decode's GEMV group leaves its one-row projection at the cropped one's address. The prompt's
+// plan must not read it: it runs whole on the host with the bits of a fresh context.
+static const int64_t CROP_CHAIN_K      = 1024;
+static const int64_t CROP_CHAIN_ROWS   = 15;
+static const int     CROP_CHAIN_LAYERS = 3;
+
+static norm_graph build_cropped_chain(ggml_backend_t cpu, std::vector<uint8_t> & meta, int64_t M) {
+    norm_graph       g;
+    ggml_init_params ip = { meta.size(), meta.data(), true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, CROP_CHAIN_K, M);
+    ggml_tensor * rows  = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * w_out = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, CROP_CHAIN_K, CROP_CHAIN_K);
+    g.inputs            = { x, rows, w_out };
+    g.out_row           = (int32_t) M - 1;
+    for (int l = 0; l < CROP_CHAIN_LAYERS; l++) {
+        ggml_tensor * up   = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, CROP_CHAIN_K, CROP_CHAIN_K);
+        ggml_tensor * down = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, CROP_CHAIN_K, CROP_CHAIN_K);
+        g.inputs.push_back(up);
+        g.inputs.push_back(down);
+        ggml_tensor * h = ggml_gelu(g.ctx, ggml_mul_mat(g.ctx, up, ggml_rms_norm(g.ctx, x, 1e-6f)));
+        x               = ggml_add(g.ctx, ggml_mul_mat(g.ctx, down, h), x);
+    }
+    ggml_tensor * out = ggml_mul_mat(g.ctx, w_out, ggml_get_rows(g.ctx, x, rows));
+    g.gf              = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+struct prompt_run {
+    std::vector<float>  out;
+    int                 fired   = -1;  // chunks run whole on the host
+    const ggml_tensor * cropped = nullptr;
+};
+
+static bool run_cropped_prompt(ggml_backend_t npu, ggml_backend_t cpu, std::vector<uint8_t> & meta, host_chunk_count_fn chunks,
+                               prompt_run * pr) {
+    norm_graph                      g = build_cropped_chain(cpu, meta, CROP_CHAIN_ROWS);
+    std::vector<std::vector<float>> got;
+    const int                       before = chunks();
+    const bool                      ok     = run(g, npu, got);
+    pr->fired                              = chunks() - before;
+    pr->out                                = ok ? got[0] : std::vector<float>();
+    pr->cropped                            = g.checked[0];
+    free_graph(g);
+    return ok;
+}
+
+static bool test_chunk_plan_after_decode(ggml_backend_dev_t dev, ggml_backend_t cpu) {
+    ggml_backend_t            fresh   = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t            decoded = ggml_backend_dev_init(dev, nullptr);
+    const host_chunk_count_fn chunks  = fresh && decoded ? host_chunk_counter(fresh) : nullptr;
+    std::vector<uint8_t>      meta(ggml_tensor_overhead() * 64 + ggml_graph_overhead());
+    prompt_run                want, got;
+    bool                      ok = chunks && run_cropped_prompt(fresh, cpu, meta, chunks, &want);
+    // the decode's graph context goes and its buffer stays: the prompt's tensors take the decode's addresses, not its memory
+    norm_graph                      decode = build_cropped_chain(cpu, meta, 1);
+    std::vector<std::vector<float>> decode_out;
+    ok                          = ok && run(decode, decoded, decode_out);
+    const ggml_tensor * grouped = decode.checked[0];
+    ggml_free(decode.ctx);
+    ok = ok && run_cropped_prompt(decoded, cpu, meta, chunks, &got);
+    ggml_backend_buffer_free(decode.buf);
+    const bool aliased = got.cropped == grouped;
+    const bool same    = got.out == want.out;
+    const bool passed  = ok && aliased && want.fired == 1 && got.fired == want.fired && same;
+    std::printf("chunk host rule, a cropped prompt after a decode at its address: %d host chunks against %d fresh, %s%s %s\n",
+                got.fired, want.fired, same ? "the same bits" : "DIFFERENT BITS", aliased ? "" : ", NOT AT ITS ADDRESS",
+                passed ? "ok" : "FAIL");
+    ggml_backend_free(fresh);
+    ggml_backend_free(decoded);
+    return passed;
+}
+
 // A layer's Q, K and V behind per-head norms through one scheduler reserved for a prompt, as llama reserves it, then at a
 // decode's, a short prompt's and the prompt's rows: the allocator matches a graph against its reservation node by node, so the
 // order graph_optimize leaves must not depend on the rows.
@@ -1921,6 +2007,7 @@ int main(void) {
     passed = npu != nullptr && test_host_chunk_rule(npu, cpu, tol) && passed;
     passed = npu != nullptr && test_host_chunk_conv_kernels(npu, cpu) && passed;
     passed = npu != nullptr && test_group_order_after_host_plan(npu, cpu) && passed;
+    passed = test_chunk_plan_after_decode(dev, cpu) && passed;
 
     ggml_backend_free(npu);
     ggml_backend_free(cpu);
