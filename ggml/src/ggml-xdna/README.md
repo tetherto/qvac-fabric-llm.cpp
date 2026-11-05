@@ -468,6 +468,7 @@ Artifacts, all in the build output directory (`build/bin` by default):
 | `gemm_bf16_f32_M{32,256,512,2048}_K1024_N2048_c8` | bf16 GEMM, one per M block; M32 is the decode one |
 | `gemm_int8_int32_M{256,512,2048}_K1024_N2048_c8` | native int8 GEMM, prefill |
 | `pgemm_c8` | prefill GEMM in the decode GEMV's weight tiles |
+| `pfx_c8` | the merged prefill design: the prefill GEMM in its 8-bit tiles, the prefill attention and a row command (a sliding layer's Q, K and V norms and RoPE, under `GGML_XDNA_PFX_ROW`) in one hardware context, loaded with `GGML_XDNA_PFX=1` |
 | `gdn_mm_c8` | GATED_DELTA_NET prefill |
 | `gdn_conv_c8` | the prefill GDN's conv input, opt-in |
 | `attn_mm_c8` | FLASH_ATTN_EXT prefill |
@@ -533,6 +534,9 @@ For users - a trade-off, a size or a location:
 | `GGML_XDNA_CONV` | 0 | `1` runs the standalone prefill `SSM_CONV` on the array; the host is cheaper, which is why it is off |
 | `GGML_XDNA_GDN_CONV` | 0 | `1` computes the prefill GDN's conv input on the array; the host is faster, which is why it is off |
 | `GGML_XDNA_KERNEL_DIR` | unset | a directory to look for the kernel artifacts in before the others (see Artifacts) |
+| `GGML_XDNA_PFX` | 0 | `1` loads `pfx_c8` in `pgemm_c8`'s place: the prefill attention runs on the GEMM's hardware context, so a layer pays no context switch between its projections and its attention. Its GEMM takes the 8-bit weight form only (`Q8_0`, `Q5_K`, `Q6_K`): a `Q4_K` projection runs on the int8 or bf16 GEMM instead, in their own hardware contexts, and a SwiGLU or GeGLU folds only into the down projection's A. A BF16 file's projections never run on the prefill GEMM, so there it moves only the attention and keeps the switches: EmbeddingGemma 2 BF16 takes 1.5% more energy a pass at 912 tokens and 3.8% more at 1188 with it than without, so leave it off for BF16. With every prefill op on the array (`GGML_XDNA_FA_MM=2`, `GGML_XDNA_GEMM_HOST=0`, `GGML_XDNA_HOST_CHUNK=0`, `GGML_XDNA_PGEMM_HOST=0`), run it with `OMP_PLACES=cores OMP_PROC_BIND=spread GOMP_SPINCOUNT=2000`: one host thread a core keeps the cores out of their boost clocks between array commands, which otherwise lifts some runs from ~38 to ~53 W, and the shorter spin idles them sooner. EmbeddingGemma 2 Q8_0 at 912 tokens then takes 165.0 ms and 5.89 J a pass, against 169.2 ms and 6.86 J without these settings and 265.3 ms and 7.99 J without `GGML_XDNA_PFX` (median of 6, 3 interleaved rounds). Without the artifact it warns at the first prefill GEMM and keeps `pgemm_c8` |
+| `GGML_XDNA_PFX_ROW` | 0 | with `GGML_XDNA_PFX=1`, `1` runs each sliding layer's Q and K norms and RoPE and V's norm on the array's row-op columns, straight into the prefill attention's inputs: the host skips those nodes, their pads and f16 casts, and the attention's pack. A layer whose graph differs from EmbeddingGemma 2's falls back to the host. Opt-in: EmbeddingGemma 2 Q8_0 takes 4.1% less energy a pass at 912 tokens and 4.0% less at 1188 with it than without |
+| `GGML_XDNA_PGEMM_GLU_X` | 0 | with `GGML_XDNA_PFX=1`, `1` runs EmbeddingGemma 2's per-layer input gate, `gelu(inp_gate x pe_in) * per-layer input`, as the projection's GEMM: the cores start the accumulator's up half from the per-layer input, so the GeGLU epilogue writes the product in bf16 straight into `per_layer_proj`'s input. The host skips the GELU and the MUL, and nothing of the gate goes to the host. A gate of other than 512 columns, or a product another node reads, stays on the host. Opt-in: EmbeddingGemma 2 Q8_0 with `GGML_XDNA_PFX_ROW=1` takes 0.9% less energy a pass at 912 tokens with it than without, and as much at 1188 within the spread of runs |
 
 For bisecting a regression - each `0` turns off the NPU route it names, and the
 host (or a less fused path) runs it instead. They are for narrowing down a bug
@@ -621,9 +625,13 @@ Diagnostics - nothing is measured unless they are set:
 | `xdna-att-layer.h/.cpp` | a full-attention decode layer as one dispatch of the fused design |
 | `xdna-att.h/.cpp` | the decode attention on the fused design's GEMV pool |
 | `xdna-head.h/.cpp` | the decode's vocabulary projection on the pool, with its exact and 4-bit rows |
-| `xdna-pgemm.h/.cpp` | the prefill GEMM in the decode GEMV's weight tiles, and what it folds in (norm, SwiGLU or GeGLU, gate into A) and the projections it runs as one |
+| `xdna-pgemm.h/.cpp` | the prefill GEMM in the decode GEMV's weight tiles, and what it folds in (norm, SwiGLU or GeGLU, gate into A, GELU times the per-layer input into A) and the projections it runs as one |
 | `xdna-host-cost.h` | the host's time for a MUL_MAT (fitted per weight type and team size), which the routing plans compare with the array's commands |
 | `xdna-attn-mm.h/.cpp` | the prefill attention on the array |
+| `xdna-pfx-attn.h/.cpp` | the prefill attention as a mode of the merged prefill design (`GGML_XDNA_PFX`); its objects are prepared apart from the host's pack, so the row command can write them instead |
+| `xdna-pfx-row.h/.cpp` | the merged prefill design's row command: a sliding layer's Q and K head norms and RoPE and V's norm on the row-op columns, straight into the prefill attention's Q, K and V^T objects: the sliding attention's Q, K and V under `GGML_XDNA_PFX_ROW` |
+| `xdna-pfx-layout.h` | where the merged prefill design's attention reads its Q, K and V^T objects, shared by its host pack and the row command |
+| `xdna-pgemm-path.h` | the prefill GEMM artifact's data paths and which artifact runs, shared by the GEMM and the merged design's attention |
 | `xdna-host-attn.h/.cpp`, `xdna-host-attn-ops.h` | the prefill attention on the host: the work items, and the AVX-512 and portable kernels |
 | `xdna-attn-mask.h` | an attention mask read on its f16 bits, as the array route and the host kernel both take it |
 | `xdna-gdn-mm.h/.cpp` | the prefill gated delta rule on the array, and the GDN input it is fed |
