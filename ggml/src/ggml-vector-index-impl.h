@@ -1006,6 +1006,8 @@ bool turbovec_planes_wanted(int bits, int dim, size_t n_vectors);
 // After an add (first new slot), a load or calibrate (0): promotes the
 // index or patches its sign planes.
 void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot);
+// Frees the sign planes and centre term, which searches read without the
+// planes mutex: the caller must hold `idx.mutex` exclusively.
 void turbovec_planes_reset(ggml_vec_index & idx);
 void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
 // How a staged search is run, following upstream's batch bookkeeping.

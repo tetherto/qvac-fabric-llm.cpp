@@ -6794,19 +6794,22 @@ void check_turbovec_1x_staged_wide_dims(int x86_rules) {
 }
 
 // GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF: a load that would promote the
-// index leaves it unpromoted, with no packed rows or sign planes, and searches
-// exactly like a plain load followed by set_staged(0). set_staged(0) frees the
-// sign planes rather than keeping their capacity.
+// index leaves it unpromoted, with no packed rows or sign planes, writes the
+// same bytes as a plain load, and searches, adds and removes exactly like a
+// plain load followed by set_staged(0). set_staged(0) frees the sign planes
+// rather than keeping their capacity.
 void check_turbovec_1x_load_staged_off() {
     // Planes from the first vector, so this small index promotes on load.
     turbovec_force_planes_for_test(1, 1);
     turbovec_force_vector_major_for_test(1);
     constexpr int dim = 128;
     constexpr int n = 2000;
+    constexpr int n_more = 64;
+    constexpr int n_removed = 16;
     constexpr int k = 10;
     constexpr int n_q = 3;
-    const std::vector<float> db = tv1x_rows(kTv1xSeedDb, n, dim);
-    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::vector<float> db = tv1x_rows(kTv1xSeedDb, n + n_more, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n + n_more);
     const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, n_q, dim);
     const std::string path =
         (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-load-staged-off.tvim").string();
@@ -6818,15 +6821,29 @@ void check_turbovec_1x_load_staged_off() {
         out_ids.assign(scores.size(), 0);
         CHECK(ggml_vec_index_search(idx, queries.data(), n_q, k, scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
     };
+    auto snapshot = [](ggml_vec_index_t * idx) {
+        uint8_t * raw = nullptr;
+        size_t size = 0;
+        CHECK(ggml_vec_index_to_bytes(idx, &raw, &size) == GGML_VEC_INDEX_OK);
+        std::vector<uint8_t> out(raw, raw + size);
+        ggml_vec_index_bytes_free(raw);
+        return out;
+    };
+    // Rows n.. are added after the load, then the first n_removed ids removed.
+    auto mutate = [&](ggml_vec_index_t * idx) {
+        CHECK(ggml_vec_index_add(idx, db.data() + static_cast<size_t>(n) * dim, n_more, ids.data() + n) ==
+              GGML_VEC_INDEX_OK);
+        for (int i = 0; i < n_removed; ++i) {
+            CHECK(ggml_vec_index_remove(idx, ids[static_cast<size_t>(i)]) == GGML_VEC_INDEX_OK);
+        }
+    };
     for (const int bits : { 2, 4 }) {
         auto * src = ggml_vec_index_create_turbovec(dim, bits);
         CHECK(src != nullptr);
         CHECK(ggml_vec_index_add(src, db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
         std::filesystem::remove(path);
         CHECK(ggml_vec_index_write(src, path.c_str()) == GGML_VEC_INDEX_OK);
-        uint8_t * bytes = nullptr;
-        size_t n_bytes = 0;
-        CHECK(ggml_vec_index_to_bytes(src, &bytes, &n_bytes) == GGML_VEC_INDEX_OK);
+        const std::vector<uint8_t> bytes = snapshot(src);
         ggml_vec_index_free(src);
 
         bool planes = false;
@@ -6841,12 +6858,18 @@ void check_turbovec_1x_load_staged_off() {
         std::vector<float> staged_scores;
         std::vector<uint64_t> staged_ids;
         search(plain, staged_scores, staged_ids);
+        const std::vector<uint8_t> plain_bytes = snapshot(plain);
         CHECK(ggml_vec_index_turbovec_set_staged(plain, 0) == GGML_VEC_INDEX_OK);
         caches(plain, planes, packed, sign);
         CHECK(!planes && !packed && sign == 0);
         std::vector<float> full_scores;
         std::vector<uint64_t> full_ids;
         search(plain, full_scores, full_ids);
+        mutate(plain);
+        std::vector<float> mutated_scores;
+        std::vector<uint64_t> mutated_ids;
+        search(plain, mutated_scores, mutated_ids);
+        const std::vector<uint8_t> mutated_bytes = snapshot(plain);
         ggml_vec_index_free(plain);
 
         ggml_vec_index_t * from_file = nullptr;
@@ -6854,45 +6877,38 @@ void check_turbovec_1x_load_staged_off() {
               GGML_VEC_INDEX_OK);
         ggml_vec_index_t * from_bytes = nullptr;
         CHECK(ggml_vec_index_from_bytes_with_flags(
-                  bytes, n_bytes, GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF, &from_bytes) == GGML_VEC_INDEX_OK);
+                  bytes.data(), bytes.size(), GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF, &from_bytes) ==
+              GGML_VEC_INDEX_OK);
         for (ggml_vec_index_t * idx : { from_file, from_bytes }) {
             caches(idx, planes, packed, sign);
             CHECK(!planes && !packed && sign == 0);
+            // The snapshot layout depends on the row count, not on staged search.
+            CHECK(snapshot(idx) == plain_bytes);
             std::vector<float> scores;
             std::vector<uint64_t> got;
             search(idx, scores, got);
             CHECK(got == full_ids && scores == full_scores);
-            // Turning it back on promotes and searches like the plain load.
-            CHECK(ggml_vec_index_turbovec_set_staged(idx, 1) == GGML_VEC_INDEX_OK);
-            caches(idx, planes, packed, sign);
-            CHECK(planes && sign > 0);
-            search(idx, scores, got);
-            CHECK(got == staged_ids && scores == staged_scores);
-            ggml_vec_index_free(idx);
         }
 
-        // Unknown flag bits are rejected and leave `out` empty.
-        ggml_vec_index_t * rejected = plain;
-        CHECK(ggml_vec_index_load_with_flags(path.c_str(), 2u, &rejected) == GGML_VEC_INDEX_E_INVALID_ARG);
-        CHECK(rejected == nullptr);
-        rejected = plain;
-        CHECK(ggml_vec_index_from_bytes_with_flags(bytes, n_bytes, 2u, &rejected) == GGML_VEC_INDEX_E_INVALID_ARG);
-        CHECK(rejected == nullptr);
-        ggml_vec_index_bytes_free(bytes);
-    }
+        // Adds and removes keep it unpromoted and match the plain load.
+        mutate(from_file);
+        caches(from_file, planes, packed, sign);
+        CHECK(!planes && !packed && sign == 0);
+        std::vector<float> scores;
+        std::vector<uint64_t> got;
+        search(from_file, scores, got);
+        CHECK(got == mutated_ids && scores == mutated_scores);
+        CHECK(snapshot(from_file) == mutated_bytes);
+        ggml_vec_index_free(from_file);
 
-    // Other storages ignore the flag.
-    auto * f32 = ggml_vec_index_create(dim, 32);
-    CHECK(f32 != nullptr);
-    CHECK(ggml_vec_index_add(f32, db.data(), 10, ids.data()) == GGML_VEC_INDEX_OK);
-    std::filesystem::remove(path);
-    CHECK(ggml_vec_index_write(f32, path.c_str()) == GGML_VEC_INDEX_OK);
-    ggml_vec_index_free(f32);
-    ggml_vec_index_t * f32_loaded = nullptr;
-    CHECK(ggml_vec_index_load_with_flags(path.c_str(), GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF, &f32_loaded) ==
-          GGML_VEC_INDEX_OK);
-    CHECK(ggml_vec_index_len(f32_loaded) == 10);
-    ggml_vec_index_free(f32_loaded);
+        // Turning it back on promotes and searches like the plain load.
+        CHECK(ggml_vec_index_turbovec_set_staged(from_bytes, 1) == GGML_VEC_INDEX_OK);
+        caches(from_bytes, planes, packed, sign);
+        CHECK(planes && sign > 0);
+        search(from_bytes, scores, got);
+        CHECK(got == staged_ids && scores == staged_scores);
+        ggml_vec_index_free(from_bytes);
+    }
     std::filesystem::remove(path);
 
     turbovec_force_vector_major_for_test(-1);
@@ -7064,6 +7080,79 @@ void check_turbovec_1x_vpermb() {
     turbovec_force_vm8_2bit_for_test(-1);
 }
 #endif
+
+// The load flags through the public API alone: unknown bits are rejected
+// with `out` left NULL, other storages ignore the flag, and a TurboVec index
+// loaded with staged search off searches like a plain load followed by
+// set_staged(0).
+void check_vector_index_load_flags() {
+    constexpr int dim = 128;
+    constexpr int n = 200;
+    constexpr int k = 10;
+    constexpr uint32_t unknown_flag = 2u;
+    const std::vector<float> db = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-load-flags.tvim").string();
+
+    auto * f32 = ggml_vec_index_create(dim, 32);
+    CHECK(f32 != nullptr);
+    CHECK(ggml_vec_index_add(f32, db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+    std::filesystem::remove(path);
+    CHECK(ggml_vec_index_write(f32, path.c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(f32);
+    ggml_vec_index_t * loaded = nullptr;
+    CHECK(ggml_vec_index_load_with_flags(path.c_str(), GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF, &loaded) ==
+          GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_len(loaded) == n);
+    ggml_vec_index_free(loaded);
+    loaded = reinterpret_cast<ggml_vec_index_t *>(&loaded);
+    CHECK(ggml_vec_index_load_with_flags(path.c_str(), unknown_flag, &loaded) == GGML_VEC_INDEX_E_INVALID_ARG);
+    CHECK(loaded == nullptr);
+    CHECK(ggml_vec_index_load_with_flags(path.c_str(), GGML_VEC_INDEX_LOAD_DEFAULT, nullptr) ==
+          GGML_VEC_INDEX_E_INVALID_ARG);
+
+    if (kTurboVecSupported) {
+        auto * tv = ggml_vec_index_create_turbovec(dim, 4);
+        CHECK(tv != nullptr);
+        CHECK(ggml_vec_index_add(tv, db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+        std::filesystem::remove(path);
+        CHECK(ggml_vec_index_write(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        uint8_t * bytes = nullptr;
+        size_t n_bytes = 0;
+        CHECK(ggml_vec_index_to_bytes(tv, &bytes, &n_bytes) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(tv);
+
+        std::vector<float> want_scores(k);
+        std::vector<uint64_t> want_ids(k);
+        ggml_vec_index_t * plain = nullptr;
+        CHECK(ggml_vec_index_load_ex(path.c_str(), &plain) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_turbovec_set_staged(plain, 0) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(plain, db.data(), 1, k, want_scores.data(), want_ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(plain);
+
+        ggml_vec_index_t * from_file = nullptr;
+        CHECK(ggml_vec_index_load_with_flags(path.c_str(), GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF, &from_file) ==
+              GGML_VEC_INDEX_OK);
+        ggml_vec_index_t * from_bytes = nullptr;
+        CHECK(ggml_vec_index_from_bytes_with_flags(
+                  bytes, n_bytes, GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF, &from_bytes) == GGML_VEC_INDEX_OK);
+        for (ggml_vec_index_t * idx : { from_file, from_bytes }) {
+            std::vector<float> scores(k);
+            std::vector<uint64_t> got(k);
+            CHECK(ggml_vec_index_search(idx, db.data(), 1, k, scores.data(), got.data()) == GGML_VEC_INDEX_OK);
+            CHECK(got == want_ids && scores == want_scores);
+            ggml_vec_index_free(idx);
+        }
+
+        ggml_vec_index_t * rejected = reinterpret_cast<ggml_vec_index_t *>(&rejected);
+        CHECK(ggml_vec_index_from_bytes_with_flags(bytes, n_bytes, unknown_flag, &rejected) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(rejected == nullptr);
+        ggml_vec_index_bytes_free(bytes);
+    }
+    std::filesystem::remove(path);
+}
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 // The lone staged search's fused AVX-512 sign scan (x86 rules, vector-major
@@ -11719,6 +11808,8 @@ int main(int argc, char ** argv) {
         ggml_vec_index_free(q8_loaded);
         std::filesystem::remove(q8_path);
     }
+
+    check_vector_index_load_flags();
 
     std::filesystem::remove_all(test_temp_dir);
 

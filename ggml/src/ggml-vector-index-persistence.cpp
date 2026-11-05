@@ -4140,15 +4140,11 @@ size_t ggml_vec_index_serialized_size(const ggml_vec_index_t * idx) {
     }
 }
 
-namespace {
+static constexpr uint32_t kLoadFlagsKnown = GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF;
 
-constexpr uint32_t kLoadFlagsKnown = GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF;
-
-bool load_flags_staged(uint32_t flags) {
+static bool load_flags_staged(uint32_t flags) {
     return (flags & GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF) == 0;
 }
-
-} // namespace
 
 int ggml_vec_index_from_bytes(const uint8_t * bytes, size_t size, ggml_vec_index_t ** out) {
     return ggml_vec_index_from_bytes_with_flags(bytes, size, GGML_VEC_INDEX_LOAD_DEFAULT, out);
@@ -4197,6 +4193,7 @@ int ggml_vec_index_load_with_flags(const char * path, uint32_t flags, ggml_vec_i
     }
     *out = nullptr;
     if ((flags & ~kLoadFlagsKnown) != 0) {
+        g_last_load_error = GGML_VEC_INDEX_E_INVALID_ARG;
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     ggml_vec_index_t * idx = load_path(path, load_flags_staged(flags));

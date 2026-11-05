@@ -384,7 +384,20 @@ GGML_VEC_INDEX_API int ggml_vec_index_from_bytes(
     size_t               size,
     ggml_vec_index_t  ** out);
 
-// `ggml_vec_index_from_bytes` with `ggml_vec_index_load_flags`.
+// Bit flags for `ggml_vec_index_from_bytes_with_flags` and
+// `ggml_vec_index_load_with_flags`, OR-ed into their `uint32_t flags`.
+enum ggml_vec_index_load_flags {
+    GGML_VEC_INDEX_LOAD_DEFAULT = 0,
+    // A TurboVec index loads with staged search off, as after
+    // `ggml_vec_index_turbovec_set_staged(idx, 0)`, without first building
+    // the staged-search caches a large index otherwise gets on load (packed
+    // rows and sign planes). Other storages ignore it.
+    GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF = 1,
+};
+
+// `ggml_vec_index_from_bytes` with `ggml_vec_index_load_flags`. Returns 0 on
+// success and stores the loaded handle in `out`; unknown flag bits return
+// GGML_VEC_INDEX_E_INVALID_ARG and leave `out` NULL.
 GGML_VEC_INDEX_API int ggml_vec_index_from_bytes_with_flags(
     const uint8_t      * bytes,
     size_t               size,
@@ -414,19 +427,9 @@ GGML_VEC_INDEX_API int ggml_vec_index_load_ex(
 // Returns NULL on failure.
 GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 
-// Flags for `ggml_vec_index_load_with_flags` and
-// `ggml_vec_index_from_bytes_with_flags`. Unknown bits are rejected with
-// GGML_VEC_INDEX_E_INVALID_ARG.
-enum ggml_vec_index_load_flags {
-    GGML_VEC_INDEX_LOAD_DEFAULT = 0,
-    // A TurboVec index loads with staged search off, as after
-    // `ggml_vec_index_turbovec_set_staged(idx, 0)`, without first building
-    // the staged-search caches a large index otherwise gets on load (packed
-    // rows and sign planes). Other storages ignore it.
-    GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF = 1,
-};
-
-// `ggml_vec_index_load_ex` with `ggml_vec_index_load_flags`.
+// `ggml_vec_index_load_ex` with `ggml_vec_index_load_flags`. Returns 0 on
+// success and stores the loaded handle in `out`; unknown flag bits return
+// GGML_VEC_INDEX_E_INVALID_ARG and leave `out` NULL.
 GGML_VEC_INDEX_API int ggml_vec_index_load_with_flags(
     const char         * path,
     uint32_t             flags,
