@@ -1071,6 +1071,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_DSV4_HC_POST:
             return op_dsv4_hc_post(octx);
 
+        case HTP_OP_CONV_TAPS_F32:
+            return op_conv_taps_f32(octx);
+
         case HTP_OP_SNAKE:
             return op_snake(octx);
 

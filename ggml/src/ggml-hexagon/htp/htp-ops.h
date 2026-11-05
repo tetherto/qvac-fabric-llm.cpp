@@ -130,6 +130,7 @@ enum htp_op_code {
     HTP_OP_SSM_SCAN,
     HTP_OP_TIMESTEP_EMBEDDING,
     HTP_OP_SNAKE,
+    HTP_OP_CONV_TAPS_F32,
     HTP_OP_INVALID
 };
 
