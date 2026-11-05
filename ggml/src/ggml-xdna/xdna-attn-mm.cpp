@@ -19,7 +19,6 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 // Host side of kernels/attn_mm.py. Three arguments:
@@ -103,43 +102,25 @@ int kv_col(int s) {
     return 4 * (s / 2) + s % 2;
 }
 
-// A layer's K/V in the tile layout, kept across ubatches: within a sequence
-// the cache only grows at the end, so a ubatch packs only its own rows.
+// The K/V in the tile layout, packed whole every call: a copy of the keys before a ubatch can hold a cell the cache has
+// refilled since (a freed one below them), and checking them by content costs about as much as packing them again.
 struct kv_cache {
     xdna_buffer * bo        = nullptr;
     int64_t       cap_tiles = 0;  // tiles a stream holds
-    int64_t       packed    = 0;  // keys packed
-    uint64_t      print     = 0;  // of the keys packed (kv_print)
 };
 
-// A fingerprint of keys [0, n): the rows 0 and n - 1 of both KV heads, so a
-// copy packed for another sequence - one whose later ubatches the host ran -
-// is not taken for this one's.
-uint64_t kv_print(const ggml_tensor * k, int64_t n) {
-    uint64_t h = 1469598103934665603ull;
-    for (int64_t j : { (int64_t) 0, n - 1 }) {
-        for (int g = 0; g < 2; g++) {
-            const uint16_t * r = (const uint16_t *) ((const char *) k->data + j * k->nb[1] + g * k->nb[2]);
-            for (int d = 0; d < 64; d++) {
-                h = (h ^ r[d]) * 1099511628211ull;
-            }
-        }
-    }
-    return h;
-}
-
 struct runner {
-    std::mutex                                 mtx;
-    xdna_kernel *                              kern = nullptr;
-    std::unordered_map<const void *, kv_cache> kv;
+    std::mutex                       mtx;
+    xdna_kernel *                    kern = nullptr;
+    kv_cache                         kv;  // one for every layer: the array runs one call at a time
     // the nodes whose output stays in their output buffer (xdna_attn_mm_keep),
     // and the last such run's
-    std::vector<const ggml_tensor *>           keep;
-    const ggml_tensor *                        kept      = nullptr;
-    xdna_buffer *                              kept_bo   = nullptr;
-    xdna_kernel_pool *                         kept_pool = nullptr;
-    size_t                                     kept_col  = 0;
-    int64_t                                    kept_tok  = 0;
+    std::vector<const ggml_tensor *> keep;
+    const ggml_tensor *              kept      = nullptr;
+    xdna_buffer *                    kept_bo   = nullptr;
+    xdna_kernel_pool *               kept_pool = nullptr;
+    size_t                           kept_col  = 0;
+    int64_t                          kept_tok  = 0;
 };
 
 runner g_am;
@@ -338,19 +319,17 @@ std::vector<uint32_t> build_seq(const std::vector<pass_tiles> & passes, int64_t 
     return xdna_seq_build(&seq);
 }
 
-// Keys [j0, n_kv) of both KV heads into the tile layout, whole tiles (the
-// keys of the first one before j0 again, the same values); the rest of the
-// last tile zero (finite: every query before them masks them). Rows convert
-// in vectors, then scatter into the tiles.
+// Keys [0, n_kv) of both KV heads into the tile layout, whole tiles; the
+// rest of the last tile zero (finite: every query before them masks them).
+// Rows convert in vectors, then scatter into the tiles.
 void pack_kv(const ggml_tensor * k,
              const ggml_tensor * v,
              uint16_t *          dst,
              int64_t             cap_tiles,
-             int64_t             j0,
              int64_t             n_kv) {
-    const int64_t t0 = j0 / NK, t1 = (n_kv + NK - 1) / NK;
+    const int64_t t1 = (n_kv + NK - 1) / NK;
 #pragma omp parallel for collapse(2) num_threads(xdna_chunk_threads())
-    for (int64_t t = t0; t < t1; t++) {
+    for (int64_t t = 0; t < t1; t++) {
         for (int s = 0; s < 4; s++) {
             const int            g = s / 2, h = s % 2;
             uint16_t *           o  = dst + ((size_t) s * cap_tiles + t) * KV_OBJ;
@@ -388,11 +367,10 @@ void pack_kv(const ggml_tensor * k,
     }
 }
 
-// Tiles [t0, t1) of each of the 4 K/V streams to the device.
-bool sync_kv_tiles(xdna_buffer * bo, int64_t cap_tiles, int64_t t0, int64_t t1) {
+// Tiles [0, t1) of each of the 4 K/V streams to the device.
+bool sync_kv_tiles(xdna_buffer * bo, int64_t cap_tiles, int64_t t1) {
     for (int s = 0; s < 4; s++) {
-        if (!xdna_buffer_sync_to_device_range(bo, (size_t) (t1 - t0) * KV_OBJ * 2,
-                                              ((size_t) s * cap_tiles + t0) * KV_OBJ * 2)) {
+        if (!xdna_buffer_sync_to_device_range(bo, (size_t) t1 * KV_OBJ * 2, (size_t) s * cap_tiles * KV_OBJ * 2)) {
             return false;
         }
     }
@@ -569,8 +547,6 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     const mask_rows & mr = *mrp;
     // the keys up to the last any row sees; past them llama's padding
     const int64_t     n_kv  = mr.n_kv;
-    // the keys before the ubatch's own: the cache's context
-    const int64_t     p0    = std::max<int64_t>(0, n_kv - n_tokens);
     const int         npass = (int) ((n_tokens + geo.pass - 1) / geo.pass);
 
     const std::vector<pass_tiles> passes = tiles_of_passes(mr, geo, n_tokens, npass);
@@ -583,11 +559,8 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         }
     }
 
-    // K/V: this layer's copy, grown to the last tile a pass needs; a ubatch
-    // packs its own rows, and all of them when the sequence starts over
-    kv_cache & kc = g_am.kv[k->data];
-    // a copy that ends where this ubatch starts, of this sequence's keys
-    int64_t    j0 = (p0 > 0 && kc.packed == p0 && kc.print == kv_print(k, p0)) ? p0 : 0;
+    // K/V: the copy, grown to the last tile a pass needs
+    kv_cache & kc = g_am.kv;
     if (!kc.bo || kc.cap_tiles < t_need) {
         if (kc.bo) {
             xdna_buffer_free(kc.bo);
@@ -598,24 +571,20 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
             kc.cap_tiles = 0;
             return false;
         }
-        j0 = 0;
     }
     if (!kc.bo->data) {
         return false;
     }
     uint16_t * kvh = (uint16_t *) kc.bo->data;
     // the tiles past n_kv that a pass streams are zero from the allocation
-    // or a longer earlier sequence - finite either way, and masked
-    const int64_t t0 = j0 / NK, t1 = (n_kv + NK - 1) / NK;
+    // or a longer earlier call's keys - finite either way, and masked
     {
         xdna_prof::section_timer st("prefill: attn kv pack");
-        pack_kv(k, v, kvh, kc.cap_tiles, j0, n_kv);
-        if (!sync_kv_tiles(kc.bo, kc.cap_tiles, t0, t1)) {
+        pack_kv(k, v, kvh, kc.cap_tiles, n_kv);
+        if (!sync_kv_tiles(kc.bo, kc.cap_tiles, (n_kv + NK - 1) / NK)) {
             return false;
         }
     }
-    kc.packed = n_kv;
-    kc.print  = kv_print(k, n_kv);
 
     const std::vector<uint32_t> insts = build_seq(passes, kc.cap_tiles);
     if (!xdna_kernel_bind_insts(pool->device, g_am.kern, insts.data(), insts.size())) {
@@ -678,15 +647,20 @@ void xdna_attn_mm_graph_begin(void) {
 
 void xdna_attn_mm_release(void) {
     std::lock_guard<std::mutex> lock(g_am.mtx);
-    for (auto & kv : g_am.kv) {
-        xdna_buffer_free(kv.second.bo);
+    if (g_am.kv.bo) {
+        xdna_buffer_free(g_am.kv.bo);
     }
-    g_am.kv.clear();
+    g_am.kv = kv_cache();
     if (g_am.kept_bo) {
         xdna_kernel_pool_release_buffer(g_am.kept_pool, g_am.kept_bo);
         g_am.kept_bo = nullptr;
         g_am.kept    = nullptr;
     }
+}
+
+int xdna_attn_mm_kv_copies(void) {
+    std::lock_guard<std::mutex> lock(g_am.mtx);
+    return g_am.kv.bo ? 1 : 0;
 }
 
 void xdna_attn_mm_keep_clear(void) {

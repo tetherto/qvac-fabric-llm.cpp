@@ -47,8 +47,9 @@ void xdna_attn_mm_keep(const struct ggml_tensor * node);
 bool xdna_attn_mm_rows(const struct ggml_tensor * node, struct xdna_attn_rows * rows);
 bool xdna_attn_mm_materialize(const struct ggml_tensor * node);
 
-// Drop what the route keeps across graphs: each layer's K/V copy, keyed by
-// the cache's data pointer, which does not outlive the context that owned it,
-// and the last kept output. Called with the model's last context; the next
-// prefill packs its K/V again.
+// Drop what the route keeps across graphs: the K/V copy's buffer and the last
+// kept output. Called with the model's last context.
 void xdna_attn_mm_release(void);
+
+// Test hook (ggml_backend_xdna_test_attn_kv_copies): the K/V copies the route holds.
+int xdna_attn_mm_kv_copies(void);
