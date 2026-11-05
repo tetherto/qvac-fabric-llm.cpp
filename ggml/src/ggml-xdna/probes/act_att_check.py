@@ -1,6 +1,8 @@
 # One-core check of the prologue's attention work (act-att.cc) against numpy.
 # On the bench, in the IRON env:
-#   NPU_CACHE_HOME=$(mktemp -d) python probes/act_att_check.py prep|combine|gates|row4|row8|pass
+#   NPU_CACHE_HOME=$(mktemp -d) python probes/act_att_check.py MODE
+# MODE: prep, combine, pass, or a row mode (ROW_MODES): row4|row8 (D 1024),
+# row4w|row8w (D 2048), gates|gates4w|gates8w (with the GDN gates).
 # Each mode checks its results against a tolerance and exits nonzero on a miss.
 # A fresh NPU_CACHE_HOME per kernel edit: iron.jit reuses a cached artifact.
 import hashlib
@@ -36,7 +38,7 @@ D, H, NROT = 256, 8, 64
 here = Path(__file__).resolve().parent.parent / "kernels"
 src = kernelsrc.inline((here / "gemv-q4.cc").read_text() + "\n" + (here / "act-att.cc").read_text())
 flags = ["-DK_TILE_Q4=256", "-DK_TILE_Q8=128", f"-DACT_TILE={ACT}", "-DN_CORE=64",
-         "-DQ4_GROUP=32", "-DQ8_GROUP=16", "-DGEMV_VEC=64", "-DACT_RAW=0", "-DACT_PRO=1"]
+         "-DQ4_GROUP=32", "-DQ8_GROUP=32", "-DGEMV_VEC=64", "-DACT_RAW=0", "-DACT_PRO=1"]
 obj = "tpro_" + hashlib.md5((src + str(flags)).encode()).hexdigest()[:8] + ".o"
 a_ty = np.ndarray[(AW,), np.dtype[np.int32]]
 s_ty = np.ndarray[(512,), np.dtype[np.int32]]
@@ -78,7 +80,7 @@ def pro(main: In, side: In, emit: Out, out: Out, *, NM: CompileTime[int],
 
     w = Worker(body, fn_args=[fm.cons(), fo.prod(), fs.cons(), fe.prod(), k_pro, k_cnt,
                               k_side, k_emit, Buffer(c_ty, name="cnt")], stack_size=0x1300,
-               data_size=32832)
+               data_size=33792)
 
     def seq(m_h, s_h, e_h, o_h, mi, si, eo, oo):
         mi.fill(m_h)
@@ -121,6 +123,85 @@ def rms_rope(x, g, cos, sin, eps, scale):
     y[:h] = a * cos[:h] - b * sin[:h]
     y[h:NROT] = a * sin[:h] + b * cos[:h]
     return y
+
+
+SIDE, EMIT, GATE_VALUES, N_GATES = 512, 256, 1024, 32
+# mode: (D, 8-bit codes, gates)
+ROW_MODES = {"row4": (1024, False, False), "row8": (1024, True, False),
+             "row4w": (2048, False, False), "row8w": (2048, True, False),
+             "gates": (1024, True, True), "gates4w": (2048, False, True), "gates8w": (2048, True, True)}
+
+
+def row_case(Dr, q8, gates):
+    # The layer boundary as xdna_gemv_row_act lays it out: h = acc + residual
+    # out, rms_norm(h) * gamma into the tiles of two chunks (the second a copy
+    # of the first's), and with gates x's tails from the last tile of the last
+    # chunk.
+    kt, grp = (128, 32) if q8 else (256, 32)
+    nt = Dr // kt
+    npr = Dr // GATE_VALUES
+    ng = N_GATES if gates else 0
+    eps = 1e-6
+    acc = rng.standard_normal(Dr).astype(np.float32) * 3
+    res = rng.standard_normal(Dr).astype(np.float32) * 10
+    gam = (rng.standard_normal(Dr) * 0.2 + 1).astype(np.float32)
+    main = np.zeros((2 * nt, AW), np.int32)
+    for c in range(2):
+        for k in range(nt):
+            t = main[c * nt + k]
+            t[512] = ng
+            t[513:519] = [1, fbits(eps), Dr, int(q8), k, 4]
+            t[AW - 1] = int(q8)
+            t[AW - 2] = (1 << 5) | (1 if k == nt - 1 else 0)
+            if c == 0 and k == 0:
+                t[AW - 6] = Dr // SIDE * 3
+                t[AW - 7] = Dr // EMIT
+            if gates and c == 1 and k == nt - 1:
+                t[510] = 1
+                t[AW - 6] += 1 + ng * npr
+                t[AW - 7] += 1
+    side = [acc.view(np.int32).reshape(-1, SIDE), res.view(np.int32).reshape(-1, SIDE),
+            gam.view(np.int32).reshape(-1, SIDE)]
+    if gates:
+        wab = (rng.standard_normal((ng, Dr)) * 0.05).astype(ml_dtypes.bfloat16)
+        dt = rng.standard_normal(16).astype(np.float32)
+        aa = -np.exp(rng.standard_normal(16)).astype(np.float32)
+        sc = np.float32(1 / np.sqrt(128))
+        consts = np.zeros(SIDE, np.float32)
+        consts[:16], consts[16:32], consts[32] = dt, aa, sc
+        side += [consts.view(np.int32).reshape(1, SIDE), wab.view(np.int32).reshape(-1, SIDE)]
+    e, o = run(main, np.concatenate(side), Dr // EMIT + (1 if gates else 0))
+    h = acc + res
+    hd = e[:Dr].view(np.float32)
+    ulp = np.abs(hd.view(np.int32).astype(np.int64) - h.view(np.int32).astype(np.int64))
+    print(f"D {Dr}: h exact:", np.array_equal(hd, h), "max ulps", ulp.max(), "differing", (ulp > 0).sum(),
+          "max rel", (np.abs(hd - h) / np.abs(h)).max())
+    check("h", np.all(np.isfinite(hd)) and (np.abs(hd - h) / np.abs(h)).max() < 1e-5)
+    x = (h / np.sqrt(np.mean(h.astype(np.float64) ** 2) + eps) * gam).astype(np.float32)
+    g = x.reshape(-1, grp)
+    dq = np.where(np.abs(g).max(1) > 0, np.abs(g).max(1) / 127, 1).astype(np.float32)
+    qref = np.clip(np.rint(g / dq[:, None]), -127, 127).astype(np.int8).reshape(-1)
+    for c in range(2):
+        codes = np.concatenate([o[c * nt + k].view(np.int8)[:kt] for k in range(nt)])
+        gd = np.concatenate([o[c * nt + k].view(np.float32)[kt // 4 + kt // grp: kt // 4 + 2 * (kt // grp)]
+                             for k in range(nt)])
+        off = np.abs(codes.astype(int) - qref).max()
+        print(f"chunk {c}: codes off by at most {off}, scale rel {np.abs(gd / dq - 1).max():.1e}, "
+              f"flags {o[c * nt + nt - 1, AW - 2]}")
+        check(f"chunk {c} codes", off <= 1)
+        check(f"chunk {c} scale", np.abs(gd / dq - 1).max() < 1e-5)
+    if gates:
+        ab = wab.astype(np.float32) @ x.astype(ml_dtypes.bfloat16).astype(np.float32)
+        z = ab[:16] + dt
+        sp = np.where(z > 20, z, np.log1p(np.exp(z)))
+        eg = np.exp(sp * aa)
+        b = 1 / (1 + np.exp(-ab[16:]))
+        tl = e[Dr:Dr + 48].view(np.float32).reshape(16, 3)
+        print("gates: eg rel", np.abs(tl[:, 0] / eg - 1).max(), "beta rel", np.abs(tl[:, 1] / b - 1).max(),
+              "scale", tl[0, 2], sc)
+        check("gates eg", np.abs(tl[:, 0] / eg - 1).max() < 1e-3)
+        check("gates beta", np.abs(tl[:, 1] / b - 1).max() < 1e-3)
+        check("gates scale", np.all(tl[:, 2] == sc))
 
 
 if MODE == "prep":
@@ -232,92 +313,8 @@ elif MODE == "combine":
     print(f"vs the reference quantized the same way: rel {np.linalg.norm(got - qref) / np.linalg.norm(qref):.3e}, "
           f"codes differing {(np.abs(got - qref) > 1e-6 * np.abs(qref).max()).sum()} of 2048")
 
-elif MODE == "gates":
-    # a GDN in-projection's row: the gates' dot products and x's tails
-    Dr, kt, grp = 1024, 128, 16
-    nt = Dr // kt
-    eps = 1e-6
-    acc = rng.standard_normal(Dr).astype(np.float32) * 3
-    res = rng.standard_normal(Dr).astype(np.float32) * 10
-    gam = (rng.standard_normal(Dr) * 0.2 + 1).astype(np.float32)
-    wab = (rng.standard_normal((32, Dr)) * 0.05).astype(ml_dtypes.bfloat16)
-    dt = rng.standard_normal(16).astype(np.float32)
-    aa = -np.exp(rng.standard_normal(16)).astype(np.float32)
-    sc = np.float32(1 / np.sqrt(128))
-    consts = np.zeros(512, np.float32)
-    consts[:16], consts[16:32], consts[32] = dt, aa, sc
-    main = np.zeros((nt, AW), np.int32)
-    for k in range(nt):
-        t = main[k]
-        t[512] = 32
-        t[513:519] = [1, fbits(eps), Dr, 1, k, 4]
-        t[AW - 1] = 1
-        t[AW - 2] = 1 << 5
-        t[AW - 6] = 6 if k == 0 else 0
-        t[AW - 7] = 4 if k == 0 else 0
-        if k == nt - 1:          # the gates on the last tile
-            t[510] = 1
-            t[AW - 6] += 33
-            t[AW - 7] += 1
-    side = np.concatenate([acc.view(np.int32).reshape(2, 512), res.view(np.int32).reshape(2, 512),
-                           gam.view(np.int32).reshape(2, 512), consts.view(np.int32).reshape(1, 512),
-                           wab.view(np.int32).reshape(32, 512)])
-    e, o = run(main, side, 5)
-    h = acc + res
-    x = (h / np.sqrt(np.mean(h.astype(np.float64) ** 2) + eps) * gam).astype(np.float32)
-    ab = wab.astype(np.float32) @ x.astype(ml_dtypes.bfloat16).astype(np.float32)
-    z = ab[:16] + dt
-    sp = np.where(z > 20, z, np.log1p(np.exp(z)))
-    eg = np.exp(sp * aa)
-    b = 1 / (1 + np.exp(-ab[16:]))
-    tl = e[1024:1024 + 48].view(np.float32).reshape(16, 3)
-    print("gates: eg rel", np.abs(tl[:, 0] / eg - 1).max(), "beta rel", np.abs(tl[:, 1] / b - 1).max(),
-          "scale", tl[0, 2], sc)
-    check("gates eg", np.abs(tl[:, 0] / eg - 1).max() < 1e-3)
-    check("gates beta", np.abs(tl[:, 1] / b - 1).max() < 1e-3)
-    check("gates scale", np.all(tl[:, 2] == sc))
-
-elif MODE in ("row4", "row8"):
-    # the layer boundary: h = acc + residual out, rms_norm(h) * gamma in tiles,
-    # two chunks (the second replays from the row)
-    q8 = MODE == "row8"
-    Dr, kt, grp = 1024, (128 if q8 else 256), (16 if q8 else 32)
-    nt = Dr // kt
-    eps = 1e-6
-    acc = rng.standard_normal(Dr).astype(np.float32) * 3
-    res = rng.standard_normal(Dr).astype(np.float32) * 10
-    gam = (rng.standard_normal(Dr) * 0.2 + 1).astype(np.float32)
-    main = np.zeros((2 * nt, AW), np.int32)
-    for c in range(2):
-        for k in range(nt):
-            t = main[c * nt + k]
-            t[513:519] = [1, fbits(eps), Dr, 1 if q8 else 0, k, 4]
-            t[AW - 1] = 1 if q8 else 0
-            t[AW - 2] = (1 << 5) | (1 if k == nt - 1 else 0)
-            t[AW - 6] = 6 if (c == 0 and k == 0) else 0
-            t[AW - 7] = 4 if (c == 0 and k == 0) else 0
-    side = np.concatenate([acc.view(np.int32).reshape(2, 512), res.view(np.int32).reshape(2, 512),
-                           gam.view(np.int32).reshape(2, 512)])
-    e, o = run(main, side, 4)
-    h = acc + res
-    hd = e[:1024].view(np.float32)
-    ulp = np.abs(hd.view(np.int32).astype(np.int64) - h.view(np.int32).astype(np.int64))
-    print("h exact:", np.array_equal(hd, h), "max ulps", ulp.max(), "differing", (ulp > 0).sum(),
-          "max rel", (np.abs(hd - h) / np.abs(h)).max())
-    check("h", np.all(np.isfinite(hd)) and (np.abs(hd - h) / np.abs(h)).max() < 1e-5)
-    x = (h / np.sqrt(np.mean(h.astype(np.float64) ** 2) + eps) * gam).astype(np.float32)
-    g = x.reshape(-1, grp)
-    dq = np.where(np.abs(g).max(1) > 0, np.abs(g).max(1) / 127, 1).astype(np.float32)
-    qref = np.clip(np.rint(g / dq[:, None]), -127, 127).astype(np.int8).reshape(-1)
-    worst = 0
-    for c in range(2):
-        codes = np.concatenate([o[c * nt + k].view(np.int8)[:kt] for k in range(nt)])
-        gd = np.concatenate([o[c * nt + k].view(np.float32)[kt // 4 + kt // grp: kt // 4 + 2 * (kt // grp)] for k in range(nt)])
-        worst = max(worst, np.abs(codes.astype(int) - qref).max())
-        print(f"chunk {c}: codes off by at most {np.abs(codes.astype(int) - qref).max()}, "
-              f"scale rel {np.abs(gd / dq - 1).max():.1e}, flags {o[c * nt + nt - 1, AW - 2]}")
-        check(f"chunk {c} codes", np.abs(codes.astype(int) - qref).max() <= 1)
-        check(f"chunk {c} scale", np.abs(gd / dq - 1).max() < 1e-5)
+elif MODE in ROW_MODES:
+    row_case(*ROW_MODES[MODE])
 
 else:
     # a tile without bit 5 passes through untouched
