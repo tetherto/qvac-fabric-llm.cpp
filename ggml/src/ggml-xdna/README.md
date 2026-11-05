@@ -674,10 +674,19 @@ Diagnostics - nothing is measured unless they are set:
   their buffers and have not been tried under the shim. The in-place pgemm
   output has no loss detection; audits of it found no loss, with and without the
   shim, but its buffer layout under the shim was not classified.
-- The fused decode layer is written around one geometry - 6144 conv channels,
-  16 value heads of 128, a 262144-float recurrent state, a residual width of
-  at most 2048 - and the designs are compiled for it, so another GDN model
-  needs the designs rebuilt and the constants in `xdna-rec.h` revisited.
+- The fused decode layer is written around one family of geometries - 16 q/k
+  groups of 128, 16 or 32 value heads of 128 (6144 or 8192 conv channels; the
+  core runs once per 16 value heads, on a 262144-float recurrent state each
+  time), a residual width that is a multiple of 512 up to 4096 - and the
+  designs are compiled for it, so another GDN model needs the designs rebuilt
+  and the constants in `xdna-rec.h` revisited.
+- The prefill gated delta rule forms a chunk's decay factors as two powers of
+  two about the chunk's middle token, which hold a decay of 2^126 across half a
+  chunk. A chunk that decays faster has its gates floored at -10.4 (natural
+  log, a decay of 3e-5 a token) before it goes to the array, and that head's
+  output then differs from the host's by about 3e-5 relative. On the test
+  prompt this touches only layer 8 head 15 of the 4B and the 9B; every other
+  chunk runs as before.
 - The host-built instruction streams and the RTP/shim constants follow the
   mlir-aie placement. The design tag does not cover the toolchain version, so a
   toolchain bump has to be paired with re-reading those constants.

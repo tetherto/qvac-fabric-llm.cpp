@@ -321,8 +321,20 @@ struct xdna_attn_gdn_geom {
     int conv_cols         = 2;   // conv columns (cols 0-1)
     int norm_cols         = 2;   // norm columns (cols 2-3)
     int gdn_cols          = 4;   // gdn columns (cols 4-7)
-    int n_vh              = 16;  // value heads
+    int n_vh              = 16;  // value heads a pass
     int n_obj             = 8;   // pkv chunks per head
+    // The conv stage covers every group of the layer once: n_kg q groups,
+    // n_kg k groups, then one a value head (n_block in all), each into its
+    // head's x slot. A layer with more value heads than n_vh runs the other
+    // stages once per n_vh of them (a pass) over its own x slots, state and
+    // azg heads, from head0.
+    int n_kg              = 16;
+    int head0             = 0;
+    // Where a pass's heads find their q and k when not in their own x slots:
+    // head head0 + i reads them from slot qk_head0 + i (-1: its own slot).
+    int qk_head0          = -1;
+    int conv_stage        = 1;
+    int core_stage        = 1;  // norm, gdn and gated
     // Shim streams the gdn state is split across, in each direction. The
     // block's cost is that stream: 512 KB in and 512 KB out a layer, which one
     // channel moves in 119 us with the arithmetic hidden underneath.

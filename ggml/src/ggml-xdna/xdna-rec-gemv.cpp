@@ -86,6 +86,19 @@ bool xdna_rec_inproj_pack(const struct ggml_tensor * w_qkv, const struct ggml_te
     return xdna_gemv_pack_weights(g, ws, 2, colmap.data(), out.packed);
 }
 
+bool xdna_rec_inproj_pack_one(const struct ggml_tensor * w, xdna_gemv_geom & geom, std::vector<uint8_t> & packed) {
+    if (!w) {
+        return false;
+    }
+    const xdna_gemv_geom g = xdna_gemv_variant(xdna_gemv_type_of(w), w->ne[0], w->ne[1], false, XDNA_GEMV_SPLIT_FUSED);
+    // no padded columns: each stream drains into the core's inputs as it is
+    if (!g.valid() || g.N != w->ne[1] || g.chunk() != xdna_gemv_out_streams(g) * xdna_gemv_stream_floats(g)) {
+        return false;
+    }
+    geom = g;
+    return xdna_gemv_pack_weights(g, &w, 1, nullptr, packed);
+}
+
 xdna_rec_gemv * xdna_rec_gemv_create(xdna_kernel_pool *         pool,
                                      const struct ggml_tensor * w_so,
                                      const struct ggml_tensor * w_gate,
