@@ -103,6 +103,10 @@
 // given a C buffer whose every line the host left dirty, as a pool buffer's
 // last holder can, still matches: no host line lands over what the array wrote.
 //
+// GGML_XDNA_PGEMM_GLU_X=1: a fused call's layout, GLU_X's and a SwiGLU's into
+// down's A, left dirty with NaN before the array writes it and written back
+// after, still matches: the call flushes it before the dispatch.
+//
 // Every intermediate is cleared before each backend runs, so a node read
 // before it was written shows as zeros instead of as the other backend's
 // result. Skips (exit 0) when no XDNA device is registered.
@@ -2407,6 +2411,192 @@ static bool test_row_layers(ggml_backend_t npu, ggml_backend_t cpu) {
     return passed;
 }
 
+// EmbeddingGemma 2's per-layer input gate, per_layer_proj(gelu(inp_gate pe) * x) with x one layer's view of the
+// per-layer inputs [dim, tokens, layers] (the last layer's through a GET_ROWS): with GGML_XDNA_PGEMM_GLU_X=1 the
+// merged design runs the gate's GEMM with x as the accumulator's up half, into per_layer_proj's A
+static const int64_t GLUX_DIM    = 512;
+static const int64_t GLUX_LAYERS = 3;
+static const float   GLUX_ACT    = 0.3f;
+static const double  GLUX_TOL    = 3e-3;
+
+struct glux_case {
+    const char * name;
+    int64_t      tokens;
+    int64_t      layer;
+    bool         get_rows;  // x's rows reversed through a GET_ROWS
+    bool         on;
+};
+
+struct glux_graph {
+    norm_graph    g;
+    ggml_tensor * ids = nullptr;
+};
+
+static glux_graph build_glux(ggml_backend_t be, const glux_case & c) {
+    glux_graph       gg;
+    norm_graph &     g  = gg.g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.act_scale         = GLUX_ACT;
+    ggml_tensor * pe    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, GLUX_DIM, c.tokens);
+    ggml_tensor * per   = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, GLUX_DIM, c.tokens, GLUX_LAYERS);
+    ggml_tensor * wg    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, GLUX_DIM, GLUX_DIM);
+    ggml_tensor * wp    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, GLUX_DIM, GLUX_DIM);
+    g.inputs            = { pe, per, wg, wp };
+    ggml_tensor * x     = ggml_view_2d(g.ctx, per, GLUX_DIM, c.tokens, per->nb[1], c.layer * per->nb[2]);
+    if (c.get_rows) {
+        gg.ids = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, c.tokens);
+        x      = ggml_get_rows(g.ctx, x, gg.ids);
+    }
+    ggml_tensor * gate = ggml_gelu(g.ctx, ggml_mul_mat(g.ctx, wg, pe));
+    ggml_tensor * out  = ggml_mul_mat(g.ctx, wp, ggml_mul(g.ctx, gate, x));
+    ggml_set_name(out, "per_layer_proj");
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return gg;
+}
+
+static void set_reversed_rows(ggml_tensor * ids) {
+    std::vector<int32_t> r(ggml_nelements(ids));
+    for (size_t i = 0; i < r.size(); i++) {
+        r[i] = (int32_t) (r.size() - 1 - i);
+    }
+    ggml_backend_tensor_set(ids, r.data(), 0, ggml_nbytes(ids));
+}
+
+static bool run_glux(glux_graph & gg, ggml_backend_t be, std::vector<float> & res) {
+    ggml_backend_buffer_clear(gg.g.buf, 0);
+    set_inputs(gg.g, 1234);
+    if (gg.ids) {
+        set_reversed_rows(gg.ids);
+    }
+    if (ggml_backend_graph_compute(be, gg.g.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    res = get_f32(gg.g.checked[0]);
+    return true;
+}
+
+static void free_glux(glux_graph & gg) {
+    ggml_backend_buffer_free(gg.g.buf);
+    ggml_free(gg.g.ctx);
+}
+
+typedef int (*glux_count_fn)(void);
+
+static bool test_glux(ggml_backend_t npu, ggml_backend_t cpu, glux_count_fn runs, const glux_case & c) {
+    glux_graph         want_g = build_glux(cpu, c);
+    glux_graph         got_g  = build_glux(npu, c);
+    std::vector<float> want, got;
+    setenv("GGML_XDNA_PGEMM_GLU_X", c.on ? "1" : "0", 1);
+    const int  before = runs();
+    const bool ok     = run_glux(want_g, cpu, want) && run_glux(got_g, npu, got);
+    const int  fired  = runs() - before;
+    unsetenv("GGML_XDNA_PGEMM_GLU_X");
+    const int    expect = c.on && pfx_loaded() ? 1 : 0;
+    const double e      = ok ? nmse(want, got) : INFINITY;
+    const bool   passed = ok && e < GLUX_TOL && fired == expect;
+    std::printf("GLU_X %-12s T %-4lld layer %lld%s switch %d nmse %.3g, %d of %d runs %s\n", c.name, (long long) c.tokens,
+                (long long) c.layer, c.get_rows ? " rows" : "", c.on ? 1 : 0, e, fired, expect, passed ? "ok" : "FAIL");
+    free_glux(want_g);
+    free_glux(got_g);
+    return passed;
+}
+
+static bool test_glux_cases(ggml_backend_t npu, ggml_backend_t cpu) {
+    auto runs = (glux_count_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_glux_count");
+    if (!runs) {
+        std::printf("test-xdna-graph: the backend has no GLU_X count\n");
+        return false;
+    }
+    // one block (its x all from the tail), whole blocks, a short last one, the model's 912 at the end of the inputs
+    // and through a GET_ROWS, 17 blocks in two slabs, and the switch off
+    const glux_case cases[] = {
+        // name         tokens layer rows   on
+        { "one block",     15, 2, false, true  },
+        { "whole block",  128, 1, false, true  },
+        { "two blocks",   200, 2, false, true  },
+        { "912",          912, 2, false, true  },
+        { "912 get_rows", 912, 2, true,  true  },
+        { "two slabs",   2100, 0, false, true  },
+        { "switch off",   912, 1, false, false },
+    };
+    bool passed = true;
+    for (const glux_case & c : cases) {
+        passed = test_glux(npu, cpu, runs, c) && passed;
+    }
+    return passed;
+}
+
+// With GGML_XDNA_PGEMM_GLU_X=1, the fused layout of a GLU_X call and of a SwiGLU into down's A, filled with NaN and left
+// dirty before its flush, then landed after the array wrote it ("pgemm-fused"): without the flush the next projection
+// reads the NaN. Only the merged design's route takes GLU_X and so flushes; elsewhere nothing is filled.
+static const int64_t DIRTY_FUSED_TOKENS = 2100;  // two slabs
+static const int64_t DIRTY_FUSED_FFN    = 2048;
+static const float   DIRTY_FUSED_SCALE  = 0.3f;
+static const double  DIRTY_FUSED_TOL    = 3e-3;  // the GLU cases' bound
+
+static bool dirty_fused_ok(const char *               call,
+                           int                        filled,
+                           const std::vector<float> & want,
+                           const std::vector<float> & got) {
+    const int    expect = pfx_loaded() ? 1 : 0;
+    const double e      = filled >= 0 ? nmse(want, got) : INFINITY;
+    const bool   ok     = filled == expect && e < DIRTY_FUSED_TOL;
+    std::printf("dirty fused layout, %-6s %d of %d filled, nmse %.3g %s\n", call, filled, expect, e,
+                ok ? "ok" : "FAIL");
+    return ok;
+}
+
+static bool dirty_fused_glux(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu) {
+    const glux_case    c      = { "dirty", DIRTY_FUSED_TOKENS, 1, false, true };
+    glux_graph         want_g = build_glux(cpu, c);
+    glux_graph         got_g  = build_glux(npu, c);
+    std::vector<float> want, got;
+    const bool         computed = run_glux(want_g, cpu, want);
+    const int          filled = dirtied_run(dirty, "pgemm-fused", computed, [&] { return run_glux(got_g, npu, got); });
+    const bool         ok     = dirty_fused_ok("GLU_X", filled, want, got);
+    free_glux(want_g);
+    free_glux(got_g);
+    return ok;
+}
+
+static bool dirty_fused_swiglu(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu) {
+    norm_graph want_g =
+        build_ffn(cpu, GGML_GLU_OP_SWIGLU, false, GLUX_DIM, DIRTY_FUSED_FFN, DIRTY_FUSED_TOKENS, DIRTY_FUSED_SCALE);
+    norm_graph got_g =
+        build_ffn(npu, GGML_GLU_OP_SWIGLU, false, GLUX_DIM, DIRTY_FUSED_FFN, DIRTY_FUSED_TOKENS, DIRTY_FUSED_SCALE);
+    std::vector<std::vector<float>> want, got;
+    const bool                      computed = run(want_g, cpu, want);
+    const int  filled = dirtied_run(dirty, "pgemm-fused", computed, [&] { return run(got_g, npu, got); });
+    const bool ok     = dirty_fused_ok("SwiGLU", filled, filled >= 0 ? want[0] : std::vector<float>(),
+                                       filled >= 0 ? got[0] : std::vector<float>());
+    free_graph(want_g);
+    free_graph(got_g);
+    return ok;
+}
+
+static bool test_dirty_fused(ggml_backend_t npu, ggml_backend_t cpu) {
+    auto dirty = (dirty_output_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_dirty_output");
+    if (!dirty) {
+        std::printf("test-xdna-graph: the backend has no dirty-output hook\n");
+        return false;
+    }
+    setenv("GGML_XDNA_PGEMM_GLU_X", "1", 1);
+    setenv("GGML_XDNA_PGEMM_HOST", "0", 1);
+    setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
+    bool passed = dirty_fused_glux(dirty, npu, cpu);
+    passed      = dirty_fused_swiglu(dirty, npu, cpu) && passed;
+    unsetenv("GGML_XDNA_PGEMM_GLU_X");
+    unsetenv("GGML_XDNA_PGEMM_HOST");
+    unsetenv("GGML_XDNA_HOST_CHUNK");
+    return passed;
+}
+
 int main(void) {
     // read once a process: the vocabulary projection of test_dirty_outputs on the array; no other case names one
     setenv("GGML_XDNA_HEAD", "1", 1);
@@ -2685,6 +2875,7 @@ int main(void) {
     }
 
     passed = check_cropped_ffn(cpu, npu, ggml_backend_dev_buffer_type(dev), tol) && passed;
+    passed = test_glux_cases(npu, cpu) && passed;
 
     // a new backend context drops the weights the earlier cases packed
     ggml_backend_free(npu);
@@ -2697,6 +2888,7 @@ int main(void) {
     passed = npu != nullptr && test_group_order_after_host_plan(npu, cpu) && passed;
     passed = test_chunk_plan_after_decode(dev, cpu) && passed;
     passed = npu != nullptr && test_dirty_outputs(npu, cpu, ggml_backend_dev_buffer_type(dev), tol) && passed;
+    passed = npu != nullptr && test_dirty_fused(npu, cpu) && passed;
 
     ggml_backend_free(npu);
     ggml_backend_free(cpu);
