@@ -606,9 +606,16 @@ size_t inproj_w_end(const xdna_rec_core * core) {
     return core->z_split ? core->z_w_off + core->z_geom.weight_bytes() : core->in_w_off + core->in_geom.weight_bytes();
 }
 
+// Whether z takes qkv's row from the prologue's cache: both halves have to
+// quantize it alike, so their tiles are the same.
+bool z_reuses_row(const xdna_rec_core * core) {
+    return core->gates && core->z_split && core->in_geom.fmt == core->z_geom.fmt &&
+           core->in_geom.k_tile() == core->z_geom.k_tile();
+}
+
 // An in-projection's prologue: h = F + A into H, rms_norm(h) * gamma into its
 // tiles and, with the gates, x's tails of NVH heads - the first ones, or with
-// `hi` the next ones (ab_hi).
+// `hi` the next ones (ab_hi), which only send the gates when z_reuses_row.
 void build_row_in(const xdna_rec_core * core, xdna_seq * seq, bool hi) {
     using namespace xdna_rec_pack;
     if (!core->gates) {
@@ -618,9 +625,14 @@ void build_row_in(const xdna_rec_core * core, xdna_seq * seq, bool hi) {
     const std::vector<uint8_t> & ab  = hi ? core->ab_hi : core->ab;
     const size_t                 off = hi ? core->ab_hi_off : core->ab_off;
     const int                    h0  = hi ? NVH : 0;
+    const uint32_t               x0  = (uint32_t) ((h0 * HEADNORM + 3 * SV) * 4);
+    if (hi && z_reuses_row(core)) {
+        xdna_seq_row_gates(seq, 6, (uint32_t) off, (uint32_t) (ab.size() / 4), 1, x0, (uint32_t) HEADNORM,
+                           (uint32_t) NVH);
+        return;
+    }
     xdna_seq_row_io_gates(seq, core->d, 9, XDNA_RES_F, XDNA_RES_A, 7, (uint32_t) core->g_attn_off, XDNA_RES_H, 6,
-                          (uint32_t) off, (uint32_t) (ab.size() / 4), 1, (uint32_t) ((h0 * HEADNORM + 3 * SV) * 4),
-                          (uint32_t) HEADNORM, (uint32_t) NVH);
+                          (uint32_t) off, (uint32_t) (ab.size() / 4), 1, x0, (uint32_t) HEADNORM, (uint32_t) NVH);
 }
 
 }  // namespace
@@ -719,6 +731,7 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool, xdna_g
         }
         if (core->z_split) {
             // z and the second half of the gates behind their own prologue
+            // pass, which sends only the gates when z_reuses_row
             build_row_in(core, &head, true);
             if (!build_inproj_z(core, &head)) {
                 GGML_LOG_ERROR("%s: in-projection z: stream build failed\n", "xdna-rec");
@@ -955,8 +968,8 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool, xdna_g
             uint8_t * a7m       = (uint8_t *) core->a7->data;
             const int gate_rows = core->gates ? 2 * xdna_rec_pack::NVH : 0;
             if (!xdna_gemv_row_act(core->in_geom, a7m + core->in_a_off, core->eps_attn, true, 0, gate_rows) ||
-                (core->z_split &&
-                 !xdna_gemv_row_act(core->z_geom, a7m + core->z_a_off, core->eps_attn, true, 0, gate_rows)) ||
+                (core->z_split && !xdna_gemv_row_act(core->z_geom, a7m + core->z_a_off, core->eps_attn, true, 0,
+                                                     gate_rows, z_reuses_row(core))) ||
                 !xdna_gemv_row_act(ffn->g1, (uint8_t *) ffn->a->data, core->eps_post, true,
                                    xdna_gemv_pair_last_flags(ffn))) {
                 GGML_LOG_ERROR("%s: the fused row activation tiles do not build\n", "xdna-rec");

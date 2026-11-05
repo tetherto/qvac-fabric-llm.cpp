@@ -1392,6 +1392,19 @@ void xdna_seq_row_io(xdna_seq * seq,
     xdna_seq_push_queue(seq, ECOL, 0, EBD, xdna_dma_dir::S2MM, ECH, true, 0);
 }
 
+// x's tails: 3 words a head, and the object's rest one head-set further on
+// each time, past x
+static void tails_bd(xdna_bd & bt, uint32_t x_off, uint32_t x_stride, uint32_t x_heads) {
+    bt.buf_len   = 256;
+    bt.buf_off   = x_off;
+    bt.d0_size   = 3;
+    bt.d0_stride = 1;
+    bt.d1_size   = x_heads;
+    bt.d1_stride = x_stride;
+    bt.d2_stride = x_stride * x_heads;
+    bt.ax_cache  = 2;
+}
+
 void xdna_seq_row_io_gates(xdna_seq * seq,
                            int        d,
                            int        res_arg,
@@ -1421,16 +1434,7 @@ void xdna_seq_row_io_gates(xdna_seq * seq,
     bh.use_next  = true;
     bg.next_bd   = SBD + 3;
     bg.use_next  = true;
-    // the tails: 3 words a head, and the object's rest one head-set further
-    // on each time, past x
-    bt.buf_len   = 256;
-    bt.buf_off   = x_off;
-    bt.d0_size   = 3;
-    bt.d0_stride = 1;
-    bt.d1_size   = x_heads;
-    bt.d1_stride = x_stride;
-    bt.d2_stride = x_stride * x_heads;
-    bt.ax_cache  = 2;
+    tails_bd(bt, x_off, x_stride, x_heads);
     be.next_bd   = EBD + 1;
     be.use_next  = true;
     xdna_seq_blockwrite(seq, SCOL, 0, SBD, &ba);
@@ -1451,6 +1455,28 @@ void xdna_seq_row_io_gates(xdna_seq * seq,
     xdna_seq_push_queue(seq, ECOL, 0, EBD, xdna_dma_dir::S2MM, ECH, true, 0);
 }
 
+void xdna_seq_row_gates(xdna_seq * seq,
+                        int        ab_arg,
+                        uint32_t   ab_off,
+                        uint32_t   ab_words,
+                        int        x_arg,
+                        uint32_t   x_off,
+                        uint32_t   x_stride,
+                        uint32_t   x_heads) {
+    constexpr uint32_t SCOL = 6, SCH = 1, ECOL = 5, ECH = 0, SBD = 11, EBD = 14;
+    xdna_bd            bw, bt;
+    contig_bd(bw, (size_t) ab_words * 4, ab_off);
+    tails_bd(bt, x_off, x_stride, x_heads);
+    xdna_seq_blockwrite(seq, SCOL, 0, SBD, &bw);
+    xdna_seq_ddr_patch(seq, SCOL, 0, SBD, ab_arg, bw.buf_off);
+    xdna_seq_issue_token(seq, SCOL, 0, xdna_dma_dir::MM2S, SCH, 0xF);
+    xdna_seq_push_queue(seq, SCOL, 0, SBD, xdna_dma_dir::MM2S, SCH, true, 0);
+    xdna_seq_blockwrite(seq, ECOL, 0, EBD, &bt);
+    xdna_seq_ddr_patch(seq, ECOL, 0, EBD, x_arg, bt.buf_off);
+    xdna_seq_issue_token(seq, ECOL, 0, xdna_dma_dir::S2MM, ECH, 0xF);
+    xdna_seq_push_queue(seq, ECOL, 0, EBD, xdna_dma_dir::S2MM, ECH, true, 0);
+}
+
 void xdna_seq_row_wait(xdna_seq * seq) {
     xdna_seq_wait_token(seq, 6, 0, xdna_dma_dir::MM2S, 1);
     xdna_seq_wait_token(seq, 5, 0, xdna_dma_dir::S2MM, 0);
@@ -1460,7 +1486,13 @@ int32_t xdna_gemv_pair_last_flags(const xdna_gemv_pair * p) {
     return pair_last_flags(p);
 }
 
-bool xdna_gemv_row_act(const xdna_gemv_geom & geom, uint8_t * dst, float eps, bool res, int32_t last_flags, int gates) {
+bool xdna_gemv_row_act(const xdna_gemv_geom & geom,
+                       uint8_t *              dst,
+                       float                  eps,
+                       bool                   res,
+                       int32_t                last_flags,
+                       int                    gates,
+                       bool                   reuse_row) {
     constexpr int AW = XDNA_GEMV_ACT_TILE / 4;
     const int     nt = geom.n_tiles();
     const int     D  = geom.K;
@@ -1487,7 +1519,7 @@ bool xdna_gemv_row_act(const xdna_gemv_geom & geom, uint8_t * dst, float eps, bo
             t[518]      = 4;
             t[AW - 1]   = fmt_word;
             t[AW - 2]   = (1 << 5) | (k == nt - 1 ? last_flags : 0);
-            if (c == 0 && k == 0) {
+            if (c == 0 && k == 0 && !reuse_row) {
                 t[AW - 6] = D / XDNA_ROW_SIDE_FLOATS * (res ? 3 : 2);
                 t[AW - 7] = D / XDNA_ROW_EMIT_FLOATS;
             }
