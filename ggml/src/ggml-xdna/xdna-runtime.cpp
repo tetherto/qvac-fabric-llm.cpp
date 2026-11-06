@@ -82,6 +82,10 @@ xdna_device * xdna_device_open(void) {
         GGML_LOG_ERROR("%s: failed to open NPU device: %s\n", "xdna-runtime", e.what());
         delete dev;
         return nullptr;
+    } catch (...) {
+        GGML_LOG_ERROR("%s: failed to open NPU device: unknown exception\n", "xdna-runtime");
+        delete dev;
+        return nullptr;
     }
     return dev;
 }
