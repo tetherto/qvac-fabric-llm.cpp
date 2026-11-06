@@ -15,6 +15,13 @@
 // restore writes cache rows below the ones that decode left on the device, and
 // a test hook keeps them stale in memory until a flush. Its logits after every
 // token are compared with a CPU-only run of the same steps, fed its tokens.
+//
+// Then two sequences in one unified cache, as llama-server's default slots:
+// the first from cell 0, whose decode attention reads the identity K/V row
+// list the fused attention layer takes; the second in the cells after the
+// first's; and the first again, past the second's cells. The fused layer has
+// to leave those two lists to the host. Each step's logits are compared with
+// a CPU-only run fed the same tokens.
 #include "llama.h"
 
 #include <algorithm>
@@ -35,13 +42,16 @@ static ggml_backend_dev_t xdna_device(void) {
     return nullptr;
 }
 
-static llama_token greedy(llama_context * ctx, int nv) {
-    const float * l = llama_get_logits_ith(ctx, -1);
-    llama_token   b = 0;
+static llama_token greedy_of(const float * l, int nv) {
+    llama_token b = 0;
     for (llama_token t = 1; t < nv; t++) {
         b = l[t] > l[b] ? t : b;
     }
     return b;
+}
+
+static llama_token greedy(llama_context * ctx, int nv) {
+    return greedy_of(llama_get_logits_ith(ctx, -1), nv);
 }
 
 static std::vector<llama_token> gen(llama_context * ctx, int nv, int n) {
@@ -195,11 +205,14 @@ static bool same_logits(const char * what, const trace & want, const trace & got
     return bad == 0 && worst < tol;
 }
 
+// The weights stay as the XDNA backend's host ops read them: the CPU's repacked kernels round differently, which
+// moved one 9B decode step 0.17 nmse away from both the unpacked CPU and the NPU.
 static llama_model * load_on_cpu(const char * model_path) {
     llama_model_params mp      = llama_model_default_params();
     ggml_backend_dev_t none[1] = { nullptr };
     mp.devices                 = none;
     mp.n_gpu_layers            = 0;
+    mp.use_extra_bufts         = false;
     llama_model * cpu          = llama_model_load_from_file(model_path, mp);
     if (!cpu) {
         std::printf("the CPU-only model did not load\n");
@@ -221,6 +234,169 @@ static bool check_restore_longer(llama_model * model, const char * model_path, c
         llama_model_free(cpu);
     }
     return ok && left == 1;
+}
+
+constexpr int    UNIFIED_PROMPT_TOKENS = 40;
+constexpr int    UNIFIED_FIRST_STEPS   = 8;   // sequence 0 from cell 0: its K/V row list is the identity
+constexpr int    UNIFIED_SECOND_STEPS  = 16;  // sequence 1 in the cells after sequence 0's: a shifted list
+constexpr int    UNIFIED_RESUME_STEPS  = 4;   // sequence 0 again, past sequence 1's cells: a list with a gap
+constexpr int    UNIFIED_SEQS          = 2;
+constexpr int    UNIFIED_CTX           = 1024;
+constexpr double UNIFIED_NMSE_MAX      = 5e-2;  // the 4B reaches 0.028; a list the NPU ignores, 0.55 and more
+constexpr char   KV_ROWS_ON[]          = "Flash Attention over K/V rows enabled";
+constexpr char   LAYER_BINDS[]         = "xdna-att-layer: layer ";
+constexpr char   PROMPT_A[] = "A gated delta net layer keeps a recurrent state that it updates with every token. ";
+constexpr char   PROMPT_B[] = "The lighthouse keeper wrote down every ship that passed during the long winter. ";
+
+// What llama and the backend log while the unified-cache run goes: the row-list line, the fused attention layer's
+// binds while sequence 0 decodes from cell 0, and any error.
+struct unified_log {
+    bool rows_on     = false;
+    bool in_first    = false;
+    int  layer_binds = 0;
+    int  errors      = 0;
+};
+
+static void on_unified_log(ggml_log_level level, const char * text, void * ud) {
+    unified_log * st = (unified_log *) ud;
+    st->rows_on      = st->rows_on || std::strstr(text, KV_ROWS_ON) != nullptr;
+    st->layer_binds += st->in_first && std::strstr(text, LAYER_BINDS) != nullptr;
+    st->errors += level == GGML_LOG_LEVEL_ERROR;
+    if (level >= GGML_LOG_LEVEL_WARN) {
+        std::fputs(text, stderr);
+    }
+}
+
+// A sequence of the unified cache: its id, the position its next token takes and its last logits.
+struct seq_cursor {
+    llama_seq_id       id  = 0;
+    llama_pos          pos = 0;
+    std::vector<float> logits;
+};
+
+static void fill_batch(llama_batch & b, const seq_cursor & s, const llama_token * tokens, int n) {
+    for (int i = 0; i < n; i++) {
+        b.token[i]     = tokens[i];
+        b.pos[i]       = s.pos + i;
+        b.n_seq_id[i]  = 1;
+        b.seq_id[i][0] = s.id;
+        b.logits[i]    = i == n - 1;
+    }
+    b.n_tokens = n;
+}
+
+// `n` tokens of sequence `s` in one batch at its next positions, and its logits after the last.
+static bool decode_seq(llama_context * ctx, int nv, seq_cursor & s, const llama_token * tokens, int n) {
+    llama_batch b = llama_batch_init(n, 0, 1);
+    fill_batch(b, s, tokens, n);
+    const bool ok = llama_decode(ctx, b) == 0;
+    llama_batch_free(b);
+    if (ok) {
+        const float * l = llama_get_logits_ith(ctx, -1);
+        s.logits.assign(l, l + nv);
+        s.pos += n;
+    }
+    return ok;
+}
+
+// `n` tokens of sequence `s`, the greedy pick of its last logits or the next of `forced`, each decoded on its own,
+// with the logits after it.
+static void seq_steps(llama_context *                  ctx,
+                      int                              nv,
+                      seq_cursor &                     s,
+                      int                              n,
+                      const std::vector<llama_token> * forced,
+                      trace &                          tr) {
+    const int m = forced ? std::min(n, (int) forced->size()) : n;
+    for (int i = 0; i < m; i++) {
+        const llama_token t = forced ? (*forced)[i] : greedy_of(s.logits.data(), (int) s.logits.size());
+        tr.tokens.push_back(t);
+        if (!decode_seq(ctx, nv, s, &t, 1)) {
+            return;
+        }
+        tr.logits.push_back(s.logits);
+    }
+}
+
+struct unified_traces {
+    trace first;    // sequence 0 from cell 0
+    trace second;   // sequence 1 behind sequence 0's cells
+    trace resumed;  // sequence 0 past sequence 1's cells
+};
+
+// Two sequences in one unified cache, as llama-server's default slots: sequence 0's prompt and UNIFIED_FIRST_STEPS
+// tokens from cell 0, sequence 1's prompt and UNIFIED_SECOND_STEPS tokens in the cells after them, then
+// UNIFIED_RESUME_STEPS more tokens of sequence 0. Greedy, or each phase fed `forced`'s tokens; `log` watches the run.
+static unified_traces unified_sequences(llama_model *          model,
+                                        const llama_vocab *    v,
+                                        int                    nv,
+                                        const unified_traces * forced,
+                                        unified_log *          log) {
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx                = UNIFIED_CTX;
+    cp.n_seq_max            = UNIFIED_SEQS;
+    cp.kv_unified           = true;
+    if (log) {
+        llama_log_set(on_unified_log, log);
+    }
+    llama_context *                ctx = llama_init_from_model(model, cp);
+    const std::vector<llama_token> a   = tokens_of(v, PROMPT_A, UNIFIED_PROMPT_TOKENS);
+    const std::vector<llama_token> b   = tokens_of(v, PROMPT_B, UNIFIED_PROMPT_TOKENS);
+    seq_cursor                     s0, s1;
+    s1.id = 1;
+    unified_traces tr;
+    if (ctx && decode_seq(ctx, nv, s0, a.data(), (int) a.size())) {
+        if (log) {
+            log->in_first = true;
+        }
+        seq_steps(ctx, nv, s0, UNIFIED_FIRST_STEPS, forced ? &forced->first.tokens : nullptr, tr.first);
+        if (log) {
+            log->in_first = false;
+        }
+        if (decode_seq(ctx, nv, s1, b.data(), (int) b.size())) {
+            seq_steps(ctx, nv, s1, UNIFIED_SECOND_STEPS, forced ? &forced->second.tokens : nullptr, tr.second);
+            seq_steps(ctx, nv, s0, UNIFIED_RESUME_STEPS, forced ? &forced->resumed.tokens : nullptr, tr.resumed);
+        }
+    }
+    if (ctx) {
+        llama_free(ctx);
+    }
+    if (log) {
+        llama_log_set(nullptr, nullptr);
+    }
+    return tr;
+}
+
+// Whether GGML_XDNA_ATTN_LAYER leaves the fused attention layer on, read as the backend reads it.
+static bool attn_layer_on(void) {
+    const char * e = getenv("GGML_XDNA_ATTN_LAYER");
+    return !e || std::strtol(e, nullptr, 10) != 0;
+}
+
+// The unified-cache run against a CPU-only one fed its tokens: every phase within UNIFIED_NMSE_MAX, with the row
+// lists on, the fused attention layer run while sequence 0 held the cells from 0 (unless GGML_XDNA_ATTN_LAYER=0
+// leaves the lists to the pool), and no error logged.
+static bool check_unified_sequences(llama_model * model, const char * model_path, const llama_vocab * v, int nv) {
+    unified_log          log;
+    const unified_traces got      = unified_sequences(model, v, nv, nullptr, &log);
+    const bool           layer_on = attn_layer_on();
+    std::printf("unified cache: K/V row lists %s, %d fused attention layer binds from cell 0%s, %d errors\n",
+                log.rows_on ? "on" : "off (the check did not run)", log.layer_binds,
+                layer_on ? "" : " (the layer is off)", log.errors);
+    llama_model * cpu = load_on_cpu(model_path);
+    bool          ok  = cpu != nullptr;
+    if (cpu) {
+        const unified_traces want = unified_sequences(cpu, v, nv, &got, nullptr);
+        ok = same_logits("sequence 0 from cell 0, against the CPU", want.first, got.first, UNIFIED_NMSE_MAX);
+        ok = same_logits("sequence 1 behind sequence 0's cells, against the CPU", want.second, got.second,
+                         UNIFIED_NMSE_MAX) &&
+             ok;
+        ok = same_logits("sequence 0 past sequence 1's cells, against the CPU", want.resumed, got.resumed,
+                         UNIFIED_NMSE_MAX) &&
+             ok;
+        llama_model_free(cpu);
+    }
+    return ok && log.rows_on && (log.layer_binds > 0 || !layer_on) && log.errors == 0;
 }
 
 int main(int argc, char ** argv) {
@@ -293,6 +469,7 @@ int main(int argc, char ** argv) {
     bool ok = want == got;
     if (getenv("ON_CPU") == nullptr) {
         ok = check_restore_longer(model, model_path, v, nv) && ok;
+        ok = check_unified_sequences(model, model_path, v, nv) && ok;
     }
     std::printf("test-xdna-state: %s\n", ok ? "passed" : "FAILED");
     llama_model_free(model);
