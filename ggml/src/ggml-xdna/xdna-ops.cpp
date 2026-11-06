@@ -1220,7 +1220,8 @@ void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool) {
     // Stems are gemm_bf16_f32_M%d_K%d_N%d_c%d and gemm_int8_int32_M%d_K%d_N%d_c%d
     // (see CMakeLists). The decode M block (GGML_XDNA_GEMM_M) is the native bf16
     // M32 geometry; every larger bf16 M block is a prefill geometry, as is each
-    // int8 M block.
+    // int8 M block. The names are in search-dir order, so the first one found
+    // for a block wins, as it does for every other artifact.
     for (const std::string & name : pool->names) {
         int M = 0, K = 0, N = 0, C = 0;
         if (xdna_scan_gemm_stem(name.c_str(), "gemm_bf16_f32_M", M, K, N, C)) {
@@ -1229,12 +1230,12 @@ void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool) {
                     ops->gemm_xclbin_decode = name;
                 }
             } else if (M > GGML_XDNA_GEMM_M) {
-                ops->pref_xclbin[M] = name;
+                ops->pref_xclbin.emplace(M, name);
             }
             continue;
         }
         if (xdna_scan_gemm_stem(name.c_str(), "gemm_int8_int32_M", M, K, N, C)) {
-            ops->i8_xclbin[M] = name;
+            ops->i8_xclbin.emplace(M, name);
         }
     }
 

@@ -134,7 +134,8 @@ std::vector<fs::path> xdna_kernel_search_dirs(void) {
         dirs.push_back(exe.parent_path());
     }
 #endif
-    dirs.emplace_back(fs::current_path());
+    // Not the working directory: a file placed there would replace a shipped
+    // kernel. GGML_XDNA_KERNEL_DIR covers running from a directory of artifacts.
     return dirs;
 }
 

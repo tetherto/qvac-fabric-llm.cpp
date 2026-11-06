@@ -97,8 +97,10 @@ line at build time into `<stem>.xclbin` next to their `.insts.bin`, in the build
 output directory. The backend looks for artifacts, in order, in
 `GGML_XDNA_KERNEL_DIR` when it is set, the directory of the module the backend
 is in (the backend library in a `GGML_BACKEND_DL` build, the binary it is
-linked into otherwise), the backend install dir, the executable dir and the
-working directory. A package that loads the backend with
+linked into otherwise), the backend install dir and the executable dir. The
+first directory that holds an artifact wins. The working directory is not
+searched, so a file placed there cannot replace a shipped kernel; point
+`GGML_XDNA_KERNEL_DIR` at it instead. A package that loads the backend with
 `ggml_backend_load_all_from_path()` ships the artifacts next to the library.
 
 `fused_layer` and `gemv_n32_r4_c8` are loaded under a **design-tagged** name.
