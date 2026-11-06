@@ -4633,11 +4633,10 @@ static ggml_guid_t ggml_backend_xdna_guid(void) {
 ggml_backend_t ggml_backend_xdna_init(void) {
     ggml_backend_xdna_context * ctx = ggml_xdna_device_context();
 
-    // When the NPU is absent the backend is still registered (llama.cpp
-    // expects every ACCEL device to yield a backend), but supports_op()
+    // A listed NPU whose open failed still yields a backend, but supports_op()
     // rejects everything so all work stays on the CPU.
     if (!ctx->device) {
-        GGML_LOG_INFO("%s: XDNA backend init: disabled (no NPU)\n", __func__);
+        GGML_LOG_INFO("%s: XDNA backend init: disabled (the NPU did not open)\n", __func__);
     } else {
         GGML_LOG_INFO("%s: XDNA backend init: device=%s (%s)\n", __func__, ctx->device->name.c_str(),
                       ctx->device->description.c_str());
