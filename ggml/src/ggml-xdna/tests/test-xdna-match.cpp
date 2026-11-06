@@ -214,11 +214,47 @@ static int check_census_keeps_name(void) {
     return ok ? 0 : 1;
 }
 
+struct route_case {
+    const char *     what;
+    xdna_model_route route;
+    bool             chunk_fits;
+    bool             fused;
+};
+
+static xdna_model_route route_of(bool known, bool misfit) {
+    xdna_model_route r;
+    r.known  = known;
+    r.misfit = misfit;
+    return r;
+}
+
+template <size_t N> static int count_route_failures(const route_case (&cases)[N]) {
+    int failures = 0;
+    for (const route_case & c : cases) {
+        const bool ok = xdna_route_fused(c.route, c.chunk_fits) == c.fused;
+        std::printf("%s: %s\n", ok ? "ok  " : "FAIL", c.what);
+        failures += ok ? 0 : 1;
+    }
+    return failures;
+}
+
+// Which decode chunks the fused layers may run: one whose width and weights they take, of a model whose layers have
+// not told, or told they are run; never one of a model the census rejected, whatever its own width and weights.
+static int check_route_fused(void) {
+    const route_case cases[] = {
+        { "a fitting chunk before the layers tell is run",             route_of(false, false), true,  true  },
+        { "a fitting chunk of a model whose layers fit is run",        route_of(true,  false), true,  true  },
+        { "a fitting chunk of a model the census rejected is not run", route_of(true,  true),  true,  false },
+        { "a chunk outside the width or weights is not run",           route_of(true,  false), false, false },
+    };
+    return count_route_failures(cases);
+}
+
 int main(void) {
     const ggml_init_params params = { ggml_tensor_overhead() * MAX_TENSORS, nullptr, true };
     ggml_context *         ctx    = ggml_init(params);
     const int              failures = check_state_gather(ctx) + check_row_crop(ctx) + check_fused_weights(ctx) +
-                                      check_layer_census(ctx) + check_census_keeps_name();
+                                      check_layer_census(ctx) + check_census_keeps_name() + check_route_fused();
     ggml_free(ctx);
     if (failures) {
         std::printf("test-xdna-match: %d failures\n", failures);
