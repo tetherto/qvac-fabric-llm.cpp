@@ -8168,6 +8168,32 @@ struct test_mul_mat_convrot_h256 : public test_case {
     }
 };
 
+// GGML_PREC_F32 on F32 x F32: both operands and the accumulation stay F32, so F16 staging fails the bar
+struct test_mul_mat_prec_f32 : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+
+    std::string vars() override {
+        return "prec=f32," + test_mul_mat::vars();
+    }
+
+    double max_nmse_err() override {
+        return 1e-9;
+    }
+
+    // WebGPU has no f32-precision matmul path
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        const char * name = ggml_backend_reg_name(reg);
+        return strcmp(name, "WebGPU") == 0 ? 5e-4 : max_nmse_err();
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx);
+        GGML_ASSERT(ggml_prec_set_acc(out, GGML_PREC_F32));
+        return out;
+    }
+};
+
 // FP4 W4A8 path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_w4a8 : public test_mul_mat {
     test_mul_mat_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -15692,6 +15718,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_convrot(type_a, 512,  37, {2, 2, 1},  true,  f16_compat));
         }
     }
+
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 64,  16,  256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 64,  48,  256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 37,  129, 320, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 128, 64,  512, {2, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 256, 300, 1024, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 64,  48,  256, {1, 1}, {1, 1}, {0, 1, 2, 3}, 384));
 
     for (int32_t group_size : {4, 16, 64, 256, 1024}) {
         for (bool inplace : {false, true}) {

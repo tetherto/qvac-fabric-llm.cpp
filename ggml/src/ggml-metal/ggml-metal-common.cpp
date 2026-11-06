@@ -41,7 +41,11 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
 
-    return !ggml_is_transposed(op->src[0]) &&
+    const bool full_f32 = op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                          ggml_get_op_params_i32(op, 0) == GGML_PREC_F32;
+
+    return !full_f32 &&
+           !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&
            has_simdgroup_mm && ne00 >= 64 && ne11 > 8;
 }

@@ -281,12 +281,17 @@ struct vk_matmul_pipeline_key {
     ggml_type type_b;
     bool mul_mat_id;
     bool f16acc;
+    bool full_f32 = false;
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, full_f32)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.full_f32);
     }
 };
+
+inline vk_matmul_pipeline_key ggml_vk_full_f32_matmul_key() {
+    return { GGML_TYPE_F32, GGML_TYPE_F32, false, false, true };
+}
 
 struct vk_matmul_pipeline_pair {
     vk_pipeline unaligned;
