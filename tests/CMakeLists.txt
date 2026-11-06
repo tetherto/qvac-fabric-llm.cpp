@@ -691,6 +691,8 @@ if (GGML_XDNA)
         add_test(NAME test-xdna-design-tag
                  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna/tests/test-xdna-design-tag.py
                          ${GGML_XDNA_GATED_FMT_DEFAULT})
+    else()
+        message(STATUS "test-xdna-design-tag: no Python 3 interpreter, test not registered")
     endif()
 endif()
 
