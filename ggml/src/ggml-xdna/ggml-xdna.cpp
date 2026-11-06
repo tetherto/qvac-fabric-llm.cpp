@@ -781,14 +781,6 @@ struct xdna_model_objs {
     struct xdna_buffer *                                         res        = nullptr;
 };
 
-// A model's decode route (xdna_wants_host_decode): what its decode chunks showed of its layers, and, once a chunk
-// with a layer norm could tell, whether the fused designs leave its decode to the host.
-struct xdna_model_route {
-    xdna_layer_census layers;
-    bool              known  = false;
-    bool              misfit = false;
-};
-
 // Process-wide context shared by all backend instances.
 struct ggml_backend_xdna_context {
     xdna_device *      device = nullptr;
@@ -4216,11 +4208,13 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // layers of a single-token decode; each fires once in the dispatch loop
     // below and replaces its conv/gdn/ffn subgraph with one persistent device
     // run.
-    // A model the fused designs do not cover keeps the per-op route for its
+    // A model the fused designs do not cover, by this chunk's width or
+    // weights or by its layer census, keeps the per-op route for its
     // recurrent bodies while the projections stay on the array (the GEMV
     // groups the isolation mode plans): rec_serve is what the fused runs are
     // gated on, not xdna_rec_active, which still describes the decode mode.
-    const bool                 rec_serve = xdna_rec_active() && xdna_rec_fits(cgraph);
+    const bool rec_serve =
+        xdna_rec_active() && xdna_route_fused(ctx->model_route[ctx->cur_model], xdna_rec_fits(cgraph));
     std::vector<xdna_rec_plan> rec_plans;
     if (rec_serve) {
         xdna_rec_scan(ctx, cgraph, rec_plans);
