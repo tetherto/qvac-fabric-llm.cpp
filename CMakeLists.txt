@@ -312,6 +312,13 @@ endif()
 
 llama_apply_app_manifests()
 
+# qvac-fabric: upstream's server-context library alone (no HTTP server, UI, CLI
+# or executable), for the decision bridge in @qvac/fabric. See the file.
+option(QVAC_FABRIC_SERVER_CONTEXT "qvac-fabric: build and install the server-context library without the HTTP server" OFF)
+if (QVAC_FABRIC_SERVER_CONTEXT)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/qvac-server-context.cmake)
+endif()
+
 endif() # NOT BUILD_LLAMA
 
 # Automatically add all files from the 'licenses' directory
@@ -414,6 +421,10 @@ if (LLAMA_MTMD AND TARGET mtmd)
     PUBLIC_HEADER
       DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/mtmd)
 
+endif()
+
+if (QVAC_FABRIC_SERVER_CONTEXT AND TARGET server-context)
+  qvac_fabric_install_server_context(${LLAMA_INCLUDE_INSTALL_DIR})
 endif()
 
 install(
