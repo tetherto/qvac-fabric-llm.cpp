@@ -17626,6 +17626,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4096, 1280, nb, n_slices));
         }
     }
+    // lists that cover the whole cache, so that the mask has as many columns as K has rows
+    for (int64_t hs : {128, 256}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows(hs, 2, 4, 1024, 1024, 256, 1));
+    }
 
     // head sizes whose half4 count per head is not a multiple of 4, and a row list that is not padded
     for (int64_t nb : {1, 64}) {
