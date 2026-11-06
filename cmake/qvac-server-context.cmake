@@ -80,11 +80,19 @@ file(GLOB QVAC_FABRIC_SERVER_CONTEXT_HEADERS "${_qvac_sc_dir}/server-*.h")
 # Install rules. The headers go to a directory of their own, not next to the
 # public llama/common/mtmd headers: they are upstream internals, consumed only by
 # the QVAC bridge inside @qvac/fabric, and the npm package must not ship them.
+#
+# The exported llama::server-context target carries the include directories its
+# headers need: they include "common.h", "mtmd.h" and their sibling server
+# headers without a path, so a consumer only links the target.
 function(qvac_fabric_install_server_context include_dir)
     install(
         TARGETS ${QVAC_FABRIC_SERVER_CONTEXT_TARGET}
         EXPORT llama-targets
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        INCLUDES DESTINATION
+            ${include_dir}/server-context
+            ${include_dir}/common
+            ${include_dir}/mtmd)
     install(FILES ${QVAC_FABRIC_SERVER_CONTEXT_HEADERS}
         DESTINATION ${include_dir}/server-context)
 endfunction()
