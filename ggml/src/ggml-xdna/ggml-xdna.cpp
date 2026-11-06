@@ -2870,30 +2870,44 @@ static ggml_backend_xdna_context * ggml_xdna_device_context(void) {
 
     std::call_once(once, [&]() {
         // An exception here would escape into llama's device and model code:
-        // treat it as no NPU, so the work stays on the CPU.
+        // treat it as no NPU, so the work stays on the CPU. The context is
+        // published only once everything is built, so a failure frees it all.
+        xdna_device *                     device = nullptr;
+        xdna_kernel_pool *                pool   = nullptr;
+        std::vector<struct xdna_kernel *> warm;
         try {
-            ctx.device = xdna_device_open();
-            if (ctx.device) {
-                ctx.pool         = new xdna_kernel_pool;
-                ctx.pool->device = ctx.device;
-                xdna_kernel_pool_scan(ctx.pool);
-                xdna_ops_init(&ctx.ops, ctx.pool);
+            device = xdna_device_open();
+            if (device) {
+                pool         = new xdna_kernel_pool;
+                pool->device = device;
+                xdna_kernel_pool_scan(pool);
+                xdna_ops_init(&ctx.ops, pool);
                 if (ctx.ops.gemm_xclbin_decode.empty() && ctx.ops.pref_xclbin.empty()) {
                     GGML_LOG_WARN("%s: no GEMM kernels found (build with GGML_XDNA=ON)\n", "ggml-xdna");
                 }
                 // Register the kernels this backend will run up front, while the
                 // NPU is idle (see xdna_kernels_warm).
-                xdna_kernels_warm(ctx.pool, &ctx.ops, ctx.warm_kerns);
+                xdna_kernels_warm(pool, &ctx.ops, warm);
             }
+            ctx.device     = device;
+            ctx.pool       = pool;
+            ctx.warm_kerns = std::move(warm);
+            return;
         } catch (const std::exception & e) {
             GGML_LOG_ERROR("%s: NPU init failed, the NPU is not used: %s\n", "ggml-xdna", e.what());
-            ctx.device = nullptr;
-            ctx.pool   = nullptr;
         } catch (...) {
             GGML_LOG_ERROR("%s: NPU init failed, the NPU is not used: unknown exception\n", "ggml-xdna");
-            ctx.device = nullptr;
-            ctx.pool   = nullptr;
         }
+        for (struct xdna_kernel * kern : warm) {
+            xdna_kernel_free(kern);
+        }
+        ctx.ops.pool = nullptr;
+        ctx.ops.gemm_xclbin_decode.clear();
+        ctx.ops.pref_blocks.clear();
+        ctx.ops.pref_xclbin.clear();
+        ctx.ops.i8_xclbin.clear();
+        delete pool;
+        delete device;
     });
 
     return &ctx;
