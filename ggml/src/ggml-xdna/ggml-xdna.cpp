@@ -2820,11 +2820,15 @@ static void xdna_kernels_warm(xdna_kernel_pool * pool, const xdna_ops * ops, std
         return;
     }
     // Per-op decode: the standalone GEMV split and the GEMM variants xdna-ops
-    // resolves.
+    // selected, not every variant the search dirs hold.
     warm_stem(xdna_gemv_stem(XDNA_GEMV_SPLIT_DEFAULT));
     warm_stem(ops->gemm_xclbin_decode);
-    warm_names("gemm_int8_int32");
-    warm_names("gemm_bf16_f32");
+    for (const auto & kv : ops->i8_xclbin) {
+        warm_stem(kv.second);
+    }
+    for (const auto & kv : ops->pref_xclbin) {
+        warm_stem(kv.second);
+    }
 }
 
 // The memlock limit, the usual reason an NPU buffer does not fit (the
