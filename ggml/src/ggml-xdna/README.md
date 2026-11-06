@@ -404,8 +404,11 @@ Diagnostics - nothing is measured unless they are set:
   `llama-quantize --tensor-type ssm_out=q5_K model-f16.gguf out.gguf Q4_K_M`.
   The failure has the same shape as the layout mismatch above.
   `GGML_XDNA_FUSED_LAYER=0` is not a way to run this model.
-- **No NPU** - the backend still registers (llama.cpp expects every accelerator
-  device to answer) but claims no ops, so everything runs on the CPU.
+- **No NPU** - with no accel device bound to `amdxdna`, or none the process
+  can read and write, the backend lists no device. Listing the device does not
+  open it: the first use does (a model placed on it, or its backend
+  initialised), and loads the kernels then. If that open fails, the device
+  stays listed but claims no ops, so everything runs on the CPU.
 
 ## Code layout
 

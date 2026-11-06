@@ -2857,9 +2857,16 @@ static long xdna_mem_available_mib() {
     return kb < 0 ? -1 : kb / 1024;
 }
 
-static ggml_backend_xdna_context * ggml_xdna_device_context(void) {
+static ggml_backend_xdna_context & xdna_ctx_storage(void) {
     static ggml_backend_xdna_context ctx;
-    static std::once_flag            once;
+    return ctx;
+}
+
+// Opens the NPU and loads its kernels on the first call. Only a use of the
+// device calls it (backend init, a buffer, supports_op), not its listing.
+static ggml_backend_xdna_context * ggml_xdna_device_context(void) {
+    ggml_backend_xdna_context & ctx = xdna_ctx_storage();
+    static std::once_flag       once;
 
     std::call_once(once, [&]() {
         ctx.device = xdna_device_open();
@@ -2878,6 +2885,47 @@ static ggml_backend_xdna_context * ggml_xdna_device_context(void) {
     });
 
     return &ctx;
+}
+
+struct xdna_npu_info {
+    bool        present = false;
+    std::string description;
+};
+
+// Whether there is an NPU to list. On Linux this reads sysfs for an accel
+// node bound to amdxdna, so listing the device does not open it or start XRT.
+static const xdna_npu_info & xdna_npu_probe(void) {
+    static const xdna_npu_info info = [] {
+        xdna_npu_info r;
+#ifdef __linux__
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        for (fs::directory_iterator it("/sys/class/accel", ec), end; !ec && it != end; it.increment(ec)) {
+            const fs::path  dir = it->path();
+            std::error_code dec;
+            const fs::path  pci = fs::read_symlink(dir / "device", dec);
+            const fs::path  drv = dec ? fs::path() : fs::read_symlink(dir / "device" / "driver", dec);
+            if (dec || drv.filename() != "amdxdna") {
+                continue;
+            }
+            const std::string node = "/dev/accel/" + dir.filename().string();
+            if (access(node.c_str(), R_OK | W_OK) != 0) {
+                GGML_LOG_WARN("%s: %s is not readable and writable; the NPU is not listed\n", "ggml-xdna",
+                              node.c_str());
+                continue;
+            }
+            r.present     = true;
+            r.description = "AMD XDNA NPU (" + pci.filename().string() + ")";
+            break;
+        }
+#else
+        const ggml_backend_xdna_context * ctx = ggml_xdna_device_context();
+        r.present                             = ctx->device != nullptr;
+        r.description                         = r.present ? ctx->device->description : std::string();
+#endif
+        return r;
+    }();
+    return info;
 }
 
 // backend interface
@@ -4552,7 +4600,8 @@ ggml_backend_t ggml_backend_xdna_init(void) {
     if (!ctx->device) {
         GGML_LOG_INFO("%s: XDNA backend init: disabled (no NPU)\n", __func__);
     } else {
-        GGML_LOG_INFO("%s: XDNA backend init: device=%s\n", __func__, ctx->device->name.c_str());
+        GGML_LOG_INFO("%s: XDNA backend init: device=%s (%s)\n", __func__, ctx->device->name.c_str(),
+                      ctx->device->description.c_str());
     }
 
     ggml_backend_t backend = new ggml_backend{
@@ -4575,14 +4624,18 @@ bool ggml_backend_is_xdna(ggml_backend_t backend) {
 
 // device interface
 
+// The listing callbacks below do not open the NPU (see xdna_npu_probe).
+
 static const char * ggml_backend_xdna_device_get_name(ggml_backend_dev_t dev) {
-    ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) dev->context;
-    return ctx->device ? ctx->device->name.c_str() : "XDNA";
+    GGML_UNUSED(dev);
+    // the name xdna_device_open gives the device
+    return xdna_npu_probe().present ? "XDNA0" : "XDNA";
 }
 
 static const char * ggml_backend_xdna_device_get_description(ggml_backend_dev_t dev) {
-    ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) dev->context;
-    return ctx->device ? ctx->device->description.c_str() : "AMD XDNA (no NPU device)";
+    GGML_UNUSED(dev);
+    const xdna_npu_info & npu = xdna_npu_probe();
+    return npu.present ? npu.description.c_str() : "AMD XDNA (no NPU device)";
 }
 
 static void ggml_backend_xdna_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
@@ -4896,7 +4949,10 @@ static ggml_backend_buffer_t ggml_backend_xdna_device_buffer_from_host_ptr(ggml_
 }
 
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) dev->context;
+    GGML_UNUSED(dev);
+    // llama asks this only of the devices a model uses, so the NPU opens here
+    // at the latest
+    ggml_backend_xdna_context * ctx = ggml_xdna_device_context();
 
     if (!ctx->device || !ctx->pool) {
         return false;
@@ -4940,7 +4996,7 @@ static const char * ggml_backend_xdna_reg_get_name(ggml_backend_reg_t reg) {
 
 static size_t ggml_backend_xdna_reg_get_device_count(ggml_backend_reg_t reg) {
     GGML_UNUSED(reg);
-    return ggml_xdna_device_context()->device ? 1 : 0;
+    return xdna_npu_probe().present ? 1 : 0;
 }
 
 static ggml_backend_dev_t ggml_backend_xdna_reg_get_device(ggml_backend_reg_t reg, size_t index) {
@@ -4950,7 +5006,7 @@ static ggml_backend_dev_t ggml_backend_xdna_reg_get_device(ggml_backend_reg_t re
     static ggml_backend_device ggml_backend_xdna_device = {
         /* .iface   = */ ggml_backend_xdna_device_i,
         /* .reg     = */ reg,
-        /* .context = */ ggml_xdna_device_context(),
+        /* .context = */ &xdna_ctx_storage(),
     };
 
     return &ggml_backend_xdna_device;
