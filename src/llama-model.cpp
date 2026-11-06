@@ -2053,6 +2053,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // Already did incremental load.
         if (!ml.no_alloc) {
             load_tensors_hadamard();
+            load_fp8_input_scales();
         }
         print_backend_buffers_info(n_gpu_layers);
         return true;
