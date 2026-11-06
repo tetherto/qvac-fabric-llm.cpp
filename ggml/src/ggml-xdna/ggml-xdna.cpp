@@ -2844,8 +2844,8 @@ static std::string xdna_memlock_str() {
     return "memlock limit " + std::to_string((unsigned long long) rl.rlim_cur >> 20) + " MiB";
 }
 
-// MemAvailable, in MiB; -1 when it cannot be read.
-static long xdna_mem_available_mib() {
+// MemAvailable, in kB; -1 when it cannot be read.
+static long xdna_mem_available_kb() {
     FILE * f = fopen("/proc/meminfo", "r");
     if (!f) {
         return -1;
@@ -2858,6 +2858,12 @@ static long xdna_mem_available_mib() {
         }
     }
     fclose(f);
+    return kb < 0 ? -1 : kb;
+}
+
+// MemAvailable, in MiB; -1 when it cannot be read.
+static long xdna_mem_available_mib() {
+    const long kb = xdna_mem_available_kb();
     return kb < 0 ? -1 : kb / 1024;
 }
 
@@ -4688,9 +4694,10 @@ static void ggml_backend_xdna_device_get_memory(ggml_backend_dev_t dev, size_t *
     long pages     = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGE_SIZE);
     *total         = (size_t) pages * page_size;
-    // MemAvailable; all of it when /proc/meminfo cannot be read
-    const long avail = xdna_mem_available_mib();
-    *free            = avail > 0 ? std::min(*total, (size_t) avail << 20) : *total;
+    // MemAvailable, as the CPU backend reports; all of it when /proc/meminfo
+    // cannot be read
+    const long avail_kb = xdna_mem_available_kb();
+    *free               = avail_kb >= 0 ? std::min(*total, (size_t) avail_kb << 10) : *total;
 #endif  // _WIN32
 }
 
