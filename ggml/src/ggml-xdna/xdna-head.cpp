@@ -204,21 +204,21 @@ xdna_head * xdna_head_create(xdna_kernel_pool *  pool,
     // The same from the rows: each part's first tile takes F, A and gamma and
     // the prologue quantizes rms_norm(F + A) * gamma; its tiles are every
     // chunk's, in DDR (a replayed first tile would take the rows again).
-    if (res && gamma && K == XDNA_RES_D) {
+    if (res && gamma && xdna_res_width_ok(K)) {
         size_t rb = 0;
         for (int i = 0; i < h->n_parts; i++) {
             h->p[i].ra_off = rb;
             rb             = xdna_align_up(rb + h->p[i].geom.act_bytes());
         }
         const size_t g_off = rb;
-        rb += (size_t) XDNA_RES_D * sizeof(float);
+        rb += (size_t) K * sizeof(float);
         h->ra = xdna_buffer_alloc(dev, rb);
         xdna_seq sr;
         bool     ok_r = h->ra != nullptr;
         for (int i = 0; ok_r && i < h->n_parts; i++) {
             const part & p = h->p[i];
             ok_r           = xdna_gemv_row_act(p.geom, (uint8_t *) h->ra->data + p.ra_off, eps, true, 0);
-            xdna_seq_row_io(&sr, 3, XDNA_RES_F, XDNA_RES_A, 1, (uint32_t) g_off, XDNA_RES_H);
+            xdna_seq_row_io(&sr, (int) K, 3, XDNA_RES_F, XDNA_RES_A, 1, (uint32_t) g_off, XDNA_RES_H);
             xdna_gemv_seq_opts o;
             o.bd_base = 0;
             o.w_off   = (uint32_t) p.w_off;
@@ -228,7 +228,7 @@ xdna_head * xdna_head_create(xdna_kernel_pool *  pool,
             xdna_seq_row_wait(&sr);
         }
         if (ok_r) {
-            std::memcpy((uint8_t *) h->ra->data + g_off, gamma, (size_t) XDNA_RES_D * sizeof(float));
+            std::memcpy((uint8_t *) h->ra->data + g_off, gamma, (size_t) K * sizeof(float));
             if (!xdna_buffer_sync_to_device(h->ra)) {
                 xdna_head_free(h);
                 return nullptr;

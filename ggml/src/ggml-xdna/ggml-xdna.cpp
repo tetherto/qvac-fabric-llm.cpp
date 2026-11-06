@@ -28,6 +28,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <sys/resource.h>
@@ -648,7 +649,8 @@ struct ggml_backend_xdna_context {
     // Stateless, so one per layer serves every sequence.
     std::map<int, struct xdna_rec_tail *>                        tails;
     // Decode attention on the pool, and how far each layer's K and V rows
-    // have been flushed to the device (reset by any multi-token graph).
+    // have been flushed to the device (reset by any multi-token graph and by
+    // any host write into a cache, xdna_att_unflush).
     struct xdna_att *                                            att = nullptr;
     std::map<const void *, int>                                  att_flushed;
     // Whole attention layers as one dispatch, per layer; null once one
@@ -706,9 +708,8 @@ struct ggml_backend_xdna_context {
     std::map<const void *, xdna_model_objs> parked;
     // Models already told their buffers did not fit (one warning each).
     std::set<const void *>                 warned_mem;
-    // Whether each model's residual stream is wider than the fused designs'
-    // (xdna_wants_host_decode), once a chunk with a layer norm said so.
-    std::map<const void *, bool>           model_misfit;
+    // Each model's decode route (xdna_wants_host_decode).
+    std::map<const void *, xdna_model_route> model_route;
     // The node the dispatch loop is on, so the exception boundary in
     // ggml_backend_xdna_graph_compute can name it. Null outside a graph.
     const struct ggml_tensor * cur_node   = nullptr;
@@ -789,6 +790,21 @@ static bool xdna_head_node(const ggml_tensor * n) {
            ggml_nelements(n) == n->src[0]->ne[1];
 }
 
+// The residual width the fused layers keep to with GGML_XDNA_FUSED_WIDE=0.
+static constexpr int64_t XDNA_FUSED_D = 1024;
+
+// The fused layers also take a wider residual stream (xdna_res_width_ok),
+// unless GGML_XDNA_FUSED_WIDE=0 leaves its decode to the host.
+static bool xdna_fused_wide(void) {
+    static const bool v = xdna_env_int("GGML_XDNA_FUSED_WIDE", 1) != 0;
+    return v;
+}
+
+// Whether the fused layers take a residual stream of width `d`.
+static bool xdna_fused_width(int64_t d) {
+    return d == XDNA_FUSED_D || (xdna_fused_wide() && xdna_res_width_ok(d));
+}
+
 namespace {
 
 // The head's input chain: [GET_ROWS of one row] <- MUL by the output norm's
@@ -813,7 +829,8 @@ static bool xdna_head_chain_of(const ggml_tensor * head, xdna_head_chain & c) {
         t      = t->src[0];
     }
     if (!t || t->op != GGML_OP_MUL || !t->src[0] || t->src[0]->op != GGML_OP_RMS_NORM || !t->src[1] ||
-        t->src[1]->op != GGML_OP_NONE || t->src[1]->type != GGML_TYPE_F32 || ggml_nelements(t->src[1]) != XDNA_RES_D) {
+        t->src[1]->op != GGML_OP_NONE || t->src[1]->type != GGML_TYPE_F32 ||
+        !xdna_fused_width(ggml_nelements(t->src[1]))) {
         return false;
     }
     c.mul   = t;
@@ -839,16 +856,18 @@ static bool xdna_res_materialize(ggml_backend_xdna_context * ctx) {
         return true;
     }
     xdna_pending_wait(ctx);
-    std::vector<float> r2((size_t) 2 * XDNA_RES_D);
+    // A and F, a row apart
+    const int64_t      d = ggml_nelements(ctx->res_lout);
+    std::vector<float> r2((size_t) (XDNA_RES_MAX_D + d));
     if (!xdna_buffer_read_settled(ctx->res, r2.data(), r2.size() * sizeof(float), XDNA_RES_A)) {
         return false;
     }
     float * lo = (float *) ctx->res_lout->data;
-    for (int i = 0; i < XDNA_RES_D; i++) {
-        lo[i] = r2[(size_t) i] + r2[(size_t) XDNA_RES_D + (size_t) i];
+    for (int64_t i = 0; i < d; i++) {
+        lo[i] = r2[(size_t) i] + r2[(size_t) (XDNA_RES_MAX_D + i)];
     }
     if (ctx->res_resid) {
-        std::memcpy(ctx->res_resid->data, r2.data(), (size_t) XDNA_RES_D * sizeof(float));
+        std::memcpy(ctx->res_resid->data, r2.data(), (size_t) d * sizeof(float));
     }
     ctx->res_dirty = false;
     return true;
@@ -933,6 +952,15 @@ struct xdna_rec_session {
     std::vector<float>   cap_qkv, cap_conv, cap_ss, cap_hres, cap_act;
 };
 
+// Floats of a session's ssm state and conv history rows in llama's cache.
+static size_t xdna_rec_state_n(const xdna_rec_session * s) {
+    return (size_t) xdna_rec_pack::state_floats(s->host.n_vh);
+}
+
+static size_t xdna_rec_conv_n(const xdna_rec_session * s) {
+    return (size_t) 3 * xdna_rec_pack::channels(s->host.n_vh);
+}
+
 namespace {
 
 // Per-graph plan of one fused layer: the node indices/tensors the fused run
@@ -969,7 +997,32 @@ struct xdna_rec_plan {
     // two MUL_MATs never run.
     ggml_tensor * n_act      = nullptr;
     int           i_cap_act  = -1;
+    int           n_vh       = 0;  // value heads (xdna_rec_layer_heads)
 };
+
+// The value heads of a GDN state row of n floats, 0 when the core runs none.
+int xdna_rec_state_heads(int64_t n) {
+    using namespace xdna_rec_pack;
+    for (int p = 1; p <= MAX_PASSES; p++) {
+        if (n == state_floats(p * NVH)) {
+            return p * NVH;
+        }
+    }
+    return 0;
+}
+
+// A layer's value heads off its tensors, 0 when they disagree or the core
+// does not run that many: the convolution's channels, the state row and the
+// gates.
+int xdna_rec_layer_heads(const xdna_rec_plan & p) {
+    using namespace xdna_rec_pack;
+    const int n_vh = (int) (p.w_conv->ne[1] / SV) - 2 * NKG;
+    if (!heads_ok(n_vh) || p.w_conv->ne[1] != channels(n_vh) || xdna_rec_state_heads(p.n_sstate->ne[0]) != n_vh ||
+        ggml_nelements(p.n_gate) != n_vh || ggml_nelements(p.n_beta) != n_vh) {
+        return 0;
+    }
+    return n_vh;
+}
 
 }  // namespace
 
@@ -1138,6 +1191,84 @@ static void xdna_tail_scan(const ggml_cgraph * cgraph, std::vector<xdna_tail_pla
 }
 
 xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset);
+xdna_buffer * xdna_host_bo_reach(const void * p, size_t reach, size_t * offset);
+
+// Test hook (ggml_backend_xdna_test_stale_kv): armed, the K/V rows the host next writes outside a graph reach the next
+// decode attention as a dirty line over stale memory would: right in the cache, NaN in memory, until a flush.
+struct xdna_stale_kv {
+    std::atomic<bool>                      armed{ false };
+    std::atomic<int>                       planted{ 0 };
+    std::mutex                             mtx;
+    std::vector<std::pair<char *, size_t>> ranges;
+};
+
+static xdna_stale_kv g_stale_kv;
+
+// 1 arms, 0 disarms and drops the rows not planted yet (their buffer may be gone); the count of plants either way.
+static int xdna_test_stale_kv(int arm) {
+    std::lock_guard<std::mutex> lock(g_stale_kv.mtx);
+    g_stale_kv.armed = arm != 0;
+    if (!arm) {
+        g_stale_kv.ranges.clear();
+    }
+    return g_stale_kv.planted;
+}
+
+static bool xdna_is_kv_cache(const ggml_tensor * t) {
+    return strncmp(t->name, "cache_k_l", 9) == 0 || strncmp(t->name, "cache_v_l", 9) == 0;
+}
+
+static void xdna_stale_kv_note(const ggml_tensor * t, size_t offset, size_t size) {
+    if (!g_stale_kv.armed || !xdna_is_kv_cache(t)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_stale_kv.mtx);
+    g_stale_kv.ranges.push_back({ (char *) t->data + offset, size });
+}
+
+static bool xdna_stale_kv_plant_range(char * p, size_t n) {
+    size_t        off = 0;
+    xdna_buffer * bo  = xdna_host_bo_of(p, &off);
+    if (!bo) {
+        return false;
+    }
+    std::vector<char> keep(p, p + n);
+    std::fill_n(p, n, (char) 0xff);  // NaN in f32, f16 and bf16 alike
+    if (!xdna_buffer_sync_to_device_range(bo, n, off)) {
+        return false;
+    }
+    memcpy(p, keep.data(), n);
+    return true;
+}
+
+static bool xdna_stale_kv_plant_ranges(const std::vector<std::pair<char *, size_t>> & ranges) {
+    bool ok = true;
+    for (const auto & r : ranges) {
+        ok = xdna_stale_kv_plant_range(r.first, r.second) && ok;
+    }
+    return ok;
+}
+
+static void xdna_stale_kv_plant(void) {
+    if (!g_stale_kv.armed) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_stale_kv.mtx);
+    if (g_stale_kv.ranges.empty()) {
+        return;
+    }
+    if (xdna_stale_kv_plant_ranges(g_stale_kv.ranges)) {
+        g_stale_kv.planted++;
+    }
+    g_stale_kv.ranges.clear();
+    g_stale_kv.armed = false;
+}
+
+// What one pool run can address past a layer's K or V start: every position it
+// takes, and a head group's offset inside a position.
+static size_t xdna_att_reach(size_t pos_b) {
+    return ((size_t) xdna_att_max_positions() + 1) * pos_b;
+}
 
 // Decode flash attention on the pool (xdna-att.h). GGML_XDNA_ATTN=0 leaves
 // it to the host.
@@ -1148,20 +1279,86 @@ static bool xdna_att_on(void) {
     return v;
 }
 
-// The shapes the pool's attention takes: Qwen3.5's full-attention decode.
+// The shapes the pool's attention takes: Qwen3.5's full-attention decode, one
+// head group of eight query heads over two kv heads, or two (the 4B and 9B).
+static constexpr int64_t XDNA_ATT_D        = 256;
+static constexpr int64_t XDNA_ATT_GROUP_H  = 8;  // query heads a pool run takes
+static constexpr int64_t XDNA_ATT_GQA      = 4;  // query heads a kv head serves
+static constexpr int64_t XDNA_ATT_MAX_GRPS = 2;
+
+// A K/V row list (src[5], ggml_flash_attn_ext_rows) of one slice, one cache
+// cell a mask column; xdna_att_rows_identity checks its values at run time.
+static bool xdna_att_rows_shape_ok(const ggml_tensor * rows, const ggml_tensor * m) {
+    return !rows ||
+           (rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows) && rows->ne[0] == m->ne[0] && rows->ne[1] == 1);
+}
+
 static bool xdna_att_eligible(const ggml_tensor * n) {
     const ggml_tensor *q = n->src[0], *k = n->src[1], *v = n->src[2], *m = n->src[3];
-    if (n->op != GGML_OP_FLASH_ATTN_EXT || !q || !k || !v || !m || n->src[4]) {
+    // no sinks (src[4])
+    if (n->op != GGML_OP_FLASH_ATTN_EXT || !q || !k || !v || !m || n->src[4] || !xdna_att_rows_shape_ok(n->src[5], m)) {
+        return false;
+    }
+    const int64_t h   = q->ne[2];
+    const int64_t kvh = h / XDNA_ATT_GQA;
+    const size_t  hb  = (size_t) XDNA_ATT_D * sizeof(ggml_fp16_t);  // a kv head's row
+    if (h % XDNA_ATT_GROUP_H != 0 || h / XDNA_ATT_GROUP_H < 1 || h / XDNA_ATT_GROUP_H > XDNA_ATT_MAX_GRPS) {
         return false;
     }
     float par[3];
     memcpy(par, n->op_params, sizeof(par));
-    return par[1] == 0.0f && par[2] == 0.0f && q->type == GGML_TYPE_F32 && q->ne[0] == 256 && q->ne[1] == 1 &&
-           q->ne[2] == 8 && q->ne[3] == 1 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && k->ne[0] == 256 &&
-           k->ne[2] == 2 && v->ne[0] == 256 && v->ne[2] == 2 && k->ne[3] == 1 && v->ne[3] == 1 &&
-           k->ne[1] == v->ne[1] && k->nb[0] == 2 && k->nb[1] == 1024 && k->nb[2] == 512 && v->nb[0] == 2 &&
-           v->nb[1] == 1024 && v->nb[2] == 512 && m->type == GGML_TYPE_F16 && m->ne[0] >= k->ne[1] &&
-           n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) && ggml_nelements(n) == (int64_t) 256 * 8;
+    return par[1] == 0.0f && par[2] == 0.0f && q->type == GGML_TYPE_F32 && q->ne[0] == XDNA_ATT_D && q->ne[1] == 1 &&
+           q->ne[3] == 1 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && k->ne[0] == XDNA_ATT_D &&
+           k->ne[2] == kvh && v->ne[0] == XDNA_ATT_D && v->ne[2] == kvh && k->ne[3] == 1 && v->ne[3] == 1 &&
+           k->ne[1] == v->ne[1] && k->nb[0] == 2 && k->nb[1] == kvh * hb && k->nb[2] == hb && v->nb[0] == 2 &&
+           v->nb[1] == kvh * hb && v->nb[2] == hb && m->type == GGML_TYPE_F16 && m->ne[0] >= k->ne[1] &&
+           n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) && ggml_nelements(n) == XDNA_ATT_D * h;
+}
+
+// The pool reads the first n_valid cache cells: a row list has to name
+// exactly those, as one sequence's list over the cells from 0 does.
+static bool xdna_att_rows_identity(const ggml_tensor * fa, int n_valid) {
+    const ggml_tensor * r = fa->src[5];
+    if (!r) {
+        return true;
+    }
+    const int32_t * rows = (const int32_t *) r->data;
+    if (!rows) {
+        return false;
+    }
+    for (int j = 0; j < n_valid; j++) {
+        if (rows[j] != j) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The head groups of a decode attention: a pool run each.
+static int xdna_att_groups(const ggml_tensor * fa) {
+    return (int) (fa->src[0]->ne[2] / XDNA_ATT_GROUP_H);
+}
+
+// One pool run a head group: its kv heads `k->nb[2]` apart inside a position.
+static bool xdna_att_run_groups(xdna_att *    att,
+                                xdna_buffer * kbo,
+                                size_t        koff,
+                                xdna_buffer * vbo,
+                                size_t        voff,
+                                const float * q,
+                                float         scale,
+                                int           n_valid,
+                                float *       out,
+                                int64_t       h,
+                                size_t        pos_b) {
+    const size_t grp_b = (size_t) xdna_att_geom::POS_B;
+    for (int64_t g = 0; g < h / XDNA_ATT_GROUP_H; g++) {
+        const size_t qo = (size_t) (g * XDNA_ATT_GROUP_H * XDNA_ATT_D);
+        if (!xdna_att_run(att, kbo, koff + g * grp_b, vbo, voff + g * grp_b, q + qo, scale, n_valid, out + qo, pos_b)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool xdna_att_try(ggml_backend_xdna_context * ctx, ggml_tensor * n) {
@@ -1178,12 +1375,12 @@ static bool xdna_att_try(ggml_backend_xdna_context * ctx, ggml_tensor * n) {
             return false;
         }
     }
-    if (n_valid <= 0 || n_valid > xdna_att_max_positions()) {
+    if (n_valid <= 0 || n_valid > xdna_att_max_positions() || !xdna_att_rows_identity(n, n_valid)) {
         return false;
     }
     size_t        koff = 0, voff = 0;
-    xdna_buffer * kbo = xdna_host_bo_of(k->data, &koff);
-    xdna_buffer * vbo = xdna_host_bo_of(v->data, &voff);
+    xdna_buffer * kbo = xdna_host_bo_reach(k->data, xdna_att_reach(k->nb[1]), &koff);
+    xdna_buffer * vbo = xdna_host_bo_reach(v->data, xdna_att_reach(v->nb[1]), &voff);
     if (!kbo || !vbo) {
         return false;
     }
@@ -1195,28 +1392,31 @@ static bool xdna_att_try(ggml_backend_xdna_context * ctx, ggml_tensor * n) {
     }
     // The rows the host wrote since the last flush of this layer: one a
     // token, or all of them after a prefill.
-    int & fl = ctx->att_flushed[k->data];
+    xdna_stale_kv_plant();
+    const size_t pos_b = k->nb[1];
+    int &        fl    = ctx->att_flushed[k->data];
     if (fl > n_valid) {
         fl = 0;
     }
     if (n_valid > fl) {
-        const size_t b0 = (size_t) fl * 1024, nb = (size_t) (n_valid - fl) * 1024;
+        const size_t b0 = (size_t) fl * pos_b, nb = (size_t) (n_valid - fl) * pos_b;
         if (!xdna_buffer_sync_to_device_range(kbo, nb, koff + b0) ||
             !xdna_buffer_sync_to_device_range(vbo, nb, voff + b0)) {
             return false;
         }
         fl = n_valid;
     }
-    float qc[8 * 256];
-    for (int h = 0; h < 8; h++) {
-        memcpy(qc + (size_t) h * 256, (const char *) q->data + h * q->nb[2], 256 * sizeof(float));
+    const int64_t h = q->ne[2];
+    float         qc[XDNA_ATT_MAX_GRPS * XDNA_ATT_GROUP_H * XDNA_ATT_D];
+    for (int64_t i = 0; i < h; i++) {
+        memcpy(qc + i * XDNA_ATT_D, (const char *) q->data + i * q->nb[2], XDNA_ATT_D * sizeof(float));
     }
     float scale;
     memcpy(&scale, n->op_params, sizeof(float));
     xdna_prof::section_timer st_att(n_valid <= 1024 ? "att: pool run (<=1k)" :
                                     n_valid <= 4096 ? "att: pool run (<=4k)" :
                                                       "att: pool run (>4k)");
-    return xdna_att_run(ctx->att, kbo, koff, vbo, voff, qc, scale, n_valid, (float *) n->data);
+    return xdna_att_run_groups(ctx->att, kbo, koff, vbo, voff, qc, scale, n_valid, (float *) n->data, h, pos_b);
 }
 
 // Run one attention tail and write attn_residual and l_out.
@@ -1237,7 +1437,7 @@ static bool xdna_tail_run(ggml_backend_xdna_context *               ctx,
         if (!ctx->res) {
             ctx->res = xdna_res_alloc(ctx->device);
         }
-        if (!ctx->res || !xdna_norm_eps(cgraph, p.w_post, &eps) || ggml_nelements(p.w_post) != XDNA_RES_D) {
+        if (!ctx->res || !xdna_norm_eps(cgraph, p.w_post, &eps) || !xdna_fused_width(ggml_nelements(p.w_post))) {
             give_up("the residual rows or the post norm are unusable");
             return false;
         }
@@ -1541,9 +1741,10 @@ static bool xdna_attl_ready(ggml_backend_xdna_context * ctx, const xdna_attl_pla
     }
     const int     n_valid = xdna_attl_valid(p.n_fa);
     size_t        koff = 0, voff = 0;
-    xdna_buffer * kbo = xdna_host_bo_of(p.n_fa->src[1]->data, &koff);
-    xdna_buffer * vbo = xdna_host_bo_of(p.n_fa->src[2]->data, &voff);
-    if (n_valid <= 0 || !kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid)) {
+    xdna_buffer * kbo = xdna_host_bo_reach(p.n_fa->src[1]->data, xdna_att_reach(p.n_fa->src[1]->nb[1]), &koff);
+    xdna_buffer * vbo = xdna_host_bo_reach(p.n_fa->src[2]->data, xdna_att_reach(p.n_fa->src[2]->nb[1]), &voff);
+    if (n_valid <= 0 || !xdna_att_rows_identity(p.n_fa, n_valid) || !kbo || !vbo ||
+        !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, p.n_fa->src[1]->nb[1], xdna_att_groups(p.n_fa))) {
         return false;
     }
     // the token's row is the last visible cell of its stream: the view's
@@ -1584,7 +1785,7 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
     }
     const ggml_tensor *k = fa->src[1], *v = fa->src[2];
     const int          n_valid = xdna_attl_valid(fa);
-    if (n_valid <= 0 || n_valid > xdna_att_layer_max_positions()) {
+    if (n_valid <= 0 || n_valid > xdna_att_layer_max_positions() || !xdna_att_rows_identity(fa, n_valid)) {
         return false;
     }
     // this token's K and V go to row n_valid - 1 of its stream: the one row
@@ -1592,10 +1793,11 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
     // indices are global across streams, the view starts at its stream)
     const ggml_tensor * views[2] = { k, v };
     const ggml_tensor * srs[2]   = { p.n_srk, p.n_srv };
+    const size_t        pos_b    = k->nb[1];
     for (int i = 0; i < 2; i++) {
         const ggml_tensor *sr = srs[i], *idx = sr->src[1];
         if (!idx || ggml_nelements(idx) != 1 || sr->src[0]->ne[1] != 1 ||
-            sr->src[0]->ne[0] * sr->src[0]->ne[2] != 512 || sr->nb[1] != 1024) {
+            sr->src[0]->ne[0] * sr->src[0]->ne[2] != k->ne[0] * k->ne[2] || sr->nb[1] != pos_b) {
             return false;
         }
         const size_t  off = (size_t) ((const char *) views[i]->data - (const char *) sr->data);
@@ -1612,9 +1814,9 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
         return false;
     }
     size_t        koff = 0, voff = 0;
-    xdna_buffer * kbo = xdna_host_bo_of(k->data, &koff);
-    xdna_buffer * vbo = xdna_host_bo_of(v->data, &voff);
-    if (!kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid)) {
+    xdna_buffer * kbo = xdna_host_bo_reach(k->data, xdna_att_reach(k->nb[1]), &koff);
+    xdna_buffer * vbo = xdna_host_bo_reach(v->data, xdna_att_reach(v->nb[1]), &voff);
+    if (!kbo || !vbo || !xdna_att_layer_fits(kbo, koff, vbo, voff, n_valid, pos_b, xdna_att_groups(fa))) {
         return false;
     }
     std::vector<float> cosv, sinv;
@@ -1648,19 +1850,20 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
     }
     // The rows the host wrote since the last flush (a prefill), as the pool
     // attention does.
+    xdna_stale_kv_plant();
     int & fl = ctx->att_flushed[k->data];
     if (fl > n_valid - 1) {
         fl = 0;
     }
     if (n_valid - 1 > fl) {
-        const size_t b0 = (size_t) fl * 1024, nb = (size_t) (n_valid - 1 - fl) * 1024;
+        const size_t b0 = (size_t) fl * pos_b, nb = (size_t) (n_valid - 1 - fl) * pos_b;
         if (!xdna_buffer_sync_to_device_range(kbo, nb, koff + b0) ||
             !xdna_buffer_sync_to_device_range(vbo, nb, voff + b0)) {
             return false;
         }
     }
     const int64_t d = p.tail.n_o->ne[0];
-    if (d != XDNA_RES_D) {
+    if (!xdna_fused_width(d)) {
         return false;
     }
     if (!ctx->res) {
@@ -1690,6 +1893,7 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
     in.koff     = koff;
     in.vbo      = vbo;
     in.voff     = voff;
+    in.pos_b    = pos_b;
     in.n_valid  = n_valid;
     in.n_rot    = n_rot;
     in.cosv     = cosv.data();
@@ -1767,40 +1971,125 @@ static bool xdna_host_decode_pin(void) {
 #endif
 }
 
-// The fused designs close on one residual width (XDNA_RES_D); a chunk without a
-// layer norm (d == 0) leaves the choice to one that has it.
+// Where the decode of a model the fused layers do not take runs.
+static const char * xdna_misfit_route(void) {
+    return xdna_host_decode_threads() > 0 ?
+               "its decode runs on the host" :
+               "the recurrent layers run on the host, the projections and the attention pool keep the NPU";
+}
+
+// The fused designs take a residual width up to XDNA_RES_MAX_D, or only 1024
+// with GGML_XDNA_FUSED_WIDE=0 (xdna_fused_width); a chunk without a layer norm
+// (d == 0) leaves the choice to one that has it.
 static bool xdna_width_fits(int64_t d) {
-    if (d == 0 || d == XDNA_RES_D) {
+    if (d == 0 || xdna_fused_width(d)) {
         return true;
     }
     static bool said = false;
     if (!said) {
         said = true;
-        GGML_LOG_WARN("%s: the fused decode layers are built for a %d-wide residual stream, this model's is %d: %s\n",
-                      "ggml-xdna", XDNA_RES_D, (int) d,
-                      xdna_host_decode_threads() > 0 ?
-                          "its decode runs on the host" :
-                          "the recurrent layers run on the host, the projections and the attention pool keep the NPU");
+        if (xdna_fused_wide()) {
+            GGML_LOG_WARN(
+                "%s: the fused decode layers take a residual width of a multiple of %d up to %d, this "
+                "model's is %d: %s\n",
+                "ggml-xdna", (int) XDNA_ROW_SIDE_FLOATS, (int) XDNA_RES_MAX_D, (int) d, xdna_misfit_route());
+        } else {
+            GGML_LOG_WARN(
+                "%s: with GGML_XDNA_FUSED_WIDE=0 the fused decode layers take a %d-wide residual stream, "
+                "this model's is %d: %s\n",
+                "ggml-xdna", (int) XDNA_FUSED_D, (int) d, xdna_misfit_route());
+        }
+    }
+    return false;
+}
+
+// The fused layers read only their own weight formats (xdna_fused_weight_ok); a chunk with any other is
+// left to the same route as a width they do not take, and one warning names the first such weight.
+static bool xdna_weights_fit(const ggml_cgraph * cgraph) {
+    const ggml_tensor * w = xdna_fused_uncovered(cgraph->nodes, cgraph->n_nodes, xdna_rec_pack::GATED_FMT);
+    if (!w) {
+        return true;
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        GGML_LOG_WARN(
+            "%s: the fused decode layers read ssm_out as %s, the FFN's gate and up as Q4_K and its down as "
+            "Q4_K or Q6_K; this model's %s is %s: %s\n",
+            "ggml-xdna", xdna_rec_pack::GATED_FMT == 0 ? "Q4_K" : "Q5_K or Q6_K", ggml_get_name(w),
+            ggml_type_name(w->type), xdna_misfit_route());
     }
     return false;
 }
 
 static bool xdna_rec_fits(const ggml_cgraph * cgraph) {
-    return xdna_width_fits(xdna_rec_width(cgraph));
+    return xdna_width_fits(xdna_rec_width(cgraph)) && xdna_weights_fit(cgraph);
 }
 
-// A decode (one token a sequence) of a model the fused designs do not cover runs whole
-// on the host; the verdict is kept per model, as a chunk without a layer norm cannot tell.
+// The layer shapes the fused designs run (xdna_layer_census_add): the core's convolution of one pass of value heads
+// up to MAX_PASSES, and the pool's attention of one head group up to XDNA_ATT_MAX_GRPS.
+static const xdna_fused_shapes & xdna_fused_layer_shapes(void) {
+    using namespace xdna_rec_pack;
+    static constexpr int64_t       group = XDNA_ATT_GROUP_H * XDNA_ATT_D;
+    static const xdna_fused_shapes s     = {
+        { channels(NVH), channels(MAX_PASSES * NVH), (int64_t) NVH * SV },
+        XDNA_ATT_D,
+        { group,         XDNA_ATT_MAX_GRPS * group,  group              },
+    };
+    return s;
+}
+
+// Whether a model's layers tell yet if the fused designs run them. At 1024 they are not asked, as before the wider
+// designs; a wider model's tell once a chunk showed a recurrent layer, a layer the designs do not run or a whole layer.
+static bool xdna_layers_known(int64_t d, const xdna_layer_census & c) {
+    return d == XDNA_FUSED_D || c.recurrent || !c.foreign.empty() || c.whole;
+}
+
+// Whether the fused designs run a model of residual width `d` with these layers (at 1024 not asked): a wider one
+// needs a recurrent layer they run and no layer they do not; one warning names what is missing.
+static bool xdna_layers_fit(int64_t d, const xdna_layer_census & c) {
+    if (d == XDNA_FUSED_D || (c.recurrent && c.foreign.empty())) {
+        return true;
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        if (c.recurrent) {
+            GGML_LOG_WARN(
+                "%s: the fused decode layers take Qwen3.5's gated delta net and attention layers with a "
+                "dense FFN, this model's %s is outside them: %s\n",
+                "ggml-xdna", c.foreign.c_str(), xdna_misfit_route());
+        } else {
+            GGML_LOG_WARN(
+                "%s: the fused decode layers take Qwen3.5's gated delta net and attention layers with a "
+                "dense FFN, this model's offloaded layers have no gated delta net: %s\n",
+                "ggml-xdna", xdna_misfit_route());
+        }
+    }
+    return false;
+}
+
+// A decode (one token a sequence) of a model the fused designs do not cover runs whole on the host, with host
+// decode threads. The verdict is kept per model, as a chunk without a layer norm cannot tell, and a wider model's
+// waits until its layers tell; it is reached without threads too, so the same warning names the misfit.
 static bool xdna_wants_host_decode(ggml_backend_xdna_context * ctx, const ggml_cgraph * cgraph) {
-    if (g_glue_n_seq_tokens != 1 || xdna_host_decode_threads() == 0) {
+    if (g_glue_n_seq_tokens != 1) {
         return false;
     }
+    xdna_model_route & r = ctx->model_route[ctx->cur_model];
+    xdna_layer_census_add(r.layers, cgraph->nodes, cgraph->n_nodes, xdna_fused_layer_shapes());
     const int64_t d = xdna_rec_width(cgraph);
     if (d != 0) {
-        ctx->model_misfit[ctx->cur_model] = !xdna_width_fits(d);
+        const bool told = xdna_layers_known(d, r.layers);
+        if (!xdna_width_fits(d) || (told && !xdna_layers_fit(d, r.layers)) || !xdna_weights_fit(cgraph)) {
+            r.known  = true;
+            r.misfit = true;
+        } else if (told) {
+            r.known  = true;
+            r.misfit = false;
+        }
     }
-    const auto it = ctx->model_misfit.find(ctx->cur_model);
-    return it != ctx->model_misfit.end() && it->second;
+    return xdna_host_decode_threads() > 0 && r.known && r.misfit;
 }
 
 static constexpr char XDNA_SYSFS_CPU[]      = "/sys/devices/system/cpu/cpu";
@@ -2032,7 +2321,7 @@ static bool xdna_rec_scan(ggml_backend_xdna_context *  ctx,
             m[il].n_resid = const_cast<ggml_tensor *>(n);
         }
         // cache_s read (GET_ROWS over the state cell), the ssm seed.
-        if (n->op == GGML_OP_GET_ROWS && n->ne[0] == xdna_rec_pack::state_floats() && n->ne[1] == 1) {
+        if (n->op == GGML_OP_GET_ROWS && xdna_rec_state_heads(n->ne[0]) > 0 && n->ne[1] == 1) {
             const ggml_tensor * r = n->src[0];
             if (r && ggml_get_name(r)) {
                 const char * src_name = ggml_get_name(r);
@@ -2057,6 +2346,10 @@ static bool xdna_rec_scan(ggml_backend_xdna_context *  ctx,
         // Single-token, single-sequence decode only (qkv rows == 1).
         if (p.n_qkv->ne[1] != 1 || p.n_qkv->ne[2] != 1 || p.n_qkv->ne[3] != 1) {
             continue;
+        }
+        p.n_vh = xdna_rec_layer_heads(p);
+        if (p.n_vh == 0) {
+            continue;  // a head count the core does not run
         }
         int maxi          = 0;
         // Both projections read the same normed row; it is the fire's input
@@ -2306,8 +2599,8 @@ static void xdna_rec_follow_cache(ggml_backend_xdna_context * ctx, const ggml_cg
         }
         ggml_tensor * ts = cache_s[il];
         ggml_tensor * tr = cache_r[il];
-        const size_t  ns = (size_t) xdna_rec_pack::state_floats();
-        const size_t  nr = (size_t) 3 * xdna_rec_pack::CH;
+        const size_t  ns = xdna_rec_state_n(s);
+        const size_t  nr = xdna_rec_conv_n(s);
         if (ts->type != GGML_TYPE_F32 || tr->type != GGML_TYPE_F32 || !ts->data || !tr->data ||
             ggml_nbytes(ts) < (size_t) (row + 1) * ns * sizeof(float) ||
             ggml_nbytes(tr) < (size_t) (row + 1) * nr * sizeof(float)) {
@@ -2377,14 +2670,14 @@ static bool xdna_rows_f32(const ggml_tensor * w, std::vector<float> & out) {
 }
 
 // The GDN gates' pieces off the graph: gate = softplus(W_a x + dt) * a and
-// beta = sigmoid(W_b x), the weights with NVH rows of the row length each.
+// beta = sigmoid(W_b x), the weights with a row of the row length a value head.
 static bool xdna_gates_of(const xdna_rec_plan & p,
                           std::vector<float> &  wa,
                           std::vector<float> &  wb,
                           std::vector<float> &  dt,
                           std::vector<float> &  a) {
-    using namespace xdna_rec_pack;
-    const ggml_tensor * g = p.n_gate;
+    const int64_t       nvh = p.n_vh;
+    const ggml_tensor * g   = p.n_gate;
     if (!g || g->op != GGML_OP_MUL || !xdna_rec_is_leaf(g->src[1]) || !p.n_beta) {
         return false;
     }
@@ -2402,14 +2695,32 @@ static bool xdna_gates_of(const xdna_rec_plan & p,
         return false;
     }
     const ggml_tensor * mb = xdna_under_views(sg->src[0]);
-    if (!ma || !mb || ma->op != GGML_OP_MUL_MAT || mb->op != GGML_OP_MUL_MAT || ma->src[0]->ne[0] != XDNA_RES_D ||
-        ma->src[0]->ne[1] != NVH || mb->src[0]->ne[0] != XDNA_RES_D || mb->src[0]->ne[1] != NVH ||
-        ma->src[1] != p.n_act || mb->src[1] != p.n_act || ggml_nelements(add->src[1]) != NVH ||
-        ggml_nelements(g->src[1]) != NVH) {
+    if (!ma || !mb || !p.n_act || ma->op != GGML_OP_MUL_MAT || mb->op != GGML_OP_MUL_MAT ||
+        ma->src[0]->ne[0] != p.n_act->ne[0] || ma->src[0]->ne[1] != nvh || mb->src[0]->ne[0] != p.n_act->ne[0] ||
+        mb->src[0]->ne[1] != nvh || ma->src[1] != p.n_act || mb->src[1] != p.n_act ||
+        ggml_nelements(add->src[1]) != nvh || ggml_nelements(g->src[1]) != nvh) {
         return false;
     }
     return xdna_rows_f32(ma->src[0], wa) && xdna_rows_f32(mb->src[0], wb) && xdna_rows_f32(add->src[1], dt) &&
            xdna_rows_f32(g->src[1], a);
+}
+
+// The layer's in-projection at the head of its stream: one GEMV for a layer
+// of one pass, qkv and z apart past it.
+static bool xdna_rec_set_inproj(xdna_rec_core * core, const xdna_rec_plan & p) {
+    using namespace xdna_rec_pack;
+    const ggml_tensor * wq = p.n_qkv->src[0];
+    const ggml_tensor * wz = p.n_z->src[0];
+    if (p.n_vh > NVH) {
+        xdna_gemv_geom       gq, gz;
+        std::vector<uint8_t> pq, pz;
+        return wq->ne[1] == channels(p.n_vh) && wz->ne[1] == (int64_t) p.n_vh * SV &&
+               xdna_rec_inproj_pack_one(wq, gq, pq) && xdna_rec_inproj_pack_one(wz, gz, pz) &&
+               xdna_rec_core_set_inproj_split(core, gq, pq, gz, pz);
+    }
+    xdna_rec_inproj ip;
+    return xdna_rec_inproj_pack(wq, wz, ip) && ip.n_qkv == channels(p.n_vh) && ip.n_z == p.n_vh * SV &&
+           xdna_rec_core_set_inproj(core, ip.geom, ip.packed);
 }
 
 static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
@@ -2429,6 +2740,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
     if (!s) {
         return false;
     }
+    const int64_t D   = ggml_nelements(p.w_post);  // the residual width
     // Another sequence's token: the state on the device is the one the
     // session last decoded, so it goes back into that sequence's cell and the
     // session reseeds from this one's (the graph read it, since the session
@@ -2440,8 +2752,8 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
     const int64_t row = xdna_rec_seq_row(p);
     if (s->seeded && !xdna_rec_holds(ctx, s, row)) {
         xdna_pending_wait(ctx);
-        const size_t ns = (size_t) state_floats();
-        const size_t nr = (size_t) 3 * CH;
+        const size_t ns = xdna_rec_state_n(s);
+        const size_t nr = xdna_rec_conv_n(s);
         if (!s->own_s || !s->own_r || s->row < 0 || s->own_s_b < (size_t) (s->row + 1) * ns * sizeof(float) ||
             s->own_r_b < (size_t) (s->row + 1) * nr * sizeof(float) ||
             !xdna_rec_core_read_state(s->core, s->own_r + (size_t) s->row * nr, s->own_s + (size_t) s->row * ns)) {
@@ -2461,18 +2773,19 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
     // valid, so they are read live from their tensors.
     const bool    inproj = p.n_act != nullptr;
     const float * act    = inproj && !s->cap_act.empty() ? s->cap_act.data() : nullptr;
-    const float * qkv    = inproj ? nullptr : !s->cap_qkv.empty() ? s->cap_qkv.data() : xdna_rec_tdata(p.n_qkv, CH);
-    const float * z      = inproj ? nullptr : xdna_rec_tdata(p.n_z, (int64_t) NVH * SV);
-    const float * gate   = xdna_rec_tdata(p.n_gate, NVH);
-    const float * beta   = xdna_rec_tdata(p.n_beta, NVH);
+    const int64_t ch_n   = channels(p.n_vh);
+    const float * qkv    = inproj ? nullptr : !s->cap_qkv.empty() ? s->cap_qkv.data() : xdna_rec_tdata(p.n_qkv, ch_n);
+    const float * z      = inproj ? nullptr : xdna_rec_tdata(p.n_z, (int64_t) p.n_vh * SV);
+    const float * gate   = xdna_rec_tdata(p.n_gate, p.n_vh);
+    const float * beta   = xdna_rec_tdata(p.n_beta, p.n_vh);
     if ((inproj ? !act : (!qkv || !z)) || !gate || !beta) {
         GGML_LOG_ERROR("%s: fused layer %d: bad input tensors\n", "ggml-xdna", p.il);
         return false;
     }
 
     if (!s->seeded) {
-        const float * ch = !s->cap_conv.empty() ? s->cap_conv.data() : xdna_rec_tdata(p.n_convst, (int64_t) 3 * CH);
-        const float * st = !s->cap_ss.empty() ? s->cap_ss.data() : xdna_rec_tdata(p.n_sstate, state_floats());
+        const float * ch = !s->cap_conv.empty() ? s->cap_conv.data() : xdna_rec_tdata(p.n_convst, 3 * ch_n);
+        const float * st = !s->cap_ss.empty() ? s->cap_ss.data() : xdna_rec_tdata(p.n_sstate, state_floats(p.n_vh));
         if (!ch || !st) {
             GGML_LOG_ERROR("%s: fused layer %d: no recurrent state to seed\n", "ggml-xdna", p.il);
             return false;
@@ -2481,6 +2794,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
         // keeps the session's device objects and only reloads its state.
         const bool create   = s->core == nullptr;
         s->host.il          = p.il;
+        s->host.n_vh        = p.n_vh;
         s->host.w_conv      = (const float *) p.w_conv->data;
         s->host.w_ssm_norm  = (const float *) p.w_gamma->data;
         s->host.w_post_norm = (const float *) p.w_post->data;
@@ -2493,9 +2807,8 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
 
         // The whole recurrent layer runs on the fused design only when the
         // quantized weight set matches its native layouts (Q4_K/Q5_K/Q6_K
-        // ssm_out, Q4_K gate/up, Q4_K/Q6_K down). A mismatch is a hard error
-        // here: the fused path is the only NPU route for the recurrent layers,
-        // there is no scalar fused fallback.
+        // ssm_out, Q4_K gate/up, Q4_K/Q6_K down). xdna_weights_fit keeps any
+        // other set off this path; this error is the backstop.
         if ((p.w_so->type != GGML_TYPE_Q4_K && p.w_so->type != GGML_TYPE_Q5_K && p.w_so->type != GGML_TYPE_Q6_K) ||
             p.w_gate->type != GGML_TYPE_Q4_K || p.w_up->type != GGML_TYPE_Q4_K ||
             (p.w_down->type != GGML_TYPE_Q4_K && p.w_down->type != GGML_TYPE_Q6_K)) {
@@ -2526,7 +2839,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
         }
 
         xdna_rec_pack_begin(s->host, ch, qkv, s->feed0);
-        xdna_rec_geom                     g = xdna_rec_pack_geom();
+        xdna_rec_geom                     g = xdna_rec_pack_geom(D, p.n_vh);
         // the layer's buffers join the token's command (xdna_run_submit)
         std::unique_ptr<xdna_arena_scope> arena;
         if (create) {
@@ -2557,9 +2870,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
             // and the same hardware context; this makes them one stream, so the
             // array pays its fixed per-phase cost once instead of twice.
             if (inproj) {
-                xdna_rec_inproj ip;
-                if (!xdna_rec_inproj_pack(p.n_qkv->src[0], p.n_z->src[0], ip) || ip.n_qkv != CH || ip.n_z != NVH * SV ||
-                    !xdna_rec_core_set_inproj(s->core, ip.geom, ip.packed)) {
+                if (!xdna_rec_set_inproj(s->core, p)) {
                     GGML_LOG_ERROR(
                         "%s: fused layer %d: the in-projection (%s, %s) "
                         "does not split into the core's inputs; "
@@ -2574,8 +2885,8 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
             float               eps_a = 0.0f, eps_p = 0.0f;
             const ggml_tensor * xn = p.n_act;
             if (inproj && xn && xn->op == GGML_OP_MUL && xn->src[0] && xn->src[0]->op == GGML_OP_RMS_NORM &&
-                xn->src[1] && xn->src[1]->type == GGML_TYPE_F32 && ggml_nelements(xn->src[1]) == XDNA_RES_D &&
-                xdna_norm_eps(cgraph, p.w_post, &eps_p)) {
+                xn->src[1] && xn->src[1]->type == GGML_TYPE_F32 && ggml_nelements(xn->src[1]) == D && xn->ne[0] == D &&
+                xdna_fused_width(D) && xdna_norm_eps(cgraph, p.w_post, &eps_p)) {
                 memcpy(&eps_a, xn->src[0]->op_params, sizeof(float));
                 if (!ctx->res) {
                     ctx->res = xdna_res_alloc(ctx->device);
@@ -2626,14 +2937,17 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
         s->aq.resize(KGATE);
     }
 
-    const float * hres = !s->cap_hres.empty() ? s->cap_hres.data() : xdna_rec_tdata(p.n_hres, D_OUT);
+    // The capture is this graph's only when the residual's producer is in it; a graph an eval
+    // callback split before the layer would otherwise read the previous token's.
+    const bool    captured = p.i_cap_hres >= 0 && !s->cap_hres.empty();
+    const float * hres     = captured ? s->cap_hres.data() : xdna_rec_tdata(p.n_hres, D);
     if (!hres) {
         GGML_LOG_ERROR("%s: fused layer %d: bad residual input\n", "ggml-xdna", p.il);
         return false;
     }
 
     xdna_prof::section_timer st_pre("layer: host pre (pack_x + ffn prep_raw)");
-    xdna_rec_pack_x(gate, beta, s->x);
+    xdna_rec_pack_x(gate, beta, s->x, p.n_vh);
     const int t = s->core->token;
 
     // With the projection draining into the FFN's tiles, the host's half of
@@ -2650,8 +2964,8 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
             return false;
         }
         float * r = (float *) ctx->res->data;
-        std::memcpy(r + XDNA_RES_F / 4, hres, D_OUT * sizeof(float));
-        std::memset(r + XDNA_RES_A / 4, 0, D_OUT * sizeof(float));
+        std::memcpy(r + XDNA_RES_F / 4, hres, (size_t) D * sizeof(float));
+        std::memset(r + XDNA_RES_A / 4, 0, (size_t) D * sizeof(float));
         if (!xdna_buffer_sync_to_device(ctx->res)) {
             return false;
         }
@@ -2713,7 +3027,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
         // is left on the host between its two dispatches. A null acc says the
         // projection already drained its own into the tiles.
         if (so_to_act) {
-            std::vector<float> ffn_out(D_OUT);
+            std::vector<float> ffn_out((size_t) D);
             // Fused: the FFN already ran, in the core's own dispatch, and left
             // its result in the tail of the activation buffer. Otherwise it is
             // a dispatch of its own and its activation is prepared here.
@@ -2737,7 +3051,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
                 give_up("the FFN accumulator could not be read");
                 return false;
             }
-            for (int i = 0; i < D_OUT; i++) {
+            for (int64_t i = 0; i < D; i++) {
                 s->hattn[i] = hres[i] + s->gv->acc[i];
                 s->hout[i]  = s->hattn[i] + ffn_out[i];
             }
@@ -2747,7 +3061,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
             return false;
         }
     } else {
-        xdna_rec_rms_norm(s->hattn.data(), s->host.w_post_norm, D_OUT, s->eps_post, s->hff.data());
+        xdna_rec_rms_norm(s->hattn.data(), s->host.w_post_norm, (size_t) D, s->eps_post, s->hff.data());
         if (!xdna_rec_gemv_ffn_run(s->gv, s->hff.data(), s->hattn.data(), s->hout.data())) {
             give_up("the FFN dispatch failed");
             return false;
@@ -2762,8 +3076,8 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
         ctx->res_resid = p.n_resid;
         ctx->res_dirty = true;
     } else {
-        std::memcpy(p.n_resid->data, s->hattn.data(), D_OUT * sizeof(float));
-        std::memcpy(p.n_lout->data, s->hout.data(), D_OUT * sizeof(float));
+        std::memcpy(p.n_resid->data, s->hattn.data(), (size_t) D * sizeof(float));
+        std::memcpy(p.n_lout->data, s->hout.data(), (size_t) D * sizeof(float));
     }
 
     // Mark the whole conv/gdn/ffn subgraph consumed (fire .. l_out).
@@ -2974,7 +3288,7 @@ static void xdna_model_use(ggml_backend_xdna_context * ctx, const void * model) 
 // releases it.
 static void xdna_model_drop(ggml_backend_xdna_context * ctx, const void * model) {
     std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
-    ctx->model_misfit.erase(model);
+    ctx->model_route.erase(model);
     if (model == ctx->cur_model) {
         xdna_model_objs_free(ctx);
         return;
@@ -3035,7 +3349,7 @@ static void xdna_release_model_state(ggml_backend_xdna_context * ctx) {
     }
     ctx->parked.clear();
     ctx->cur_model = nullptr;
-    ctx->model_misfit.clear();
+    ctx->model_route.clear();
     xdna_att_free(ctx->att);
     ctx->att = nullptr;
     ctx->att_flushed.clear();
@@ -3244,6 +3558,14 @@ static bool xdna_weight_here(const struct ggml_tensor * w) {
            ggml_backend_buffer_get_type(w->buffer) == ggml_backend_xdna_device_get_buffer_type(nullptr);
 }
 
+// A MUL_MAT that runs on the prefill GEMM in this graph, as xdna_ops_compute
+// routes it. A fusion that lays its result out as a reader's A leaves its own
+// node unwritten, which a one-row reader the isolation mode or a GEMV group
+// takes would read: llama crops a prompt's last layer to its output rows.
+static bool xdna_takes_pgemm(const xdna_ops * ops, const struct ggml_tensor * t) {
+    return xdna_ops_supported(ops, t) && ops->gemv_group_of.count(t) == 0 && xdna_pgemm_supported(t);
+}
+
 static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx, struct ggml_cgraph * cgraph) {
     if (!ctx->device) {
         return GGML_STATUS_SUCCESS;
@@ -3296,11 +3618,13 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // below and replaces its conv/gdn/ffn subgraph with one persistent device
     // run.
     xdna_rec_follow_cache(ctx, cgraph);
-    // A model the fused designs do not cover keeps the per-op route for its
+    // A model the fused designs do not cover, by this chunk's width or
+    // weights or by its layer census, keeps the per-op route for its
     // recurrent bodies while the projections stay on the array (the GEMV
     // groups the isolation mode plans): rec_serve is what the fused runs are
     // gated on, not xdna_rec_active, which still describes the decode mode.
-    const bool                 rec_serve = xdna_rec_active() && xdna_rec_fits(cgraph);
+    const bool rec_serve =
+        xdna_rec_active() && xdna_route_fused(ctx->model_route[ctx->cur_model], xdna_rec_fits(cgraph));
     std::vector<xdna_rec_plan> rec_plans;
     if (rec_serve) {
         xdna_rec_scan(ctx, cgraph, rec_plans);
@@ -3545,7 +3869,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             consumed.insert(up);
             glu_fused.insert(node);
             if (uses[node] == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-                xdna_pgemm_glu_fused_supported(node, reader[node])) {
+                xdna_pgemm_glu_fused_supported(node, reader[node]) && xdna_takes_pgemm(&ctx->ops, reader[node])) {
                 glu_to_a.insert(node);
             }
         }
@@ -3639,7 +3963,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
         };
         for (int i = 0; i < cgraph->n_nodes; i++) {
             struct ggml_tensor * gd = cgraph->nodes[i];
-            if (gd->op != GGML_OP_GATED_DELTA_NET || !xdna_gdn_mm_supported(gd)) {
+            if (gd->op != GGML_OP_GATED_DELTA_NET || !xdna_gdn_mm_supported(gd) || !xdna_gdn_mm_one_run(gd)) {
                 continue;
             }
             l2_of                q2, k2;
@@ -3833,8 +4157,8 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             const auto & rd = readers[m];
             bool         ok = !rd.empty() && xdna_weight_here(m->src[1]);
             for (const struct ggml_tensor * t : rd) {
-                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == m && t->src[0] != m && xdna_pgemm_supported(t) &&
-                     xdna_weight_here(t->src[0]);
+                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == m && t->src[0] != m &&
+                     xdna_takes_pgemm(&ctx->ops, t) && xdna_weight_here(t->src[0]);
             }
             if (ok) {
                 norm_a.insert(m);
@@ -3877,7 +4201,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                 ok = ok && !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
             }
             for (const struct ggml_tensor * t : readers[v]) {
-                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == v && xdna_pgemm_supported(t);
+                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == v && xdna_takes_pgemm(&ctx->ops, t);
             }
             // the GDN output the norm reads: left where the array wrote it when
             // nothing else reads its rows (xdna_gdn_mm_keep)
@@ -3945,7 +4269,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                 ok = ok && readers[c].size() == 1 && !consumed.count(c) && !(c->flags & GGML_TENSOR_FLAG_OUTPUT);
             }
             for (const struct ggml_tensor * t : readers[g]) {
-                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == g && xdna_pgemm_supported(t);
+                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == g && xdna_takes_pgemm(&ctx->ops, t);
             }
             if (ok) {
                 gate_a.insert(g);
@@ -4024,27 +4348,27 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             if (s && node->type == GGML_TYPE_F32 && node->data) {
                 switch (c.kind) {
                     case 0:  // qkv
-                        s->cap_qkv.resize(xdna_rec_pack::CH);
-                        std::memcpy(s->cap_qkv.data(), node->data, xdna_rec_pack::CH * sizeof(float));
+                        s->cap_qkv.resize((size_t) xdna_rec_pack::channels(c.p->n_vh));
+                        std::memcpy(s->cap_qkv.data(), node->data, s->cap_qkv.size() * sizeof(float));
                         break;
                     case 1:  // conv seed (only consumed at the one-time seed)
                         if (reseed) {
-                            s->cap_conv.resize((size_t) 3 * xdna_rec_pack::CH);
-                            std::memcpy(s->cap_conv.data(), node->data, (size_t) 3 * xdna_rec_pack::CH * sizeof(float));
+                            s->cap_conv.resize((size_t) 3 * xdna_rec_pack::channels(c.p->n_vh));
+                            std::memcpy(s->cap_conv.data(), node->data, s->cap_conv.size() * sizeof(float));
                         }
                         break;
                     case 2:
                         {  // ssm seed (only consumed at the one-time seed)
-                            const int64_t n = xdna_rec_pack::state_floats();
+                            const int64_t n = xdna_rec_pack::state_floats(c.p->n_vh);
                             if (reseed) {
                                 s->cap_ss.resize((size_t) n);
                                 std::memcpy(s->cap_ss.data(), node->data, (size_t) n * sizeof(float));
                             }
                             break;
                         }
-                    case 3:  // residual h
-                        s->cap_hres.resize(xdna_rec_pack::D_OUT);
-                        std::memcpy(s->cap_hres.data(), node->data, xdna_rec_pack::D_OUT * sizeof(float));
+                    case 3:  // residual h, the residual width
+                        s->cap_hres.resize((size_t) ggml_nelements(c.p->w_post));
+                        std::memcpy(s->cap_hres.data(), node->data, s->cap_hres.size() * sizeof(float));
                         break;
                     case 4:  // the in-projection's input
                         s->cap_act.resize((size_t) node->ne[0]);
@@ -4649,9 +4973,13 @@ static ggml_backend_t ggml_backend_xdna_device_init_backend(ggml_backend_dev_t d
 namespace {
 
 struct xdna_host_bo_entry {
-    xdna_buffer * bo;
-    size_t        bytes;
+    xdna_buffer *                   bo;
+    size_t                          bytes;
+    std::map<size_t, xdna_buffer *> views;  // by start (xdna_host_bo_reach)
 };
+
+// A view starts on a page.
+constexpr size_t XDNA_HOST_VIEW_ALIGN = 4096;
 
 }  // namespace
 
@@ -4665,12 +4993,10 @@ static std::map<uintptr_t, xdna_host_bo_entry> & xdna_host_bos(void) {
     return m;
 }
 
-// The BO a host pointer of this buffer type lies in, and its byte offset
-// there; null when the pointer is not in one.
-xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset) {
-    std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
-    auto &                      m  = xdna_host_bos();
-    auto                        it = m.upper_bound((uintptr_t) p);
+// The entry a host pointer lies in and its byte offset there, under xdna_host_bo_mu.
+static xdna_host_bo_entry * xdna_host_bo_entry_of(const void * p, size_t * offset) {
+    auto & m  = xdna_host_bos();
+    auto   it = m.upper_bound((uintptr_t) p);
     if (it == m.begin()) {
         return nullptr;
     }
@@ -4679,10 +5005,54 @@ xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset) {
     if (off >= it->second.bytes) {
         return nullptr;
     }
-    if (offset) {
-        *offset = (size_t) off;
+    *offset = (size_t) off;
+    return &it->second;
+}
+
+// The BO a host pointer of this buffer type lies in, and its byte offset
+// there; null when the pointer is not in one.
+xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset) {
+    std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
+    size_t                      off = 0;
+    xdna_host_bo_entry *        e   = xdna_host_bo_entry_of(p, &off);
+    if (e && offset) {
+        *offset = off;
     }
-    return it->second.bo;
+    return e ? e->bo : nullptr;
+}
+
+// As xdna_host_bo_of, for a run that addresses `reach` bytes from the pointer:
+// past a descriptor's 32-bit offset, a view of the BO from the pointer's page
+// instead, kept until the BO is freed.
+xdna_buffer * xdna_host_bo_reach(const void * p, size_t reach, size_t * offset) {
+    std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
+    size_t                      off = 0;
+    xdna_host_bo_entry *        e   = xdna_host_bo_entry_of(p, &off);
+    if (!e) {
+        return nullptr;
+    }
+    if (off + reach <= UINT32_MAX) {
+        *offset = off;
+        return e->bo;
+    }
+    const size_t base = off / XDNA_HOST_VIEW_ALIGN * XDNA_HOST_VIEW_ALIGN;
+    auto         it   = e->views.find(base);
+    if (it == e->views.end()) {
+        xdna_buffer * view = xdna_buffer_sub(e->bo, base, e->bytes - base);
+        if (!view) {
+            return nullptr;  // xdna-runtime names the view
+        }
+        it = e->views.emplace(base, view).first;
+    }
+    *offset = off - base;
+    return it->second;
+}
+
+static void xdna_host_bo_free_views(xdna_host_bo_entry & e) {
+    for (auto & kv : e.views) {
+        xdna_buffer_free(kv.second);
+    }
+    e.views.clear();
 }
 
 static void xdna_hb_free(ggml_backend_buffer_t buffer) {
@@ -4692,13 +5062,28 @@ static void xdna_hb_free(ggml_backend_buffer_t buffer) {
     }
     {
         std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
-        xdna_host_bos().erase((uintptr_t) bo->data);
+        auto                        it = xdna_host_bos().find((uintptr_t) bo->data);
+        if (it != xdna_host_bos().end()) {
+            xdna_host_bo_free_views(it->second);
+            xdna_host_bos().erase(it);
+        }
     }
     xdna_buffer_free(bo);
 }
 
 static void * xdna_hb_base(ggml_backend_buffer_t buffer) {
     return ((xdna_buffer *) buffer->context)->data;
+}
+
+// A host write into a cache outside a graph (a state restore): the decode attention flushes its rows from the first again.
+static void xdna_att_unflush(ggml_backend_buffer_t buffer) {
+    if (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_ANY) {
+        return;  // weights and graph buffers hold no cache
+    }
+    ggml_backend_xdna_context *           ctx  = ggml_xdna_device_context();
+    const char *                          base = (const char *) xdna_hb_base(buffer);
+    std::lock_guard<std::recursive_mutex> lock(ctx->compute_mutex);
+    ctx->att_flushed.erase(ctx->att_flushed.lower_bound(base), ctx->att_flushed.lower_bound(base + buffer->size));
 }
 
 // The fused decode keeps a sequence's recurrent state on the array between
@@ -4720,13 +5105,16 @@ static void xdna_rec_follow_io(const void * p, size_t n, bool write) {
     std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
     const char * const a0     = (const char *) p;
     const char * const a1     = a0 + n;
-    const size_t       ns     = (size_t) xdna_rec_pack::state_floats();
-    const size_t       nr     = (size_t) 3 * xdna_rec_pack::CH;
     bool               waited = false;
     const auto         visit  = [&](std::map<std::pair<int, int64_t>, xdna_rec_session *> & rec) {
         for (auto & kv : rec) {
             xdna_rec_session * s = kv.second;
-            if (!s || !s->seeded || !s->own_s || !s->own_r || s->row < 0 ||
+            if (!s) {
+                continue;
+            }
+            const size_t ns = xdna_rec_state_n(s);
+            const size_t nr = xdna_rec_conv_n(s);
+            if (!s->seeded || !s->own_s || !s->own_r || s->row < 0 ||
                 s->own_s_b < (size_t) (s->row + 1) * ns * sizeof(float) ||
                 s->own_r_b < (size_t) (s->row + 1) * nr * sizeof(float)) {
                 continue;
@@ -4764,7 +5152,7 @@ static void xdna_hb_memset(ggml_backend_buffer_t buffer,
                            uint8_t               value,
                            size_t                offset,
                            size_t                size) {
-    GGML_UNUSED(buffer);
+    xdna_att_unflush(buffer);
     xdna_rec_follow_io((char *) tensor->data + offset, size, true);
     memset((char *) tensor->data + offset, value, size);
 }
@@ -4774,10 +5162,11 @@ static void xdna_hb_set(ggml_backend_buffer_t buffer,
                         const void *          data,
                         size_t                offset,
                         size_t                size) {
-    GGML_UNUSED(buffer);
+    xdna_att_unflush(buffer);
     xdna_rec_follow_io(data, size, false);  // a copy out of another seeded row
     xdna_rec_follow_io((char *) tensor->data + offset, size, true);
     memcpy((char *) tensor->data + offset, data, size);
+    xdna_stale_kv_note(tensor, offset, size);
 }
 
 static void xdna_hb_get(ggml_backend_buffer_t      buffer,
@@ -4791,8 +5180,8 @@ static void xdna_hb_get(ggml_backend_buffer_t      buffer,
 }
 
 static bool xdna_hb_cpy(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
-    GGML_UNUSED(buffer);
     if (ggml_backend_buffer_is_host(src->buffer)) {
+        xdna_att_unflush(buffer);
         xdna_rec_follow_io(src->data, ggml_nbytes(src), false);
         xdna_rec_follow_io(dst->data, ggml_nbytes(src), true);
         memcpy(dst->data, src->data, ggml_nbytes(src));
@@ -4802,6 +5191,7 @@ static bool xdna_hb_cpy(ggml_backend_buffer_t buffer, const struct ggml_tensor *
 }
 
 static void xdna_hb_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    xdna_att_unflush(buffer);
     xdna_rec_follow_io(xdna_hb_base(buffer), buffer->size, true);
     memset(xdna_hb_base(buffer), value, buffer->size);
 }
@@ -4838,7 +5228,7 @@ static ggml_backend_buffer_t xdna_hbt_alloc(ggml_backend_buffer_type_t buft, siz
     }
     {
         std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
-        xdna_host_bos()[(uintptr_t) bo->data] = { bo, bo->bytes };
+        xdna_host_bos()[(uintptr_t) bo->data] = { bo, bo->bytes, {} };
     }
     return ggml_backend_buffer_init(buft, xdna_hb_iface, bo, size);
 }
@@ -4958,7 +5348,9 @@ static ggml_backend_dev_t ggml_backend_xdna_reg_get_device(ggml_backend_reg_t re
 
 static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
+    if (std::strcmp(name, "ggml_backend_xdna_test_stale_kv") == 0) {
+        return (void *) xdna_test_stale_kv;
+    }
     return NULL;
 }
 

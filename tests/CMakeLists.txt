@@ -669,15 +669,32 @@ if (GGML_XDNA)
     llama_build_and_test(test-xdna-graph.cpp)
     # Two llama contexts computing at once (-m model.gguf).
     llama_build_and_test(test-xdna-contexts.cpp     LABEL "model")
-    # A sequence's state saved and restored around other tokens (-m model.gguf).
+    # A sequence's state saved and restored around other tokens, and two
+    # sequences in one unified cache (-m model.gguf).
     llama_build_and_test(test-xdna-state.cpp        LABEL "model")
     # Every thread's CPU mask unchanged by the pinned host decode (-m model.gguf).
     llama_build_and_test(test-xdna-affinity.cpp     LABEL "model")
+    # A model's recurrent layers, prefill and decode, against the CPU backend
+    # (-m model.gguf; probes/gdn_widen_model.py makes one of 32 value heads).
+    llama_build_and_test(test-xdna-gdn.cpp          LABEL "model")
+    # A fused decode watched through an eval callback against the unwatched
+    # one (-m model.gguf).
+    llama_build_and_test(test-xdna-observe.cpp      LABEL "model")
+    # A context made after another was freed, while a third stays alive, against
+    # the third's tokens (-m model.gguf [-c n_ctx]).
+    llama_build_and_test(test-xdna-kv-reuse.cpp     LABEL "model")
     # The host-only backend tests are built with the backend
     # (ggml/src/ggml-xdna/CMakeLists.txt); they need no model and no device.
     foreach(t test-xdna-repack test-xdna-head-rows test-xdna-match)
         if (TARGET ${t})
             add_test(NAME ${t} COMMAND ${t} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+        endif()
+    endforeach()
+    # The FFN pair and the fused attention layer on the device against the
+    # CPU, self-skipping; no model.
+    foreach(t test-xdna-pair test-xdna-att-layer)
+        if (TARGET ${t})
+            add_test(NAME ${t} COMMAND ${t})
         endif()
     endforeach()
 endif()

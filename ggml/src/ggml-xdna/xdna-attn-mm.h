@@ -1,7 +1,8 @@
 #pragma once
 
-// Prefill attention on the mmul (kernels/attn_mm.py) for Qwen3.5's six
-// full-attention layers: GGML_OP_FLASH_ATTN_EXT with 8 query heads, 2 KV heads,
+// Prefill attention on the mmul (kernels/attn_mm.py) for Qwen3.5's
+// full-attention layers: GGML_OP_FLASH_ATTN_EXT with 8 query heads over 2 KV
+// heads a call - a head group; the 4B's and 9B's 16 over 4 are two calls -
 // D = 256, scale 1/16 and a plain causal mask, the f16 cache in llama's own
 // layout. GGML_XDNA_FA_MM=0 leaves it to the host.
 
@@ -19,7 +20,8 @@ bool xdna_attn_mm_run(struct xdna_kernel_pool * pool, struct ggml_tensor * node)
 
 // The output left where the array wrote it, for a reader that takes its
 // rows from there (xdna_pgemm_run_gate): planned per graph with
-// xdna_attn_mm_keep, the run of such a node writes nothing into its node.
+// xdna_attn_mm_keep, the run of such a node of one head group writes nothing
+// into its node.
 // Token t, head h's 256 values are two halves of 128 (xdna_attn_mm_row, the
 // second O_OBJ = 4096 floats after the first) until the next run;
 // xdna_attn_mm_materialize
