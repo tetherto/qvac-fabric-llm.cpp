@@ -75,10 +75,8 @@ xdna_device * xdna_device_open(void) {
     xdna_device * dev = new xdna_device;
     try {
         dev->device      = xrt::device(0);
-        // one NPU per system: named like the other backends' devices (CUDA0,
-        // Vulkan0), so --device takes it unquoted; XRT's name goes in the
-        // description
-        dev->name        = "XDNA0";
+        // XRT's name goes in the description
+        dev->name        = XDNA_DEVICE_NAME;
         dev->description = dev->device.get_info<xrt::info::device::name>() + " (" +
                            dev->device.get_info<xrt::info::device::bdf>() + ")";
     } catch (const std::exception & e) {

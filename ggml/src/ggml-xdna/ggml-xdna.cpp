@@ -4666,8 +4666,7 @@ bool ggml_backend_is_xdna(ggml_backend_t backend) {
 
 static const char * ggml_backend_xdna_device_get_name(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
-    // the name xdna_device_open gives the device
-    return xdna_npu_probe().present ? "XDNA0" : "XDNA";
+    return xdna_npu_probe().present ? XDNA_DEVICE_NAME : "XDNA";
 }
 
 static const char * ggml_backend_xdna_device_get_description(ggml_backend_dev_t dev) {

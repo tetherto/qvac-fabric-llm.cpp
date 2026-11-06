@@ -11,6 +11,10 @@
 
 // --- device ----------------------------------------------------------------
 
+// The NPU's device name. One NPU per system, named like the other backends'
+// devices (CUDA0, Vulkan0), so --device takes it unquoted.
+constexpr const char * XDNA_DEVICE_NAME = "XDNA0";
+
 // Open the first NPU. Returns nullptr when no device is available.
 xdna_device * xdna_device_open(void);
 
