@@ -681,7 +681,7 @@ struct mtmd_helper_video {
             ffprobe_bin.c_str(),
             "-v", "quiet",
             "-show_entries", "stream=width,height,r_frame_rate,nb_frames,duration",
-            "-select_streams", "v:0",
+            "-select_streams", "V:0", // V: not an attached picture (cover art)
             "-of", "default=noprint_wrappers=1",
             input_arg,
             nullptr,
@@ -797,7 +797,7 @@ struct mtmd_helper_video {
 
         // decode the stream that probe() sized (and checked against max_pixels), not the one ffmpeg would pick
         cmd.push_back("-map");
-        cmd.push_back("0:v:0");
+        cmd.push_back("0:V:0");
 
         if (fps_target > 0.0f) {
             snprintf(fps_buf, sizeof(fps_buf), "fps=%.6f", fps_target);

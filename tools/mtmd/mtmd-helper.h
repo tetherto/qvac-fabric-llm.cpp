@@ -36,7 +36,7 @@ MTMD_API struct mtmd_helper_video_init_params mtmd_helper_video_init_params_defa
 // opt for mtmd_helper_bitmap_init_from_*()
 struct mtmd_helper_init_opt {
     struct mtmd_helper_video_init_params video_params;
-    // decode limits, checked before anything is allocated or decoded; 0 means no limit
+    // decode limits, checked before the decoded output is allocated; 0 means no limit
     // an input over a limit fails with MTMD_HELPER_BITMAP_AUDIO_TOO_LONG or MTMD_HELPER_BITMAP_IMAGE_TOO_LARGE
     uint64_t max_audio_frames; // mono samples at the model's audio sample rate (mtmd_get_audio_sample_rate)
     uint64_t max_image_pixels; // width * height of an image, a webp, or each video frame (with video_params.max_frame_pixels, the lower one applies)
@@ -57,7 +57,7 @@ enum mtmd_helper_bitmap_status {
     MTMD_HELPER_BITMAP_OK = 0,
     MTMD_HELPER_BITMAP_FAILED,          // unreadable or unsupported input
     MTMD_HELPER_BITMAP_AUDIO_TOO_LONG,  // over mtmd_helper_init_opt.max_audio_frames
-    MTMD_HELPER_BITMAP_IMAGE_TOO_LARGE, // over mtmd_helper_init_opt.max_image_pixels
+    MTMD_HELPER_BITMAP_IMAGE_TOO_LARGE, // over mtmd_helper_init_opt.max_image_pixels or video_params.max_frame_pixels
 };
 
 struct mtmd_helper_bitmap_wrapper {
@@ -85,7 +85,7 @@ MTMD_API struct mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_file(
 //   - for now, video input is only supported via C++ helper functions
 //   - audio files will be auto-detected based on magic bytes
 //   - output bitmap will have SHA-256 hash (hex string) as the ID
-//   - opt.max_audio_frames and opt.max_image_pixels are compared with the length or size the decoder itself reads from the input, before it allocates or decodes
+//   - opt.max_audio_frames and opt.max_image_pixels are compared with the length or size the decoder itself reads from the input, before the decoded output is allocated (an MP3 without a Xing frame is decoded once to count its length)
 // returns nullptr on failure, with the reason in status
 // this function is thread-safe
 MTMD_API struct mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(
