@@ -20185,7 +20185,8 @@ static bool ggml_vk_supports_mul_mat_convrot(const vk_device & device, const ggm
     const auto & limits = device->properties.limits;
 
     // the shaders read activations and I8 weights through uint[] arrays
-    const bool aligned = ggml_vk_convrot_word_aligned(a) && ggml_vk_convrot_word_aligned(w) &&
+    const bool aligned = ggml_vk_op_views_aligned(device, op) &&
+                         ggml_vk_convrot_word_aligned(a) && ggml_vk_convrot_word_aligned(w) &&
                          ggml_vk_convrot_word_aligned(s) && ggml_vk_convrot_word_aligned(op);
 
     // rows, columns and batches map to X/Y/Z workgroups without a split-dispatch path
