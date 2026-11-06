@@ -5500,6 +5500,8 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
     if (!ctx->device || !ctx->pool) {
         return false;
     }
+    // the plan state the checks read is rewritten by another context's compute
+    std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
 
     // Claim the native NPU ops plus the whitelisted cheap ops of the fused
     // recurrent layer, so the decode chunk stays whole and the glue can host

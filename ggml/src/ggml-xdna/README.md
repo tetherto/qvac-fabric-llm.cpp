@@ -669,7 +669,7 @@ Diagnostics - nothing is measured unless they are set:
   toolchain bump has to be paired with re-reading those constants.
 - All llama contexts in a process share one backend context. Their graph
   computes take turns on it (the array runs one command stream at a time
-  anyway).
+  anyway), and one context's support queries wait for another's compute.
 - The device reports itself to the scheduler as an integrated GPU: its buffers
   are host memory, and the free memory it reports is the system's
   `MemAvailable`, which the CPU and any other device on host memory draw from
