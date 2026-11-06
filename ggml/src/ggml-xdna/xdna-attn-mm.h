@@ -1,9 +1,12 @@
 #pragma once
 
-// Prefill attention on the mmul (kernels/attn_mm.py) for Qwen3.5's six
-// full-attention layers: GGML_OP_FLASH_ATTN_EXT with 8 query heads, 2 KV heads,
-// D = 256, scale 1/16 and a plain causal mask, the f16 cache in llama's own
-// layout. GGML_XDNA_FA_MM=0 leaves it to the host.
+// Prefill attention on the mmul (kernels/attn_mm.py): GGML_OP_FLASH_ATTN_EXT
+// with 2 KV heads of 256 (Qwen3.5's six full-attention layers, EmbeddingGemma
+// 2's sliding-window layers), f32 Q and f16 K and V in llama's own layouts, and
+// a mask that shows each row one run of keys: a causal or bidirectional or
+// banded one, packed sequences, the cache rows before a ubatch. Which calls
+// are worth it is a size rule (xdna-attn-mm.cpp); GGML_XDNA_FA_MM=0 leaves
+// them all to the host.
 
 #include <stddef.h>
 
@@ -11,7 +14,7 @@ struct ggml_tensor;
 struct xdna_kernel_pool;
 
 // True when `node` is an attention the design covers (the mask is checked,
-// not assumed) and the artifact is present.
+// not assumed), large enough to repay the call, and the artifact is present.
 bool xdna_attn_mm_supported(const struct ggml_tensor * node);
 
 // Run it to completion and write the f32 output.
@@ -44,8 +47,9 @@ void xdna_attn_mm_keep(const struct ggml_tensor * node);
 bool xdna_attn_mm_rows(const struct ggml_tensor * node, struct xdna_attn_rows * rows);
 bool xdna_attn_mm_materialize(const struct ggml_tensor * node);
 
-// Drop what the route keeps across graphs: each layer's K/V copy, keyed by
-// the cache's data pointer, which does not outlive the context that owned it,
-// and the last kept output. Called with the model's last context; the next
-// prefill packs its K/V again.
+// Drop what the route keeps across graphs: the K/V copy's buffer and the last
+// kept output. Called with the model's last context.
 void xdna_attn_mm_release(void);
+
+// Test hook (ggml_backend_xdna_test_attn_kv_copies): the K/V copies the route holds.
+int xdna_attn_mm_kv_copies(void);

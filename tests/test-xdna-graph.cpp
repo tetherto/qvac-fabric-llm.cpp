@@ -15,6 +15,81 @@
 // prefill GEMM): a later graph must not reuse the A an earlier one laid out
 // for the same tensor.
 //
+// A prompt's last layer cropped to its output row, as llama builds it when
+// only the last token's logits are asked for: the FFN of that one row in a
+// prefill graph, on both routes, with the SwiGLU folded into the GEMM and not.
+// The fused route runs one-row projections off the prefill GEMM, so no fusion
+// may leave the norm or the SwiGLU only in such a projection's A.
+//
+// A prefill FLASH_ATTN_EXT in the shapes llama builds - the 8 query heads of
+// Qwen3.5 over a causal cache, and a bidirectional or banded attention of 4
+// query heads with packed sequences, K and V cast to f16 - computed on the
+// array and on the CPU backend. The array answers to ~2e-4 NMSE, the backend's
+// own host kernel (xdna-host-attn.cpp) to ~1e-13 and ggml-cpu's op bit for bit,
+// so the three are told apart: a mask the design cannot follow, or a call too
+// small for the array (the size rule, tried either side of both its bounds),
+// comes out within the host kernel's bound (looser below the 64 queries of
+// ggml-cpu's tile, whose own op is the less exact there). The host kernel is
+// run on heads of 64 to 1024, K and V heads of different sizes, 1 to 32 query
+// heads a KV head, f16 and f32 K and V, causal, bidirectional and banded masks,
+// packed sequences, rows that see nothing, a mask with holes and one with
+// finite values, masks with rows and columns past the queries and keys, and on
+// its portable kernels (GGML_XDNA_HOST_FA=2). Two attentions of one graph whose
+// mask a node rewrites in place between them each get their own mask's answer.
+// An attention through a list of cache rows (ggml_flash_attn_ext_rows), which
+// no route of the backend reads, is ggml-cpu's op on every route.
+// A ubatch on the array whose first token refills a freed cell below the keys
+// the prompt before it packed sees that cell's new key, whether its rows see
+// their keys causally or all of them.
+// Attentions whose K and V the graph casts, at inputs of different lengths,
+// leave the array holding no more K/V copies than the first one did.
+// An output the array writes and the host reads back, left dirty in the host's
+// cache with NaN before the array gets it, reads what the array wrote: a
+// prefill GEMM's staging, the vocabulary projection, the prefill attention, a
+// decode's attention on the pool and GATED_DELTA_NET.
+//
+// BF16 and F16 weight projections, which no quantized route carries, through
+// the bf16 GEMM: an M that fits the decode block, one that takes several
+// prefill blocks, one whose last block is partial and one whose last block
+// holds fewer rows than a sweep of its kernel (it runs a shorter stream); a K
+// of one run, of several and one that ends in a partial run; and, in one
+// graph, projections of different K and N one after the other (the cores hang
+// when consecutive runs differ in their K-loop count).
+// A bf16 block whose first C line the device leaves unwritten is run again, and the op
+// fails once it has been lost more often than the re-runs allow.
+//
+// A prefill projection of a row count that is not a whole 128-row block, its
+// tensors in the backend's own buffers: the array writes the output in place,
+// in whole blocks, into rows the allocation reserves for it, and the tensor
+// that follows it is untouched.
+//
+// Projections of one activation that follow each other (Q, K and V), in the
+// backend's own buffers: one call writes each output into its own tensor, in
+// whole blocks of 128 rows, and the tensor that follows them is untouched.
+//
+// Projections of one activation that ggml orders apart, each followed by its
+// norm (a layer's Q, K and V): the backend, as a scheduler's graph_optimize,
+// moves them next to each other so that one call can run them. The scheduler
+// computes the graph, and so does the CPU. A projection stays where it is when
+// a node between writes into its activation in place, or when its weight is
+// a node of the graph computed after the first projection. The order is the
+// same at every row count, a decode's one included: a scheduler reserved for a
+// prompt computes the layer at 1, 2 and 64 rows without reserving again.
+//
+// A prompt's FFN, down(GLU(gate(x), up(x))) with SWIGLU and with GEGLU: the
+// backend runs the gate and up projections and the activation as one call,
+// writing the product straight into the down projection's input; with the
+// GLU a graph output it writes the product itself. Activations are scaled
+// to put the gate on the activation's curve and, larger, in its tails. Two
+// sizes: EmbeddingGemma 2's (512, 2048) and Qwen3.5-4B's (2560, 9216).
+//
+// Two bf16 projections of one row count whose own cheapest prefill blocks
+// differ run on one block: computed again, the graph changes block no time.
+//
+// A prompt whose last layer is cropped to its output row, built in the graph
+// memory a decode of the same layers used before it, plans as on a fresh
+// context: the decode's GEMV groups do not follow the address into its plan.
+//
 // Every intermediate is cleared before each backend runs, so a node read
 // before it was written shows as zeros instead of as the other backend's
 // result. Skips (exit 0) when no XDNA device is registered.
@@ -23,11 +98,15 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <random>
+#include <string>
 #include <vector>
 
 static ggml_backend_dev_t xdna_device(void) {
@@ -65,6 +144,8 @@ struct norm_graph {
     ggml_cgraph *         gf  = nullptr;
     std::vector<ggml_tensor *> inputs;
     std::vector<ggml_tensor *> checked;  // compared, in graph order
+    int32_t                    out_row = 0;  // what an I32 input (the output-row crop) selects
+    float                      act_scale = 1.0f;  // of the f32 inputs
 };
 
 // K x M activations, an N x K Q4_K projection; side_reader adds SQR(sum)
@@ -119,10 +200,15 @@ static void set_inputs(norm_graph & g, uint32_t seed) {
     std::uniform_real_distribution<float> u(-1.0f, 1.0f);
     for (size_t i = 0; i < g.inputs.size(); i++) {
         ggml_tensor *      t = g.inputs[i];
+        if (t->type == GGML_TYPE_I32) {
+            std::vector<int32_t> rows(ggml_nelements(t), g.out_row);
+            ggml_backend_tensor_set(t, rows.data(), 0, ggml_nbytes(t));
+            continue;
+        }
         std::mt19937       rng((t->type == GGML_TYPE_F32 ? seed : 1234) * 16 + (uint32_t) i);
         std::vector<float> f(ggml_nelements(t));
         for (float & x : f) {
-            x = u(rng);
+            x = u(rng) * (t->type == GGML_TYPE_F32 ? g.act_scale : 1.0f);
         }
         if (t->type == GGML_TYPE_F32) {
             ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
@@ -148,6 +234,11 @@ static bool run(norm_graph & g, ggml_backend_t be, std::vector<std::vector<float
     return true;
 }
 
+static void free_graph(norm_graph & g) {
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
+}
+
 // one Q4_K projection of a single token, the same graph object every run
 static norm_graph build_one_token(ggml_backend_t cpu, int64_t K, int64_t N) {
     norm_graph g;
@@ -165,7 +256,1846 @@ static norm_graph build_one_token(ggml_backend_t cpu, int64_t K, int64_t N) {
     return g;
 }
 
+enum fa_mask { FA_CAUSAL, FA_FULL, FA_BAND, FA_HOLES, FA_BIAS, FA_EMPTY_ROWS };
+
+static const int FA_KV_HEADS = 2;
+static const int FA_HEAD_DIM = 256;
+
+// the array's bf16 answers to ~2e-4, the host kernel's f32 to ~1e-13, ggml-cpu's own op exactly
+static const double FA_ARRAY_NMSE_MIN = 1e-6;
+static const double FA_ARRAY_NMSE_MAX = 1e-3;
+static const double FA_HOST_NMSE_MAX  = 1e-9;
+// ggml-cpu's op below 64 queries (its tile) rounds Q and sums V in f16 and is itself ~1e-6 off the exact value
+static const int    FA_CPU_TILE_QUERIES    = 64;
+static const double FA_HOST_NMSE_UNTILED_MAX = 1e-5;
+// fewer queries than this stay on ggml-cpu's op
+static const int FA_HOST_MIN_QUERIES = 8;
+
+// GGML_XDNA_FA_MM: the host, the array from the size rule's bound, the array whatever the size
+enum fa_route { FA_ROUTE_HOST = 0, FA_ROUTE_BY_SIZE = 1, FA_ROUTE_ARRAY = 2 };
+
+struct fa_case {
+    const char * name;
+    fa_route     route;
+    int          heads;
+    int          n_tokens;
+    int          n_ctx;       // keys of earlier context before the tokens (causal)
+    int          pad;         // the keys round up to a multiple of it, hidden
+    int          seqs;        // equal sequences packed in the ubatch
+    fa_mask      mask;
+    int          window;      // FA_BAND: keys on each side
+    float        scale;
+    bool         cache_view;  // K and V as views of a cache, not a cast
+    bool         on_array;    // expected to run on the array
+    int          head_dim = FA_HEAD_DIM;
+    int          kv_heads = FA_KV_HEADS;
+    bool         kv_f32   = false;
+    int          host_fa  = 1;      // GGML_XDNA_HOST_FA: 0 ggml-cpu, 1 the kernels, 2 the portable ones
+    int          v_dim    = 0;      // head size of V when it is not K's
+    int          mask_extra_rows = 0;  // mask rows past the queries, visible
+    int          mask_extra_cols = 0;  // mask columns past the keys, visible
+    bool         cpu_op   = false;  // a shape the kernel does not take: ggml-cpu's op runs it
+    bool         cast_f32 = false;  // K and V computed in f32 and cast to f16 as the model does with no KV cache
+};
+
+// The graph the model builds around one attention: a projection of n_tokens
+// beside it, so the backend sees a prefill graph and starts a new mask epoch.
+static norm_graph build_fa(ggml_backend_t cpu, const fa_case & c) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    const int64_t n_kv  = ((int64_t) c.n_ctx + c.n_tokens + c.pad - 1) / c.pad * c.pad;
+    const int64_t D     = c.head_dim;
+    const int64_t Dv    = c.v_dim ? c.v_dim : D;
+    const ggml_type kv_type = c.kv_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16;
+
+    ggml_tensor * qr = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, D, c.heads, c.n_tokens);
+    ggml_tensor * q  = ggml_permute(g.ctx, qr, 0, 2, 1, 3);
+    ggml_tensor * kr, *vr, *k, *v;
+    if (c.cache_view) {
+        kr = ggml_new_tensor_3d(g.ctx, kv_type, D, c.kv_heads, n_kv);
+        vr = ggml_new_tensor_3d(g.ctx, kv_type, Dv, c.kv_heads, n_kv);
+        k  = ggml_permute(g.ctx, kr, 0, 2, 1, 3);
+        v  = ggml_permute(g.ctx, vr, 0, 2, 1, 3);
+    } else if (c.cast_f32) {
+        kr = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, D, c.kv_heads, n_kv);
+        vr = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, Dv, c.kv_heads, n_kv);
+        k  = ggml_cast(g.ctx, ggml_permute(g.ctx, kr, 0, 2, 1, 3), GGML_TYPE_F16);
+        v  = ggml_cast(g.ctx, ggml_permute(g.ctx, vr, 0, 2, 1, 3), GGML_TYPE_F16);
+    } else {
+        kr = k = ggml_new_tensor_3d(g.ctx, kv_type, D, n_kv, c.kv_heads);
+        vr = v = ggml_new_tensor_3d(g.ctx, kv_type, Dv, n_kv, c.kv_heads);
+    }
+    ggml_tensor * m  = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, n_kv + c.mask_extra_cols, c.n_tokens + c.mask_extra_rows);
+    ggml_set_input(m);  // as the model's mask is: its spans are kept for the graph
+    ggml_tensor * dw = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, 64);
+    ggml_tensor * dx = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, c.n_tokens);
+    g.inputs         = { qr, kr, vr, m, dw, dx };
+
+    ggml_tensor * out = ggml_flash_attn_ext(g.ctx, q, k, v, m, c.scale, 0.0f, 0.0f);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
+    ggml_set_name(out, "attn");
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    ggml_build_forward_expand(g.gf, ggml_mul_mat(g.ctx, dw, dx));
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+// FA_EMPTY_ROWS: single rows and a run of rows long enough to empty whole items see nothing
+static bool fa_row_empty(int t) {
+    return t % 10 == 3 || (t >= 32 && t < 64);
+}
+
+// which keys a token sees: the same sequence, and the mask's own rule
+static bool fa_visible(const fa_case & c, int t, int j) {
+    const int len = c.n_tokens / c.seqs;
+    const int s_t = std::min(t / len, c.seqs - 1);
+    // keys before n_ctx are the first sequence's earlier positions
+    const bool ctx_key = j < c.n_ctx;
+    const int  jt      = j - c.n_ctx;
+    if (!ctx_key && jt >= c.n_tokens) {
+        return false;
+    }
+    const int s_j  = ctx_key ? 0 : std::min(jt / len, c.seqs - 1);
+    const int p_t  = t - s_t * len + (s_t == 0 ? c.n_ctx : 0);
+    const int p_j  = ctx_key ? j : jt - s_j * len + (s_j == 0 ? c.n_ctx : 0);
+    if (s_t != s_j) {
+        return false;
+    }
+    switch (c.mask) {
+        case FA_CAUSAL: return p_j <= p_t;
+        case FA_FULL:   return true;
+        case FA_BAND:   return std::abs(p_j - p_t) <= c.window;
+        case FA_HOLES:  return j % 2 == 0;
+        case FA_BIAS:   return std::abs(p_j - p_t) <= c.window;
+        case FA_EMPTY_ROWS: return !fa_row_empty(t);
+    }
+    return false;
+}
+
+// what a visible key adds to its score: nothing, or for FA_BIAS a finite value
+static float fa_value(const fa_case & c, int j) {
+    return c.mask == FA_BIAS ? -0.1f * (float) (j % 7) : 0.0f;
+}
+
+static void set_normal(ggml_tensor * t, std::mt19937 & rng, std::normal_distribution<float> & nd) {
+    std::vector<float> f(ggml_nelements(t));
+    for (float & x : f) {
+        x = nd(rng);
+    }
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
+        return;
+    }
+    std::vector<ggml_fp16_t> h(f.size());
+    ggml_fp32_to_fp16_row(f.data(), h.data(), (int64_t) f.size());
+    ggml_backend_tensor_set(t, h.data(), 0, ggml_nbytes(t));
+}
+
+static void set_fa_inputs(norm_graph & g, const fa_case & c) {
+    std::mt19937 rng(77);
+    // q and k are small, as a model that normalises them leaves them: a score of a few
+    std::normal_distribution<float> nd(0.0f, c.scale < 0.5f ? 1.0f : 0.25f);
+    for (size_t i = 0; i < 3; i++) {
+        set_normal(g.inputs[i], rng, nd);
+    }
+    ggml_tensor *            m    = g.inputs[3];
+    const int64_t            n_kv = m->ne[0] - c.mask_extra_cols;
+    std::vector<ggml_fp16_t> mk((size_t) ggml_nelements(m), ggml_fp32_to_fp16(-INFINITY));
+    for (int64_t t = 0; t < m->ne[1]; t++) {
+        for (int64_t j = 0; j < m->ne[0]; j++) {
+            const bool padding = t >= c.n_tokens || j >= n_kv;
+            if (padding || fa_visible(c, (int) t, (int) j)) {
+                mk[(size_t) t * m->ne[0] + j] = ggml_fp32_to_fp16(padding ? 0.0f : fa_value(c, (int) j));
+            }
+        }
+    }
+    ggml_backend_tensor_set(m, mk.data(), 0, ggml_nbytes(m));
+    for (size_t i = 4; i < g.inputs.size(); i++) {
+        std::vector<float> f(ggml_nelements(g.inputs[i]), 0.5f);
+        ggml_backend_tensor_set(g.inputs[i], f.data(), 0, ggml_nbytes(g.inputs[i]));
+    }
+}
+
+// Where a case ran tells in how it differs from ggml-cpu's op: the array in ~2e-4, the host kernel in a
+// rounding that is not 0, and ggml-cpu's own op (the kernel off, or too few queries) in nothing
+static bool fa_result_ok(const fa_case & c, double e) {
+    if (c.on_array) {
+        return e > FA_ARRAY_NMSE_MIN && e < FA_ARRAY_NMSE_MAX;
+    }
+    if (c.host_fa == 0 || c.cpu_op || c.n_tokens < FA_HOST_MIN_QUERIES) {
+        return e == 0.0;
+    }
+    return e > 0.0 && e < (c.n_tokens < FA_CPU_TILE_QUERIES ? FA_HOST_NMSE_UNTILED_MAX : FA_HOST_NMSE_MAX);
+}
+
+static void set_fa_route(fa_route route) {
+    setenv("GGML_XDNA_FA_MM", std::to_string((int) route).c_str(), 1);
+}
+
+// whether `be` takes every cast of the graph's K and V (two at least)
+static bool casts_claimed(ggml_backend_t be, ggml_cgraph * gf) {
+    int n = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->op == GGML_OP_CPY) {
+            n++;
+            if (!ggml_backend_supports_op(be, t)) {
+                return false;
+            }
+        }
+    }
+    return n >= 2;
+}
+
+static bool run_fa(norm_graph & g, const fa_case & c, ggml_backend_t be, std::vector<float> & res) {
+    ggml_backend_buffer_clear(g.buf, 0);
+    set_fa_inputs(g, c);
+    if (ggml_backend_graph_compute(be, g.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    res = get_f32(g.checked[0]);
+    return true;
+}
+
+// Two attentions of one graph that read different masks held in one tensor: a node rewrites the mask in
+// place between them, so both see the same address and shape. A computed mask has nothing to read before the
+// graph runs and no stable content while it does, so neither route may keep an answer for it: both
+// attentions are the host kernel's, each with its own mask.
+static const int FA_MASKS_TOKENS = 300;
+static const int FA_MASKS_WINDOW = 40;
+static const int FA_MASKS_HEADS  = 4;
+
+static std::vector<ggml_fp16_t> fa_masks_values(bool band) {
+    const int                n = FA_MASKS_TOKENS;
+    std::vector<ggml_fp16_t> m((size_t) n * n, ggml_fp32_to_fp16(-INFINITY));
+    for (int t = 0; t < n; t++) {
+        for (int j = 0; j < n; j++) {
+            if (band ? std::abs(j - t) <= FA_MASKS_WINDOW : j <= t) {
+                m[(size_t) t * n + j] = ggml_fp32_to_fp16(0.0f);
+            }
+        }
+    }
+    return m;
+}
+
+struct fa_masks_graph {
+    ggml_context *             ctx = nullptr;
+    ggml_backend_buffer_t      buf = nullptr;
+    ggml_cgraph *              gf  = nullptr;
+    std::vector<ggml_tensor *> in;  // q, k, v, the first mask, the second mask as f32 rows, their row ids, a projection
+    ggml_tensor *              out[2] = {};
+};
+
+static ggml_tensor * add_masked_attention(fa_masks_graph & g, ggml_tensor * q, ggml_tensor * mask) {
+    ggml_tensor * out = ggml_flash_attn_ext(g.ctx, q, g.in[1], g.in[2], mask, 1.0f, 0.0f, 0.0f);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
+    ggml_set_output(out);
+    ggml_build_forward_expand(g.gf, out);
+    return out;
+}
+
+static fa_masks_graph build_fa_masks(ggml_backend_t cpu) {
+    fa_masks_graph   g;
+    const int64_t    n  = FA_MASKS_TOKENS, D = FA_HEAD_DIM;
+    ggml_init_params ip = { ggml_tensor_overhead() * 24 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.in                = { ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, D, FA_MASKS_HEADS, n),
+                            ggml_new_tensor_3d(g.ctx, GGML_TYPE_F16, D, n, FA_KV_HEADS),
+                            ggml_new_tensor_3d(g.ctx, GGML_TYPE_F16, D, n, FA_KV_HEADS),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, n, n),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, n, n),
+                            ggml_new_tensor_1d(g.ctx, GGML_TYPE_I64, n),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, 64),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, n) };
+    g.gf                = ggml_new_graph(g.ctx);
+    ggml_tensor * q     = ggml_permute(g.ctx, g.in[0], 0, 2, 1, 3);
+    g.out[0]            = add_masked_attention(g, q, g.in[3]);
+    g.out[1]            = add_masked_attention(g, q, ggml_set_rows(g.ctx, g.in[3], g.in[4], g.in[5]));
+    ggml_build_forward_expand(g.gf, ggml_mul_mat(g.ctx, g.in[6], g.in[7]));
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+static void set_fa_masks_inputs(fa_masks_graph & g) {
+    const int                       n = FA_MASKS_TOKENS;
+    std::mt19937                    rng(77);
+    std::normal_distribution<float> nd(0.0f, 0.25f);
+    for (int i = 0; i < 3; i++) {
+        set_normal(g.in[i], rng, nd);
+    }
+    const std::vector<ggml_fp16_t> first = fa_masks_values(false), second = fa_masks_values(true);
+    ggml_backend_tensor_set(g.in[3], first.data(), 0, ggml_nbytes(g.in[3]));
+    std::vector<float> rows((size_t) n * n);
+    ggml_fp16_to_fp32_row(second.data(), rows.data(), (int64_t) rows.size());
+    ggml_backend_tensor_set(g.in[4], rows.data(), 0, ggml_nbytes(g.in[4]));
+    std::vector<int64_t> ids(n);
+    for (int i = 0; i < n; i++) {
+        ids[i] = i;
+    }
+    ggml_backend_tensor_set(g.in[5], ids.data(), 0, ggml_nbytes(g.in[5]));
+    for (size_t i = 6; i < g.in.size(); i++) {
+        std::vector<float> f(ggml_nelements(g.in[i]), 0.5f);
+        ggml_backend_tensor_set(g.in[i], f.data(), 0, ggml_nbytes(g.in[i]));
+    }
+}
+
+static bool run_fa_masks(fa_masks_graph & g, ggml_backend_t be, std::vector<float> * res) {
+    ggml_backend_buffer_clear(g.buf, 0);
+    set_fa_masks_inputs(g);
+    if (ggml_backend_graph_compute(be, g.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    for (int i = 0; i < 2; i++) {
+        res[i] = get_f32(g.out[i]);
+    }
+    return true;
+}
+
+static bool test_fa_computed_masks(ggml_backend_t npu, ggml_backend_t cpu, fa_route route) {
+    const char * name = route == FA_ROUTE_ARRAY ? "array route" : "host route";
+    set_fa_route(route);
+    setenv("GGML_XDNA_HOST_FA", "1", 1);
+    fa_masks_graph     g = build_fa_masks(cpu);
+    std::vector<float> want[2], got[2];
+    if (!run_fa_masks(g, cpu, want) || !run_fa_masks(g, npu, got)) {
+        std::printf("test-xdna-graph: compute failed\n");
+        return false;
+    }
+    const bool shared = g.out[0]->src[3]->data == g.out[1]->src[3]->data;
+    bool       ok     = shared;
+    for (int i = 0; i < 2; i++) {
+        const double e    = nmse(want[i], got[i]);
+        const bool   fits = e > 0.0 && e < FA_HOST_NMSE_MAX;
+        ok                = ok && fits;
+        std::printf("FLASH_ATTN_EXT rewritten mask, %-11s attention %d nmse %.3g %s\n", name, i, e, fits ? "ok" : "FAIL");
+    }
+    std::printf("FLASH_ATTN_EXT rewritten mask, %-11s both masks at one address: %s\n", name, shared ? "yes" : "NO FAIL");
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
+    unsetenv("GGML_XDNA_FA_MM");
+    unsetenv("GGML_XDNA_HOST_FA");
+    return ok;
+}
+
+// An attention through a list of cache rows (ggml_flash_attn_ext_rows), the rows backwards: no route of the backend reads the
+// list, so the host kernel, the array (GGML_XDNA_FA_MM=2) and the decode pool each leave it to ggml-cpu's op, bit for bit. The
+// same decode without the list shows the pool runs there.
+static const int FA_ROWS_CACHE = 768;  // the cache's rows and the list's: both pad to one multiple of 256
+static const int FA_ROWS_CTX   = 400;  // keys a prompt's first token sees before its own
+static const int FA_ROWS_HEADS = 8;
+
+struct fa_rows_case {
+    const char * name;
+    fa_route     route;
+    int          n_tokens;
+    bool         rows;     // through the list; else ggml_flash_attn_ext on the cache rows in order
+    bool         on_pool;  // the decode pool runs it
+};
+
+struct fa_rows_graph {
+    ggml_context *             ctx = nullptr;
+    ggml_backend_buffer_t      buf = nullptr;
+    ggml_cgraph *              gf  = nullptr;
+    std::vector<ggml_tensor *> in;  // q, the K cache, the V cache, the mask, the row list, a projection's two inputs
+    ggml_tensor *              out = nullptr;
+};
+
+// in the device's buffers: the decode pool reads K and V only from there
+static fa_rows_graph build_fa_rows(ggml_backend_buffer_type_t buft, const fa_rows_case & c) {
+    fa_rows_graph    g;
+    const int64_t    D  = FA_HEAD_DIM;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.in                = { ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, D, FA_ROWS_HEADS, c.n_tokens),
+                            ggml_new_tensor_3d(g.ctx, GGML_TYPE_F16, D, FA_KV_HEADS, FA_ROWS_CACHE),
+                            ggml_new_tensor_3d(g.ctx, GGML_TYPE_F16, D, FA_KV_HEADS, FA_ROWS_CACHE),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, FA_ROWS_CACHE, c.n_tokens),
+                            ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, FA_ROWS_CACHE),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, 64),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, c.n_tokens) };
+    ggml_set_input(g.in[3]);
+    ggml_tensor * q = ggml_permute(g.ctx, g.in[0], 0, 2, 1, 3);
+    ggml_tensor * k = ggml_permute(g.ctx, g.in[1], 0, 2, 1, 3);
+    ggml_tensor * v = ggml_permute(g.ctx, g.in[2], 0, 2, 1, 3);
+    const float   scale = 0.0625f;
+    g.out = c.rows ? ggml_flash_attn_ext_rows(g.ctx, q, k, v, g.in[3], g.in[4], scale, 0.0f, 0.0f) :
+                     ggml_flash_attn_ext(g.ctx, q, k, v, g.in[3], scale, 0.0f, 0.0f);
+    ggml_prec_set_acc(g.out, GGML_PREC_F32);
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, g.out);
+    ggml_build_forward_expand(g.gf, ggml_mul_mat(g.ctx, g.in[5], g.in[6]));
+    g.buf = ggml_backend_alloc_ctx_tensors_from_buft(g.ctx, buft);
+    return g;
+}
+
+// token t sees list columns [0, FA_ROWS_CTX + t]: causal over the list, the keys of its context first
+static std::vector<ggml_fp16_t> fa_rows_mask(int n_tokens) {
+    std::vector<ggml_fp16_t> m((size_t) FA_ROWS_CACHE * n_tokens, ggml_fp32_to_fp16(-INFINITY));
+    for (int t = 0; t < n_tokens; t++) {
+        std::fill_n(m.begin() + (size_t) t * FA_ROWS_CACHE, FA_ROWS_CTX + t + 1, ggml_fp32_to_fp16(0.0f));
+    }
+    return m;
+}
+
+static std::vector<int32_t> fa_rows_backwards(void) {
+    std::vector<int32_t> rows(FA_ROWS_CACHE);
+    for (int i = 0; i < FA_ROWS_CACHE; i++) {
+        rows[i] = FA_ROWS_CACHE - 1 - i;
+    }
+    return rows;
+}
+
+static void set_fa_rows_inputs(fa_rows_graph & g, const fa_rows_case & c) {
+    std::mt19937                    rng(77);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (int i = 0; i < 3; i++) {
+        set_normal(g.in[i], rng, nd);
+    }
+    const std::vector<ggml_fp16_t> mask = fa_rows_mask(c.n_tokens);
+    const std::vector<int32_t>     rows = fa_rows_backwards();
+    ggml_backend_tensor_set(g.in[3], mask.data(), 0, ggml_nbytes(g.in[3]));
+    ggml_backend_tensor_set(g.in[4], rows.data(), 0, ggml_nbytes(g.in[4]));
+    for (size_t i = 5; i < g.in.size(); i++) {
+        std::vector<float> f(ggml_nelements(g.in[i]), 0.5f);
+        ggml_backend_tensor_set(g.in[i], f.data(), 0, ggml_nbytes(g.in[i]));
+    }
+}
+
+static bool run_fa_rows(fa_rows_graph & g, const fa_rows_case & c, ggml_backend_t be, std::vector<float> & res) {
+    ggml_backend_buffer_clear(g.buf, 0);
+    set_fa_rows_inputs(g, c);
+    if (ggml_backend_graph_compute(be, g.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    res = get_f32(g.out);
+    return true;
+}
+
+static void free_rows_graph(fa_rows_graph & g) {
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
+}
+
+static bool test_fa_kv_rows(ggml_backend_t npu, ggml_backend_t cpu, ggml_backend_buffer_type_t buft) {
+    const fa_rows_case cases[] = {
+        { "prompt, the host kernel",          FA_ROUTE_HOST,  300, true,  false },
+        { "prompt, the array (FA_MM=2)",      FA_ROUTE_ARRAY, 300, true,  false },
+        { "decode",                           FA_ROUTE_HOST,  1,   true,  false },
+        { "decode, no list: the pool",        FA_ROUTE_HOST,  1,   false, true },
+    };
+    setenv("GGML_XDNA_HOST_FA", "1", 1);
+    // every graph kept to the end: the pool syncs a cache's rows to the device once by its address, which a freed one hands on
+    std::vector<fa_rows_graph> graphs;
+    bool                       passed = true;
+    for (const fa_rows_case & c : cases) {
+        set_fa_route(c.route);
+        graphs.push_back(build_fa_rows(buft, c));
+        std::vector<float> want, got;
+        const bool computed = run_fa_rows(graphs.back(), c, cpu, want) && run_fa_rows(graphs.back(), c, npu, got);
+        const double e      = computed ? nmse(want, got) : INFINITY;
+        const bool   ok     = computed && (c.on_pool ? e > 0.0 && e < FA_ARRAY_NMSE_MAX : e == 0.0);
+        passed              = passed && ok;
+        std::printf("FLASH_ATTN_EXT kv_rows, %-30s nmse %.3g %s\n", c.name, e, ok ? "ok" : "FAIL");
+    }
+    for (fa_rows_graph & g : graphs) {
+        free_rows_graph(g);
+    }
+    unsetenv("GGML_XDNA_FA_MM");
+    unsetenv("GGML_XDNA_HOST_FA");
+    return passed;
+}
+
+// The array packs a prompt's keys, cells [0, 600), and a decode writes cell 600; the next ubatch's first token refills freed
+// cell 300 and the rest follow 600. Every query looks for cell 300's new key, so a copy that kept its old key shows; the rows see
+// their keys causally (each still ending at the tail) or all of them.
+static const int   FA_REFILL_CACHE  = 1024;
+static const int   FA_REFILL_PROMPT = 600;
+static const int   FA_REFILL_CELL   = 300;
+static const int   FA_REFILL_TOKENS = 100;
+static const int   FA_REFILL_HEADS  = 8;
+static const float FA_REFILL_SCALE  = 0.0625f;
+static const float FA_REFILL_KEY    = 0.5f;  // the refilled key, along the queries: a score of 8, every other one ~0.25
+static const float FA_REFILL_VALUE  = 3.0f;
+
+struct fa_cache {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor *         k   = nullptr;  // [D, KV heads, cells], f16
+    ggml_tensor *         v   = nullptr;
+};
+
+static fa_cache new_fa_cache(ggml_backend_t cpu) {
+    fa_cache         c;
+    ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
+    c.ctx               = ggml_init(ip);
+    c.k                 = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, FA_HEAD_DIM, FA_KV_HEADS, FA_REFILL_CACHE);
+    c.v                 = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, FA_HEAD_DIM, FA_KV_HEADS, FA_REFILL_CACHE);
+    c.buf               = ggml_backend_alloc_ctx_tensors(c.ctx, cpu);
+    return c;
+}
+
+// cells [c0, c1) of K and V at random, small keys
+static void fill_cells(const fa_cache & c, int c0, int c1, uint32_t seed) {
+    std::mt19937                    rng(seed);
+    std::normal_distribution<float> nk(0.0f, 0.25f), nv(0.0f, 1.0f);
+    const size_t                    row = (size_t) FA_HEAD_DIM * FA_KV_HEADS;
+    std::vector<ggml_fp16_t>        k((c1 - c0) * row), v((c1 - c0) * row);
+    for (size_t i = 0; i < k.size(); i++) {
+        k[i] = ggml_fp32_to_fp16(nk(rng));
+        v[i] = ggml_fp32_to_fp16(nv(rng));
+    }
+    ggml_backend_tensor_set(c.k, k.data(), (size_t) c0 * c.k->nb[2], k.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(c.v, v.data(), (size_t) c0 * c.v->nb[2], v.size() * sizeof(ggml_fp16_t));
+}
+
+// the queries and the refilled key: +-1 by dimension
+static float refill_sign(int d) {
+    return d % 3 == 0 ? -1.0f : 1.0f;
+}
+
+static void refill_cell(const fa_cache & c) {
+    const size_t             row = (size_t) FA_HEAD_DIM * FA_KV_HEADS;
+    std::vector<ggml_fp16_t> k(row), v(row, ggml_fp32_to_fp16(FA_REFILL_VALUE));
+    for (size_t i = 0; i < row; i++) {
+        k[i] = ggml_fp32_to_fp16(FA_REFILL_KEY * refill_sign((int) (i % FA_HEAD_DIM)));
+    }
+    ggml_backend_tensor_set(c.k, k.data(), (size_t) FA_REFILL_CELL * c.k->nb[2], row * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(c.v, v.data(), (size_t) FA_REFILL_CELL * c.v->nb[2], row * sizeof(ggml_fp16_t));
+}
+
+// n_tokens queries over the whole cache; in[0] the queries, in[1] the mask, in[2], in[3] a projection beside it
+static fa_rows_graph build_fa_on_cache(ggml_backend_t cpu, const fa_cache & c, int n_tokens) {
+    fa_rows_graph    g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.in                = { ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, FA_HEAD_DIM, FA_REFILL_HEADS, n_tokens),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, FA_REFILL_CACHE, n_tokens),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, 64),
+                            ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, n_tokens) };
+    ggml_set_input(g.in[1]);
+    ggml_tensor * q = ggml_permute(g.ctx, g.in[0], 0, 2, 1, 3);
+    ggml_tensor * k = ggml_permute(g.ctx, c.k, 0, 2, 1, 3);
+    ggml_tensor * v = ggml_permute(g.ctx, c.v, 0, 2, 1, 3);
+    g.out           = ggml_flash_attn_ext(g.ctx, q, k, v, g.in[1], FA_REFILL_SCALE, 0.0f, 0.0f);
+    ggml_prec_set_acc(g.out, GGML_PREC_F32);
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, g.out);
+    ggml_build_forward_expand(g.gf, ggml_mul_mat(g.ctx, g.in[2], g.in[3]));
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+// row t sees cells [0, last(t)]
+static void set_refill_inputs(fa_rows_graph & g, int n_tokens, int last0, bool causal) {
+    std::vector<float> q(ggml_nelements(g.in[0]));
+    for (size_t i = 0; i < q.size(); i++) {
+        q[i] = refill_sign((int) (i % FA_HEAD_DIM));
+    }
+    ggml_backend_tensor_set(g.in[0], q.data(), 0, ggml_nbytes(g.in[0]));
+    std::vector<ggml_fp16_t> m((size_t) FA_REFILL_CACHE * n_tokens, ggml_fp32_to_fp16(-INFINITY));
+    for (int t = 0; t < n_tokens; t++) {
+        const int last = causal ? last0 + t : last0 + n_tokens - 1;
+        std::fill_n(m.begin() + (size_t) t * FA_REFILL_CACHE, last + 1, ggml_fp32_to_fp16(0.0f));
+    }
+    ggml_backend_tensor_set(g.in[1], m.data(), 0, ggml_nbytes(g.in[1]));
+    for (size_t i = 2; i < g.in.size(); i++) {
+        std::vector<float> f(ggml_nelements(g.in[i]), 0.5f);
+        ggml_backend_tensor_set(g.in[i], f.data(), 0, ggml_nbytes(g.in[i]));
+    }
+}
+
+static bool run_refill(fa_rows_graph & g, ggml_backend_t be, int n_tokens, int last0, bool causal, std::vector<float> * res) {
+    set_refill_inputs(g, n_tokens, last0, causal);
+    if (ggml_backend_graph_compute(be, g.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    *res = get_f32(g.out);
+    return true;
+}
+
+// the second ubatch on the array after the first prompt packed the cache, against the CPU
+static bool test_fa_refill(ggml_backend_t npu, ggml_backend_t cpu, bool causal) {
+    set_fa_route(FA_ROUTE_ARRAY);
+    fa_cache c = new_fa_cache(cpu);
+    fill_cells(c, 0, FA_REFILL_CACHE, 11);
+    fa_rows_graph      prompt = build_fa_on_cache(cpu, c, FA_REFILL_PROMPT);
+    fa_rows_graph      next   = build_fa_on_cache(cpu, c, FA_REFILL_TOKENS);
+    std::vector<float> first, want, got;
+    bool               ok = run_refill(prompt, npu, FA_REFILL_PROMPT, 0, true, &first);
+    // the decode's token in cell 600, the ubatch's in 300 and from 601 on
+    fill_cells(c, FA_REFILL_PROMPT, FA_REFILL_PROMPT + FA_REFILL_TOKENS, 12);
+    refill_cell(c);
+    ok = ok && run_refill(next, cpu, FA_REFILL_TOKENS, FA_REFILL_PROMPT, causal, &want) &&
+         run_refill(next, npu, FA_REFILL_TOKENS, FA_REFILL_PROMPT, causal, &got);
+    const double e      = ok ? nmse(want, got) : INFINITY;
+    const bool   passed = ok && e > FA_ARRAY_NMSE_MIN && e < FA_ARRAY_NMSE_MAX;
+    std::printf("FLASH_ATTN_EXT array, a ubatch refilling cell %d after a prompt, %-13s nmse %.3g %s\n", FA_REFILL_CELL,
+                causal ? "causal" : "bidirectional", e, passed ? "ok" : "FAIL");
+    free_rows_graph(prompt);
+    free_rows_graph(next);
+    ggml_backend_buffer_free(c.buf);
+    ggml_free(c.ctx);
+    unsetenv("GGML_XDNA_FA_MM");
+    return passed;
+}
+
+typedef int (*kv_copies_fn)(void);
+
+// An attention whose K and V the graph casts (a model with no KV cache, EmbeddingGemma 2 above the array's bound) at inputs of
+// different lengths, every graph kept so each K has an address of its own: the array keeps no K/V copy per address.
+static const int FA_COPIES_LENGTHS[] = { 600, 700, 800, 900 };
+
+static bool test_fa_kv_copies(ggml_backend_t npu, ggml_backend_t cpu) {
+    auto copies = (kv_copies_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_attn_kv_copies");
+    if (!copies) {
+        std::printf("test-xdna-graph: the backend has no K/V copy count\n");
+        return false;
+    }
+    set_fa_route(FA_ROUTE_ARRAY);
+    setenv("GGML_XDNA_HOST_FA", "1", 1);
+    std::vector<norm_graph> graphs;
+    bool                    results_ok = true;
+    int                     first = -1, last = -1;
+    for (int n_tokens : FA_COPIES_LENGTHS) {
+        const fa_case c = { "cast K and V", FA_ROUTE_ARRAY, 4, n_tokens, 0, 1, 1, FA_BAND, 512, 1.0f, false, true,
+                            FA_HEAD_DIM, FA_KV_HEADS, false, 1, 0, 0, 0, false, true };
+        graphs.push_back(build_fa(cpu, c));
+        std::vector<float> want, got;
+        results_ok = results_ok && run_fa(graphs.back(), c, cpu, want) && run_fa(graphs.back(), c, npu, got) &&
+                     fa_result_ok(c, nmse(want, got));
+        last  = copies();
+        first = first < 0 ? last : first;
+    }
+    for (norm_graph & g : graphs) {
+        free_graph(g);
+    }
+    unsetenv("GGML_XDNA_FA_MM");
+    unsetenv("GGML_XDNA_HOST_FA");
+    const bool passed = results_ok && last == first;
+    std::printf("FLASH_ATTN_EXT K and V cast, %zu lengths on the array: %d K/V copies after the first, %d after the last, "
+                "results %s %s\n",
+                std::size(FA_COPIES_LENGTHS), first, last, results_ok ? "ok" : "WRONG", passed ? "ok" : "FAIL");
+    return passed;
+}
+
+// Where a projection is expected to run: either, the host (the CPU backend's own
+// product, bit for bit) or the array (a different order of summing, so not bit for bit).
+enum gemm_route { GEMM_ROUTE_ANY, GEMM_ROUTE_HOST, GEMM_ROUTE_ARRAY };
+
+struct gemm_shape {
+    int64_t        K;
+    int64_t        N;
+    enum ggml_type wtype = GGML_TYPE_COUNT;  // the case's when unset
+    gemm_route     route = GEMM_ROUTE_ANY;
+};
+
+// The projections of `shapes` on M activation rows, in this order and with no
+// other op between them. The activations are one tensor per distinct K.
+static norm_graph build_gemms(ggml_backend_t cpu, enum ggml_type wtype, int64_t M, const std::vector<gemm_shape> & shapes) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 64 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.gf                = ggml_new_graph(g.ctx);
+
+    std::map<int64_t, ggml_tensor *> acts;
+    for (const gemm_shape & sh : shapes) {
+        ggml_tensor *& a = acts[sh.K];
+        if (!a) {
+            a = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, sh.K, M);
+            g.inputs.push_back(a);
+        }
+        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, sh.wtype == GGML_TYPE_COUNT ? wtype : sh.wtype, sh.K, sh.N);
+        g.inputs.push_back(w);
+        ggml_tensor * out = ggml_mul_mat(g.ctx, w, a);
+        ggml_set_name(out, (std::string("K") + std::to_string(sh.K) + " N" + std::to_string(sh.N)).c_str());
+        ggml_build_forward_expand(g.gf, out);
+        g.checked.push_back(out);
+    }
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+struct gemm_case {
+    const char *            name;
+    enum ggml_type          wtype;
+    int64_t                 M;
+    std::vector<gemm_shape> shapes;
+    bool                    pgemm_host_on  = false;  // the host rule for pgemm commands, off for the other cases
+    bool                    gemm_host_off  = false;  // GGML_XDNA_GEMM_HOST=0
+};
+
+// An N x K Q4_K projection of M tokens followed by a tensor of its own to guard,
+// allocated in `be`'s buffers
+static norm_graph build_projection(ggml_backend_t be, int64_t K, int64_t N, int64_t M, ggml_tensor ** guard) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * a     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * p     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, N);
+    g.inputs            = { a, p };
+    ggml_tensor * out   = ggml_mul_mat(g.ctx, p, a);
+    ggml_set_name(out, "proj");
+    *guard = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, 2 * 1024);
+    g.gf   = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
+struct route_case {
+    const char *   name;
+    enum ggml_type wtype;
+    int64_t        M, K, N;
+    int            count;  // projections of one activation: one command of the array
+    bool           on_array;
+    bool           per_op_decode = false;  // GGML_XDNA_FUSED_LAYER=0: a row of a decode takes the per-op route
+};
+
+// The product of the case on the NPU against the CPU backend's: exactly the CPU's bits when the host ran it, within `tol` of
+// them, and not exactly, when the array did (it rounds the activations to bf16).
+static bool route_matches(const std::vector<float> & want, const std::vector<float> & got, bool on_array, double tol, double * e) {
+    *e = nmse(want, got);
+    return on_array ? *e > 0.0 && *e < tol : *e == 0.0;
+}
+
+typedef int (*host_chunk_count_fn)(void);
+
+// The backend's count of the chunks it ran whole on the host, so a rule that never fires cannot pass on bits alone: the per-group
+// rule leaves the same projections to the host and the same bits show.
+static host_chunk_count_fn host_chunk_counter(ggml_backend_t npu) {
+    auto count = (host_chunk_count_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_host_chunk_count");
+    if (!count) {
+        std::printf("test-xdna-graph: the backend has no host chunk count\n");
+    }
+    return count;
+}
+
+// The host's prefill rule for the commands of the array: one of 2 to 128 rows goes to the host when the host's products of
+// everything the command carries (the projections of one activation) are quicker than the command, in the CPU backend's own
+// bits whatever the weight type (the bf16 GEMM does not take it either); more rows, or a command the host does not beat, is
+// the array's. One row is a decode's, which the rule leaves alone. The chunk rule is off here; the graphs stay allocated to
+// the end because the packed weights are keyed by the tensors' addresses, which a freed one hands on.
+static bool test_pgemm_host_rule(ggml_backend_t npu, ggml_backend_t cpu, double tol) {
+    const host_chunk_count_fn chunks = host_chunk_counter(npu);
+    if (!chunks) {
+        return false;
+    }
+    setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
+    const route_case cases[] = {
+        { "Q8_0, 15 rows: the host",                         GGML_TYPE_Q8_0, 15,  1024, 1024, 1, false },
+        { "Q4_K, 15 rows: the host",                         GGML_TYPE_Q4_K, 15,  1024, 1024, 1, false },
+        { "Q8_0, one block, a large product: array",         GGML_TYPE_Q8_0, 128, 1024, 4096, 1, true },
+        { "Q8_0, 129 rows, a small product: array",          GGML_TYPE_Q8_0, 129, 512,  512,  1, true },
+        { "Q8_0, 128 rows, one projection: the host",        GGML_TYPE_Q8_0, 128, 512,  1024, 1, false },
+        { "Q8_0, 128 rows, three of one activation: array",  GGML_TYPE_Q8_0, 128, 512,  1024, 3, true },
+        { "Q8_0, one row of a decode: not the rule's",       GGML_TYPE_Q8_0, 1,   1024, 1024, 1, true, true },
+    };
+    std::vector<norm_graph> graphs;
+    bool                    passed = true;
+    for (const route_case & c : cases) {
+        graphs.push_back(build_gemms(cpu, c.wtype, c.M, std::vector<gemm_shape>(c.count, gemm_shape{ c.K, c.N })));
+        norm_graph &                    g = graphs.back();
+        std::vector<std::vector<float>> want, got;
+        if (c.per_op_decode) {
+            setenv("GGML_XDNA_FUSED_LAYER", "0", 1);
+        }
+        const int  chunks_before = chunks();
+        const bool computed      = run(g, cpu, want) && run(g, npu, got);
+        const int  chunks_fired  = chunks() - chunks_before;
+        unsetenv("GGML_XDNA_FUSED_LAYER");
+        if (!computed) {
+            std::printf("test-xdna-graph: compute failed\n");
+            return false;
+        }
+        for (size_t i = 0; i < g.checked.size(); i++) {
+            double     e  = INFINITY;
+            const bool ok = ggml_backend_supports_op(npu, g.checked[i]) && route_matches(want[i], got[i], c.on_array, tol, &e) &&
+                            chunks_fired == 0;
+            passed        = passed && ok;
+            std::printf("MUL_MAT host rule, %-50s nmse %.3g %s\n", c.name, e, ok ? "ok" : "FAIL");
+        }
+    }
+    for (norm_graph & g : graphs) {
+        ggml_backend_buffer_free(g.buf);
+        ggml_free(g.ctx);
+    }
+    unsetenv("GGML_XDNA_HOST_CHUNK");
+    return passed;
+}
+
+// `layers` of x = x + down(gelu(up(norm(x)))) over M rows of K, the hidden size N: every projection reads an activation of its own,
+// so each is a command of the array.
+static norm_graph build_chain(ggml_backend_t cpu, enum ggml_type wtype, int64_t M, int64_t K, int64_t N, int layers) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * (size_t) (8 * layers + 8) + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    g.inputs.push_back(x);
+    for (int l = 0; l < layers; l++) {
+        ggml_tensor * up   = ggml_new_tensor_2d(g.ctx, wtype, K, N);
+        ggml_tensor * down = ggml_new_tensor_2d(g.ctx, wtype, N, K);
+        g.inputs.push_back(up);
+        g.inputs.push_back(down);
+        ggml_tensor * h = ggml_gelu(g.ctx, ggml_mul_mat(g.ctx, up, ggml_rms_norm(g.ctx, x, 1e-6f)));
+        x               = ggml_add(g.ctx, ggml_mul_mat(g.ctx, down, h), x);
+    }
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, x);
+    g.checked = { x };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+// A prefill chunk is run whole on the host when the host's products cost less than its commands (one CPU graph: the CPU
+// backend's own bits), and keeps its commands when they cost less. Above one block of rows the host must win by more than its
+// fits' largest error, and the rows must be within the fit of every weight type: the K-quants' covers one block.
+// GGML_XDNA_HOST_CHUNK=0 and GGML_XDNA_PGEMM_HOST=0 leave every projection to the array.
+static bool test_host_chunk_rule(ggml_backend_t npu, ggml_backend_t cpu, double tol) {
+    const host_chunk_count_fn chunks = host_chunk_counter(npu);
+    if (!chunks) {
+        return false;
+    }
+    struct chunk_case {
+        const char *   name;
+        enum ggml_type wtype;
+        int64_t        M, K, N;
+        bool           off_switches;
+        bool           on_array;
+    };
+    const chunk_case cases[] = {
+        { "15 rows of Q8_0: the host",                    GGML_TYPE_Q8_0, 15,  512,  1024, false, false },
+        { "41 rows of Q8_0: the host",                    GGML_TYPE_Q8_0, 41,  512,  2048, false, false },
+        { "15 rows of BF16: the host",                    GGML_TYPE_BF16, 15,  512,  1024, false, false },
+        { "128 rows of large Q8_0 products: the array",   GGML_TYPE_Q8_0, 128, 1024, 4096, false, true },
+        { "132 rows of small Q8_0 products: the host",    GGML_TYPE_Q8_0, 132, 512,  512,  false, false },
+        { "132 rows of BF16: the host",                   GGML_TYPE_BF16, 132, 512,  1024, false, false },
+        { "128 rows of Q8_0 1024 x 1024: the host",       GGML_TYPE_Q8_0, 128, 1024, 1024, false, false },
+        { "132 rows of the same, inside the margin: array", GGML_TYPE_Q8_0, 132, 1024, 1024, false, true },
+        { "132 rows of small Q4_K products: the array",   GGML_TYPE_Q4_K, 132, 512,  512,  false, true },
+        { "15 rows of Q8_0, rules off: the array",        GGML_TYPE_Q8_0, 15,  512,  1024, true,  true },
+        { "15 rows of BF16, rules off: the array",        GGML_TYPE_BF16, 15,  512,  1024, true,  true },
+    };
+    std::vector<norm_graph> graphs;
+    bool                    passed = true;
+    for (const chunk_case & c : cases) {
+        if (c.off_switches) {
+            setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
+            setenv("GGML_XDNA_PGEMM_HOST", "0", 1);
+        }
+        graphs.push_back(build_chain(cpu, c.wtype, c.M, c.K, c.N, 3));
+        norm_graph &                    g = graphs.back();
+        std::vector<std::vector<float>> want, got;
+        const int                       before   = chunks();
+        const bool                      computed = run(g, cpu, want) && run(g, npu, got);
+        const int                       fired    = chunks() - before;
+        unsetenv("GGML_XDNA_HOST_CHUNK");
+        unsetenv("GGML_XDNA_PGEMM_HOST");
+        if (!computed) {
+            std::printf("test-xdna-graph: compute failed\n");
+            return false;
+        }
+        double     e;
+        const bool ok = route_matches(want[0], got[0], c.on_array, tol, &e) && fired == (c.on_array ? 0 : 1);
+        passed        = passed && ok;
+        std::printf("chunk host rule, %-46s nmse %.3g, %d host chunks %s\n", c.name, e, fired, ok ? "ok" : "FAIL");
+    }
+    for (norm_graph & g : graphs) {
+        ggml_backend_buffer_free(g.buf);
+        ggml_free(g.ctx);
+    }
+    return passed;
+}
+
+static bool test_output_in_place(ggml_backend_t npu, ggml_backend_t cpu, int64_t M, double tol) {
+    const int64_t K = 1024, N = 1024;
+    ggml_tensor * cpu_guard = nullptr;
+    ggml_tensor * npu_guard = nullptr;
+    norm_graph    want_g    = build_projection(cpu, K, N, M, &cpu_guard);
+    norm_graph    got_g     = build_projection(npu, K, N, M, &npu_guard);
+    ggml_tensor * out       = got_g.checked[0];
+
+    const size_t room     = ggml_backend_buffer_get_alloc_size(got_g.buf, out);
+    const bool   reserved = room >= (size_t) ((M + 127) / 128 * 128) * N * sizeof(float);
+
+    std::vector<float> pattern(ggml_nelements(npu_guard), 3.0f);
+    std::vector<std::vector<float>> want, got;
+    bool ok = run(want_g, cpu, want);
+    ggml_backend_buffer_clear(got_g.buf, 0);
+    set_inputs(got_g, 1234);
+    ggml_backend_tensor_set(npu_guard, pattern.data(), 0, ggml_nbytes(npu_guard));
+    ok = ok && ggml_backend_graph_compute(npu, got_g.gf) == GGML_STATUS_SUCCESS;
+    std::vector<float> after(pattern.size());
+    ggml_backend_tensor_get(npu_guard, after.data(), 0, ggml_nbytes(npu_guard));
+    if (ok) {
+        got = { get_f32(out) };
+    }
+    const bool   intact = after == pattern;
+    const double e      = ok ? nmse(want[0], got[0]) : INFINITY;
+    const bool   passed = ok && reserved && intact && e < tol;
+    std::printf("MUL_MAT in place, M %-4lld alloc %zu of %zu bytes %s, guard %s, nmse %.3g %s\n", (long long) M, room,
+                ggml_nbytes(out), reserved ? "reserved" : "NOT RESERVED", intact ? "intact" : "OVERWRITTEN", e,
+                passed ? "ok" : "FAIL");
+    ggml_backend_buffer_free(want_g.buf);
+    ggml_backend_buffer_free(got_g.buf);
+    ggml_free(want_g.ctx);
+    ggml_free(got_g.ctx);
+    return passed;
+}
+
+// One Q4_K weight applied to `count` activations of M tokens, each product in a node of its own
+static norm_graph build_repeated(ggml_backend_t be, int64_t K, int64_t N, int64_t M, int count) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * p     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, N);
+    g.inputs            = { p };
+    g.gf                = ggml_new_graph(g.ctx);
+    for (int i = 0; i < count; i++) {
+        ggml_tensor * a = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+        g.inputs.push_back(a);
+        ggml_tensor * out = ggml_mul_mat(g.ctx, p, a);
+        ggml_build_forward_expand(g.gf, out);
+        g.checked.push_back(out);
+    }
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
+// The streams of the same call are kept; a repeat of its shape with another
+// activation and another output place, in one graph and in the next pass,
+// has to land in its own node
+static bool test_repeated_projection(ggml_backend_t npu, ggml_backend_t cpu, int64_t M, int count, double tol) {
+    const int64_t K = 1024, N = 1024;
+    norm_graph    want_g = build_repeated(cpu, K, N, M, count);
+    norm_graph    got_g  = build_repeated(npu, K, N, M, count);
+    std::vector<std::vector<float>> want, got;
+    bool ok = run(want_g, cpu, want);
+    double worst = 0;
+    for (int pass = 0; ok && pass < 2; pass++) {
+        ok = run(got_g, npu, got);
+        for (int i = 0; ok && i < count; i++) {
+            worst = std::max(worst, nmse(want[i], got[i]));
+        }
+    }
+    const bool passed = ok && worst < tol;
+    std::printf("MUL_MAT x%d of one weight, M %-4lld two passes, worst nmse %.3g %s\n", count, (long long) M, worst,
+                passed ? "ok" : "FAIL");
+    ggml_backend_buffer_free(want_g.buf);
+    ggml_backend_buffer_free(got_g.buf);
+    ggml_free(want_g.ctx);
+    ggml_free(got_g.ctx);
+    return passed;
+}
+
+// x (K x M) through a gate and an up projection of F rows, joined by `op`
+static norm_graph build_ffn(ggml_backend_t be, ggml_glu_op op, bool glu_is_output, int64_t K, int64_t F, int64_t M,
+                            float scale) {
+    norm_graph    g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.act_scale         = scale;
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * wg    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, K, F);
+    ggml_tensor * wu    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, K, F);
+    ggml_tensor * wd    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, F, K);
+    g.inputs            = { x, wg, wu };
+    ggml_tensor * gate  = ggml_mul_mat(g.ctx, wg, x);
+    ggml_tensor * up    = ggml_mul_mat(g.ctx, wu, x);
+    ggml_tensor * glu =
+        op == GGML_GLU_OP_GEGLU ? ggml_geglu_split(g.ctx, gate, up) : ggml_swiglu_split(g.ctx, gate, up);
+    ggml_set_name(glu, "glu");
+    ggml_tensor * out = glu;
+    if (glu_is_output) {
+        ggml_set_output(glu);
+    } else {
+        g.inputs.push_back(wd);
+        out = ggml_mul_mat(g.ctx, wd, glu);
+        ggml_set_name(out, "down");
+    }
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
+static bool test_ffn(ggml_backend_t npu, ggml_backend_t cpu, ggml_glu_op op, bool glu_is_output, int64_t K, int64_t F,
+                     int64_t M, float scale, double tol) {
+    norm_graph                      want_g = build_ffn(cpu, op, glu_is_output, K, F, M, scale);
+    norm_graph                      got_g  = build_ffn(npu, op, glu_is_output, K, F, M, scale);
+    std::vector<std::vector<float>> want, got;
+    const bool                      ok = run(want_g, cpu, want) && run(got_g, npu, got);
+    const double                    e  = ok ? nmse(want[0], got[0]) : INFINITY;
+    const bool                      passed = ok && e < tol;
+    std::printf("%-6s %-4s K %-5lld F %-5lld M %-4lld scale %-5.2f nmse %.3g %s\n",
+                op == GGML_GLU_OP_GEGLU ? "GEGLU" : "SWIGLU", glu_is_output ? "glu" : "down", (long long) K,
+                (long long) F, (long long) M, scale, e, passed ? "ok" : "FAIL");
+    ggml_backend_buffer_free(want_g.buf);
+    ggml_backend_buffer_free(got_g.buf);
+    ggml_free(want_g.ctx);
+    ggml_free(got_g.ctx);
+    return passed;
+}
+
+// x (K x M) through `wtype` projections of `ns[i]` rows each, then a tensor to guard
+static norm_graph build_group(ggml_backend_t be, const std::vector<int64_t> & ns, int64_t M, ggml_tensor ** guard,
+                              enum ggml_type wtype = GGML_TYPE_Q8_0) {
+    const int64_t K = 512;
+    norm_graph    g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    g.inputs            = { x };
+    std::vector<ggml_tensor *> mm;
+    for (int64_t n : ns) {
+        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, wtype, K, n);
+        g.inputs.push_back(w);
+        mm.push_back(ggml_mul_mat(g.ctx, w, x));
+    }
+    *guard = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, 2 * 1024);
+    g.gf   = ggml_new_graph(g.ctx);
+    for (ggml_tensor * t : mm) {
+        ggml_build_forward_expand(g.gf, t);
+    }
+    g.checked = mm;
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
+static bool test_group(ggml_backend_t npu, ggml_backend_t cpu, const std::vector<int64_t> & ns, int64_t M, double tol,
+                       enum ggml_type wtype = GGML_TYPE_Q8_0) {
+    ggml_tensor *                   cpu_guard = nullptr;
+    ggml_tensor *                   npu_guard = nullptr;
+    norm_graph                      want_g    = build_group(cpu, ns, M, &cpu_guard, wtype);
+    norm_graph                      got_g     = build_group(npu, ns, M, &npu_guard, wtype);
+    std::vector<std::vector<float>> want, got;
+    std::vector<float>              pattern(ggml_nelements(npu_guard), 3.0f);
+    bool                            ok = run(want_g, cpu, want);
+    ggml_backend_buffer_clear(got_g.buf, 0);
+    set_inputs(got_g, 1234);
+    ggml_backend_tensor_set(npu_guard, pattern.data(), 0, ggml_nbytes(npu_guard));
+    ok = ok && ggml_backend_graph_compute(npu, got_g.gf) == GGML_STATUS_SUCCESS;
+    std::vector<float> after(pattern.size());
+    ggml_backend_tensor_get(npu_guard, after.data(), 0, ggml_nbytes(npu_guard));
+    double worst = 0;
+    for (size_t i = 0; ok && i < got_g.checked.size(); i++) {
+        worst = std::max(worst, nmse(want[i], get_f32(got_g.checked[i])));
+    }
+    const bool intact = after == pattern;
+    const bool passed = ok && intact && worst < tol;
+    std::printf("MUL_MAT %-4s group of %zu, M %-4lld guard %s, worst nmse %.3g %s\n", ggml_type_name(wtype), ns.size(),
+                (long long) M, intact ? "intact" : "OVERWRITTEN", ok ? worst : INFINITY, passed ? "ok" : "FAIL");
+    ggml_backend_buffer_free(want_g.buf);
+    ggml_backend_buffer_free(got_g.buf);
+    ggml_free(want_g.ctx);
+    ggml_free(got_g.ctx);
+    return passed;
+}
+
+typedef int (*gemm_count_fn)(void);
+
+// The outputs of a group of bf16 projections with the group on and off (GGML_XDNA_GEMM_GROUP=0):
+// each column of C depends on its own weights and the activation only, so the two are the same bits,
+// and a slice put in the wrong node or at the wrong column shows. The group is one bf16 GEMM call,
+// one by one is a call each.
+static bool test_group_matches_one_by_one(ggml_backend_t npu, const std::vector<int64_t> & ns, int64_t M) {
+    auto calls = (gemm_count_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_gemm_count");
+    if (!calls) {
+        std::printf("test-xdna-graph: the backend has no GEMM call count\n");
+        return false;
+    }
+    ggml_tensor *                   guard_a = nullptr;
+    ggml_tensor *                   guard_b = nullptr;
+    norm_graph                      grouped = build_group(npu, ns, M, &guard_a, GGML_TYPE_BF16);
+    norm_graph                      single  = build_group(npu, ns, M, &guard_b, GGML_TYPE_BF16);
+    set_inputs(grouped, 1234);
+    set_inputs(single, 1234);
+    setenv("GGML_XDNA_GEMM_GROUP", "1", 1);
+    const int before = calls();
+    bool      ok     = ggml_backend_graph_compute(npu, grouped.gf) == GGML_STATUS_SUCCESS;
+    const int group  = calls() - before;
+    setenv("GGML_XDNA_GEMM_GROUP", "0", 1);
+    ok               = ok && ggml_backend_graph_compute(npu, single.gf) == GGML_STATUS_SUCCESS;
+    const int alone  = calls() - before - group;
+    unsetenv("GGML_XDNA_GEMM_GROUP");
+    bool same = ok;
+    for (size_t i = 0; ok && i < grouped.checked.size(); i++) {
+        same = same && get_f32(grouped.checked[i]) == get_f32(single.checked[i]);
+    }
+    const bool runs = group == 1 && alone == (int) ns.size();
+    std::printf("MUL_MAT BF16 group of %zu, M %-4lld one by one: %s, GEMM calls %d and %d %s\n", ns.size(),
+                (long long) M, same ? "bit-identical" : "DIFFERENT", group, alone, same && runs ? "ok" : "FAIL");
+    ggml_backend_buffer_free(grouped.buf);
+    ggml_backend_buffer_free(single.buf);
+    ggml_free(grouped.ctx);
+    ggml_free(single.ctx);
+    return same && runs;
+}
+
+typedef int (*block_switch_fn)(void);
+
+static const float CHAIN_SCALE = 0.5f;
+
+// x (1024 x M) through a bf16 projection onto 512 columns, and its result, scaled on the host as a layer's norm stands
+// between its projections, through another onto 512: above 1024 rows the first one's own cheapest block is the 2048 one
+// and the second one's the 512 one.
+static norm_graph build_block_chain(ggml_backend_t be, int64_t M) {
+    const int64_t    K = 1024, N = 512;
+    norm_graph       g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * w1    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_BF16, K, N);
+    ggml_tensor * w2    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_BF16, N, N);
+    g.inputs            = { x, w1, w2 };
+    ggml_tensor * y     = ggml_mul_mat(g.ctx, w1, x);
+    ggml_tensor * z     = ggml_mul_mat(g.ctx, w2, ggml_scale(g.ctx, y, CHAIN_SCALE));
+    g.gf                = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, z);
+    g.checked = { y, z };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
+// The chain's two GEMMs share one block: a second compute, which starts from the block the first left, changes
+// block no time. Two GEMM calls show that the array, not the host, ran it.
+static bool test_one_block_a_graph(ggml_backend_t npu, ggml_backend_t cpu, int64_t M, double tol) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(npu));
+    auto switches = (block_switch_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_block_switches");
+    auto calls    = (gemm_count_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_gemm_count");
+    if (!switches || !calls) {
+        std::printf("test-xdna-graph: the backend has no block switch or GEMM call count\n");
+        return false;
+    }
+    norm_graph                      want_g = build_block_chain(cpu, M);
+    norm_graph                      got_g  = build_block_chain(npu, M);
+    std::vector<std::vector<float>> want, got;
+    bool                            ok        = run(want_g, cpu, want) && run(got_g, npu, got);
+    const int                       calls0    = calls();
+    const int                       switches0 = switches();
+    ok                                        = ok && run(got_g, npu, got);
+    const int ran     = calls() - calls0;
+    const int changed = switches() - switches0;
+    double    worst   = 0;
+    for (size_t i = 0; ok && i < got.size(); i++) {
+        worst = std::max(worst, nmse(want[i], got[i]));
+    }
+    const bool passed = ok && ran == 2 && changed == 0 && worst < tol;
+    std::printf("MUL_MAT BF16 chain K 1024 then 512, M %-4lld: GEMM calls %d, block changes %d, worst nmse %.3g %s\n",
+                (long long) M, ran, changed, ok ? worst : INFINITY, passed ? "ok" : "FAIL");
+    ggml_backend_buffer_free(want_g.buf);
+    ggml_backend_buffer_free(got_g.buf);
+    ggml_free(want_g.ctx);
+    ggml_free(got_g.ctx);
+    return passed;
+}
+
+// x (K x M) through Q8_0 projections of `ns[i]` rows each, an RMS_NORM after every one and the
+// results joined in that order, as a graph expanded from its output places them: projection,
+// norm, next projection. Nodes are allocated in `ops_be`, or left to the scheduler when null.
+enum class between { nothing, writer, weight_view };
+
+struct ordered_graph {
+    ggml_context *             leaf = nullptr;
+    ggml_context *             ops  = nullptr;
+    ggml_backend_buffer_t      leaf_buf = nullptr;
+    ggml_backend_buffer_t      ops_buf  = nullptr;
+    ggml_cgraph *              gf   = nullptr;
+    std::vector<ggml_tensor *> mm;
+    ggml_tensor *              out = nullptr;
+    norm_graph                 inputs;
+};
+
+// the second projection's weight: a view of a larger tensor, a node of its own
+static ggml_tensor * weight_view(ordered_graph & g, int64_t K, int64_t n, enum ggml_type wtype) {
+    ggml_tensor * full = ggml_new_tensor_2d(g.leaf, wtype, K, n + 128);
+    g.inputs.inputs.push_back(full);
+    return ggml_view_2d(g.ops, full, K, n, full->nb[1], 0);
+}
+
+static ordered_graph build_ordered(ggml_backend_t leaf_be, ggml_backend_t ops_be, const std::vector<int64_t> & ns,
+                                   int64_t M, between what, enum ggml_type wtype) {
+    const int64_t K = 512;
+    ordered_graph g;
+    ggml_init_params lp = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_init_params op = { ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, true };
+    g.leaf              = ggml_init(lp);
+    g.ops               = ggml_init(op);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.leaf, GGML_TYPE_F32, K, M);
+    g.inputs.inputs     = { x };
+    g.gf                = ggml_new_graph(g.ops);
+    for (size_t i = 0; i < ns.size(); i++) {
+        ggml_tensor * w = nullptr;
+        if (i == 1 && what == between::weight_view) {
+            w = weight_view(g, K, ns[i], wtype);
+        } else {
+            w = ggml_new_tensor_2d(g.leaf, wtype, K, ns[i]);
+            g.inputs.inputs.push_back(w);
+        }
+        ggml_tensor * mm = ggml_mul_mat(g.ops, w, x);
+        g.mm.push_back(mm);
+        ggml_tensor * norm = ggml_rms_norm(g.ops, mm, 1e-6f);
+        g.out              = g.out ? ggml_concat(g.ops, g.out, norm, 0) : norm;
+        if (i == 0) {
+            ggml_build_forward_expand(g.gf, g.out);
+            if (what == between::writer) {
+                ggml_build_forward_expand(g.gf, ggml_scale_inplace(g.ops, x, 1.0f));
+            }
+        }
+    }
+    ggml_build_forward_expand(g.gf, g.out);
+    g.leaf_buf = ggml_backend_alloc_ctx_tensors(g.leaf, leaf_be);
+    if (ops_be) {
+        g.ops_buf = ggml_backend_alloc_ctx_tensors(g.ops, ops_be);
+    }
+    return g;
+}
+
+static void free_ordered(ordered_graph & g) {
+    ggml_backend_buffer_free(g.leaf_buf);
+    ggml_backend_buffer_free(g.ops_buf);
+    ggml_free(g.leaf);
+    ggml_free(g.ops);
+}
+
+static int node_index(const ggml_cgraph * gf, const ggml_tensor * t) {
+    for (int i = 0; i < ggml_graph_n_nodes(const_cast<ggml_cgraph *>(gf)); i++) {
+        if (ggml_graph_node(const_cast<ggml_cgraph *>(gf), i) == t) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool next_to(const ordered_graph & g, size_t i) {
+    return node_index(g.gf, g.mm[i]) == node_index(g.gf, g.mm[i - 1]) + 1;
+}
+
+// whether every projection follows the one before it in the scheduler's graph
+static bool projections_adjacent(const ordered_graph & g) {
+    for (size_t i = 1; i < g.mm.size(); i++) {
+        if (!next_to(g, i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Q K V behind their norms through the scheduler against the CPU. `what` is a node between the
+// first and second projection; `group_on` false (GGML_XDNA_PGEMM_GROUP=0) leaves the order as
+// the graph was expanded.
+static bool test_group_order(ggml_backend_t npu, ggml_backend_t cpu, between what, bool group_on, int64_t M,
+                             double tol, enum ggml_type wtype = GGML_TYPE_Q8_0) {
+    const char * group_env = wtype == GGML_TYPE_BF16 ? "GGML_XDNA_GEMM_GROUP" : "GGML_XDNA_PGEMM_GROUP";
+    setenv(group_env, group_on ? "1" : "0", 1);
+    const std::vector<int64_t> ns = { 1024, 512, 512 };
+    ordered_graph              want_g = build_ordered(cpu, cpu, ns, M, what, wtype);
+    ordered_graph              got_g  = build_ordered(npu, nullptr, ns, M, what, wtype);
+    set_inputs(want_g.inputs, 1234);
+    set_inputs(got_g.inputs, 1234);
+    bool ok = ggml_backend_graph_compute(cpu, want_g.gf) == GGML_STATUS_SUCCESS;
+    ggml_backend_t        backends[2] = { npu, cpu };
+    ggml_backend_sched_t  sched       = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    ok = ok && ggml_backend_sched_alloc_graph(sched, got_g.gf);
+    const bool moved = what == between::nothing ? projections_adjacent(got_g) : next_to(got_g, 1);
+    ok = ok && ggml_backend_sched_graph_compute(sched, got_g.gf) == GGML_STATUS_SUCCESS;
+    const double e      = ok ? nmse(get_f32(want_g.out), get_f32(got_g.out)) : INFINITY;
+    const bool   passed = ok && moved == (group_on && what == between::nothing) && e < tol;
+    const char * names[] = { "norms", "a writer of the activation", "a weight computed after Q" };
+    std::printf("MUL_MAT %-4s Q K V behind %-27s M %-4lld GROUP=%d: projections %s, nmse %.3g %s\n",
+                ggml_type_name(wtype), names[(int) what], (long long) M, group_on ? 1 : 0,
+                moved ? "moved together" : "left apart", e, passed ? "ok" : "FAIL");
+    ggml_backend_sched_free(sched);
+    free_ordered(want_g);
+    free_ordered(got_g);
+    unsetenv(group_env);
+    return passed;
+}
+
+// A K of two runs (the second accumulates) on M rows of several blocks, so the folds of gemm_compute and of finalize
+// both meet a block whose first C line is marked unwritten `times` times; `reruns` is what the backend must report,
+// or -1 for one per fold (at least the two K runs of two blocks).
+typedef void (*lose_c_lines_fn)(int blocks, int times);
+typedef int (*rerun_count_fn)(void);
+
+struct lost_line_case {
+    int  blocks;
+    int  times;
+    bool op_ok;
+    int  reruns;
+};
+
+// A cast to F16 is claimed from F32 only, and GGML_XDNA_GLUE_CAST=0 leaves it to the scheduler; a cast to F32
+// takes the plain F32 rule whatever its source, with the switch on or off.
+static bool test_cast_claims(ggml_backend_t npu, ggml_backend_t cpu) {
+    ggml_init_params      ip     = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_context *        ctx    = ggml_init(ip);
+    ggml_tensor *         f32    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 8);
+    ggml_tensor *         f16    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 8);
+    ggml_tensor *         to_f16 = ggml_cast(ctx, f32, GGML_TYPE_F16);
+    ggml_tensor *         to_f32 = ggml_cast(ctx, f16, GGML_TYPE_F32);
+    ggml_backend_buffer_t buf    = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    const bool            on16   = ggml_backend_supports_op(npu, to_f16);
+    const bool            on32   = ggml_backend_supports_op(npu, to_f32);
+    setenv("GGML_XDNA_GLUE_CAST", "0", 1);
+    const bool off16 = ggml_backend_supports_op(npu, to_f16);
+    const bool off32 = ggml_backend_supports_op(npu, to_f32);
+    unsetenv("GGML_XDNA_GLUE_CAST");
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    const bool ok = on16 && on32 && !off16 && off32;
+    std::printf("CPY casts claimed: to F16 %d, to F32 %d; GLUE_CAST=0: to F16 %d, to F32 %d %s\n", on16, on32, off16,
+                off32, ok ? "ok" : "FAIL");
+    return ok;
+}
+
+static bool test_lost_c_line(ggml_backend_t npu, ggml_backend_t cpu, ggml_backend_reg_t reg, double tol) {
+    auto lose  = (lose_c_lines_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_lose_c_lines");
+    auto count = (rerun_count_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_rerun_count");
+    if (!lose || !count) {
+        std::printf("test-xdna-graph: the backend has no lost-line hook\n");
+        return false;
+    }
+    const lost_line_case cases[] = {
+        { 0, 0, true,  0 },  // nothing lost
+        { 99, 1, true, -1 },  // every fold of the op loses its first line once
+        { 1, 2, true,  2 },  // one block twice, the most the re-runs cover
+        { 1, 3, false, 2 },  // one block three times: the op fails
+        { 0, 0, true,  0 },  // and the backend works again
+    };
+    norm_graph                      g = build_gemms(cpu, GGML_TYPE_BF16, 600, { { 1024, 512 } });
+    std::vector<std::vector<float>> want, got;
+    bool                            passed = run(g, cpu, want);
+    for (const lost_line_case & c : cases) {
+        const int before = count();
+        lose(c.blocks, c.times);
+        const bool ok = run(g, npu, got);
+        lose(0, 0);
+        const int    reruns  = count() - before;
+        const double e       = ok ? nmse(want[0], got[0]) : INFINITY;
+        const bool   runs_ok = c.reruns < 0 ? reruns >= 4 : reruns == c.reruns;
+        const bool   good    = ok == c.op_ok && runs_ok && (!c.op_ok || e < tol);
+        passed               = passed && good;
+        std::printf("MUL_MAT BF16 M600 K1024 first C line lost x%d on %d blocks: op %s, %d re-runs, nmse %.3g %s\n",
+                    c.times, c.blocks, ok ? "ok" : "failed", reruns, e, good ? "ok" : "FAIL");
+    }
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
+    return passed;
+}
+
+// The conv input of a gated delta net layer over M rows: the projection's output, transposed and concatenated behind the
+// cached rows, then the SSM_CONV by its taps. A chunk the host runs whole takes the concat and the conv on the backend's own
+// kernels, which sum as ggml-cpu's do.
+static norm_graph build_conv_input(ggml_backend_t cpu, int64_t M, int64_t K, int64_t channels, int64_t taps) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * w     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, K, channels);
+    ggml_tensor * state = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, taps - 1, channels);
+    ggml_tensor * taps_w = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, taps, channels);
+    g.inputs            = { x, w, state, taps_w };
+    ggml_tensor * qkv   = ggml_mul_mat(g.ctx, w, x);
+    ggml_tensor * input = ggml_concat(g.ctx, state, ggml_transpose(g.ctx, qkv), 0);
+    ggml_tensor * out   = ggml_ssm_conv(g.ctx, input, taps_w);
+    g.gf                = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+static bool test_host_chunk_conv_kernels(ggml_backend_t npu, ggml_backend_t cpu) {
+    const host_chunk_count_fn chunks = host_chunk_counter(npu);
+    if (!chunks) {
+        return false;
+    }
+    norm_graph g = build_conv_input(cpu, 15, 512, 1024, 4);
+    std::vector<std::vector<float>> want, got;
+    const int                       before = chunks();
+    if (!run(g, cpu, want) || !run(g, npu, got)) {
+        std::printf("test-xdna-graph: compute failed\n");
+        return false;
+    }
+    const int    fired = chunks() - before;
+    const double e     = nmse(want[0], got[0]);
+    const bool   ok    = e == 0.0 && fired == 1;
+    std::printf("chunk host rule, conv input of 15 rows on the backend's concat and SSM_CONV      nmse %.3g, %d host chunks %s\n", e,
+                fired, ok ? "ok" : "FAIL");
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
+    return ok;
+}
+
+// graph_optimize groups by shape. The plan of the compute before it, which left these projections to the host, does not keep it
+// from moving them together: the graph computes alone first (its nodes are in the NPU's buffers), then the scheduler splits it.
+static bool test_group_order_after_host_plan(ggml_backend_t npu, ggml_backend_t cpu) {
+    setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
+    setenv("GGML_XDNA_PGEMM_HOST", "1", 1);
+    const std::vector<int64_t> ns     = { 1024, 512, 512 };
+    ordered_graph              want_g = build_ordered(cpu, cpu, ns, 15, between::nothing, GGML_TYPE_Q8_0);
+    ordered_graph              got_g  = build_ordered(npu, npu, ns, 15, between::nothing, GGML_TYPE_Q8_0);
+    set_inputs(want_g.inputs, 1234);
+    set_inputs(got_g.inputs, 1234);
+    bool ok = ggml_backend_graph_compute(cpu, want_g.gf) == GGML_STATUS_SUCCESS &&
+              ggml_backend_graph_compute(npu, got_g.gf) == GGML_STATUS_SUCCESS;
+    const double          e           = ok ? nmse(get_f32(want_g.out), get_f32(got_g.out)) : INFINITY;
+    ggml_backend_t        backends[2] = { npu, cpu };
+    ggml_backend_sched_t  sched       = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    ok                                = ok && ggml_backend_sched_alloc_graph(sched, got_g.gf);
+    const bool moved                  = projections_adjacent(got_g);
+    const bool passed                 = ok && e == 0.0 && moved;
+    std::printf("MUL_MAT Q K V after a compute that left them to the host: nmse %.3g, projections %s %s\n", e,
+                moved ? "moved together" : "left apart", passed ? "ok" : "FAIL");
+    ggml_backend_sched_free(sched);
+    free_ordered(want_g);
+    free_ordered(got_g);
+    unsetenv("GGML_XDNA_HOST_CHUNK");
+    unsetenv("GGML_XDNA_PGEMM_HOST");
+    return passed;
+}
+
+// A prompt cropped to its last row (a Q4_K projection after Q8_0 layers) built in the graph memory a decode of the same layers
+// used, as llama reuses it: the decode's GEMV group leaves its one-row projection at the cropped one's address. The prompt's
+// plan must not read it: it runs whole on the host with the bits of a fresh context.
+static const int64_t CROP_CHAIN_K      = 1024;
+static const int64_t CROP_CHAIN_ROWS   = 15;
+static const int     CROP_CHAIN_LAYERS = 3;
+
+static norm_graph build_cropped_chain(ggml_backend_t cpu, std::vector<uint8_t> & meta, int64_t M) {
+    norm_graph       g;
+    ggml_init_params ip = { meta.size(), meta.data(), true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, CROP_CHAIN_K, M);
+    ggml_tensor * rows  = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * w_out = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, CROP_CHAIN_K, CROP_CHAIN_K);
+    g.inputs            = { x, rows, w_out };
+    g.out_row           = (int32_t) M - 1;
+    for (int l = 0; l < CROP_CHAIN_LAYERS; l++) {
+        ggml_tensor * up   = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, CROP_CHAIN_K, CROP_CHAIN_K);
+        ggml_tensor * down = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, CROP_CHAIN_K, CROP_CHAIN_K);
+        g.inputs.push_back(up);
+        g.inputs.push_back(down);
+        ggml_tensor * h = ggml_gelu(g.ctx, ggml_mul_mat(g.ctx, up, ggml_rms_norm(g.ctx, x, 1e-6f)));
+        x               = ggml_add(g.ctx, ggml_mul_mat(g.ctx, down, h), x);
+    }
+    ggml_tensor * out = ggml_mul_mat(g.ctx, w_out, ggml_get_rows(g.ctx, x, rows));
+    g.gf              = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+struct prompt_run {
+    std::vector<float>  out;
+    int                 fired   = -1;  // chunks run whole on the host
+    const ggml_tensor * cropped = nullptr;
+};
+
+static bool run_cropped_prompt(ggml_backend_t npu, ggml_backend_t cpu, std::vector<uint8_t> & meta, host_chunk_count_fn chunks,
+                               prompt_run * pr) {
+    norm_graph                      g = build_cropped_chain(cpu, meta, CROP_CHAIN_ROWS);
+    std::vector<std::vector<float>> got;
+    const int                       before = chunks();
+    const bool                      ok     = run(g, npu, got);
+    pr->fired                              = chunks() - before;
+    pr->out                                = ok ? got[0] : std::vector<float>();
+    pr->cropped                            = g.checked[0];
+    free_graph(g);
+    return ok;
+}
+
+static bool test_chunk_plan_after_decode(ggml_backend_dev_t dev, ggml_backend_t cpu) {
+    ggml_backend_t            fresh   = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t            decoded = ggml_backend_dev_init(dev, nullptr);
+    const host_chunk_count_fn chunks  = fresh && decoded ? host_chunk_counter(fresh) : nullptr;
+    std::vector<uint8_t>      meta(ggml_tensor_overhead() * 64 + ggml_graph_overhead());
+    prompt_run                want, got;
+    bool                      ok = chunks && run_cropped_prompt(fresh, cpu, meta, chunks, &want);
+    // the decode's graph context goes and its buffer stays: the prompt's tensors take the decode's addresses, not its memory
+    norm_graph                      decode = build_cropped_chain(cpu, meta, 1);
+    std::vector<std::vector<float>> decode_out;
+    ok                          = ok && run(decode, decoded, decode_out);
+    const ggml_tensor * grouped = decode.checked[0];
+    ggml_free(decode.ctx);
+    ok = ok && run_cropped_prompt(decoded, cpu, meta, chunks, &got);
+    ggml_backend_buffer_free(decode.buf);
+    const bool aliased = got.cropped == grouped;
+    const bool same    = got.out == want.out;
+    const bool passed  = ok && aliased && want.fired == 1 && got.fired == want.fired && same;
+    std::printf("chunk host rule, a cropped prompt after a decode at its address: %d host chunks against %d fresh, %s%s %s\n",
+                got.fired, want.fired, same ? "the same bits" : "DIFFERENT BITS", aliased ? "" : ", NOT AT ITS ADDRESS",
+                passed ? "ok" : "FAIL");
+    ggml_backend_free(fresh);
+    ggml_backend_free(decoded);
+    return passed;
+}
+
+// A layer's Q, K and V behind per-head norms through one scheduler reserved for a prompt, as llama reserves it, then at a
+// decode's, a short prompt's and the prompt's rows: the allocator matches a graph against its reservation node by node, so the
+// order graph_optimize leaves must not depend on the rows.
+static const int64_t LAYER_HEAD_DIM = 64;
+static const int64_t LAYER_PROMPT   = 64;
+
+static ordered_graph build_layer(ggml_backend_t leaf_be, ggml_backend_t ops_be, const std::vector<int64_t> & ns, int64_t M,
+                                 enum ggml_type wtype) {
+    const int64_t    K = 512;
+    ordered_graph    g;
+    ggml_init_params lp = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_init_params op = { ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, true };
+    g.leaf              = ggml_init(lp);
+    g.ops               = ggml_init(op);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.leaf, GGML_TYPE_F32, K, M);
+    g.inputs.inputs     = { x };
+    g.gf                = ggml_new_graph(g.ops);
+    for (int64_t n : ns) {
+        ggml_tensor * w = ggml_new_tensor_2d(g.leaf, wtype, K, n);
+        g.inputs.inputs.push_back(w);
+        ggml_tensor * mm = ggml_mul_mat(g.ops, w, x);
+        g.mm.push_back(mm);
+        ggml_tensor * norm = ggml_rms_norm(g.ops, ggml_reshape_3d(g.ops, mm, LAYER_HEAD_DIM, n / LAYER_HEAD_DIM, M), 1e-6f);
+        g.out              = g.out ? ggml_concat(g.ops, g.out, norm, 1) : norm;
+    }
+    ggml_build_forward_expand(g.gf, g.out);
+    g.leaf_buf = ggml_backend_alloc_ctx_tensors(g.leaf, leaf_be);
+    if (ops_be) {
+        g.ops_buf = ggml_backend_alloc_ctx_tensors(g.ops, ops_be);
+    }
+    return g;
+}
+
+// a re-reservation the scheduler did not expect: the same backends and the same graph size
+static void count_unexpected_realloc(ggml_backend_sched_t, ggml_cgraph *, bool backend_ids_changed, bool graph_size_changed,
+                                     void * user_data) {
+    if (!backend_ids_changed && !graph_size_changed) {
+        (*(int *) user_data)++;
+    }
+}
+
+static std::vector<ggml_tensor *> graph_nodes(ggml_cgraph * gf) {
+    std::vector<ggml_tensor *> nodes;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        nodes.push_back(ggml_graph_node(gf, i));
+    }
+    return nodes;
+}
+
+// each node's place in `expanded`, in the order the graph holds them now
+static std::vector<int> places_in(ggml_cgraph * gf, const std::vector<ggml_tensor *> & expanded) {
+    std::vector<int> places;
+    for (const ggml_tensor * t : graph_nodes(gf)) {
+        places.push_back((int) (std::find(expanded.begin(), expanded.end(), t) - expanded.begin()));
+    }
+    return places;
+}
+
+// the layer at M rows through `sched`: the order graph_optimize left, and the output's nmse against the CPU
+static bool run_layer(ggml_backend_sched_t sched, ggml_backend_t npu, ggml_backend_t cpu, enum ggml_type wtype, int64_t M,
+                      std::vector<int> * places, double * e) {
+    const std::vector<int64_t> ns     = { 1024, 512, 512 };
+    ordered_graph              want_g = build_layer(cpu, cpu, ns, M, wtype);
+    ordered_graph              got_g  = build_layer(npu, nullptr, ns, M, wtype);
+    set_inputs(want_g.inputs, 1234);
+    set_inputs(got_g.inputs, 1234);
+    const std::vector<ggml_tensor *> expanded = graph_nodes(got_g.gf);
+    ggml_backend_sched_reset(sched);
+    const bool ok = ggml_backend_graph_compute(cpu, want_g.gf) == GGML_STATUS_SUCCESS &&
+                    ggml_backend_sched_alloc_graph(sched, got_g.gf) &&
+                    ggml_backend_sched_graph_compute(sched, got_g.gf) == GGML_STATUS_SUCCESS;
+    *places = places_in(got_g.gf, expanded);
+    *e      = ok ? nmse(get_f32(want_g.out), get_f32(got_g.out)) : INFINITY;
+    free_ordered(want_g);
+    free_ordered(got_g);
+    return ok;
+}
+
+static bool test_group_order_rows(ggml_backend_t npu, ggml_backend_t cpu, enum ggml_type wtype, double tol) {
+    ggml_backend_t       backends[2] = { npu, cpu };
+    ggml_backend_sched_t sched       = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    int                  unexpected  = 0;
+    ggml_backend_sched_set_realloc_callback(sched, count_unexpected_realloc, &unexpected);
+    ordered_graph reserve_g = build_layer(npu, nullptr, { 1024, 512, 512 }, LAYER_PROMPT, wtype);
+    bool          ok        = ggml_backend_sched_reserve(sched, reserve_g.gf);
+    free_ordered(reserve_g);
+    std::vector<int> first_places;
+    bool             same  = true;
+    double           worst = 0;
+    for (int64_t M : { (int64_t) 1, (int64_t) 2, LAYER_PROMPT, (int64_t) 1 }) {
+        std::vector<int> places;
+        double           e = INFINITY;
+        ok                 = ok && run_layer(sched, npu, cpu, wtype, M, &places, &e);
+        first_places       = first_places.empty() ? places : first_places;
+        same               = same && places == first_places;
+        worst              = std::max(worst, e);
+    }
+    const bool passed = ok && same && unexpected == 0 && worst < tol;
+    std::printf("MUL_MAT %-4s Q K V at 1, 2 and %lld rows after a prompt's reservation: order %s, %d unexpected "
+                "re-reservations, worst nmse %.3g %s\n",
+                ggml_type_name(wtype), (long long) LAYER_PROMPT, same ? "the same" : "DIFFERS", unexpected,
+                ok ? worst : INFINITY, passed ? "ok" : "FAIL");
+    ggml_backend_sched_free(sched);
+    return passed;
+}
+
+// Qwen3.5-0.8B's residual and FFN widths, and a short prompt's rows
+static constexpr int64_t CROP_EMBD   = 1024;
+static constexpr int64_t CROP_FFN    = 3584;
+static constexpr int64_t CROP_PROMPT = 16;
+
+// An M-row Q4_K projection, the GET_ROWS of its last row, then RMS_NORM, MUL
+// and a SwiGLU FFN of that one row, in the device's buffers as an offloaded
+// layer's are (the norm is laid out as an A only there)
+static norm_graph build_cropped_ffn(ggml_backend_buffer_type_t buft, int64_t K, int64_t F, int64_t M) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * p     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, K);
+    ggml_tensor * rows  = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * w     = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, K);
+    ggml_tensor * wg    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, F);
+    ggml_tensor * wu    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, F);
+    ggml_tensor * wd    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, F, K);
+    g.inputs            = { x, p, rows, w, wg, wu, wd };
+    g.out_row           = (int32_t) M - 1;
+    ggml_tensor * last  = ggml_get_rows(g.ctx, ggml_mul_mat(g.ctx, p, x), rows);
+    ggml_tensor * norm  = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, last, 1e-6f), w);
+    ggml_tensor * glu   = ggml_swiglu_split(g.ctx, ggml_mul_mat(g.ctx, wg, norm), ggml_mul_mat(g.ctx, wu, norm));
+    ggml_tensor * out   = ggml_mul_mat(g.ctx, wd, glu);
+    ggml_set_name(out, "ffn_out");
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors_from_buft(g.ctx, buft);
+    return g;
+}
+
+// the cropped FFN on both routes, the SwiGLU folded into the GEMM and not
+static bool check_cropped_ffn(ggml_backend_t cpu, ggml_backend_t npu, ggml_backend_buffer_type_t buft, double tol) {
+    bool passed = true;
+    for (const char * route : { "fused", "per-op" }) {
+        setenv("GGML_XDNA_FUSED_LAYER", std::strcmp(route, "fused") == 0 ? "1" : "0", 1);
+        for (const char * fold : { "1", "0" }) {
+            setenv("GGML_XDNA_PGEMM_GLU", fold, 1);
+            norm_graph                      g = build_cropped_ffn(buft, CROP_EMBD, CROP_FFN, CROP_PROMPT);
+            std::vector<std::vector<float>> want, got;
+            if (!run(g, cpu, want) || !run(g, npu, got)) {
+                std::printf("test-xdna-graph: compute failed\n");
+                return false;
+            }
+            const double e  = nmse(want[0], got[0]);
+            const bool   ok = e < tol;
+            passed          = passed && ok;
+            std::printf("FFN of a cropped row, %-6s GLU fold %s nmse %.3g %s\n", route, fold, e, ok ? "ok" : "FAIL");
+            ggml_backend_buffer_free(g.buf);
+            ggml_free(g.ctx);
+        }
+    }
+    unsetenv("GGML_XDNA_PGEMM_GLU");
+    unsetenv("GGML_XDNA_FUSED_LAYER");
+    return passed;
+}
+
+// One output of each site that hands the array a buffer the host reads back, filled with NaN by plain stores and left dirty
+// in the host's cache before the site gives it to the array (ggml_backend_xdna_test_dirty_output): a site that flushes it
+// first reads what the array wrote; one that does not reads the NaN its read-back sync writes back over it. Each case checks
+// the site filled exactly the one output, so a case its site never ran in cannot pass.
+typedef int (*dirty_output_fn)(const char * site, int arm);
+
+static const int     DIRTY_GEMM_ROWS    = 128;  // one block of a large product: the array's (test_pgemm_host_rule)
+static const int64_t DIRTY_GEMM_K       = 1024;
+static const int64_t DIRTY_GEMM_N       = 4096;
+static const int64_t DIRTY_HEAD_VOCAB   = 65536;  // the dirt shows at this many rows without the flush, not at 4096
+static const int     DIRTY_FA_TOKENS    = 600;
+static const int     GDN_TOKENS         = 144;    // the fewest of one sequence the array's GATED_DELTA_NET takes
+static const int     GDN_HEADS          = 16;
+static const int     GDN_DIM            = 128;
+static const double  GDN_ARRAY_NMSE_MAX = 1e-3;  // the array's bf16: 7e-6 on these inputs
+
+// `filled` -1: a compute failed
+static bool dirty_result_ok(const char *               site,
+                            int                        filled,
+                            const std::vector<float> & want,
+                            const std::vector<float> & got,
+                            double                     max_nmse) {
+    const double e  = filled >= 0 ? nmse(want, got) : INFINITY;
+    const bool   ok = filled == 1 && e < max_nmse;
+    std::printf("dirty output before the array writes it, %-8s %d filled, nmse %.3g %s\n", site, filled, e,
+                ok ? "ok" : "FAIL");
+    return ok;
+}
+
+// the outputs `site` filled while the NPU ran a graph with the site's next output left dirty; -1 when a compute failed
+static int dirtied_run(dirty_output_fn dirty, const char * site, bool computed, const std::function<bool()> & run_npu) {
+    const int  before = dirty(site, 1);
+    const bool ok     = run_npu();
+    const int  after  = dirty(site, 0);
+    return computed && ok ? after - before : -1;
+}
+
+static bool dirty_pgemm(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu, double tol) {
+    norm_graph                      g = build_gemms(cpu, GGML_TYPE_Q8_0, DIRTY_GEMM_ROWS,
+                                                    {
+                                                        gemm_shape{ DIRTY_GEMM_K, DIRTY_GEMM_N }
+    });
+    std::vector<std::vector<float>> want, got;
+    const bool                      computed = run(g, cpu, want);
+    const int                       filled   = dirtied_run(dirty, "pgemm", computed, [&] { return run(g, npu, got); });
+    const bool                      ok = dirty_result_ok("pgemm", filled, filled >= 0 ? want[0] : std::vector<float>(),
+                                                         filled >= 0 ? got[0] : std::vector<float>(), tol);
+    free_graph(g);
+    return ok;
+}
+
+// the vocabulary projection of a decode on the array (GGML_XDNA_HEAD=1, set for the process in main)
+static bool dirty_head(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu, double tol) {
+    norm_graph g = build_one_token(cpu, DIRTY_GEMM_K, DIRTY_HEAD_VOCAB);
+    ggml_set_name(g.inputs[1], "output.weight");
+    std::vector<std::vector<float>> want, got;
+    const bool                      computed = run(g, cpu, want);
+    const int                       filled   = dirtied_run(dirty, "head", computed, [&] { return run(g, npu, got); });
+    const bool                      ok = dirty_result_ok("head", filled, filled >= 0 ? want[0] : std::vector<float>(),
+                                                         filled >= 0 ? got[0] : std::vector<float>(), tol);
+    free_graph(g);
+    return ok;
+}
+
+static bool dirty_attn_mm(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu) {
+    set_fa_route(FA_ROUTE_ARRAY);
+    fa_cache c = new_fa_cache(cpu);
+    fill_cells(c, 0, FA_REFILL_CACHE, 13);
+    fa_rows_graph      g = build_fa_on_cache(cpu, c, DIRTY_FA_TOKENS);
+    std::vector<float> want, got;
+    const bool         computed = run_refill(g, cpu, DIRTY_FA_TOKENS, 0, true, &want);
+    const int          filled =
+        dirtied_run(dirty, "attn-mm", computed, [&] { return run_refill(g, npu, DIRTY_FA_TOKENS, 0, true, &got); });
+    const bool ok = dirty_result_ok("attn-mm", filled, want, got, FA_ARRAY_NMSE_MAX);
+    free_rows_graph(g);
+    ggml_backend_buffer_free(c.buf);
+    ggml_free(c.ctx);
+    unsetenv("GGML_XDNA_FA_MM");
+    return ok;
+}
+
+// a decode's attention on the pool, its K and V in the device's buffers (test_fa_kv_rows' last case)
+static bool dirty_att(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu, ggml_backend_buffer_type_t buft) {
+    const fa_rows_case c = { "decode on the pool", FA_ROUTE_HOST, 1, false, true };
+    set_fa_route(c.route);
+    setenv("GGML_XDNA_HOST_FA", "1", 1);
+    fa_rows_graph      g = build_fa_rows(buft, c);
+    std::vector<float> want, got;
+    const bool         computed = run_fa_rows(g, c, cpu, want);
+    const int          filled   = dirtied_run(dirty, "att", computed, [&] { return run_fa_rows(g, c, npu, got); });
+    const bool         ok       = dirty_result_ok("att", filled, want, got, FA_ARRAY_NMSE_MAX);
+    free_rows_graph(g);
+    unsetenv("GGML_XDNA_FA_MM");
+    unsetenv("GGML_XDNA_HOST_FA");
+    return ok;
+}
+
+// GATED_DELTA_NET of one sequence in the shapes the array takes: q, k unit rows a head, v, the log decay g < 0, beta, s0
+static norm_graph build_gdn(ggml_backend_t cpu) {
+    norm_graph       g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.inputs            = { ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, GDN_DIM, GDN_HEADS, GDN_TOKENS, 1),
+                            ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, GDN_DIM, GDN_HEADS, GDN_TOKENS, 1),
+                            ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, GDN_DIM, GDN_HEADS, GDN_TOKENS, 1),
+                            ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, 1, GDN_HEADS, GDN_TOKENS, 1),
+                            ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, 1, GDN_HEADS, GDN_TOKENS, 1),
+                            ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, GDN_DIM, GDN_DIM, GDN_HEADS, 1) };
+    ggml_tensor * out =
+        ggml_gated_delta_net(g.ctx, g.inputs[0], g.inputs[1], g.inputs[2], g.inputs[3], g.inputs[4], g.inputs[5], 1);
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
+static void set_unit_rows(ggml_tensor * t, std::mt19937 & rng) {
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float>              f(ggml_nelements(t));
+    for (size_t r = 0; r < f.size(); r += GDN_DIM) {
+        double sq = 0.0;
+        for (int d = 0; d < GDN_DIM; d++) {
+            f[r + d] = nd(rng);
+            sq += (double) f[r + d] * f[r + d];
+        }
+        for (int d = 0; d < GDN_DIM; d++) {
+            f[r + d] = (float) (f[r + d] / std::sqrt(sq));
+        }
+    }
+    ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
+}
+
+static void set_uniform(ggml_tensor * t, std::mt19937 & rng, float lo, float hi) {
+    std::uniform_real_distribution<float> u(lo, hi);
+    std::vector<float>                    f(ggml_nelements(t));
+    for (float & x : f) {
+        x = u(rng);
+    }
+    ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
+}
+
+static bool run_gdn(norm_graph & g, ggml_backend_t be, std::vector<float> & res) {
+    std::mt19937                    rng(21);
+    std::normal_distribution<float> nv(0.0f, 0.5f), ns(0.0f, 0.05f);
+    set_unit_rows(g.inputs[0], rng);
+    set_unit_rows(g.inputs[1], rng);
+    set_normal(g.inputs[2], rng, nv);
+    set_uniform(g.inputs[3], rng, -0.5f, -0.02f);
+    set_uniform(g.inputs[4], rng, 0.2f, 0.8f);
+    set_normal(g.inputs[5], rng, ns);
+    if (ggml_backend_graph_compute(be, g.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    res = get_f32(g.checked[0]);
+    return true;
+}
+
+static bool dirty_gdn_mm(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu) {
+    norm_graph         g = build_gdn(cpu);
+    std::vector<float> want, got;
+    const bool         computed = run_gdn(g, cpu, want);
+    const int          filled   = dirtied_run(dirty, "gdn-mm", computed, [&] { return run_gdn(g, npu, got); });
+    const bool         ok       = dirty_result_ok("gdn-mm", filled, want, got, GDN_ARRAY_NMSE_MAX);
+    free_graph(g);
+    return ok;
+}
+
+static bool test_dirty_outputs(ggml_backend_t npu, ggml_backend_t cpu, ggml_backend_buffer_type_t buft, double tol) {
+    auto dirty = (dirty_output_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_dirty_output");
+    if (!dirty) {
+        std::printf("test-xdna-graph: the backend has no dirty-output hook\n");
+        return false;
+    }
+    setenv("GGML_XDNA_PGEMM_HOST", "0", 1);
+    setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
+    bool passed = dirty_pgemm(dirty, npu, cpu, tol);
+    passed      = dirty_head(dirty, npu, cpu, tol) && passed;
+    passed      = dirty_attn_mm(dirty, npu, cpu) && passed;
+    // after a prefill: the pool flushes a cache's rows once by address until the next one
+    passed      = dirty_att(dirty, npu, cpu, buft) && passed;
+    passed      = dirty_gdn_mm(dirty, npu, cpu) && passed;
+    unsetenv("GGML_XDNA_PGEMM_HOST");
+    unsetenv("GGML_XDNA_HOST_CHUNK");
+    return passed;
+}
+
 int main(void) {
+    // read once a process: the vocabulary projection of test_dirty_outputs on the array; no other case names one
+    setenv("GGML_XDNA_HEAD", "1", 1);
     ggml_backend_load_all();
     ggml_backend_dev_t dev = xdna_device();
     if (!dev) {
@@ -183,6 +2113,10 @@ int main(void) {
     // Q8_K on the CPU, which leaves them 1-2e-4 apart
     const double tol    = 1e-3;
     bool         passed = true;
+
+    // the route cases below are about the array at small sizes; the host routing has its own at the end
+    setenv("GGML_XDNA_PGEMM_HOST", "0", 1);
+    setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
     for (bool side_reader : { false, true }) {
         norm_graph                      g = build(cpu, side_reader, 1024, 1024, 128);
         std::vector<std::vector<float>> want, got;
@@ -221,6 +2155,230 @@ int main(void) {
         ggml_free(g.ctx);
     }
     unsetenv("GGML_XDNA_FUSED_LAYER");
+
+    // the cases that are not about the size rule force the array (or the host), whatever the size; the
+    // by-size cases sit either side of its two bounds: n_tokens x n_kv x n_head, then the visible keys x n_head
+    const fa_case fa_cases[] = {
+        // name                                       route               heads tokens   ctx  pad seqs mask       window scale   cache  array
+        { "causal 8 heads, cache view",               FA_ROUTE_ARRAY,        8, 1536,    0, 256,  1, FA_CAUSAL,   0, 0.0625f, true,  true },
+        { "causal with 1100 keys of context",         FA_ROUTE_ARRAY,        8,  600, 1100, 256,  1, FA_CAUSAL,   0, 0.0625f, true,  true },
+        { "bidirectional, 3 sequences",               FA_ROUTE_ARRAY,        4,  777,    0,   1,  3, FA_FULL,     0, 1.0f,    false, true },
+        { "band 512, 2 sequences",                    FA_ROUTE_ARRAY,        4, 1300,    0,   1,  2, FA_BAND,   512, 1.0f,    false, true },
+        { "band 40, one sequence",                    FA_ROUTE_ARRAY,        4,  900,    0,   1,  1, FA_BAND,    40, 1.0f,    false, true },
+        { "40 sequences of 16 tokens",                FA_ROUTE_ARRAY,        4,  640,    0,   1, 40, FA_FULL,     0, 1.0f,    false, true },
+        { "1 head per KV head group, causal",         FA_ROUTE_ARRAY,        2,  700,    0,   1,  1, FA_CAUSAL,   0, 0.0625f, false, true },
+        { "below 64 tokens: the host",                FA_ROUTE_ARRAY,        4,   40,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false },
+        { "a mask with holes: the host",              FA_ROUTE_ARRAY,        4,  700,    0,   1,  1, FA_HOLES,    0, 1.0f,    false, false },
+        { "FA_MM=0: the host at any size",            FA_ROUTE_HOST,         4, 1600,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false },
+        { "by size: under the shape bound",           FA_ROUTE_BY_SIZE,      4,  700,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false },
+        { "by size: over it, few keys visible",       FA_ROUTE_BY_SIZE,      4, 4600,    0,   1,  1, FA_BAND,    40, 1.0f,    false, false },
+        { "by size: over both bounds",                FA_ROUTE_BY_SIZE,      4, 4600,    0,   1,  1, FA_FULL,     0, 1.0f,    false, true },
+        { "by size: 8 heads, 11000 keys of context",  FA_ROUTE_BY_SIZE,      8,  600, 11000, 256,  1, FA_CAUSAL,   0, 0.0625f, true,  false },
+        { "by size: 8 heads, 16500 keys of context",  FA_ROUTE_BY_SIZE,      8,  600, 16500, 256,  1, FA_CAUSAL,   0, 0.0625f, true,  true },
+        // the host kernel: every case on the host (the array route off), whatever it would have chosen
+        { "host: causal 8 heads, cache view",         FA_ROUTE_HOST,         8,  517,    0, 256,  1, FA_CAUSAL,   0, 0.0625f, true,  false },
+        { "host: causal with 1100 keys of context",   FA_ROUTE_HOST,         8,  301, 1100, 256,  1, FA_CAUSAL,   0, 0.0625f, true,  false },
+        { "host: bidirectional, 3 sequences",         FA_ROUTE_HOST,         4,  777,    0,   1,  3, FA_FULL,     0, 1.0f,    false, false },
+        { "host: band 512, 2 sequences",              FA_ROUTE_HOST,         4,  901,    0,   1,  2, FA_BAND,   512, 1.0f,    false, false },
+        { "host: band 40, one sequence",              FA_ROUTE_HOST,         4,  333,    0,   1,  1, FA_BAND,    40, 1.0f,    false, false },
+        { "host: 40 sequences of 16 tokens",          FA_ROUTE_HOST,         4,  640,    0,   1, 40, FA_FULL,     0, 1.0f,    false, false },
+        { "host: a mask with holes",                  FA_ROUTE_HOST,         4,  700,    0,   1,  1, FA_HOLES,    0, 1.0f,    false, false },
+        { "host: a mask with finite values",          FA_ROUTE_HOST,         4,  300,    0,   1,  1, FA_BIAS,    60, 1.0f,    false, false },
+        { "host: 8 tokens, the least it takes",       FA_ROUTE_HOST,         4,    8,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false },
+        { "host: 7 tokens stay on ggml-cpu",          FA_ROUTE_HOST,         4,    7,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false },
+        { "host: heads of 512, one KV head",          FA_ROUTE_HOST,         4,  301,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false, 512, 1 },
+        { "host: heads of 64, 2 query heads a group", FA_ROUTE_HOST,         4,  200,    0,   1,  1, FA_CAUSAL,   0, 0.125f,  false, false, 64, 2 },
+        { "host: heads of 80, 3 query heads a group", FA_ROUTE_HOST,         6,  250,    0,   1,  1, FA_BAND,    70, 0.1f,    false, false, 80, 2 },
+        { "host: 1 query head a group",               FA_ROUTE_HOST,         2,  260,    0,   1,  1, FA_CAUSAL,   0, 0.0625f, false, false },
+        { "host: 8 query heads, one KV head",         FA_ROUTE_HOST,         8,  260,    0,   1,  1, FA_CAUSAL,   0, 0.0625f, false, false, 128, 1 },
+        { "host: f32 K and V",                        FA_ROUTE_HOST,         4,  500,    0,   1,  1, FA_BAND,   120, 1.0f,    false, false, 256, 2, true },
+        { "host: f32 K and V, cache view",            FA_ROUTE_HOST,         8,  300,  200, 128,  1, FA_CAUSAL,   0, 0.0625f, true,  false, 256, 2, true },
+        { "host: ggml-cpu's op (HOST_FA=0)",          FA_ROUTE_HOST,         4,  600,    0,   1,  1, FA_BAND,   512, 1.0f,    false, false, 256, 2, false, 0 },
+        { "portable: band 512, 2 sequences",          FA_ROUTE_HOST,         4,  901,    0,   1,  2, FA_BAND,   512, 1.0f,    false, false, 256, 2, false, 2 },
+        { "portable: causal 8 heads, f32 cache view", FA_ROUTE_HOST,         8,  300,  200, 128,  1, FA_CAUSAL,   0, 0.0625f, true,  false, 256, 2, true,  2 },
+        { "portable: a mask with finite values",      FA_ROUTE_HOST,         4,  300,    0,   1,  1, FA_BIAS,    60, 1.0f,    false, false, 80, 2, false, 2 },
+        { "host: rows that see nothing",              FA_ROUTE_HOST,         4,  200,    0,   1,  1, FA_EMPTY_ROWS, 0, 1.0f,  false, false },
+        { "portable: rows that see nothing",          FA_ROUTE_HOST,         4,  200,    0,   1,  1, FA_EMPTY_ROWS, 0, 1.0f,  false, false, 256, 2, false, 2 },
+        { "host: K heads of 192, V heads of 128",     FA_ROUTE_HOST,         4,  250,    0,   1,  1, FA_CAUSAL,   0, 0.0722f, false, false, 192, 1, false, 1, 128 },
+        { "host: K heads of 64, V heads of 256",      FA_ROUTE_HOST,         4,  260,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false, 64, 2, false, 1, 256 },
+        { "host: 16 query heads, one KV head",        FA_ROUTE_HOST,        16,  200,    0,   1,  1, FA_CAUSAL,   0, 0.125f,  false, false, 64, 1 },
+        { "host: 32 query heads, one KV head (most)", FA_ROUTE_HOST,        32,  150,    0,   1,  1, FA_CAUSAL,   0, 0.125f,  false, false, 64, 1 },
+        { "host: 33 query heads stay on ggml-cpu",    FA_ROUTE_HOST,        33,  100,    0,   1,  1, FA_CAUSAL,   0, 0.125f,  false, false, 64, 1, false, 1, 0, 0, 0, true },
+        { "host: heads of 1024 (the most)",           FA_ROUTE_HOST,         2,  100,    0,   1,  1, FA_CAUSAL,   0, 0.03125f, false, false, 1024, 1 },
+        { "host: heads of 1040 stay on ggml-cpu",     FA_ROUTE_HOST,         2,  100,    0,   1,  1, FA_CAUSAL,   0, 0.03125f, false, false, 1040, 1, false, 1, 0, 0, 0, true },
+        { "host: a mask with 64 rows past the queries", FA_ROUTE_HOST,       4,  300,    0,   1,  1, FA_CAUSAL,   0, 0.0625f, false, false, 256, 2, false, 1, 0, 64 },
+        { "host: a mask 16 columns wider than the keys", FA_ROUTE_HOST,      4,  300,    0,   1,  1, FA_BAND,    60, 1.0f,    false, false, 256, 2, false, 1, 0, 0, 16 },
+        { "array: a mask with 64 rows past the queries", FA_ROUTE_ARRAY,     4,  700,    0,   1,  1, FA_CAUSAL,   0, 0.0625f, false, true,  256, 2, false, 1, 0, 64 },
+        // the bound by size follows the route that would run: 64M visible triples for the host kernel, 8M when ggml-cpu's op would
+        { "by size: 21M triples, the host kernel",    FA_ROUTE_BY_SIZE,      4, 2300,    0,   1,  1, FA_FULL,     0, 1.0f,    false, false },
+        { "by size: 21M triples, HOST_FA=0: the array", FA_ROUTE_BY_SIZE,    4, 2300,    0,   1,  1, FA_FULL,     0, 1.0f,    false, true,  256, 2, false, 0 },
+        { "K and V cast from f32: the host",          FA_ROUTE_HOST,         4,  912,    0,   1,  1, FA_BAND,   512, 1.0f,    false, false, 256, 2, false, 1, 0, 0, 0, false, true },
+        { "K and V cast from f32: the array",         FA_ROUTE_ARRAY,        4, 1300,    0,   1,  2, FA_BAND,   512, 1.0f,    false, true,  256, 2, false, 1, 0, 0, 0, false, true },
+    };
+    for (const fa_case & c : fa_cases) {
+        set_fa_route(c.route);
+        setenv("GGML_XDNA_HOST_FA", std::to_string(c.host_fa).c_str(), 1);
+        norm_graph               g = build_fa(cpu, c);
+        std::vector<float>       want, got;
+        if (!run_fa(g, c, cpu, want) || !run_fa(g, c, npu, got)) {
+            std::printf("test-xdna-graph: compute failed\n");
+            return 1;
+        }
+        const double e  = nmse(want, got);
+        // the casts of such a graph are the backend's own (host ops inside its chunk), not a split to the CPU
+        const bool   claimed = !c.cast_f32 || casts_claimed(npu, g.gf);
+        const bool   ok      = claimed && fa_result_ok(c, e);
+        passed               = passed && ok;
+        std::printf("FLASH_ATTN_EXT %-52s nmse %.3g %s%s\n", c.name, e, claimed ? "" : "casts not claimed ", ok ? "ok" : "FAIL");
+        ggml_backend_buffer_free(g.buf);
+        ggml_free(g.ctx);
+    }
+    unsetenv("GGML_XDNA_FA_MM");
+    unsetenv("GGML_XDNA_HOST_FA");
+    for (fa_route route : { FA_ROUTE_HOST, FA_ROUTE_ARRAY }) {
+        passed = test_fa_computed_masks(npu, cpu, route) && passed;
+    }
+    passed = test_fa_kv_rows(npu, cpu, ggml_backend_dev_buffer_type(dev)) && passed;
+    for (bool causal : { true, false }) {
+        passed = test_fa_refill(npu, cpu, causal) && passed;
+    }
+    passed = test_fa_kv_copies(npu, cpu) && passed;
+
+    const gemm_case gemm_cases[] = {
+        { "decode block",     GGML_TYPE_BF16, 15,  { { 512, 1024 }, { 1024, 512 } } },
+        { "two blocks",       GGML_TYPE_BF16, 300, { { 512, 1024 }, { 512, 512 } } },
+        { "partial block",    GGML_TYPE_BF16, 912, { { 512, 2048 }, { 512, 512 } } },
+        { "short tail",       GGML_TYPE_BF16, 1100, { { 512, 512 }, { 1024, 512 } } },
+        { "mixed K and N",    GGML_TYPE_BF16, 912, { { 512, 1024 }, { 1024, 512 }, { 2048, 512 }, { 576, 1024 }, { 512, 512 } } },
+        { "f16 weights",      GGML_TYPE_F16,  130, { { 1536, 512 }, { 512, 2048 } } },
+        // a bf16 projection between pgemm ones pays two context switches: the host does a small one
+        // (EmbeddingGemma 2's per_layer_model_proj), the array a large one, and between bf16 ones no switch is paid
+        { "among pgemm, small", GGML_TYPE_BF16, 15,
+          { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_HOST }, { 512, 1024, GGML_TYPE_Q4_K } } },
+        { "among pgemm, mid",   GGML_TYPE_BF16, 132,
+          { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_HOST }, { 512, 1024, GGML_TYPE_Q4_K } } },
+        { "among pgemm, large", GGML_TYPE_BF16, 8192,
+          { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_ARRAY }, { 512, 1024, GGML_TYPE_Q4_K } } },
+        { "among bf16",         GGML_TYPE_BF16, 15,
+          { { 512, 1024 }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_ARRAY }, { 512, 1024 } } },
+        // GGML_XDNA_GEMM_HOST=0 leaves the small projection to the array, switches or not
+        { "among pgemm, rule off", GGML_TYPE_BF16, 15,
+          { { 512, 1024, GGML_TYPE_Q4_K }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_ARRAY }, { 512, 1024, GGML_TYPE_Q4_K } },
+          false, true },
+        // the model decides both: neighbours with work stay on the array and the bf16 projection among them goes to the host;
+        // small neighbours go to the host and leave the bf16 one no switch to pay
+        { "among large pgemm, model", GGML_TYPE_BF16, 15,
+          { { 2048, 4096, GGML_TYPE_Q8_0, GEMM_ROUTE_ARRAY }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_HOST },
+            { 2048, 4096, GGML_TYPE_Q8_0, GEMM_ROUTE_ARRAY } },
+          true },
+        { "among small pgemm, model", GGML_TYPE_BF16, 15,
+          { { 512, 1024, GGML_TYPE_Q4_K, GEMM_ROUTE_HOST }, { 512, 12288, GGML_TYPE_COUNT, GEMM_ROUTE_ARRAY },
+            { 512, 1024, GGML_TYPE_Q4_K, GEMM_ROUTE_HOST } },
+          true },
+    };
+    for (const gemm_case & c : gemm_cases) {
+        norm_graph                      g = build_gemms(cpu, c.wtype, c.M, c.shapes);
+        std::vector<std::vector<float>> want, got;
+        if (c.pgemm_host_on) {
+            unsetenv("GGML_XDNA_PGEMM_HOST");
+        }
+        if (c.gemm_host_off) {
+            setenv("GGML_XDNA_GEMM_HOST", "0", 1);
+        }
+        const bool computed = run(g, cpu, want) && run(g, npu, got);
+        setenv("GGML_XDNA_PGEMM_HOST", "0", 1);
+        unsetenv("GGML_XDNA_GEMM_HOST");
+        if (!computed) {
+            std::printf("test-xdna-graph: compute failed\n");
+            return 1;
+        }
+        for (size_t i = 0; i < g.checked.size(); i++) {
+            const double e     = nmse(want[i], got[i]);
+            const bool   exact = e == 0.0;
+            const gemm_route route = c.shapes[i].route;
+            const bool   ok    = e < tol && (route != GEMM_ROUTE_HOST || exact) && (route != GEMM_ROUTE_ARRAY || !exact);
+            passed             = passed && ok;
+            std::printf("MUL_MAT %-4s M%-4lld %-20s %-12s nmse %.3g %s\n", ggml_type_name(c.wtype), (long long) c.M, c.name,
+                        ggml_get_name(g.checked[i]), e, ok ? "ok" : "FAIL");
+        }
+        ggml_backend_buffer_free(g.buf);
+        ggml_free(g.ctx);
+    }
+
+    passed = test_lost_c_line(npu, cpu, ggml_backend_dev_backend_reg(dev), tol) && passed;
+    passed = test_cast_claims(npu, cpu) && passed;
+
+    // a call runs the 128-row blocks its rows fill: one up to 128 rows, an odd count at 300 and 520, and 2100
+    // rows are 17 blocks, a 16-block slab and a last one of one block
+    for (int64_t M : { 15, 100, 128, 129, 300, 520, 2100 }) {
+        passed = test_output_in_place(npu, cpu, M, tol) && passed;
+    }
+    for (int64_t M : { 15, 200 }) {
+        passed = test_repeated_projection(npu, cpu, M, 3, tol) && passed;
+    }
+
+    const std::vector<std::vector<int64_t>> groups = { { 1024, 512, 512 }, { 2048, 512, 512 }, { 1024, 640 } };
+    for (const std::vector<int64_t> & ns : groups) {
+        for (int64_t M : { 15, 100, 128, 200, 300, 2100 }) {
+            passed = test_group(npu, cpu, ns, M, tol) && passed;
+        }
+    }
+
+    for (bool group_on : { true, false }) {
+        passed = test_group_order(npu, cpu, between::nothing, group_on, 200, tol) && passed;
+    }
+    for (between what : { between::writer, between::weight_view }) {
+        passed = test_group_order(npu, cpu, what, true, 200, tol) && passed;
+    }
+
+    // a layer's Q, K and V (the narrow ones of a local layer and the wide Q of a global one) and its up and
+    // gate on the bf16 GEMM, from a decode-sized batch to two blocks
+    const std::vector<std::vector<int64_t>> bf16_groups = { { 1024, 512, 512 }, { 2048, 512, 512 }, { 2048, 2048 } };
+    for (const std::vector<int64_t> & ns : bf16_groups) {
+        for (int64_t M : { 15, 200, 912 }) {
+            passed = test_group(npu, cpu, ns, M, tol, GGML_TYPE_BF16) && passed;
+            passed = test_group_matches_one_by_one(npu, ns, M) && passed;
+        }
+    }
+    // two bf16 projections whose own cheapest blocks differ share one: 1029 rows just past 1024, 1188 a batch
+    for (int64_t M : { 1029, 1188 }) {
+        passed = test_one_block_a_graph(npu, cpu, M, tol) && passed;
+    }
+    for (bool group_on : { true, false }) {
+        passed = test_group_order(npu, cpu, between::nothing, group_on, 200, tol, GGML_TYPE_BF16) && passed;
+    }
+    for (between what : { between::writer, between::weight_view }) {
+        passed = test_group_order(npu, cpu, what, true, 200, tol, GGML_TYPE_BF16) && passed;
+    }
+    for (enum ggml_type wtype : { GGML_TYPE_Q8_0, GGML_TYPE_BF16 }) {
+        passed = test_group_order_rows(npu, cpu, wtype, tol) && passed;
+    }
+
+    for (ggml_glu_op op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
+        for (bool glu_is_output : { false, true }) {
+            for (float scale : { 0.05f, 0.3f }) {
+                for (int64_t M : { 15, 128, 200, 2100 }) {
+                    passed = test_ffn(npu, cpu, op, glu_is_output, 512, 2048, M, scale, 3e-3) && passed;
+                }
+                passed = test_ffn(npu, cpu, op, glu_is_output, 2560, 9216, 300, scale, 3e-3) && passed;
+                passed = test_ffn(npu, cpu, op, glu_is_output, 2560, 9216, 100, scale, 3e-3) && passed;
+            }
+        }
+    }
+
+    passed = check_cropped_ffn(cpu, npu, ggml_backend_dev_buffer_type(dev), tol) && passed;
+
+    // a new backend context drops the weights the earlier cases packed
+    ggml_backend_free(npu);
+    npu = ggml_backend_dev_init(dev, nullptr);
+    unsetenv("GGML_XDNA_PGEMM_HOST");
+    unsetenv("GGML_XDNA_HOST_CHUNK");
+    passed = npu != nullptr && test_pgemm_host_rule(npu, cpu, tol) && passed;
+    passed = npu != nullptr && test_host_chunk_rule(npu, cpu, tol) && passed;
+    passed = npu != nullptr && test_host_chunk_conv_kernels(npu, cpu) && passed;
+    passed = npu != nullptr && test_group_order_after_host_plan(npu, cpu) && passed;
+    passed = test_chunk_plan_after_decode(dev, cpu) && passed;
+    passed = npu != nullptr && test_dirty_outputs(npu, cpu, ggml_backend_dev_buffer_type(dev), tol) && passed;
 
     ggml_backend_free(npu);
     ggml_backend_free(cpu);

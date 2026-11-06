@@ -12,6 +12,7 @@ ggml_add_backend_library(ggml-xdna
                          xdna-ops.cpp
                          xdna-pgemm.cpp
                          xdna-attn-mm.cpp
+                         xdna-host-attn.cpp
                          xdna-gdn-mm.cpp
                          xdna-conv-prefill.cpp
                          xdna-rec.cpp
@@ -52,15 +53,17 @@ endif()
 # compiles stay in sync.
 #
 # The prefill tile_m is the reuse factor for the weights: one B sweep feeds
-# tile_m * n_compute_rows rows, so the 64-row int8 tile re-reads B from DDR
-# four times less often than the 16-row tile the first prefill kernels used.
-# bf16 cannot go that far - its double-width A/B banks plus the f32 C tile
-# exceed the 64 KB core L1 past 32 rows - so the two routes bake different
-# tiles. The prefill M blocks must stay multiples of tile_m * n_compute_rows.
+# tile_m * n_compute_rows rows, so the 64-row tile re-reads B from DDR half as
+# often as the 32-row one. A core's input streams are the limit of the bf16
+# kernel (a 64x64 B tile is 8 KB for 32 rows of A): the wider tile takes the
+# GEMM of 512 rows by N=12288 from 2.2 to 1.2 ms. It fills the 64 KB core L1
+# exactly with a single f32 C buffer (gemm.py), so the core waits for each C
+# tile to leave. The prefill M blocks must stay multiples of
+# tile_m * n_compute_rows.
 set(XDNA_GEMM_M 32)         # decode M block (tile_m * n_compute_rows)
 set(XDNA_TILE_M 8)          # decode per-core M tile (r=4 native bf16)
 set(XDNA_GEMM_M_BIG 256)    # base prefill M block
-set(XDNA_TILE_M_BIG 32)     # bf16 prefill per-core M tile
+set(XDNA_TILE_M_BIG 64)     # bf16 prefill per-core M tile
 set(XDNA_TILE_M_BIG_I8 64)  # int8 prefill per-core M tile
 set(XDNA_GEMM_M_BIG_EXTRA 512 2048)   # extra prefill M blocks (baked variants)
 # The option was called XDNA_GATED_FMT while the README and the runtime
@@ -72,7 +75,9 @@ if (DEFINED CACHE{XDNA_GATED_FMT} AND NOT DEFINED CACHE{GGML_XDNA_GATED_FMT})
     set(GGML_XDNA_GATED_FMT "${XDNA_GATED_FMT}" CACHE STRING
         "ggml-xdna: gated activation layout baked into the fused layer (0 = 4-bit, for a Q4_K ssm_out; 1 = 8-bit, for Q5_K/Q6_K)")
 endif()
-set(GGML_XDNA_GATED_FMT 1 CACHE STRING
+# the layout the committed xdna-design-tag.h is tagged at (test-xdna-design-tag)
+set(GGML_XDNA_GATED_FMT_DEFAULT 1 CACHE INTERNAL "")
+set(GGML_XDNA_GATED_FMT ${GGML_XDNA_GATED_FMT_DEFAULT} CACHE STRING
     "ggml-xdna: gated activation layout baked into the fused layer (0 = 4-bit, for a Q4_K ssm_out; 1 = 8-bit, for Q5_K/Q6_K)")
 set(XDNA_TILE_K 64)         # per-core K tile (larger = fewer C reloads per call)
 set(XDNA_TILE_N 64)         # per-core N tile (wider = longer B DDR bursts)
@@ -508,9 +513,11 @@ if (GGML_XDNA_BUILD_KERNELS)
 endif()
 
 # Host-only tests of what a device cannot check for itself: which weight
-# conversions the repacker accepts, how many head rows stay exact, and which
-# nodes the graph planners take for the ones llama builds. They
-# compile the backend sources they test directly and open no device.
+# conversions the repacker accepts, how many head rows stay exact, which
+# nodes the graph planners take for the ones llama builds, what the mark that
+# tells a lost write from a landed one leaves behind, how the GEMM stream
+# issues its sweeps, and how far a grouped projection's output offset reaches.
+# They compile the backend sources they test directly and open no device.
 # tests/CMakeLists.txt adds them to ctest: testing is enabled there, after this
 # directory is configured.
 option(GGML_XDNA_BUILD_TESTS "ggml-xdna: build the host-only backend tests" ON)
@@ -523,4 +530,11 @@ if (GGML_XDNA_BUILD_TESTS)
     target_link_libraries(test-xdna-head-rows PRIVATE XRT::xrt_coreutil)
     add_executable(test-xdna-match tests/test-xdna-match.cpp)
     target_link_libraries(test-xdna-match PRIVATE ggml-base)
+    add_executable(test-xdna-seq tests/test-xdna-seq.cpp xdna-seq.cpp)
+    target_include_directories(test-xdna-seq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    target_link_libraries(test-xdna-seq PRIVATE ggml-base)
+    add_executable(test-xdna-mark tests/test-xdna-mark.cpp xdna-runtime.cpp)
+    target_include_directories(test-xdna-mark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    target_link_libraries(test-xdna-mark PRIVATE ggml-base XRT::xrt_coreutil)
+    add_executable(test-xdna-seg-reach tests/test-xdna-seg-reach.cpp)
 endif()
