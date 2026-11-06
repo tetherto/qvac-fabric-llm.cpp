@@ -5819,3 +5819,32 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 
     return true;
 }
+
+static void ggml_convrot_repack_row_q8_0(const int8_t * weights, ggml_fp16_t scale, int64_t n_blocks, block_q8_0 * dst) {
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        dst[b].d = scale;
+        memcpy(dst[b].qs, weights + b*QK8_0, QK8_0);
+    }
+}
+
+size_t ggml_convrot_repack_q8_0(
+        const int8_t * weights,
+        const float  * scales,
+        int64_t        in_features,
+        int64_t        out_features,
+        void         * dst) {
+    GGML_ASSERT(in_features > 0 && in_features % QK8_0 == 0);
+    GGML_ASSERT(out_features >= 0);
+
+    const int64_t n_blocks = in_features / QK8_0;
+    const size_t  row_size = (size_t) n_blocks * sizeof(block_q8_0);
+
+    if (dst) {
+        block_q8_0 * y = (block_q8_0 *) dst;
+        for (int64_t r = 0; r < out_features; ++r) {
+            ggml_convrot_repack_row_q8_0(weights + r*in_features, GGML_FP32_TO_FP16(scales[r]), n_blocks, y + r*n_blocks);
+        }
+    }
+
+    return row_size * (size_t) out_features;
+}

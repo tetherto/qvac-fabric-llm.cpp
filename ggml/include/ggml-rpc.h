@@ -23,15 +23,16 @@ extern "C" {
 // 112 adds the speech ops to the ggml_op enum (temp-11018: 111).
 // 113 adds GATED_DELTA_NET_DEFERRED and GDN_CONV_DEFERRED to the ggml_op enum
 //     (temp-11259: 112).
+// 114 adds MUL_MAT_CONVROT and CONVROT to the ggml_op enum.
 // A minor bump is additive: the client still accepts a server with an older
 // minor and must gate every command introduced by a later minor on the minor
 // the server announces at HELLO.
-#define RPC_PROTO_MAJOR_VERSION    113
+#define RPC_PROTO_MAJOR_VERSION    114
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 127, "GGML_OP_COUNT has changed - update the RPC protocol version");
+static_assert(GGML_OP_COUNT == 129, "GGML_OP_COUNT has changed - update the RPC protocol version");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
