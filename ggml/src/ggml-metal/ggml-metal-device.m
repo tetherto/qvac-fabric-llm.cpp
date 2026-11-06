@@ -127,6 +127,7 @@ int ggml_metal_pipeline_thread_execution_width(struct ggml_metal_pipeline_with_p
     X(FA_Q5_1,         fa_q5_1)        \
     X(FA_Q8_0,         fa_q8_0)        \
     X(FA_BACK,         fa_back)        \
+    X(FA_BACK_MMA,     fa_back_mma)    \
     X(FA_TENSOR,       fa_tensor)      \
     X(FA_VEC_F16,      fa_vec_f16)     \
     X(FA_VEC_F32,      fa_vec_f32)     \

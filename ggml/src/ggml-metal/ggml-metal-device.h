@@ -294,6 +294,18 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t d_max,
         const struct ggml_tensor * op);
 
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_back_mma(
+        ggml_metal_library_t lib,
+        int32_t target,
+        int32_t d,
+        bool split,
+        bool seq,
+        const struct ggml_tensor * op);
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_back_mma_sum_splits(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op);
+
 // MTLResidencySet wrapper
 
 typedef void * ggml_metal_rset_t;

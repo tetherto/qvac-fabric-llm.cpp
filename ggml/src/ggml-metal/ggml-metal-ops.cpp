@@ -28,6 +28,11 @@ static constexpr int64_t GGML_METAL_FA_KV_SPLIT_MIN_KV       = 256;
 static constexpr int64_t GGML_METAL_FA_KV_SPLIT_MIN_Q_ELEMS  = 512;
 static constexpr int64_t GGML_METAL_FA_KV_SPLIT_MIN_QK_ELEMS = 1024*1024;
 
+// flash attention backward: splitting the DKV q tiles (tuned on the M2)
+static constexpr int64_t GGML_METAL_FA_BACK_SPLIT_THREADGROUPS = 256; // threadgroups that fill the GPU
+static constexpr int64_t GGML_METAL_FA_BACK_SPLIT_MIN_UNITS    = 16;  // q tiles a split needs to be worth it
+static constexpr int64_t GGML_METAL_FA_BACK_NSPLIT_MAX         = 16;  // most splits
+
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
         return { nullptr, 0 };
@@ -5259,6 +5264,86 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// head sizes of the simdgroup matrix kernels (fa_back_mma.metal)
+static bool ggml_metal_op_flash_attn_ext_back_mma_d(int64_t D) {
+    switch (D) {
+        case 32:
+        case 64:
+        case 80:
+        case 96:
+        case 112:
+        case 128:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// how many ways to split the DKV q tiles: enough to fill the GPU, with enough tiles in each split to be worth it;
+// GGML_METAL_FA_BACK_NSPLIT=n overrides it. It must depend on the shape only: buffer sizing and dispatch both call it
+static int ggml_metal_op_flash_attn_ext_back_nsplit(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT_BACK);
+
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+
+    if (ggml_get_op_params_i32(op, 5) != GGML_FLASH_ATTN_EXT_BACK_DKV ||
+       !ggml_metal_op_flash_attn_ext_back_mma_d(q->ne[0]) ||
+        ggml_is_empty(op)) {
+        return 1;
+    }
+
+    static const int nsplit_env = getenv("GGML_METAL_FA_BACK_NSPLIT") ? atoi(getenv("GGML_METAL_FA_BACK_NSPLIT")) : 0;
+
+    const int64_t n_kvb   = (k->ne[1] + OP_FLASH_ATTN_EXT_BACK_MMA_BR - 1)/OP_FLASH_ATTN_EXT_BACK_MMA_BR;
+    const int64_t n_units = (q->ne[2]/k->ne[2])*((q->ne[1] + OP_FLASH_ATTN_EXT_BACK_MMA_BC - 1)/OP_FLASH_ATTN_EXT_BACK_MMA_BC);
+    const int64_t base    = n_kvb*k->ne[2]*q->ne[3];
+
+    if (nsplit_env > 0) {
+        return (int) std::max<int64_t>(1, std::min<int64_t>({n_units, GGML_METAL_FA_BACK_NSPLIT_MAX, nsplit_env}));
+    }
+
+    return (int) std::max<int64_t>(1, std::min({
+        n_units/GGML_METAL_FA_BACK_SPLIT_MIN_UNITS, GGML_METAL_FA_BACK_NSPLIT_MAX, GGML_METAL_FA_BACK_SPLIT_THREADGROUPS/base}));
+}
+
+// the partial dK and dV of the q tile splits, one dst sized slice per split
+size_t ggml_metal_op_flash_attn_ext_back_extra_tmp(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT_BACK);
+
+    const int nsplit = ggml_metal_op_flash_attn_ext_back_nsplit(op);
+
+    return nsplit > 1 ? (size_t) nsplit*ggml_nelements(op)*sizeof(float) : 0;
+}
+
+// sum the nsplit partial dK and dV of the temp buffer into dst
+static void ggml_metal_op_flash_attn_ext_back_sum_splits(ggml_metal_op_t ctx, const ggml_tensor * op, ggml_metal_buffer_id bid_tmp, ggml_metal_buffer_id bid_dst, int32_t nsplit) {
+    const int64_t n_out = ggml_nelements(op); // dK and dV
+
+    assert(ggml_metal_op_flash_attn_ext_back_extra_tmp(op) == (size_t) nsplit*n_out*sizeof(float));
+
+    GGML_ASSERT(n_out <= (1u << 31));
+
+    // wait for the DKV kernel to finish writing the partials
+    ggml_metal_op_concurrency_reset(ctx);
+
+    ggml_metal_kargs_ext_back_sum_splits args = {
+        /* .n      =*/ n_out,
+        /* .nsplit =*/ nsplit,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_back_mma_sum_splits(ctx->lib, op);
+
+    const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (ctx->enc, bid_tmp, 1);
+    ggml_metal_encoder_set_buffer  (ctx->enc, bid_dst, 2);
+
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_out + nth - 1)/nth, 1, 1, nth, 1, 1);
+}
+
 int ggml_metal_op_flash_attn_ext_back(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -5299,9 +5384,45 @@ int ggml_metal_op_flash_attn_ext_back(ggml_metal_op_t ctx, int idx) {
         /* .scale     =*/ ggml_get_op_params_f32(op, 0),
     };
 
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+
+    // simdgroup matrix kernels (fa_back_mma.metal) where supported, else the warp kernels (fa_back.metal);
+    // GGML_METAL_FA_BACK_NO_MMA forces the warp kernels
+    static const bool no_mma = getenv("GGML_METAL_FA_BACK_NO_MMA") != nullptr;
+    const bool use_mma = !no_mma && props_dev->has_simdgroup_mm &&
+                         ggml_metal_op_flash_attn_ext_back_mma_d(args.D);
+
+    // DKV: the q tile splits write partial dK and dV to the temp buffer past dst, then a kernel sums them into dst
+    const int nsplit = use_mma ? ggml_metal_op_flash_attn_ext_back_nsplit(op) : 1;
+
+    ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(dst_d);
+
+    ggml_metal_buffer_id bid_tmp = bid_dst;
+    bid_tmp.offs += ggml_nbytes(op);
+
     const int32_t d_max = args.D <= 64 ? 64 : args.D <= 128 ? 128 : 256;
 
-    auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_back(lib, args.target, d_max, op);
+    // rows of a head: q rows, or kv rows of a kv head for DKV
+    const bool    dkv     = args.target == GGML_FLASH_ATTN_EXT_BACK_DKV;
+    const int64_t n_rows  = dkv ? args.n_kv      : args.n_q;
+    const int64_t n_heads = dkv ? args.n_head_kv : args.n_head;
+
+    // threadgroups of the simdgroup matrix kernels: one per OP_FLASH_ATTN_EXT_BACK_MMA_BR rows of a head, and per q tile
+    // split for DKV
+    const int64_t ntg0 = (n_rows + OP_FLASH_ATTN_EXT_BACK_MMA_BR - 1)/OP_FLASH_ATTN_EXT_BACK_MMA_BR;
+    const int64_t ntg  = ntg0*n_heads*args.ne3*nsplit;
+
+    // DKV takes dO, Q and dO again through one tile on grids of at least GGML_METAL_MIN_THREADGROUPS threadgroups, where
+    // its smaller threadgroup memory fits more of them per core
+    const bool dkv_seq = use_mma && dkv && ntg >= GGML_METAL_MIN_THREADGROUPS;
+
+    auto pipeline = use_mma ?
+        ggml_metal_library_get_pipeline_flash_attn_ext_back_mma(lib, args.target, (int32_t) args.D, nsplit > 1, dkv_seq, op) :
+        ggml_metal_library_get_pipeline_flash_attn_ext_back    (lib, args.target, d_max, op);
+
+    const int nsg = pipeline.nsg;
+
+    GGML_ASSERT(nsg > 0 && nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -5309,26 +5430,30 @@ int ggml_metal_op_flash_attn_ext_back(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),      1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(k),      2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(grad_o), 3);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst_d),  4);
+    ggml_metal_encoder_set_buffer  (enc, nsplit > 1 ? bid_tmp : bid_dst,   4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mask ? mask : q), 5);
 
     if (args.target == GGML_FLASH_ATTN_EXT_BACK_STATS) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(o),     6);
-    }    
+    }
     if (args.target == GGML_FLASH_ATTN_EXT_BACK_DQ || args.target == GGML_FLASH_ATTN_EXT_BACK_DKV) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(v),     7);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(stats), 8);
     }
 
-    const int64_t n_rows = args.target == GGML_FLASH_ATTN_EXT_BACK_DKV ?
-        args.n_kv*args.n_head_kv*args.ne3 :
-        args.n_q*args.n_head*args.ne3;
+    if (use_mma) {
+        GGML_ASSERT(pipeline.smem <= props_dev->max_theadgroup_memory_size);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ntg0, n_heads, args.ne3*nsplit, 32, nsg, 1);
 
-    const int nsg = pipeline.nsg;
-
-    GGML_ASSERT(nsg > 0 && nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
-
-    ggml_metal_encoder_dispatch_threadgroups(enc, (n_rows + nsg - 1)/nsg, 1, 1, 32, nsg, 1);
+        if (nsplit > 1) {
+            ggml_metal_op_flash_attn_ext_back_sum_splits(ctx, op, bid_tmp, bid_dst, nsplit);
+        }
+    } else {
+        // a simdgroup per row
+        const int64_t n_rows_all = n_rows*n_heads*args.ne3;
+        ggml_metal_encoder_dispatch_threadgroups(enc, (n_rows_all + nsg - 1)/nsg, 1, 1, 32, nsg, 1);
+    }
 
     return 1;
 }

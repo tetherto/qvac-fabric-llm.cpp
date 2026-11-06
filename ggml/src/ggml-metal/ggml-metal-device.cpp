@@ -2612,6 +2612,106 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
     return res;
 }
 
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_back_mma(
+        ggml_metal_library_t lib,
+        int32_t target,
+        int32_t d,
+        bool split,
+        bool seq,
+        const struct ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT_BACK);
+
+    char base[256];
+    char name[256];
+
+    constexpr const char * const target_names[] = {
+        "stats",
+        "dq",
+        "dkv",
+    };
+
+    assert(target >= 0 && target < 3);
+    assert(d == 32 || d == 64 || d == 80 || d == 96 || d == 112 || d == 128);
+    assert(op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16);
+    assert(!split || target == GGML_FLASH_ATTN_EXT_BACK_DKV);
+    assert(!seq   || target == GGML_FLASH_ATTN_EXT_BACK_DKV);
+
+    const char * const kv_typename = ggml_type_name(op->src[1]->type);
+
+    // dkv is specialized on the q tile split and on seq (dO, Q and dO again through one tile)
+    const bool dkv = target == GGML_FLASH_ATTN_EXT_BACK_DKV;
+
+    snprintf(base, 256, "kernel_flash_attn_ext_back_mma_%s_%s_d%d", target_names[target], kv_typename, d);
+    if (dkv) {
+        snprintf(name, 256, "%s_split=%d_seq=%d", base, split, seq);
+    } else {
+        snprintf(name, 256, "%s", base);
+    }
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        if (dkv) {
+            ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+            ggml_metal_cv_set_bool(cv, split, FC_FLASH_ATTN_EXT_BACK_MMA + 0);
+            ggml_metal_cv_set_bool(cv, seq,   FC_FLASH_ATTN_EXT_BACK_MMA + 1);
+
+            res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+            ggml_metal_cv_free(cv);
+        } else {
+            res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+        }
+    }
+
+    // threadgroup memory as fab_mma_stats, fab_mma_dq and fab_mma_dkv carve smem_raw: the F32 tiles, masks, S and dP
+    // (and L and D for dkv), then one int flag per simdgroup
+    const auto fab_mma_smem = [seq](const int D, const int target) -> size_t {
+        constexpr size_t BR = OP_FLASH_ATTN_EXT_BACK_MMA_BR;
+        constexpr size_t BC = OP_FLASH_ATTN_EXT_BACK_MMA_BC;
+        const size_t stride = D + 4;
+        size_t n_f32 = 0;
+        switch (target) {
+            case GGML_FLASH_ATTN_EXT_BACK_STATS:
+                n_f32 = BC*stride + BR*(BC + 4) + BR*BC;
+                break;
+            case GGML_FLASH_ATTN_EXT_BACK_DQ:
+                n_f32 = BC*stride + BR*(BC + 4) + 2*BR*BC;
+                break;
+            default:
+                n_f32 = (seq ? BC : std::max(BR, 2*BC))*stride + BC*(BR + 4) + 2*BR*BC + 2*BC;
+                break;
+        }
+        return n_f32*sizeof(float) + OP_FLASH_ATTN_EXT_BACK_MMA_NSG*sizeof(int32_t);
+    };
+
+    res.nsg  = OP_FLASH_ATTN_EXT_BACK_MMA_NSG;
+    res.smem = GGML_PAD(fab_mma_smem(d, target), 16);
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_back_mma_sum_splits(
+        ggml_metal_library_t lib,
+        const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT_BACK);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_flash_attn_ext_back_mma_sum_splits");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+
+    GGML_UNUSED(op);
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_library_t lib, const ggml_tensor * op, int32_t n_fuse) {
     char base[256];
     char name[256];
