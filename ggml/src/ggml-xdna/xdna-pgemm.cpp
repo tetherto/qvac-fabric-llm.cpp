@@ -1,4 +1,5 @@
 #include "xdna-pgemm.h"
+#include "xdna-pgemm-path.h"
 
 #include "ggml-backend.h"
 #include "ggml-impl.h"
@@ -51,7 +52,35 @@
 
 namespace {
 
-constexpr const char * STEM        = "pgemm_c8";
+bool pfx_requested() {
+    return xdna_env_int("GGML_XDNA_PFX", 0) != 0;
+}
+
+// A build without the merged design's artifact keeps pgemm's own
+bool pfx_selected() {
+    return pfx_requested() && !xdna_artifact_find(xdna_pgemm_path::PFX_STEM, false).xclbin.empty();
+}
+
+// Said at the kernel load, not where the route is chosen: llama's fit probe
+// places the weights with only errors shown, and the choice is made once
+void warn_pfx_missing() {
+    if (pfx_requested() && !xdna_pgemm_path::pfx_loaded()) {
+        GGML_LOG_WARN("%s: GGML_XDNA_PFX=1, but %s is not built: the prefill runs on %s\n", "xdna-pgemm",
+                      xdna_pgemm_path::PFX_STEM, xdna_pgemm_path::PGEMM_STEM);
+    }
+}
+
+}  // namespace
+
+bool xdna_pgemm_path::pfx_loaded() {
+    static const bool loaded = pfx_selected();
+    return loaded;
+}
+
+namespace {
+
+using namespace xdna_pgemm_path;
+
 constexpr int          COLS        = 8;
 constexpr int          NC          = 64;             // output columns a core
 constexpr int          KS          = 64;             // K a step
@@ -59,7 +88,6 @@ constexpr int          MB          = 64;             // M rows a core
 constexpr int          MBLK        = 2 * MB;         // M rows a block
 constexpr int          CHUNK       = COLS * 2 * NC;  // 1024
 constexpr int          HDR_BYTES   = MB * KS * 2;
-constexpr int          A_COL0      = 6;              // the two A streams' shim columns
 // M blocks a run: the descriptor repeats are eight bits, and a slab bounds
 // the staging buffers. Slabs are as large as that allows: most calls find A
 // laid out already (norm, gate, GLU into A), so cutting a call finer to
@@ -87,25 +115,25 @@ constexpr int32_t      PG_MODE_PLAIN = 0;
 constexpr int32_t      PG_MODE_GLU   = 1;
 constexpr int32_t      PG_MODE_GLU_A = 2;
 constexpr int32_t      PG_MODE_GELU  = 4;
-// The weights' path, fixed by kernels/pgemm.py
-constexpr uint32_t     W_SHIM_CH   = 1;        // shim MM2S channel
-constexpr uint32_t     W_MT_S2MM   = 5;        // MemTile S2MM channel
-constexpr uint32_t     W_MT_MM2S   = 4;        // MemTile MM2S channel of GEMV tile r: 4 + r
-constexpr uint32_t     W_LOCK0     = 48;       // slot s: (empty, full) locks 48 + 2 s, + 1
-constexpr uint32_t     WS_ADDR     = 0x24000;  // the slot buffer, bytes into the MemTile
-constexpr size_t       WS_BYTES    = (size_t) 33 * 10752;
-constexpr uint32_t     MT_CTRL_PKT = 26;       // the MemTiles' controller packet id
-// MemTile descriptors the static program leaves free (it uses 0-5, 24-29):
-// S2MM 5's ring, MM2S 4's, MM2S 5's
-constexpr uint32_t     MT_BD_S2MM  = 40;
-constexpr uint32_t     MT_BD_MM2S0 = 16;
-constexpr uint32_t     MT_BD_MM2S1 = 44;
-// MemTile tasks in flight a channel: its queue holds about five and drops the
-// rest without a word
-constexpr int          MT_Q        = 4;
-// shim descriptors: 0 the A header, 1 the A body (columns 6, 7), 2-3 W, 4.. C
-constexpr uint32_t     SH_BD_W     = 2;
-constexpr uint32_t     SH_BD_C     = 4;
+// GLU_X (xdna_pgemm_run_glux): a block's x on W, each core's 64 rows of its 32 gate columns in f32, sent as one
+// W object of the merged design's per-core packet ids (kernels/pgemm.py W_PKT_CORE)
+constexpr uint32_t     W_PKT_CORE0  = 2;
+constexpr uint32_t     W_OBJ_BYTES  = 10752;  // the cores' W buffer, the length of every W send
+constexpr int          CORES        = 4;
+constexpr uint32_t     X_COLS       = NC / 2;
+constexpr uint32_t     X_OBJ_BYTES  = MB * X_COLS * 4;
+constexpr uint32_t     X_SLOT_BYTES = (CORES - 1) * X_OBJ_BYTES + W_OBJ_BYTES;  // the last core's send reads a W buffer
+constexpr int          X_SLOTS      = 2;
+constexpr int          C_RING_X     = 2;                       // fused C rings of four shim BDs from SH_BD_C: 4-11
+constexpr uint32_t     SH_BD_X      = SH_BD_C + 4 * C_RING_X;  // x's blocks, one shim BD a pair: 12, 13
+constexpr uint32_t     SH_BD_X_TAIL = SH_BD_X + 2;             // the last block's x, from the tail: 14, 15
+constexpr uint32_t     ARG_X        = 3;
+constexpr uint32_t     ARG_X_TAIL   = 2;   // the fused output's buffer, past its layout
+// MemTile descriptors: S2MM 5's x fills (odd channels take BDs 24-47), and per pair a chain on MM2S 4 (BDs 0-23) and
+// MM2S 5 a slot: x of the pair's two cores, then its weight tiles
+constexpr uint32_t     MT_BD_X_FILL   = 30;
+constexpr uint32_t     MT_BD_CHAIN[2] = { 16, 34 };
+constexpr uint32_t     CHAIN_LEN      = 3;
 
 // Where a weight's chunks sit in the MemTile: `G` tiles a group (of each
 // GEMV tile r), `ng` groups a chunk, `nslots` slots. When a whole chunk fits
@@ -250,7 +278,7 @@ struct runner {
 runner g_pg;
 
 bool artifact_present() {
-    static const bool present = !xdna_artifact_find(STEM, false).xclbin.empty();
+    static const bool present = !xdna_artifact_find(pgemm_stem(), false).xclbin.empty();
     return present;
 }
 
@@ -302,16 +330,6 @@ bool glu_gated(const ggml_tensor * glu) {
     return op == GGML_GLU_OP_SWIGLU || op == GGML_GLU_OP_GEGLU;
 }
 
-// A linear transfer of `words`, encoded as IRON writes one: unit strides
-// (a zero stride encodes as 0xFFFFF) and the AXI cache bits.
-xdna_bd linear_bd(uint32_t words) {
-    xdna_bd bd;
-    bd.buf_len   = words;
-    bd.d0_stride = bd.d1_stride = bd.d2_stride = 1;
-    bd.ax_cache                                = 2;
-    return bd;
-}
-
 // One projection's share of a call that writes several: its `nobj` objects of
 // 512 columns from the call's object `obj0` on go to `cols` columns of a
 // row-major (rows x ldc) f32 target at byte `off` of argument 2.
@@ -340,6 +358,12 @@ struct c_dest {
     bool     fused    = false;
     uint32_t half[2]  = {};
     uint32_t a_blk    = 0;
+    // GLU_X (fused): a block's x rows, `ldc` floats apart, the slab's first x_blocks of them from byte x_off of
+    // argument 3 and the rest (its last block) from byte x_tail of argument 2
+    bool     glux     = false;
+    int      x_blocks = 0;
+    uint32_t x_off    = 0;
+    uint32_t x_tail   = 0;
 };
 
 // The segment call object `s` falls in, none past them all
@@ -352,42 +376,212 @@ const c_seg * seg_of(const c_dest & cd, int s) {
     return nullptr;
 }
 
-// MemTile DMA (xdna_seq's descriptors are the shim's): a MemTile's own locks
-// and memory as its DMA addresses them, locks 64 on and words 0x20000 on.
-void mt_set_lock(xdna_seq * seq, uint32_t col, uint32_t id, uint32_t value) {
-    xdna_seq_write(seq, col, 1, 0xC0000 + id * 0x10, value);
-}
-
-// A linear descriptor of `words` at byte `addr` of the MemTile, taking lock
-// `acq` at `acq_val` or more and releasing `rel` by `rel_val`
-void mt_bd(xdna_seq * seq,
-           uint32_t   col,
-           uint32_t   id,
-           uint32_t   words,
-           uint32_t   addr,
-           uint32_t   acq,
-           uint32_t   acq_val,
-           uint32_t   rel,
-           uint32_t   rel_val) {
-    seq->n_instr++;
-    seq->ops.push_back(xdna_txn::OP_BLOCKWRITE);
-    seq->ops.push_back(0);
-    seq->ops.push_back(xdna_txn::tile_reg(col, 1, 0xA0000 + id * 0x20));
-    seq->ops.push_back(xdna_txn::SZ_BLOCKWRITE * 4);
-    seq->ops.push_back(words);
-    seq->ops.push_back(0x20000 + addr / 4);
-    for (int k = 0; k < 5; k++) {
-        seq->ops.push_back(0);
+// The packet header field of pair r's W sends, when the artifact routes W by packet id
+uint32_t w_send_packet(uint32_t r) {
+    if (!w_path_packet()) {
+        return 0;
     }
-    seq->ops.push_back(1u << 31 | (rel_val & 0x7F) << 24 | (64 + rel) << 16 | 1u << 15 | ((0u - acq_val) & 0x7F) << 8 |
-                       (64 + acq));
+    return MT_BD_PKT | (W_PKT_PAIR0 + r) << MT_BD_PKT_ID_SHIFT;
 }
 
-// Start MemTile task `id` on a channel, `repeat` more times, with a token
-void mt_push(xdna_seq * seq, uint32_t col, uint32_t id, xdna_dma_dir dir, uint32_t ch, uint32_t repeat) {
-    const uint32_t ctrl = (dir == xdna_dma_dir::MM2S ? 0xA0630 : 0xA0600) + ch * 8;
-    xdna_seq_maskwrite(seq, col, 1, ctrl, MT_CTRL_PKT << 8, 0x1F00);
-    xdna_seq_write(seq, col, 1, ctrl + 4, id | repeat << 16 | 1u << 31);
+// Both A streams: the slab's header, then its half of `nmb` blocks, `rounds` times
+void a_streams(xdna_seq * seq, int nmb, uint32_t a_blk, uint32_t h_off, uint32_t a_off, uint32_t rounds) {
+    for (int h = 0; h < 2; h++) {
+        xdna_bd bd = linear_bd(HDR_BYTES / 4);
+        xdna_seq_blockwrite(seq, A_COL0 + h, 0, 0, &bd);
+        xdna_seq_ddr_patch(seq, A_COL0 + h, 0, 0, 1, h_off + (uint32_t) h * HDR_BYTES);
+        xdna_seq_push_queue(seq, A_COL0 + h, 0, 0, xdna_dma_dir::MM2S, 0, false, 0);
+        bd = linear_bd((uint32_t) nmb * a_blk / 4);
+        xdna_seq_blockwrite(seq, A_COL0 + h, 0, 1, &bd);
+        xdna_seq_ddr_patch(seq, A_COL0 + h, 0, 1, 1, a_off + (uint32_t) h * (nmb + 1) * a_blk);
+        xdna_seq_push_queue(seq, A_COL0 + h, 0, 1, xdna_dma_dir::MM2S, 0, false, rounds - 1);
+    }
+}
+
+// Column c's fused C of chunk ch's block b, a chain of four from shim BD id0: a core's object is its 64 rows x 32 bf16
+// of columns ch 512 + c 64 + r 32 (K step ch 8 + c, pair-swapped in the odd half), then 4 KB that land on the next
+// block's rows; the column's four in the join's order (r, mb) = (i / 2, i % 2)
+void fused_c_task(xdna_seq * seq, const c_dest & cd, int c, int ch, int b, uint32_t id0) {
+    for (uint32_t i = 0; i < 4; i++) {
+        const uint32_t r = i / 2, mb = i % 2;
+        const uint32_t st = (uint32_t) (ch * 8 + c) ^ mb;
+        xdna_bd        bd;
+        bd.buf_len   = 2048;
+        bd.d0_size   = 16;
+        bd.d0_stride = 1;
+        bd.d1_size   = MB;
+        bd.d1_stride = KS / 2;
+        bd.d2_stride = cd.a_blk / 4;
+        bd.ax_cache  = 2;
+        bd.next_bd   = id0 + i + 1;
+        bd.use_next  = i < 3;
+        xdna_seq_blockwrite(seq, c, 0, id0 + i, &bd);
+        xdna_seq_ddr_patch(seq, c, 0, id0 + i, 2, cd.half[mb] + (uint32_t) b * cd.a_blk + (st * MB * KS + r * 32) * 2);
+    }
+    xdna_seq_issue_token(seq, c, 0, xdna_dma_dir::S2MM, 0, 0xF);
+    xdna_seq_push_queue(seq, c, 0, id0, xdna_dma_dir::S2MM, 0, true, 0);
+}
+
+// --- GLU_X's stream: the replayed weight and each block's x into the MemTile, a block's x objects ahead of the pair's
+// weight tiles on its channel, act(gate) * x into the next projection's A ---
+
+uint32_t x_lock(const w_plan & wp, uint32_t k) {
+    return W_LOCK0 + 2 * (uint32_t) wp.nslots + 2 * k;
+}
+
+uint32_t x_slot_addr(const w_plan & wp, uint32_t slot, uint32_t k) {
+    return WS_ADDR + (uint32_t) wp.nslots * slot + k * X_SLOT_BYTES;
+}
+
+// The weight slots as build_seq sets them for R sends of a fill, and the x slots' (empty, full) locks: a fill of the
+// four cores' objects
+void glux_locks(xdna_seq * seq, const w_plan & wp, uint32_t R) {
+    for (uint32_t c = 0; c < COLS; c++) {
+        for (int k = 0; k < wp.nslots; k++) {
+            mt_set_lock(seq, c, W_LOCK0 + 2 * k, 2 * R);
+            mt_set_lock(seq, c, W_LOCK0 + 2 * k + 1, 0);
+        }
+        for (uint32_t k = 0; k < X_SLOTS; k++) {
+            mt_set_lock(seq, c, x_lock(wp, k), CORES);
+            mt_set_lock(seq, c, x_lock(wp, k) + 1, 0);
+        }
+    }
+}
+
+// A column's whole weight, one shim task
+void glux_w_task(xdna_seq * seq, uint32_t c, uint32_t w_col) {
+    xdna_bd bd = linear_bd(w_col / 4);
+    xdna_seq_blockwrite(seq, c, 0, SH_BD_W, &bd);
+    xdna_seq_ddr_patch(seq, c, 0, SH_BD_W, 0, c * w_col);
+    xdna_seq_issue_token(seq, c, 0, xdna_dma_dir::MM2S, W_SHIM_CH, 0xF);
+    xdna_seq_push_queue(seq, c, 0, SH_BD_W, xdna_dma_dir::MM2S, W_SHIM_CH, true, 0);
+}
+
+// `nmb` blocks of a column's x, rows `ldx` floats apart from byte `off` of argument `arg`, one shim BD a pair from id0:
+// each block's 128 rows of the pair's 32 columns, both cores' halves of them
+void glux_x_task(xdna_seq * seq, uint32_t c, int nmb, uint32_t arg, uint32_t off, uint32_t ldx, uint32_t id0) {
+    for (uint32_t r = 0; r < 2; r++) {
+        xdna_bd bd;
+        bd.buf_len     = 2 * MB * X_COLS;
+        bd.d0_size     = X_COLS;
+        bd.d0_stride   = 1;
+        bd.d1_size     = MB;
+        bd.d1_stride   = ldx;
+        bd.d2_stride   = MB * ldx;
+        bd.iter_size   = (uint32_t) nmb;
+        bd.iter_stride = MBLK * ldx;
+        bd.ax_cache    = 2;
+        bd.next_bd     = id0 + r + 1;
+        bd.use_next    = r == 0;
+        xdna_seq_blockwrite(seq, c, 0, id0 + r, &bd);
+        xdna_seq_ddr_patch(seq, c, 0, id0 + r, arg, off + (c * (uint32_t) NC + r * X_COLS) * 4);
+    }
+    xdna_seq_issue_token(seq, c, 0, xdna_dma_dir::MM2S, W_SHIM_CH, 0xF);
+    xdna_seq_push_queue(seq, c, 0, id0, xdna_dma_dir::MM2S, W_SHIM_CH, true, (uint32_t) nmb - 1);
+}
+
+// The column's MemTile descriptors, written once: the weight's fill (its tiles sent R times a pair), the x slots'
+// fills, and per pair and x slot the chain x (r, 0), x (r, 1), weight tiles of r
+void glux_mt_bds(xdna_seq * seq, uint32_t c, const w_plan & wp, uint32_t gt, uint32_t tb, uint32_t R) {
+    const uint32_t e = W_LOCK0, f = e + 1, slot = (uint32_t) wp.G * 2 * tb;
+    mt_bd(seq, c, MT_BD_S2MM, gt * 2 * tb / 4, WS_ADDR, e, 2 * R, f, 2 * R);
+    for (uint32_t k = 0; k < X_SLOTS; k++) {
+        const uint32_t xe = x_lock(wp, k), xf = xe + 1, at = x_slot_addr(wp, slot, k);
+        mt_bd(seq, c, MT_BD_X_FILL + k, CORES * X_OBJ_BYTES / 4, at, xe, CORES, xf, CORES);
+        for (uint32_t r = 0; r < 2; r++) {
+            const uint32_t id = MT_BD_CHAIN[r] + CHAIN_LEN * k;
+            for (uint32_t mb = 0; mb < 2; mb++) {
+                const uint32_t i   = 2 * r + mb;
+                const uint32_t pkt = MT_BD_PKT | (W_PKT_CORE0 + i) << MT_BD_PKT_ID_SHIFT;
+                mt_bd(seq, c, id + mb, W_OBJ_BYTES / 4, at + i * X_OBJ_BYTES, xf, 1, xe, 1, pkt, (int) (id + mb + 1));
+            }
+            mt_bd(seq, c, id + 2, gt * tb / 4, WS_ADDR + r * gt * tb, f, 1, e, 1, w_send_packet(r));
+        }
+    }
+}
+
+// MemTile tasks pushed on a column's W channels
+struct mt_pushed {
+    int s2mm    = 0;
+    int mm2s[2] = { 0, 0 };
+};
+
+void glux_push_fill(xdna_seq * seq, uint32_t c, uint32_t id, mt_pushed & n) {
+    wait_mt_queue(seq, c, xdna_dma_dir::S2MM, W_MT_S2MM, n.s2mm);
+    mt_push(seq, c, id, xdna_dma_dir::S2MM, W_MT_S2MM, 0);
+    n.s2mm++;
+}
+
+void glux_push_chain(xdna_seq * seq, uint32_t c, uint32_t r, uint32_t k, mt_pushed & n) {
+    wait_mt_queue(seq, c, xdna_dma_dir::MM2S, W_MT_MM2S + r, n.mm2s[r]);
+    mt_push(seq, c, MT_BD_CHAIN[r] + CHAIN_LEN * k, xdna_dma_dir::MM2S, W_MT_MM2S + r, 0);
+    n.mm2s[r]++;
+}
+
+// Block b's x into slot b % X_SLOTS and out to each pair ahead of its weight tiles, then its fused C
+void glux_block(xdna_seq * seq, const c_dest & cd, int b, mt_pushed * n) {
+    const uint32_t k = (uint32_t) (b % X_SLOTS);
+    for (uint32_t c = 0; c < COLS; c++) {
+        glux_push_fill(seq, c, MT_BD_X_FILL + k, n[c]);
+        glux_push_chain(seq, c, 0, k, n[c]);
+        glux_push_chain(seq, c, 1, k, n[c]);
+    }
+    if (b >= C_RING_X - 1) {
+        for (uint32_t c = 0; c < COLS; c++) {
+            xdna_seq_wait_token(seq, c, 0, xdna_dma_dir::S2MM, 0);
+        }
+    }
+    for (int c = 0; c < COLS; c++) {
+        fused_c_task(seq, cd, c, 0, b, SH_BD_C + 4 * (uint32_t) (b % C_RING_X));
+    }
+}
+
+// Every token issued taken before the run ends: the MemTile's, the shim's W tasks and the C ring's
+void glux_final_waits(xdna_seq * seq, const mt_pushed & n, int shim_tasks, int nmb) {
+    for (uint32_t c = 0; c < COLS; c++) {
+        wait_last(seq, c, 1, xdna_dma_dir::S2MM, W_MT_S2MM, n.s2mm, MT_Q);
+        wait_last(seq, c, 1, xdna_dma_dir::MM2S, W_MT_MM2S, n.mm2s[0], MT_Q);
+        wait_last(seq, c, 1, xdna_dma_dir::MM2S, W_MT_MM2S + 1, n.mm2s[1], MT_Q);
+        wait_last(seq, c, 0, xdna_dma_dir::MM2S, W_SHIM_CH, shim_tasks, shim_tasks);
+    }
+    for (int k = std::max(0, nmb - (C_RING_X - 1)); k < nmb; k++) {
+        for (uint32_t c = 0; c < COLS; c++) {
+            xdna_seq_wait_token(seq, c, 0, xdna_dma_dir::S2MM, 0);
+        }
+    }
+}
+
+// A slab of a one-chunk weight whose plan replays it (xdna_pgemm_glux_supported), GLU_X's
+std::vector<uint32_t> build_seq_glux(const xdna_gemv_geom & g,
+                                     const w_plan &         wp,
+                                     int                    nmb,
+                                     const c_dest &         cd,
+                                     uint32_t               h_off,
+                                     uint32_t               a_off) {
+    const uint32_t tb    = (uint32_t) g.tile_bytes();
+    const uint32_t gt    = (uint32_t) g.n_tiles();
+    const uint32_t a_blk = (uint32_t) (g.K / KS) * MB * KS * 2;
+    const int      tail  = nmb - cd.x_blocks;
+    xdna_seq       seq;
+    glux_locks(&seq, wp, (uint32_t) nmb);
+    a_streams(&seq, nmb, a_blk, h_off, a_off, 1);
+    mt_pushed n[COLS];
+    for (uint32_t c = 0; c < COLS; c++) {
+        glux_w_task(&seq, c, (uint32_t) g.col_weight_bytes());
+        if (cd.x_blocks > 0) {
+            glux_x_task(&seq, c, cd.x_blocks, ARG_X, cd.x_off, cd.ldc, SH_BD_X);
+        }
+        if (tail > 0) {
+            glux_x_task(&seq, c, tail, ARG_X_TAIL, cd.x_tail, cd.ldc, SH_BD_X_TAIL);
+        }
+        glux_mt_bds(&seq, c, wp, gt, tb, (uint32_t) nmb);
+        glux_push_fill(&seq, c, MT_BD_S2MM, n[c]);
+    }
+    for (int b = 0; b < nmb; b++) {
+        glux_block(&seq, cd, b, n);
+    }
+    glux_final_waits(&seq, n[0], 1 + (cd.x_blocks > 0) + (tail > 0), nmb);
+    return xdna_seq_build(&seq);
 }
 
 // The stream for `nmb` M blocks of a weight of geometry `g` and plan `wp`,
@@ -399,6 +593,9 @@ std::vector<uint32_t> build_seq(const xdna_gemv_geom & g,
                                 const c_dest &         cd,
                                 uint32_t               h_off,
                                 uint32_t               a_off) {
+    if (cd.glux) {
+        return build_seq_glux(g, wp, nmb, cd, h_off, a_off);
+    }
     const int      nch   = g.n_out();
     const int      nt    = g.n_tiles();
     const uint32_t tb    = (uint32_t) g.tile_bytes();
@@ -417,17 +614,7 @@ std::vector<uint32_t> build_seq(const xdna_gemv_geom & g,
             mt_set_lock(&seq, c, W_LOCK0 + 2 * k + 1, 0);
         }
     }
-    // A: the header, then the slab's half, once a chunk
-    for (int h = 0; h < 2; h++) {
-        xdna_bd bd = linear_bd(HDR_BYTES / 4);
-        xdna_seq_blockwrite(&seq, A_COL0 + h, 0, 0, &bd);
-        xdna_seq_ddr_patch(&seq, A_COL0 + h, 0, 0, 1, h_off + (uint32_t) h * HDR_BYTES);
-        xdna_seq_push_queue(&seq, A_COL0 + h, 0, 0, xdna_dma_dir::MM2S, 0, false, 0);
-        bd = linear_bd((uint32_t) nmb * a_blk / 4);
-        xdna_seq_blockwrite(&seq, A_COL0 + h, 0, 1, &bd);
-        xdna_seq_ddr_patch(&seq, A_COL0 + h, 0, 1, 1, a_off + (uint32_t) h * (nmb + 1) * a_blk);
-        xdna_seq_push_queue(&seq, A_COL0 + h, 0, 1, xdna_dma_dir::MM2S, 0, false, (uint32_t) nch - 1);
-    }
+    a_streams(&seq, nmb, a_blk, h_off, a_off, (uint32_t) nch);
     // W from DDR: replayed, each column's whole stream once; streamed, a
     // chunk once per block
     int  w_pushed = 0;
@@ -461,7 +648,7 @@ std::vector<uint32_t> build_seq(const xdna_gemv_geom & g,
             mt_push(&seq, c, MT_BD_S2MM + q, xdna_dma_dir::S2MM, W_MT_S2MM, 0);
             for (uint32_t r = 0; r < 2; r++) {
                 const uint32_t id = (r ? MT_BD_MM2S1 : MT_BD_MM2S0) + q;
-                mt_bd(&seq, c, id, gt * tb / 4, at + r * gt * tb, f, 1, e, 1);
+                mt_bd(&seq, c, id, gt * tb / 4, at + r * gt * tb, f, 1, e, 1, w_send_packet(r));
                 mt_push(&seq, c, id, xdna_dma_dir::MM2S, W_MT_MM2S + r, R - 1);
             }
         }
@@ -507,31 +694,8 @@ std::vector<uint32_t> build_seq(const xdna_gemv_geom & g,
             }
         }
         if (cd.fused) {
-            // a core's object is its 64 rows x 32 bf16 of columns ch 512 +
-            // c 64 + r 32 (K step ch 8 + c, pair-swapped in the odd half),
-            // then 4 KB that land on the next block's rows; the column's four
-            // in the join's order (r, mb) = (i / 2, i % 2), a chain of four
             for (int c = 0; c < COLS; c++) {
-                const uint32_t id0 = SH_BD_C + 4 * (uint32_t) (c_e % C_RING);
-                for (uint32_t i = 0; i < 4; i++) {
-                    const uint32_t r = i / 2, mb = i % 2;
-                    const uint32_t st = (uint32_t) (ch * 8 + c) ^ mb;
-                    xdna_bd        bd;
-                    bd.buf_len   = 2048;
-                    bd.d0_size   = 16;
-                    bd.d0_stride = 1;
-                    bd.d1_size   = MB;
-                    bd.d1_stride = KS / 2;
-                    bd.d2_stride = cd.a_blk / 4;
-                    bd.ax_cache  = 2;
-                    bd.next_bd   = id0 + i + 1;
-                    bd.use_next  = i < 3;
-                    xdna_seq_blockwrite(&seq, c, 0, id0 + i, &bd);
-                    xdna_seq_ddr_patch(&seq, c, 0, id0 + i, 2,
-                                       cd.half[mb] + (uint32_t) b * cd.a_blk + (st * MB * KS + r * 32) * 2);
-                }
-                xdna_seq_issue_token(&seq, c, 0, xdna_dma_dir::S2MM, 0, 0xF);
-                xdna_seq_push_queue(&seq, c, 0, id0, xdna_dma_dir::S2MM, 0, true, 0);
+                fused_c_task(&seq, cd, c, ch, b, SH_BD_C + 4 * (uint32_t) (c_e % C_RING));
             }
             c_e++;
             return;
@@ -639,6 +803,10 @@ std::string seq_key(const weights * ws, int nmb, const c_dest & cd, uint32_t h_o
     put(cd.fused);
     put(cd.half);
     put(cd.a_blk);
+    put(cd.glux);
+    put(cd.x_blocks);
+    put(cd.x_off);
+    put(cd.x_tail);
     put(nsg);
     key.append((const char *) cd.segs.data(), nsg * sizeof(c_seg));
     return key;
@@ -679,7 +847,8 @@ xdna_kernel * seq_kernel(xdna_kernel_pool * pool,
         return it->second.kern;
     }
     if (!g_pg.kern) {
-        g_pg.kern = xdna_kernel_find(pool->device, STEM);
+        warn_pfx_missing();
+        g_pg.kern = xdna_kernel_find(pool->device, pgemm_stem());
     }
     xdna_kernel * kern = xdna_kernel_clone(g_pg.kern);
     if (!kern) {
@@ -815,6 +984,9 @@ bool xdna_pgemm_shape_supported(const ggml_tensor * op) {
         return false;
     }
     const xdna_gemv_geom g = geom_of(w);
+    if (pfx_loaded() && g.fmt == XDNA_WFMT_Q4G32) {
+        return false;
+    }
     return g.valid() && g.K % KS == 0 && g.n_out() <= 256;
 }
 
@@ -918,6 +1090,18 @@ bool sync_segs(const pg_dst & ov, size_t rows, bool to_device) {
     return ok;
 }
 
+// rows [M, `tile` x ceil(M / tile)) of every segment to the device: a later command reads them from DRAM, where no
+// dirty line may land over the zeros the array writes there
+bool sync_tile_pad(const pg_dst & ov, size_t M, size_t tile) {
+    const size_t rows = (M + tile - 1) / tile * tile;
+    bool         ok   = true;
+    for (const c_seg & x : ov.segs) {
+        ok = ok && xdna_buffer_sync_to_device_range(ov.bo, (rows - M) * x.ldc * sizeof(float),
+                                                    x.off + M * x.ldc * sizeof(float));
+    }
+    return ok;
+}
+
 // whether `node`'s allocation holds `rows` rows of its output: its own, or
 // the rows past them that its buffer type reserved (xdna_pgemm_out_bytes)
 bool out_room(const ggml_tensor * node, size_t rows) {
@@ -925,8 +1109,39 @@ bool out_room(const ggml_tensor * node, size_t rows) {
            (node->buffer && rows * node->nb[1] <= ggml_backend_buffer_get_alloc_size(node->buffer, node));
 }
 
+// GGML_XDNA_PGEMM_GLU_X=1 with the merged design loaded: the planner may take GLU_X (xdna_pgemm_glux_supported)
+bool glux_on() {
+    return pfx_loaded() && xdna_env_int("GGML_XDNA_PGEMM_GLU_X", 0) != 0;
+}
+
+// GLU_X's x: the tensor, rows of the gate's N floats, at byte `off` of `bo`
+struct glux_x {
+    const ggml_tensor * t   = nullptr;
+    xdna_buffer *       bo  = nullptr;
+    size_t              off = 0;
+};
+
+// The bytes past a fused layout that hold GLU_X's last block of x
+size_t glux_tail_bytes(int N) {
+    return (size_t) MBLK * N * sizeof(float);
+}
+
+// x for the array: its first x_rows rows to the device where they are, the rest of M (the last block's) copied to
+// byte `tail` of bo and zero past M, so the array reads nothing past x and the rows past M give gelu(0) * 0
+bool glux_stage_x(const glux_x & gx, xdna_buffer * bo, size_t tail, int x_rows, int M, int N) {
+    const size_t row  = (size_t) N * sizeof(float);
+    const int    real = M - x_rows;
+    char *       dst  = (char *) bo->data + tail;
+    std::memcpy(dst, (const char *) gx.t->data + (size_t) x_rows * row, (size_t) real * row);
+    std::memset(dst + (size_t) real * row, 0, (size_t) (MBLK - real) * row);
+    return (x_rows == 0 || xdna_buffer_sync_to_device_range(gx.bo, (size_t) x_rows * row, gx.off)) &&
+           xdna_buffer_sync_to_device_range(bo, glux_tail_bytes(N), tail);
+}
+
 // With `fuse` (a SwiGLU call) the output goes as bf16 into that layout, the
-// next projection's A (K = N): nothing is written to the node.
+// next projection's A (K = N): nothing is written to the node. With `gx` too
+// (GLU_X) the cores' up half starts as x, a weight's zero up half adds nothing,
+// and the output is gelu(gate) * x.
 bool pgemm_call(xdna_kernel_pool *  pool,
                 const ggml_tensor * a,
                 weights *           ws,
@@ -934,7 +1149,8 @@ bool pgemm_call(xdna_kernel_pool *  pool,
                 int                 N,
                 bool                glu,
                 const pg_dst *      ov   = nullptr,
-                a_layout *          fuse = nullptr) {
+                a_layout *          fuse = nullptr,
+                const glux_x *      gx   = nullptr) {
     const xdna_gemv_geom & g     = ws->geom;
     const int              M     = (int) ggml_nrows(a);  // contiguous, so a row is nb[1] after the last
     const int              K     = g.K;
@@ -990,7 +1206,7 @@ bool pgemm_call(xdna_kernel_pool *  pool,
     }
     // the cores' output mode (kernels/gemm-expand.cc, ggml_xdna_pg_out)
     const int mode = (fuse ? PG_MODE_GLU_A : glu ? PG_MODE_GLU : PG_MODE_PLAIN) |
-                     (glu && ggml_get_glu_op(node) == GGML_GLU_OP_GEGLU ? PG_MODE_GELU : 0);
+                     (glu && (gx || ggml_get_glu_op(node) == GGML_GLU_OP_GEGLU) ? PG_MODE_GELU : 0);
     // every slab's headers: its blocks times the chunks, the K tiles a block,
     // the tile format, the K steps a tile and the pairs of them
     {
@@ -999,17 +1215,11 @@ bool pgemm_call(xdna_kernel_pool *  pool,
         std::memset(ah, 0, h_total);
         for (int sl = 0; sl < n_sl; sl++) {
             for (int h = 0; h < 2; h++) {
-                int32_t  words[8] = { blocks_of(sl) * nch,    g.n_tiles(),  q8 ? 1 : 0, steps, steps / 2, glu ? 1 : 2,
-                                     mode,                   steps / 2 - 1 };
-                uint16_t hb[16];                     // (a memcpy: read through a uint16_t
-                std::memcpy(hb, words, sizeof(hb));  // pointer, the ints are dead stores)
-                // the header goes through the MemTile's tiling too: its bf16
-                // j (row j / 8 of the first 8 x 8 sub-tile) is sent from
-                // row j / 8, column j % 8 of the (64 x 64) object
-                uint16_t * hdr = ah + (size_t) (sl * 2 + h) * HDR_BYTES / 2;
-                for (int j = 0; j < 16; j++) {
-                    hdr[(j / 8) * KS + j % 8] = hb[j];
-                }
+                int32_t words[HDR_WORDS] = { blocks_of(sl) * nch, g.n_tiles(), q8 ? 1 : 0, steps, steps / 2,
+                                             glu ? 1 : 2,         mode,        steps / 2 - 1 };
+                words[HW_X_ON]           = gx ? 1 : 0;
+                // the header goes through the MemTile's tiling too
+                write_tiled_words(words, HDR_WORDS, ah + (size_t) (sl * 2 + h) * HDR_BYTES / 2);
             }
         }
         if (!xdna_buffer_sync_to_device_range(al->bo, h_total, 0)) {
@@ -1066,22 +1276,28 @@ bool pgemm_call(xdna_kernel_pool *  pool,
     // columns fit it; otherwise into staging buffers, two deep, the host
     // copies rows out of.
     const a_geom fg(M, N);  // a fused output's layout
+    const size_t f_bytes = fg.bytes() + (gx ? glux_tail_bytes(N) : 0);
+    const int    x_rows  = (n_blk - 1) * MBLK;  // GLU_X: the rows of x the array reads where they are
     if (fuse) {
-        if (!glu || N % (CHUNK / 2) != 0 || fg.bytes() >= (1ull << 32)) {
+        if (!glu || N % (CHUNK / 2) != 0 || f_bytes >= (1ull << 32) ||
+            (gx && gx->off + (size_t) x_rows * N * sizeof(float) >= (1ull << 32))) {
             GGML_LOG_ERROR("%s: the fused output layout does not fit the call\n", "xdna-pgemm");
             return false;
         }
-        if (fuse->cap < fg.bytes()) {
+        if (fuse->cap < f_bytes) {
             if (fuse->bo) {
                 xdna_buffer_free(fuse->bo);
             }
-            fuse->bo  = xdna_buffer_alloc(pool->device, fg.bytes());
-            fuse->cap = fuse->bo ? fg.bytes() : 0;
+            fuse->bo  = xdna_buffer_alloc(pool->device, f_bytes);
+            fuse->cap = fuse->bo ? f_bytes : 0;
         }
         if (!fuse->bo) {
             return false;
         }
         fuse->src = nullptr;
+        if (gx && !glux_stage_x(*gx, fuse->bo, fg.bytes(), x_rows, M, N)) {
+            return false;
+        }
     }
     size_t        dst_off = 0;
     xdna_buffer * dst_bo  = fuse ? fuse->bo : ov ? ov->bo : xdna_host_bo_of(node->data, &dst_off);
@@ -1134,6 +1350,14 @@ bool pgemm_call(xdna_kernel_pool *  pool,
     }
     trim_seqs();
     buf_st.stop();
+    // With GLU_X on, a fused layout is flushed before the array writes it too: without it, a long input's repeats
+    // differed now and then. What leaves its lines stale is not identified.
+    const bool fused_flush = fuse && glux_on();
+    if (ok && fused_flush) {
+        xdna_prof::section_timer flush_st("prefill: pgemm: fused flush");
+        xdna_test_dirty_if_armed(XDNA_OUT_PGEMM_FUSED, fuse->bo, fg.bytes(), 0);
+        ok = xdna_buffer_sync_to_device_range(fuse->bo, fg.bytes(), 0);
+    }
     if (ok && direct && !fuse) {
         // no dirty line of dst may land over what the array writes
         xdna_prof::section_timer flush_st("prefill: pgemm: dst flush");
@@ -1150,6 +1374,12 @@ bool pgemm_call(xdna_kernel_pool *  pool,
             }
             cs.half[0]    = (uint32_t) fg.half(sl, 0);
             cs.half[1]    = (uint32_t) fg.half(sl, 1);
+            if (gx) {
+                cs.glux     = true;
+                cs.x_blocks = sl == n_sl - 1 ? nmb - 1 : nmb;
+                cs.x_off    = (uint32_t) (gx->off + (size_t) sl * slab * MBLK * N * sizeof(float));
+                cs.x_tail   = (uint32_t) fg.bytes();
+            }
             // the stream names this slab's place in dst, so a kernel is bound
             // to it per slab
             xdna_prof::section_timer stream_st("prefill: pgemm: stream");
@@ -1172,7 +1402,7 @@ bool pgemm_call(xdna_kernel_pool *  pool,
                 ok = false;
                 break;
             }
-            xdna_buffer *            args[4] = { ws->bo, al->bo, direct ? dst_bo : bo_c[sl % 2], sink };
+            xdna_buffer *            args[4] = { ws->bo, al->bo, direct ? dst_bo : bo_c[sl % 2], gx ? gx->bo : sink };
             xdna_prof::section_timer start_st("prefill: pgemm: start");
             runs[sl % 2] = xdna_kernel_run_start(kern, args, 4);
         }
@@ -1197,6 +1427,9 @@ bool pgemm_call(xdna_kernel_pool *  pool,
                 break;
             }
         }
+    }
+    if (fused_flush) {
+        xdna_test_land_dirty(XDNA_OUT_PGEMM_FUSED, fuse->bo, fg.bytes(), 0);
     }
     if (ok && direct && !ov && !fuse) {
         xdna_prof::section_timer invalidate_st("prefill: pgemm: dst invalidate");
@@ -1266,7 +1499,10 @@ bool xdna_pgemm_run_into(xdna_kernel_pool * pool, ggml_tensor * node, xdna_buffe
     return pgemm_call(pool, node->src[1], ws, node, (int) w->ne[1], false, &ov);
 }
 
-bool xdna_pgemm_glu_supported(const ggml_tensor * glu) {
+namespace {
+
+// The gate/up pairs the fold takes, whichever output it writes.
+bool glu_foldable(const ggml_tensor * glu) {
     if (!glu || glu->op != GGML_OP_GLU || !glu_gated(glu) || xdna_env_int("GGML_XDNA_PGEMM_GLU", 1) == 0 ||
         glu->type != GGML_TYPE_F32 || ggml_get_op_params_i32(glu, 1) != 0 || !ggml_is_contiguous(glu)) {
         return false;
@@ -1282,7 +1518,17 @@ bool xdna_pgemm_glu_supported(const ggml_tensor * glu) {
     return g.valid() && g.n_out() <= 256;
 }
 
+}  // namespace
+
+// The f32 gated product: the merged design writes it only as the next projection's A.
+bool xdna_pgemm_glu_supported(const ggml_tensor * glu) {
+    return !pfx_loaded() && glu_foldable(glu);
+}
+
 bool xdna_pgemm_run_glu(xdna_kernel_pool * pool, ggml_tensor * glu) {
+    if (!xdna_pgemm_glu_supported(glu)) {
+        return false;
+    }
     std::lock_guard<std::mutex> lock(g_pg.mtx);
     const ggml_tensor *         gate = glu->src[0];
     const ggml_tensor *         up   = glu->src[1];
@@ -1295,7 +1541,7 @@ bool xdna_pgemm_run_glu(xdna_kernel_pool * pool, ggml_tensor * glu) {
 }
 
 bool xdna_pgemm_glu_fused_supported(const ggml_tensor * glu, const ggml_tensor * down) {
-    return xdna_env_int("GGML_XDNA_PGEMM_GLU_A", 1) != 0 && xdna_pgemm_glu_supported(glu) && down &&
+    return xdna_env_int("GGML_XDNA_PGEMM_GLU_A", 1) != 0 && glu_foldable(glu) && down &&
            down->op == GGML_OP_MUL_MAT && down->src[1] == glu && xdna_pgemm_supported(down) &&
            glu->ne[0] % (CHUNK / 2) == 0 && glu->ne[0] == down->src[0]->ne[0];
 }
@@ -1310,6 +1556,64 @@ bool xdna_pgemm_run_glu_fused(xdna_kernel_pool * pool, ggml_tensor * glu) {
         return false;
     }
     return pgemm_call(pool, gate->src[1], ws, glu, (int) gate->src[0]->ne[1], true, nullptr, &g_pg.fused);
+}
+
+namespace {
+
+// A GELU of a projection on the array, its weight one chunk of gate columns the plan replays, with room in the
+// MemTile's weight buffer for the x slots next to its slots
+bool glux_gate_ok(const ggml_tensor * act) {
+    if (!act || act->op != GGML_OP_UNARY || ggml_get_unary_op(act) != GGML_UNARY_OP_GELU || !ggml_is_contiguous(act)) {
+        return false;
+    }
+    const ggml_tensor * mm = act->src[0];
+    if (!mm || !xdna_pgemm_supported(mm) || mm->ne[0] != CHUNK / 2) {
+        return false;
+    }
+    const xdna_gemv_geom g = geom_of(mm->src[0]);
+    if (!g.valid() || g.n_out() != 1) {
+        return false;
+    }
+    const w_plan wp = plan_of(g);
+    return wp.replay() && (size_t) wp.nslots * wp.G * 2 * g.tile_bytes() + X_SLOTS * X_SLOT_BYTES <= WS_BYTES;
+}
+
+// x: f32 rows of the gate's shape, one after the other, in one of the backend's buffers
+bool glux_x_ok(const ggml_tensor * x, const ggml_tensor * mul) {
+    size_t off = 0;
+    return x && x->type == GGML_TYPE_F32 && ggml_are_same_shape(x, mul) && x->nb[0] == sizeof(float) &&
+           x->nb[1] == (size_t) x->ne[0] * sizeof(float) && x->data && xdna_host_bo_of(x->data, &off);
+}
+
+}  // namespace
+
+bool xdna_pgemm_glux_supported(const ggml_tensor * mul, const ggml_tensor * proj) {
+    if (!glux_on() || !mul || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) ||
+        mul->ne[2] != 1 || mul->ne[3] != 1 || !glux_gate_ok(mul->src[0]) || !ggml_are_same_shape(mul->src[0], mul) ||
+        !glux_x_ok(mul->src[1], mul)) {
+        return false;
+    }
+    return proj && proj->op == GGML_OP_MUL_MAT && proj->src[1] == mul && xdna_pgemm_supported(proj) &&
+           proj->src[0]->ne[0] == mul->ne[0];
+}
+
+bool xdna_pgemm_run_glux(xdna_kernel_pool * pool, ggml_tensor * mul) {
+    std::lock_guard<std::mutex> lock(g_pg.mtx);
+    const ggml_tensor *         mm = mul->src[0]->src[0];
+    // the plain pack: a chunk's second 32 columns a core lie past the weight's 512, zero, so the up half stays x
+    weights *                   ws = weights_for(pool, { mm->src[0] });
+    glux_x                      gx;
+    gx.t  = mul->src[1];
+    gx.bo = xdna_host_bo_of(gx.t->data, &gx.off);
+    if (!ws || !gx.bo) {
+        GGML_LOG_ERROR("%s: cannot run %s with x %s\n", "xdna-pgemm", mm->src[0]->name, gx.t->name);
+        return false;
+    }
+    if (!pgemm_call(pool, mm->src[1], ws, mul, (int) mm->src[0]->ne[1], true, nullptr, &g_pg.fused, &gx)) {
+        return false;
+    }
+    g_pg.unwritten.push_back(mul);
+    return true;
 }
 
 bool xdna_pgemm_norm_supported(const ggml_tensor * mul) {
@@ -1699,13 +2003,19 @@ bool group_dst(struct ggml_tensor * const * mm, int n, size_t out_rows, pg_dst &
 
 }  // namespace
 
-bool xdna_pgemm_run_group(xdna_kernel_pool * pool, struct ggml_tensor * const * mm, int n) {
+bool xdna_pgemm_run_group(xdna_kernel_pool * pool, struct ggml_tensor * const * mm, int n, int pad_tile) {
     std::lock_guard<std::mutex> lock(g_pg.mtx);
     const int                   M        = (int) ggml_nrows(mm[0]->src[1]);
     const size_t                out_rows = ((size_t) M + MBLK - 1) / MBLK * MBLK;
     pg_dst                      ov;
-    if (!group_dst(mm, n, out_rows, ov) || !segs_fit(ov, out_rows)) {
+    if (!group_dst(mm, n, out_rows, ov) || !segs_fit(ov, out_rows) || pad_tile < 0 || pad_tile > MBLK) {
         return false;
+    }
+    if (pad_tile > 0) {
+        xdna_prof::section_timer st("prefill: pgemm: pad flush");
+        if (!sync_tile_pad(ov, (size_t) M, (size_t) pad_tile)) {
+            return false;
+        }
     }
     std::vector<const ggml_tensor *> w;
     int                              cols = 0;

@@ -79,7 +79,8 @@
 // A prompt's FFN, down(GLU(gate(x), up(x))) with SWIGLU and with GEGLU: the
 // backend runs the gate and up projections and the activation as one call,
 // writing the product straight into the down projection's input; with the
-// GLU a graph output it writes the product itself. Activations are scaled
+// GLU a graph output it writes the product itself (the host does, when the
+// merged design of GGML_XDNA_PFX is loaded). Activations are scaled
 // to put the gate on the activation's curve and, larger, in its tails. Two
 // sizes: EmbeddingGemma 2's (512, 2048) and Qwen3.5-4B's (2560, 9216).
 //
@@ -89,6 +90,22 @@
 // A prompt whose last layer is cropped to its output row, built in the graph
 // memory a decode of the same layers used before it, plans as on a fresh
 // context: the decode's GEMV groups do not follow the address into its plan.
+//
+// EmbeddingGemma 2's sliding attention layer as llama builds it with no KV
+// cache, one text and packed texts: with the merged design loaded and
+// GGML_XDNA_PFX_ROW=1 the row command writes the attention's Q, K and V from
+// the projections and the host runs none of the norms, RoPEs, pads and casts.
+// The attentions on that route and the ones that fall back are counted: below
+// 64 tokens, with the switch off, or with K's RoPE a graph output none takes
+// it; one made to fall back gives the bits of the switch off. Their buffers
+// are filled with NaN first: the row command reads the projections' rows past
+// the tokens, which only the array's zeros may reach in memory. An attention
+// given a C buffer whose every line the host left dirty, as a pool buffer's
+// last holder can, still matches: no host line lands over what the array wrote.
+//
+// GGML_XDNA_PGEMM_GLU_X=1: a fused call's layout, GLU_X's and a SwiGLU's into
+// down's A, left dirty with NaN before the array writes it and written back
+// after, still matches: the call flushes it before the dispatch.
 //
 // Every intermediate is cleared before each backend runs, so a node read
 // before it was written shows as zeros instead of as the other backend's
@@ -886,6 +903,18 @@ static bool test_fa_kv_copies(ggml_backend_t npu, ggml_backend_t cpu) {
 // product, bit for bit) or the array (a different order of summing, so not bit for bit).
 enum gemm_route { GEMM_ROUTE_ANY, GEMM_ROUTE_HOST, GEMM_ROUTE_ARRAY };
 
+// The merged prefill design loaded as pgemm_c8 (GGML_XDNA_PFX=1): 8-bit weight tiles only, and a GLU folded into
+// its GEMM written only as the next projection's A.
+static bool pfx_loaded() {
+    const char * v = std::getenv("GGML_XDNA_PFX");
+    return v && std::atoi(v) != 0;
+}
+
+// A weight type the prefill GEMM takes in the design that is loaded: the merged one's Q8_0 for Q4_K.
+static ggml_type pgemm_weight(ggml_type t) {
+    return pfx_loaded() && t == GGML_TYPE_Q4_K ? GGML_TYPE_Q8_0 : t;
+}
+
 struct gemm_shape {
     int64_t        K;
     int64_t        N;
@@ -908,7 +937,7 @@ static norm_graph build_gemms(ggml_backend_t cpu, enum ggml_type wtype, int64_t 
             a = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, sh.K, M);
             g.inputs.push_back(a);
         }
-        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, sh.wtype == GGML_TYPE_COUNT ? wtype : sh.wtype, sh.K, sh.N);
+        ggml_tensor * w = ggml_new_tensor_2d(g.ctx, pgemm_weight(sh.wtype == GGML_TYPE_COUNT ? wtype : sh.wtype), sh.K, sh.N);
         g.inputs.push_back(w);
         ggml_tensor * out = ggml_mul_mat(g.ctx, w, a);
         ggml_set_name(out, (std::string("K") + std::to_string(sh.K) + " N" + std::to_string(sh.N)).c_str());
@@ -928,14 +957,14 @@ struct gemm_case {
     bool                    gemm_host_off  = false;  // GGML_XDNA_GEMM_HOST=0
 };
 
-// An N x K Q4_K projection of M tokens followed by a tensor of its own to guard,
+// An N x K projection of M tokens (Q4_K, or pgemm_weight's type) followed by a tensor of its own to guard,
 // allocated in `be`'s buffers
 static norm_graph build_projection(ggml_backend_t be, int64_t K, int64_t N, int64_t M, ggml_tensor ** guard) {
     norm_graph g;
     ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
     g.ctx               = ggml_init(ip);
     ggml_tensor * a     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, M);
-    ggml_tensor * p     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, N);
+    ggml_tensor * p     = ggml_new_tensor_2d(g.ctx, pgemm_weight(GGML_TYPE_Q4_K), K, N);
     g.inputs            = { a, p };
     ggml_tensor * out   = ggml_mul_mat(g.ctx, p, a);
     ggml_set_name(out, "proj");
@@ -1225,17 +1254,29 @@ static norm_graph build_ffn(ggml_backend_t be, ggml_glu_op op, bool glu_is_outpu
     return g;
 }
 
+typedef int (*glu_fold_count_fn)(void);
+
+// The fold runs once a graph; the merged design leaves a GLU that is an output to the host.
 static bool test_ffn(ggml_backend_t npu, ggml_backend_t cpu, ggml_glu_op op, bool glu_is_output, int64_t K, int64_t F,
                      int64_t M, float scale, double tol) {
+    auto folds = (glu_fold_count_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_glu_fold_count");
+    if (!folds) {
+        std::printf("test-xdna-graph: the backend has no GLU fold count\n");
+        return false;
+    }
     norm_graph                      want_g = build_ffn(cpu, op, glu_is_output, K, F, M, scale);
     norm_graph                      got_g  = build_ffn(npu, op, glu_is_output, K, F, M, scale);
     std::vector<std::vector<float>> want, got;
+    const int                       before = folds();
     const bool                      ok = run(want_g, cpu, want) && run(got_g, npu, got);
+    const int                       fired  = folds() - before;
+    const int                       expect = pfx_loaded() && glu_is_output ? 0 : 1;
     const double                    e  = ok ? nmse(want[0], got[0]) : INFINITY;
-    const bool                      passed = ok && e < tol;
-    std::printf("%-6s %-4s K %-5lld F %-5lld M %-4lld scale %-5.2f nmse %.3g %s\n",
+    const bool                      passed = ok && e < tol && fired == expect;
+    std::printf("%-6s %-4s K %-5lld F %-5lld M %-4lld scale %-5.2f nmse %.3g, %d of %d folds %s\n",
                 op == GGML_GLU_OP_GEGLU ? "GEGLU" : "SWIGLU", glu_is_output ? "glu" : "down", (long long) K,
-                (long long) F, (long long) M, scale, e, passed ? "ok" : "FAIL");
+                (long long) F, (long long) M, scale, e, fired, expect, passed ? "ok" : "FAIL");
     ggml_backend_buffer_free(want_g.buf);
     ggml_backend_buffer_free(got_g.buf);
     ggml_free(want_g.ctx);
@@ -1969,7 +2010,9 @@ static bool dirty_head(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t
     return ok;
 }
 
+// the prefill attention on the route it takes: the merged design's with it loaded (GGML_XDNA_PFX)
 static bool dirty_attn_mm(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu) {
+    const char * site = pfx_loaded() ? "pfx-attn" : "attn-mm";
     set_fa_route(FA_ROUTE_ARRAY);
     fa_cache c = new_fa_cache(cpu);
     fill_cells(c, 0, FA_REFILL_CACHE, 13);
@@ -1977,8 +2020,8 @@ static bool dirty_attn_mm(dirty_output_fn dirty, ggml_backend_t npu, ggml_backen
     std::vector<float> want, got;
     const bool         computed = run_refill(g, cpu, DIRTY_FA_TOKENS, 0, true, &want);
     const int          filled =
-        dirtied_run(dirty, "attn-mm", computed, [&] { return run_refill(g, npu, DIRTY_FA_TOKENS, 0, true, &got); });
-    const bool ok = dirty_result_ok("attn-mm", filled, want, got, FA_ARRAY_NMSE_MAX);
+        dirtied_run(dirty, site, computed, [&] { return run_refill(g, npu, DIRTY_FA_TOKENS, 0, true, &got); });
+    const bool ok = dirty_result_ok(site, filled, want, got, FA_ARRAY_NMSE_MAX);
     free_rows_graph(g);
     ggml_backend_buffer_free(c.buf);
     ggml_free(c.ctx);
@@ -2088,6 +2131,467 @@ static bool test_dirty_outputs(ggml_backend_t npu, ggml_backend_t cpu, ggml_back
     // after a prefill: the pool flushes a cache's rows once by address until the next one
     passed      = dirty_att(dirty, npu, cpu, buft) && passed;
     passed      = dirty_gdn_mm(dirty, npu, cpu) && passed;
+    unsetenv("GGML_XDNA_PGEMM_HOST");
+    unsetenv("GGML_XDNA_HOST_CHUNK");
+    return passed;
+}
+
+// EmbeddingGemma 2's sliding attention layer as llama builds it with no KV cache: Q8_0 projections, Q's and K's head
+// norms and neox RoPE, V's norm, K and V padded to the mask's keys and cast to f16, a window over packed texts.
+static const int64_t ROW_EMBD          = 512;
+static const int64_t ROW_HEAD_DIM      = 256;
+static const int64_t ROW_Q_HEADS       = 4;
+static const int64_t ROW_KV_HEADS      = 2;
+static const int64_t ROW_KV_PAD        = 256;  // build_attn_inp_no_cache pads the mask's keys to it
+static const int     ROW_HALF_WINDOW   = 256;  // the model's n_swa / 2: keys either side a row sees
+static const float   ROW_EPS           = 1e-6f;
+static const int     ROW_N_CTX_ORIG    = 2048;
+static const float   ROW_FREQ_BASE     = 10000.0f;
+static const float   ROW_BETA_FAST     = 32.0f;
+static const float   ROW_BETA_SLOW     = 1.0f;
+// norm weights near a quarter leave a score of a few, as the model's q_norm and k_norm do
+static const float   ROW_NORM_W        = 0.25f;
+static const float   ROW_NORM_W_SPREAD = 0.05f;
+static const int     ROW_UNSET         = -1;  // GGML_XDNA_PFX_ROW unset
+static const int     ROW_NO_REF        = -2;  // no second run to compare bits with
+// every float of a buffer filled with it is a NaN: a row read before the array wrote it, or over what it wrote,
+// shows; the row command reads each projection's rows past the tokens up to its last key tile
+static const int     ROW_POISON        = 0xFF;
+
+struct row_case {
+    const char * name;
+    int          n_tokens;
+    int          texts;
+    int          pfx_row;     // GGML_XDNA_PFX_ROW, or ROW_UNSET
+    bool         rope_k_out;  // K's RoPE a graph output
+    int          fail;        // attentions made to fall back (ggml_backend_xdna_test_pfx_row_fail)
+    int          rows;        // attentions on the row command, with the merged design loaded
+    int          fallbacks;   // attentions that fall back to the host's inputs, with it loaded
+    int          same_as;     // GGML_XDNA_PFX_ROW of a second run that gives the same bits, or ROW_NO_REF
+    bool         dirty_c;     // its attention given a C the host left dirty (ggml_backend_xdna_test_dirty_output)
+};
+
+struct row_graph {
+    ggml_context *        ctx    = nullptr;
+    ggml_backend_buffer_t buf    = nullptr;
+    ggml_cgraph *         gf     = nullptr;
+    ggml_tensor *         x      = nullptr;
+    ggml_tensor *         w[3]   = {};  // Q, K and V
+    ggml_tensor *         q_norm = nullptr;
+    ggml_tensor *         k_norm = nullptr;
+    ggml_tensor *         pos    = nullptr;
+    ggml_tensor *         mask   = nullptr;
+    ggml_tensor *         out    = nullptr;
+};
+
+// x through projection i of `heads` heads, split into them; expanded first, next to the layer's other projections,
+// as the backend's graph_optimize orders them (ggml_backend_graph_compute does not call it)
+static ggml_tensor * row_projection(row_graph & g, int i, int64_t heads) {
+    g.w[i]           = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, ROW_EMBD, heads * ROW_HEAD_DIM);
+    ggml_tensor * mm = ggml_mul_mat(g.ctx, g.w[i], g.x);
+    ggml_build_forward_expand(g.gf, mm);
+    return ggml_reshape_3d(g.ctx, mm, ROW_HEAD_DIM, heads, g.x->ne[1]);
+}
+
+static ggml_tensor * row_rope(row_graph & g, ggml_tensor * t) {
+    return ggml_rope_ext(g.ctx, t, g.pos, nullptr, ROW_HEAD_DIM, GGML_ROPE_TYPE_NEOX, ROW_N_CTX_ORIG, ROW_FREQ_BASE, 1.0f,
+                         0.0f, 1.0f, ROW_BETA_FAST, ROW_BETA_SLOW);
+}
+
+// build_attn's K or V: padded to the mask's keys, its heads outermost, cast to f16
+static ggml_tensor * row_kv(row_graph & g, ggml_tensor * t, int64_t n_kv) {
+    t = ggml_pad(g.ctx, t, 0, 0, (int) (n_kv - t->ne[2]), 0);
+    return ggml_cast(g.ctx, ggml_permute(g.ctx, t, 0, 2, 1, 3), GGML_TYPE_F16);
+}
+
+static row_graph build_row_layer(ggml_backend_t be, const row_case & c) {
+    row_graph        g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 48 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    const int64_t n_kv  = GGML_PAD(c.n_tokens, ROW_KV_PAD);
+    g.x                 = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, ROW_EMBD, c.n_tokens);
+    g.q_norm            = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, ROW_HEAD_DIM);
+    g.k_norm            = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, ROW_HEAD_DIM);
+    g.pos               = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, c.n_tokens);
+    g.mask              = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, n_kv, c.n_tokens);
+    ggml_set_input(g.mask);
+    g.gf          = ggml_new_graph(g.ctx);
+    ggml_tensor * q = row_projection(g, 0, ROW_Q_HEADS);
+    ggml_tensor * k = row_projection(g, 1, ROW_KV_HEADS);
+    ggml_tensor * v = row_projection(g, 2, ROW_KV_HEADS);
+    q               = row_rope(g, ggml_mul(g.ctx, ggml_rms_norm(g.ctx, q, ROW_EPS), g.q_norm));
+    k               = row_rope(g, ggml_mul(g.ctx, ggml_rms_norm(g.ctx, k, ROW_EPS), g.k_norm));
+    v               = ggml_rms_norm(g.ctx, v, ROW_EPS);
+    if (c.rope_k_out) {
+        ggml_set_output(k);
+    }
+    q = ggml_view_4d(g.ctx, q, q->ne[0], q->ne[1], q->ne[2], 1, q->nb[1], q->nb[2], q->nb[2] * q->ne[2], 0);
+    g.out = ggml_flash_attn_ext(g.ctx, ggml_permute(g.ctx, q, 0, 2, 1, 3), row_kv(g, k, n_kv), row_kv(g, v, n_kv), g.mask,
+                                1.0f, 0.0f, 0.0f);
+    ggml_prec_set_acc(g.out, GGML_PREC_F32);
+    ggml_set_output(g.out);
+    ggml_build_forward_expand(g.gf, g.out);
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return g;
+}
+
+static void free_row_layer(row_graph & g) {
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
+}
+
+// the text of token t, the last one taking the tokens past n / texts each, and its position there
+static int row_text(const row_case & c, int t) {
+    return std::min(t / (c.n_tokens / c.texts), c.texts - 1);
+}
+
+static int row_pos(const row_case & c, int t) {
+    return t - row_text(c, t) * (c.n_tokens / c.texts);
+}
+
+static std::vector<float> row_uniform(size_t n, uint32_t seed, float scale, float offset) {
+    std::mt19937                          rng(seed);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::vector<float>                    f(n);
+    for (float & x : f) {
+        x = offset + scale * u(rng);
+    }
+    return f;
+}
+
+static void set_row_weight(ggml_tensor * w, uint32_t seed) {
+    const std::vector<float> f = row_uniform((size_t) ggml_nelements(w), seed, 1.0f, 0.0f);
+    std::vector<uint8_t>     q(ggml_nbytes(w));
+    ggml_quantize_chunk(w->type, f.data(), q.data(), 0, w->ne[1], w->ne[0], nullptr);
+    ggml_backend_tensor_set(w, q.data(), 0, q.size());
+}
+
+static void set_row_f32(ggml_tensor * t, uint32_t seed, float scale, float offset) {
+    const std::vector<float> f = row_uniform((size_t) ggml_nelements(t), seed, scale, offset);
+    ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
+}
+
+static void set_row_positions(row_graph & g, const row_case & c) {
+    std::vector<int32_t> p(c.n_tokens);
+    for (int t = 0; t < c.n_tokens; t++) {
+        p[t] = row_pos(c, t);
+    }
+    ggml_backend_tensor_set(g.pos, p.data(), 0, ggml_nbytes(g.pos));
+}
+
+// what token t sees: its own text's keys within the window, as llama's no-cache mask
+static void set_row_mask_row(const row_case & c, int t, ggml_fp16_t * row) {
+    for (int j = 0; j < c.n_tokens; j++) {
+        if (row_text(c, j) == row_text(c, t) && std::abs(row_pos(c, j) - row_pos(c, t)) <= ROW_HALF_WINDOW) {
+            row[j] = ggml_fp32_to_fp16(0.0f);
+        }
+    }
+}
+
+static void set_row_mask(row_graph & g, const row_case & c) {
+    std::vector<ggml_fp16_t> m((size_t) ggml_nelements(g.mask), ggml_fp32_to_fp16(-INFINITY));
+    for (int t = 0; t < c.n_tokens; t++) {
+        set_row_mask_row(c, t, m.data() + (size_t) t * g.mask->ne[0]);
+    }
+    ggml_backend_tensor_set(g.mask, m.data(), 0, ggml_nbytes(g.mask));
+}
+
+static void set_row_inputs(row_graph & g, const row_case & c) {
+    set_row_f32(g.x, 11, 1.0f, 0.0f);
+    for (int i = 0; i < 3; i++) {
+        set_row_weight(g.w[i], 21 + (uint32_t) i);
+    }
+    set_row_f32(g.q_norm, 31, ROW_NORM_W_SPREAD, ROW_NORM_W);
+    set_row_f32(g.k_norm, 32, ROW_NORM_W_SPREAD, ROW_NORM_W);
+    set_row_positions(g, c);
+    set_row_mask(g, c);
+}
+
+static bool run_row_layer(row_graph & g, const row_case & c, ggml_backend_t be, std::vector<float> & res) {
+    ggml_backend_buffer_clear(g.buf, ROW_POISON);
+    set_row_inputs(g, c);
+    if (ggml_backend_graph_compute(be, g.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    res = get_f32(g.out);
+    return true;
+}
+
+static void set_pfx_row(int value) {
+    if (value == ROW_UNSET) {
+        unsetenv("GGML_XDNA_PFX_ROW");
+    } else {
+        setenv("GGML_XDNA_PFX_ROW", std::to_string(value).c_str(), 1);
+    }
+}
+
+static const char * pfx_row_name(int value) {
+    return value == ROW_UNSET ? "unset" : value == 0 ? "0" : "1";
+}
+
+typedef int (*pfx_row_count_fn)(void);
+typedef void (*pfx_row_fail_fn)(int attentions);
+
+struct row_hooks {
+    pfx_row_count_fn rows      = nullptr;
+    pfx_row_count_fn fallbacks = nullptr;
+    pfx_row_fail_fn  fail      = nullptr;
+    dirty_output_fn  dirty     = nullptr;
+};
+
+static row_hooks row_hooks_of(ggml_backend_t npu) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(npu));
+    row_hooks          h;
+    h.rows      = (pfx_row_count_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_pfx_row_count");
+    h.fallbacks = (pfx_row_count_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_pfx_row_fallbacks");
+    h.fail      = (pfx_row_fail_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_pfx_row_fail");
+    h.dirty     = (dirty_output_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_test_dirty_output");
+    return h;
+}
+
+// The layer on the NPU against the CPU backend, the attentions that ran on the row command, fell back and took a dirty
+// C buffer counted (the merged design is static per process: without it none do), and a second run's bits where the
+// case names one
+static bool test_row_layer(ggml_backend_t npu, ggml_backend_t cpu, const row_hooks & h, const row_case & c) {
+    row_graph          want_g = build_row_layer(cpu, c);
+    row_graph          got_g  = build_row_layer(npu, c);
+    std::vector<float> want, got, ref;
+    set_pfx_row(c.pfx_row);
+    h.fail(c.fail);
+    const int rows0 = h.rows(), fallbacks0 = h.fallbacks(), dirtied0 = h.dirty("pfx-attn", c.dirty_c);
+    bool      ok    = run_row_layer(want_g, c, cpu, want) && run_row_layer(got_g, c, npu, got);
+    const int rows = h.rows() - rows0, fallbacks = h.fallbacks() - fallbacks0;
+    const int dirtied = h.dirty("pfx-attn", 0) - dirtied0;
+    h.fail(0);
+    const bool compare = c.same_as != ROW_NO_REF;
+    if (ok && compare) {
+        set_pfx_row(c.same_as);
+        ok = run_row_layer(got_g, c, npu, ref);
+    }
+    unsetenv("GGML_XDNA_PFX_ROW");
+    const int    want_rows      = pfx_loaded() ? c.rows : 0;
+    const int    want_fallbacks = pfx_loaded() ? c.fallbacks : 0;
+    const int    want_dirtied   = pfx_loaded() && c.dirty_c ? 1 : 0;
+    const double e              = ok ? nmse(want, got) : INFINITY;
+    const bool   same           = !compare || (ok && std::memcmp(ref.data(), got.data(), got.size() * sizeof(float)) == 0);
+    const bool   passed = ok && e > FA_ARRAY_NMSE_MIN && e < FA_ARRAY_NMSE_MAX && rows == want_rows &&
+                        fallbacks == want_fallbacks && dirtied == want_dirtied && same;
+    std::printf(
+        "PFXROW %-6s T %-4d texts %d switch %-5s nmse %.3g, %d of %d rows, %d of %d fallbacks, "
+        "%d of %d dirty C%s%s %s\n",
+        c.name, c.n_tokens, c.texts, pfx_row_name(c.pfx_row), e, rows, want_rows, fallbacks, want_fallbacks, dirtied,
+        want_dirtied, compare ? (same ? ", same bits as switch " : ", OTHER bits than switch ") : "",
+        compare ? pfx_row_name(c.same_as) : "", passed ? "ok" : "FAIL");
+    free_row_layer(want_g);
+    free_row_layer(got_g);
+    return passed;
+}
+
+static bool test_row_layers(ggml_backend_t npu, ggml_backend_t cpu) {
+    const row_hooks h = row_hooks_of(npu);
+    if (!h.rows || !h.fallbacks || !h.fail || !h.dirty) {
+        std::printf("test-xdna-graph: the backend has no row command hooks\n");
+        return false;
+    }
+    const row_case cases[] = {
+        // name     tokens texts switch     K RoPE out fail rows fallbacks same bits as dirty C
+        { "R15",       15,  1, 1,         false,     0,   0,   0,        ROW_NO_REF,  false },
+        { "R132",     132,  1, 1,         false,     0,   1,   0,        ROW_NO_REF,  false },
+        { "R912",     912,  1, 1,         false,     0,   1,   0,        ROW_NO_REF,  false },
+        { "R1188p",  1188,  8, 1,         false,     0,   1,   0,        ROW_NO_REF,  false },
+        { "R600p0",   600,  6, 0,         false,     0,   0,   0,        ROW_UNSET,   false },
+        { "Rout",     132,  1, 1,         true,      0,   0,   0,        ROW_NO_REF,  false },
+        { "Rfail",    912,  1, 1,         false,     1,   0,   1,        0,           false },
+        { "Rdirty",   912,  1, 1,         false,     0,   1,   0,        ROW_NO_REF,  true  },
+    };
+    bool passed = true;
+    for (const row_case & c : cases) {
+        passed = test_row_layer(npu, cpu, h, c) && passed;
+    }
+    return passed;
+}
+
+// EmbeddingGemma 2's per-layer input gate, per_layer_proj(gelu(inp_gate pe) * x) with x one layer's view of the
+// per-layer inputs [dim, tokens, layers] (the last layer's through a GET_ROWS): with GGML_XDNA_PGEMM_GLU_X=1 the
+// merged design runs the gate's GEMM with x as the accumulator's up half, into per_layer_proj's A
+static const int64_t GLUX_DIM    = 512;
+static const int64_t GLUX_LAYERS = 3;
+static const float   GLUX_ACT    = 0.3f;
+static const double  GLUX_TOL    = 3e-3;
+
+struct glux_case {
+    const char * name;
+    int64_t      tokens;
+    int64_t      layer;
+    bool         get_rows;  // x's rows reversed through a GET_ROWS
+    bool         on;
+};
+
+struct glux_graph {
+    norm_graph    g;
+    ggml_tensor * ids = nullptr;
+};
+
+static glux_graph build_glux(ggml_backend_t be, const glux_case & c) {
+    glux_graph       gg;
+    norm_graph &     g  = gg.g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    g.act_scale         = GLUX_ACT;
+    ggml_tensor * pe    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, GLUX_DIM, c.tokens);
+    ggml_tensor * per   = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, GLUX_DIM, c.tokens, GLUX_LAYERS);
+    ggml_tensor * wg    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, GLUX_DIM, GLUX_DIM);
+    ggml_tensor * wp    = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, GLUX_DIM, GLUX_DIM);
+    g.inputs            = { pe, per, wg, wp };
+    ggml_tensor * x     = ggml_view_2d(g.ctx, per, GLUX_DIM, c.tokens, per->nb[1], c.layer * per->nb[2]);
+    if (c.get_rows) {
+        gg.ids = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, c.tokens);
+        x      = ggml_get_rows(g.ctx, x, gg.ids);
+    }
+    ggml_tensor * gate = ggml_gelu(g.ctx, ggml_mul_mat(g.ctx, wg, pe));
+    ggml_tensor * out  = ggml_mul_mat(g.ctx, wp, ggml_mul(g.ctx, gate, x));
+    ggml_set_name(out, "per_layer_proj");
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, be);
+    return gg;
+}
+
+static void set_reversed_rows(ggml_tensor * ids) {
+    std::vector<int32_t> r(ggml_nelements(ids));
+    for (size_t i = 0; i < r.size(); i++) {
+        r[i] = (int32_t) (r.size() - 1 - i);
+    }
+    ggml_backend_tensor_set(ids, r.data(), 0, ggml_nbytes(ids));
+}
+
+static bool run_glux(glux_graph & gg, ggml_backend_t be, std::vector<float> & res) {
+    ggml_backend_buffer_clear(gg.g.buf, 0);
+    set_inputs(gg.g, 1234);
+    if (gg.ids) {
+        set_reversed_rows(gg.ids);
+    }
+    if (ggml_backend_graph_compute(be, gg.g.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    res = get_f32(gg.g.checked[0]);
+    return true;
+}
+
+static void free_glux(glux_graph & gg) {
+    ggml_backend_buffer_free(gg.g.buf);
+    ggml_free(gg.g.ctx);
+}
+
+typedef int (*glux_count_fn)(void);
+
+static bool test_glux(ggml_backend_t npu, ggml_backend_t cpu, glux_count_fn runs, const glux_case & c) {
+    glux_graph         want_g = build_glux(cpu, c);
+    glux_graph         got_g  = build_glux(npu, c);
+    std::vector<float> want, got;
+    setenv("GGML_XDNA_PGEMM_GLU_X", c.on ? "1" : "0", 1);
+    const int  before = runs();
+    const bool ok     = run_glux(want_g, cpu, want) && run_glux(got_g, npu, got);
+    const int  fired  = runs() - before;
+    unsetenv("GGML_XDNA_PGEMM_GLU_X");
+    const int    expect = c.on && pfx_loaded() ? 1 : 0;
+    const double e      = ok ? nmse(want, got) : INFINITY;
+    const bool   passed = ok && e < GLUX_TOL && fired == expect;
+    std::printf("GLU_X %-12s T %-4lld layer %lld%s switch %d nmse %.3g, %d of %d runs %s\n", c.name, (long long) c.tokens,
+                (long long) c.layer, c.get_rows ? " rows" : "", c.on ? 1 : 0, e, fired, expect, passed ? "ok" : "FAIL");
+    free_glux(want_g);
+    free_glux(got_g);
+    return passed;
+}
+
+static bool test_glux_cases(ggml_backend_t npu, ggml_backend_t cpu) {
+    auto runs = (glux_count_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_glux_count");
+    if (!runs) {
+        std::printf("test-xdna-graph: the backend has no GLU_X count\n");
+        return false;
+    }
+    // one block (its x all from the tail), whole blocks, a short last one, the model's 912 at the end of the inputs
+    // and through a GET_ROWS, 17 blocks in two slabs, and the switch off
+    const glux_case cases[] = {
+        // name         tokens layer rows   on
+        { "one block",     15, 2, false, true  },
+        { "whole block",  128, 1, false, true  },
+        { "two blocks",   200, 2, false, true  },
+        { "912",          912, 2, false, true  },
+        { "912 get_rows", 912, 2, true,  true  },
+        { "two slabs",   2100, 0, false, true  },
+        { "switch off",   912, 1, false, false },
+    };
+    bool passed = true;
+    for (const glux_case & c : cases) {
+        passed = test_glux(npu, cpu, runs, c) && passed;
+    }
+    return passed;
+}
+
+// With GGML_XDNA_PGEMM_GLU_X=1, the fused layout of a GLU_X call and of a SwiGLU into down's A, filled with NaN and left
+// dirty before its flush, then landed after the array wrote it ("pgemm-fused"): without the flush the next projection
+// reads the NaN. Only the merged design's route takes GLU_X and so flushes; elsewhere nothing is filled.
+static const int64_t DIRTY_FUSED_TOKENS = 2100;  // two slabs
+static const int64_t DIRTY_FUSED_FFN    = 2048;
+static const float   DIRTY_FUSED_SCALE  = 0.3f;
+static const double  DIRTY_FUSED_TOL    = 3e-3;  // the GLU cases' bound
+
+static bool dirty_fused_ok(const char *               call,
+                           int                        filled,
+                           const std::vector<float> & want,
+                           const std::vector<float> & got) {
+    const int    expect = pfx_loaded() ? 1 : 0;
+    const double e      = filled >= 0 ? nmse(want, got) : INFINITY;
+    const bool   ok     = filled == expect && e < DIRTY_FUSED_TOL;
+    std::printf("dirty fused layout, %-6s %d of %d filled, nmse %.3g %s\n", call, filled, expect, e,
+                ok ? "ok" : "FAIL");
+    return ok;
+}
+
+static bool dirty_fused_glux(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu) {
+    const glux_case    c      = { "dirty", DIRTY_FUSED_TOKENS, 1, false, true };
+    glux_graph         want_g = build_glux(cpu, c);
+    glux_graph         got_g  = build_glux(npu, c);
+    std::vector<float> want, got;
+    const bool         computed = run_glux(want_g, cpu, want);
+    const int          filled = dirtied_run(dirty, "pgemm-fused", computed, [&] { return run_glux(got_g, npu, got); });
+    const bool         ok     = dirty_fused_ok("GLU_X", filled, want, got);
+    free_glux(want_g);
+    free_glux(got_g);
+    return ok;
+}
+
+static bool dirty_fused_swiglu(dirty_output_fn dirty, ggml_backend_t npu, ggml_backend_t cpu) {
+    norm_graph want_g =
+        build_ffn(cpu, GGML_GLU_OP_SWIGLU, false, GLUX_DIM, DIRTY_FUSED_FFN, DIRTY_FUSED_TOKENS, DIRTY_FUSED_SCALE);
+    norm_graph got_g =
+        build_ffn(npu, GGML_GLU_OP_SWIGLU, false, GLUX_DIM, DIRTY_FUSED_FFN, DIRTY_FUSED_TOKENS, DIRTY_FUSED_SCALE);
+    std::vector<std::vector<float>> want, got;
+    const bool                      computed = run(want_g, cpu, want);
+    const int  filled = dirtied_run(dirty, "pgemm-fused", computed, [&] { return run(got_g, npu, got); });
+    const bool ok     = dirty_fused_ok("SwiGLU", filled, filled >= 0 ? want[0] : std::vector<float>(),
+                                       filled >= 0 ? got[0] : std::vector<float>());
+    free_graph(want_g);
+    free_graph(got_g);
+    return ok;
+}
+
+static bool test_dirty_fused(ggml_backend_t npu, ggml_backend_t cpu) {
+    auto dirty = (dirty_output_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(npu)), "ggml_backend_xdna_test_dirty_output");
+    if (!dirty) {
+        std::printf("test-xdna-graph: the backend has no dirty-output hook\n");
+        return false;
+    }
+    setenv("GGML_XDNA_PGEMM_GLU_X", "1", 1);
+    setenv("GGML_XDNA_PGEMM_HOST", "0", 1);
+    setenv("GGML_XDNA_HOST_CHUNK", "0", 1);
+    bool passed = dirty_fused_glux(dirty, npu, cpu);
+    passed      = dirty_fused_swiglu(dirty, npu, cpu) && passed;
+    unsetenv("GGML_XDNA_PGEMM_GLU_X");
     unsetenv("GGML_XDNA_PGEMM_HOST");
     unsetenv("GGML_XDNA_HOST_CHUNK");
     return passed;
@@ -2243,6 +2747,10 @@ int main(void) {
         passed = test_fa_refill(npu, cpu, causal) && passed;
     }
     passed = test_fa_kv_copies(npu, cpu) && passed;
+    // the sliding layer's attention on the array whatever its size, as the model's all-array settings run it
+    set_fa_route(FA_ROUTE_ARRAY);
+    passed = test_row_layers(npu, cpu) && passed;
+    unsetenv("GGML_XDNA_FA_MM");
 
     const gemm_case gemm_cases[] = {
         { "decode block",     GGML_TYPE_BF16, 15,  { { 512, 1024 }, { 1024, 512 } } },
@@ -2367,6 +2875,7 @@ int main(void) {
     }
 
     passed = check_cropped_ffn(cpu, npu, ggml_backend_dev_buffer_type(dev), tol) && passed;
+    passed = test_glux_cases(npu, cpu) && passed;
 
     // a new backend context drops the weights the earlier cases packed
     ggml_backend_free(npu);
@@ -2379,6 +2888,7 @@ int main(void) {
     passed = npu != nullptr && test_group_order_after_host_plan(npu, cpu) && passed;
     passed = test_chunk_plan_after_decode(dev, cpu) && passed;
     passed = npu != nullptr && test_dirty_outputs(npu, cpu, ggml_backend_dev_buffer_type(dev), tol) && passed;
+    passed = npu != nullptr && test_dirty_fused(npu, cpu) && passed;
 
     ggml_backend_free(npu);
     ggml_backend_free(cpu);

@@ -12,6 +12,8 @@ ggml_add_backend_library(ggml-xdna
                          xdna-ops.cpp
                          xdna-pgemm.cpp
                          xdna-attn-mm.cpp
+                         xdna-pfx-attn.cpp
+                         xdna-pfx-row.cpp
                          xdna-host-attn.cpp
                          xdna-gdn-mm.cpp
                          xdna-conv-prefill.cpp
@@ -279,6 +281,31 @@ if (GGML_XDNA_BUILD_KERNELS)
     )
     list(APPEND XDNA_ARTIFACTS ${PG_XCLBIN} ${PG_INSTS})
 
+    # The merged prefill design (pfx.py): pgemm's GEMM in its 8-bit tile form on
+    # every core, attn-mm.cc's attention on six columns and the row ops
+    # (rowop.cc) on two, so a layer runs in one hardware context.
+    # GGML_XDNA_PFX=1 loads it in pgemm_c8's place.
+    set(PFX_STEM "pfx_c8")
+    set(PFX_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PFX_STEM}.xclbin")
+    set(PFX_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PFX_STEM}.insts.bin")
+    add_custom_command(
+        OUTPUT ${PFX_XCLBIN} ${PFX_INSTS}
+        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/pfx.py"
+                -d npu2
+                --xclbin-path ${PFX_XCLBIN}
+                --insts-path ${PFX_INSTS}
+        DEPENDS "${GEMM_DIR}/pfx.py" "${GEMM_DIR}/rowop.cc" "${GEMM_DIR}/attn_mm.py" "${GEMM_DIR}/attn-mm.cc"
+                "${GEMM_DIR}/pgemm.py" "${GEMM_DIR}/gemm-expand.cc" ${XDNA_KERNEL_HEADERS}
+                "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/wfmt.py"
+                "${GEMM_DIR}/gemv-q4.cc" "${GEMM_DIR}/gemm-dequant.cc"
+                "${GEMM_DIR}/act-att.cc" "${GEMM_DIR}/attn-dec.cc"
+                "${GEMM_DIR}/gemv-merge.cc" "${GEMM_DIR}/gemv-zero.cc"
+        WORKING_DIRECTORY "${GEMM_DIR}"
+        COMMENT "ggml-xdna: compiling the merged prefill design"
+        VERBATIM
+    )
+    list(APPEND XDNA_ARTIFACTS ${PFX_XCLBIN} ${PFX_INSTS})
+
     # Prefill attention (attn_mm.py + attn-mm.cc):
     # the six full-attention layers on the mmul, the cores driven by a header
     # (passes, the ubatch's first position), so one artifact covers every
@@ -516,8 +543,9 @@ endif()
 # conversions the repacker accepts, how many head rows stay exact, which
 # nodes the graph planners take for the ones llama builds, what the mark that
 # tells a lost write from a landed one leaves behind, how the GEMM stream
-# issues its sweeps, and how far a grouped projection's output offset reaches.
-# They compile the backend sources they test directly and open no device.
+# issues its sweeps, how far a grouped projection's output offset reaches, and
+# what the merged design's row command hands its cores. They compile the backend
+# sources they test directly and open no device.
 # tests/CMakeLists.txt adds them to ctest: testing is enabled there, after this
 # directory is configured.
 option(GGML_XDNA_BUILD_TESTS "ggml-xdna: build the host-only backend tests" ON)
@@ -537,4 +565,9 @@ if (GGML_XDNA_BUILD_TESTS)
     target_include_directories(test-xdna-mark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
     target_link_libraries(test-xdna-mark PRIVATE ggml-base XRT::xrt_coreutil)
     add_executable(test-xdna-seg-reach tests/test-xdna-seg-reach.cpp)
+    add_executable(test-xdna-pfx-row tests/test-xdna-pfx-row.cpp xdna-pfx-row.cpp xdna-pfx-attn.cpp xdna-seq.cpp
+                   xdna-runtime.cpp)
+    target_include_directories(test-xdna-pfx-row PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    target_link_libraries(test-xdna-pfx-row PRIVATE ggml-base XRT::xrt_coreutil
+                          $<TARGET_NAME_IF_EXISTS:OpenMP::OpenMP_CXX>)
 endif()
