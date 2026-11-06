@@ -13,6 +13,9 @@
 #    include <windows.h>
 #else
 #    include <dlfcn.h>
+#    if defined(__GLIBC__)
+#        include <link.h>
+#    endif
 #endif
 
 #include <algorithm>
@@ -109,6 +112,17 @@ static fs::path xdna_module_dir(void) {
     }
 #else
     Dl_info info;
+#    if defined(__GLIBC__)
+    // Linked into the main program (an empty link-map name), dli_fname is
+    // argv[0], which can resolve against the working directory: use the
+    // executable's real path.
+    struct link_map * lm = nullptr;
+    if (dladdr1((void *) &xdna_module_dir, &info, (void **) &lm, RTLD_DL_LINKMAP) && lm && lm->l_name && !*lm->l_name) {
+        std::error_code ec;
+        const fs::path  exe = fs::read_symlink("/proc/self/exe", ec);
+        return ec ? fs::path() : exe.parent_path();
+    }
+#    endif
     if (dladdr((void *) &xdna_module_dir, &info) && info.dli_fname && *info.dli_fname) {
         std::error_code ec;
         const fs::path  p = fs::canonical(info.dli_fname, ec);
