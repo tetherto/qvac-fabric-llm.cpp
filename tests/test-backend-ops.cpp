@@ -8168,7 +8168,7 @@ struct test_mul_mat_convrot_h256 : public test_case {
     }
 };
 
-// GGML_PREC_F32 on F32 x F32: both operands and the accumulation stay F32, so F16 staging fails the bar
+// F32 x F32 with GGML_PREC_F32 accumulation and src1 operand: F16 or TF32 staging fails the bar
 struct test_mul_mat_prec_f32 : public test_mul_mat {
     using test_mul_mat::test_mul_mat;
 
@@ -8190,6 +8190,7 @@ struct test_mul_mat_prec_f32 : public test_mul_mat {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = test_mul_mat::build_graph(ctx);
         GGML_ASSERT(ggml_prec_set_acc(out, GGML_PREC_F32));
+        GGML_ASSERT(ggml_prec_set_src(out, GGML_PREC_F32, 1));
         return out;
     }
 };

@@ -7295,12 +7295,17 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
     return ctx->device->fp16 && prec == GGML_PREC_DEFAULT;
 }
 
+static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_full_f32_matmul_pipeline_map(ggml_backend_vk_context * ctx) {
+    auto it = ctx->device->pipeline_matmul.find(ggml_vk_full_f32_matmul_key());
+    return it == ctx->device->pipeline_matmul.end() || it->second.empty() ? nullptr : &it->second;
+}
+
+static bool ggml_vk_mul_mat_requests_full_f32(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32;
+}
+
 static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipeline_map(
         ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false) {
-    if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32 && prec == GGML_PREC_F32 && !mul_mat_id) {
-        auto it = ctx->device->pipeline_matmul.find(ggml_vk_full_f32_matmul_key());
-        return it == ctx->device->pipeline_matmul.end() || it->second.empty() ? nullptr : &it->second;
-    }
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
     vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc};
     auto it = ctx->device->pipeline_matmul.find(key);
@@ -7974,9 +7979,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         src1_uma = d_Qy != nullptr;
     }
 
-    const bool full_f32 = (ggml_prec) dst->op_params[0] == GGML_PREC_F32 &&
-                          src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
-                          ggml_vk_get_mul_mat_mat_pipeline_map(ctx, GGML_TYPE_F32, GGML_TYPE_F32, GGML_PREC_F32) != nullptr;
+    const std::vector<vk_matmul_pipeline_pair>* full_f32_map =
+        ggml_vk_mul_mat_requests_full_f32(src0, src1, dst) ? ggml_vk_get_full_f32_matmul_pipeline_map(ctx) : nullptr;
+    const bool full_f32 = full_f32_map != nullptr;
     const bool x_non_contig = (!full_f32 && ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
                               !ggml_vk_dim01_contiguous(src0);
     // If src0 is BF16, try to use a BF16 x BF16 multiply
@@ -7996,7 +8001,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool y_f32_kernel     = y_kernel_type == GGML_TYPE_F32;
     const bool y_needs_reformat = !quantize_y && (!ggml_vk_dim01_contiguous(src1) || y_kernel_type != src1->type);
 
-    const std::vector<vk_matmul_pipeline_pair>* mmp_map =
+    const std::vector<vk_matmul_pipeline_pair>* mmp_map = full_f32 ? full_f32_map :
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0]);
 
     bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
@@ -8004,7 +8009,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     if (qx_needs_dequant) {
         // dequant src0 to f16
-        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, x_reformat_type, y_kernel_type, (ggml_prec)dst->op_params[0]);
+        mmp_map = full_f32 ? full_f32_map :
+            ggml_vk_get_mul_mat_mat_pipeline_map(ctx, x_reformat_type, y_kernel_type, (ggml_prec)dst->op_params[0]);
     }
 
     GGML_ASSERT(mmp_map != nullptr);
@@ -8940,6 +8946,7 @@ static ggml_tensor ggml_vk_convrot_gemm_result(const ggml_tensor * dst, ggml_ten
     result.op = GGML_OP_MUL_MAT;
     memset(result.op_params, 0, sizeof(result.op_params));
     ggml_set_op_params_i32(&result, 0, GGML_PREC_F32);
+    ggml_set_op_params_i32(&result, 3, GGML_PREC_F32);
     result.src[0] = weights;
     result.src[1] = activations;
     return result;
