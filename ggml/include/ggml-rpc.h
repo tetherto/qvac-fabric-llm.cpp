@@ -34,8 +34,13 @@ extern "C" {
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
+// Any change to these ids breaks the wire format, so it needs a major bump.
+// GGML_TYPE_COUNT is pinned by PQ2_0/PTQ1_0 and does not move when upstream
+// adds a type; the TBQ/PQ family follows upstream's last type, so check its
+// first id instead.
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 125, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_TYPE_TBQ3_0 == 44, "GGML_TYPE_TBQ3_0 has moved - update RPC_PROTO_MAJOR_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
