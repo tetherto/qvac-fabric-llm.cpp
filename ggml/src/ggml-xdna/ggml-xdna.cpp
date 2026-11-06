@@ -2956,9 +2956,7 @@ static const xdna_npu_info & xdna_npu_probe(void) {
                 break;
             }
 #else
-            const ggml_backend_xdna_context * ctx = ggml_xdna_device_context();
-            r.present                             = ctx->device != nullptr;
-            r.description                         = r.present ? ctx->device->description : std::string();
+            // no sysfs to read: nothing is listed
 #endif
         } catch (...) {
             GGML_LOG_ERROR("%s: NPU probe failed; the NPU is not listed\n", "ggml-xdna");
