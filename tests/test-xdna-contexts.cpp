@@ -10,7 +10,8 @@
 // after round, and every decode has to succeed. The backend runs one graph
 // compute at a time and keeps each context's fused-layer sessions apart;
 // without either, the second context crashed or decoded on the first one's
-// recurrent state.
+// recurrent state. Built with -fsanitize=thread, it also checks one context's
+// support queries against the other's compute (run it under setarch -R).
 //
 // Skips (exit 0) without a model or an XDNA device.
 
