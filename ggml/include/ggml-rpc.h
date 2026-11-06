@@ -23,15 +23,23 @@ extern "C" {
 // 112 adds the speech ops to the ggml_op enum (temp-11018: 111).
 // 113 adds GATED_DELTA_NET_DEFERRED and GDN_CONV_DEFERRED to the ggml_op enum
 //     (temp-11259: 112).
+// 114 renumbers ops and types for upstream b12032: GGML_OP_TOP_K_MASK goes in
+//     before GGML_OP_UNARY and GGML_TYPE_F8_E4M3 takes 43, so every later op id
+//     and the TBQ/PQ type ids move up by one (b11739 fork: 113).
 // A minor bump is additive: the client still accepts a server with an older
 // minor and must gate every command introduced by a later minor on the minor
 // the server announces at HELLO.
-#define RPC_PROTO_MAJOR_VERSION    113
+#define RPC_PROTO_MAJOR_VERSION    114
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
+// Any change to these ids breaks the wire format, so it needs a major bump.
+// GGML_TYPE_COUNT is pinned by PQ2_0/PTQ1_0 and does not move when upstream
+// adds a type; the TBQ/PQ family follows upstream's last type, so check its
+// first id instead.
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 128, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 128, "GGML_OP_COUNT has changed - update RPC_PROTO_MAJOR_VERSION");
+static_assert(GGML_TYPE_TBQ3_0 == 44, "GGML_TYPE_TBQ3_0 has moved - update RPC_PROTO_MAJOR_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
