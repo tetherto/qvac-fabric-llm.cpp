@@ -15709,8 +15709,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
 
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_mul_mat_convrot(type_a, 256, 1, {1, 1, 1}, false, false));
         for (bool f16_compat : {false, true}) {
-            test_cases.emplace_back(new test_mul_mat_convrot(type_a, 256,  1,  {1, 1, 1},  false, f16_compat));
             test_cases.emplace_back(new test_mul_mat_convrot(type_a, 512,  37, {1, 1, 1},  false, f16_compat));
             test_cases.emplace_back(new test_mul_mat_convrot(type_a, 512,  37, {7, 1, 1},  false, f16_compat));
             test_cases.emplace_back(new test_mul_mat_convrot(type_a, 1280, 64, {48, 1, 1}, false, f16_compat));
