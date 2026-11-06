@@ -27,6 +27,7 @@
 #include "ggml-cuda/conv2d-transpose.cuh"
 #include "ggml-cuda/conv3d.cuh"
 #include "ggml-cuda/convert.cuh"
+#include "ggml-cuda/convrot.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
@@ -2702,6 +2703,10 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context &          ctx,
                               const ggml_tensor *                  src1,
                               ggml_tensor *                        dst,
                               const ggml_cuda_cutlass_activation * activation = nullptr) {
+    if (activation == nullptr && ggml_cuda_op_mul_mat_use_convrot_h256(dst) &&
+        ggml_cuda_op_convrot_h256(ctx, src1, dst)) {
+        return true;
+    }
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return true;
     }
@@ -3147,6 +3152,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context &          ctx,
             if (!ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst, activation)) {
                 return false;
             }
+            break;
+        case GGML_OP_MUL_MAT_CONVROT:
+            ggml_cuda_op_mul_mat_convrot(ctx, dst);
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
@@ -7142,6 +7150,21 @@ static bool ggml_backend_cuda_repacked_supports_op(
 }
 
 // TODO: move these functions here
+static bool ggml_backend_cuda_supports_mul_mat_convrot(const ggml_tensor * op) {
+    const ggml_tensor * a = op->src[0];
+    const ggml_tensor * w = op->src[1];
+    const ggml_tensor * s = op->src[2];
+    const bool launchable = a->ne[1] <= 65535 && a->ne[2] > 0 && a->ne[3] > 0 && a->ne[2] <= 65535 / a->ne[3];
+    return launchable &&
+        (a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16) &&
+        w->type == GGML_TYPE_I8 && s->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+        ggml_get_op_params_i32(op, 0) == 256 &&
+        a->ne[0] == w->ne[0] && a->ne[0] > 0 && a->ne[0] % 256 == 0 &&
+        w->ne[2] == 1 && w->ne[3] == 1 &&
+        s->ne[0] == w->ne[1] && s->ne[1] == 1 && s->ne[2] == 1 && s->ne[3] == 1 &&
+        op->ne[0] == w->ne[1] && op->ne[1] == a->ne[1] && op->ne[2] == a->ne[2] && op->ne[3] == a->ne[3];
+}
+
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
@@ -7296,6 +7319,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return as_ok && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
                        op->type == GGML_TYPE_F32;
             }
+        case GGML_OP_MUL_MAT_CONVROT:
+            return ggml_backend_cuda_supports_mul_mat_convrot(op);
         case GGML_OP_OUT_PROD:
             {
                 // ggml_cuda_out_prod dequantizes any non-F32 src to F32 via ggml_get_to_fp32_cuda
@@ -7760,6 +7785,7 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
         case GGML_OP_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_CONVROT:
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_ROPE:

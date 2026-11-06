@@ -441,8 +441,17 @@ h256_errors h256_error(const std::vector<float> & h, const std::vector<float> & 
     return e;
 }
 
+bool has_native_h256(ggml_backend_t backend) {
+    return std::strncmp(ggml_backend_name(backend), "CUDA", 4) == 0;
+}
+
+std::vector<float> zero_h256_when_native(ggml_backend_t backend, const std::vector<float> & h) {
+    return has_native_h256(backend) ? std::vector<float>(h.size(), 0.0f) : h;
+}
+
 double h256_tolerance(ggml_backend_t backend, double max_abs_ref) {
-    const bool exact = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    const bool exact = has_native_h256(backend) ||
+                       ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
     return exact ? kH256Tolerance : kPlainMatmulTolerance * max_abs_ref;
 }
 
@@ -463,9 +472,10 @@ int test_h256_hint(ggml_backend_t backend) {
     }
 
     const std::vector<float> hv = dense_h256();
+    const std::vector<float> uploaded_h = zero_h256_when_native(backend, hv);
     const std::vector<float> xv = pattern(ggml_nelements(x), 17, 31, 97);
     const bool computed = compute(backend, g, graph, [&] {
-        ggml_backend_tensor_set(h, hv.data(), 0, ggml_nbytes(h));
+        ggml_backend_tensor_set(h, uploaded_h.data(), 0, ggml_nbytes(h));
         ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
     });
     if (!computed) {
