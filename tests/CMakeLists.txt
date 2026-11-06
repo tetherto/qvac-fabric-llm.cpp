@@ -715,7 +715,8 @@ if (GGML_XDNA)
     llama_build_and_test(test-xdna-graph.cpp)
     # Two llama contexts computing at once (-m model.gguf).
     llama_build_and_test(test-xdna-contexts.cpp     LABEL "model")
-    # A sequence's state saved and restored around other tokens (-m model.gguf).
+    # A sequence's state saved and restored around other tokens, and two
+    # sequences in one unified cache (-m model.gguf).
     llama_build_and_test(test-xdna-state.cpp        LABEL "model")
     # Every thread's CPU mask unchanged by the pinned host decode (-m model.gguf).
     llama_build_and_test(test-xdna-affinity.cpp     LABEL "model")
