@@ -62,7 +62,16 @@ else()
     target_compile_features(server-context PRIVATE cxx_std_17)
     # Linked into the shared @qvac/fabric module, so position-independent
     # regardless of BUILD_SHARED_LIBS (upstream only sets it for shared builds).
-    set_target_properties(server-context PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    #
+    # Hidden visibility: the server classes are internals of the runtime, used
+    # only by the bridge linked into the same module. @qvac/fabric exports by
+    # wildcard (e.g. *common_*, *llama_* in its Mach-O list), and those patterns
+    # also match mangled server symbols whose signatures mention common_params
+    # or llama_model. A hidden symbol is never exported, whatever the list says.
+    set_target_properties(server-context PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON)
     target_include_directories(server-context PRIVATE
         "${_qvac_sc_dir}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tools/mtmd"
