@@ -3231,6 +3231,25 @@ void turbovec_block_seq(const ggml_vec_index & idx, size_t block, uint8_t * seq_
 #endif
 }
 
+void turbovec_blocked_set_blocks_packed(
+    ggml_vec_index & idx, size_t first_block, size_t n_blocks, const uint8_t * packed_rows) {
+    const int bits = idx.turbovec_bits;
+    const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / bits);
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    const size_t row_bytes = turbovec_row_bytes(bits, static_cast<size_t>(idx.dim));
+    const TurboVecLayout layout = turbovec_layout(idx);
+    std::vector<uint8_t> seq(lane_size * n_byte_groups);
+    for (size_t b = 0; b < n_blocks; ++b) {
+        for (size_t lane = 0; lane < lane_size; ++lane) {
+            packed_row_to_seq_fast(
+                packed_rows + (b * lane_size + lane) * row_bytes, bits, idx.dim, seq.data() + lane * n_byte_groups);
+        }
+        write_blocked_block(
+            seq.data(), n_byte_groups,
+            idx.turbovec_blocked_data.data() + (first_block + b) * n_byte_groups * lane_size, layout);
+    }
+}
+
 void turbovec_blocked_set_block_seq(ggml_vec_index & idx, size_t block, const uint8_t * seq_blocked) {
     const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / idx.turbovec_bits);
     const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
