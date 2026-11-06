@@ -231,12 +231,13 @@ GOMP_SPINCOUNT=20000 ./build/bin/llama-embedding -m embeddinggemma-2-Q8_0.gguf \
 
 A pass runs host glue between its array commands, a few nodes at a time, so
 its threads should spin briefly at each barrier rather than sleep. At 912
-tokens (ms and package J a pass, median of 3 interleaved rounds) the Q8_0
-file takes 146.8 ms and 7.80 J with `GOMP_SPINCOUNT=20000` (~0.2 ms of spin),
-155.9 ms and 7.88 J with `OMP_WAIT_POLICY=PASSIVE`, and 142.0 ms and 8.17 J
-with libgomp's default spin (~3 ms); the BF16 file 169.1 / 8.85, 189.7 / 9.51
-and 166.8 / 9.20. The short spin gives up 1.4 to 3.4% of the time against the
-default and saves ~4% of the energy.
+tokens (ms and package J a pass, measured as in the table below) the Q8_0 file
+takes 140.5 ms and 12.5 J with `GOMP_SPINCOUNT=20000` (~0.2 ms of spin),
+150.9 ms and 12.1 J with `OMP_WAIT_POLICY=PASSIVE`, and 137.5 ms and 13.7 J
+with libgomp's default spin (~3 ms); the BF16 file 160.7 / 15.6, 182.7 / 15.6
+and 156.9 / 15.7. The short spin gives up 2.2 to 2.4% of the time against the
+default and saves 0.5 to 8.5% of the energy. Sleeping saves at most 3.4% more
+energy and costs 7 to 14% more time.
 
 Against the CPU backend, the pooled embeddings agree to a cosine of at least
 0.9994 (Q8_0) and 0.9996 (BF16), and every layer's output stays within an
@@ -248,25 +249,26 @@ runs the packing, ordering and CPU-parity checks.
 
 Measured on a Ryzen AI MAX+ 395 against the CPU backend (16 threads, wait
 policy unset), XDNA with `GOMP_SPINCOUNT=20000`: median ms and package joules
-a pass over 6 runs alternating between the two, the package power read from
-the `PPT` sensor. The inputs marked `host` run whole on the host by the rule
-above.
+a pass over 6 runs, 3 rounds that each run the backends forward and then
+backward. A run repeats the pass, and its package power is the mean of the
+`PPT` sensor, read every 100 ms, over at least 5 s of passes after the reading
+settles. The inputs marked `host` run whole on the host by the rule above.
 
 | file | input | CPU ms | CPU J | XDNA ms | XDNA J |
 | :-- | :-- | --: | --: | --: | --: |
-| Q8_0 | one 15-token query (`host`) | 7.2 | 0.44 | 8.4 | 0.49 |
-| Q8_0 | one 41-token text (`host`) | 13.4 | 0.62 | 13.7 | 0.59 |
-| Q8_0 | one 67-token text (`host`) | 28.4 | 1.38 | 20.2 | 0.87 |
-| Q8_0 | one 132-token text | 42.0 | 2.42 | 41.1 | 1.73 |
-| Q8_0 | one 912-token text | 247.1 | 24.9 | 145.1 | 7.32 |
-| Q8_0 | eight texts, 1188 tokens, one batch | 351.2 | 41.7 | 174.9 | 9.83 |
-| BF16 | one 15-token query (`host`) | 6.8 | 0.52 | 7.3 | 0.34 |
-| BF16 | one 132-token text (`host`) | 41.8 | 2.31 | 26.3 | 1.08 |
-| BF16 | one 912-token text | 196.2 | 15.4 | 165.6 | 8.42 |
-| BF16 | eight texts, 1188 tokens, one batch | 288.7 | 28.9 | 199.2 | 11.2 |
+| Q8_0 | one 15-token query (`host`) | 6.4 | 0.75 | 6.6 | 0.74 |
+| Q8_0 | one 41-token text (`host`) | 11.8 | 1.57 | 11.7 | 1.51 |
+| Q8_0 | one 67-token text (`host`) | 26.0 | 3.20 | 17.5 | 2.29 |
+| Q8_0 | one 132-token text | 44.6 | 5.48 | 42.9 | 1.45 |
+| Q8_0 | one 912-token text | 256.3 | 31.2 | 141.8 | 12.5 |
+| Q8_0 | eight texts, 1188 tokens, one batch | 358.8 | 43.4 | 171.4 | 15.0 |
+| BF16 | one 15-token query (`host`) | 6.5 | 0.52 | 7.5 | 0.34 |
+| BF16 | one 132-token text (`host`) | 38.2 | 5.10 | 25.8 | 3.44 |
+| BF16 | one 912-token text | 208.3 | 25.6 | 158.0 | 15.5 |
+| BF16 | eight texts, 1188 tokens, one batch | 300.6 | 36.9 | 193.5 | 19.0 |
 
-A pass the rule runs on the host is quicker than the CPU backend's at 67
-tokens and more, and up to 1.2 times slower on the shortest inputs, where
+A pass the rule runs on the host is as quick as the CPU backend's at 41 tokens
+and quicker from 67, and up to 1.15 times slower on a 15-token query, where
 `--device none` is the quicker choice.
 
 ## How it works
