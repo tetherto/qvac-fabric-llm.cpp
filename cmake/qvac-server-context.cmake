@@ -16,70 +16,76 @@
 
 set(_qvac_sc_dir "${CMAKE_CURRENT_SOURCE_DIR}/tools/server")
 
+# The library this option ships must be position-independent and hidden (see
+# below). Upstream's own target, defined when LLAMA_BUILD_SERVER=ON, is neither
+# in a static build, and making it so would change what upstream's server
+# libraries export. The two options build different things; refuse the mix
+# rather than ship upstream's target unchanged.
 if (TARGET server-context)
-    # The full tools + server build already defined it (LLAMA_BUILD_SERVER=ON).
-    # Reuse that target; only the install rules below are added.
-    set(QVAC_FABRIC_SERVER_CONTEXT_TARGET server-context)
-else()
-    if (NOT TARGET llama-common)
-        message(FATAL_ERROR "QVAC_FABRIC_SERVER_CONTEXT requires LLAMA_BUILD_COMMON=ON")
-    endif()
-    if (NOT TARGET mtmd)
-        message(FATAL_ERROR "QVAC_FABRIC_SERVER_CONTEXT requires LLAMA_MTMD=ON")
-    endif()
-
-    file(READ "${_qvac_sc_dir}/CMakeLists.txt" _qvac_sc_cmake)
-    string(REGEX MATCH
-        "set\\(TARGET server-context\\)[ \t\r\n]+add_library\\(\\$\\{TARGET\\} STATIC([^)]*)\\)"
-        _qvac_sc_match "${_qvac_sc_cmake}")
-    if (NOT _qvac_sc_match)
-        message(FATAL_ERROR
-            "QVAC_FABRIC_SERVER_CONTEXT: could not find the server-context source list in "
-            "tools/server/CMakeLists.txt. Upstream changed how that target is declared; update "
-            "cmake/qvac-server-context.cmake to match.")
-    endif()
-
-    string(REGEX REPLACE "[ \t\r\n]+" ";" _qvac_sc_files "${CMAKE_MATCH_1}")
-    list(FILTER _qvac_sc_files EXCLUDE REGEX "^$")
-
-    set(_qvac_sc_sources)
-    foreach(_f IN LISTS _qvac_sc_files)
-        if (NOT EXISTS "${_qvac_sc_dir}/${_f}")
-            message(FATAL_ERROR "QVAC_FABRIC_SERVER_CONTEXT: listed source ${_f} does not exist")
-        endif()
-        # Guard the property that makes this target safe to ship: none of the
-        # HTTP server or model-router implementation files may be compiled in.
-        if (_f MATCHES "^(server|server-http|server-models)\\.cpp$")
-            message(FATAL_ERROR
-                "QVAC_FABRIC_SERVER_CONTEXT: upstream's server-context now lists ${_f}, "
-                "which belongs to the HTTP server. Review before shipping it in the runtime.")
-        endif()
-        list(APPEND _qvac_sc_sources "${_qvac_sc_dir}/${_f}")
-    endforeach()
-
-    add_library(server-context STATIC ${_qvac_sc_sources})
-    llama_add_compile_flags()
-    target_compile_features(server-context PRIVATE cxx_std_17)
-    # Linked into the shared @qvac/fabric module, so position-independent
-    # regardless of BUILD_SHARED_LIBS (upstream only sets it for shared builds).
-    #
-    # Hidden visibility: the server classes are internals of the runtime, used
-    # only by the bridge linked into the same module. @qvac/fabric exports by
-    # wildcard (e.g. *common_*, *llama_* in its Mach-O list), and those patterns
-    # also match mangled server symbols whose signatures mention common_params
-    # or llama_model. A hidden symbol is never exported, whatever the list says.
-    set_target_properties(server-context PROPERTIES
-        POSITION_INDEPENDENT_CODE ON
-        CXX_VISIBILITY_PRESET hidden
-        VISIBILITY_INLINES_HIDDEN ON)
-    target_include_directories(server-context PRIVATE
-        "${_qvac_sc_dir}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tools/mtmd"
-        "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(server-context PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
-
-    set(QVAC_FABRIC_SERVER_CONTEXT_TARGET server-context)
+    message(FATAL_ERROR
+        "QVAC_FABRIC_SERVER_CONTEXT cannot be combined with LLAMA_BUILD_SERVER: it builds "
+        "its own position-independent, hidden-visibility server-context for the @qvac/fabric "
+        "runtime. Turn one of them off (the qvac-fabric port sets LLAMA_BUILD_SERVER=OFF).")
 endif()
+
+if (NOT TARGET llama-common)
+    message(FATAL_ERROR "QVAC_FABRIC_SERVER_CONTEXT requires LLAMA_BUILD_COMMON=ON")
+endif()
+if (NOT TARGET mtmd)
+    message(FATAL_ERROR "QVAC_FABRIC_SERVER_CONTEXT requires LLAMA_MTMD=ON")
+endif()
+
+file(READ "${_qvac_sc_dir}/CMakeLists.txt" _qvac_sc_cmake)
+string(REGEX MATCH
+    "set\\(TARGET server-context\\)[ \t\r\n]+add_library\\(\\$\\{TARGET\\} STATIC([^)]*)\\)"
+    _qvac_sc_match "${_qvac_sc_cmake}")
+if (NOT _qvac_sc_match)
+    message(FATAL_ERROR
+        "QVAC_FABRIC_SERVER_CONTEXT: could not find the server-context source list in "
+        "tools/server/CMakeLists.txt. Upstream changed how that target is declared; update "
+        "cmake/qvac-server-context.cmake to match.")
+endif()
+
+string(REGEX REPLACE "[ \t\r\n]+" ";" _qvac_sc_files "${CMAKE_MATCH_1}")
+list(FILTER _qvac_sc_files EXCLUDE REGEX "^$")
+
+set(_qvac_sc_sources)
+foreach(_f IN LISTS _qvac_sc_files)
+    if (NOT EXISTS "${_qvac_sc_dir}/${_f}")
+        message(FATAL_ERROR "QVAC_FABRIC_SERVER_CONTEXT: listed source ${_f} does not exist")
+    endif()
+    # Guard the property that makes this target safe to ship: none of the
+    # HTTP server or model-router implementation files may be compiled in.
+    if (_f MATCHES "^(server|server-http|server-models)\\.cpp$")
+        message(FATAL_ERROR
+            "QVAC_FABRIC_SERVER_CONTEXT: upstream's server-context now lists ${_f}, "
+            "which belongs to the HTTP server. Review before shipping it in the runtime.")
+    endif()
+    list(APPEND _qvac_sc_sources "${_qvac_sc_dir}/${_f}")
+endforeach()
+
+add_library(server-context STATIC ${_qvac_sc_sources})
+llama_add_compile_flags()
+target_compile_features(server-context PRIVATE cxx_std_17)
+# Linked into the shared @qvac/fabric module, so position-independent
+# regardless of BUILD_SHARED_LIBS (upstream only sets it for shared builds).
+#
+# Hidden visibility: the server classes are internals of the runtime, used
+# only by the bridge linked into the same module. @qvac/fabric exports by
+# wildcard (e.g. *common_*, *llama_* in its Mach-O list), and those patterns
+# also match mangled server symbols whose signatures mention common_params
+# or llama_model. A hidden symbol is never exported, whatever the list says.
+set_target_properties(server-context PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
+target_include_directories(server-context PRIVATE
+    "${_qvac_sc_dir}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/mtmd"
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(server-context PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+
+set(QVAC_FABRIC_SERVER_CONTEXT_TARGET server-context)
 
 # Every server-*.h, not only the ones in the source list: server-context.h
 # includes server-http.h (header-only request/response structs), which upstream
