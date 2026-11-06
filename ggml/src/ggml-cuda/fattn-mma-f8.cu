@@ -475,7 +475,7 @@ bool ggml_cuda_flash_attn_ext_f8_supported(int device, const ggml_tensor * dst) 
         K->nb[1] % 16 == 0 && V->nb[1] % 16 == 0 &&
         mask != nullptr && mask->type == GGML_TYPE_F16 && ggml_cuda_is_aligned(mask, 16) && mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] &&
         mask->ne[2] == 1 && (mask->ne[3] == Q->ne[3] || mask->ne[3] == 1) && mask->nb[1] % 16 == 0 &&
-        sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f && ggml_get_op_params_i32(dst, 4) == 0;
+        sinks == nullptr && dst->src[5] == nullptr && max_bias == 0.0f && logit_softcap == 0.0f && ggml_get_op_params_i32(dst, 4) == 0;
 }
 
 template <int D>
