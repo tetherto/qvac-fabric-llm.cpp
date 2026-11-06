@@ -894,8 +894,10 @@ void turbovec_planes_reset(ggml_vec_index & idx) {
     idx.turbovec_planes = false;
     idx.turbovec_stats_ready = false;
     idx.turbovec_centre_ready = false;
-    idx.turbovec_sign_blocked.clear();
-    idx.turbovec_centre.clear();
+    // Swapped out rather than cleared: clear() keeps the capacity, and the
+    // sign planes alone are dim / 8 bytes per vector.
+    std::vector<uint8_t>().swap(idx.turbovec_sign_blocked);
+    std::vector<float>().swap(idx.turbovec_centre);
 }
 
 void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last) {
@@ -2475,6 +2477,14 @@ int turbovec_rounding_parity_for_test() {
         }
     }
     return 0;
+}
+
+void turbovec_staged_caches_for_test(
+    const ggml_vec_index_t * idx, bool * planes, bool * packed_rows, size_t * sign_capacity) {
+    std::lock_guard<std::mutex> lock(idx->turbovec_planes_mutex);
+    *planes = idx->turbovec_planes;
+    *packed_rows = idx->turbovec_packed_rows;
+    *sign_capacity = idx->turbovec_sign_blocked.capacity();
 }
 
 void turbovec_force_planes_for_test(int mode, size_t min_vectors) {

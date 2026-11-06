@@ -4140,12 +4140,23 @@ size_t ggml_vec_index_serialized_size(const ggml_vec_index_t * idx) {
     }
 }
 
+static constexpr uint32_t kLoadFlagsKnown = GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF;
+
+static bool load_flags_staged(uint32_t flags) {
+    return (flags & GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF) == 0;
+}
+
 int ggml_vec_index_from_bytes(const uint8_t * bytes, size_t size, ggml_vec_index_t ** out) {
+    return ggml_vec_index_from_bytes_with_flags(bytes, size, GGML_VEC_INDEX_LOAD_DEFAULT, out);
+}
+
+int ggml_vec_index_from_bytes_with_flags(
+    const uint8_t * bytes, size_t size, uint32_t flags, ggml_vec_index_t ** out) {
     if (out == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     *out = nullptr;
-    if (bytes == nullptr || size == 0) {
+    if (bytes == nullptr || size == 0 || (flags & ~kLoadFlagsKnown) != 0) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     try {
@@ -4154,7 +4165,8 @@ int ggml_vec_index_from_bytes(const uint8_t * bytes, size_t size, ggml_vec_index
         }
         test_maybe_throw_bad_alloc();
         int error = GGML_VEC_INDEX_E_IO;
-        ggml_vec_index_t * idx = turbovec_v8_load_image(std::vector<uint8_t>(bytes, bytes + size), error, nullptr);
+        ggml_vec_index_t * idx = turbovec_v8_load_image(
+            std::vector<uint8_t>(bytes, bytes + size), error, nullptr, load_flags_staged(flags));
         if (idx == nullptr) {
             return error;
         }
@@ -4169,11 +4181,22 @@ int ggml_vec_index_from_bytes(const uint8_t * bytes, size_t size, ggml_vec_index
 }
 
 int ggml_vec_index_load_ex(const char * path, ggml_vec_index_t ** out) {
+    return ggml_vec_index_load_with_flags(path, GGML_VEC_INDEX_LOAD_DEFAULT, out);
+}
+
+static ggml_vec_index_t * load_path(const char * path, bool staged);
+static ggml_vec_index_t * load_path_impl(const char * path, bool staged);
+
+int ggml_vec_index_load_with_flags(const char * path, uint32_t flags, ggml_vec_index_t ** out) {
     if (out == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     *out = nullptr;
-    ggml_vec_index_t * idx = ggml_vec_index_load(path);
+    if ((flags & ~kLoadFlagsKnown) != 0) {
+        g_last_load_error = GGML_VEC_INDEX_E_INVALID_ARG;
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    ggml_vec_index_t * idx = load_path(path, load_flags_staged(flags));
     if (idx == nullptr) {
         return load_status_from_last_error();
     }
@@ -4182,6 +4205,20 @@ int ggml_vec_index_load_ex(const char * path, ggml_vec_index_t ** out) {
 }
 
 ggml_vec_index_t * ggml_vec_index_load(const char * path) {
+    return load_path(path, true);
+}
+
+static ggml_vec_index_t * load_path(const char * path, bool staged) {
+    ggml_vec_index_t * idx = load_path_impl(path, staged);
+    // A legacy (v3) TurboVec index never runs staged search, but reports
+    // the setting it was loaded with like a v8 one.
+    if (idx != nullptr && !staged && is_turbovec(*idx)) {
+        idx->turbovec_staged_enabled = false;
+    }
+    return idx;
+}
+
+static ggml_vec_index_t * load_path_impl(const char * path, bool staged) {
     g_last_load_error = GGML_VEC_INDEX_OK;
     try {
         if (path == nullptr) {
@@ -4226,7 +4263,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
             }
             int error = GGML_VEC_INDEX_E_IO;
             TurboVecV8LoadInfo info;
-            ggml_vec_index_t * loaded = turbovec_v8_load_image(std::move(raw), error, &info);
+            ggml_vec_index_t * loaded = turbovec_v8_load_image(std::move(raw), error, &info, staged);
             if (loaded == nullptr) {
                 return load_fail(error);
             }
