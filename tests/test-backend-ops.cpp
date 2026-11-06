@@ -12895,6 +12895,59 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with K and V far from 1 (e.g. large K from a K bias); Q is scaled so the logits stay moderate
+struct test_flash_attn_ext_kv_range : public test_case {
+    const int64_t hs;
+    const int64_t nh; // K/V heads
+    const int64_t kv;
+    const int64_t nb;
+    const float   k_range;
+    const float   v_range;
+
+    std::string vars() override {
+        return VARS_TO_STR6(hs, nh, kv, nb, k_range, v_range);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_kv_range(int64_t hs = 128, int64_t nh = 2, int64_t kv = 1024, int64_t nb = 256,
+                                 float k_range = 1.0f, float v_range = 1.0f)
+        : hs(hs), nh(nh), kv(kv), nb(nb), k_range(k_range), v_range(v_range) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, 4*nh, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q") == 0) {
+                init_tensor_uniform(t, -4.0f/k_range, 4.0f/k_range);
+            } else if (strcmp(t->name, "k") == 0) {
+                init_tensor_uniform(t, -k_range, k_range);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -v_range, v_range);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT_BACK
 struct test_flash_attn_ext_back : public test_case {
     const int64_t hs; // head size of K and V
@@ -17629,6 +17682,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // lists that cover the whole cache, so that the mask has as many columns as K has rows
     for (int64_t hs : {128, 256}) {
         test_cases.emplace_back(new test_flash_attn_ext_kv_rows(hs, 2, 4, 1024, 1024, 256, 1));
+    }
+    for (int64_t hs : {128, 256}) {
+        for (float k_range : {1.0f, 100.0f, 2000.0f}) {
+            for (float v_range : {1.0f, 0.01f, 2000.0f}) {
+                test_cases.emplace_back(new test_flash_attn_ext_kv_range(hs, 2, 1024, 256, k_range, v_range));
+            }
+        }
     }
 
     // head sizes whose half4 count per head is not a multiple of 4, and a row list that is not padded

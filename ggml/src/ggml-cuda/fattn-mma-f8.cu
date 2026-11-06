@@ -24,6 +24,12 @@ static __device__ __forceinline__ uint32_t fattn_f8_pack4(const float a, const f
     return lo | (hi << 16);
 }
 
+// Scale that maps amax to 256: the top e4m3 binade [128, 256] then spans half of the range with a step of amax/16,
+// while mapping amax to 448 = 1.75*256 leaves [256, 448] with a step of amax/14.
+static __device__ __forceinline__ float fattn_f8_scale(const float amax) {
+    return amax > 0.0f ? amax*(1.0f/256.0f) : 1.0f;
+}
+
 static __device__ __forceinline__ void fattn_f8_mma(float * c, const uint32_t * a, const uint32_t b0, const uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
@@ -42,69 +48,129 @@ static __host__ __device__ __forceinline__ int fattn_f8_v_key(const int p) {
     return (p/16)*16 + ((p%4)/2)*8 + ((p%16)/4)*2 + p%2;
 }
 
-// K (F16) -> e4m3, contiguous [stream][head][key][D].
+// K (F16) -> e4m3, contiguous [stream][head][key][D], each row with its own scale: K = K8*K_scale[row].
+// The D/8 threads of a row are in the same warp.
+template <int D>
 static __global__ void fattn_f8_convert_k(
-        const char * __restrict__ K, uint8_t * __restrict__ K8, const int D, const int n_kv, const int n_kvh,
-        const int64_t nb11, const int64_t nb12, const int64_t nb13, const int64_t n_items) {
+        const char * __restrict__ K, uint8_t * __restrict__ K8, float * __restrict__ K_scale, const int n_kv,
+        const int n_kvh, const int64_t nb11, const int64_t nb12, const int64_t nb13, const int64_t n_items) {
 #ifdef FATTN_F8_AVAILABLE
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    if (i >= n_items) {
-        return;
-    }
     const int     d8   = i % (D/8);
     const int64_t row  = i / (D/8);
     const int     key  = row % n_kv;
     const int     hk   = (row / n_kv) % n_kvh;
     const int     s    = row / ((int64_t) n_kv*n_kvh);
 
-    const uint4 raw = *(const uint4 *) (K + s*nb13 + hk*nb12 + key*nb11 + d8*16);
-    const half2 * h2 = (const half2 *) &raw;
-    float2 f[4];
+    float2 f[4] = {};
+    if (i < n_items) {
+        const uint4 raw = *(const uint4 *) (K + s*nb13 + hk*nb12 + key*nb11 + d8*16);
+        const half2 * h2 = (const half2 *) &raw;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            f[j] = __half22float2(h2[j]);
+        }
+    }
+    float amax = 0.0f;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        f[j] = __half22float2(h2[j]);
+        amax = fmaxf(amax, fmaxf(fabsf(f[j].x), fabsf(f[j].y)));
     }
+    amax = warp_reduce_max<D/8>(amax);
+    if (i >= n_items) {
+        return;
+    }
+    const float ks  = fattn_f8_scale(amax);
+    const float iks = 1.0f/ks;
+
     uint2 out;
-    out.x = fattn_f8_pack4(f[0].x, f[0].y, f[1].x, f[1].y);
-    out.y = fattn_f8_pack4(f[2].x, f[2].y, f[3].x, f[3].y);
+    out.x = fattn_f8_pack4(f[0].x*iks, f[0].y*iks, f[1].x*iks, f[1].y*iks);
+    out.y = fattn_f8_pack4(f[2].x*iks, f[2].y*iks, f[3].x*iks, f[3].y*iks);
     *(uint2 *) (K8 + row*D + d8*8) = out;
+    if (d8 == 0) {
+        K_scale[row] = ks;
+    }
 #else
-    GGML_UNUSED_VARS(K, K8, D, n_kv, n_kvh, nb11, nb12, nb13, n_items);
+    GGML_UNUSED_VARS(K, K8, K_scale, n_kv, n_kvh, nb11, nb12, nb13, n_items);
     NO_DEVICE_CODE;
 #endif // FATTN_F8_AVAILABLE
 }
 
 // V (F16 or e4m3) -> e4m3, transposed [stream][head][D][key] with the key order of fattn_f8_v_key per 32 keys.
+// F16 V gets one scale per block of 32 keys: V = Vt*V_scale[block].
+static constexpr int FATTN_F8_V_THREADS = 256;
+
 template <int D>
+__launch_bounds__(FATTN_F8_V_THREADS)
 static __global__ void fattn_f8_transpose_v(
-        const char * __restrict__ V, uint8_t * __restrict__ Vt, const bool v_f8, const int n_kv, const int n_kvh,
-        const int64_t nb21, const int64_t nb22, const int64_t nb23) {
+        const char * __restrict__ V, uint8_t * __restrict__ Vt, float * __restrict__ V_scale, const bool v_f8,
+        const int n_kv, const int n_kvh, const int64_t nb21, const int64_t nb22, const int64_t nb23) {
 #ifdef FATTN_F8_AVAILABLE
+    constexpr int NI = 32*(D/8)/FATTN_F8_V_THREADS; // 16 byte items per thread
+    static_assert(NI*FATTN_F8_V_THREADS == 32*(D/8), "unsupported head size");
+
     __shared__ __align__(16) uint8_t tile[32][D + 16];
+    __shared__ float amax_warp[FATTN_F8_V_THREADS/WARP_SIZE];
 
     const int blk = blockIdx.x;
     const int hk  = blockIdx.y;
     const int s   = blockIdx.z;
     const char * Vh = V + s*nb23 + hk*nb22;
 
-    for (int i = threadIdx.x; i < 32*(D/8); i += blockDim.x) {
-        const int key = i / (D/8);
-        const int d8  = i % (D/8);
-        const char * src = Vh + (int64_t) (blk*32 + key)*nb21;
-        uint2 out;
-        if (v_f8) {
-            out = *(const uint2 *) (src + d8*8);
-        } else {
-            const uint4 raw = *(const uint4 *) (src + d8*16);
-            const half2 * h2 = (const half2 *) &raw;
+    if (v_f8) {
+#pragma unroll
+        for (int n = 0; n < NI; ++n) {
+            const int i   = n*FATTN_F8_V_THREADS + threadIdx.x;
+            const int key = i / (D/8);
+            const int d8  = i % (D/8);
+            *(uint2 *) &tile[key][d8*8] = *(const uint2 *) (Vh + (int64_t) (blk*32 + key)*nb21 + d8*8);
+        }
+    } else {
+        uint4 raw[NI];
+        float amax = 0.0f;
+#pragma unroll
+        for (int n = 0; n < NI; ++n) {
+            const int i   = n*FATTN_F8_V_THREADS + threadIdx.x;
+            const int key = i / (D/8);
+            const int d8  = i % (D/8);
+            raw[n] = *(const uint4 *) (Vh + (int64_t) (blk*32 + key)*nb21 + d8*16);
+            const half2 * h2 = (const half2 *) &raw[n];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 f = __half22float2(h2[j]);
+                amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
+            }
+        }
+        amax = warp_reduce_max(amax);
+        if (threadIdx.x % WARP_SIZE == 0) {
+            amax_warp[threadIdx.x / WARP_SIZE] = amax;
+        }
+        __syncthreads();
+        amax = 0.0f;
+#pragma unroll
+        for (int w = 0; w < FATTN_F8_V_THREADS/WARP_SIZE; ++w) {
+            amax = fmaxf(amax, amax_warp[w]);
+        }
+        const float vs  = fattn_f8_scale(amax);
+        const float ivs = 1.0f/vs;
+        if (threadIdx.x == 0) {
+            V_scale[((int64_t) s*n_kvh + hk)*(n_kv/32) + blk] = vs;
+        }
+#pragma unroll
+        for (int n = 0; n < NI; ++n) {
+            const int i   = n*FATTN_F8_V_THREADS + threadIdx.x;
+            const int key = i / (D/8);
+            const int d8  = i % (D/8);
+            const half2 * h2 = (const half2 *) &raw[n];
             const float2 f0 = __half22float2(h2[0]);
             const float2 f1 = __half22float2(h2[1]);
             const float2 f2 = __half22float2(h2[2]);
             const float2 f3 = __half22float2(h2[3]);
-            out.x = fattn_f8_pack4(f0.x, f0.y, f1.x, f1.y);
-            out.y = fattn_f8_pack4(f2.x, f2.y, f3.x, f3.y);
+            uint2 out;
+            out.x = fattn_f8_pack4(f0.x*ivs, f0.y*ivs, f1.x*ivs, f1.y*ivs);
+            out.y = fattn_f8_pack4(f2.x*ivs, f2.y*ivs, f3.x*ivs, f3.y*ivs);
+            *(uint2 *) &tile[key][d8*8] = out;
         }
-        *(uint2 *) &tile[key][d8*8] = out;
     }
     __syncthreads();
 
@@ -120,7 +186,7 @@ static __global__ void fattn_f8_transpose_v(
         *(uint32_t *) (dst + (int64_t) d*n_kv + p0) = v;
     }
 #else
-    GGML_UNUSED_VARS(V, Vt, v_f8, n_kv, n_kvh, nb21, nb22, nb23);
+    GGML_UNUSED_VARS(V, Vt, V_scale, v_f8, n_kv, n_kvh, nb21, nb22, nb23);
     NO_DEVICE_CODE;
 #endif // FATTN_F8_AVAILABLE
 }
@@ -151,15 +217,18 @@ static __global__ void fattn_f8_kv_max(
     }
 }
 
-template <int D>
+// k_scaled/v_scaled: F16 K/V converted with the scales of fattn_f8_convert_k/fattn_f8_transpose_v
+template <int D, bool k_scaled, bool v_scaled>
 __launch_bounds__(FATTN_F8_NW*WARP_SIZE, 1)
 static __global__ void flash_attn_ext_f8(
         const char * __restrict__ Q, const uint8_t * __restrict__ K, const uint8_t * __restrict__ Vt,
+        const float * __restrict__ K_scale, const float * __restrict__ V_scale,
         const half * __restrict__ mask, const int * __restrict__ KV_max, float * __restrict__ dst,
         const float scale_log2, const int n_q, const int n_head, const int gqa_ratio,
         const int64_t nb01, const int64_t nb02, const int64_t nb03,
         const int64_t sk1, const int64_t sk2, const int64_t sk3,
         const int64_t sv1, const int64_t sv2, const int64_t sv3,
+        const int64_t sks2, const int64_t sks3, const int64_t svs2, const int64_t svs3,
         const int ne31, const int64_t sm1, const int64_t sm3) {
 #ifdef FATTN_F8_AVAILABLE
     constexpr int NW = FATTN_F8_NW;
@@ -174,6 +243,7 @@ static __global__ void flash_attn_ext_f8(
     uint8_t * sV  = sK + 2*BK*D;                    // [2][D][BK], transposed V
     half    * sM  = (half *) (sV + 2*D*BK);         // [2][BQ][BK]
     float   * sQs = (float *) (sM + 2*BQ*BK);       // [BQ]
+    float   * sKs = sQs + BQ;                       // [2][BK], the K row scales
     uint8_t * sQ  = sK;                             // [BQ][D], only before the first K tile
 
     const int tid  = threadIdx.x;
@@ -189,8 +259,10 @@ static __global__ void flash_attn_ext_f8(
     const uint8_t * Kh = K + s*sk3 + (h/gqa_ratio)*sk2;
     const uint8_t * Vh = Vt + s*sv3 + (h/gqa_ratio)*sv2;
     const half    * Mh = mask + s*sm3;
+    const float   * Ksh = k_scaled ? K_scale + s*sks3 + (h/gqa_ratio)*sks2 : nullptr;
+    const float   * Vsh = v_scaled ? V_scale + s*svs3 + (h/gqa_ratio)*svs2 : nullptr;
 
-    // Q: one row per warp iteration, per-row scale amax/448.
+    // Q: one row per warp iteration, per-row scale (fattn_f8_scale).
     constexpr int QPL = D/WARP_SIZE; // values per lane
     for (int r = warp*16; r < warp*16 + 16; ++r) {
         const int q = q0 + r;
@@ -214,7 +286,7 @@ static __global__ void flash_attn_ext_f8(
             amax = fmaxf(amax, fabsf(x[j]));
         }
         amax = warp_reduce_max(amax);
-        const float qs  = amax > 0.0f ? amax/448.0f : 1.0f;
+        const float qs  = fattn_f8_scale(amax);
         const float iqs = 1.0f/qs;
 
         uint32_t packed[QPL/4];
@@ -273,6 +345,9 @@ static __global__ void flash_attn_ext_f8(
             const int q = min(q0 + r, ne31 - 1);
             cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(dM + r*BK + ((c ^ (r & 7))*8)), Mh + q*sm1 + kt + c*8);
         }
+        if (k_scaled && tid < BK/4) {
+            cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(sKs + buf*BK + tid*4), Ksh + kt + tid*4);
+        }
         cp_async_commit_group();
     };
 
@@ -288,12 +363,19 @@ static __global__ void flash_attn_ext_f8(
     float mB = -INFINITY;
     float lA = 0.0f;
     float lB = 0.0f;
+    float vref = v_scaled ? 0.0f : 1.0f; // oacc is in units of vref/FATTN_F8_P_SCALE, vref = the largest V block scale so far
 
     if (kv_end > 0) {
         load_tile(0, 0);
     }
     int buf = 0;
     for (int kt = 0; kt < kv_end; kt += BK, buf ^= 1) {
+        float vs[BK/32];
+#pragma unroll
+        for (int k2 = 0; k2 < BK/32; ++k2) {
+            vs[k2] = v_scaled ? Vsh[kt/32 + k2] : 1.0f;
+        }
+
         if (kt + BK < kv_end) {
             load_tile(kt + BK, buf ^ 1);
             cp_async_wait_group<1>();
@@ -327,13 +409,21 @@ static __global__ void flash_attn_ext_f8(
         }
 
         // online softmax, base 2
-        const half * cM = sM + buf*BQ*BK;
+        const half  * cM  = sM + buf*BQ*BK;
+        const float * cKs = sKs + buf*BK;
         float mxA = -INFINITY;
         float mxB = -INFINITY;
 #pragma unroll
         for (int j = 0; j < BK/8; ++j) {
             const float2 fA = __half22float2(*(const half2 *) (cM + rA*BK + ((j ^ (rA & 7))*8) + 2*tig));
             const float2 fB = __half22float2(*(const half2 *) (cM + rB*BK + ((j ^ (rB & 7))*8) + 2*tig));
+            if constexpr (k_scaled) {
+                const float2 kss = *(const float2 *) (cKs + j*8 + 2*tig);
+                sacc[j][0] *= kss.x;
+                sacc[j][1] *= kss.y;
+                sacc[j][2] *= kss.x;
+                sacc[j][3] *= kss.y;
+            }
             sacc[j][0] = sacc[j][0]*qsA + fA.x*FATTN_F8_LOG2E;
             sacc[j][1] = sacc[j][1]*qsA + fA.y*FATTN_F8_LOG2E;
             sacc[j][2] = sacc[j][2]*qsB + fB.x*FATTN_F8_LOG2E;
@@ -350,8 +440,8 @@ static __global__ void flash_attn_ext_f8(
         const float mnB  = fmaxf(mB, mxB);
         const float refA = mnA == -INFINITY ? 0.0f : mnA;
         const float refB = mnB == -INFINITY ? 0.0f : mnB;
-        const float cA   = exp2f(mA - refA);
-        const float cB   = exp2f(mB - refB);
+        float       cA   = exp2f(mA - refA);
+        float       cB   = exp2f(mB - refB);
         mA = mnA;
         mB = mnB;
         lA *= cA;
@@ -365,6 +455,19 @@ static __global__ void flash_attn_ext_f8(
             lA += sacc[j][0] + sacc[j][1];
             lB += sacc[j][2] + sacc[j][3];
         }
+
+        // V block scales: P is scaled by vs/vref so that P*vs stays in the e4m3 range of P
+        if constexpr (v_scaled) {
+            float vref_new = vref;
+#pragma unroll
+            for (int k2 = 0; k2 < BK/32; ++k2) {
+                vref_new = fmaxf(vref_new, vs[k2]);
+            }
+            const float cv = vref/vref_new;
+            vref = vref_new;
+            cA *= cv;
+            cB *= cv;
+        }
 #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
             oacc[nt][0] *= cA;
@@ -377,7 +480,7 @@ static __global__ void flash_attn_ext_f8(
         uint32_t pa[BK/32][4];
 #pragma unroll
         for (int k2 = 0; k2 < BK/32; ++k2) {
-            const float ps = FATTN_F8_P_SCALE;
+            const float ps = v_scaled ? FATTN_F8_P_SCALE*(vs[k2]/vref) : FATTN_F8_P_SCALE;
             pa[k2][0] = fattn_f8_pack4(sacc[4*k2 + 0][0]*ps, sacc[4*k2 + 0][1]*ps, sacc[4*k2 + 1][0]*ps, sacc[4*k2 + 1][1]*ps);
             pa[k2][1] = fattn_f8_pack4(sacc[4*k2 + 0][2]*ps, sacc[4*k2 + 0][3]*ps, sacc[4*k2 + 1][2]*ps, sacc[4*k2 + 1][3]*ps);
             pa[k2][2] = fattn_f8_pack4(sacc[4*k2 + 2][0]*ps, sacc[4*k2 + 2][1]*ps, sacc[4*k2 + 3][0]*ps, sacc[4*k2 + 3][1]*ps);
@@ -407,8 +510,8 @@ static __global__ void flash_attn_ext_f8(
         lA += __shfl_xor_sync(0xFFFFFFFF, lA, off);
         lB += __shfl_xor_sync(0xFFFFFFFF, lB, off);
     }
-    const float iA = lA > 0.0f ? 1.0f/(lA*FATTN_F8_P_SCALE) : 0.0f;
-    const float iB = lB > 0.0f ? 1.0f/(lB*FATTN_F8_P_SCALE) : 0.0f;
+    const float iA = lA > 0.0f ? vref/(lA*FATTN_F8_P_SCALE) : 0.0f;
+    const float iB = lB > 0.0f ? vref/(lB*FATTN_F8_P_SCALE) : 0.0f;
     const int qA = q0 + rA;
     const int qB = q0 + rB;
     if (qA < n_q) {
@@ -426,8 +529,8 @@ static __global__ void flash_attn_ext_f8(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K, Vt, mask, KV_max, dst, scale_log2, n_q, n_head, gqa_ratio, nb01, nb02, nb03,
-        sk1, sk2, sk3, sv1, sv2, sv3, ne31, sm1, sm3);
+    GGML_UNUSED_VARS(Q, K, Vt, K_scale, V_scale, mask, KV_max, dst, scale_log2, n_q, n_head, gqa_ratio, nb01, nb02, nb03,
+        sk1, sk2, sk3, sv1, sv2, sv3, sks2, sks3, svs2, svs3, ne31, sm1, sm3);
     NO_DEVICE_CODE;
 #endif // FATTN_F8_AVAILABLE
 }
@@ -493,7 +596,9 @@ static void ggml_cuda_flash_attn_ext_f8_case(ggml_backend_cuda_context & ctx, gg
     const int n_q   = Q->ne[1];
     const int n_s   = Q->ne[3];
 
+    // F16 K and V get their own scales (see fattn_f8_convert_k and fattn_f8_transpose_v), e4m3 K and V have none
     ggml_cuda_pool_alloc<uint8_t> K8_alloc(ctx.pool());
+    ggml_cuda_pool_alloc<float>   K_scale(ctx.pool());
     const uint8_t * K8 = (const uint8_t *) K->data;
     int64_t sk1 = K->nb[1];
     int64_t sk2 = K->nb[2];
@@ -501,8 +606,9 @@ static void ggml_cuda_flash_attn_ext_f8_case(ggml_backend_cuda_context & ctx, gg
     if (K->type != GGML_TYPE_F8_E4M3) {
         const int64_t n_items = (int64_t) n_kv*n_kvh*n_skv*(D/8);
         K8_alloc.alloc((size_t) n_kv*n_kvh*n_skv*D);
-        fattn_f8_convert_k<<<(n_items + 255)/256, 256, 0, stream>>>(
-            (const char *) K->data, K8_alloc.ptr, D, n_kv, n_kvh, K->nb[1], K->nb[2], K->nb[3], n_items);
+        K_scale.alloc((size_t) n_kv*n_kvh*n_skv);
+        fattn_f8_convert_k<D><<<(n_items + 255)/256, 256, 0, stream>>>(
+            (const char *) K->data, K8_alloc.ptr, K_scale.ptr, n_kv, n_kvh, K->nb[1], K->nb[2], K->nb[3], n_items);
         K8  = K8_alloc.ptr;
         sk1 = D;
         sk2 = (int64_t) n_kv*D;
@@ -511,13 +617,22 @@ static void ggml_cuda_flash_attn_ext_f8_case(ggml_backend_cuda_context & ctx, gg
     if (n_skv == 1) {
         sk3 = 0;
     }
+    const int64_t sks2 = n_kv;
+    const int64_t sks3 = n_skv == 1 ? 0 : sks2*n_kvh;
 
+    const bool v_f8 = V->type == GGML_TYPE_F8_E4M3;
     ggml_cuda_pool_alloc<uint8_t> Vt(ctx.pool(), (size_t) n_kv*n_kvh*n_skv*D);
-    fattn_f8_transpose_v<D><<<dim3(n_kv/32, n_kvh, n_skv), 256, 0, stream>>>(
-        (const char *) V->data, Vt.ptr, V->type == GGML_TYPE_F8_E4M3, n_kv, n_kvh, V->nb[1], V->nb[2], V->nb[3]);
+    ggml_cuda_pool_alloc<float>   V_scale(ctx.pool());
+    if (!v_f8) {
+        V_scale.alloc((size_t) (n_kv/32)*n_kvh*n_skv);
+    }
+    fattn_f8_transpose_v<D><<<dim3(n_kv/32, n_kvh, n_skv), FATTN_F8_V_THREADS, 0, stream>>>(
+        (const char *) V->data, Vt.ptr, V_scale.ptr, v_f8, n_kv, n_kvh, V->nb[1], V->nb[2], V->nb[3]);
     const int64_t sv1 = n_kv;
     const int64_t sv2 = (int64_t) D*n_kv;
     const int64_t sv3 = n_skv == 1 ? 0 : sv2*n_kvh;
+    const int64_t svs2 = n_kv/32;
+    const int64_t svs3 = n_skv == 1 ? 0 : svs2*n_kvh;
 
     const int ntiles = (n_q + FATTN_F8_BQ - 1)/FATTN_F8_BQ;
     const int64_t sm1 = mask->nb[1]/sizeof(half);
@@ -528,14 +643,31 @@ static void ggml_cuda_flash_attn_ext_f8_case(ggml_backend_cuda_context & ctx, gg
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
-    const size_t nbytes_shared = 2*FATTN_F8_BK*D + 2*D*FATTN_F8_BK + 2*FATTN_F8_BQ*FATTN_F8_BK*sizeof(half) + FATTN_F8_BQ*sizeof(float);
-    CUDA_SET_SHARED_MEMORY_LIMIT((flash_attn_ext_f8<D>), nbytes_shared);
+    const size_t nbytes_shared = 2*FATTN_F8_BK*D + 2*D*FATTN_F8_BK + 2*FATTN_F8_BQ*FATTN_F8_BK*sizeof(half) +
+        FATTN_F8_BQ*sizeof(float) + 2*FATTN_F8_BK*sizeof(float);
 
-    flash_attn_ext_f8<D><<<dim3(ntiles, Q->ne[2], n_s), FATTN_F8_NW*WARP_SIZE, nbytes_shared, stream>>>(
-        (const char *) Q->data, K8, Vt.ptr, (const half *) mask->data, KV_max.ptr, (float *) dst->data,
-        scale*FATTN_F8_LOG2E, n_q, Q->ne[2], Q->ne[2]/n_kvh,
-        Q->nb[1], Q->nb[2], Q->nb[3], sk1, sk2, sk3, sv1, sv2, sv3,
-        mask->ne[1], sm1, sm3);
+    // the shared memory limit is raised once per kernel, i.e. per CUDA_SET_SHARED_MEMORY_LIMIT site
+    auto launch = [&](auto kernel) {
+        kernel<<<dim3(ntiles, Q->ne[2], n_s), FATTN_F8_NW*WARP_SIZE, nbytes_shared, stream>>>(
+            (const char *) Q->data, K8, Vt.ptr, K_scale.ptr, V_scale.ptr, (const half *) mask->data, KV_max.ptr,
+            (float *) dst->data, scale*FATTN_F8_LOG2E, n_q, Q->ne[2], Q->ne[2]/n_kvh,
+            Q->nb[1], Q->nb[2], Q->nb[3], sk1, sk2, sk3, sv1, sv2, sv3, sks2, sks3, svs2, svs3,
+            mask->ne[1], sm1, sm3);
+    };
+    const bool k_scaled = K_scale.ptr != nullptr;
+    if (k_scaled && !v_f8) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((flash_attn_ext_f8<D, true, true>), nbytes_shared);
+        launch(flash_attn_ext_f8<D, true, true>);
+    } else if (k_scaled) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((flash_attn_ext_f8<D, true, false>), nbytes_shared);
+        launch(flash_attn_ext_f8<D, true, false>);
+    } else if (!v_f8) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((flash_attn_ext_f8<D, false, true>), nbytes_shared);
+        launch(flash_attn_ext_f8<D, false, true>);
+    } else {
+        CUDA_SET_SHARED_MEMORY_LIMIT((flash_attn_ext_f8<D, false, false>), nbytes_shared);
+        launch(flash_attn_ext_f8<D, false, false>);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
