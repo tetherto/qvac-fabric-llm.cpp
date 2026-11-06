@@ -188,3 +188,17 @@ static inline void xdna_layer_census_add(xdna_layer_census &         c,
         xdna_layer_census_node(c, nodes[i], s);
     }
 }
+
+// A model's decode route (xdna_wants_host_decode): what its decode chunks showed of its layers, and, once a chunk
+// with a layer norm could tell, whether the fused designs leave its decode to the host.
+struct xdna_model_route {
+    xdna_layer_census layers;
+    bool              known  = false;
+    bool              misfit = false;
+};
+
+// Whether the fused layers may run a chunk whose own width and weights they take: not once its model's layers told
+// that the designs do not run them.
+static inline bool xdna_route_fused(const xdna_model_route & r, bool chunk_fits) {
+    return chunk_fits && !(r.known && r.misfit);
+}
