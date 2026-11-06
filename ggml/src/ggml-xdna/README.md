@@ -678,3 +678,9 @@ Diagnostics - nothing is measured unless they are set:
   its full-attention layers (heads of 512, one KV head) at any length: the
   prefill attention kernel takes heads of 256 over 2 KV heads, and each call
   pays two hardware-context switches.
+- A prefill attention call on the array packs and flushes every key the cache
+  holds, not only its ubatch's: a copy kept from an earlier ubatch can hold a
+  cell the cache has freed and refilled since. On Qwen3.5-0.8B, a pp8192 in
+  2048-token ubatches makes 12 such calls, and their packing takes 14 ms of the
+  3.3 s prefill (~1.2 ms a call). In 512-token ubatches its attention stays on
+  the host.
