@@ -4653,8 +4653,9 @@ static void ggml_backend_xdna_device_get_memory(ggml_backend_dev_t dev, size_t *
     long pages     = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGE_SIZE);
     *total         = (size_t) pages * page_size;
-    // "free" system memory is ill-defined, for practical purposes assume all of it is free:
-    *free          = *total;
+    // MemAvailable; all of it when /proc/meminfo cannot be read
+    const long avail = xdna_mem_available_mib();
+    *free            = avail > 0 ? std::min(*total, (size_t) avail << 20) : *total;
 #endif  // _WIN32
 }
 

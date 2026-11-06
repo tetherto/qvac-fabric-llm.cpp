@@ -451,5 +451,6 @@ Diagnostics - nothing is measured unless they are set:
   computes take turns on it (the array runs one command stream at a time
   anyway).
 - The device reports itself to the scheduler as an integrated GPU: its buffers
-  are host memory, and the free memory it reports is all of system memory, so
-  any `--fit` accounting is nominal.
+  are host memory, and the free memory it reports is the system's
+  `MemAvailable`, which the CPU and any other device on host memory draw from
+  too.
