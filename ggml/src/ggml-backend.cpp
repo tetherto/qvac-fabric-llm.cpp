@@ -955,11 +955,13 @@ void ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml
 }
 
 // creates a copy of the tensor with the same memory layout
+// the op_params go along: a weight can carry backend data there (the static input scale of an FP8 weight)
 static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, const struct ggml_tensor * tensor) {
     struct ggml_tensor * dup = ggml_dup_tensor(ctx, tensor);
     for (int i = 0; i < GGML_MAX_DIMS; i++) {
         dup->nb[i] = tensor->nb[i];
     }
+    memcpy(dup->op_params, tensor->op_params, sizeof(dup->op_params));
     return dup;
 }
 
