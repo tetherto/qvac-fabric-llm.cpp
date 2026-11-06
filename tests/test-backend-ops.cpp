@@ -7982,6 +7982,192 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
+static float convrot_h256_coefficient(int row, int col) {
+    static const int signs[4][4] = {
+        { 1,  1,  1, -1},
+        { 1,  1, -1,  1},
+        { 1, -1,  1,  1},
+        {-1,  1,  1,  1},
+    };
+    int sign = 1;
+    for (int digit = 0; digit < 4; ++digit) {
+        sign *= signs[row % 4][col % 4];
+        row /= 4;
+        col /= 4;
+    }
+    return sign / 16.0f;
+}
+
+static void init_tensor_i8_uniform(ggml_tensor * tensor) {
+    std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<int> dis(-127, 127);
+    std::vector<int8_t> data(ggml_nelements(tensor));
+    for (int8_t & value : data) {
+        value = (int8_t) dis(gen);
+    }
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size());
+}
+
+static void init_tensor_convrot_h256(ggml_tensor * tensor) {
+    std::vector<float> data(256 * 256);
+    for (int row = 0; row < 256; ++row) {
+        for (int col = 0; col < 256; ++col) {
+            data[row * 256 + col] = convrot_h256_coefficient(row, col);
+        }
+    }
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size() * sizeof(float));
+}
+
+// GGML_OP_MUL_MAT_CONVROT
+struct test_mul_mat_convrot : public test_case {
+    const ggml_type type_a;
+    const int64_t k;
+    const int64_t n;
+    const std::array<int64_t, 3> nb;
+    const bool v;
+    const bool f16_compat;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, k, n, nb, v, f16_compat);
+    }
+
+    double max_nmse_err() override {
+        return f16_compat ? 5e-4 : 1e-7;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * k * n * nb[0] * nb[1] * nb[2];
+    }
+
+    test_mul_mat_convrot(ggml_type type_a = GGML_TYPE_F32, int64_t k = 512, int64_t n = 37,
+            std::array<int64_t, 3> nb = {7, 1, 1}, bool v = false, bool f16_compat = false)
+        : type_a(type_a), k(k), n(n), nb(nb), v(v), f16_compat(f16_compat) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        if (v) {
+            ggml_tensor * storage = ggml_new_tensor_4d(ctx, type_a, k, 2 * nb[0], nb[1], nb[2]);
+            ggml_set_name(storage, "a_storage");
+            a = ggml_view_4d(ctx, storage, k, nb[0], nb[1], nb[2], 2 * storage->nb[1], storage->nb[2], storage->nb[3], 0);
+        } else {
+            a = ggml_new_tensor_4d(ctx, type_a, k, nb[0], nb[1], nb[2]);
+        }
+        ggml_set_name(a, "a");
+
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, k, n);
+        ggml_set_name(w, "w");
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 1);
+        ggml_set_name(s, "s");
+
+        ggml_tensor * out = ggml_mul_mat_convrot(ctx, a, w, s, 256);
+        ggml_mul_mat_convrot_set_f16_compat(out, f16_compat);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I8) {
+                init_tensor_i8_uniform(t);
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, 0.001f, 0.01f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_CONVROT
+struct test_convrot : public test_case {
+    const int32_t group_size;
+    const std::array<int64_t, 4> ne;
+    const bool inplace;
+    const bool v;
+
+    std::string vars() override {
+        return VARS_TO_STR4(group_size, ne, inplace, v);
+    }
+
+    test_convrot(int32_t group_size = 256, std::array<int64_t, 4> ne = {512, 3, 2, 1}, bool inplace = false, bool v = false)
+        : group_size(group_size), ne(ne), inplace(inplace), v(v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        if (v) {
+            ggml_tensor * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], 2 * ne[1], ne[2], ne[3]);
+            ggml_set_name(storage, "a_storage");
+            a = ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3], 2 * storage->nb[1], storage->nb[2], storage->nb[3], 0);
+        } else {
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        }
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = inplace ? ggml_convrot_inplace(ctx, a, group_size) : ggml_convrot(ctx, a, group_size);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->view_src) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_HINT_SRC0_IS_CONVROT_H256; the scale in front gives the hinted matmul a GPU producer
+struct test_mul_mat_convrot_h256 : public test_case {
+    const int64_t n;
+    const int64_t nb2;
+    const bool producer;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, nb2, producer);
+    }
+
+    test_mul_mat_convrot_h256(int64_t n = 257, int64_t nb2 = 3, bool producer = true)
+        : n(n), nb2(nb2), producer(producer) {}
+
+    // backends without the native transform run the plain matmul, held to test_mul_mat's bar
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 256);
+        ggml_set_name(h, "h");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, n, nb2);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * src = producer ? ggml_scale(ctx, x, 1.25f) : x;
+        ggml_tensor * out = ggml_mul_mat(ctx, h, src);
+        ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_CONVROT_H256);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "h") == 0) {
+                init_tensor_convrot_h256(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_CONVROT_H256";
+    }
+};
+
 // FP4 W4A8 path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_w4a8 : public test_mul_mat {
     test_mul_mat_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -15495,6 +15681,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 1));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
+
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (bool f16_compat : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_convrot(type_a, 256,  1,  {1, 1, 1},  false, f16_compat));
+            test_cases.emplace_back(new test_mul_mat_convrot(type_a, 512,  37, {1, 1, 1},  false, f16_compat));
+            test_cases.emplace_back(new test_mul_mat_convrot(type_a, 512,  37, {7, 1, 1},  false, f16_compat));
+            test_cases.emplace_back(new test_mul_mat_convrot(type_a, 1280, 64, {48, 1, 1}, false, f16_compat));
+            test_cases.emplace_back(new test_mul_mat_convrot(type_a, 512,  33, {2, 3, 2},  false, f16_compat));
+            test_cases.emplace_back(new test_mul_mat_convrot(type_a, 512,  37, {2, 2, 1},  true,  f16_compat));
+        }
+    }
+
+    for (int32_t group_size : {4, 16, 64, 256, 1024}) {
+        for (bool inplace : {false, true}) {
+            test_cases.emplace_back(new test_convrot(group_size, {2 * group_size, 3, 2, 1}, inplace, false));
+            test_cases.emplace_back(new test_convrot(group_size, {2 * group_size, 3, 2, 1}, inplace, true));
+        }
+    }
+    test_cases.emplace_back(new test_convrot(4,   {1024, 1, 1, 1}, false, false));
+    test_cases.emplace_back(new test_convrot(256, {256,  5, 3, 2}, false, false));
+
+    test_cases.emplace_back(new test_mul_mat_convrot_h256(1,   1, false));
+    test_cases.emplace_back(new test_mul_mat_convrot_h256(257, 3, false));
+    test_cases.emplace_back(new test_mul_mat_convrot_h256(257, 3, true));
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

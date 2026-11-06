@@ -464,8 +464,11 @@ extern "C" {
 
     // op hint
     enum ggml_op_hint {
-        GGML_HINT_NONE             = 0,
-        GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_NONE                 = 0,
+        GGML_HINT_SRC0_IS_HADAMARD     = 1,
+        // src0 is the dense normalized ConvRot H256 matrix (ggml_convrot with
+        // group_size 256); backends without a native transform run the plain matmul
+        GGML_HINT_SRC0_IS_CONVROT_H256 = 2,
     };
 
     // model file types
@@ -669,6 +672,12 @@ extern "C" {
         // snapshot per draft token. See ggml_gated_delta_net_deferred.
         GGML_OP_GATED_DELTA_NET_DEFERRED,
         GGML_OP_GDN_CONV_DEFERRED,
+
+        // ConvRot (ComfyUI TensorWise I8 diffusion weights): the I8 linear layer
+        // that rotates each 256-wide scaled weight block, and the activation-side
+        // rotation that lets the same layer run on the standard matmul kernels.
+        GGML_OP_MUL_MAT_CONVROT,
+        GGML_OP_CONVROT,
 
         GGML_OP_COUNT,
     };
@@ -1642,6 +1651,72 @@ extern "C" {
     GGML_API void ggml_mul_mat_set_hint(
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
+
+    // ConvRot linear layer on ComfyUI TensorWise I8 weights.
+    //
+    // Each group_size-wide block of a scaled weight row is rotated by the
+    // normalized regular radix-4 Hadamard before the dot product. Only
+    // group_size 256 is accepted.
+    //
+    // activations : F32 or F16 [in_features, batch, ...]
+    // weights     : I8  [in_features, out_features]
+    // scales      : F32 [out_features, 1], one scale per weight row
+    // result      : F32 [out_features, batch, ...]
+    GGML_API struct ggml_tensor * ggml_mul_mat_convrot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * activations,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * scales,
+            int32_t               group_size);
+
+    // ask the backend for its F16 compatibility arithmetic (F16 operands and
+    // output, as the F16 loaders produce); the weights stay I8 at rest
+    GGML_API void ggml_mul_mat_convrot_set_f16_compat(
+            struct ggml_tensor * a,
+            bool                 enabled);
+
+    // ConvRot rotation of every group_size-wide block along dimension 0.
+    //
+    // a is F32 and a->ne[0] a multiple of group_size. The rotation is
+    // symmetric and orthogonal, so (H*w) . x == w . (H*x): rotating the
+    // activations lets a ConvRot layer run on ggml_mul_mat with weights
+    // repacked by ggml_convrot_repack_q8_0().
+    GGML_API struct ggml_tensor * ggml_convrot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int32_t               group_size);
+
+    GGML_API struct ggml_tensor * ggml_convrot_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int32_t               group_size);
+
+    // true for a power of four in [4, 1024]
+    GGML_API bool ggml_convrot_group_size_is_valid(int32_t group_size);
+
+    // ggml_mul_mat(weights, ggml_convrot(activations, group_size))
+    //
+    // weights     : [in_features, out_features], any ggml_mul_mat type,
+    //               typically Q8_0 from ggml_convrot_repack_q8_0()
+    // activations : F32 [in_features, batch, ...]
+    GGML_API struct ggml_tensor * ggml_convrot_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * activations,
+            int32_t               group_size);
+
+    // Repack I8 ConvRot weights [in_features, out_features] with one F32 scale
+    // per row into Q8_0 rows. The int8 values are copied verbatim; the only
+    // rounding is the row scale becoming the F16 scale of each block, which
+    // loses relative precision below 2^-14 and cannot represent scales above
+    // the F16 range. in_features must be a multiple of 32. Returns the packed
+    // size in bytes; pass dst == NULL to query it.
+    GGML_API size_t ggml_convrot_repack_q8_0(
+            const int8_t * weights,
+            const float  * scales,
+            int64_t        in_features,
+            int64_t        out_features,
+            void         * dst);
 
     // indirect matrix multiplication
     //

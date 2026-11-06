@@ -15009,3 +15009,167 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_convrot
+
+static void ggml_convrot_hadamard_4(float * p, int stride) {
+    const float a = p[0*stride];
+    const float b = p[1*stride];
+    const float c = p[2*stride];
+    const float d = p[3*stride];
+    p[0*stride] = ( a + b + c - d)*0.5f;
+    p[1*stride] = ( a + b - c + d)*0.5f;
+    p[2*stride] = ( a - b + c + d)*0.5f;
+    p[3*stride] = (-a + b + c + d)*0.5f;
+}
+
+static void ggml_convrot_stage_f32(float * v, int n, int stride) {
+    for (int base = 0; base < n; base += 4*stride) {
+        for (int i = 0; i < stride; ++i) {
+            ggml_convrot_hadamard_4(v + base + i, stride);
+        }
+    }
+}
+
+static void ggml_convrot_block_f32(float * v, int n) {
+    for (int stride = 1; stride < n; stride *= 4) {
+        ggml_convrot_stage_f32(v, n, stride);
+    }
+}
+
+static void ggml_convrot_rotate_row_f32(float * row, int64_t n, int group_size) {
+    for (int64_t k0 = 0; k0 < n; k0 += group_size) {
+        ggml_convrot_block_f32(row + k0, group_size);
+    }
+}
+
+static void ggml_convrot_gather_f32(const char * src, size_t nb, int n, float * dst) {
+    for (int i = 0; i < n; ++i) {
+        dst[i] = *(const float *) (src + i*nb);
+    }
+}
+
+static void ggml_convrot_scatter_f32(const float * src, int n, char * dst, size_t nb) {
+    for (int i = 0; i < n; ++i) {
+        *(float *) (dst + i*nb) = src[i];
+    }
+}
+
+void ggml_compute_forward_convrot(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    const int32_t group_size = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(ggml_convrot_group_size_is_valid(group_size));
+    GGML_ASSERT(src0->ne[0] % group_size == 0);
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t groups_per_row = ne00/group_size;
+    const int64_t n_groups = ggml_nelements(src0)/group_size;
+    const int64_t per_thread = (n_groups + nth - 1)/nth;
+    const int64_t g0 = per_thread*ith;
+    const int64_t g1 = MIN(g0 + per_thread, n_groups);
+
+    float block[1024];
+
+    for (int64_t g = g0; g < g1; ++g) {
+        const int64_t ir = g/groups_per_row;
+        const int64_t k0 = (g % groups_per_row)*group_size;
+        const int64_t i3 = ir/(ne02*ne01);
+        const int64_t i2 = (ir - i3*ne02*ne01)/ne01;
+        const int64_t i1 = ir - i3*ne02*ne01 - i2*ne01;
+
+        const char * src_block = (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03 + k0*nb00;
+              char * dst_block = (      char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3  + k0*nb0;
+
+        ggml_convrot_gather_f32(src_block, nb00, group_size, block);
+        ggml_convrot_block_f32(block, group_size);
+        ggml_convrot_scatter_f32(block, group_size, dst_block, nb0);
+    }
+}
+
+// ggml_compute_forward_mul_mat_convrot
+
+static void ggml_convrot_load_weight_row(const ggml_tensor * weights, int64_t row, float scale, float * out) {
+    const char * weight_row = (const char *) weights->data + row*weights->nb[1];
+    for (int64_t i = 0; i < weights->ne[0]; ++i) {
+        out[i] = (float) *(const int8_t *) (weight_row + i*weights->nb[0]) * scale;
+    }
+}
+
+static float ggml_convrot_dot_f32(const float * w, const char * x, size_t nb, int64_t n) {
+    float sum = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+        sum += w[i] * *(const float *) (x + i*nb);
+    }
+    return sum;
+}
+
+static float ggml_convrot_dot_f16(const float * w, const char * x, size_t nb, int64_t n) {
+    float sum = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+        sum += w[i] * GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) (x + i*nb));
+    }
+    return sum;
+}
+
+static void ggml_convrot_row_outputs(const float * w, int64_t row, const ggml_tensor * activations, ggml_tensor * dst) {
+    const int64_t ne1 = activations->ne[1];
+    const int64_t ne2 = activations->ne[2];
+    const int64_t n_columns = ne1*ne2*activations->ne[3];
+    const bool is_f16 = activations->type == GGML_TYPE_F16;
+
+    for (int64_t column = 0; column < n_columns; ++column) {
+        const int64_t i1 = column % ne1;
+        const int64_t i2 = (column/ne1) % ne2;
+        const int64_t i3 = column/(ne1*ne2);
+
+        const char * x = (const char *) activations->data + i1*activations->nb[1] + i2*activations->nb[2] + i3*activations->nb[3];
+        float * out = (float *) ((char *) dst->data + row*dst->nb[0] + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        *out = is_f16 ? ggml_convrot_dot_f16(w, x, activations->nb[0], activations->ne[0])
+                      : ggml_convrot_dot_f32(w, x, activations->nb[0], activations->ne[0]);
+    }
+}
+
+void ggml_compute_forward_mul_mat_convrot(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * activations = dst->src[0];
+    const ggml_tensor * weights     = dst->src[1];
+    const ggml_tensor * scales      = dst->src[2];
+    const int32_t group_size = ggml_get_op_params_i32(dst, 0);
+
+    GGML_ASSERT(activations->type == GGML_TYPE_F32 || activations->type == GGML_TYPE_F16);
+    GGML_ASSERT(weights->type == GGML_TYPE_I8);
+    GGML_ASSERT(scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(group_size == 256);
+    GGML_ASSERT(weights->ne[0] == activations->ne[0]);
+    GGML_ASSERT(weights->ne[0] % group_size == 0);
+    GGML_ASSERT(scales->ne[0] == weights->ne[1]);
+    GGML_ASSERT(dst->ne[0] == weights->ne[1]);
+    GGML_ASSERT(dst->ne[1] == activations->ne[1]);
+    GGML_ASSERT(dst->ne[2] == activations->ne[2]);
+    GGML_ASSERT(dst->ne[3] == activations->ne[3]);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t k = weights->ne[0];
+    float * w = (float *) params->wdata + (k + CACHE_LINE_SIZE_F32)*ith;
+
+    for (int64_t row = ith; row < weights->ne[1]; row += nth) {
+        const float scale = *(const float *) ((const char *) scales->data + row*scales->nb[0]);
+        ggml_convrot_load_weight_row(weights, row, scale, w);
+        ggml_convrot_rotate_row_f32(w, k, group_size);
+        ggml_convrot_row_outputs(w, row, activations, dst);
+    }
+}
