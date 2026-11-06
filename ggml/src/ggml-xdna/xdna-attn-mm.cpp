@@ -112,7 +112,7 @@ struct kv_cache {
 struct runner {
     std::mutex                       mtx;
     xdna_kernel *                    kern = nullptr;
-    kv_cache                         kv;  // one for every layer: the array runs one call at a time
+    kv_cache                         kv;  // the one K/V copy, shared by every layer: the array runs one call at a time
     // the nodes whose output stays in their output buffer (xdna_attn_mm_keep),
     // and the last such run's
     std::vector<const ggml_tensor *> keep;
@@ -249,7 +249,7 @@ std::vector<pass_tiles> tiles_of_passes(const mask_rows & mr, const geometry & g
     return passes;
 }
 
-// One past the last tile any pass streams: what a layer's K/V copy must hold.
+// One past the last tile any pass streams: what the shared K/V copy must hold.
 int64_t tiles_reached(const std::vector<pass_tiles> & passes) {
     int64_t reached = 0;
     for (const pass_tiles & pt : passes) {
