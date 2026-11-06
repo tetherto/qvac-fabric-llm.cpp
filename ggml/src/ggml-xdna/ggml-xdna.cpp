@@ -5048,9 +5048,18 @@ static ggml_backend_dev_t ggml_backend_xdna_reg_get_device(ggml_backend_reg_t re
     return &ggml_backend_xdna_device;
 }
 
+// Whether the NPU opened and its kernels loaded, opening it on the first call.
+// A listed device can still fail to open, and then claims no ops.
+static bool ggml_backend_xdna_device_ready(void) {
+    const ggml_backend_xdna_context * ctx = ggml_xdna_device_context();
+    return ctx->device != nullptr && ctx->pool != nullptr;
+}
+
 static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
+    if (std::strcmp(name, "ggml_backend_xdna_device_ready") == 0) {
+        return (void *) ggml_backend_xdna_device_ready;
+    }
     return NULL;
 }
 

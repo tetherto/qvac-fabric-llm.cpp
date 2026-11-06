@@ -660,7 +660,7 @@ llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-laya.cpp)
 
-# XDNA NPU. Self-skipping when no XDNA device is registered.
+# XDNA NPU. Self-skipping when no XDNA device is registered or it fails to open.
 if (GGML_XDNA)
     # Load, run and free a model several times in one process (#293).
     llama_build_and_test(test-xdna-reload.cpp       LABEL "model")

@@ -29,7 +29,10 @@ static ggml_backend_dev_t xdna_device(void) {
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "XDNA") == 0) {
-            return dev;
+            // listed is not opened: skip an NPU whose open failed
+            auto ready = (bool (*)(void)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+                                                                            "ggml_backend_xdna_device_ready");
+            return ready && ready() ? dev : nullptr;
         }
     }
     return nullptr;
