@@ -41,6 +41,14 @@ static ggml_backend_dev_t xdna_device(void) {
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "XDNA") == 0) {
+            // a listed NPU that does not open fails rather than skips, so a
+            // broken NPU runner cannot pass
+            auto ready = (bool (*)(void)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+                                                                            "ggml_backend_xdna_device_ready");
+            if (!ready || !ready()) {
+                std::fprintf(stderr, "XDNA device is listed but did not open\n");
+                std::exit(1);
+            }
             return dev;
         }
     }
