@@ -472,6 +472,11 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 static void llm_graph_set_input_rs(llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_n_rs();
 
+    if (inp->seq_off) {
+        GGML_ASSERT(ubatch->is_ragged() && ggml_nelements(inp->seq_off) == ubatch->n_seqs + 1);
+        ggml_backend_tensor_set(inp->seq_off, ubatch->seq_off, 0, ggml_nbytes(inp->seq_off));
+    }
+
     // the deferred gdn inputs read the pending rollback, which s_copy() below consumes
     if (inp->rec_idx) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_copy_base->buffer));
@@ -498,6 +503,13 @@ static void llm_graph_set_input_rs(llm_graph_input_rs * inp, const llama_memory_
     }
 }
 
+static bool llm_graph_rs_moved_match(const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx, uint32_t n_seqs) {
+    uint32_t i0;
+    uint32_t i1;
+    mctx->get_moved_range(n_seqs, i0, i1);
+    return inp->mv0 == i0 && inp->mv1 == i1;
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     llm_graph_set_input_rs(this, mctx, ubatch);
 }
@@ -515,7 +527,9 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= llm_graph_rs_moved_match(this, mctx, params.ubatch.n_seqs);
     res &= s_base_inplace == mctx->get_s_base_inplace(params.ubatch.n_seqs);
+    res &= (seq_off != nullptr) == params.ubatch.is_ragged();
 
     return res;
 }
@@ -1283,7 +1297,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= llm_graph_rs_moved_match(inp_rs.get(), mctx->get_recr(), params.ubatch.n_seqs);
     res &= inp_rs->s_base_inplace == mctx->get_recr()->get_s_base_inplace(params.ubatch.n_seqs);
+    res &= (inp_rs->seq_off != nullptr) == params.ubatch.is_ragged();
 
     return res;
 }
@@ -1316,7 +1332,9 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= llm_graph_rs_moved_match(inp_rs.get(), mctx->get_recr(), params.ubatch.n_seqs);
     res &= inp_rs->s_base_inplace == mctx->get_recr()->get_s_base_inplace(params.ubatch.n_seqs);
+    res &= (inp_rs->seq_off != nullptr) == params.ubatch.is_ragged();
 
     return res;
 }
@@ -1394,7 +1412,9 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= llm_graph_rs_moved_match(inp_rs.get(), mctx->get_recr(), params.ubatch.n_seqs);
     res &= inp_rs->s_base_inplace == mctx->get_recr()->get_s_base_inplace(params.ubatch.n_seqs);
+    res &= (inp_rs->seq_off != nullptr) == params.ubatch.is_ragged();
 
     return res;
 }
@@ -3981,7 +4001,8 @@ ggml_tensor * llm_graph_context::build_rs(
            uint32_t   rs_head,
            uint32_t   rs_size,
             int32_t   rs_zero,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+               bool   in_place) const {
 
     GGML_UNUSED(rs_size);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
@@ -3998,6 +4019,17 @@ ggml_tensor * llm_graph_context::build_rs(
     const int64_t i0 = n_rs - state_copy->ne[0];
 
     ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
+
+    if (in_place) {
+        // the gather starts at the first state of the ubatch that is not in its own cell yet (at the extra states when
+        // every state is in place): copy them all to their cells, then the ubatch reads its states from the cache
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0,
+                states_all,
+                ggml_view_2d(ctx0, s, state_size, n_rs - i0, s->nb[1], (rs_head + i0)*s->nb[1])));
+
+        return ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1]);
+    }
 
     ggml_tensor * output_states = get_state_rows ?
         get_state_rows(ctx0, states, state_copy_main) :
@@ -4031,9 +4063,16 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
 
+    mctx_cur->get_moved_range(n_seqs, inp->mv0, inp->mv1);
+
+    const int64_t i0 = inp->mv1 > inp->mv0 ? inp->mv0 : n_seqs;
+    inp->s_copy_moved = ggml_view_1d(ctx0, inp->s_copy, n_rs - i0, i0 * inp->s_copy->nb[0]);
+
     if (mctx_cur->get_gdn_deferred()) {
         inp->s_copy_base = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
         ggml_set_input(inp->s_copy_base);
+
+        inp->s_copy_moved = ggml_view_1d(ctx0, inp->s_copy_base, n_rs - i0, i0 * inp->s_copy_base->nb[0]);
 
         inp->s_copy_base_main  = ggml_view_1d(ctx0, inp->s_copy_base, n_seqs, 0);
         inp->s_copy_base_extra = ggml_view_1d(ctx0, inp->s_copy_base, n_rs - n_seqs, n_seqs * inp->s_copy_base->nb[0]);
@@ -4042,6 +4081,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_input(inp->rec_idx);
 
         inp->s_base_inplace = mctx_cur->get_s_base_inplace(n_seqs);
+    }
+
+    if (ubatch.is_ragged()) {
+        inp->seq_off = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs + 1);
+        ggml_set_input(inp->seq_off);
+        ggml_set_name(inp->seq_off, "rs_seq_off");
     }
 
     inp->head = mctx_cur->get_head();
@@ -4063,16 +4108,19 @@ ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * s,
             int32_t   state_size,
             int32_t   n_seqs,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+               bool   in_place) const {
     const auto * kv_state = inp->mctx;
+
+    GGML_ASSERT(!in_place || !get_state_rows);
 
     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
-    ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
+    ggml_tensor * state_copy = in_place ? inp->s_copy_moved : get_state_rows ? inp->s_copy_tail : inp->s_copy;
 
     return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
-                    get_state_rows);
+                    get_state_rows, in_place);
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

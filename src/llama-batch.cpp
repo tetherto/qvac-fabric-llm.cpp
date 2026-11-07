@@ -318,6 +318,7 @@ bool llama_batch_allocr::init(
             /*.output       =*/ batch.logits,
             /*.type         =*/ is_embd_vec.empty() ? nullptr : is_embd_vec.data(),
             /*.decision_order =*/ decision_order.empty() ? nullptr : decision_order.data(),
+            /*.seq_off      =*/ nullptr,
             /*.data         =*/ {},
         };
 
@@ -542,6 +543,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.output       =*/ udata->output.data(),
         /*.type         =*/ nullptr,
         /*.decision_order =*/ nullptr,
+        /*.seq_off      =*/ nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -790,6 +792,75 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     return ubatch_add(idxs, n_seqs, true);
 }
 
+llama_ubatch llama_batch_allocr::split_ragged(uint32_t n_ubatch) {
+    if (has_cpl) {
+        // coupled sequences keep the equal split
+        return split_equal(n_ubatch, false, 0);
+    }
+
+    std::vector<seq_set_t> cur_seq_set;
+    std::vector<idx_vec_t> idxs_per_seq;
+
+    uint32_t n_added = 0;
+
+    // take the sequence sets in the order of their first unused token, each with as many of its tokens as fit
+    for (int32_t i = 0; i < batch.n_tokens && n_added < n_ubatch; ++i) {
+        if (used[i]) {
+            continue;
+        }
+
+        bool add = true;
+        for (const auto & cur : cur_seq_set) {
+            if (!(cur & seq_set[i]).none()) {
+                add = false;
+                break;
+            }
+        }
+        if (!add) {
+            continue;
+        }
+
+        cur_seq_set.push_back(seq_set[i]);
+
+        idx_vec_t idxs;
+        for (const int32_t idx : seq_set_map[seq_set[i]]) {
+            if (n_added >= n_ubatch) {
+                break;
+            }
+            if (used[idx]) {
+                continue;
+            }
+
+            idxs.push_back(idx);
+
+            used[idx] = true;
+            ++n_used;
+            ++n_added;
+        }
+
+        idxs_per_seq.push_back(std::move(idxs));
+    }
+
+    const uint32_t n_seqs = cur_seq_set.size();
+
+    if (n_seqs == 0) {
+        return {};
+    }
+
+    std::vector<int32_t>  idxs;
+    std::vector<uint32_t> seq_lens(n_seqs);
+
+    bool equal = true;
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        seq_lens[s] = idxs_per_seq[s].size();
+        equal = equal && seq_lens[s] == seq_lens[0];
+
+        idxs.insert(idxs.end(), idxs_per_seq[s].begin(), idxs_per_seq[s].end());
+    }
+
+    return ubatch_add(idxs, n_seqs, equal, equal ? nullptr : &seq_lens);
+}
+
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
     // find the first unused token
     uint32_t cur_idx = 0;
@@ -864,10 +935,11 @@ void llama_batch_allocr::clear() {
     std::fill(seq_idx.begin(), seq_idx.end(), -1);
 }
 
-llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {
+llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs,
+        const std::vector<uint32_t> * seq_lens) {
     const uint32_t n_tokens = idxs.size();
 
-    assert(n_tokens%n_seqs == 0);
+    assert(seq_lens || n_tokens%n_seqs == 0);
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
@@ -907,6 +979,17 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->decision_order.resize(decision_order.empty() ? 0 : n_tokens);
 
     udata->batch_idxs = idxs;
+
+    if (seq_lens) {
+        GGML_ASSERT(seq_lens->size() == n_seqs);
+        udata->seq_off.resize(n_seqs + 1);
+        udata->seq_off[0] = 0;
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            udata->seq_off[s + 1] = udata->seq_off[s] + (int32_t) (*seq_lens)[s];
+        }
+        GGML_ASSERT((uint32_t) udata->seq_off[n_seqs] == n_tokens);
+    }
+
     udata->seq_id_data.reserve(n_tokens);
 
     seq_set_t seq_set_unq;
@@ -967,7 +1050,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     llama_ubatch res {
         /*.b_equal_seqs =*/ equal_seqs,
         /*.n_tokens     =*/ n_tokens,
-        /*.n_seq_tokens =*/ n_tokens/n_seqs,
+        /*.n_seq_tokens =*/ seq_lens ? 0 : n_tokens/n_seqs,
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ (uint32_t) udata->seq_id_unq.size(),
         /*.n_pos        =*/ n_pos_per_embd,
@@ -983,6 +1066,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.output       =*/ udata->output.data(),
         /*.type         =*/ mixed ? udata->type.data() : nullptr,
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
+        /*.seq_off      =*/ seq_lens ? udata->seq_off.data() : nullptr,
         /*.data         =*/ std::move(udata),
     };
 
