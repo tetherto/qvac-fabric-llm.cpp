@@ -11,12 +11,17 @@
 
 // --- device ----------------------------------------------------------------
 
+// The NPU's device name. One NPU per system, named like the other backends'
+// devices (CUDA0, Vulkan0), so --device takes it unquoted.
+constexpr const char * XDNA_DEVICE_NAME = "XDNA0";
+
 // Open the first NPU. Returns nullptr when no device is available.
 xdna_device * xdna_device_open(void);
 
 // --- kernel ----------------------------------------------------------------
 
-// Kernel search dirs (the backend dir, the executable dir, cwd).
+// Kernel search dirs, in priority order (GGML_XDNA_KERNEL_DIR, the module dir,
+// the backend install dir, the executable dir). Never the working directory.
 std::vector<std::filesystem::path> xdna_kernel_search_dirs(void);
 
 // Load an xclbin into a kernel handle without an instruction stream; bind one

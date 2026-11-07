@@ -94,7 +94,7 @@ target_compile_definitions(ggml-xdna PRIVATE
 # NPU kernels are compiled out-of-line by kernels/gemm.py (IRON/MLIR-AIE) at
 # build time. Each variant is a (K N) tuple; M and the tiles are fixed by the
 # geometry above. Artifacts land in the runtime output directory and are loaded
-# from there (or the executable directory / cwd) at runtime. The .insts.bin is
+# from there (or the executable directory) at runtime. The .insts.bin is
 # a reference copy of the compiled DMA sequence; the runtime builds streams.
 option(GGML_XDNA_BUILD_KERNELS "ggml-xdna: build NPU GEMM kernels (requires IRON)" ON)
 set(GGML_XDNA_GEMM_PYTHON "" CACHE FILEPATH

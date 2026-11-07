@@ -2820,11 +2820,15 @@ static void xdna_kernels_warm(xdna_kernel_pool * pool, const xdna_ops * ops, std
         return;
     }
     // Per-op decode: the standalone GEMV split and the GEMM variants xdna-ops
-    // resolves.
+    // selected, not every variant the search dirs hold.
     warm_stem(xdna_gemv_stem(XDNA_GEMV_SPLIT_DEFAULT));
     warm_stem(ops->gemm_xclbin_decode);
-    warm_names("gemm_int8_int32");
-    warm_names("gemm_bf16_f32");
+    for (const auto & kv : ops->i8_xclbin) {
+        warm_stem(kv.second);
+    }
+    for (const auto & kv : ops->pref_xclbin) {
+        warm_stem(kv.second);
+    }
 }
 
 // The memlock limit, the usual reason an NPU buffer does not fit (the
@@ -2840,8 +2844,8 @@ static std::string xdna_memlock_str() {
     return "memlock limit " + std::to_string((unsigned long long) rl.rlim_cur >> 20) + " MiB";
 }
 
-// MemAvailable, in MiB; -1 when it cannot be read.
-static long xdna_mem_available_mib() {
+// MemAvailable, in kB; -1 when it cannot be read.
+static long xdna_mem_available_kb() {
     FILE * f = fopen("/proc/meminfo", "r");
     if (!f) {
         return -1;
@@ -2854,30 +2858,113 @@ static long xdna_mem_available_mib() {
         }
     }
     fclose(f);
+    return kb < 0 ? -1 : kb;
+}
+
+// MemAvailable, in MiB; -1 when it cannot be read.
+static long xdna_mem_available_mib() {
+    const long kb = xdna_mem_available_kb();
     return kb < 0 ? -1 : kb / 1024;
 }
 
-static ggml_backend_xdna_context * ggml_xdna_device_context(void) {
+static ggml_backend_xdna_context & xdna_ctx_storage(void) {
     static ggml_backend_xdna_context ctx;
-    static std::once_flag            once;
+    return ctx;
+}
+
+// Opens the NPU and loads its kernels on the first call. Only a use of the
+// device calls it (backend init, a buffer, supports_op), not its listing.
+static ggml_backend_xdna_context * ggml_xdna_device_context(void) {
+    ggml_backend_xdna_context & ctx = xdna_ctx_storage();
+    static std::once_flag       once;
 
     std::call_once(once, [&]() {
-        ctx.device = xdna_device_open();
-        if (ctx.device) {
-            ctx.pool         = new xdna_kernel_pool;
-            ctx.pool->device = ctx.device;
-            xdna_kernel_pool_scan(ctx.pool);
-            xdna_ops_init(&ctx.ops, ctx.pool);
-            if (ctx.ops.gemm_xclbin_decode.empty() && ctx.ops.pref_xclbin.empty()) {
-                GGML_LOG_WARN("%s: no GEMM kernels found (build with GGML_XDNA=ON)\n", "ggml-xdna");
+        // An exception here would escape into llama's device and model code:
+        // treat it as no NPU, so the work stays on the CPU. The context is
+        // published only once everything is built, so a failure frees it all.
+        xdna_device *                     device = nullptr;
+        xdna_kernel_pool *                pool   = nullptr;
+        std::vector<struct xdna_kernel *> warm;
+        try {
+            device = xdna_device_open();
+            if (device) {
+                pool         = new xdna_kernel_pool;
+                pool->device = device;
+                xdna_kernel_pool_scan(pool);
+                xdna_ops_init(&ctx.ops, pool);
+                if (ctx.ops.gemm_xclbin_decode.empty() && ctx.ops.pref_xclbin.empty()) {
+                    GGML_LOG_WARN("%s: no GEMM kernels found (build with GGML_XDNA=ON)\n", "ggml-xdna");
+                }
+                // Register the kernels this backend will run up front, while the
+                // NPU is idle (see xdna_kernels_warm).
+                xdna_kernels_warm(pool, &ctx.ops, warm);
             }
-            // Register the kernels this backend will run up front, while the
-            // NPU is idle (see xdna_kernels_warm).
-            xdna_kernels_warm(ctx.pool, &ctx.ops, ctx.warm_kerns);
+            ctx.device     = device;
+            ctx.pool       = pool;
+            ctx.warm_kerns = std::move(warm);
+            return;
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("%s: NPU init failed, the NPU is not used: %s\n", "ggml-xdna", e.what());
+        } catch (...) {
+            GGML_LOG_ERROR("%s: NPU init failed, the NPU is not used: unknown exception\n", "ggml-xdna");
         }
+        for (struct xdna_kernel * kern : warm) {
+            xdna_kernel_free(kern);
+        }
+        ctx.ops.pool = nullptr;
+        ctx.ops.gemm_xclbin_decode.clear();
+        ctx.ops.pref_blocks.clear();
+        ctx.ops.pref_xclbin.clear();
+        ctx.ops.i8_xclbin.clear();
+        delete pool;
+        delete device;
     });
 
     return &ctx;
+}
+
+struct xdna_npu_info {
+    bool        present = false;
+    std::string description;
+};
+
+// Whether there is an NPU to list. On Linux this reads sysfs for an accel
+// node bound to amdxdna, so listing the device does not open it or start XRT.
+static const xdna_npu_info & xdna_npu_probe(void) {
+    static const xdna_npu_info info = []() -> xdna_npu_info {
+        xdna_npu_info r;
+        try {
+#ifdef __linux__
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            for (fs::directory_iterator it("/sys/class/accel", ec), end; !ec && it != end; it.increment(ec)) {
+                const fs::path  dir = it->path();
+                std::error_code dec;
+                const fs::path  pci = fs::read_symlink(dir / "device", dec);
+                const fs::path  drv = dec ? fs::path() : fs::read_symlink(dir / "device" / "driver", dec);
+                if (dec || drv.filename() != "amdxdna") {
+                    continue;
+                }
+                const std::string node = "/dev/accel/" + dir.filename().string();
+                if (access(node.c_str(), R_OK | W_OK) != 0) {
+                    GGML_LOG_WARN("%s: %s is not readable and writable; the NPU is not listed\n", "ggml-xdna",
+                                  node.c_str());
+                    continue;
+                }
+                r.present     = true;
+                r.description = "AMD XDNA NPU (" + pci.filename().string() + ")";
+                break;
+            }
+#else
+            // no sysfs to read: nothing is listed
+#endif
+        } catch (...) {
+            GGML_LOG_ERROR("%s: NPU probe failed; the NPU is not listed\n", "ggml-xdna");
+            return {};
+        }
+        return r;
+    }();
+    return info;
 }
 
 // backend interface
@@ -4546,13 +4633,13 @@ static ggml_guid_t ggml_backend_xdna_guid(void) {
 ggml_backend_t ggml_backend_xdna_init(void) {
     ggml_backend_xdna_context * ctx = ggml_xdna_device_context();
 
-    // When the NPU is absent the backend is still registered (llama.cpp
-    // expects every ACCEL device to yield a backend), but supports_op()
+    // A listed NPU whose open failed still yields a backend, but supports_op()
     // rejects everything so all work stays on the CPU.
     if (!ctx->device) {
-        GGML_LOG_INFO("%s: XDNA backend init: disabled (no NPU)\n", __func__);
+        GGML_LOG_INFO("%s: XDNA backend init: disabled (the NPU did not open)\n", __func__);
     } else {
-        GGML_LOG_INFO("%s: XDNA backend init: device=%s\n", __func__, ctx->device->name.c_str());
+        GGML_LOG_INFO("%s: XDNA backend init: device=%s (%s)\n", __func__, ctx->device->name.c_str(),
+                      ctx->device->description.c_str());
     }
 
     ggml_backend_t backend = new ggml_backend{
@@ -4575,14 +4662,17 @@ bool ggml_backend_is_xdna(ggml_backend_t backend) {
 
 // device interface
 
+// The listing callbacks below do not open the NPU (see xdna_npu_probe).
+
 static const char * ggml_backend_xdna_device_get_name(ggml_backend_dev_t dev) {
-    ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) dev->context;
-    return ctx->device ? ctx->device->name.c_str() : "XDNA";
+    GGML_UNUSED(dev);
+    return xdna_npu_probe().present ? XDNA_DEVICE_NAME : "XDNA";
 }
 
 static const char * ggml_backend_xdna_device_get_description(ggml_backend_dev_t dev) {
-    ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) dev->context;
-    return ctx->device ? ctx->device->description.c_str() : "AMD XDNA (no NPU device)";
+    GGML_UNUSED(dev);
+    const xdna_npu_info & npu = xdna_npu_probe();
+    return npu.present ? npu.description.c_str() : "AMD XDNA (no NPU device)";
 }
 
 static void ggml_backend_xdna_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
@@ -4600,8 +4690,10 @@ static void ggml_backend_xdna_device_get_memory(ggml_backend_dev_t dev, size_t *
     long pages     = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGE_SIZE);
     *total         = (size_t) pages * page_size;
-    // "free" system memory is ill-defined, for practical purposes assume all of it is free:
-    *free          = *total;
+    // MemAvailable, as the CPU backend reports; all of it when /proc/meminfo
+    // cannot be read
+    const long avail_kb = xdna_mem_available_kb();
+    *free               = avail_kb >= 0 ? std::min(*total, (size_t) avail_kb << 10) : *total;
 #endif  // _WIN32
 }
 
@@ -4896,7 +4988,10 @@ static ggml_backend_buffer_t ggml_backend_xdna_device_buffer_from_host_ptr(ggml_
 }
 
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) dev->context;
+    GGML_UNUSED(dev);
+    // llama asks this only of the devices a model uses, so the NPU opens here
+    // at the latest
+    ggml_backend_xdna_context * ctx = ggml_xdna_device_context();
 
     if (!ctx->device || !ctx->pool) {
         return false;
@@ -4940,7 +5035,7 @@ static const char * ggml_backend_xdna_reg_get_name(ggml_backend_reg_t reg) {
 
 static size_t ggml_backend_xdna_reg_get_device_count(ggml_backend_reg_t reg) {
     GGML_UNUSED(reg);
-    return ggml_xdna_device_context()->device ? 1 : 0;
+    return xdna_npu_probe().present ? 1 : 0;
 }
 
 static ggml_backend_dev_t ggml_backend_xdna_reg_get_device(ggml_backend_reg_t reg, size_t index) {
@@ -4950,15 +5045,24 @@ static ggml_backend_dev_t ggml_backend_xdna_reg_get_device(ggml_backend_reg_t re
     static ggml_backend_device ggml_backend_xdna_device = {
         /* .iface   = */ ggml_backend_xdna_device_i,
         /* .reg     = */ reg,
-        /* .context = */ ggml_xdna_device_context(),
+        /* .context = */ &xdna_ctx_storage(),
     };
 
     return &ggml_backend_xdna_device;
 }
 
+// Whether the NPU opened and its kernels loaded, opening it on the first call.
+// A listed device can still fail to open, and then claims no ops.
+static bool ggml_backend_xdna_device_ready(void) {
+    const ggml_backend_xdna_context * ctx = ggml_xdna_device_context();
+    return ctx->device != nullptr && ctx->pool != nullptr;
+}
+
 static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
+    if (std::strcmp(name, "ggml_backend_xdna_device_ready") == 0) {
+        return (void *) ggml_backend_xdna_device_ready;
+    }
     return NULL;
 }
 
