@@ -13,6 +13,9 @@
 #    include <windows.h>
 #else
 #    include <dlfcn.h>
+#    if defined(__GLIBC__)
+#        include <link.h>
+#    endif
 #endif
 
 #include <algorithm>
@@ -72,14 +75,16 @@ xdna_device * xdna_device_open(void) {
     xdna_device * dev = new xdna_device;
     try {
         dev->device      = xrt::device(0);
-        // one NPU per system: named like the other backends' devices (CUDA0,
-        // Vulkan0), so --device takes it unquoted; XRT's name goes in the
-        // description
-        dev->name        = "XDNA0";
+        // XRT's name goes in the description
+        dev->name        = XDNA_DEVICE_NAME;
         dev->description = dev->device.get_info<xrt::info::device::name>() + " (" +
                            dev->device.get_info<xrt::info::device::bdf>() + ")";
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("%s: failed to open NPU device: %s\n", "xdna-runtime", e.what());
+        delete dev;
+        return nullptr;
+    } catch (...) {
+        GGML_LOG_ERROR("%s: failed to open NPU device: unknown exception\n", "xdna-runtime");
         delete dev;
         return nullptr;
     }
@@ -105,6 +110,17 @@ static fs::path xdna_module_dir(void) {
     }
 #else
     Dl_info info;
+#    if defined(__GLIBC__)
+    // Linked into the main program (an empty link-map name), dli_fname is
+    // argv[0], which can resolve against the working directory: use the
+    // executable's real path.
+    struct link_map * lm = nullptr;
+    if (dladdr1((void *) &xdna_module_dir, &info, (void **) &lm, RTLD_DL_LINKMAP) && lm && lm->l_name && !*lm->l_name) {
+        std::error_code ec;
+        const fs::path  exe = fs::read_symlink("/proc/self/exe", ec);
+        return ec ? fs::path() : exe.parent_path();
+    }
+#    endif
     if (dladdr((void *) &xdna_module_dir, &info) && info.dli_fname && *info.dli_fname) {
         std::error_code ec;
         const fs::path  p = fs::canonical(info.dli_fname, ec);
@@ -134,7 +150,8 @@ std::vector<fs::path> xdna_kernel_search_dirs(void) {
         dirs.push_back(exe.parent_path());
     }
 #endif
-    dirs.emplace_back(fs::current_path());
+    // Not the working directory: a file placed there would replace a shipped
+    // kernel. GGML_XDNA_KERNEL_DIR covers running from a directory of artifacts.
     return dirs;
 }
 

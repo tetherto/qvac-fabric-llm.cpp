@@ -97,8 +97,11 @@ line at build time into `<stem>.xclbin` next to their `.insts.bin`, in the build
 output directory. The backend looks for artifacts, in order, in
 `GGML_XDNA_KERNEL_DIR` when it is set, the directory of the module the backend
 is in (the backend library in a `GGML_BACKEND_DL` build, the binary it is
-linked into otherwise), the backend install dir, the executable dir and the
-working directory. A package that loads the backend with
+linked into otherwise), the backend install dir and the executable dir. The
+first directory that holds an artifact wins. The working directory is not
+searched, so a file placed there cannot replace a shipped kernel; point
+`GGML_XDNA_KERNEL_DIR` at it instead, as an absolute path (a relative one
+resolves against the working directory). A package that loads the backend with
 `ggml_backend_load_all_from_path()` ships the artifacts next to the library.
 
 `fused_layer` and `gemv_n32_r4_c8` are loaded under a **design-tagged** name.
@@ -402,8 +405,11 @@ Diagnostics - nothing is measured unless they are set:
   `llama-quantize --tensor-type ssm_out=q5_K model-f16.gguf out.gguf Q4_K_M`.
   The failure has the same shape as the layout mismatch above.
   `GGML_XDNA_FUSED_LAYER=0` is not a way to run this model.
-- **No NPU** - the backend still registers (llama.cpp expects every accelerator
-  device to answer) but claims no ops, so everything runs on the CPU.
+- **No NPU** - with no accel device bound to `amdxdna`, or none the process
+  can read and write, the backend lists no device. Listing the device does not
+  open it: the first use does (a model placed on it, or its backend
+  initialised), and loads the kernels then. If that open fails, the device
+  stays listed but claims no ops, so everything runs on the CPU.
 
 ## Code layout
 
@@ -446,5 +452,6 @@ Diagnostics - nothing is measured unless they are set:
   computes take turns on it (the array runs one command stream at a time
   anyway).
 - The device reports itself to the scheduler as an integrated GPU: its buffers
-  are host memory, and the free memory it reports is all of system memory, so
-  any `--fit` accounting is nominal.
+  are host memory, and the free memory it reports is the system's
+  `MemAvailable`, which the CPU and any other device on host memory draw from
+  too.
