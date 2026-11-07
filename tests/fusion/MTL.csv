@@ -452,14 +452,13 @@ qwen3next           ,0   ,any     ,ADD+ADD                     ,      2
 qwen3next           ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
 qwen3next           ,0   ,any     ,MUL+ADD                     ,      4
 qwen3next           ,0   ,decode  ,MUL_MAT_ID+GLU              ,      2
-qwen3next           ,0   ,any     ,RMS_NORM+MUL                ,      5
+qwen3next           ,0   ,any     ,RMS_NORM+MUL                ,      6
 qwen3next           ,0   ,any     ,RMS_NORM+MUL+ROPE           ,      1
 qwen3next           ,0   ,any     ,RMS_NORM+MUL+ROPE+SET_ROWS  ,      1
-qwen3next           ,0   ,any     ,RMS_NORM+MUL+UNARY+MUL      ,      1
 qwen3next           ,0   ,any     ,RMS_NORM+SCALE              ,      2
 qwen3next           ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
 qwen3next           ,0   ,any     ,SSM_CONV+UNARY              ,      1
-qwen3next           ,0   ,any     ,UNARY+MUL                   ,      2
+qwen3next           ,0   ,any     ,UNARY+MUL                   ,      3
 qwen3tts            ,0   ,prefill ,MUL_MAT+ADD                 ,      2
 qwen3tts            ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
 qwen3tts            ,0   ,any     ,RMS_NORM+MUL                ,      9
