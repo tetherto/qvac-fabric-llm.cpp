@@ -41,7 +41,8 @@ env:
   LLAMA_ARG_LOG_PREFIX: 1
   LLAMA_ARG_LOG_TIMESTAMPS: 1
   # TODO: fix failing tests on OpenVINO backend
-  CTEST_EXCLUDE: "test-llama-archs|test-llama-context"
+  # QVAC divergence from upstream: the anchored test names hit unresolved OpenVINO frontend limitations. Other CI jobs still run them.
+  CTEST_EXCLUDE: "test-llama-archs|test-llama-context|^(test-hadamard-contracts|test-moe-no-output-ubatches|test-coreml-ffn)$"
 
 jobs:
   authorize:
