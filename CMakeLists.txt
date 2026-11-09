@@ -309,7 +309,7 @@ if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
 endif()
 
 # qvac-fabric: upstream's server-context library alone (no HTTP server, UI, CLI
-# or executable), for the decision bridge in @qvac/fabric. See the file.
+# or executable), for the QVAC decision addon. See the file.
 option(QVAC_FABRIC_SERVER_CONTEXT "qvac-fabric: build and install the server-context library without the HTTP server" OFF)
 if (QVAC_FABRIC_SERVER_CONTEXT)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/qvac-server-context.cmake)
