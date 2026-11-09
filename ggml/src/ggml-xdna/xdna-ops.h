@@ -15,6 +15,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 struct ggml_tensor;
@@ -38,8 +39,9 @@ struct xdna_ops {
     // Two GEMM families. Decode: M=32, native bf16 r=4, exact - used for ops
     // with M < GEMM_M_BIG_MIN. Prefill: one or more baked M blocks (the M64
     // base; larger blocks when their artifacts are built), bfp16-emulated r=8
-    // (2x mmul), selected per op as the block that minimizes the weighted
-    // pad/weight-stream cost. Quantized (Q4_K/Q5_K/Q6_K) prefill weights
+    // (2x mmul), the block that minimizes the weighted pad/weight-stream cost:
+    // one per graph for all the GEMMs of a route and row count
+    // (xdna_ops_plan_blocks), per op when unplanned. Quantized (Q4_K/Q5_K/Q6_K) prefill weights
     // additionally route to the native int8 GEMM (1 B/val) when an int8
     // artifact for the chosen block is present.
     xdna_gemm_tiles                      gemm_tiles;          // decode geometry (default)
@@ -49,17 +51,24 @@ struct xdna_ops {
     std::vector<int>                     pref_blocks;  // baked M blocks, descending
     std::unordered_map<int, std::string> pref_xclbin;  // block -> bf16 stem
     std::unordered_map<int, std::string> i8_xclbin;    // block -> int8 stem
+    std::unordered_map<int64_t, int>     plan_block;   // route and row count -> block (xdna_ops_plan_blocks)
 
     // Packed-weight cache: tensor data pointer + K + N -> device BO holding the
-    // transposed [K_pad x N] bf16 weights (K_pad = K rounded up to the GEMM
-    // block). Weights are immutable, so the pack (transpose + bf16 conversion)
-    // is done once per tensor and reused; kernels point into it via B offsets.
+    // transposed [K_pad x N] bf16 weights (K_pad = K rounded up to a whole
+    // number of GEMM_K_RUN runs). Weights are immutable, so the pack
+    // (transpose + bf16 conversion) is done once per tensor and reused;
+    // kernels point into it via B offsets. Projections run as one GEMM are
+    // packed side by side along N; `rest` lists the weights after the first
+    // and their columns (empty for one weight).
     struct weight_key {
-        const void * data = nullptr;
-        int          K    = 0;
-        int          N    = 0;
+        const void *                                  data = nullptr;
+        int                                           K    = 0;
+        int                                           N    = 0;
+        std::vector<std::pair<const void *, int64_t>> rest;
 
-        bool operator==(const weight_key & o) const { return data == o.data && K == o.K && N == o.N; }
+        bool operator==(const weight_key & o) const {
+            return data == o.data && K == o.K && N == o.N && rest == o.rest;
+        }
     };
 
     struct weight_hash {
@@ -89,22 +98,32 @@ struct xdna_ops {
 
     // Batching: MUL_MAT ops are submitted (started without wait) and collected
     // here; xdna_ops_finalize() waits them all, reads C back, and writes dst.
-    // Each op is tiled in M (the baked M block) and K (GEMM_K_MAX blocks): a
-    // pending_run is one (M-block, K-block) submission.
+    // Each op is tiled in M (the baked M block) and K (GEMM_K_RUN runs): a
+    // pending_run is one (M-block, K-run) submission.
     struct pending_run {
         xrt::run      run;
-        xdna_buffer * bo_c   = nullptr;  // held until readback
-        xdna_buffer * bo_a   = nullptr;  // released after readback
-        int           mb_idx = 0;        // index into pending_op::m_blocks
+        xdna_buffer * bo_c       = nullptr;  // held until readback
+        xdna_buffer * bo_a       = nullptr;  // released after readback
+        xdna_buffer * bo_w       = nullptr;  // the packed weights, for a re-run
+        xdna_kernel * kern       = nullptr;  // the run's kernel, for a re-run
+        int           mb_idx     = 0;        // index into pending_op::m_blocks
+        bool          accumulate = false;    // adds to dst: not the op's first K run
     };
 
     struct pending_m_block {
         int                      m0 = 0;  // dst row offset of this M-block
-        std::vector<pending_run> runs;    // one per K-block
+        std::vector<pending_run> runs;    // one per K run
+    };
+
+    // Columns [n0, n0 + n) of an op's C are the rows of node's output
+    struct pending_out {
+        struct ggml_tensor * node = nullptr;
+        int                  n0   = 0;
+        int                  n    = 0;
     };
 
     struct pending_op {
-        struct ggml_tensor *         node  = nullptr;
+        std::vector<pending_out>     outs;       // one per projection of the op
         int                          Mk    = 0;  // M block of the geometry used (32 or 64)
         int                          m_off = 0;  // first row of the range in the op
         int                          M     = 0;  // total rows of the op
@@ -113,6 +132,11 @@ struct xdna_ops {
     };
 
     std::vector<pending_op> pending;
+
+    // The bound kernel of each GEMM stream by shape, so a repeated shape does
+    // not build its stream again.
+    std::unordered_map<std::string, xdna_kernel *> gemm_kernel;
+    std::mutex                                     gemm_kernel_mutex;
 
     // Decode GEMV runners, keyed by the first weight of the dispatch. The
     // packed weights live in the runner's device buffer for the process
@@ -140,6 +164,11 @@ struct xdna_ops {
 
     std::vector<gemv_group>                             gemv_groups;
     std::unordered_map<const struct ggml_tensor *, int> gemv_group_of;
+
+    // Projections of the bf16 GEMM that the host runs in this graph, because
+    // the host is quicker than the array plus the hardware-context switches
+    // into and out of the bf16 design (xdna_ops_plan_gemm).
+    std::unordered_set<const struct ggml_tensor *> gemm_host;
 };
 
 // Find the projections of `cgraph` that share an activation and record them as
@@ -150,6 +179,21 @@ struct xdna_ops {
 void xdna_ops_plan_gemv(xdna_ops *                                             ops,
                         const struct ggml_cgraph *                             cgraph,
                         const std::unordered_set<const struct ggml_tensor *> * skip);
+
+// Decide which bf16-GEMM projections of `cgraph` run on the host. A projection
+// between commands of another design (the pgemm ones) pays a hardware-context
+// switch in and another out, and below a size the host does it in less than
+// that. Call once per prefill graph, after xdna_ops_plan_gemv.
+void xdna_ops_plan_gemm(xdna_ops * ops, const struct ggml_cgraph * cgraph);
+
+// Give the GEMMs of `cgraph` that share a route and a row count one prefill block. Each block is its own xclbin, so
+// blocks that alternate pay a hardware-context switch at every change (GGML_XDNA_GEMM_ONE_BLOCK=0: each op picks its
+// own). Call once per graph, before the other plans.
+void xdna_ops_plan_blocks(xdna_ops * ops, const struct ggml_cgraph * cgraph);
+
+// Whether a chunk of a prefill (more than one row) is quicker run whole on the host than as commands of the array, within the
+// rows the host's cost fits cover (GGML_XDNA_HOST_CHUNK=0: never). It clears the plan of xdna_ops_plan_gemm.
+bool xdna_ops_plan_chunk(xdna_ops * ops, const struct ggml_cgraph * cgraph);
 
 // Discover the GEMM xclbin and set up the fixed geometry.
 void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool);
@@ -163,6 +207,21 @@ void xdna_ops_release_weights(xdna_ops * ops);
 // True when `op` can be run on the NPU. Dispatches per-op (only GEMM so far).
 bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op);
 
+// True when `mm` (n >= 2 projections) can run as one bf16 GEMM: they read one
+// activation, every one is on the bf16 route, and their columns together fit
+// the GEMM. Their weights are packed side by side, and each output goes to its
+// own node.
+bool xdna_ops_gemm_group_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n);
+
+// The same by shape, type and geometry alone, at any row count and none of a
+// compute's plans: graph_optimize runs outside any compute, which groups again
+// with its plans and rows.
+bool xdna_ops_gemm_group_shape_supported(const xdna_ops * ops, struct ggml_tensor * const * mm, int n);
+
+// Submit the projections of a supported group as one GEMM; xdna_ops_finalize
+// writes every output. False on failure, with nothing pending.
+bool xdna_ops_compute_group(xdna_ops * ops, struct ggml_tensor * const * mm, int n);
+
 // Execute `node` on the NPU. Dispatches per-op; returns false on failure.
 // With batching this only submits (starts) the kernels; call xdna_ops_finalize
 // after all ops of a layer to wait and write results.
@@ -171,3 +230,11 @@ bool xdna_ops_compute(xdna_ops * ops, struct ggml_tensor * node);
 // Wait all pending submissions, read C back, accumulate K-blocks, write dst,
 // and release buffers. Safe to call when nothing is pending.
 bool xdna_ops_finalize(xdna_ops * ops);
+
+// Test hooks, reached through the registry's proc addresses: the next `blocks` folded bf16 GEMM blocks have their first C
+// line poisoned again `times` times each, as a write that did not land would leave it; the re-runs so far; the bf16
+// GEMM calls so far; the changes of prefill block between consecutive GEMM calls so far.
+void xdna_ops_test_lose_c_lines(int blocks, int times);
+int  xdna_ops_test_rerun_count(void);
+int  xdna_ops_test_gemm_count(void);
+int  xdna_ops_test_block_switches(void);

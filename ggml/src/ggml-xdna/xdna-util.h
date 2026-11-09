@@ -4,6 +4,7 @@
 // single one stays local to it.
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
@@ -46,6 +47,23 @@ static inline int xdna_host_threads() {
     static const int n = std::max(1, std::min(16, (int) std::thread::hardware_concurrency() / 2));
     return n;
 }
+
+// The CPU team the glue runs the current chunk's host ops on, set as a graph
+// starts. A per-call host pass takes the same size: a region of any other
+// size makes the OpenMP runtime rebuild its team at every switch, which cost a
+// 15-token GEMM's activation layout 146 us instead of 15.
+inline std::atomic<int> g_xdna_chunk_threads{ 0 };
+
+static inline int xdna_chunk_threads() {
+    const int n = g_xdna_chunk_threads.load(std::memory_order_relaxed);
+    return n > 0 ? n : xdna_host_threads();
+}
+
+// The team the glue runs the chunk being computed on: the decode's below 32 tokens a sequence, the prompt's from there
+// (ggml-xdna.cpp).
+int xdna_host_team(void);
+// The team of the prompt's glue, which a chunk run whole on the host takes.
+int xdna_host_prompt_team(void);
 
 // This thread's number in its OpenMP team; 0 outside one or without OpenMP.
 static inline int xdna_omp_thread() {

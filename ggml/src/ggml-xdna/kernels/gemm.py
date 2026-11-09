@@ -266,8 +266,10 @@ def bf16_f32_gemm(
     matmul_kernel = _matmul_kernel
     # A 128-row tile needs three L1 buffers of 32 KB for C alone at depth 2,
     # which does not fit; one C object in flight is enough because the shim
-    # waits on its token before the next sweep reuses the descriptors.
-    fifo_depth_out = 1 if m >= 128 else fifo_depth
+    # waits on its token before the next sweep reuses the descriptors. The
+    # 64-row bf16 tile (A and B banks 8 KB each, C 16 KB) fills the 64 KB L1
+    # with one C buffer; its int8 counterpart has half-size banks and keeps two.
+    fifo_depth_out = 1 if (m >= 128 or (m >= 64 and dtype_in_str == "bf16")) else fifo_depth
 
     # AIE tiles: rows 0-1 mem tiles, rows 2-5 compute cores.
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]

@@ -565,6 +565,9 @@ llama_test(test-hexagon-dma-reader)
 llama_build(test-backend-ops.cpp LINK ggml)
 
 llama_build_and_test(test-backend-memory.cpp LINK ggml)
+# a synthetic buffer type with a guard; needs the non-public ggml-backend-impl.h
+llama_build_and_test(test-backend-buffer-size.cpp LINK ggml)
+target_include_directories(test-backend-buffer-size PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 
@@ -662,7 +665,7 @@ llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-laya.cpp)
 
-# XDNA NPU. Self-skipping when no XDNA device is registered.
+# XDNA NPU. Self-skipping when no XDNA device is registered; failing when one is listed but does not open.
 if (GGML_XDNA)
     # Load, run and free a model several times in one process (#293).
     llama_build_and_test(test-xdna-reload.cpp       LABEL "model")
@@ -675,13 +678,25 @@ if (GGML_XDNA)
     llama_build_and_test(test-xdna-state.cpp        LABEL "model")
     # Every thread's CPU mask unchanged by the pinned host decode (-m model.gguf).
     llama_build_and_test(test-xdna-affinity.cpp     LABEL "model")
+    # An embedding model's layer outputs and pooled embeddings against the CPU (-m model.gguf).
+    llama_build_and_test(test-xdna-embedding.cpp    LABEL "model")
     # The host-only backend tests are built with the backend
     # (ggml/src/ggml-xdna/CMakeLists.txt); they need no model and no device.
-    foreach(t test-xdna-repack test-xdna-head-rows test-xdna-match)
+    foreach(t test-xdna-repack test-xdna-head-rows test-xdna-match test-xdna-mark test-xdna-seq test-xdna-seg-reach
+              test-xdna-pfx-row)
         if (TARGET ${t})
             add_test(NAME ${t} COMMAND ${t} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
         endif()
     endforeach()
+    # The committed design tag header against the kernel sources at the default gated layout: Python, no IRON, no device.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME test-xdna-design-tag
+                 COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna/tests/test-xdna-design-tag.py
+                         ${GGML_XDNA_GATED_FMT_DEFAULT})
+    else()
+        message(STATUS "test-xdna-design-tag: no Python 3 interpreter, test not registered")
+    endif()
 endif()
 
 if (APPLE)

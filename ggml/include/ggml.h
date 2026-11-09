@@ -383,6 +383,8 @@ extern "C" {
     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
 
+    typedef struct { uint8_t bits; } ggml_fp8_e4m3_t;
+
     struct ggml_object;
     struct ggml_context;
     struct ggml_cgraph;
@@ -432,14 +434,16 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_TBQ3_0    = 43, // TurboQuant 3-bit + QJL Stage 2, block=128 (4.25 bpw)
-        GGML_TYPE_TBQ4_0    = 44, // TurboQuant 4-bit + QJL Stage 2, block=128 (5.25 bpw)
-        GGML_TYPE_TBQ3_0_64 = 45, // TurboQuant 3-bit + QJL Stage 2, block=64  (4.5 bpw)
-        GGML_TYPE_TBQ4_0_64 = 46, // TurboQuant 4-bit + QJL Stage 2, block=64  (5.5 bpw)
-        GGML_TYPE_PQ3_0     = 47, // PolarQuant 3-bit (Stage 1 only), block=128 (3.125 bpw)
-        GGML_TYPE_PQ3_0_64  = 48, // PolarQuant 3-bit (Stage 1 only), block=64  (3.25 bpw)
-        GGML_TYPE_PQ4_0     = 49, // PolarQuant 4-bit (Stage 1 only), block=128 (4.125 bpw)
-        GGML_TYPE_PQ4_0_64  = 50, // PolarQuant 4-bit (Stage 1 only), block=64  (4.25 bpw)
+        GGML_TYPE_F8_E4M3   = 43,
+        // fabric KV-cache-only types, moved out of the upstream range (not stored in GGUF files)
+        GGML_TYPE_TBQ3_0    = 52, // TurboQuant 3-bit + QJL Stage 2, block=128 (4.25 bpw)
+        GGML_TYPE_TBQ4_0    = 53, // TurboQuant 4-bit + QJL Stage 2, block=128 (5.25 bpw)
+        GGML_TYPE_TBQ3_0_64 = 54, // TurboQuant 3-bit + QJL Stage 2, block=64  (4.5 bpw)
+        GGML_TYPE_TBQ4_0_64 = 55, // TurboQuant 4-bit + QJL Stage 2, block=64  (5.5 bpw)
+        GGML_TYPE_PQ3_0     = 56, // PolarQuant 3-bit (Stage 1 only), block=128 (3.125 bpw)
+        GGML_TYPE_PQ3_0_64  = 57, // PolarQuant 3-bit (Stage 1 only), block=64  (3.25 bpw)
+        GGML_TYPE_PQ4_0     = 58, // PolarQuant 4-bit (Stage 1 only), block=128 (4.125 bpw)
+        GGML_TYPE_PQ4_0_64  = 59, // PolarQuant 4-bit (Stage 1 only), block=64  (4.25 bpw)
         GGML_TYPE_PQ2_0     = 142,
         GGML_TYPE_PTQ1_0    = 143,
         GGML_TYPE_COUNT     = 144,
@@ -501,6 +505,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_F8_E4M3 = 29, // except 1d tensors
         GGML_FTYPE_MOSTLY_PQ2_0  = 141, // except 1d tensors
         GGML_FTYPE_MOSTLY_PTQ1_0 = 143, // except 1d tensors
     };

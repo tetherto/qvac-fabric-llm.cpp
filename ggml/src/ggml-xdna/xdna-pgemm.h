@@ -1,6 +1,9 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
+
+#include <vector>
 
 // The prefill GEMM (kernels/pgemm.py): a
 // quantized MUL_MAT at prefill batch size on the whole array, every core
@@ -12,15 +15,40 @@
 struct ggml_tensor;
 struct xdna_kernel_pool;
 
-// True when `op` is a MUL_MAT this route runs: a weight the decode GEMV packs
-// (or Q8_0, into its 8-bit form),
-// at least 64 activation rows, and the artifact present (GGML_XDNA_PGEMM=0
-// turns the route off).
+// True when `op` is a MUL_MAT of a shape this route can run: a weight the
+// decode GEMV packs (or Q8_0, into its 8-bit form), an activation of any
+// number of rows, and the artifact present (GGML_XDNA_PGEMM=0 turns the route
+// off).
+bool xdna_pgemm_shape_supported(const struct ggml_tensor * op);
+
+// True when `op` is a MUL_MAT this route runs: one of that shape unless the
+// graph's plan leaves it to the host (xdna_pgemm_plan_host). That plan is the
+// last compute's, so what runs outside a compute (graph_optimize, an
+// allocation size) asks xdna_pgemm_shape_supported.
 bool xdna_pgemm_supported(const struct ggml_tensor * op);
+
+// True when `op` is a MUL_MAT this route could run but the plan leaves to the
+// host. The bf16 GEMM must not take it either.
+bool xdna_pgemm_host_planned(const struct ggml_tensor * op);
+
+// The projections of the graph about to compute that the host runs. The plan
+// replaces the last one's; GGML_XDNA_PGEMM_HOST=0 never names any.
+void xdna_pgemm_plan_host(const std::vector<const struct ggml_tensor *> & nodes);
+
+// What a command of M rows of K against N columns costs the pass, in ms: the
+// array's time and the host's share around it. A group of projections of one
+// activation is one command of their summed N.
+double xdna_pgemm_command_ms(int M, int K, int N);
 
 // A graph is starting: the activation layouts kept for the projections that
 // share an input belong to the previous one.
 void xdna_pgemm_graph_begin(void);
+
+// The bytes a prefill GEMM writes into `op`'s output: its rows rounded up to
+// the array's 128-row blocks, which the host buffer type reports as the
+// tensor's allocation size so the array can write the output in place;
+// 0 when `op` does not go that way.
+size_t xdna_pgemm_out_bytes(const struct ggml_tensor * op);
 
 // Drop the packed weights. They are keyed by a tensor's data pointer, which
 // does not survive the model that owned it.
@@ -33,25 +61,36 @@ bool xdna_pgemm_run(struct xdna_kernel_pool * pool, struct ggml_tensor * node);
 // N floats from byte `off` of `bo`, which has room for xdna_pgemm_into_rows(M)
 // rows. The node's own data is not written.
 struct xdna_buffer;
-// The rows a call of M rows writes in place: an even count of 128-row blocks.
+// The rows a call of M rows writes in place: the 128-row blocks it runs.
 size_t xdna_pgemm_into_rows(int M);
 bool xdna_pgemm_run_into(struct xdna_kernel_pool * pool,
                          struct ggml_tensor *      node,
                          struct xdna_buffer *      bo,
                          size_t                    off);
 
-// A SWIGLU of two such MUL_MATs of one activation (the FFN's gate and up,
-// weights of one type) the array runs whole: one call, the cores applying
-// silu(gate) * up before C leaves them (GGML_XDNA_PGEMM_GLU=0: off). The
-// caller skips the two MUL_MATs, whose outputs nothing else may read.
+// A SWIGLU or GEGLU of two such MUL_MATs of one activation (the FFN's gate
+// and up, weights of one type) the array runs whole: one call, the cores
+// applying silu(gate) * up, or gelu(gate) * up in its tanh form, before C
+// leaves them (GGML_XDNA_PGEMM_GLU=0: off). The caller skips the two
+// MUL_MATs, whose outputs nothing else may read.
 bool xdna_pgemm_glu_supported(const struct ggml_tensor * glu);
 bool xdna_pgemm_run_glu(struct xdna_kernel_pool * pool, struct ggml_tensor * glu);
-// The same SwiGLU written by the cores in bf16 straight into the A layout of
+// The same GLU written by the cores in bf16 straight into the A layout of
 // `down`, the MUL_MAT that reads it (GGML_XDNA_PGEMM_GLU_A=0: off): the GLU's
 // own output is not written, and down's call finds its A laid out. The caller
 // runs down next and lets nothing else read the GLU's node.
 bool xdna_pgemm_glu_fused_supported(const struct ggml_tensor * glu, const struct ggml_tensor * down);
 bool xdna_pgemm_run_glu_fused(struct xdna_kernel_pool * pool, struct ggml_tensor * glu);
+
+// GLU_X: a MUL of GELU(MUL_MAT) and x (`mul`; x f32 rows of the projection's
+// shape in one of the backend's buffers, EmbeddingGemma 2's per-layer input)
+// written by the cores in bf16 straight into the A layout of `proj`, the
+// MUL_MAT that reads it, in the merged design (GGML_XDNA_PGEMM_GLU_X=1: on).
+// The accumulator's up half starts as x, so the GELU epilogue of the fused
+// GLU applies gelu(gate) * x. Neither the MUL_MAT, the GELU nor the MUL is
+// written; the caller skips the first two and runs proj next.
+bool xdna_pgemm_glux_supported(const struct ggml_tensor * mul, const struct ggml_tensor * proj);
+bool xdna_pgemm_run_glux(struct xdna_kernel_pool * pool, struct ggml_tensor * mul);
 
 // An RMS_NORM's output times its weight (`mul`, the MUL of the norm and a
 // vector) laid out straight into the A layout of the MUL_MATs that read it
@@ -103,3 +142,22 @@ bool xdna_pgemm_run_pair(struct xdna_kernel_pool *  pool,
                          const struct ggml_tensor * b,
                          float *                    a_out,
                          float *                    b_out);
+
+// Projections of one activation that follow each other in the graph (a layer's
+// Q, K and V) and fit one weight: one call, the output of each straight into
+// its own node (GGML_XDNA_PGEMM_GROUP=0: off). All but the last end on a whole
+// 512 columns; every node is in one of the backend's buffers. The caller runs
+// the call at the first of them and skips the rest.
+bool xdna_pgemm_group_supported(struct ggml_tensor * const * mm, int n);
+// The same by the shape alone, for graph_optimize, which runs outside any compute: the plan of the previous one does not enter.
+bool xdna_pgemm_group_shape_supported(struct ggml_tensor * const * mm, int n);
+// pad_tile > 0 (up to 128): the outputs' rows past M up to a multiple of it are read later from DRAM, as zero
+bool xdna_pgemm_run_group(struct xdna_kernel_pool * pool, struct ggml_tensor * const * mm, int n, int pad_tile = 0);
+
+// What a group member's 32-bit byte offset into its BO reaches.
+static const uint64_t XDNA_PGEMM_SEG_REACH = 1ull << 32;
+
+// Whether `rows` rows of `ldc` floats from byte `off` of a BO end within what that offset reaches.
+static inline bool xdna_pgemm_seg_in_reach(size_t off, size_t rows, size_t ldc) {
+    return off + rows * ldc * sizeof(float) < XDNA_PGEMM_SEG_REACH;
+}

@@ -265,6 +265,16 @@ void xdna_head_free(xdna_head * h) {
     delete h;
 }
 
+namespace {
+
+// no dirty line of the logits may land over what the array writes
+bool flush_logits(xdna_head * h) {
+    xdna_test_dirty_if_armed(XDNA_OUT_HEAD, h->o, h->o->bytes, 0);
+    return xdna_buffer_sync_to_device(h->o);
+}
+
+}  // namespace
+
 bool xdna_head_run(xdna_head * h, const float * x, float * logits) {
     if (!h || !x || !logits || !h->a->data) {
         GGML_LOG_ERROR("%s: bad call or the head's activation has no host mapping (x=%p logits=%p)\n", "xdna-head",
@@ -283,6 +293,9 @@ bool xdna_head_run(xdna_head * h, const float * x, float * logits) {
             return false;
         }
     }
+    if (!flush_logits(h)) {
+        return false;
+    }
     {
         xdna_prof::section_timer st("head: dispatch (restart+wait)");
         if (!xdna_run_restart(h->run) || !xdna_run_wait(h->run)) {
@@ -300,7 +313,7 @@ xrt::run * xdna_head_start_rows(xdna_head * h) {
     if (!xdna_head_rows(h)) {
         return nullptr;
     }
-    if (!xdna_run_submit(h->kern_r, h->run_r, h->args_r.data(), h->args_r.size())) {
+    if (!flush_logits(h) || !xdna_run_submit(h->kern_r, h->run_r, h->args_r.data(), h->args_r.size())) {
         return nullptr;
     }
     return &h->run_r;

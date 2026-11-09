@@ -1842,6 +1842,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (int i = 0; i < n_layer_all; ++i) {
             auto & layer = layers[i];
 
+            if (hparams.has_kv(i)) {
+                layer.k_cache_scale = create_tensor(tn(LLM_TENSOR_ATTN_K, "k_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.v_cache_scale = create_tensor(tn(LLM_TENSOR_ATTN_V, "v_scale", i), {1}, TENSOR_NOT_REQUIRED);
+
+                if ((layer.k_cache_scale && layer.k_cache_scale->type != GGML_TYPE_F32) ||
+                    (layer.v_cache_scale && layer.v_cache_scale->type != GGML_TYPE_F32)) {
+                    throw std::runtime_error(format("KV cache scales for layer %d must be F32", i));
+                }
+            }
+
             // attention weight scales (per-tensor, shape {1})
             if (!layer.wq_s && layer.wq) {
                 layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
@@ -1979,13 +1989,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
         // output scales
-        if (output && output->type == GGML_TYPE_NVFP4) {
+        if (output) {
             // weight scale
-            if (!output_s) {
+            if (!output_s && (ml.get_weight(tn(LLM_TENSOR_OUTPUT, "scale").str().c_str()) ||
+                              gguf_find_tensor(ml.metadata, tn(LLM_TENSOR_OUTPUT, "scale").str().c_str()) >= 0)) {
                 output_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "scale"), {1}, TENSOR_NOT_REQUIRED);
             }
             // input scale
-            if (!output_in_s) {
+            if (!output_in_s && (ml.get_weight(tn(LLM_TENSOR_OUTPUT, "input_scale").str().c_str()) ||
+                                 gguf_find_tensor(ml.metadata, tn(LLM_TENSOR_OUTPUT, "input_scale").str().c_str()) >= 0)) {
                 output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
             }
         }
@@ -1999,12 +2011,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         can_prefetch.insert(per_layer_tok_embd);
     }
 
-    // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
-    // If sidecar scales exist, the output weight must be an actual output tensor.
-    GGML_ASSERT(!(output && tok_embd &&
+    if (output && tok_embd &&
             strcmp(output->name, tok_embd->name) == 0 &&
-            output->type == GGML_TYPE_NVFP4 &&
-            (output_s || output_in_s)));
+            (output_s || output_in_s)) {
+        throw std::runtime_error("output scales require a separate output weight");
+    }
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
@@ -2019,6 +2030,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // Already did incremental load.
         if (!ml.no_alloc) {
             load_tensors_hadamard();
+            load_fp8_input_scales();
         }
         print_backend_buffers_info(n_gpu_layers);
         return true;
@@ -2032,6 +2044,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     if (!ml.no_alloc) {
         load_tensors_hadamard();
+        load_fp8_input_scales();
     }
     return true;
 }
@@ -2253,6 +2266,36 @@ void llama_model::print_backend_buffers_info(const int32_t n_gpu_layers) {
             LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
                 __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
         }
+    }
+}
+
+// The CUDA backend quantizes the activations of FP8 matmuls with the checkpoint's static input_scale when the
+// weight carries it in op_params (see GGML_CUDA_FP8_INPUT_SCALE_TAG in ggml-cuda/fp8.cuh).
+void llama_model_base::load_fp8_input_scales() {
+    static constexpr int32_t fp8_input_scale_tag = 0x46503853;
+    static const std::string suffix = ".weight";
+    int n_set = 0;
+    for (auto & [name, w] : tensors_by_name) {
+        if (w->type != GGML_TYPE_F8_E4M3 || name.size() <= suffix.size() ||
+                name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            continue;
+        }
+        const std::string in_name = name.substr(0, name.size() - suffix.size()) + ".input_scale";
+        const ggml_tensor * in_s = get_tensor(in_name.c_str());
+        if (in_s == nullptr || in_s->type != GGML_TYPE_F32 || ggml_nelements(in_s) != 1 || in_s->buffer == nullptr) {
+            continue;
+        }
+        float value = 0.0f;
+        ggml_backend_tensor_get(in_s, &value, 0, sizeof(value));
+        if (!std::isfinite(value) || value <= 0.0f) {
+            continue;
+        }
+        std::memcpy((char *) w->op_params + 0, &fp8_input_scale_tag, sizeof(int32_t));
+        std::memcpy((char *) w->op_params + 4, &value, sizeof(float));
+        n_set++;
+    }
+    if (n_set > 0) {
+        LLAMA_LOG_INFO("%s: %d FP8 weights use their static input scale\n", __func__, n_set);
     }
 }
 

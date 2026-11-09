@@ -182,7 +182,10 @@ different ids; here a lone query over 32,768 or more vectors splits its scan
 across the index's threads without changing any result. An index stays
 staged if it later shrinks below the threshold.
 `ggml_vec_index_turbovec_set_staged(idx, 0)` makes an index scan in full
-instead. On x86, as upstream does, the sign planes are scanned with the
+instead and frees the planes. To load an index that way, pass
+`GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF` to `ggml_vec_index_load_with_flags`
+or `ggml_vec_index_from_bytes_with_flags`: a large index then never builds
+the planes during the load. On x86, as upstream does, the sign planes are scanned with the
 `vpermb` arithmetic, the shortlist is ranked by counting bit masks against the
 query rather than through lookup tables, and a 4-bit shortlist is rescored
 straight from the bit planes. A 2-bit shortlist is rescored row by row

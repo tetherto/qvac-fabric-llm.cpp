@@ -41,6 +41,10 @@ extern "C" {
     GGML_API size_t                ggml_backend_buft_get_max_size    (ggml_backend_buffer_type_t buft);
     GGML_API size_t                ggml_backend_buft_get_alloc_size  (ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
     GGML_API size_t                ggml_backend_buft_get_alloc_size_n(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+    // Reported size of a physical buffer allocated for this payload request,
+    // including backend padding/guards. Does not allocate. Zero stays zero;
+    // SIZE_MAX denotes an unrepresentable request. Defaults to the payload size.
+    GGML_API size_t                ggml_backend_buft_get_buffer_alloc_size(ggml_backend_buffer_type_t buft, size_t size);
     GGML_API bool                  ggml_backend_buft_is_host         (ggml_backend_buffer_type_t buft);
     GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device      (ggml_backend_buffer_type_t buft);
 
@@ -227,6 +231,10 @@ extern "C" {
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
+    // Optional "ggml_backend_buft_get_buffer_alloc_size" registry procedure.
+    // Return the same size that alloc_buffer reports for a single physical
+    // payload allocation, or SIZE_MAX on overflow. Must not allocate or mutate.
+    typedef size_t (*ggml_backend_buft_get_buffer_alloc_size_t)(ggml_backend_buffer_type_t buft, size_t size);
     // Get buffer types preferred over the default for model weight placement.
     // The result is ordered, NULL-terminated, and must be copied before the next call.
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_preferred_bufts_t)(ggml_backend_dev_t device);

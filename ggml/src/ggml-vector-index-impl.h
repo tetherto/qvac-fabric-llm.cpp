@@ -748,6 +748,10 @@ void turbovec_force_vm8_2bit_for_test(int mode);
 // small indexes included, so a test reaches the batch kernels.
 void turbovec_force_batches_for_test(int enabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
+// Whether the staged-search caches exist, and the bytes the sign planes still
+// hold allocated.
+void turbovec_staged_caches_for_test(
+    const ggml_vec_index_t * idx, bool * planes, bool * packed_rows, size_t * sign_capacity);
 // Staged searches so far whose sampled seed left the shortlist short, and
 // staged batch scan tasks run so far.
 int64_t turbovec_seed_short_count_for_test(void);
@@ -1002,6 +1006,8 @@ bool turbovec_planes_wanted(int bits, int dim, size_t n_vectors);
 // After an add (first new slot), a load or calibrate (0): promotes the
 // index or patches its sign planes.
 void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot);
+// Frees the sign planes and centre term, which searches read without the
+// planes mutex: the caller must hold `idx.mutex` exclusively.
 void turbovec_planes_reset(ggml_vec_index & idx);
 void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
 // How a staged search is run, following upstream's batch bookkeeping.
@@ -1162,7 +1168,10 @@ struct TurboVecV8LoadInfo {
     // File rows with redo ops in the adopted commit.
     std::vector<size_t> pending;
 };
-ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error, TurboVecV8LoadInfo * info);
+// `staged` false loads with staged search off and never builds its caches
+// (GGML_VEC_INDEX_LOAD_TURBOVEC_STAGED_OFF).
+ggml_vec_index_t * turbovec_v8_load_image(
+    std::vector<uint8_t> raw, int & error, TurboVecV8LoadInfo * info, bool staged = true);
 
 // Positioned writes made durable together (one fsync per batch).
 using TurboVecWriteBatch = std::vector<std::pair<uint64_t, std::vector<uint8_t>>>;
@@ -1213,6 +1222,11 @@ void turbovec_blocked_set_row_seq(ggml_vec_index & idx, size_t slot, const uint8
 // `seq_into_native`). The block must lie inside the cache.
 void turbovec_block_seq(const ggml_vec_index & idx, size_t block, uint8_t * seq_blocked);
 void turbovec_blocked_set_block_seq(ggml_vec_index & idx, size_t block, const uint8_t * seq_blocked);
+// Writes blocks [first_block, first_block + n_blocks) of the blocked cache
+// from their packed rows, 32 per block in slot order, with the conversion
+// `repack_turbovec_codes` uses. The blocks must lie inside the cache.
+void turbovec_blocked_set_blocks_packed(
+    ggml_vec_index & idx, size_t first_block, size_t n_blocks, const uint8_t * packed_rows);
 // Writes n_new packed rows into the blocked cache from first_slot on.
 void turbovec_blocked_append(ggml_vec_index & idx, const uint8_t * packed, size_t first_slot, size_t n_new);
 // The sign planes of rows [first_slot, n_vectors) into the sign blocked

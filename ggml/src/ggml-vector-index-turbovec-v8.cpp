@@ -629,7 +629,8 @@ uint64_t turbovec_v8_declared_size(std::istream & f, uint64_t file_size) {
     return std::min<uint64_t>(file_size, geo.unit_at(0) + n / kBlock * geo.unit_len());
 }
 
-ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error, TurboVecV8LoadInfo * info) {
+ggml_vec_index_t * turbovec_v8_load_image(
+    std::vector<uint8_t> raw, int & error, TurboVecV8LoadInfo * info, bool staged) {
     error = GGML_VEC_INDEX_E_IO;
     if (raw.size() < 12 || !turbovec_v8_magic(raw.data(), raw.size())) {
         error = GGML_VEC_INDEX_E_BAD_MAGIC;
@@ -768,10 +769,14 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
     const size_t packed_bytes = turbovec_row_bytes(geo.bits, geo.dim);
     const size_t nsg = planes_nsg(geo);
     const size_t low_row = static_cast<size_t>(geo.bits - 1) * nsg;
+    // Set before any rows decode, so an index loaded with staged search off
+    // is never promoted below: its rows decode straight into the blocked
+    // cache, with no packed rows kept.
+    idx->turbovec_staged_enabled = staged;
     // Rows decode straight into the blocked cache. An index the planes
     // layout will promote decodes into packed rows instead, which its staged
     // search reads, and builds the blocked cache from them.
-    const bool keep_packed = turbovec_planes_wanted(geo.bits, dim, n);
+    const bool keep_packed = staged && turbovec_planes_wanted(geo.bits, dim, n);
     idx->turbovec_packed_rows = keep_packed;
     if (keep_packed) {
         idx->turbovec_data.assign(n * packed_bytes, 0);
@@ -791,8 +796,6 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
             turbovec_blocked_set_row_seq(*idx, slot, codes);
         }
     };
-    std::vector<uint8_t> packed_row(packed_bytes);
-    std::vector<uint8_t> seq_row(row_bytes);
     auto put_row_codes = [&](size_t slot, const uint8_t * codes) {
         // Tail rows and redo ops always carry sequential row codes.
         put_seq_row(slot, codes);
@@ -800,6 +803,25 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
 
     const size_t n_blocks = n / kBlock;
     std::vector<uint8_t> codes(row_bytes);
+    // A planes-layout file loaded without packed rows (staged search off)
+    // gathers its rows' packed codes kChunkBlocks blocks at a time and
+    // converts them a block at a time, as the packed-row repack does; row by
+    // row it loaded about twice as slowly.
+    constexpr size_t kChunkBlocks = 64;
+    const bool chunk_planes = geo.layout == kLayoutPlanes && !keep_packed;
+    std::vector<uint8_t> chunk(chunk_planes ? kChunkBlocks * kBlock * packed_bytes : 0);
+    size_t chunk_first = 0;
+    // Such an index keeps no packed rows, so the state hash is summed from
+    // each chunk's packed rows here: rebuilding it afterwards would unpack
+    // every block of the blocked cache again (about 10x the hash itself).
+    // Redo ops replace rows after the chunks, so a file with any is hashed
+    // afterwards instead.
+    const bool hash_in_chunks = chunk_planes && chosen->ops.empty();
+    if (hash_in_chunks) {
+        idx->state_hash_xor = 0;
+        idx->state_hash_sum = 0;
+        idx->state_hash_sum_rot = 0;
+    }
     // Sequential units already hold whole blocks in the sequential-blocked
     // layout: they go into the blocked cache a block at a time.
     const bool whole_blocks = geo.layout != kLayoutPlanes && !keep_packed;
@@ -813,14 +835,12 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
             if (geo.layout == kLayoutPlanes) {
                 // Canonical planes unit: sign bytes group-major across the
                 // block's lanes, then each lane's low planes.
-                uint8_t * packed = keep_packed ? idx->turbovec_data.data() + slot * packed_bytes : packed_row.data();
+                uint8_t * packed = keep_packed
+                    ? idx->turbovec_data.data() + slot * packed_bytes
+                    : chunk.data() + ((block - chunk_first) * kBlock + lane) * packed_bytes;
                 std::memcpy(packed, unit + nsg * kBlock + lane * low_row, low_row);
                 for (size_t g = 0; g < nsg; ++g) {
                     packed[low_row + g] = unit[g * kBlock + lane];
-                }
-                if (!keep_packed) {
-                    turbovec_packed_row_to_seq(packed, geo.bits, dim, seq_row.data());
-                    turbovec_blocked_set_row_seq(*idx, slot, seq_row.data());
                 }
             } else if (!whole_blocks) {
                 for (size_t g = 0; g < row_bytes; ++g) {
@@ -834,6 +854,16 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
             }
             idx->turbovec_scale[slot] = v;
             idx->slot_to_id[slot] = get_u64_le(unit + kBlock * row_bytes + kBlock * 4 + lane * 8);
+        }
+        if (chunk_planes && (block + 1 - chunk_first == kChunkBlocks || block + 1 == n_blocks)) {
+            turbovec_blocked_set_blocks_packed(*idx, chunk_first, block + 1 - chunk_first, chunk.data());
+            if (hash_in_chunks) {
+                for (size_t slot = chunk_first * kBlock; slot < (block + 1) * kBlock; ++slot) {
+                    add_state_hash(
+                        *idx, slot_state_hash(*idx, slot, chunk.data() + (slot - chunk_first * kBlock) * packed_bytes));
+                }
+            }
+            chunk_first = block + 1;
         }
     }
     // Pending redo ops override their slots.
@@ -859,6 +889,10 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
         }
         idx->turbovec_scale[slot] = v;
         idx->slot_to_id[slot] = get_u64_le(row + row_bytes + 4);
+        if (hash_in_chunks) {
+            turbovec_seq_row_to_packed(row, geo.bits, dim, chunk.data());
+            add_state_hash(*idx, slot_state_hash(*idx, slot, chunk.data()));
+        }
     }
 
     // Duplicate or reserved ids mean a corrupt file.
@@ -891,7 +925,11 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
             turbovec_layout(*idx));
     }
     turbovec_planes_refresh(*idx, 0);
-    rebuild_state_hash(*idx);
+    if (hash_in_chunks) {
+        idx->state_hash_valid = true;
+    } else {
+        rebuild_state_hash(*idx);
+    }
     turbovec_settle_rows(*idx);
     if (info != nullptr) {
         info->gen = chosen->gen;

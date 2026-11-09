@@ -1,4 +1,5 @@
 #include "mmq-cutlass.cuh"
+#include "fp8.cuh"
 
 #include <climits>
 
@@ -192,6 +193,28 @@ bool ggml_cuda_cutlass_get_activation_layout(ggml_backend_cuda_context &        
                                              ggml_cuda_cutlass_activation_layout & layout) {
     layout = {};
 
+    if (src0->type == GGML_TYPE_F8_E4M3) {
+        const ggml_backend_buffer_type_t buffer_type = ggml_backend_cuda_buffer_type(ctx.device);
+        if (!ggml_cuda_fp8_activation_supported(src0, src1, dst) || src1->buffer == nullptr || dst->buffer == nullptr ||
+            ggml_backend_buffer_get_type(src1->buffer) != buffer_type ||
+            ggml_backend_buffer_get_type(dst->buffer) != buffer_type) {
+            return false;
+        }
+        const int64_t k = src0->ne[0];
+        const int64_t m = ggml_nelements(src1) / k;
+        layout.size_values     = (size_t) m*k;
+        layout.offset_scales   = GGML_PAD(layout.size_values, (size_t) 128);
+        layout.size_scales     = sizeof(float);
+        layout.offset_rows     = layout.offset_scales + 128;
+        layout.size_allocation = layout.offset_rows;
+        layout.m               = (int) m;
+        layout.k               = (int) k;
+        layout.k_padded        = (int) k;
+        layout.type            = GGML_TYPE_F8_E4M3;
+        layout.fp8_input_scale = ggml_cuda_fp8_input_scale(src0);
+        return true;
+    }
+
     ggml_cuda_cutlass_weight weight;
     if (!ggml_cuda_repacked_mul_mat_supported(src0, src1, dst) || !ggml_cuda_cutlass_weight_from_tensor(src0, weight) ||
         src1->buffer == nullptr || dst->buffer == nullptr || src0->ne[1] % 4 != 0) {
@@ -248,7 +271,9 @@ bool ggml_cuda_cutlass_prepare_activation(ggml_backend_cuda_context &           
     uint8_t * values     = (uint8_t *) workspace;
     uint8_t * scales     = values + layout.offset_scales;
     float *   row_scales = layout.size_rows != 0 ? (float *) (values + layout.offset_rows) : nullptr;
-    if (!cutlass_quantize((const float *) src1->data, values, scales, row_scales, ggml_cuda_is_aligned(src1, 32),
+    if (layout.type == GGML_TYPE_F8_E4M3) {
+        ggml_cuda_fp8_quantize(ctx, src1, layout.fp8_input_scale, values, (float *) scales);
+    } else if (!cutlass_quantize((const float *) src1->data, values, scales, row_scales, ggml_cuda_is_aligned(src1, 32),
                           layout.type, layout.k, layout.k_padded, src1->nb[1] / sizeof(float), layout.m,
                           layout.size_scales, ctx.stream())) {
         return false;

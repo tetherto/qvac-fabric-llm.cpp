@@ -13,6 +13,9 @@
 #    include <windows.h>
 #else
 #    include <dlfcn.h>
+#    if defined(__GLIBC__)
+#        include <link.h>
+#    endif
 #endif
 
 #include <algorithm>
@@ -22,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -72,14 +76,16 @@ xdna_device * xdna_device_open(void) {
     xdna_device * dev = new xdna_device;
     try {
         dev->device      = xrt::device(0);
-        // one NPU per system: named like the other backends' devices (CUDA0,
-        // Vulkan0), so --device takes it unquoted; XRT's name goes in the
-        // description
-        dev->name        = "XDNA0";
+        // XRT's name goes in the description
+        dev->name        = XDNA_DEVICE_NAME;
         dev->description = dev->device.get_info<xrt::info::device::name>() + " (" +
                            dev->device.get_info<xrt::info::device::bdf>() + ")";
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("%s: failed to open NPU device: %s\n", "xdna-runtime", e.what());
+        delete dev;
+        return nullptr;
+    } catch (...) {
+        GGML_LOG_ERROR("%s: failed to open NPU device: unknown exception\n", "xdna-runtime");
         delete dev;
         return nullptr;
     }
@@ -105,6 +111,17 @@ static fs::path xdna_module_dir(void) {
     }
 #else
     Dl_info info;
+#    if defined(__GLIBC__)
+    // Linked into the main program (an empty link-map name), dli_fname is
+    // argv[0], which can resolve against the working directory: use the
+    // executable's real path.
+    struct link_map * lm = nullptr;
+    if (dladdr1((void *) &xdna_module_dir, &info, (void **) &lm, RTLD_DL_LINKMAP) && lm && lm->l_name && !*lm->l_name) {
+        std::error_code ec;
+        const fs::path  exe = fs::read_symlink("/proc/self/exe", ec);
+        return ec ? fs::path() : exe.parent_path();
+    }
+#    endif
     if (dladdr((void *) &xdna_module_dir, &info) && info.dli_fname && *info.dli_fname) {
         std::error_code ec;
         const fs::path  p = fs::canonical(info.dli_fname, ec);
@@ -134,7 +151,8 @@ std::vector<fs::path> xdna_kernel_search_dirs(void) {
         dirs.push_back(exe.parent_path());
     }
 #endif
-    dirs.emplace_back(fs::current_path());
+    // Not the working directory: a file placed there would replace a shipped
+    // kernel. GGML_XDNA_KERNEL_DIR covers running from a directory of artifacts.
     return dirs;
 }
 
@@ -249,6 +267,19 @@ bool xdna_insts_read_file(const char * path, std::vector<uint32_t> & out) {
         return false;
     }
     return true;
+}
+
+xdna_kernel * xdna_kernel_clone(const xdna_kernel * proto) {
+    if (!proto) {
+        GGML_LOG_ERROR("%s: kernel clone: null kernel\n", "xdna-runtime");
+        return nullptr;
+    }
+    xdna_kernel * kern = new xdna_kernel;
+    kern->device       = proto->device;
+    kern->context      = proto->context;
+    kern->kernel       = proto->kernel;
+    kern->xclbin_name  = proto->xclbin_name;
+    return kern;
 }
 
 bool xdna_kernel_bind_insts(xdna_device * dev, xdna_kernel * kern, const uint32_t * insts, size_t n_words) {
@@ -515,13 +546,14 @@ bool xdna_buffer_sync_from_device_range(xdna_buffer * buf, size_t bytes, size_t 
 
 // --- reading what the array wrote ------------------------------------------
 //
-// A dispatch reports completion before the last of its DMA writes is readable,
-// and a read taken in that window hands back - and caches - the previous
-// contents of the buffer. There is no host-side barrier for it: the completion
-// is honest, and the cache ioctl above does nothing on this platform for a
-// host_only BO. So the read has to tell a landed write from a pending one, and
-// that is what the pattern is for: mark the range before the dispatch, read
-// until the mark is gone.
+// The array's writes are not coherent with the host's caches. On this platform
+// (XRT's KMQ shim) bo.sync is a clflush of the range in both directions, with
+// no fence after it and no driver ioctl, so a sync from the device writes back
+// any line the host left dirty there, over what the array wrote: a sync to the
+// device before the dispatch keeps such lines off a range the array writes.
+// A dispatch has also been seen to report completion before the last of its
+// DMA writes was readable. Where that matters, mark the range before the
+// dispatch and read until the mark is gone.
 
 // Reading back what the device wrote: up to XDNA_SETTLE_PASSES checks for the
 // mark, XDNA_SETTLE_PAUSE pause instructions apart, and XDNA_SETTLE_US of spin
@@ -541,6 +573,28 @@ static void xdna_poison_range(void * p, size_t bytes) {
     for (size_t i = 0; i < n; i++) {
         words[i] = XDNA_POISON_F32;
     }
+}
+
+// The pattern in non-temporal 16-byte stores, ordered before whatever follows by the fence.
+static void xdna_poison_range_stream(void * p, size_t bytes) {
+#if defined(__x86_64__) || defined(__i386__)
+    uint32_t *   words = (uint32_t *) p;
+    const size_t n     = bytes / sizeof(uint32_t);
+    size_t       i     = 0;
+    for (; i < n && ((uintptr_t) (words + i) & (sizeof(__m128i) - 1)); i++) {
+        words[i] = XDNA_POISON_F32;
+    }
+    const __m128i pattern = _mm_set1_epi32((int) XDNA_POISON_F32);
+    for (; i + 4 <= n; i += 4) {
+        _mm_stream_si128((__m128i *) (words + i), pattern);
+    }
+    for (; i < n; i++) {
+        words[i] = XDNA_POISON_F32;
+    }
+    _mm_sfence();
+#else
+    xdna_poison_range(p, bytes);
+#endif
 }
 
 static size_t xdna_poison_left(const void * p, size_t bytes) {
@@ -568,21 +622,35 @@ static void xdna_cache_writeback(void * p, size_t bytes) {
 #endif
 }
 
+// The words of [offset, offset+bytes) a mark covers, clamped to the buffer: their address, with `bytes` set to their
+// size; null when there are none.
+static uint8_t * xdna_marked_range(xdna_buffer * buf, size_t * bytes, size_t offset) {
+    if (!buf || !buf->data || *bytes == 0 || offset >= buf->bytes) {
+        return nullptr;
+    }
+    *bytes = xdna_markable(std::min(*bytes, buf->bytes - offset));
+    return *bytes == 0 ? nullptr : (uint8_t *) buf->data + offset;
+}
+
 void xdna_buffer_mark(xdna_buffer * buf, size_t bytes, size_t offset) {
-    if (!buf || !buf->data || bytes == 0 || offset >= buf->bytes) {
+    uint8_t * base = xdna_marked_range(buf, &bytes, offset);
+    if (!base) {
         return;
     }
-    if (bytes > buf->bytes - offset) {
-        bytes = buf->bytes - offset;
-    }
-    bytes = xdna_markable(bytes);
-    if (bytes == 0) {
-        return;
-    }
-    uint8_t * base = (uint8_t *) buf->data + offset;
     xdna_poison_range(base, bytes);
     // Written back, not left dirty: our own cache lines could otherwise land
     // on top of what the device writes.
+    xdna_cache_writeback(base, bytes);
+}
+
+void xdna_buffer_mark_bulk(xdna_buffer * buf, size_t bytes, size_t offset) {
+    uint8_t * base = xdna_marked_range(buf, &bytes, offset);
+    if (!base) {
+        return;
+    }
+    xdna_poison_range_stream(base, bytes);
+    // Needed, and no fence replaces it: with an sfence or an mfence alone every fresh process lost chunks to the mark
+    // that never cleared (12 of 12). Why is not traced.
     xdna_cache_writeback(base, bytes);
 }
 
@@ -1368,5 +1436,51 @@ void xdna_kernel_pool_release_buffer(xdna_kernel_pool * pool, xdna_buffer * buf)
         }
         xdna_buffer_free(pool->pool[lru].buf);
         pool->pool.erase(pool->pool.begin() + (std::ptrdiff_t) lru);
+    }
+}
+
+namespace {
+
+const char * const OUT_SITE_NAMES[XDNA_OUT_SITES] = { "pgemm", "attn-mm",  "gdn-mm",     "att",
+                                                      "head",  "pfx-attn", "pgemm-fused" };
+std::atomic<bool>  g_out_armed[XDNA_OUT_SITES];
+std::atomic<int>   g_out_filled[XDNA_OUT_SITES];
+std::atomic<bool>  g_out_landing[XDNA_OUT_SITES];  // filled, not yet landed (xdna_test_land_dirty)
+
+int out_site_of(const char * name) {
+    for (int s = 0; s < XDNA_OUT_SITES; s++) {
+        if (name && std::strcmp(name, OUT_SITE_NAMES[s]) == 0) {
+            return s;
+        }
+    }
+    return -1;
+}
+
+}  // namespace
+
+int xdna_test_dirty_output(const char * site, int arm) {
+    const int s = out_site_of(site);
+    if (s < 0) {
+        return -1;
+    }
+    if (arm) {
+        g_out_armed[s] = true;
+    }
+    return g_out_filled[s];
+}
+
+void xdna_test_dirty_if_armed(xdna_out_site site, xdna_buffer * buf, size_t bytes, size_t offset) {
+    if (!g_out_armed[site].exchange(false) || !buf || !buf->data || offset >= buf->bytes) {
+        return;
+    }
+    const size_t n = std::min(bytes, buf->bytes - offset) / sizeof(float);
+    std::fill_n((float *) ((uint8_t *) buf->data + offset), n, std::numeric_limits<float>::quiet_NaN());
+    g_out_filled[site]++;
+    g_out_landing[site] = true;
+}
+
+void xdna_test_land_dirty(xdna_out_site site, xdna_buffer * buf, size_t bytes, size_t offset) {
+    if (g_out_landing[site].exchange(false)) {
+        (void) xdna_buffer_sync_to_device_range(buf, bytes, offset);
     }
 }

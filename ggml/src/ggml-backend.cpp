@@ -221,6 +221,23 @@ size_t ggml_backend_buft_get_alloc_size_n(ggml_backend_buffer_type_t buft, struc
     return ggml_backend_buft_get_alloc_size_n_default(buft, tensors, n_tensors);
 }
 
+size_t ggml_backend_buft_get_buffer_alloc_size(ggml_backend_buffer_type_t buft, size_t size) {
+    GGML_ASSERT(buft);
+    // the allocation wrapper never calls the backend for an empty buffer
+    if (size == 0 || buft->device == NULL) {
+        return size;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(buft->device);
+    auto get_size = reg ? reinterpret_cast<ggml_backend_buft_get_buffer_alloc_size_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_get_buffer_alloc_size")) : nullptr;
+    if (get_size == nullptr) {
+        return size;
+    }
+    const size_t result = get_size(buft, size);
+    GGML_ASSERT(result >= size);
+    return result;
+}
+
 bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
     if (buft->iface.is_host) {
@@ -938,11 +955,13 @@ void ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml
 }
 
 // creates a copy of the tensor with the same memory layout
+// the op_params go along: a weight can carry backend data there (the static input scale of an FP8 weight)
 static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, const struct ggml_tensor * tensor) {
     struct ggml_tensor * dup = ggml_dup_tensor(ctx, tensor);
     for (int i = 0; i < GGML_MAX_DIMS; i++) {
         dup->nb[i] = tensor->nb[i];
     }
+    memcpy(dup->op_params, tensor->op_params, sizeof(dup->op_params));
     return dup;
 }
 

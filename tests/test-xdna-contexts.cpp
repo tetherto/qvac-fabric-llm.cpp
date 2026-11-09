@@ -10,7 +10,8 @@
 // after round, and every decode has to succeed. The backend runs one graph
 // compute at a time and keeps each context's fused-layer sessions apart;
 // without either, the second context crashed or decoded on the first one's
-// recurrent state.
+// recurrent state. Built with -fsanitize=thread, it also checks one context's
+// support queries against the other's compute (run it under setarch -R).
 //
 // Skips (exit 0) without a model or an XDNA device.
 
@@ -29,6 +30,14 @@ static ggml_backend_dev_t xdna_device(void) {
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "XDNA") == 0) {
+            // a listed NPU that does not open fails rather than skips, so a
+            // broken NPU runner cannot pass
+            auto ready = (bool (*)(void)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+                                                                            "ggml_backend_xdna_device_ready");
+            if (!ready || !ready()) {
+                std::fprintf(stderr, "XDNA device is listed but did not open\n");
+                std::exit(1);
+            }
             return dev;
         }
     }
