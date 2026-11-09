@@ -1,11 +1,13 @@
 # qvac-fabric: build and install upstream's server-context library on its own.
 #
-# QVAC hosts upstream's decision execution (server-context: decision parsing,
-# task scheduling, the response queue and the post_systemone handler) inside the
-# shared @qvac/fabric runtime, behind a QVAC-owned C bridge. Enabling
+# QVAC's decision addon (@qvac/decision-ggml) runs upstream's decision execution
+# (server-context: decision parsing, task scheduling, the response queue and the
+# post_systemone handler) in-process. It builds this port with the
+# server-context feature and links the archive statically; its llama, common
+# and mtmd references resolve from the shared @qvac/fabric runtime. Enabling
 # LLAMA_BUILD_SERVER for that would also build the web UI, the CLI, the HTTP
 # listener (cpp-httplib) and the llama-server executable, none of which the
-# runtime may contain. This file builds only the server-context target, with
+# addon may contain. This file builds only the server-context target, with
 # the same sources, include directories and link libraries as upstream's
 # tools/server/CMakeLists.txt, and installs its archive and headers.
 #
@@ -24,8 +26,8 @@ set(_qvac_sc_dir "${CMAKE_CURRENT_SOURCE_DIR}/tools/server")
 if (TARGET server-context)
     message(FATAL_ERROR
         "QVAC_FABRIC_SERVER_CONTEXT cannot be combined with LLAMA_BUILD_SERVER: it builds "
-        "its own position-independent, hidden-visibility server-context for the @qvac/fabric "
-        "runtime. Turn one of them off (the qvac-fabric port sets LLAMA_BUILD_SERVER=OFF).")
+        "its own position-independent, hidden-visibility server-context for the QVAC "
+        "decision addon. Turn one of them off (the qvac-fabric port sets LLAMA_BUILD_SERVER=OFF).")
 endif()
 
 if (NOT TARGET llama-common)
@@ -59,7 +61,7 @@ foreach(_f IN LISTS _qvac_sc_files)
     if (_f MATCHES "^(server|server-http|server-models)\\.cpp$")
         message(FATAL_ERROR
             "QVAC_FABRIC_SERVER_CONTEXT: upstream's server-context now lists ${_f}, "
-            "which belongs to the HTTP server. Review before shipping it in the runtime.")
+            "which belongs to the HTTP server. Review before shipping it in the decision addon.")
     endif()
     list(APPEND _qvac_sc_sources "${_qvac_sc_dir}/${_f}")
 endforeach()
@@ -67,14 +69,14 @@ endforeach()
 add_library(server-context STATIC ${_qvac_sc_sources})
 llama_add_compile_flags()
 target_compile_features(server-context PRIVATE cxx_std_17)
-# Linked into the shared @qvac/fabric module, so position-independent
-# regardless of BUILD_SHARED_LIBS (upstream only sets it for shared builds).
+# Linked into a shared addon module, so position-independent regardless of
+# BUILD_SHARED_LIBS (upstream only sets it for shared builds).
 #
-# Hidden visibility: the server classes are internals of the runtime, used
-# only by the bridge linked into the same module. @qvac/fabric exports by
-# wildcard (e.g. *common_*, *llama_* in its Mach-O list), and those patterns
-# also match mangled server symbols whose signatures mention common_params
-# or llama_model. A hidden symbol is never exported, whatever the list says.
+# Hidden visibility: the server classes are internals of the addon that links
+# this archive, and the addon exports only its module entry points. A hidden
+# symbol is never exported, whatever an export list or wildcard matches (for
+# example, mangled server symbols whose signatures mention common_params or
+# llama_model).
 set_target_properties(server-context PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden
@@ -94,7 +96,7 @@ file(GLOB QVAC_FABRIC_SERVER_CONTEXT_HEADERS "${_qvac_sc_dir}/server-*.h")
 
 # Install rules. The headers go to a directory of their own, not next to the
 # public llama/common/mtmd headers: they are upstream internals, consumed only by
-# the QVAC bridge inside @qvac/fabric, and the npm package must not ship them.
+# the decision addon that links the archive.
 #
 # The exported llama::server-context target carries the include directories its
 # headers need: they include "common.h", "mtmd.h" and their sibling server
