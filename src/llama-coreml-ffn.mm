@@ -203,7 +203,7 @@ llama_coreml_ffn * llama_coreml_ffn_load(const llama_model & model, const llama_
             (channels - params.metal_channels) % params.n_packages == 0 && params.min_tokens >= 2 && params.min_tokens <= rows,
             "invalid Core ML FFN configuration");
         require(model.arch == LLM_ARCH_QWEN35 && model.hparams.n_embd == hidden && model.hparams.n_layer() == 64 &&
-            !model.hparams.no_alloc && model.hdmd.rot.empty() && model.hdmd.inv.empty(), "Core ML FFN requires an unrotated Qwen3.8-27B model");
+            !model.no_alloc() && model.hdmd.rot.empty() && model.hdmd.inv.empty(), "Core ML FFN requires an unrotated Qwen3.8-27B model");
         for (int i = 0; i < 64; ++i) {
             const auto & layer = model.layers[i];
             require(model.dev_layer(i) && std::string(ggml_backend_dev_name(model.dev_layer(i))) == "MTL0",
