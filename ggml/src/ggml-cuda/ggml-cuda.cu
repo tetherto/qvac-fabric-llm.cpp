@@ -86,6 +86,7 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/sigmoid-back.cuh"
 #include "ggml-cuda/ssm-conv-back.cuh"
+#include "ggml-cuda/nvrtc-fusion.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -408,6 +409,13 @@ static bool ggml_cuda_fusion_disabled() {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
     return disabled;
 }
+
+#ifdef GGML_CUDA_NVRTC_FUSION
+// GGML_CUDA_DISABLE_FUSION turns the generated kernels off as well
+static bool ggml_cuda_nvrtc_active() {
+    return ggml_cuda_nvrtc_fusion_enabled() && !ggml_cuda_fusion_disabled();
+}
+#endif
 
 static bool ggml_cuda_p2p_enabled() {
     static const bool enabled = ggml_cuda_env_set("GGML_CUDA_P2P");
@@ -2728,6 +2736,9 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context &          ctx,
         if (activation != nullptr && activation->type == GGML_TYPE_F8_E4M3 && src0->type == GGML_TYPE_BF16 &&
                 ggml_cuda_mul_mat_fp8_bf16(ctx, src0, src1, dst, activation->values, (const float *) activation->scales)) {
             return true;
+        }
+        if (activation != nullptr && !activation->src1_written) {
+            return false;
         }
         ggml_cuda_mul_mat_canonical(ctx, src0, src1, dst);
         return true;
@@ -5898,6 +5909,52 @@ struct ggml_cuda_cutlass_activation_plan {
 #endif
     }
 
+#ifdef GGML_CUDA_NVRTC_FUSION
+    // FP8 groups with a static input scale, for generated kernels that can write the e4m3 copy themselves
+    std::vector<ggml_cuda_nvrtc_fp8_sink> nvrtc_sinks() const {
+        std::vector<ggml_cuda_nvrtc_fp8_sink> sinks;
+        if (workspace == nullptr) {
+            return sinks;
+        }
+        for (size_t gi = 0; gi < groups.size(); ++gi) {
+            const group & g = groups[gi];
+            if (g.layout.type != GGML_TYPE_F8_E4M3 || g.layout.fp8_input_scale <= 0.0f || g.prepared ||
+                g.src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(g.src1)) {
+                continue;
+            }
+            ggml_cuda_nvrtc_fp8_sink sink;
+            sink.src1        = g.src1;
+            sink.values      = (uint8_t *) workspace + g.workspace_offset;
+            sink.scale       = (float *) (sink.values + g.layout.offset_scales);
+            sink.input_scale = g.layout.fp8_input_scale;
+            sink.matmuls.assign(g.nodes.begin(), g.nodes.end());
+            sink.group = (int) gi;
+            // an earlier group in the same workspace slot must be done before the copy is written
+            for (const group & h : groups) {
+                if (&h != &g && h.slot == g.slot && h.last < g.first) {
+                    sink.min_anchor = std::max(sink.min_anchor, h.last + 1);
+                }
+            }
+            sinks.push_back(std::move(sink));
+        }
+        return sinks;
+    }
+
+    void nvrtc_mark(const std::vector<ggml_cuda_nvrtc_fp8_sink> & sinks) {
+        for (const ggml_cuda_nvrtc_fp8_sink & sink : sinks) {
+            if (!sink.fulfilled) {
+                continue;
+            }
+            group & g = groups[sink.group];
+            g.activation = {
+                sink.values, (const uint8_t *) sink.scale, nullptr, g.layout.m, g.layout.k, g.layout.k_padded,
+                g.layout.type, sink.src1_written,
+            };
+            g.prepared = true;
+        }
+    }
+#endif
+
     void allocate_direct(ggml_backend_cuda_context & ctx) {
         if (workspace_size == 0) {
             return;
@@ -6084,6 +6141,13 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
 
     for (auto it = plan.groups.begin(); it != plan.groups.end();) {
         bool          safe = it->nodes.size() >= 2;
+#ifdef GGML_CUDA_NVRTC_FUSION
+        // a generated kernel can write the e4m3 copy of a single FP8 matmul's input while it computes it
+        if (it->nodes.size() == 1 && it->layout.type == GGML_TYPE_F8_E4M3 && it->layout.fp8_input_scale > 0.0f &&
+            ggml_cuda_nvrtc_active()) {
+            safe = true;
+        }
+#endif
         node_location location;
         if (safe) {
             const auto first_location = locations.find(it->nodes.front());
@@ -6247,8 +6311,12 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *    
                                                  const bool                          cuda_graph_update_required,
                                                  const void *                        graph_key,
                                                  const bool                          should_launch_concurrent_events,
-                                                 ggml_cuda_cutlass_activation_plan & activation_plan) {
+                                                 ggml_cuda_cutlass_activation_plan & activation_plan,
+                                                 ggml_cuda_nvrtc_plan *              nvrtc_plan) {
     bool graph_evaluated_or_captured = false;
+#ifndef GGML_CUDA_NVRTC_FUSION
+    GGML_UNUSED(nvrtc_plan);
+#endif
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -6287,6 +6355,11 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *    
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+#ifdef GGML_CUDA_NVRTC_FUSION
+                if (nvrtc_plan != nullptr) {
+                    ggml_cuda_nvrtc_fusion_after(nvrtc_plan, *cuda_ctx, i - 1);
+                }
+#endif
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -6327,7 +6400,24 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *    
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, &activation_plan);
+                ggml_cgraph * fuse_graph = cgraph;
+#ifdef GGML_CUDA_NVRTC_FUSION
+                ggml_cgraph nvrtc_view;
+                if (nvrtc_plan != nullptr) {
+                    if (ggml_cuda_nvrtc_fusion_run(nvrtc_plan, *cuda_ctx, i)) {
+                        continue;
+                    }
+                    // the other fusions must not take nodes that a generated kernel computes
+                    const int limit = ggml_cuda_nvrtc_fusion_next_claimed(nvrtc_plan, i);
+                    if (limit < cgraph->n_nodes) {
+                        nvrtc_view         = *cgraph;
+                        nvrtc_view.n_nodes = limit;
+                        fuse_graph         = &nvrtc_view;
+                    }
+                }
+#endif
+
+                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, fuse_graph, i, &activation_plan);
 
                 if (nodes_to_skip < 0) {
                     GGML_LOG_ERROR("%s: fusion failed %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -6374,6 +6464,11 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *    
                     try_launch_concurrent_event(node);
                }
             }
+#ifdef GGML_CUDA_NVRTC_FUSION
+            if (nvrtc_plan != nullptr) {
+                ggml_cuda_nvrtc_fusion_after(nvrtc_plan, *cuda_ctx, cgraph->n_nodes - 1);
+            }
+#endif
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -6493,6 +6588,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     activation_plan.allocate_direct(*cuda_ctx);
 #endif
 
+    ggml_cuda_nvrtc_plan * nvrtc_plan = nullptr;
+#ifdef GGML_CUDA_NVRTC_FUSION
+    if ((!use_cuda_graph || cuda_graph_update_required) && !concurrent_events_active && ggml_cuda_nvrtc_active()) {
+        std::vector<ggml_cuda_nvrtc_fp8_sink> sinks = activation_plan.nvrtc_sinks();
+        nvrtc_plan = ggml_cuda_nvrtc_fusion_plan(*cuda_ctx, cgraph, &sinks);
+        activation_plan.nvrtc_mark(sinks);
+    }
+#endif
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -6503,8 +6607,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    if (!ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key,
-                                              concurrent_events_active, activation_plan)) {
+    const bool evaluated = ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required,
+                                                                graph_key, concurrent_events_active, activation_plan, nvrtc_plan);
+#ifdef GGML_CUDA_NVRTC_FUSION
+    ggml_cuda_nvrtc_fusion_free(nvrtc_plan);
+#endif
+    if (!evaluated) {
 #ifdef USE_CUDA_GRAPH
         if (use_cuda_graph && cuda_graph_update_required) {
             cudaGraph_t failed_graph = nullptr;
@@ -6558,6 +6666,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     const bool disable_fusion = ggml_cuda_fusion_disabled();
+
+#ifdef GGML_CUDA_NVRTC_FUSION
+    if (params != nullptr && ggml_cuda_nvrtc_active()) {
+        ggml_cuda_nvrtc_fusion_add_alloc_deps(cgraph, params->add_alloc_dep, params->user_data);
+    }
+#endif
 
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 
@@ -8044,6 +8158,13 @@ static uint64_t ggml_backend_cuda_mlp_fusion_count(ggml_backend_t backend) {
     return ctx->mlp_fusion_count;
 }
 
+#ifdef GGML_CUDA_NVRTC_FUSION
+static uint64_t ggml_backend_cuda_nvrtc_fusion_count(ggml_backend_t backend) {
+    const auto * ctx = (const ggml_backend_cuda_context *) backend->context;
+    return ctx->nvrtc_fusion_count;
+}
+#endif
+
 // Physical devices before skipping, so tests can tell a skipped card from an absent one.
 static int ggml_backend_cuda_physical_device_count(void) {
     return ggml_cuda_info().physical_device_count;
@@ -8081,6 +8202,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_mlp_fusion_count") == 0) {
         return (void *)ggml_backend_cuda_mlp_fusion_count;
     }
+#ifdef GGML_CUDA_NVRTC_FUSION
+    // only while generated kernels replace nodes, so that tests expect them only then
+    if (strcmp(name, "ggml_backend_cuda_nvrtc_fusion_count") == 0) {
+        return ggml_cuda_nvrtc_active() && !ggml_cuda_nvrtc_fusion_verify() ? (void *)ggml_backend_cuda_nvrtc_fusion_count : nullptr;
+    }
+#endif
 #ifdef GGML_CUDA_CUTLASS
     if (strcmp(name, "ggml_backend_begin_async_upload") == 0) {
         return (void *) ggml_backend_cuda_begin_async_upload;
