@@ -293,6 +293,7 @@
 #define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K
+#define ggml_vec_dot_tq2_0_q8_0_generic ggml_vec_dot_tq2_0_q8_0
 #define ggml_vec_dot_tq2_0_q8_1_generic ggml_vec_dot_tq2_0_q8_1
 #define ggml_vec_dot_q2_K_q8_K_generic ggml_vec_dot_q2_K_q8_K
 #define ggml_vec_dot_iq2_xxs_q8_K_generic ggml_vec_dot_iq2_xxs_q8_K
@@ -347,6 +348,7 @@
 // quants.c
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K
+#define ggml_vec_dot_tq2_0_q8_0_generic ggml_vec_dot_tq2_0_q8_0
 #define ggml_vec_dot_tq2_0_q8_1_generic ggml_vec_dot_tq2_0_q8_1
 #define ggml_vec_dot_iq2_xxs_q8_K_generic ggml_vec_dot_iq2_xxs_q8_K
 #define ggml_vec_dot_iq2_xs_q8_K_generic ggml_vec_dot_iq2_xs_q8_K
