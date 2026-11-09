@@ -27,7 +27,7 @@ struct mtmd_helper_video_init_params {
     float fps_target;            // desired output fps; <= 0 means use the video's native fps, defaulted to 4.0f
     const char * ffmpeg_bin_dir; // directory containing ffmpeg/ffprobe binaries; NULL means search PATH
     int64_t timestamp_interval_ms; // interval for adding timestamp as text chunk (example: "[10m50.5s]"); <= 0 means no timestamp, defaulted to 5000ms
-    uint64_t max_frame_pixels;     // width * height limit of a frame, checked before decoding; 0 means no limit, defaulted to 0
+    uint64_t max_frame_pixels;     // width * height limit of each frame, checked before decoding; the number of frames is not limited; 0 means no limit, defaulted to 0
     // TODO @ngxson : allow "placeholder" bitmap output for counting tokens
 };
 
@@ -39,7 +39,7 @@ struct mtmd_helper_init_opt {
     // decode limits, checked before the decoded output is allocated; 0 means no limit
     // an input over a limit fails with MTMD_HELPER_BITMAP_AUDIO_TOO_LONG or MTMD_HELPER_BITMAP_IMAGE_TOO_LARGE
     uint64_t max_audio_frames; // mono samples at the model's audio sample rate (mtmd_get_audio_sample_rate)
-    uint64_t max_image_pixels; // width * height of an image, a webp, or each video frame (with video_params.max_frame_pixels, the lower one applies)
+    uint64_t max_image_pixels; // width * height of an image (webp included) or of each video frame; for video, the lower of this and video_params.max_frame_pixels applies
 };
 typedef struct mtmd_helper_init_opt mtmd_helper_init_opt;
 

@@ -460,16 +460,12 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf_impl(const mtmd_cont
     }
 
 #ifdef MTMD_VIDEO
-    // max_image_pixels also bounds the frames that ffmpeg decodes
-    mtmd_helper_video_init_params video_params = opt.video_params;
-    if (opt.max_image_pixels > 0 && (video_params.max_frame_pixels == 0 || opt.max_image_pixels < video_params.max_frame_pixels)) {
-        video_params.max_frame_pixels = opt.max_image_pixels;
-    }
-
-    // stb_image does not support webp; decode it with ffmpeg as a single frame
+    // stb_image does not support webp; decode it with ffmpeg as a single frame, limited by max_image_pixels like the other images
     if (!result && is_webp_file(buf, len)) {
+        mtmd_helper_video_init_params webp_params = opt.video_params;
+        webp_params.max_frame_pixels = opt.max_image_pixels;
         auto status = MTMD_HELPER_BITMAP_FAILED;
-        result = decode_webp_with_ffmpeg(ctx, buf, len, placeholder, video_params, status);
+        result = decode_webp_with_ffmpeg(ctx, buf, len, placeholder, webp_params, status);
         if (!result) {
             LOG_ERR("%s: failed to decode webp buffer\n", __func__);
             return {nullptr, nullptr, status};
@@ -482,6 +478,11 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf_impl(const mtmd_cont
     // last try: load as video
 #ifdef MTMD_VIDEO
     if (!result) {
+        // max_image_pixels also bounds the frames that ffmpeg decodes
+        mtmd_helper_video_init_params video_params = opt.video_params;
+        if (opt.max_image_pixels > 0 && (video_params.max_frame_pixels == 0 || opt.max_image_pixels < video_params.max_frame_pixels)) {
+            video_params.max_frame_pixels = opt.max_image_pixels;
+        }
         auto status = MTMD_HELPER_BITMAP_FAILED;
         auto video_ctx = video_init_from_buf(ctx, buf, len, video_params, status);
         if (!video_ctx) {
