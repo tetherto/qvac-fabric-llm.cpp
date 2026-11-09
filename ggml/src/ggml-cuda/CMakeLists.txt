@@ -190,6 +190,11 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CCCL::CCCL)
     endif()
 
+    if (GGML_CUDA_NVRTC_FUSION)
+        add_compile_definitions(GGML_CUDA_NVRTC_FUSION)
+        target_link_libraries(ggml-cuda PRIVATE CUDA::nvrtc CUDA::cuda_driver)
+    endif()
+
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library

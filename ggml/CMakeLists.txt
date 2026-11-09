@@ -203,6 +203,7 @@ option(GGML_MUSA                            "ggml: use MUSA"                    
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
 option(GGML_CUDA_CUTLASS                    "ggml: build CUTLASS kernels"                     OFF)
+option(GGML_CUDA_NVRTC_FUSION               "ggml: fuse elementwise ops with NVRTC kernels"   OFF)
 option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
 option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
