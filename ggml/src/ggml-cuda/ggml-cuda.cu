@@ -410,6 +410,13 @@ static bool ggml_cuda_fusion_disabled() {
     return disabled;
 }
 
+#ifdef GGML_CUDA_NVRTC_FUSION
+// GGML_CUDA_DISABLE_FUSION turns the generated kernels off as well
+static bool ggml_cuda_nvrtc_active() {
+    return ggml_cuda_nvrtc_fusion_enabled() && !ggml_cuda_fusion_disabled();
+}
+#endif
+
 static bool ggml_cuda_p2p_enabled() {
     static const bool enabled = ggml_cuda_env_set("GGML_CUDA_P2P");
     return enabled;
@@ -6137,7 +6144,7 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
 #ifdef GGML_CUDA_NVRTC_FUSION
         // a generated kernel can write the e4m3 copy of a single FP8 matmul's input while it computes it
         if (it->nodes.size() == 1 && it->layout.type == GGML_TYPE_F8_E4M3 && it->layout.fp8_input_scale > 0.0f &&
-            ggml_cuda_nvrtc_fusion_enabled()) {
+            ggml_cuda_nvrtc_active()) {
             safe = true;
         }
 #endif
@@ -6583,7 +6590,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_nvrtc_plan * nvrtc_plan = nullptr;
 #ifdef GGML_CUDA_NVRTC_FUSION
-    if ((!use_cuda_graph || cuda_graph_update_required) && !concurrent_events_active) {
+    if ((!use_cuda_graph || cuda_graph_update_required) && !concurrent_events_active && ggml_cuda_nvrtc_active()) {
         std::vector<ggml_cuda_nvrtc_fp8_sink> sinks = activation_plan.nvrtc_sinks();
         nvrtc_plan = ggml_cuda_nvrtc_fusion_plan(*cuda_ctx, cgraph, &sinks);
         activation_plan.nvrtc_mark(sinks);
@@ -6661,7 +6668,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     const bool disable_fusion = ggml_cuda_fusion_disabled();
 
 #ifdef GGML_CUDA_NVRTC_FUSION
-    if (params != nullptr) {
+    if (params != nullptr && ggml_cuda_nvrtc_active()) {
         ggml_cuda_nvrtc_fusion_add_alloc_deps(cgraph, params->add_alloc_dep, params->user_data);
     }
 #endif
