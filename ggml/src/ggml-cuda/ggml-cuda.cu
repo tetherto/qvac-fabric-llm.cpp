@@ -6814,7 +6814,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
     stream_context.reset();
 
-    if (!use_cuda_graph) {
+    // the branches need allocation dependencies (see below)
+    if (!use_cuda_graph || params == nullptr) {
         return;
     }
 
@@ -6998,6 +6999,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 concurrent_events.emplace(root_node, std::move(concurrent_event));
                 GGML_LOG_DEBUG("Adding stream at node %s %p\n", root_node->name, root_node);
                 concurrent_node_ranges.emplace_back(fork_node_idx, join_node_idx);
+
+                // the branches run on their own streams at the same time, so a tensor that one of them frees (in the
+                // allocation order below) can be reused by a node of another branch while it is still read. keep every
+                // tensor of the branches, and their sources, allocated until the join node
+                for (int i = fork_node_idx + 1; i < join_node_idx; ++i) {
+                    ggml_tensor * node = cgraph->nodes[i];
+                    params->add_alloc_dep(params->user_data, node, const_cast<ggml_tensor *>(join_node));
+                    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                        if (node->src[j]) {
+                            params->add_alloc_dep(params->user_data, node->src[j], const_cast<ggml_tensor *>(join_node));
+                        }
+                    }
+                }
 
                 // interleave tensors to extend lifetimes so that ggml graph doesn't recycle them
                 // example transformation:
