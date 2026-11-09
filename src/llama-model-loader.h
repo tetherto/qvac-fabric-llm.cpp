@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
