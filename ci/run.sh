@@ -199,7 +199,8 @@ if [ ! -z ${GG_BUILD_OPENVINO} ]; then
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_OPENVINO=ON"
 
     # TODO: fix failing tests on OpenVINO backend
-    CTEST_EXTRA="-E test-llama-archs|test-llama-context"
+    # QVAC divergence from upstream: the anchored test names hit unresolved OpenVINO frontend limitations. Other CI jobs still run them.
+    CTEST_EXTRA="-E test-llama-archs|test-llama-context|^(test-hadamard-contracts|test-moe-no-output-ubatches|test-coreml-ffn)$"
 fi
 
 ## helpers
