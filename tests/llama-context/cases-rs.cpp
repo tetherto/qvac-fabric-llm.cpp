@@ -695,7 +695,12 @@ struct case_multi_seq_ragged : ctx_test {
 
         constexpr double nmse_eps = 1e-4; // see case_multi_seq_split_replay
 
-        // the steps mix ragged, equal-split and decode ubatches, whose graphs the reserve must all cover
+        // the steps mix ragged, equal-split and decode ubatches, whose graphs the reserve must all cover. the check is for
+        // the archs with ragged ubatches: the graphs of others (f.ex. the dsv4 cache) change with the layouts of the steps
+        char arch_str[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_str, sizeof(arch_str));
+        const bool realloc_check = strcmp(arch_str, "qwen35") == 0 || strcmp(arch_str, "qwen35moe") == 0;
+
         const auto make_ctx_ragged = [&]() {
             ctx_opts opts;
             opts.n_ctx         = 256;
@@ -703,6 +708,7 @@ struct case_multi_seq_ragged : ctx_test {
             opts.n_ubatch      = 16;
             opts.n_seq_max     = 3;
             opts.kv_unified    = 1;
+            opts.realloc_check = realloc_check;
             return mr.ctx(opts);
         };
 
