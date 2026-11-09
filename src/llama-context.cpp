@@ -1017,9 +1017,16 @@ void llama_context::synchronize() {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
+    // nothing submitted since the last synchronization: return without touching the backends, whose synchronize is not
+    // thread-safe, so that repeated calls (the server samples slots on several threads) are read-only
+    if (!sync_pending) {
+        return;
+    }
 
-    // nothing evaluated since the last synchronization: no stats to add, and repeated calls stay read-only
+    ggml_backend_sched_synchronize(sched.get());
+    sync_pending = false;
+
+    // nothing evaluated since the last synchronization: no stats to add
     if (n_queued_tokens == 0) {
         return;
     }
@@ -3137,6 +3144,8 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+
+    sync_pending = true;
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {

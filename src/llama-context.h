@@ -502,6 +502,9 @@ private:
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
 
+    // work was submitted to the scheduler since the last synchronize()
+    bool sync_pending = false;
+
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls
 
