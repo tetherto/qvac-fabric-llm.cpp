@@ -2285,7 +2285,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_b
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
         int32_t nqptg,
-        int32_t ncpsg) {
+        int32_t ncpsg,
+        bool    has_rows) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_UNUSED(op);
 
@@ -2295,10 +2296,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_b
     snprintf(base, 256, "kernel_%s",
             "flash_attn_ext_blk");
 
-    snprintf(name, 256, "%s_nqptg=%d_ncpsg=%d",
+    snprintf(name, 256, "%s_nqptg=%d_ncpsg=%d_rows=%d",
             base,
             nqptg,
-            ncpsg);
+            ncpsg,
+            has_rows);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -2313,6 +2315,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_b
         //ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT_BLK + 21);
         //ggml_metal_cv_set_int32(cv, nsg,  FC_FLASH_ATTN_EXT_BLK + 22);
         //ggml_metal_cv_set_int32(cv, nwg,  FC_FLASH_ATTN_EXT_BLK + 23);
+        ggml_metal_cv_set_bool (cv, has_rows, FC_FLASH_ATTN_EXT_BLK + 5);
         ggml_metal_cv_set_int32(cv, nqptg, FC_FLASH_ATTN_EXT_BLK + 24);
         ggml_metal_cv_set_int32(cv, ncpsg, FC_FLASH_ATTN_EXT_BLK + 25);
 
@@ -2369,6 +2372,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         bool    has_bias,
         bool    has_scap,
         bool    has_kvpad,
+        bool    has_rows,
         int32_t nsg,
         int32_t nwg,
         bool    use_kv_f16,
@@ -2393,13 +2397,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
             dk,
             dv);
 
-    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
+    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_rows=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
             base,
             has_mask,
             has_sinks,
             has_bias,
             has_scap,
             has_kvpad,
+            has_rows,
             bc_mask,
             ns10,
             ns20,
@@ -2415,6 +2420,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         ggml_metal_cv_set_bool(cv, has_bias,  FC_FLASH_ATTN_EXT + 2);
         ggml_metal_cv_set_bool(cv, has_scap,  FC_FLASH_ATTN_EXT + 3);
         ggml_metal_cv_set_bool(cv, has_kvpad, FC_FLASH_ATTN_EXT + 4);
+        ggml_metal_cv_set_bool(cv, has_rows,  FC_FLASH_ATTN_EXT + 5);
 
         ggml_metal_cv_set_bool(cv, bc_mask, FC_FLASH_ATTN_EXT + 10);
 
