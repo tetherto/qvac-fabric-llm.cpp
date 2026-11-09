@@ -1411,7 +1411,8 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         const uint32_t used = cells.used_max_p1();
 
         // also pad to at least 1/16 of the used cells: when many sequences grow at once, the padded size (and the
-        // graph) then changes every ~30 ubatches instead of every few, for at most ~6% more masked cells
+        // graph) then changes every ~30 ubatches instead of every few. the pad is the first power of two from 256 that
+        // reaches used/16, so it stays under used/8: less than 12.5% more masked cells
         uint32_t n_pad_cur = std::max(n_pad, 256u);
         while ((n_pad_cur & (n_pad_cur - 1)) == 0 && n_pad_cur < used / 16) {
             n_pad_cur *= 2;
