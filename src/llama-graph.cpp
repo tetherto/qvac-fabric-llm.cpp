@@ -4010,8 +4010,7 @@ ggml_tensor * llm_graph_context::build_rs(
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    state_zero = ggml_scale_inplace(ctx0, state_zero, 0);
-    ggml_build_forward_expand(gf, state_zero);
+    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
@@ -4024,18 +4023,12 @@ ggml_tensor * llm_graph_context::build_rs(
     if (in_place) {
         // the gather starts at the first state of the ubatch that is not in its own cell yet (at the extra states when
         // every state is in place): copy them all to their cells, then the ubatch reads its states from the cache
-        ggml_tensor * states_moved = ggml_cpy(ctx0,
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0,
                 states_all,
-                ggml_view_2d(ctx0, s, state_size, n_rs - i0, s->nb[1], (rs_head + i0)*s->nb[1]));
-        ggml_build_forward_expand(gf, states_moved);
+                ggml_view_2d(ctx0, s, state_size, n_rs - i0, s->nb[1], (rs_head + i0)*s->nb[1])));
 
-        // the view has no data edge to the clear and the copy above, so a backend that reorders nodes by their sources
-        // could run the readers first: the view computes nothing, and the two extra sources only order it after them
-        ggml_tensor * states_ubatch = ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1]);
-        states_ubatch->src[1] = state_zero;
-        states_ubatch->src[2] = states_moved;
-
-        return states_ubatch;
+        return ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1]);
     }
 
     ggml_tensor * output_states = get_state_rows ?
