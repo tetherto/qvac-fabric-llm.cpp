@@ -23,10 +23,12 @@ extern "C" {
 // 112 adds the speech ops to the ggml_op enum (temp-11018: 111).
 // 113 adds GATED_DELTA_NET_DEFERRED and GDN_CONV_DEFERRED to the ggml_op enum
 //     (temp-11259: 112).
+// 114 adds GGML_TYPE_F8_E4M3 as type 43 and moves the TBQ and PQ types
+//     from 43-50 to 52-59.
 // A minor bump is additive: the client still accepts a server with an older
 // minor and must gate every command introduced by a later minor on the minor
 // the server announces at HELLO.
-#define RPC_PROTO_MAJOR_VERSION    113
+#define RPC_PROTO_MAJOR_VERSION    114
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 

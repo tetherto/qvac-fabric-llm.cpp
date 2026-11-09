@@ -19,6 +19,8 @@ struct ggml_cuda_cutlass_activation_layout {
     int       k        = 0;
     int       k_padded = 0;
     ggml_type type     = GGML_TYPE_COUNT;
+
+    float fp8_input_scale = 0.0f; // GGML_TYPE_F8_E4M3: static activation scale, 0 for a dynamic one
 };
 
 struct ggml_cuda_cutlass_activation {
@@ -30,6 +32,9 @@ struct ggml_cuda_cutlass_activation {
     int       k        = 0;
     int       k_padded = 0;
     ggml_type type     = GGML_TYPE_COUNT;
+
+    // false when a fused producer skipped writing src1, so a matmul must not fall back to reading it
+    bool src1_written = true;
 };
 
 bool ggml_cuda_cutlass_get_activation_layout(ggml_backend_cuda_context &           ctx,
