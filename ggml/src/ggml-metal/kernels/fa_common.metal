@@ -3,6 +3,7 @@ constant bool FC_flash_attn_ext_has_sinks [[function_constant(FC_FLASH_ATTN_EXT 
 constant bool FC_flash_attn_ext_has_bias  [[function_constant(FC_FLASH_ATTN_EXT + 2)]];
 constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT + 3)]];
 constant bool FC_flash_attn_ext_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT + 4)]];
+constant bool FC_flash_attn_ext_has_rows  [[function_constant(FC_FLASH_ATTN_EXT + 5)]];
 
 constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 
@@ -55,6 +56,7 @@ void kernel_flash_attn_ext_impl(
         device const char * pad,
         device const char * blk,
         device       char * dst,
+        device const char * rows,
         threadgroup  half * shmem_f16,
         uint3   tgpig,
         ushort  tiisg,
@@ -141,6 +143,10 @@ void kernel_flash_attn_ext_impl(
         v += ikv2*args.nb22 + ikv3*args.nb23;
     }
 
+    // K/V row list of the current slice (ggml_flash_attn_ext_rows): the loop runs over the list and reads the cache
+    // rows through it. negative entries are padding, their mask is -INF
+    device const int * rows_list = (device const int *) rows + (FC_flash_attn_ext_has_rows ? iq3*args.ne11 : 0);
+
     // load heads from Q to shared memory
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
@@ -187,12 +193,21 @@ void kernel_flash_attn_ext_impl(
             slope = pow(base, exph);
         }
 
+        // with kv_rows, the first list entry of the next block of this workgroup is loaded one block ahead
+        int r0_nxt = FC_flash_attn_ext_has_rows && iwg*C < args.ne11 ? rows_list[iwg*C] : 0;
+
         // loop over the KV cache
         // each simdgroup handles blocks of Q rows and C columns
         for (int ic0 = iwg; ; ic0 += NWG) {
             int ic = ic0*C;
             if (ic >= args.ne11) {
                 break;
+            }
+
+            int r0 = 0;
+            if (FC_flash_attn_ext_has_rows) {
+                r0     = r0_nxt;
+                r0_nxt = ic + NWG*C < args.ne11 ? rows_list[ic + NWG*C] : 0;
             }
 
             // the last partial chunk uses the pad buffer as source
@@ -235,9 +250,20 @@ void kernel_flash_attn_ext_impl(
 
             char blk_cur = 1;
 
+            // with kv_rows, a block of consecutive cache rows (flagged by kernel_flash_attn_ext_blk) is read like the
+            // dense cache, from row ic_kv
+            bool rows_dense = true;
+            int  ic_kv      = ic;
+
             // read the mask into shared mem
             if (FC_flash_attn_ext_has_mask) {
                 blk_cur = blk[ic0];
+
+                if (FC_flash_attn_ext_has_rows) {
+                    rows_dense = blk_cur & 4;
+                    ic_kv      = rows_dense ? r0 : ic;
+                    blk_cur   &= 3;
+                }
 
                 if (blk_cur == 0) {
                     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
@@ -291,9 +317,9 @@ void kernel_flash_attn_ext_impl(
 
             // Q*K^T
             // this is compile-time check, so it does not have runtime overhead
-            if (is_same<kd4x4_t, k4x4_t>::value) {
+            if (is_same<kd4x4_t, k4x4_t>::value && rows_dense) {
                 // we can read directly from global memory
-                device      const k_t * pk = (device const k_t *) (k + ic*args.nb11);
+                device      const k_t * pk = (device const k_t *) (k + ic_kv*args.nb11);
                 threadgroup const q_t * pq = sq;
                 threadgroup       s_t * ps = ss;
 
@@ -358,8 +384,14 @@ void kernel_flash_attn_ext_impl(
 
                     qk8x8_t mqk = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
 
+                    // with kv_rows, the K row of this thread comes from the list (padding reads row 0, its mask is -INF)
+                    int i11 = ic_kv + 8*cc + ty;
+                    if (FC_flash_attn_ext_has_rows && !rows_dense) {
+                        i11 = max(rows_list[ic + 8*cc + ty], 0);
+                    }
+
                     for (short ii = 0; ii < DK16; ii += 4) {
-                        device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k + ((ic + 8*cc + ty)*args.nb11));
+                        device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k + (i11*args.nb11));
 
                         if (DK16%4 == 0) {
                             // the head is evenly divisible by 4*16 = 64, so no need for bound checks
@@ -463,7 +495,7 @@ void kernel_flash_attn_ext_impl(
             // O = O + (Q*K^T)*V
             {
                 // we can read directly from global memory
-                if (is_same<vd4x4_t, v4x4_t>::value) {
+                if (is_same<vd4x4_t, v4x4_t>::value && rows_dense) {
                     static_assert(PV8 % NSG == 0, "");
 
                     constexpr short NO = PV8/NSG;
@@ -481,7 +513,7 @@ void kernel_flash_attn_ext_impl(
                     }
 
                     {
-                        device const v_t * pv = (device const v_t *) (v + ic*args.nb21);
+                        device const v_t * pv = (device const v_t *) (v + ic_kv*args.nb21);
 
                         pv += 8*sgitg;
 
@@ -549,8 +581,13 @@ void kernel_flash_attn_ext_impl(
                         s8x8_t vs;
                         simdgroup_load(vs, ss + 8*cc, SH, 0, false);
 
+                        int i21 = ic_kv + 8*cc + ty;
+                        if (FC_flash_attn_ext_has_rows && !rows_dense) {
+                            i21 = max(rows_list[ic + 8*cc + ty], 0);
+                        }
+
                         for (short ii = 4*sgitg; ii < DV16; ii += 4*NSG) {
-                            device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + ((ic + 8*cc + ty)*args.nb21));
+                            device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + (i21*args.nb21));
 
                             if (DV16%4 == 0) {
                                 // no need for bound checks
@@ -725,12 +762,13 @@ kernel void kernel_flash_attn_ext(
         device const char * pad,
         device const char * blk,
         device       char * dst,
+        device const char * rows,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
 #define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C
-#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg
+#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, rows, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
       // note: disabled cases to reduce library load time
       //case 1: kernel_flash_attn_ext_impl<FWD_TMPL, 1>(FWD_ARGS); break;

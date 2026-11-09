@@ -195,6 +195,7 @@ kernel void kernel_flash_attn_ext_pad(
     }
 }
 
+constant bool    FC_flash_attn_ext_blk_has_rows [[function_constant(FC_FLASH_ATTN_EXT_BLK + 5)]];
 constant int32_t FC_flash_attn_ext_blk_nqptg [[function_constant(FC_FLASH_ATTN_EXT_BLK + 24)]];
 constant int32_t FC_flash_attn_ext_blk_ncpsg [[function_constant(FC_FLASH_ATTN_EXT_BLK + 25)]];
 
@@ -202,10 +203,12 @@ constant int32_t FC_flash_attn_ext_blk_ncpsg [[function_constant(FC_FLASH_ATTN_E
 // 0 -     masked (i.e. full of -INF, skip)
 // 1 - not masked (i.e. at least one element of the mask is not -INF)
 // 2 - all zero
+// with kv_rows (one list of cache rows per mask slice), 4 is added when the C list entries are consecutive cache rows
 kernel void kernel_flash_attn_ext_blk(
         constant ggml_metal_kargs_flash_attn_ext_blk & args,
         device const char * mask,
         device       char * dst,
+        device const int  * rows,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]]) {
     // block size C x Q
@@ -246,6 +249,21 @@ kernel void kernel_flash_attn_ext_blk(
             } else {
                 res = 1;
             }
+        }
+    }
+
+    if (FC_flash_attn_ext_blk_has_rows && res != 0) {
+        device const int * list = rows + i3*args.ne30 + i0*C;
+
+        const int r0 = list[0];
+
+        bool seq = r0 >= 0;
+        for (short i = tiisg; i < C; i += NW) {
+            seq = seq && list[i] == r0 + i;
+        }
+
+        if (simd_all(seq)) {
+            res |= 4;
         }
     }
 
