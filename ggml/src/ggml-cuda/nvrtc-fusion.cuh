@@ -30,6 +30,9 @@ struct ggml_cuda_nvrtc_fp8_sink {
 
 bool ggml_cuda_nvrtc_fusion_enabled();
 
+// GGML_CUDA_NVRTC_VERIFY=1: the generated kernels run next to the normal path instead of replacing it
+bool ggml_cuda_nvrtc_fusion_verify();
+
 // graph_optimize: keep the inputs of each fused group alive until the group runs
 void ggml_cuda_nvrtc_fusion_add_alloc_deps(
         const ggml_cgraph * cgraph, void (*add_alloc_dep)(void *, ggml_tensor *, ggml_tensor *), void * user_data);

@@ -1760,6 +1760,10 @@ static bool nf_small_batch(const ggml_cgraph * cgraph) {
     return rows >= 0 && rows <= min_rows;
 }
 
+bool ggml_cuda_nvrtc_fusion_verify() {
+    return nf_verify();
+}
+
 bool ggml_cuda_nvrtc_fusion_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_NVRTC_FUSION");
@@ -2184,6 +2188,7 @@ bool ggml_cuda_nvrtc_fusion_run(ggml_cuda_nvrtc_plan * plan, ggml_backend_cuda_c
             cuGetErrorString(res, &msg);
             GGML_ABORT("nvrtc-fusion: launch failed: %s", msg ? msg : "?");
         }
+        ctx.nvrtc_fusion_count++;
         return true;
     }
     return plan->claimed[i] != 0;

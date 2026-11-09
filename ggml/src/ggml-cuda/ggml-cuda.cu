@@ -8158,6 +8158,13 @@ static uint64_t ggml_backend_cuda_mlp_fusion_count(ggml_backend_t backend) {
     return ctx->mlp_fusion_count;
 }
 
+#ifdef GGML_CUDA_NVRTC_FUSION
+static uint64_t ggml_backend_cuda_nvrtc_fusion_count(ggml_backend_t backend) {
+    const auto * ctx = (const ggml_backend_cuda_context *) backend->context;
+    return ctx->nvrtc_fusion_count;
+}
+#endif
+
 // Physical devices before skipping, so tests can tell a skipped card from an absent one.
 static int ggml_backend_cuda_physical_device_count(void) {
     return ggml_cuda_info().physical_device_count;
@@ -8195,6 +8202,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_mlp_fusion_count") == 0) {
         return (void *)ggml_backend_cuda_mlp_fusion_count;
     }
+#ifdef GGML_CUDA_NVRTC_FUSION
+    // only while generated kernels replace nodes, so that tests expect them only then
+    if (strcmp(name, "ggml_backend_cuda_nvrtc_fusion_count") == 0) {
+        return ggml_cuda_nvrtc_active() && !ggml_cuda_nvrtc_fusion_verify() ? (void *)ggml_backend_cuda_nvrtc_fusion_count : nullptr;
+    }
+#endif
 #ifdef GGML_CUDA_CUTLASS
     if (strcmp(name, "ggml_backend_begin_async_upload") == 0) {
         return (void *) ggml_backend_cuda_begin_async_upload;

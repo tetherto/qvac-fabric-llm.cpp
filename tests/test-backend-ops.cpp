@@ -6340,6 +6340,7 @@ struct test_qwen35_elementwise : public test_case {
     const ggml_type type;
 
     std::vector<ggml_tensor *> verify;
+    mutable bool has_fusion_counter = false;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6348,6 +6349,17 @@ struct test_qwen35_elementwise : public test_case {
 
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+
+    // the CUDA backend exports the counter only while the NVRTC pass replaces nodes
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn = uint64_t (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nvrtc_fusion_count");
+        has_fusion_counter = counter != nullptr;
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return has_fusion_counter; }
 
     double max_nmse_err() override {
         // f16 copies round at ~5e-4, which puts the unfused path right at 1e-7 for some inputs
