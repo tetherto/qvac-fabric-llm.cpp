@@ -695,7 +695,7 @@ struct case_multi_seq_ragged : ctx_test {
 
         constexpr double nmse_eps = 1e-4; // see case_multi_seq_split_replay
 
-        // ragged graphs are not covered by the reserve, which uses an equal split
+        // the steps mix ragged, equal-split and decode ubatches, whose graphs the reserve must all cover
         const auto make_ctx_ragged = [&]() {
             ctx_opts opts;
             opts.n_ctx         = 256;
@@ -703,7 +703,6 @@ struct case_multi_seq_ragged : ctx_test {
             opts.n_ubatch      = 16;
             opts.n_seq_max     = 3;
             opts.kv_unified    = 1;
-            opts.realloc_check = false;
             return mr.ctx(opts);
         };
 

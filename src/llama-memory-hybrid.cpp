@@ -141,6 +141,11 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+bool llama_memory_hybrid::get_ragged() const {
+    // see init_batch: the ragged split needs a unified attention cache
+    return mem_attn->get_n_stream() == 1 && mem_recr->rs_ragged;
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

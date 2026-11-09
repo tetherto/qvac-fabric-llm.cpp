@@ -151,6 +151,10 @@ struct llama_memory_i {
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
+    // the batches are split into ragged ubatches (llama_ubatch::seq_off) when their sequences have different lengths.
+    // the graphs of ragged ubatches differ from the equal-split ones, so the compute buffers are planned for each kind
+    virtual bool get_ragged() const { return false; }
+
     //
     // state write/read
     //

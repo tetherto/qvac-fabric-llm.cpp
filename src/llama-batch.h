@@ -209,8 +209,9 @@ public:
     llama_ubatch split_ragged(uint32_t n_ubatch);
 
     // a helper method for creating a well-defined ubatch of tokens
+    // ragged: shaped like a ragged ubatch (seq_off, not equal), for reserving the graphs of ragged ubatches
     // TODO: support embeddings if needed in the future
-    llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
+    llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs, bool ragged = false);
 
 private:
     void clear();

@@ -500,7 +500,7 @@ bool llama_batch_allocr::init(
     return true;
 }
 
-llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs) {
+llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs, bool ragged) {
     const uint32_t n_tokens = n_seq_tokens*n_seqs;
 
     clear();
@@ -524,10 +524,18 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         udata->seq_id_unq.push_back(s);
     }
 
+    // the offsets only matter when the inputs are set, which a reserve does not do
+    if (ragged) {
+        udata->seq_off.resize(n_seqs + 1);
+        for (uint32_t s = 0; s <= n_seqs; ++s) {
+            udata->seq_off[s] = s*n_seq_tokens;
+        }
+    }
+
     llama_ubatch res {
-        /*.b_equal_seqs =*/ true,
+        /*.b_equal_seqs =*/ !ragged,
         /*.n_tokens     =*/ n_tokens,
-        /*.n_seq_tokens =*/ n_seq_tokens,
+        /*.n_seq_tokens =*/ ragged ? 0 : n_seq_tokens,
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ n_seqs,
         /*.n_pos        =*/ n_pos_per_embd,
@@ -543,7 +551,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.output       =*/ udata->output.data(),
         /*.type         =*/ nullptr,
         /*.decision_order =*/ nullptr,
-        /*.seq_off      =*/ nullptr,
+        /*.seq_off      =*/ ragged ? udata->seq_off.data() : nullptr,
         /*.data         =*/ std::move(udata),
     };
 

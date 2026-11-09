@@ -294,7 +294,11 @@ public:
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        bool ragged = false);
+
+    // plan the compute buffers for the worst-case graph of ragged (or equal-split) ubatches
+    bool sched_plan_ragged(bool ragged);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -440,6 +444,9 @@ private:
     // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
     int32_t n_reallocs_diff = 0;
+
+    // the compute buffers are planned for the worst-case graph of ragged ubatches (else of equal-split ones)
+    bool sched_ragged = false;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
