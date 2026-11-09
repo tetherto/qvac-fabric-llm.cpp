@@ -4413,6 +4413,9 @@ private:
         llama_synchronize(ctx_tgt);
         llama_get_logits(ctx_tgt);
 
+        // the debug sampling timings count the whole parallel section, once per slot sampled in it
+        const int64_t t_start = ggml_time_us();
+
         auto work = [&](int t) {
             for (int i = t; i < n; i += n_threads) {
                 server_slot & slot = *to_sample[i];
@@ -4431,6 +4434,11 @@ private:
         work(0);
         for (auto & w : workers) {
             w.join();
+        }
+
+        t_sampl += ggml_time_us() - t_start;
+        for (const server_slot * slot : to_sample) {
+            n_sampl += out[slot->id] != LLAMA_TOKEN_NULL;
         }
     }
 
