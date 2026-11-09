@@ -12772,11 +12772,12 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     const int64_t nb;       // queries per slice
     const int64_t n_slices;
     const ggml_type type_KV;
+    const bool runs;        // rows in runs of consecutive cells instead of random cells
 
     std::vector<int32_t> rows;
 
     std::string vars() override {
-        return VARS_TO_STR8(hs, nh, gqa, n_cells, kv, nb, n_slices, type_KV);
+        return VARS_TO_STR8(hs, nh, gqa, n_cells, kv, nb, n_slices, type_KV) + (runs ? ",runs=1" : "");
     }
 
     double max_nmse_err() override {
@@ -12784,8 +12785,8 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     }
 
     test_flash_attn_ext_kv_rows(int64_t hs = 256, int64_t nh = 2, int64_t gqa = 8, int64_t n_cells = 2048, int64_t kv = 512,
-                                int64_t nb = 8, int64_t n_slices = 4, ggml_type type_KV = GGML_TYPE_F16)
-        : hs(hs), nh(nh), gqa(gqa), n_cells(n_cells), kv(kv), nb(nb), n_slices(n_slices), type_KV(type_KV) {}
+                                int64_t nb = 8, int64_t n_slices = 4, ggml_type type_KV = GGML_TYPE_F16, bool runs = false)
+        : hs(hs), nh(nh), gqa(gqa), n_cells(n_cells), kv(kv), nb(nb), n_slices(n_slices), type_KV(type_KV), runs(runs) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_slices);
@@ -12817,15 +12818,19 @@ struct test_flash_attn_ext_kv_rows : public test_case {
         std::mt19937 gen(0x6B76);
 
         // per slice: distinct random cells, the tail of the list is padding
+        // with runs: runs of 40 consecutive cells with gaps of 7, so that some blocks of the list are consecutive and some are not
         rows.assign(kv*n_slices, -1);
         std::vector<int32_t> order(n_cells);
         for (int64_t s = 0; s < n_slices; ++s) {
             for (int64_t i = 0; i < n_cells; ++i) {
-                order[i] = i;
+                order[i] = runs ? s*131 + i + (i/40)*7 : i;
             }
-            std::shuffle(order.begin(), order.end(), gen);
+            if (!runs) {
+                std::shuffle(order.begin(), order.end(), gen);
+            }
             const int64_t n_used = std::min<int64_t>(n_cells, kv - (s*37) % std::max<int64_t>(1, kv/2));
             for (int64_t i = 0; i < n_used; ++i) {
+                GGML_ASSERT(order[i] < n_cells);
                 rows[s*kv + i] = order[i];
             }
         }
@@ -17393,6 +17398,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (float v_range : {1.0f, 0.01f, 2000.0f}) {
                 test_cases.emplace_back(new test_flash_attn_ext_kv_range(hs, 2, 1024, 256, k_range, v_range));
             }
+        }
+    }
+
+    // row lists in runs of consecutive cells: the vec kernels read those blocks like the dense cache
+    for (int64_t nb : {1, 3, 8}) {
+        for (int64_t n_slices : {1, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 4, 6, 4096, 1024, nb, n_slices, GGML_TYPE_F16,  true));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(128, 8, 4, 4096, 512,  nb, n_slices, GGML_TYPE_F16,  true));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(128, 4, 1, 4096, 256,  nb, n_slices, GGML_TYPE_F16,  true));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 64, 4, 2, 4096, 768,  nb, n_slices, GGML_TYPE_Q8_0, true));
         }
     }
 
