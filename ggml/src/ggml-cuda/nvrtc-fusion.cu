@@ -1048,9 +1048,10 @@ struct nf_gen {
                 return "0.0f";
         }
         const std::string v = var();
-        if (t->type == GGML_TYPE_F16 && t->op != GGML_OP_CPY) {
+        // F16/BF16 results, copies included, are rounded: a reader in the same kernel sees what it would load
+        if (t->type == GGML_TYPE_F16) {
             line("const float " + v + " = rnd_f16(" + r + ");");
-        } else if (t->type == GGML_TYPE_BF16 && t->op != GGML_OP_CPY) {
+        } else if (t->type == GGML_TYPE_BF16) {
             line("const float " + v + " = rnd_bf16(" + r + ");");
         } else {
             line("const float " + v + " = " + r + ";");

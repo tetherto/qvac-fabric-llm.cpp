@@ -6455,6 +6455,13 @@ struct test_qwen35_elementwise : public test_case {
                     out = ggml_add(ctx, out, ggml_view_2d(ctx, h, m, n_t, h->nb[1], 0));
                 }
             } break;
+            case 8: {
+                // a copy to F16/BF16 read back in the same kernel: out is exactly the rounding error of x
+                ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, n_t);
+                ggml_tensor * h = ggml_cpy(ctx, x, ggml_new_tensor_2d(ctx, type, ne0, n_t));
+                ggml_tensor * f = ggml_cpy(ctx, h, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, n_t));
+                out = ggml_sub(ctx, f, x);
+            } break;
             default: {
                 // mixed types with broadcasting, stored as another type
                 ggml_tensor * a = ggml_new_tensor_3d(ctx, type, ne0, n_t, n_s);
@@ -17787,6 +17794,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qwen35_elementwise(6, 5120, n_t));
         test_cases.emplace_back(new test_qwen35_elementwise(7, 5120, n_t));
     }
+    test_cases.emplace_back(new test_qwen35_elementwise(8, 1024, 64, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_qwen35_elementwise(8, 1024, 64, 1, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_ssm_conv_direct(10240, 257, 1, 1));     // Flash-Next channels
     test_cases.emplace_back(new test_ssm_conv_direct(256, 64, 1, 1, true));  // another whole-concat reader: no fusion
 
