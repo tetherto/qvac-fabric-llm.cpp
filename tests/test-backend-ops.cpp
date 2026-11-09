@@ -15771,6 +15771,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 128, 64,  512, {2, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 256, 300, 1024, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 64,  48,  256, {1, 1}, {1, 1}, {0, 1, 2, 3}, 384));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 16, 2105344, 32, {1, 1}, {1, 1}, {0, 1, 2, 3}, 40));
 
     for (int32_t group_size : {4, 16, 64, 256, 1024}) {
         for (bool inplace : {false, true}) {
