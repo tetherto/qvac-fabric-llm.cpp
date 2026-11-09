@@ -457,11 +457,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
-    // in place for decode: only the concat below reads the conv states, and the write-back of the new states
-    // depends on it. with several tokens per seq they are gathered, so that a fused concat + conv + write-back
-    // (the CUDA NVRTC pass) does not read and write the same cache rows; the copy is small
-    const bool in_place = ubatch.n_seq_tokens == 1;
-    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs, nullptr, in_place);
+    // gathered, not read in place: a fused concat + conv + write-back (the CUDA NVRTC pass) must not read and write
+    // the same cache rows, and decode and prompt ubatches build the same nodes, so the reserve covers both. the copy
+    // is small
+    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
