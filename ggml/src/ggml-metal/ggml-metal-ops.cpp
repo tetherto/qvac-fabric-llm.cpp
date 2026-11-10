@@ -3171,7 +3171,8 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
 // fused gate + up matrix-vector products followed by SWIGLU (see GGML_METAL_FUSION_MUL_MV_GLU)
 // split:   up/gate MUL_MAT(_ID) + GLU
 // stacked: ffn_gate_up_exps MUL_MAT_ID + GLU over its two halves (the VIEWs are elided)
-static int ggml_metal_op_mul_mv_glu(ggml_metal_op_t ctx, int idx, int n_fuse) {
+// with norm, a leading RMS_NORM + MUL is folded in as well (see GGML_METAL_FUSION_RMS_NORM_MUL_MV_GLU)
+static int ggml_metal_op_mul_mv_glu(ggml_metal_op_t ctx, int idx, int n_fuse, const ggml_tensor * norm = nullptr) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
@@ -3192,13 +3193,20 @@ static int ggml_metal_op_mul_mv_glu(ggml_metal_op_t ctx, int idx, int n_fuse) {
     const ggml_tensor * gate_w = stacked ? up->src[0]     : glu->src[0]->src[0];
 
     const ggml_tensor * src0 = up->src[0];
-    const ggml_tensor * src1 = up->src[1];
+    const ggml_tensor * src1 = norm ? norm->src[0] : up->src[1];
     const ggml_tensor * ids  = up->src[2];
+
+    float eps = 0.0f;
+    if (norm) {
+        GGML_ASSERT(up->op == GGML_OP_MUL_MAT && !stacked);
+        memcpy(&eps, norm->op_params, sizeof(float));
+    }
 
     ggml_metal_buffer_id bid_up   = ggml_metal_get_buffer_id(src0);
     ggml_metal_buffer_id bid_gate = ggml_metal_get_buffer_id(gate_w);
     ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(src1);
     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(glu);
+    ggml_metal_buffer_id bid_w    = norm ? ggml_metal_get_buffer_id(ctx->node(idx + 1)->src[1]) : bid_src1;
 
     if (stacked) {
         bid_up.offs += (size_t) glu->ne[0] * src0->nb[1];
@@ -3279,7 +3287,7 @@ static int ggml_metal_op_mul_mv_glu(ggml_metal_op_t ctx, int idx, int n_fuse) {
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0*nsg - 1)/(nr0*nsg), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
         }
     } else {
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_glu(lib, up);
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_glu(lib, up, norm != nullptr);
 
         const int nr0 = pipeline.nr0;
         const int nr1 = pipeline.nr1;
@@ -3310,7 +3318,7 @@ static int ggml_metal_op_mul_mv_glu(ggml_metal_op_t ctx, int idx, int n_fuse) {
             /*.nr0  =*/ nr0,
             /*.r2   =*/ r2,
             /*.r3   =*/ r3,
-            /*.eps  =*/ 0.0f,
+            /*.eps  =*/ eps,
         };
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -3319,6 +3327,7 @@ static int ggml_metal_op_mul_mv_glu(ggml_metal_op_t ctx, int idx, int n_fuse) {
         ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
         ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
         ggml_metal_encoder_set_buffer  (enc, bid_gate, 4);
+        ggml_metal_encoder_set_buffer  (enc, bid_w,    5);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
@@ -3331,8 +3340,8 @@ static int ggml_metal_op_mul_mv_glu(ggml_metal_op_t ctx, int idx, int n_fuse) {
     }
 
     if (ggml_metal_fusion_info_debug(ctx->finfo) > 0) {
-        GGML_LOG_INFO("%s: fused %s + GLU (%s)\n",
-                __func__, ggml_op_name(up->op), stacked ? "stacked" : "split");
+        GGML_LOG_INFO("%s: fused %s%s + GLU (%s)\n",
+                __func__, norm ? "RMS_NORM + MUL + " : "", ggml_op_name(up->op), stacked ? "stacked" : "split");
     }
 
     return n_fuse;
@@ -6242,6 +6251,11 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_RMS_NORM_MUL_MV) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_rms_norm_mul_mv(ctx, idx, n);
+        }
+
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_RMS_NORM_MUL_MV_GLU) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_mul_mv_glu(ctx, idx, n, op);
         }
 
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_RMS_NORM_ROPE) {

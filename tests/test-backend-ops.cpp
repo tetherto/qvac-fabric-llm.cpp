@@ -12187,6 +12187,74 @@ struct test_rms_norm_mul_mv : public test_case {
     }
 };
 
+// RMS_NORM + MUL (weight) feeding a gate/up pair and its SWIGLU, as ffn_norm -> FFN; a backend may fold the norm into
+// the fused gate/up kernel. extra_use gives the normalized row another consumer and n > 1 rows make it a mat-mat
+struct test_rms_norm_mul_mv_glu : public test_case {
+    const ggml_type type_a;
+    const int64_t k;
+    const int64_t m;
+    const int64_t n;
+    const bool extra_use;
+
+    static constexpr const char * fusion_label = "RMS_NORM+MUL+MUL_MAT+MUL_MAT+GLU";
+
+    mutable bool has_fusion_label = false;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, k, m, n, extra_use);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MV_GLU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const int64_t count = backend_fusion_label_count(backend, fusion_label);
+        has_fusion_label = count >= 0;
+        return has_fusion_label ? (uint64_t) count : 0;
+    }
+
+    bool fusable() const { return type_a == GGML_TYPE_Q4_0 && n == 1 && !extra_use; }
+
+    bool expect_fusion()    override { return has_fusion_label &&  fusable(); }
+    bool expect_no_fusion() override { return has_fusion_label && !fusable(); }
+
+    test_rms_norm_mul_mv_glu(ggml_type type_a = GGML_TYPE_Q4_0, int64_t k = 2560, int64_t m = 1024, int64_t n = 1, bool extra_use = false)
+        : type_a(type_a), k(k), m(m), n(n), extra_use(extra_use) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+
+        ggml_tensor * a_gate = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a_gate, "a_gate");
+        ggml_tensor * a_up   = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a_up, "a_up");
+
+        ggml_tensor * out = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, a_gate, cur), ggml_mul_mat(ctx, a_up, cur));
+
+        // compare whole rows: a sum of the outputs would amplify the rounding by cancellation
+        if (extra_use) {
+            out = ggml_concat(ctx, out, ggml_scale(ctx, cur, 2.0f), 0);
+        }
+
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // RMS_NORM + MUL (weight) + ROPE over the full row width, as the per-head Q/K norms of Qwen3, optionally followed by
 // SET_ROWS of the rotated rows into a cache through a 2D view, as the K-cache write. a backend may fuse the chain;
 // n_dims < ne0 (partial rotation) and extra_use (the normalized rows have another consumer) must keep it unfused
@@ -17049,6 +17117,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_mul_mv(type, 2560,  256, 3, 4));       // 4 rows: keep the norm
     }
     test_cases.emplace_back(new test_rms_norm_mul_mv(GGML_TYPE_Q8_0, 2560, 256, 2));   // no fused kernel: keep the norm
+
+    // RMS_NORM + MUL folded into the decode gate/up + SWIGLU kernel (5120 x 17408 = Qwen3.5 27B FFN)
+    test_cases.emplace_back(new test_rms_norm_mul_mv_glu(GGML_TYPE_Q4_0, 2560, 1024));
+    test_cases.emplace_back(new test_rms_norm_mul_mv_glu(GGML_TYPE_Q4_0, 5120, 17408));
+    test_cases.emplace_back(new test_rms_norm_mul_mv_glu(GGML_TYPE_Q4_0,  256,   33));
+    test_cases.emplace_back(new test_rms_norm_mul_mv_glu(GGML_TYPE_Q4_0, 2560, 1024, 4));       // 4 rows: no fusion
+    test_cases.emplace_back(new test_rms_norm_mul_mv_glu(GGML_TYPE_Q4_0, 2560, 1024, 1, true)); // other use: no fusion
+    test_cases.emplace_back(new test_rms_norm_mul_mv_glu(GGML_TYPE_Q8_0, 2560, 1024));          // no fused kernel
 
     // one src1 row: the Q4_0 and MXFP4 mat-vec stores add the residual (Q8_0 has no such kernel and keeps the ADD)
     for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_MXFP4, GGML_TYPE_Q8_0}) {

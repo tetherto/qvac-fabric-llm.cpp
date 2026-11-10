@@ -1824,7 +1824,7 @@ static bool ggml_metal_mul_mv_glu_type_supported(enum ggml_type type) {
     }
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_glu(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_glu(ggml_metal_library_t lib, const ggml_tensor * op, bool norm) {
     GGML_TENSOR_LOCALS(int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(int32_t, ne1, op->src[1], ne);
 
@@ -1888,8 +1888,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_glu(ggml_
     const int16_t r2 = (int16_t) (ne12 / ne02);
     const int16_t r3 = (int16_t) (ne13 / ne03);
 
+    // the norm variant (a fused RMS_NORM + MUL) exists for Q4_0 only
+    GGML_ASSERT(!norm || tsrc0 == GGML_TYPE_Q4_0);
+
+    if (norm) {
+        nr0 = N_R0_Q4_0_GLU_NORM;
+    }
+
     snprintf(base, 256, "kernel_mul_mv_glu_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d", base, nsg, ne12, r2, r3);
+    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_norm=%d", base, nsg, ne12, r2, r3, norm);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1899,6 +1906,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_glu(ggml_
         ggml_metal_cv_set_int16(cv, (int16_t) ne12, FC_MUL_MV + 2);
         ggml_metal_cv_set_int16(cv, r2,             FC_MUL_MV + 3);
         ggml_metal_cv_set_int16(cv, r3,             FC_MUL_MV + 4);
+        ggml_metal_cv_set_bool (cv, norm,           FC_MUL_MV + 8);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
