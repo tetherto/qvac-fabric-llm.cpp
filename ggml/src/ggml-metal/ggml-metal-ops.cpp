@@ -4411,9 +4411,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     const bool use_vec = ggml_metal_op_flash_attn_ext_use_vec(op);
 
-    // with kv_rows, the non-vec path gathers the referenced rows into a contiguous F16 buffer and
+    // with kv_rows and a few query rows (KV split), the half8x8 kernel reads the K/V rows through the lists, since a
+    // gather pass over all the listed rows costs more than the attention. the blk pass flags the blocks of consecutive
+    // rows in the list of each mask slice. large heads keep the gather: the kernel needs extra threadgroup memory for
+    // the scattered blocks of the lists
+    const bool rows_direct = has_rows && ggml_metal_op_flash_attn_ext_use_kv_split(op) &&
+        !ggml_metal_op_flash_attn_ext_use_tensor(op, props_dev->has_tensor) && ne00 < 512 && ne33 == ne03;
+
+    // otherwise the non-vec path gathers the referenced rows into a contiguous F16 buffer and
     // attends over it with the F16 kernel - quantized KV is first dequantized with the F16 pass
-    const bool rows_gather = has_rows && !use_vec;
+    const bool rows_gather = has_rows && !use_vec && !rows_direct;
 
     // the vec kernels dequantize the KV inline; no need for the F16 dequant pass in the sparse path
     const bool dequant_kv = !use_sparse && (rows_gather ?
@@ -4683,12 +4690,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 /*.nb33 =*/ nb33,
             };
 
-            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_blk(lib, op, nqptg, ncpsg);
+            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_blk(lib, op, nqptg, ncpsg, false);
 
             ggml_metal_encoder_set_pipeline(enc, pipeline0);
             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_src3, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_blk,  2);
+            ggml_metal_encoder_set_buffer  (enc, bid_src3, 3);
 
             const int32_t nblk1 = ((ne01 + nqptg - 1)/nqptg);
             const int32_t nblk0 = ((ne30 + ncpsg - 1)/ncpsg);
@@ -4822,12 +4830,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 /*.nb33 =*/ nb33,
             };
 
-            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_blk(lib, op, nqptg, ncpsg);
+            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_blk(lib, op, nqptg, ncpsg, rows_direct);
 
             ggml_metal_encoder_set_pipeline(enc, pipeline0);
             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_src3, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_blk,  2);
+            ggml_metal_encoder_set_buffer  (enc, rows_direct ? ggml_metal_get_buffer_id(kv_rows) : bid_src3, 3);
 
             const int32_t nblk1 = ((ne01 + nqptg - 1)/nqptg);
             const int32_t nblk0 = ((ne30 + ncpsg - 1)/ncpsg);
@@ -4841,7 +4850,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_op_concurrency_reset(ctx);
         }
 
-        const int is_q = !use_kv_f16 && ggml_is_quantized(op->src[1]->type) ? 1 : 0;
+        // the quantized K/V and the scattered blocks of the kv_rows lists are staged through a per-simdgroup scratch
+        const int is_q = (!use_kv_f16 && ggml_is_quantized(op->src[1]->type)) || rows_direct ? 1 : 0;
 
         // shared memory layout (halfs unless noted):
         //   queries/attn/result: Q*(DK + 2*PAD2(DV,64) + 4*C)
@@ -4870,7 +4880,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.nb03          =*/ nb03,
             /*.ne11          =*/ (int32_t) ne11_attn,
             /*.ne_12_2       =*/ ne12,
-            /*.ne_12_3       =*/ has_rows ? ne03 : ne13, // the gathered K/V holds one copy per stream
+            /*.ne_12_3       =*/ rows_gather ? ne03 : ne13, // the gathered K/V holds one copy per stream
             /*.ns10          =*/ ns10,
             /*.nb11          =*/ nb11_attn,
             /*.nb12          =*/ nb12_attn,
@@ -4899,7 +4909,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // workgroups: with the KV split each writes its unnormalized result to the temp buffer for the reduce kernel
         const int32_t nwg = ggml_metal_op_flash_attn_ext_use_kv_split(op) ? GGML_METAL_FA_KV_SPLIT_NWG : 1;
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg, use_kv_f16, ns10, ns20);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, rows_direct, nsg, nwg, use_kv_f16, ns10, ns20);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -4911,6 +4921,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
         ggml_metal_encoder_set_buffer  (enc, bid_blk,  7);
         ggml_metal_encoder_set_buffer  (enc, nwg > 1 ? bid_tmp : bid_dst, 8);
+        ggml_metal_encoder_set_buffer  (enc, rows_direct ? ggml_metal_get_buffer_id(kv_rows) : bid_src0, 9);
 
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
