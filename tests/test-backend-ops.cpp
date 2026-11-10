@@ -6700,12 +6700,18 @@ struct test_qwen35_elementwise : public test_case {
 // one decode step of the gated delta net conv: CONCAT(state, transpose(x)) -> SSM_CONV -> SILU, and the copy of the last 3
 // concat columns into the conv state cache, adjacent as the qwen35 graphs build it (Metal fuses them into one kernel).
 // with inplace the state is the cache row the copy writes. Verified nodes: the SiLU output and the new state.
+// with n_norm, the L2 norms of the first n_norm heads of hd channels follow (n_norm/2 q heads, then the k heads, as
+// build_gdn_l2_norm builds them), which Metal also folds into the kernel
 struct test_ssm_conv_state : public test_case {
     const int64_t channels, n_t, n_s;
     const bool inplace;
     const bool extra_reader; // a whole-concat reader: no fusion
+    const int64_t n_norm;
+    const int64_t hd;
 
-    static constexpr const char * fusion_label = "CONCAT+CPY+SSM_CONV+UNARY";
+    const char * fusion_label() const {
+        return n_norm > 0 ? "CONCAT+CPY+SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE" : "CONCAT+CPY+SSM_CONV+UNARY";
+    }
 
     mutable bool has_fusion_label = false;
 
@@ -6720,11 +6726,11 @@ struct test_ssm_conv_state : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
 
     std::string vars() override {
-        return VARS_TO_STR5(channels, n_t, n_s, inplace, extra_reader);
+        return VARS_TO_STR7(channels, n_t, n_s, inplace, extra_reader, n_norm, hd);
     }
 
     uint64_t fusion_count(ggml_backend_t backend) override {
-        const int64_t count = backend_fusion_label_count(backend, fusion_label);
+        const int64_t count = backend_fusion_label_count(backend, fusion_label());
         has_fusion_label = count >= 0;
         return has_fusion_label ? (uint64_t) count : 0;
     }
@@ -6732,8 +6738,9 @@ struct test_ssm_conv_state : public test_case {
     bool expect_fusion()    override { return has_fusion_label &&   n_t == 1 && !extra_reader;  }
     bool expect_no_fusion() override { return has_fusion_label && !(n_t == 1 && !extra_reader); }
 
-    test_ssm_conv_state(int64_t channels = 64, int64_t n_t = 1, int64_t n_s = 1, bool inplace = false, bool extra_reader = false)
-        : channels(channels), n_t(n_t), n_s(n_s), inplace(inplace), extra_reader(extra_reader) {}
+    test_ssm_conv_state(int64_t channels = 64, int64_t n_t = 1, int64_t n_s = 1, bool inplace = false, bool extra_reader = false,
+            int64_t n_norm = 0, int64_t hd = 128)
+        : channels(channels), n_t(n_t), n_s(n_s), inplace(inplace), extra_reader(extra_reader), n_norm(n_norm), hd(hd) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         verify.clear();
@@ -6770,6 +6777,22 @@ struct test_ssm_conv_state : public test_case {
             ggml_build_forward_expand(gf, out);
         }
         verify.push_back(out);
+
+        if (n_norm > 0) {
+            const int64_t nq = n_norm / 2;
+            const int64_t nk = n_norm - nq;
+            const size_t  nb_row = ggml_row_size(GGML_TYPE_F32, C);
+            ggml_tensor * q = ggml_view_4d(ctx, out, hd, nq, n_t, n_s, ggml_row_size(GGML_TYPE_F32, hd), nb_row, nb_row * n_t, 0);
+            ggml_tensor * k = ggml_view_4d(ctx, out, hd, nk, n_t, n_s, ggml_row_size(GGML_TYPE_F32, hd), nb_row, nb_row * n_t,
+                    ggml_row_size(GGML_TYPE_F32, nq * hd));
+            for (ggml_tensor * t : { q, k }) {
+                ggml_tensor * tn = ggml_scale(ctx, ggml_rms_norm(ctx, t, 1e-6f/hd), 1.0f/sqrtf((float) hd));
+                if (gf) {
+                    ggml_build_forward_expand(gf, tn);
+                }
+                verify.push_back(tn);
+            }
+        }
 
         if (extra_reader) {
             ggml_tensor * whole = ggml_scale(ctx, cc, 2.0f);
@@ -19020,6 +19043,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_ssm_conv_state(130, 2, 1, inplace));       // two new columns: no fusion
         test_cases.emplace_back(new test_ssm_conv_state(130, 1, 1, inplace, true)); // another concat reader: no fusion
+        // with the q/k L2 norms: 16 q + 16 k heads of 128 as in Qwen3.5 27B, and smaller heads
+        for (int64_t ns : {1, 2}) {
+            test_cases.emplace_back(new test_ssm_conv_state(10240, 1, ns, inplace, false, 32, 128));
+            test_cases.emplace_back(new test_ssm_conv_state(640,   1, ns, inplace, false, 4,  128));
+            test_cases.emplace_back(new test_ssm_conv_state(192,   1, ns, inplace, false, 2,  64));
+        }
+        test_cases.emplace_back(new test_ssm_conv_state(640, 2, 1, inplace, false, 4, 128)); // two new columns: no fusion
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
