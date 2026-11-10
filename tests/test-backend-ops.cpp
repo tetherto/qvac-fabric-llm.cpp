@@ -7846,11 +7846,15 @@ struct test_mul_mat : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        return build_graph(ctx, ctx);
+        return build_mul_mat(ctx, ctx);
     }
 
+    // without weights, call the 1-argument build_graph, which subclasses extend
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
-        ggml_context * ctx_a = weights ? ctx_weights : ctx;
+        return weights ? build_mul_mat(ctx, ctx_weights) : build_graph(ctx);
+    }
+
+    ggml_tensor * build_mul_mat(ggml_context * ctx, ggml_context * ctx_a) {
         GGML_ASSERT(ctx_a);
 
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
@@ -17976,6 +17980,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_pos(GGML_TYPE_Q5_K, GGML_TYPE_F32, 1000, 13, 4608, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 6170, 13, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1000, 21, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+    // the first column counts of the per-type few-row ranges that the lists above skip
+    for (int64_t n : {4, 6, 7, 17}) {
+        for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                                 GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 4608, {1, 1}, {1, 1}));
+        }
+    }
 
     // int8 MMQ with ragged M/N: M a multiple of 4 but not of the 16/32/64/128 tiles (packed rows end mid-tile),
     // odd M (per-element fallback), N not a multiple of the tile width
