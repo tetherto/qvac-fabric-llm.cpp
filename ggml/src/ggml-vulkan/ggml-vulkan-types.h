@@ -1041,6 +1041,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_fwht_f16[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_mul_mat_convrot_f32, pipeline_mul_mat_convrot_f16;
     vk_pipeline pipeline_convrot_f32;
+    vk_pipeline pipeline_rope_flux_f32;
     vk_pipeline pipeline_convrot_reconstruct_f32, pipeline_convrot_reconstruct_f16;
     vk_pipeline pipeline_convrot_convert_f32_f16, pipeline_convrot_convert_f16_f32, pipeline_convrot_round_f16;
     vk_pipeline pipeline_convrot_convert_i8_f16, pipeline_convrot_activation_split_f32, pipeline_convrot_activation_split_f16, pipeline_convrot_combine;

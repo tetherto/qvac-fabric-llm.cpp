@@ -1452,6 +1452,7 @@ void process_shaders() {
     string_to_spv("mul_mat_convrot_f32", "mul_mat_convrot.comp", {});
     string_to_spv("mul_mat_convrot_f16", "mul_mat_convrot.comp", {{"ACT_F16", "1"}});
     string_to_spv("convrot_f32", "convrot.comp", {});
+    string_to_spv("rope_flux_f32", "rope_flux.comp", {});
     string_to_spv("convrot_reconstruct_f32", "convrot_reconstruct.comp", {});
     string_to_spv("convrot_reconstruct_f16", "convrot_reconstruct.comp", {{"DST_F16", "1"}});
     string_to_spv("convrot_convert_f32_f16", "convrot_convert.comp", {{"DST_F16", "1"}});
