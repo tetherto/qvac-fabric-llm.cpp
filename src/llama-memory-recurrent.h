@@ -85,6 +85,10 @@ public:
     // overwrites the slot it replays from. rollback then only changes how many rows get replayed.
     bool    gdn_deferred = false;
     bool    gdn_inplace  = false; // update the base states in place (single cell only)
+
+    // without rollback snapshots or the deferred commit, a single cell always reads and writes its own row,
+    // so the graphs can use the cache rows in place instead of gathering them
+    bool    rs_inplace   = false;
     int64_t gdn_rec_size = 0; // floats per record slot
 
     int64_t gdn_conv_channels() const { return hparams.ssm_d_inner + 2*hparams.ssm_n_group*hparams.ssm_d_state; }

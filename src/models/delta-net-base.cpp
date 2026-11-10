@@ -457,7 +457,18 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
-    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    ggml_tensor * conv_states;
+    if (inp->s_base_inplace && !inp->rec_idx) {
+        // a single cell keeps its own conv state: read it from the cache row, which the cpy below updates
+        const int32_t rs_z = mctx_cur->get_rs_z();
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0,
+            ggml_view_1d(ctx0, conv_states_all, hparams.n_embd_r()*(rs_z >= 0), rs_z*conv_states_all->nb[1]*(rs_z >= 0)), 0));
+
+        conv_states = ggml_view_2d(ctx0, conv_states_all, hparams.n_embd_r(), n_seqs, conv_states_all->nb[1],
+                                   kv_head*conv_states_all->nb[1]);
+    } else {
+        conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    }
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
@@ -565,11 +576,11 @@ ggml_tensor * llm_build_delta_net_base::build_rs_ssm(
         llm_graph_input_rs * inp,
         ggml_tensor *        ssm_states_all,
         int64_t              n_seqs) {
-    if (!inp->rec_idx) {
+    const auto * mctx_cur = inp->mctx;
+
+    if (!inp->rec_idx && !inp->s_base_inplace) {
         return build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     }
-
-    const auto * mctx_cur = inp->mctx;
 
     if (inp->s_base_inplace) {
         // every cell keeps its own base state: no gather, the op reads and writes the cache rows

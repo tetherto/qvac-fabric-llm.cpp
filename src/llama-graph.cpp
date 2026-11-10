@@ -4040,9 +4040,9 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
         inp->rec_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 3, n_seqs);
         ggml_set_input(inp->rec_idx);
-
-        inp->s_base_inplace = mctx_cur->get_s_base_inplace(n_seqs);
     }
+
+    inp->s_base_inplace = mctx_cur->get_s_base_inplace(n_seqs);
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
