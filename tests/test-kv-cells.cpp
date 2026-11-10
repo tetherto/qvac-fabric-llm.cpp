@@ -308,7 +308,10 @@ static void test_seq_cells_match_brute_force() {
                     expected.push_back(c);
                 }
             }
-            expected.resize(N_CELLS, -1);
+            // padding: the cells after the last listed one, then -1 past the end of the cache
+            for (int32_t c = expected.empty() ? 0 : expected.back() + 1; expected.size() < N_CELLS; ++c) {
+                expected.push_back(c < (int32_t) N_CELLS ? c : -1);
+            }
 
             GGML_ASSERT(std::equal(expected.begin(), expected.end(), data.begin() + is*N_CELLS));
         }
