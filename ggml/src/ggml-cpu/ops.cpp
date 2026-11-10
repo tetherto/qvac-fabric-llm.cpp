@@ -7433,6 +7433,65 @@ void ggml_compute_forward_rope_back(
     }
 }
 
+// ggml_compute_forward_rope_flux
+
+static void ggml_rope_flux_copy_row(const char * src_row, size_t nb0, int64_t d_head, float * dst_row) {
+    for (int64_t d = 0; d < d_head; ++d) {
+        dst_row[d] = *(const float *) (src_row + d*nb0);
+    }
+}
+
+static void ggml_rope_flux_rotate_row(
+        const char * src_row, size_t nb0, const ggml_tensor * pe, const char * pe_row, int64_t n_pairs, float * dst_row) {
+    for (int64_t pair = 0; pair < n_pairs; ++pair) {
+        const char * x = src_row + 2*pair*nb0;
+        const char * m = pe_row + pair*pe->nb[2];
+
+        const float x_even = *(const float *) x;
+        const float x_odd  = *(const float *) (x + nb0);
+
+        dst_row[2*pair]     = x_even * *(const float *) m               + x_odd * *(const float *) (m + pe->nb[0]);
+        dst_row[2*pair + 1] = x_even * *(const float *) (m + pe->nb[1]) + x_odd * *(const float *) (m + pe->nb[1] + pe->nb[0]);
+    }
+}
+
+static void ggml_rope_flux_rows(const ggml_tensor * dst, int64_t r0, int64_t r1) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * pe   = dst->src[1];
+
+    const int64_t d_head = src0->ne[0];
+    const int64_t n_head = src0->ne[1];
+    const int64_t L      = src0->ne[2];
+
+    for (int64_t row = r0; row < r1; ++row) {
+        const int64_t l  = row % L;
+        const int64_t bh = row / L;
+
+        const char * src_row = (const char *) src0->data + (bh / n_head)*src0->nb[3] + l*src0->nb[2] + (bh % n_head)*src0->nb[1];
+        float * dst_row = (float *) dst->data + row*d_head;
+
+        if (pe == nullptr) {
+            ggml_rope_flux_copy_row(src_row, src0->nb[0], d_head, dst_row);
+        } else {
+            ggml_rope_flux_rotate_row(src_row, src0->nb[0], pe, (const char *) pe->data + l*pe->nb[3], d_head/2, dst_row);
+        }
+    }
+}
+
+void ggml_compute_forward_rope_flux(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n_rows = ggml_nrows(dst);
+    const int64_t dr = (n_rows + params->nth - 1) / params->nth;
+    const int64_t r0 = dr * params->ith;
+    const int64_t r1 = MIN(r0 + dr, n_rows);
+
+    ggml_rope_flux_rows(dst, r0, r1);
+}
+
 // ggml_compute_forward_conv_transpose_1d
 
 static void ggml_compute_forward_conv_transpose_1d_f16_f32(

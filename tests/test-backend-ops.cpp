@@ -8372,6 +8372,50 @@ struct test_convrot : public test_case {
     }
 };
 
+// GGML_OP_ROPE_FLUX
+struct test_rope_flux : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool with_pe;
+    const bool permuted;
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, with_pe, permuted);
+    }
+
+    test_rope_flux(std::array<int64_t, 4> ne = {64, 3, 17, 2}, bool with_pe = true, bool permuted = false)
+        : ne(ne), with_pe(with_pe), permuted(permuted) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x;
+        if (permuted) {
+            ggml_tensor * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[2], ne[1], ne[3]);
+            ggml_set_name(storage, "x_storage");
+            x = ggml_permute(ctx, storage, 0, 2, 1, 3);
+        } else {
+            x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        }
+        ggml_set_name(x, "x");
+
+        ggml_tensor * pe = nullptr;
+        if (with_pe) {
+            pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, ne[0] / 2, ne[2]);
+            ggml_set_name(pe, "pe");
+        }
+
+        ggml_tensor * out = ggml_rope_flux(ctx, x, pe);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->view_src) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_HINT_SRC0_IS_CONVROT_H256; the scale in front gives the hinted matmul a GPU producer
 struct test_mul_mat_convrot_h256 : public test_case {
     const int64_t n;
@@ -16073,6 +16117,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_convrot_h256(1,   1, false));
     test_cases.emplace_back(new test_mul_mat_convrot_h256(257, 3, false));
     test_cases.emplace_back(new test_mul_mat_convrot_h256(257, 3, true));
+
+    for (bool with_pe : {true, false}) {
+        for (bool permuted : {false, true}) {
+            test_cases.emplace_back(new test_rope_flux({64,  3,  17, 2}, with_pe, permuted));
+            test_cases.emplace_back(new test_rope_flux({128, 24, 33, 1}, with_pe, permuted));
+        }
+    }
+    test_cases.emplace_back(new test_rope_flux({2, 1, 1, 1}, true, false));
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
