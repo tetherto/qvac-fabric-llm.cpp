@@ -9395,6 +9395,30 @@ void ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tenso
     cgraph->n_nodes++;
 }
 
+struct ggml_tensor * ggml_graph_leaf(struct ggml_cgraph * cgraph, int i) {
+    if (i < 0) {
+        GGML_ASSERT(cgraph->n_leafs + i >= 0);
+        return cgraph->leafs[cgraph->n_leafs + i];
+    }
+
+    GGML_ASSERT(i < cgraph->n_leafs);
+    return cgraph->leafs[i];
+}
+
+struct ggml_tensor ** ggml_graph_leafs(struct ggml_cgraph * cgraph) {
+    return cgraph->leafs;
+}
+
+int ggml_graph_n_leafs(struct ggml_cgraph * cgraph) {
+    return cgraph->n_leafs;
+}
+
+void ggml_graph_add_leaf(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
+    GGML_ASSERT(cgraph->size > cgraph->n_leafs);
+    cgraph->leafs[cgraph->n_leafs] = tensor;
+    cgraph->n_leafs++;
+}
+
 struct ggml_tensor * ggml_graph_get_tensor(const struct ggml_cgraph * cgraph, const char * name) {
     for (int i = 0; i < cgraph->n_leafs; i++) {
         struct ggml_tensor * leaf = cgraph->leafs[i];
