@@ -155,6 +155,26 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
     return p.eps();
 }
 
+// What may precede a required tool call: the reasoning block and whitespace, nothing else. Optional content before the
+// call lets the model answer in text and never reach it, since the grammar accepts end of generation only after a call.
+// Without reasoning extraction the block is kept as content, so a thinking model can still think before calling.
+static common_peg_parser build_required_call_preamble(parser_build_context & ctx) {
+    const analyze_reasoning * reasoning = ctx.reasoning;
+    if (ctx.extracting_reasoning || reasoning == nullptr || reasoning->end.empty() ||
+        (reasoning->mode != reasoning_mode::TAG_BASED && reasoning->mode != reasoning_mode::TOOLS_ONLY)) {
+        return ctx.reasoning_parser;
+    }
+
+    auto &            p   = ctx.p;
+    const std::string end = trim_whitespace(reasoning->end);
+    if (!reasoning->start.empty()) {
+        // The peek keeps a partial start tag, which may yet turn into the call, from streaming out as content.
+        return p.optional(p.peek(p.optspace(reasoning->start)) +
+                          p.content(p.optspace(reasoning->start) + p.until(end) + p.optspace(reasoning->end)));
+    }
+    return p.optional(p.content(p.until(end) + p.optspace(reasoning->end)));
+}
+
 common_peg_parser analyze_content::build_parser(parser_build_context & ctx) const {
     auto & p = ctx.p;
 
@@ -218,6 +238,10 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
             format.section_start, format.section_end, inputs.tools, inputs.parallel_tool_calls,
             inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED, name_field, args_field, format.tools_array_wrapped,
             format.fun_name_is_key, format.id_field, format.gen_id_field, format.parameter_order, format.openai_wrapper_trigger);
+    }
+
+    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+        return build_required_call_preamble(ctx) + p.space() + tools_parser + p.end();
     }
 
     // Handle content wrappers if present
@@ -350,6 +374,10 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
         tool_calls = p.optional(tool_calls);
     }
 
+    if (require_calls) {
+        return build_required_call_preamble(ctx) + p.space() + tool_calls + p.end();
+    }
+
     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
     return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
@@ -467,6 +495,10 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
 
     if (!require_tools) {
         tool_calls = p.optional(tool_calls);
+    }
+
+    if (require_tools) {
+        return build_required_call_preamble(ctx) + p.space() + tool_calls + p.end();
     }
 
     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
