@@ -75,3 +75,33 @@ jobs:
         run: |
           git lfs install
           GG_BUILD_METAL=1 bash ./ci/run.sh ~/results/llama.cpp/$RUNNER_NAME ~/mnt/llama.cpp
+
+      - name: Test SIGLU and masked attention independently
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          test -x build-ci-debug/bin/test-backend-ops
+          status=0
+          for op in SIGLU FLASH_ATTN_EXT_MASKED_VALUES; do
+            log="build-ci-debug/${op}.log"
+            if build-ci-debug/bin/test-backend-ops -b MTL0 -o "$op" 2>&1 | tee "$log"; then
+              grep -Eq '[1-9][0-9]*/[1-9][0-9]* tests passed' "$log" || status=1
+            else
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Preserve failing Metal fixtures and logs
+        if: ${{ failure() && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: metal-failure-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 7
+          compression-level: 0
+          path: |
+            build-ci-*/CMakeCache.txt
+            build-ci-*/Testing/Temporary/*.log
+            build-ci-*/*.log
+            build-ci-*/tests/**/*.log
+            build-ci-*/tests/test-models/*.gguf

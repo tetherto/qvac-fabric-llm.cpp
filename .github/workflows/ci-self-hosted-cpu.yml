@@ -73,6 +73,36 @@ jobs:
           git lfs install
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp/$RUNNER_NAME ~/mnt/llama.cpp
 
+      - name: Diagnose k-pool with AMX disabled
+        if: ${{ failure() && !cancelled() }}
+        shell: bash
+        run: |
+          if ! grep -q 'FAIL: GLM5 k-pool' build-ci-debug/Testing/Temporary/LastTest.log; then
+            exit 0
+          fi
+          mkdir -p build-ci-noamx
+          cat > build-ci-noamx/no-amx <<'EOF'
+          #!/bin/bash
+          exec "$@" -mno-amx-tile -mno-amx-int8 -mno-amx-bf16
+          EOF
+          chmod +x build-ci-noamx/no-amx
+          cmake -S . -B build-ci-noamx -DCMAKE_BUILD_TYPE=Debug \
+            -DLLAMA_OPENSSL=OFF -DGGML_SCHED_NO_REALLOC=ON -DGGML_NATIVE=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER="$PWD/build-ci-noamx/no-amx" \
+            -DCMAKE_CXX_COMPILER_LAUNCHER="$PWD/build-ci-noamx/no-amx"
+          cmake --build build-ci-noamx --target test-llama-archs -j "$(nproc)"
+          ctest --test-dir build-ci-noamx --output-on-failure -R '^test-glm5-kpool-sequences$'
+
+      - name: Preserve failing CPU logs
+        if: ${{ failure() && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: cpu-failure-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 7
+          path: |
+            build-ci-*/CMakeCache.txt
+            build-ci-*/Testing/Temporary/*.log
+
   cpu-arm64-high-perf-graviton4:
     if: false  # QVAC-23796: no matching hardware
     runs-on: ah-ubuntu_24_04-c8g_8x
