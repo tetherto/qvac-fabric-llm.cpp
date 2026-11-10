@@ -1247,6 +1247,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_convrot(ggml_met
     return ggml_metal_library_get_or_compile(lib, "kernel_convrot_f32");
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope_flux(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+
+    return ggml_metal_library_get_or_compile(lib, op->src[1] ? "kernel_rope_flux" : "kernel_rope_flux_permute");
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op, bool add, bool norm) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);

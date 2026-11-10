@@ -438,3 +438,51 @@ template [[host_name("kernel_rope_multi_f16")]] kernel kernel_rope_multi_t kerne
 
 template [[host_name("kernel_rope_vision_f32")]] kernel kernel_rope_vision_t kernel_rope_vision<float>;
 template [[host_name("kernel_rope_vision_f16")]] kernel kernel_rope_vision_t kernel_rope_vision<half>;
+
+kernel void kernel_rope_flux(
+        constant ggml_metal_kargs_rope_flux & args,
+        device const char * src0,
+        device const char * src1,
+        device       float * dst,
+        uint tid [[thread_position_in_grid]]) {
+    const uint total = (uint) args.d_head * (uint) args.L * (uint) args.N * (uint) args.n_head;
+    if (tid >= total) {
+        return;
+    }
+
+    const int d  = tid % args.d_head;
+    const int l  = (tid / args.d_head) % args.L;
+    const int bh = tid / (args.d_head * args.L);
+    const int h  = bh % args.n_head;
+    const int n  = bh / args.n_head;
+
+    const int pair = d / 2;
+    const int comp = d % 2;
+
+    device const char * x = src0 + n*args.nb03 + l*args.nb02 + h*args.nb01 + (2*pair)*args.nb00;
+    device const char * m = src1 + l*args.pe_nb3 + pair*args.pe_nb2 + comp*args.pe_nb1;
+
+    const float x_even = *(device const float *) x;
+    const float x_odd  = *(device const float *) (x + args.nb00);
+
+    dst[tid] = x_even * *(device const float *) m + x_odd * *(device const float *) (m + args.pe_nb0);
+}
+
+kernel void kernel_rope_flux_permute(
+        constant ggml_metal_kargs_rope_flux & args,
+        device const char * src0,
+        device       float * dst,
+        uint tid [[thread_position_in_grid]]) {
+    const uint total = (uint) args.d_head * (uint) args.L * (uint) args.N * (uint) args.n_head;
+    if (tid >= total) {
+        return;
+    }
+
+    const int d  = tid % args.d_head;
+    const int l  = (tid / args.d_head) % args.L;
+    const int bh = tid / (args.d_head * args.L);
+    const int h  = bh % args.n_head;
+    const int n  = bh / args.n_head;
+
+    dst[tid] = *(device const float *) (src0 + n*args.nb03 + l*args.nb02 + h*args.nb01 + d*args.nb00);
+}
