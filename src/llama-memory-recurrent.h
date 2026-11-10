@@ -89,6 +89,10 @@ public:
     // the graph takes ragged ubatches (llama_batch_allocr::split_ragged): the conv and gated delta net ops
     // get per-sequence token ranges, so one ubatch can mix sequences of different lengths
     bool    rs_ragged    = false;
+
+    // without rollback snapshots or the deferred commit, a single cell always reads and writes its own row,
+    // so the graph reads its conv state in place instead of gathering it (the ssm states are always read in place)
+    bool    rs_inplace   = false;
     int64_t gdn_rec_size = 0; // floats per record slot
 
     int64_t gdn_conv_channels() const { return hparams.ssm_d_inner + 2*hparams.ssm_n_group*hparams.ssm_d_state; }

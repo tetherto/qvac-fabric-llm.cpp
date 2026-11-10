@@ -42,6 +42,7 @@
 #define N_SG_Q4_0 2
 // glu holds 2 accs per row, so use fewer rows per simdgroup
 #define N_R0_Q4_0_GLU 1
+#define N_R0_Q4_0_GLU_NORM 2 // the norm variant also reads the norm weight: more rows per simdgroup share both reads
 
 #define N_R0_Q4_1 4
 #define N_SG_Q4_1 2
@@ -1189,6 +1190,35 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
 } ggml_metal_kargs_ssm_conv;
+
+typedef struct {
+    int32_t  C;     // channels
+    uint64_t nb01;  // conv state [3, C, n_seqs] strides
+    uint64_t nb02;
+    uint64_t nb11;  // new input [1, C, n_seqs] strides
+    uint64_t nb12;
+    uint64_t nb2;   // dst [C, 1, n_seqs] seq stride
+    uint64_t nbs1;  // new conv state [3*C, n_seqs] row stride
+} ggml_metal_kargs_ssm_conv_state;
+
+typedef struct {
+    int32_t  hd;    // head size (channels per simdgroup), at most 128
+    int32_t  n_q;   // leading heads L2-normalized into dst_q
+    int32_t  n_k;   // next heads L2-normalized into dst_k
+    float    eps;   // of the RMS_NORM
+    float    scale; // of the SCALE
+    float    bias;
+    uint64_t nb01;  // conv state [3, C, n_seqs] strides
+    uint64_t nb02;
+    uint64_t nb11;  // new input [1, C, n_seqs] strides
+    uint64_t nb12;
+    uint64_t nb2;   // dst [C, 1, n_seqs] seq stride
+    uint64_t nbs1;  // new conv state [3*C, n_seqs] row stride
+    uint64_t nbq1;  // dst_q [hd, n_q, 1, n_seqs] strides
+    uint64_t nbq3;
+    uint64_t nbk1;  // dst_k [hd, n_k, 1, n_seqs] strides
+    uint64_t nbk3;
+} ggml_metal_kargs_ssm_conv_state_norm;
 
 typedef struct {
     int64_t  d_state;

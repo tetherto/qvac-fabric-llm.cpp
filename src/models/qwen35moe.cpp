@@ -384,6 +384,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
+    // the norm feeds the four input projections: keep them together, so backends can fold the norm into them
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_build_forward_expand(gf, z);
+    ggml_build_forward_expand(gf, beta);
+
     // with the deferred commit the gdn op activates the gates itself
     const bool raw_gates = inp->rec_idx != nullptr;
 
@@ -395,6 +400,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
+    ggml_build_forward_expand(gf, alpha);
 
     ggml_tensor * gate = alpha;
     if (!raw_gates) {
@@ -445,11 +451,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
         conv_qkv_mix = ggml_silu(ctx0, conv_output_proper);
         cb(conv_qkv_mix, "conv_output_silu", il);
-    }
 
-    ggml_tensor * state = build_rs_ssm(inp, ssm_states_all, n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
+        // right after the conv state copy, so backends can fuse the conv step with it
+        ggml_build_forward_expand(gf, conv_qkv_mix);
+    }
 
     // Calculate the total conv dimension
     int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
@@ -484,7 +489,15 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     if (!deferred) {
         q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
         k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+
+        // right after the conv step, so backends can fuse the norms with it
+        ggml_build_forward_expand(gf, q_conv);
+        ggml_build_forward_expand(gf, k_conv);
     }
+
+    ggml_tensor * state = build_rs_ssm(inp, ssm_states_all, n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    cb(state, "state_predelta", il);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
