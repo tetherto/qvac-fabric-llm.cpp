@@ -43,6 +43,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq-cutlass.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmq-few.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmid-back.cuh"
@@ -2890,6 +2891,11 @@ static void ggml_cuda_mul_mat_canonical(
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false) &&
             !ggml_cuda_mul_mat_requests_full_f32(src0, src1, dst)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // from a per-type number of src1 columns up to 24, few-row MMQ is faster than MMVQ and MMQ
+    if (ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
+        ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
