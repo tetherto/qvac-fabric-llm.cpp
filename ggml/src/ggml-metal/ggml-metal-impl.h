@@ -657,6 +657,44 @@ typedef struct {
     float    eps; // fused RMS_NORM (FC_mul_mv_norm)
 } ggml_metal_kargs_mul_mv;
 
+// native mode rotates the activations once before a tiled FP32 I8 matmul;
+// the F16 compatibility mode reconstructs F16 weight tiles
+typedef struct {
+    int32_t  k;
+    int32_t  out_features;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    int32_t  f16_compat;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb20;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_mul_mat_convrot;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    int32_t  group_size;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_convrot;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

@@ -187,6 +187,33 @@ struct vk_op_fwht_push_constants {
     float scale;
 };
 
+struct vk_op_mul_mat_convrot_push_constants {
+    uint32_t k;
+    uint32_t ne02;
+    uint32_t a_offset;
+    uint32_t w_offset;
+    uint32_t s_offset;
+    uint32_t d_offset;
+};
+
+struct vk_op_convrot_push_constants {
+    uint32_t group_size;
+    uint32_t groups_per_row;
+    uint32_t ne01;
+    uint32_t ne02;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+    uint32_t nb0;
+    uint32_t nb1;
+    uint32_t nb2;
+    uint32_t nb3;
+    uint32_t src_offset;
+    uint32_t dst_offset;
+    uint32_t total_groups;
+};
+
 struct vk_op_dsv4_hc_comb_push_constants {
     uint32_t n_tokens;
 

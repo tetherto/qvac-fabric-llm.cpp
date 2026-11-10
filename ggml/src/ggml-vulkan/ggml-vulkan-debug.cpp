@@ -771,6 +771,7 @@ int64_t ggml_vk_get_op_batch_size(const ggml_tensor * op) {
         case GGML_OP_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_CONVROT:
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_ROPE:
@@ -968,6 +969,11 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             }
         } else if (tensor->op == GGML_OP_MUL_MAT) {
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_MUL_MAT_CONVROT) {
+            tensor_clone = ggml_mul_mat_convrot(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], ggml_get_op_params_i32(tensor, 0));
+            ggml_mul_mat_convrot_set_f16_compat(tensor_clone, ggml_get_op_params_i32(tensor, 1) != 0);
+        } else if (tensor->op == GGML_OP_CONVROT) {
+            tensor_clone = ggml_convrot(ggml_ctx, src_clone[0], ggml_get_op_params_i32(tensor, 0));
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {
             tensor_clone = ggml_mul_mat_id(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID_BACK_A) {
