@@ -4387,8 +4387,9 @@ size_t ggml_metal_op_flash_attn_ext_extra_rows(const ggml_tensor * op) {
 }
 
 // grouping the heads pays off when the K/V reads dominate: a single tile of query rows over an F16 cache
+// with kv_rows, only for a single slice: concurrent sequences decode into interleaved cells, and scattered row lists run faster without grouping
 static bool ggml_metal_op_flash_attn_ext_vec_can_group_heads(const ggml_tensor * op, bool use_sparse, int nqptg) {
-    return !use_sparse && op->src[5] == nullptr &&
+    return !use_sparse && (op->src[5] == nullptr || op->src[0]->ne[3] == 1) &&
         op->src[0]->ne[1] <= nqptg &&
         op->src[1]->type == GGML_TYPE_F16 &&
         op->src[2]->type == GGML_TYPE_F16;
