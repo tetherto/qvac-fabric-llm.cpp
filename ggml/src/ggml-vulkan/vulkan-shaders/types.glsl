@@ -309,6 +309,12 @@ struct block_q8_1_x4
     int32_t qs[32];
 };
 
+struct block_q8_1_x4_packed64
+{
+    f16vec2 ds[4];
+    ivec2 qs[16];
+};
+
 struct block_q8_1_x4_packed128
 {
     f16vec2 ds[4];
