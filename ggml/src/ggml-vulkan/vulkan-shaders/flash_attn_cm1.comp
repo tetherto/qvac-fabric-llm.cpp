@@ -66,6 +66,7 @@ const uint32_t osh_stride = row_split * MatBr / 4;
 shared O_TYPEV4 pvsh[MatBc * osh_stride];
 
 shared ACC_TYPE slope[Br];
+shared uint32_t v_visible[Bc];
 
 #ifdef HAS_QJL_CORRECTION
 const uint32_t QJL_PROJ_K = QJL_FULL_PROJ ? HSK : QUANT_K;
@@ -220,6 +221,10 @@ void main() {
             }
             // Only load if the block is not all zeros
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
+                for (uint32_t c = tid; c < Bc; c += gl_WorkGroupSize.x) {
+                    v_visible[c] = 0;
+                }
+                barrier();
                 bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
@@ -264,6 +269,11 @@ void main() {
                                 m = f16vec4(0.0);
                             }
                             mask_cache[idx / WorkGroupSize] = m;
+                            [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+                                if (i * Br + r * 4 + k < N && float(m[k]) > NEG_FLT_MAX_OVER_2) {
+                                    atomicOr(v_visible[c], 1u);
+                                }
+                            }
                         } else if (USE_SPARSE) {
                             mask_cache[idx / WorkGroupSize] = f16vec4(NEG_FLT_MAX_OVER_2);
                         }
@@ -563,6 +573,8 @@ void main() {
 #endif
 
 #if !defined(V_BLOCK_SIZE) || V_BLOCK_SIZE == 1
+        // RDNA3 WMMA can change rounding on +0 * negative V. Zero keys masked in every output row.
+        const bool mask_v = MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO;
         // Standard path: V is f16, P·V via coopmat. Quantized V skipped fused above.
         // V_BLOCK_SIZE is undefined for the f16/f16 same-type variant (compiled with the
         // upstream flash_attn_base.glsl, which defines BLOCK_SIZE_V but not V_BLOCK_SIZE);
@@ -575,7 +587,7 @@ void main() {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
                     uint32_t v_row;
                     bool kv_active = fa_kv_index(j * Bc + c, v_row);
-                    if (kv_active && (HSV == HSV_pad || d < HSV / 4)) {
+                    if (kv_active && (!mask_v || v_visible[c] != 0) && (HSV == HSV_pad || d < HSV / 4)) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             uint coord = v_row * v_stride * BLOCK_SIZE_V + 4 * d;
@@ -585,7 +597,13 @@ void main() {
                         } else
 #endif
                         {
-                            V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + v_row * v_stride / 4 + d]);
+                            if (V_TRANSPOSED) {
+                                [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+                                    V_Tf[k] = data_v[v_offset + (4 * d + k) * v_stride + v_row];
+                                }
+                            } else {
+                                V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + v_row * v_stride / 4 + d]);
+                            }
                         }
                     }
 
@@ -622,7 +640,7 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
-            const bool stage_v = USE_DECODE_V || KV_bounds_check || USE_SPARSE;
+            const bool stage_v = USE_DECODE_V || KV_bounds_check || USE_SPARSE || mask_v;
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
@@ -637,14 +655,20 @@ void main() {
                     const uint ib = coord / BLOCK_SIZE_V;
                     const uint iqs = coord % BLOCK_SIZE_V;
 
-                    if (USE_SPARSE ? (kv_active && v_col < HSV) : (!KV_bounds_check || (v_row < KV && v_col < HSV))) {
+                    if ((!mask_v || v_visible[row] != 0) && (USE_SPARSE ? (kv_active && v_col < HSV) : (!KV_bounds_check || (v_row < KV && v_col < HSV)))) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
                         } else
 #endif
                         {
-                            kvsh[row * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
+                            if (V_TRANSPOSED) {
+                                [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+                                    kvsh[row * vsh_stride + col][k] = data_v[v_offset + (v_col + k) * v_stride + v_row];
+                                }
+                            } else {
+                                kvsh[row * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
+                            }
                         }
                     } else {
                         kvsh[row * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
@@ -659,7 +683,7 @@ void main() {
             if (hsv_offset < HSV_pad) {
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
                     if (SHMEM_STAGING == 0) {
-                    if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
+                    if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE && !mask_v) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                         if (V_TRANSPOSED) {
