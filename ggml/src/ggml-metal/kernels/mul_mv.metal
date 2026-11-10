@@ -401,12 +401,15 @@ void mul_vec_q_n_f32_impl(
     mul_vec_q_n_f32_impl_t<block_q_type, NR0, args_t, false, false>(args, src0, src1, src1, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
-template<typename block_q_type, short NR0, typename args_t>
-void mul_vec_q_n_f32_glu_impl(
+// NORM: fused RMS_NORM + MUL in front of the gate/up pair, as in mul_vec_q_n_f32_impl_t: src1 is the un-normalized row x
+// and srcw the norm weight w, and both products are scaled by rsqrt(mean(x^2) + eps) before the SWIGLU
+template<typename block_q_type, short NR0, typename args_t, bool NORM>
+void mul_vec_q_n_f32_glu_impl_t(
         args_t args,
         device const char * src0,
         device const char * src0_gate,
         device const char * src1,
+        device const char * srcw,
         device       char * dst,
         threadgroup  char * shmem,
         uint3  tgpig,
@@ -449,18 +452,35 @@ void mul_vec_q_n_f32_glu_impl(
     float yl[16];
 
     device const float * yb = y + ib0*QK4_0 + il;
+    device const float * wb = (device const float *) srcw + ib0*QK4_0 + il;
+
+    float sumsq = 0.f;
 
     for (int ib = ib0; ib < nb; ib += NQ) {
         float sumy[2] = { 0.f, 0.f };
 
         FOR_UNROLL (short i = 0; i < 8; i += 2) {
-            sumy[0]  += yb[i +  0] + yb[i +  1];
-            yl[i + 0] = yb[i +  0];
-            yl[i + 1] = yb[i +  1]/256.f;
+            float y0  = yb[i +  0];
+            float y1  = yb[i +  1];
+            float y16 = yb[i + 16];
+            float y17 = yb[i + 17];
 
-            sumy[1]  += yb[i + 16] + yb[i + 17];
-            yl[i + 8] = yb[i + 16]/16.f;
-            yl[i + 9] = yb[i + 17]/4096.f;
+            if (NORM) {
+                sumsq += y0*y0 + y1*y1 + y16*y16 + y17*y17;
+
+                y0  *= wb[i +  0];
+                y1  *= wb[i +  1];
+                y16 *= wb[i + 16];
+                y17 *= wb[i + 17];
+            }
+
+            sumy[0]  += y0 + y1;
+            yl[i + 0] = y0;
+            yl[i + 1] = y1/256.f;
+
+            sumy[1]  += y16 + y17;
+            yl[i + 8] = y16/16.f;
+            yl[i + 9] = y17/4096.f;
         }
 
         FOR_UNROLL (short p = 0; p < 2; ++p) {
@@ -470,18 +490,40 @@ void mul_vec_q_n_f32_glu_impl(
         }
 
         yb += QK4_0 * 16;
+        if (NORM) {
+            wb += QK4_0 * 16;
+        }
+    }
+
+    float scale = 1.0f;
+    if (NORM) {
+        scale = rsqrt(simd_sum(sumsq)/args.ne00 + args.eps);
     }
 
     device float * dst_f32 = (device float *) dst + im*args.ne0*args.ne1 + r1*args.ne0;
 
     for (int row = 0; row < NR0; ++row) {
-        const float tot_up   = simd_sum(sumf[0][row]);
-        const float tot_gate = simd_sum(sumf[1][row]);
+        const float tot_up   = simd_sum(sumf[0][row])*scale;
+        const float tot_gate = simd_sum(sumf[1][row])*scale;
 
         if (tiisg == 0 && r0 + row < args.ne01) {
             dst_f32[r0 + row] = (tot_gate / (1.0f + exp(-tot_gate))) * tot_up;
         }
     }
+}
+
+template<typename block_q_type, short NR0, typename args_t>
+void mul_vec_q_n_f32_glu_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src0_gate,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    mul_vec_q_n_f32_glu_impl_t<block_q_type, NR0, args_t, false>(args, src0, src0_gate, src1, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 template<int nr0, typename args_t>
@@ -1058,6 +1100,7 @@ kernel void kernel_mul_mv_q4_0_f32(
 #undef MV_ARGS
 }
 
+// with FC_mul_mv_norm, src1 is the un-normalized row and srcw the norm weight (fused RMS_NORM + MUL)
 [[host_name("kernel_mul_mv_glu_q4_0_f32")]]
 kernel void kernel_mul_mv_glu_q4_0_f32(
         constant ggml_metal_kargs_mul_mv & args,
@@ -1065,10 +1108,16 @@ kernel void kernel_mul_mv_glu_q4_0_f32(
         device const char * src1,
         device       char * dst,
         device const char * src0_gate,
+        device const char * srcw,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    mul_vec_q_n_f32_glu_impl<block_q4_0, N_R0_Q4_0_GLU, constant ggml_metal_kargs_mul_mv &>(args, src0, src0_gate, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    typedef constant ggml_metal_kargs_mul_mv & args_t;
+    if (FC_mul_mv_norm) {
+        mul_vec_q_n_f32_glu_impl_t<block_q4_0, N_R0_Q4_0_GLU_NORM, args_t, true >(args, src0, src0_gate, src1, srcw, dst, nullptr, tgpig, tiisg, sgitg);
+    } else {
+        mul_vec_q_n_f32_glu_impl_t<block_q4_0, N_R0_Q4_0_GLU,      args_t, false>(args, src0, src0_gate, src1, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    }
 }
 
 kernel void kernel_mul_mv_q4_1_f32(
