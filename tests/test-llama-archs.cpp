@@ -1879,6 +1879,7 @@ static void test_hadamard_split_futures(bool with_hadamard) {
         gguf_set_val_i32(split_ctx.get(), "split.tensors.count", (int32_t) n_tensors);
         if (with_hadamard) {
             add_hadamard_metadata(split_ctx.get());
+            gguf_set_val_u32(split_ctx.get(), "general.file_type", LLAMA_FTYPE_ALL_F32);
         }
 
         for (int64_t i = 0; i < n_tensors; ++i) {
@@ -1925,6 +1926,7 @@ static void test_hadamard_split_futures(bool with_hadamard) {
     fulfill_thread.join();
     GGML_ASSERT(loaded);
     GGML_ASSERT(loaded->hdmd.rot.size() == (with_hadamard ? 1 : 0));
+    GGML_ASSERT(loaded->ftype() == (with_hadamard ? LLAMA_FTYPE_ALL_F32 : LLAMA_FTYPE_GUESSED));
     llama_model_free(loaded);
 }
 
