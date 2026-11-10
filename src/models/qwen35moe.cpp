@@ -381,6 +381,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
+    // the norm feeds the four input projections: keep them together, so backends can fold the norm into them
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_build_forward_expand(gf, z);
+    ggml_build_forward_expand(gf, beta);
+
     // with the deferred commit the gdn op activates the gates itself
     const bool raw_gates = inp->rec_idx != nullptr;
 
@@ -392,6 +397,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
+    ggml_build_forward_expand(gf, alpha);
 
     ggml_tensor * gate = alpha;
     if (!raw_gates) {
