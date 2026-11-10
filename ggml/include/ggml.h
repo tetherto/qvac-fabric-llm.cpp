@@ -683,6 +683,9 @@ extern "C" {
         // rotation that lets the same layer run on the standard matmul kernels.
         GGML_OP_MUL_MAT_CONVROT,
         GGML_OP_CONVROT,
+        // conv and gated delta net over sequences of different lengths in one batch
+        GGML_OP_SSM_CONV_RAGGED,
+        GGML_OP_GATED_DELTA_NET_RAGGED,
 
         // Flux RoPE: rotates each even/odd pair by a precomputed 2x2 matrix and
         // permutes [d_head, n_head, L, N] into the flash-attention layout.
@@ -3247,6 +3250,40 @@ extern "C" {
             struct ggml_tensor  * dt,
             struct ggml_tensor  * a,
             int64_t               K);
+
+    // ragged variants of ggml_ssm_conv and ggml_gated_delta_net: the sequences of a batch may have
+    // different lengths. The tokens of seq s are rows [seq_off[s], seq_off[s + 1]) of the inputs.
+    //
+    // causal depthwise conv, preceded per seq by its conv state:
+    //   x       : [C, n_tokens]
+    //   state   : [d_conv - 1, C, n_seqs] (time-major per channel, as ggml_ssm_conv's conv_x)
+    //   w       : [d_conv, C]
+    //   seq_off : I32 [n_seqs + 1]
+    // result 1D: y [C, n_tokens] (SiLU applied if silu) | new states [d_conv - 1, C, n_seqs]
+    GGML_API struct ggml_tensor * ggml_ssm_conv_ragged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * seq_off,
+            bool                  silu);
+
+    // gated delta net with K == 1, scalar gate:
+    //   q, k    : [S_k, H_k, n_tokens]
+    //   v       : [S_v, H_v, n_tokens]
+    //   g, beta : [1, H_v, n_tokens]
+    //   state   : [S_v, S_v, H_v, n_seqs]
+    //   seq_off : I32 [n_seqs + 1]
+    // result 1D: attn [S_v, H_v, n_tokens] | new states [S_v, S_v, H_v, n_seqs]
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ragged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * seq_off);
 
     GGML_API int64_t ggml_gated_delta_net_rec_size(int64_t S_k, int64_t H_k, int64_t S_v, int64_t H_v, int64_t G, int64_t K);
 
