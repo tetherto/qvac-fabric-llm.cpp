@@ -56,6 +56,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_SSM_CONV_STATE,  // CONCAT + CPY + SSM_CONV + UNARY(silu) (decode conv step with its conv state update)
     GGML_METAL_FUSION_RMS_NORM_MUL_MV_GLU, // RMS_NORM + MUL + MUL_MAT + MUL_MAT + GLU (norm folded into the decode gate/up + swiglu)
     GGML_METAL_FUSION_SSM_CONV_STATE_NORM, // SSM_CONV_STATE + (RMS_NORM + SCALE) x 2 (the q/k L2 norms of the conv output)
+    GGML_METAL_FUSION_GDN_GATES,       // ADD + UNARY(softplus) + MUL + UNARY(sigmoid) + GDN_CACHE (gates activated in the gdn kernel)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

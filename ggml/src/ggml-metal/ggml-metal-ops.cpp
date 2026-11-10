@@ -2269,14 +2269,74 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// encode the GATED_DELTA_NET at idx. with cpy, the new state goes straight into the cache view of that cpy; with gates
+// ({alpha, dt, a, beta}, see GGML_METAL_FUSION_GDN_GATES) the kernel activates the raw gates itself
+static void ggml_metal_op_gated_delta_net_encode(
+        ggml_metal_op_t             ctx,
+        int                         idx,
+        const ggml_tensor *         cpy,
+        const ggml_tensor * const * gates);
+
 int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    const bool use_fusion = ctx->use_fusion();
+    const int  debug_fusion = ggml_metal_fusion_info_debug(ctx->finfo);
+
+    const ggml_tensor * cpy = nullptr;
+    int n_fuse = 1;
+
+    if (use_fusion) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_GDN_CACHE) {
+            cpy = ctx->node(idx + 1);
+            n_fuse = 2;
+
+            ctx->count_fusions(fusion);
+
+            if (debug_fusion > 1) {
+                GGML_LOG_DEBUG("%s: fuse: GATED_DELTA_NET + CPY\n", __func__);
+            }
+        }
+    }
+
+    GGML_UNUSED(op);
+
+    ggml_metal_op_gated_delta_net_encode(ctx, idx, cpy, nullptr);
+
+    return n_fuse;
+}
+
+// ADD + UNARY(softplus) + MUL + UNARY(sigmoid) + GATED_DELTA_NET + CPY, see GGML_METAL_FUSION_GDN_GATES
+static int ggml_metal_op_gdn_gates(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    ggml_metal_op_fusion_concurrency(ctx, idx, n_fuse);
+
+    const ggml_tensor * add = ctx->node(idx);
+    const ggml_tensor * mul = ctx->node(idx + 2);
+    const ggml_tensor * sig = ctx->node(idx + 3);
+
+    const ggml_tensor * gates[4] = { add->src[0], add->src[1], mul->src[1], sig->src[0] };
+
+    ggml_metal_op_gated_delta_net_encode(ctx, idx + 4, ctx->node(idx + 5), gates);
+
+    if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+        GGML_LOG_DEBUG("%s: fuse: ADD + UNARY + MUL + UNARY + GATED_DELTA_NET + CPY\n", __func__);
+    }
+
+    return n_fuse;
+}
+
+static void ggml_metal_op_gated_delta_net_encode(
+        ggml_metal_op_t             ctx,
+        int                         idx,
+        const ggml_tensor *         cpy,
+        const ggml_tensor * const * gates) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
-
-    const bool use_fusion = ctx->use_fusion();
-    const int  debug_fusion = ggml_metal_fusion_info_debug(ctx->finfo);
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
@@ -2287,31 +2347,18 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
+    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op, gates != nullptr);
 
     // when fused with the trailing cache cpy, the snapshots are written straight into the
     // recurrent cache and the cpy is skipped (see GGML_METAL_FUSION_GDN_CACHE)
     ggml_metal_buffer_id bid_out = ggml_metal_get_buffer_id(op);
     uint64_t nb_out = 0;
-    int n_fuse = 1;
 
-    if (use_fusion) {
-        int n = 1;
-        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+    if (cpy) {
+        const ggml_tensor * dst_cache = cpy->src[1]; // cache view
 
-        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_GDN_CACHE) {
-            const ggml_tensor * dst_cache = ctx->node(idx + 1)->src[1]; // cache view
-
-            bid_out = ggml_metal_get_buffer_id(dst_cache);
-            nb_out  = dst_cache->nb[2]/sizeof(float);
-            n_fuse = 2;
-
-            ctx->count_fusions(fusion);
-
-            if (debug_fusion > 1) {
-                GGML_LOG_DEBUG("%s: fuse: GATED_DELTA_NET + CPY\n", __func__);
-            }
-        }
+        bid_out = ggml_metal_get_buffer_id(dst_cache);
+        nb_out  = dst_cache->nb[2]/sizeof(float);
     }
 
     int ida = 0;
@@ -2360,11 +2407,13 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), ida++); // q
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), ida++); // k
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), ida++); // v
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), ida++); // gate
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(gates ? gates[0] : op->src[3]), ida++); // gate (raw alpha)
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(gates ? gates[3] : op->src[4]), ida++); // beta (raw)
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst (attn)
     ggml_metal_encoder_set_buffer  (enc, bid_out,                              ida++); // state_out
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(gates ? gates[1] : op->src[3]), ida++); // dt
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(gates ? gates[2] : op->src[3]), ida++); // a
 
     const int nsg = pipeline.nsg;
 
@@ -2373,8 +2422,6 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     } else {
         ggml_metal_encoder_dispatch_threadgroups(enc, (op->src[2]->ne[0] + nsg - 1)/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
     }
-
-    return n_fuse;
 }
 
 int ggml_metal_op_gated_delta_net_deferred(ggml_metal_op_t ctx, int idx) {
@@ -5302,6 +5349,11 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         int n = 1;
         fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
         n_fuse = n;
+
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_GDN_GATES) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_gdn_gates(ctx, idx, n_fuse);
+        }
 
         // snake activation autofuse: mul -> sin -> sqr -> mul -> add
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SNAKE) {

@@ -6880,6 +6880,143 @@ struct test_gdn_conv_deferred : public test_case {
     }
 };
 
+// the decode gates of a gated delta net layer, g = softplus(alpha + dt)*a and beta = sigmoid(beta), feeding the gdn whose
+// new state is copied into the cache, as the qwen35 graphs build them (Metal activates the gates in the gdn kernel).
+// with inplace the state is the cache row the copy writes; extra_reader gives the sigmoid another consumer
+struct test_gdn_gates : public test_case {
+    const int64_t head_count, head_size, n_seq_tokens, n_seqs;
+    const bool inplace;
+    const bool extra_reader;
+
+    static constexpr const char * fusion_label = "ADD+UNARY+MUL+UNARY+GATED_DELTA_NET+CPY";
+
+    mutable bool has_fusion_label = false;
+
+    std::vector<ggml_tensor *> verify;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_GATES";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(head_count, head_size, n_seq_tokens, n_seqs, inplace, extra_reader);
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const int64_t count = backend_fusion_label_count(backend, fusion_label);
+        has_fusion_label = count >= 0;
+        return has_fusion_label ? (uint64_t) count : 0;
+    }
+
+    bool fusable() const { return n_seq_tokens == 1 && !extra_reader; }
+
+    bool expect_fusion()    override { return has_fusion_label &&  fusable(); }
+    bool expect_no_fusion() override { return has_fusion_label && !fusable(); }
+
+    // the graphs read the state in place only on Metal: other backends' gdn cache fusions may not alias it
+    bool skip_backend(ggml_backend_t backend) override {
+        return inplace && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend))), "MTL") != 0;
+    }
+
+    test_gdn_gates(int64_t head_count = 8, int64_t head_size = 128, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
+            bool inplace = false, bool extra_reader = false)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          inplace(inplace), extra_reader(extra_reader) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+
+        const int64_t S = head_size;
+        const int64_t H = head_count;
+        const int64_t T = n_seq_tokens;
+        const int64_t D = S * S * H;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, n_seqs);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * alpha_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, T, n_seqs);
+        ggml_tensor * beta_src  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, T, n_seqs);
+        ggml_tensor * dt        = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor * a         = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_set_name(alpha_src, "alpha");
+        ggml_set_name(beta_src,  "beta");
+        ggml_set_name(dt,        "dt");
+        ggml_set_name(a,         "a");
+
+        // allocatable intermediates, like the alpha and beta projections
+        ggml_tensor * alpha = ggml_scale(ctx, alpha_src, 1.0f);
+        ggml_tensor * beta  = ggml_scale(ctx, beta_src, 1.0f);
+        if (gf) {
+            ggml_build_forward_expand(gf, q);
+            ggml_build_forward_expand(gf, k);
+            ggml_build_forward_expand(gf, alpha);
+            ggml_build_forward_expand(gf, beta);
+        }
+
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_seqs + 1);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * state;
+        if (inplace) {
+            state = ggml_view_2d(ctx, cache, D, n_seqs, cache->nb[1], cache->nb[1]);
+        } else {
+            state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_seqs);
+            ggml_set_name(state, "state");
+        }
+
+        ggml_tensor * g = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
+        g = ggml_reshape_4d(ctx, g, 1, H, T, n_seqs);
+        ggml_tensor * b = ggml_sigmoid(ctx, beta);
+
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, b, ggml_reshape_4d(ctx, state, S, S, H, n_seqs), 1);
+
+        const int64_t n_attn = S * H * T * n_seqs;
+        ggml_tensor * attn = ggml_view_1d(ctx, gdn, n_attn, 0);
+        ggml_tensor * snew = ggml_view_2d(ctx, gdn, D, n_seqs, ggml_row_size(GGML_TYPE_F32, D), ggml_row_size(GGML_TYPE_F32, n_attn));
+        ggml_tensor * cpy  = ggml_cpy(ctx, snew, ggml_view_2d(ctx, cache, D, n_seqs, cache->nb[1], cache->nb[1]));
+        if (gf) {
+            ggml_build_forward_expand(gf, cpy);
+        }
+        verify.push_back(cpy);
+
+        ggml_tensor * out = ggml_scale(ctx, attn, 1.0f);
+        ggml_set_name(out, "out");
+        verify.push_back(out);
+
+        if (extra_reader) {
+            ggml_tensor * bb = ggml_scale(ctx, b, 2.0f);
+            verify.push_back(bb);
+            return ggml_add(ctx, ggml_sum(ctx, out), ggml_sum(ctx, bb));
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "a") == 0) {
+                init_tensor_uniform(t, -2.0f, -0.1f);
+            } else if (strcmp(t->name, "alpha") == 0 || strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, -3.0f, 3.0f);
+            } else if (strcmp(t->name, "cache") == 0 || strcmp(t->name, "state") == 0) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -18026,6 +18163,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qwen35_elementwise(8, 1024, 64, 1, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_ssm_conv_direct(10240, 257, 1, 1));     // Flash-Next channels
     test_cases.emplace_back(new test_ssm_conv_direct(256, 64, 1, 1, true));  // another whole-concat reader: no fusion
+
+    // the decode gates activated in the gdn (48 heads of 128 = Qwen3.5 27B)
+    for (bool inplace : {false, true}) {
+        for (int64_t ns : {1, 2}) {
+            test_cases.emplace_back(new test_gdn_gates(48, 128, 1, ns, inplace));
+        }
+        test_cases.emplace_back(new test_gdn_gates(8,  64, 1, 1, inplace));
+        test_cases.emplace_back(new test_gdn_gates(8, 128, 2, 1, inplace));       // two tokens: no fusion
+        test_cases.emplace_back(new test_gdn_gates(8, 128, 1, 1, inplace, true)); // another sigmoid reader: no fusion
+    }
 
     // the decode conv step with its state copy (Metal CONCAT + CPY + SSM_CONV + SILU); 10240 = Qwen3.5 27B channels
     for (bool inplace : {false, true}) {

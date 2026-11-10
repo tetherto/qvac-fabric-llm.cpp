@@ -4,6 +4,9 @@ constant short FC_gated_delta_net_ne20 [[function_constant(FC_GATED_DELTA_NET + 
 constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 1)]];
 constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 2)]];
 constant short FC_gated_delta_net_nt   [[function_constant(FC_GATED_DELTA_NET + 3)]];
+// raw gates (G == 1): g is the raw alpha and b the raw beta, activated as g = softplus(g + dt)*a and b = sigmoid(b),
+// with the arithmetic of the ADD, SOFTPLUS + MUL and SIGMOID kernels they replace
+constant bool  FC_gated_delta_net_raw  [[function_constant(FC_GATED_DELTA_NET + 4)]];
 
 static inline float gdn_dot(float  a, float  b) { return a * b; }
 static inline float gdn_dot(float2 a, float2 b) { return dot(a, b); }
@@ -20,6 +23,8 @@ kernel void kernel_gated_delta_net_impl(
         device const char * s,
         device       char * dst,
         device       char * dst_fuse,
+        device const char * gdt,
+        device const char * ga,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
@@ -77,9 +82,16 @@ kernel void kernel_gated_delta_net_impl(
         const T qt = ((device const T *) q_ptr)[tx];
 
         if (G == 1) {
-            const float g_exp = exp(g_ptr[0]);
+            float gv = g_ptr[0];
+            float bv = b_ptr[0];
+            if (FC_gated_delta_net_raw) {
+                const float t = g_ptr[0] + ((device const float *) gdt)[i21];
+                gv = select(log(1 + exp(t)), t, t > 20) * ((device const float *) ga)[i21];
+                bv = 1 / (1 + exp(-b_ptr[0]));
+            }
+            const float g_exp = exp(gv);
             const float s_k = simd_sum(gdn_dot(ls, kt));
-            const float d = (v_ptr[i20] - g_exp * s_k) * b_ptr[0];
+            const float d = (v_ptr[i20] - g_exp * s_k) * bv;
             ls = ls * g_exp + kt * d;
         } else {
             const T ge = exp(((device const T *) g_ptr)[tx]);
