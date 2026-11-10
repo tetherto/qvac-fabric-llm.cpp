@@ -2135,7 +2135,9 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
     while (i_f < n_idxs && total < GGML_METAL_FUSION_MAX) {
         int len = 1;
         const ggml_metal_fusion * fusion = ggml_metal_fusion_next(gf, idxs, n_idxs, i_f, GGML_METAL_FUSION_STRUCTURAL, &len);
-        if (!fusion || total + len > GGML_METAL_FUSION_MAX) {
+        // the packed raw span (views included) is capped too: a pattern that does not fit whole is not chained, so the
+        // cap never splits it and lets the reorder place other nodes inside it
+        if (!fusion || total + len > GGML_METAL_FUSION_MAX || idxs[i_f + len - 1] - idx + 1 > GGML_METAL_FUSION_MAX) {
             break;
         }
 
