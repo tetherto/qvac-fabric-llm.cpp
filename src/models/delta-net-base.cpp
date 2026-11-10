@@ -457,18 +457,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
-    ggml_tensor * conv_states;
-    if (inp->s_base_inplace && !inp->rec_idx) {
-        // a single cell keeps its own conv state: read it from the cache row, which the cpy below updates
-        const int32_t rs_z = mctx_cur->get_rs_z();
-        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0,
-            ggml_view_1d(ctx0, conv_states_all, hparams.n_embd_r()*(rs_z >= 0), rs_z*conv_states_all->nb[1]*(rs_z >= 0)), 0));
-
-        conv_states = ggml_view_2d(ctx0, conv_states_all, hparams.n_embd_r(), n_seqs, conv_states_all->nb[1],
-                                   kv_head*conv_states_all->nb[1]);
-    } else {
-        conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
-    }
+    // gathered, not read in place: a fused concat + conv + write-back (the CUDA NVRTC pass) must not read and write
+    // the same cache rows, and decode and prompt ubatches build the same nodes, so the reserve covers both. the copy
+    // is small. a single cell on Metal (rs_inplace) reads it in place: the Metal conv step reads it before it writes it
+    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs, nullptr, inp->s_base_inplace && !inp->rec_idx);
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
@@ -572,29 +564,104 @@ ggml_tensor * llm_build_delta_net_base::build_conv_deferred(
     return out;
 }
 
+ggml_tensor * llm_build_delta_net_base::build_recurrent_ragged(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        qkv_mixed,
+        ggml_tensor *        conv_kernel,
+        ggml_tensor *        g,
+        ggml_tensor *        b,
+        int64_t              head_k_dim,
+        int64_t              num_k_heads,
+        int64_t              head_v_dim,
+        int64_t              num_v_heads,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+
+    GGML_ASSERT(ubatch.is_ragged() && inp->seq_off != nullptr && inp->rec_idx == nullptr);
+    GGML_ASSERT(head_k_dim == head_v_dim);
+
+    const int64_t n_seqs   = ubatch.n_seqs;
+    const int64_t n_tokens = ubatch.n_tokens;
+    const int64_t C        = qkv_mixed->ne[0];
+    const int64_t d_conv   = conv_kernel->ne[0];
+    const auto    kv_head  = mctx_cur->get_head();
+
+    ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+    ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+
+    // conv: in place, the conv op reads the states before the new ones are copied back
+    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs, nullptr, true);
+    conv_states = ggml_reshape_3d(ctx0, conv_states, d_conv - 1, C, n_seqs);
+    cb(conv_states, "conv_states", il);
+
+    qkv_mixed = ggml_reshape_2d(ctx0, qkv_mixed, C, n_tokens);
+
+    ggml_tensor * conv_out = ggml_ssm_conv_ragged(ctx0, qkv_mixed, conv_states, conv_kernel, inp->seq_off, true);
+    cb(conv_out, "conv_ragged", il);
+
+    const size_t row_conv = ggml_row_size(conv_out->type, C);
+
+    ggml_tensor * conv_new = ggml_view_2d(ctx0, conv_out, (d_conv - 1)*C, n_seqs,
+            ggml_row_size(conv_out->type, (d_conv - 1)*C), n_tokens*row_conv);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_new,
+            ggml_view_2d(ctx0, conv_states_all, (d_conv - 1)*C, n_seqs, conv_states_all->nb[1], kv_head*conv_states_all->nb[1])));
+
+    ggml_tensor * q = ggml_view_3d(ctx0, conv_out, head_k_dim, num_k_heads, n_tokens,
+            ggml_row_size(conv_out->type, head_k_dim), row_conv, 0);
+    ggml_tensor * k = ggml_view_3d(ctx0, conv_out, head_k_dim, num_k_heads, n_tokens,
+            ggml_row_size(conv_out->type, head_k_dim), row_conv, ggml_row_size(conv_out->type, head_k_dim*num_k_heads));
+    ggml_tensor * v = ggml_view_3d(ctx0, conv_out, head_v_dim, num_v_heads, n_tokens,
+            ggml_row_size(conv_out->type, head_v_dim), row_conv, ggml_row_size(conv_out->type, 2*head_k_dim*num_k_heads));
+
+    q = build_gdn_l2_norm(ctx0, q, hparams.f_norm_rms_eps);
+    k = build_gdn_l2_norm(ctx0, k, hparams.f_norm_rms_eps);
+    cb(q, "q_conv_predelta", il);
+    cb(k, "k_conv_predelta", il);
+    cb(v, "v_conv_predelta", il);
+
+    g = ggml_reshape_3d(ctx0, g, 1, num_v_heads, n_tokens);
+    b = ggml_reshape_3d(ctx0, b, 1, num_v_heads, n_tokens);
+
+    ggml_tensor * state = build_rs_ssm(inp, ssm_states_all, n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    cb(state, "state_predelta", il);
+
+    ggml_tensor * gdn_out = ggml_gated_delta_net_ragged(ctx0, q, k, v, g, b, state, inp->seq_off);
+    cb(gdn_out, "gdn_ragged_out", il);
+
+    const int64_t D = head_v_dim*head_v_dim*num_v_heads;
+
+    ggml_tensor * new_state = ggml_view_2d(ctx0, gdn_out, D, n_seqs,
+            ggml_row_size(gdn_out->type, D), ggml_row_size(gdn_out->type, head_v_dim*num_v_heads*n_tokens));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state,
+            ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1], kv_head*ssm_states_all->nb[1])));
+
+    ggml_tensor * output = ggml_view_4d(ctx0, gdn_out, head_v_dim, num_v_heads, n_tokens, 1,
+            ggml_row_size(gdn_out->type, head_v_dim),
+            ggml_row_size(gdn_out->type, head_v_dim*num_v_heads),
+            ggml_row_size(gdn_out->type, head_v_dim*num_v_heads*n_tokens), 0);
+    cb(output, "attn_output", il);
+
+    return output;
+}
+
 ggml_tensor * llm_build_delta_net_base::build_rs_ssm(
         llm_graph_input_rs * inp,
         ggml_tensor *        ssm_states_all,
         int64_t              n_seqs) {
+    if (!inp->rec_idx) {
+        // in place: the delta net reads the state before its new state is written back (build_recurrent_attn)
+        return build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, nullptr, true);
+    }
+
     const auto * mctx_cur = inp->mctx;
 
-    if (!inp->rec_idx && !inp->s_base_inplace) {
-        return build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    }
-
-    if (inp->s_base_inplace) {
-        // every cell keeps its own base state: no gather, the op reads and writes the cache rows
-        const int32_t rs_z = mctx_cur->get_rs_z();
-        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0,
-            ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s()*(rs_z >= 0), rs_z*ssm_states_all->nb[1]*(rs_z >= 0)), 0));
-
-        return ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                            mctx_cur->get_head()*ssm_states_all->nb[1]);
-    }
-
-    // one gather of all n_rs base states: the ubatch states, then the extra cells (see build_rs)
-    return build_rs(ssm_states_all, inp->s_copy_base, inp->s_copy_base_main, hparams.n_embd_s(), n_seqs,
-                    mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z());
+    // in place: the op reads the base state of each cell before it writes the new one there. otherwise one gather of
+    // all n_rs base states: the ubatch states, then the extra cells (see build_rs)
+    return build_rs(ssm_states_all, inp->s_base_inplace ? inp->s_copy_moved : inp->s_copy_base, inp->s_copy_base_main,
+                    hparams.n_embd_s(), n_seqs,
+                    mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z(),
+                    nullptr, inp->s_base_inplace);
 }
 
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(

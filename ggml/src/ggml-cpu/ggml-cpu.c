@@ -1986,6 +1986,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat(params, tensor);
             } break;
+        case GGML_OP_MUL_MAT_CONVROT:
+            {
+                ggml_compute_forward_mul_mat_convrot(params, tensor);
+            } break;
+        case GGML_OP_CONVROT:
+            {
+                ggml_compute_forward_convrot(params, tensor);
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
@@ -2282,6 +2290,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gdn_conv_deferred(params, tensor);
             } break;
+        case GGML_OP_SSM_CONV_RAGGED:
+            {
+                ggml_compute_forward_ssm_conv_ragged(params, tensor);
+            } break;
+        case GGML_OP_GATED_DELTA_NET_RAGGED:
+            {
+                ggml_compute_forward_gated_delta_net_ragged(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2491,6 +2507,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GATED_DELTA_NET_BACK:
         case GGML_OP_GATED_DELTA_NET_DEFERRED:
         case GGML_OP_GDN_CONV_DEFERRED:
+        case GGML_OP_SSM_CONV_RAGGED:
+        case GGML_OP_GATED_DELTA_NET_RAGGED:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -2570,6 +2588,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GROUP_NORM:
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_CONVROT:
+        case GGML_OP_CONVROT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_MUL_MAT_ID_BACK_A:
         case GGML_OP_MUL_MAT_ID_BACK_B:
@@ -3145,6 +3165,10 @@ struct ggml_cplan ggml_graph_plan(
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
+                case GGML_OP_MUL_MAT_CONVROT:
+                    {
+                        cur = sizeof(float)*(node->src[1]->ne[0] + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
                 case GGML_OP_OUT_PROD:
                     {
                         if (ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_F8_E4M3 ||
@@ -3258,6 +3282,11 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const int64_t S_v = node->src[2]->ne[0];
                         cur = (S_v + S_v * S_v) * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_GATED_DELTA_NET_RAGGED:
+                    {
+                        const int64_t S_v = node->src[2]->ne[0];
+                        cur = (S_v + CACHE_LINE_SIZE_F32) * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_GATED_DELTA_NET_BACK:
                     {

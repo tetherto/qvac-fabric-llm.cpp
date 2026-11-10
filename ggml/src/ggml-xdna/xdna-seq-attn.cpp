@@ -29,6 +29,22 @@ static void emit_bd(xdna_seq * seq, int col, int bd, uint32_t len_words, uint32_
     xdna_seq_ddr_patch(seq, (uint32_t) col, 0, (uint32_t) bd, arg, byte_off);
 }
 
+// emit_bd's transfer, continued by descriptor `next` when it ends.
+static void
+emit_bd_next(xdna_seq * seq, int col, int bd, uint32_t len_words, uint32_t arg, uint32_t byte_off, uint32_t next) {
+    xdna_bd bd_;
+    bd_.buf_len   = len_words;
+    bd_.buf_off   = byte_off;
+    bd_.d0_stride = 1;
+    bd_.d1_stride = 1;
+    bd_.d2_stride = 1;
+    bd_.ax_cache  = 2;
+    bd_.next_bd   = next;
+    bd_.use_next  = true;
+    xdna_seq_blockwrite(seq, (uint32_t) col, 0, (uint32_t) bd, &bd_);
+    xdna_seq_ddr_patch(seq, (uint32_t) col, 0, (uint32_t) bd, arg, byte_off);
+}
+
 // A strided descriptor: `d1` runs of `d0` words, `d1_stride` words apart. The
 // encoding is the one IRON emits for a two-dimensional TensorAccessPattern -
 // sizes in 32-bit words, strides in words - read back out of a built artifact.
@@ -71,6 +87,12 @@ static bool valid_geom(const xdna_attn_gdn_geom * g) {
         g->pkvb_n != g->n_obj * g->pkv_n) {
         return false;
     }
+    // A pass inside the layer's value heads, its q/k slots inside the groups'.
+    const int n_v = g->n_block - 2 * g->n_kg;
+    if (g->n_kg <= 0 || n_v < g->n_vh || g->head0 < 0 || g->head0 + g->n_vh > n_v || g->qk_head0 < -1 ||
+        g->qk_head0 + g->n_vh > g->n_kg) {
+        return false;
+    }
     // The stage's own geometry: a stream driven against a different one would
     // truncate a divisor or a modulo into a dropped round.
     if (g->feed_slot <= 0 || g->feed_slot > g->feed_n || g->rows <= 0 || g->chunk <= 0 || g->rows % g->chunk != 0 ||
@@ -97,13 +119,21 @@ bool xdna_attn_gdn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g, int sched
     // gated epilogue alone. The cores loop forever waiting on their fifos, so
     // a phase submitted on its own is the same work in the same order - which
     // is what makes a per-stage timing possible at all.
-    const bool want_conv  = phase < 0 || phase == 0;
-    const bool want_norm  = phase < 0 || phase == 1;
-    const bool want_gdn   = phase < 0 || phase == 2;
-    const bool want_gated = phase < 0 || phase == 3;
+    const bool want_conv  = g && g->conv_stage && (phase < 0 || phase == 0);
+    const bool want_norm  = g && g->core_stage && (phase < 0 || phase == 1);
+    const bool want_gdn   = g && g->core_stage && (phase < 0 || phase == 2);
+    const bool want_gated = g && g->core_stage && (phase < 0 || phase == 3);
     if (!seq || !valid_geom(g) || schedule < 0 || schedule > 7 || phase > 3) {
         GGML_LOG_ERROR("%s: the geometry or the schedule is not one this builder emits (schedule=%d phase=%d)\n",
                        "xdna-seq-attn", schedule, phase);
+        return false;
+    }
+    // Passes and a layer wider than one are the production schedule's, with
+    // both hand-overs on chip.
+    const bool one_pass =
+        g->n_block == 2 * g->n_kg + g->n_vh && g->head0 == 0 && g->qk_head0 < 0 && g->conv_stage && g->core_stage;
+    if (!one_pass && (schedule != 4 || !g->pkv_onchip || !g->attn_onchip)) {
+        GGML_LOG_ERROR("%s: a layer of several passes needs schedule 4 with pkv and attn on chip\n", "xdna-seq-attn");
         return false;
     }
     seq->n_cols          = (uint32_t) g->n_cols;
@@ -135,8 +165,9 @@ bool xdna_attn_gdn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g, int sched
         xdna_seq_push_queue(seq, (uint32_t) col, 0, bd, DIR_MM2S, 0, false, 0);
     };
     auto conv_drain = [&](int col, int ga, int b = 0) {
-        const int      h    = ga % g->n_vh;
-        const int      r    = ga / g->n_vh;  // 0 = q, 1 = k, 2 = v region
+        const bool     qk   = ga < 2 * g->n_kg;
+        const int      h    = qk ? ga % g->n_kg : ga - 2 * g->n_kg;
+        const int      r    = qk ? ga / g->n_kg : 2;  // 0 = q, 1 = k, 2 = v region
         const uint32_t xoff = (uint32_t) ((h * g->head_norm + r * g->sv) * 4);
         const int      xc = g->conv_x_col[col], xh = g->conv_x_ch[col];
         const int      hc = g->conv_h_col[col], hh = g->conv_h_ch[col];
@@ -376,11 +407,13 @@ bool xdna_attn_gdn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g, int sched
             // On the attn column's shim, not the gated tile's: the GEMV's eight
             // weight streams take a channel on every column and this is the one
             // the recurrent design can spare (attn_gdn_gated.py).
-            emit_bd(seq, azg_col, 0, (uint32_t) (g->n_vh * g->azg_n), 4, 0);
+            emit_bd(seq, azg_col, 0, (uint32_t) (g->n_vh * g->azg_n), 4, (uint32_t) (g->head0 * g->azg_n * 4));
             xdna_seq_push_queue(seq, (uint32_t) azg_col, 0, 0, DIR_MM2S, 0, false, 0);
         }
+        // The pass's chunks in the state, after the heads of the passes before it
+        const int st0 = g->head0 * g->n_obj;
         // Rounds in flight before waiting; each costs one descriptor per stream.
-        const int B = (schedule >= 4) ? 4 : 1;
+        const int B   = (schedule >= 4) ? 4 : 1;
 
         for (int r0 = 0; r0 < gdn_slots; r0 += B) {
             const int nb = std::min(B, gdn_slots - r0);
@@ -394,14 +427,26 @@ bool xdna_attn_gdn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g, int sched
                     // this round can run: one fill per head, here, where the gdn
                     // waits pace it. Four descriptors, because at most two are in
                     // flight between waits.
-                    const int      h  = (r0 + b) / (g->n_obj / gc);
-                    const uint32_t bd = (uint32_t) (4 + (h & 3));
-                    emit_bd(seq, norm_col0, (int) bd, (uint32_t) g->head_norm, 1, (uint32_t) (h * g->head_norm * 4));
+                    const int      h    = (r0 + b) / (g->n_obj / gc);
+                    const uint32_t xoff = (uint32_t) ((g->head0 + h) * g->head_norm * 4);
+                    uint32_t       bd   = (uint32_t) (4 + (h & 3));
+                    if (g->qk_head0 >= 0) {
+                        // q and k from their group's slot, then v and the tails
+                        // from the head's: two descriptors a head, two heads
+                        // in flight
+                        bd                  = (uint32_t) (4 + 2 * (h & 1));
+                        const uint32_t qk_w = (uint32_t) (2 * g->sv);
+                        emit_bd_next(seq, norm_col0, (int) bd, qk_w, 1,
+                                     (uint32_t) ((g->qk_head0 + h) * g->head_norm * 4), bd + 1);
+                        emit_bd(seq, norm_col0, (int) bd + 1, (uint32_t) g->head_norm - qk_w, 1, xoff + qk_w * 4);
+                    } else {
+                        emit_bd(seq, norm_col0, (int) bd, (uint32_t) g->head_norm, 1, xoff);
+                    }
                     xdna_seq_push_queue(seq, (uint32_t) norm_col0, 0, bd, DIR_MM2S, 0, false, 0);
                 }
                 for (int sgi = 0; sgi < sg; sgi++) {
                     emit_bd(seq, s_col[sgi], b, (uint32_t) (gg * g->rows / 2), 3,
-                            (uint32_t) ((c0 + sgi * gg) * g->rows * 2));
+                            (uint32_t) ((st0 + c0 + sgi * gg) * g->rows * 2));
                     xdna_seq_push_queue(seq, (uint32_t) s_col[sgi], 0, (uint32_t) b, DIR_MM2S, (uint32_t) s_ch[sgi],
                                         false, 0);
                 }
@@ -416,7 +461,7 @@ bool xdna_attn_gdn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g, int sched
                     // drains sit above the fills rather than alongside them.
                     const uint32_t bd = (uint32_t) (B + b);
                     emit_bd(seq, o_col[sgi], (int) bd, (uint32_t) (gg * g->rows / 2), 3,
-                            (uint32_t) ((c0 + sgi * gg) * g->rows * 2));
+                            (uint32_t) ((st0 + c0 + sgi * gg) * g->rows * 2));
                     xdna_seq_issue_token(seq, (uint32_t) o_col[sgi], 0, DIR_S2MM, (uint32_t) o_ch[sgi], 0xF);
                     xdna_seq_push_queue(seq, (uint32_t) o_col[sgi], 0, bd, DIR_S2MM, (uint32_t) o_ch[sgi], true, 0);
                 }

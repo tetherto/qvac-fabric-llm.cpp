@@ -84,10 +84,14 @@ public:
     // the rows recorded by the last ubatch. each cell has two record slots so that a ubatch never
     // overwrites the slot it replays from. rollback then only changes how many rows get replayed.
     bool    gdn_deferred = false;
-    bool    gdn_inplace  = false; // update the base states in place (single cell only)
+    bool    gdn_inplace  = false; // update the base states in place
+
+    // the graph takes ragged ubatches (llama_batch_allocr::split_ragged): the conv and gated delta net ops
+    // get per-sequence token ranges, so one ubatch can mix sequences of different lengths
+    bool    rs_ragged    = false;
 
     // without rollback snapshots or the deferred commit, a single cell always reads and writes its own row,
-    // so the graphs can use the cache rows in place instead of gathering them
+    // so the graph reads its conv state in place instead of gathering it (the ssm states are always read in place)
     bool    rs_inplace   = false;
     int64_t gdn_rec_size = 0; // floats per record slot
 
@@ -224,6 +228,11 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // rows [i0, i1) of the ubatch whose state is not in its own cell yet (s_copy(i) != head + i, with the deferred gdn
+    // commit the base state), empty when every state is in place. unlike s_copy, it leaves a pending rollback index
+    // in place. the full (reserve) context reports every row, so the reserved graph sizes the buffers for all of them
+    void get_moved_range(uint32_t n_seqs, uint32_t & i0, uint32_t & i1) const;
+
     void set_input_gdn_deferred(int32_t * s_copy_base, int32_t * rec_idx, const llama_ubatch & ubatch) const;
 
     // true when the deferred gdn op updates the base states in place instead of gathering them,
@@ -231,6 +240,9 @@ public:
     bool get_s_base_inplace(uint32_t n_seqs) const;
 
 private:
+    // the source of s_copy(i), without consuming the pending rollback index
+    int32_t s_copy_src(int i) const;
+
     const llama_memory_status status;
 
     llama_memory_recurrent * mem;

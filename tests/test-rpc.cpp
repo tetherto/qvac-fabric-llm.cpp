@@ -118,6 +118,40 @@ static bool check_unreachable_prefetch_timing(prefetch_connection_fn prefetch_co
     return true;
 }
 
+static bool any_op_offered(ggml_backend_dev_t device, const std::vector<ggml_tensor *> & ops) {
+    for (ggml_tensor * op : ops) {
+        if (ggml_backend_dev_supports_op(device, op)) {
+            fprintf(stderr, "RPC device offers %s, which the remote backend may not implement\n", ggml_op_desc(op));
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool check_convrot_ops_not_offered(ggml_backend_dev_t device) {
+    constexpr int64_t group_size = 256;
+    constexpr int64_t rows       = 4;
+    constexpr int64_t columns    = 2;
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx{ ggml_init(params) };
+    if (ctx == nullptr) {
+        return false;
+    }
+    ggml_tensor * activations = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, group_size, columns);
+    ggml_tensor * weights     = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I8, group_size, rows);
+    ggml_tensor * scales      = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, rows, 1);
+    const std::vector<ggml_tensor *> ops = {
+        ggml_mul_mat_convrot(ctx.get(), activations, weights, scales, group_size),
+        ggml_convrot(ctx.get(), activations, group_size),
+    };
+    return !any_op_offered(device, ops);
+}
+
 static ggml_backend_ptr init_backend(const std::string & endpoint, ggml_backend_dev_t & device) {
     ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
     if (rpc_reg == nullptr) {
@@ -178,6 +212,10 @@ int main() {
     ggml_backend_ptr   backend_b = init_backend(endpoint_b, device_b);
     if (backend_a == nullptr || backend_b == nullptr) {
         fprintf(stderr, "failed to initialize RPC test backends\n");
+        return 1;
+    }
+
+    if (!check_convrot_ops_not_offered(device_a)) {
         return 1;
     }
 

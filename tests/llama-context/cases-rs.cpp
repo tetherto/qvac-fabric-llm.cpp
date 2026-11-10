@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <utility>
@@ -555,6 +556,121 @@ struct case_multi_seq_cell_swap : ctx_test {
     }
 };
 
+// sequences of different lengths decoded in one batch, with a ubatch smaller than the batch so that the
+// sequences of a ubatch differ in length and some are split across ubatches (ragged ubatches on hybrid
+// models, see llama_batch_allocr::split_ragged). Each seq must match a fresh context that decodes it alone.
+struct case_multi_seq_ragged : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "ragged"; }
+
+    const char * description() const override {
+        return "seqs of different lengths decoded in one batch, against a context per seq";
+    }
+
+    std::string skip_reason(model_run & mr) const override {
+        if (!llama_model_is_hybrid(mr.model)) {
+            return "not a hybrid model";
+        }
+
+        // plamo2 fails this with the equal split as well (its first seq differs from the alone run on CPU and CUDA)
+        char arch_str[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_str, sizeof(arch_str));
+        if (strcmp(arch_str, "plamo2") == 0) {
+            return "differs from the alone run with the equal split too";
+        }
+
+        return ctx_test::skip_reason(mr);
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr double nmse_eps = 1e-4; // see case_multi_seq_split_replay
+
+        // the steps mix ragged, equal-split and decode ubatches, whose graphs the reserve must all cover. the check is for
+        // the archs with ragged ubatches: the graphs of others (f.ex. the dsv4 cache) change with the layouts of the steps
+        char arch_str[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_str, sizeof(arch_str));
+        const bool realloc_check = strcmp(arch_str, "qwen35") == 0 || strcmp(arch_str, "qwen35moe") == 0;
+
+        const auto make_ctx_ragged = [&]() {
+            ctx_opts opts;
+            opts.n_ctx         = 256;
+            opts.n_batch       = 64;
+            opts.n_ubatch      = 16;
+            opts.n_seq_max     = 3;
+            opts.kv_unified    = 1;
+            opts.realloc_check = realloc_check;
+            return mr.ctx(opts);
+        };
+
+        // per step and seq the positions [p0, p1) to decode
+        using range = std::pair<llama_pos, llama_pos>;
+        const std::vector<std::vector<range>> steps = {
+            { {  0, 13 }, {  0,  2 }, { 0,  7 } },
+            { { 13, 14 }, {  2, 11 }, { 7,  8 } },
+            { { 14, 20 }, { 11, 12 }, { 8, 30 } },
+        };
+
+        // decodes the given ranges of the given seqs in one batch, returns the logits of the last token of each seq
+        const auto decode = [&](llama_context * ctx, const std::vector<llama_seq_id> & seqs, const std::vector<range> & r) {
+            common_batch batch(ctx);
+            std::vector<int32_t> last(3, -1);
+            int32_t n_tokens = 0;
+            for (llama_seq_id s : seqs) {
+                for (llama_pos pos = r[s].first; pos < r[s].second; ++pos) {
+                    last[s] = n_tokens++;
+                    batch.add(gen_token(n_vocab, s, pos), pos, s, pos + 1 == r[s].second);
+                }
+            }
+            const bool ok = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+            std::vector<std::vector<float>> res(3);
+            for (llama_seq_id s : seqs) {
+                if (ok) {
+                    const float * l = llama_get_logits_ith(ctx, last[s]);
+                    res[s].assign(l, l + n_vocab);
+                }
+            }
+            return res;
+        };
+
+        llama_context_ptr ctx = make_ctx_ragged();
+        std::vector<llama_context_ptr> refs;
+        for (int s = 0; s < 3; ++s) {
+            refs.push_back(make_ctx_ragged());
+        }
+        CTX_REQUIRE(ctx && refs[0] && refs[1] && refs[2], "failed to init context");
+
+        for (size_t i = 0; i < steps.size(); ++i) {
+            const auto got = decode(ctx.get(), { 0, 1, 2 }, steps[i]);
+            for (llama_seq_id s = 0; s < 3; ++s) {
+                const auto ref = decode(refs[s].get(), { s }, steps[i]);
+                CTX_REQUIRE(!got[s].empty() && !ref[s].empty(),
+                        "step " + std::to_string(i) + ": decode of seq " + std::to_string(s) + " failed");
+
+                std::vector<uint8_t> st_got;
+                std::vector<uint8_t> st_ref;
+                CTX_REQUIRE(get_seq_state(ctx.get(), s, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, st_got) &&
+                            get_seq_state(refs[s].get(), s, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, st_ref),
+                        "step " + std::to_string(i) + ": state of seq " + std::to_string(s) + " failed");
+
+                const double nmse_logits = compare_logits(ref[s].data(), got[s].data(), n_vocab).nmse();
+                // compared as floats: the headers of the two states are the same
+                const double nmse_state = st_got.size() != st_ref.size() ? std::numeric_limits<double>::infinity() :
+                    compare_logits((const float *) st_ref.data(), (const float *) st_got.data(), st_ref.size()/sizeof(float)).nmse();
+                if (nmse_logits > nmse_eps || nmse_state > nmse_eps) {
+                    TLOG_ERR("%s: step %zu: seq %d mismatch (logits nmse %g, state nmse %g)\n", __func__, i, s, nmse_logits, nmse_state);
+                    return case_result::fail("step " + std::to_string(i) + ": seq " + std::to_string(s) + " mismatch");
+                }
+                TLOG_INF("%s: step %zu: seq %d matched (logits nmse %g, state nmse %g)\n", __func__, i, s, nmse_logits, nmse_state);
+            }
+        }
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -562,6 +678,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
     cases.push_back(std::make_unique<case_multi_seq_cell_swap>());
+    cases.push_back(std::make_unique<case_multi_seq_ragged>());
 
     return cases;
 }

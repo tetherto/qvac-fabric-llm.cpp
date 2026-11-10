@@ -1184,6 +1184,28 @@ static bool ggml_metal_is_bonsai_ptq1_0_r4_shape(int64_t ne00, int64_t ne01) {
     return (ne01 == 5120 && ne00 == 17408) || (ne01 == 10240 && ne00 == 5120);
 }
 
+static ggml_metal_pipeline_with_params ggml_metal_library_get_or_compile(ggml_metal_library_t lib, const char * name) {
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mat_convrot(ggml_metal_library_t lib, const ggml_tensor * op, const char * stage) {
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
+
+    char name[256];
+    snprintf(name, sizeof(name), "kernel_mul_mat_convrot_%s_%s", stage, op->src[0]->type == GGML_TYPE_F32 ? "f32" : "f16");
+    return ggml_metal_library_get_or_compile(lib, name);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_convrot(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+
+    return ggml_metal_library_get_or_compile(lib, "kernel_convrot_f32");
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op, bool add, bool norm) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
