@@ -42,18 +42,18 @@ struct xdna_rec_geom {
     int64_t azg_bytes         = 0;  // azg BO: n_vh x [attn|z|gamma|hh] f32
     int64_t out_bytes         = 0;  // gated out (scratch + aq + d_a) bytes
     int64_t d_out             = 0;  // h_attn / h_out width in floats
+    int     n_vh              = 0;  // value heads (xdna_rec_pack::heads_ok)
 
     bool valid() const;
 };
 
-// Fixed geometry constants of one 1024-wide Qwen3.5 gated-delta-net layer.
+// Fixed geometry constants of one Qwen3.5 gated-delta-net layer. Its
+// residual width is the model's (xdna_res_width_ok), its value heads a
+// multiple of the core's NVH (heads_ok).
 namespace xdna_rec_pack {
 // conv / gdn stage (attn_gdn_gated.xclbin)
-constexpr int CH         = 6144;
 constexpr int SV         = 128;
-constexpr int NVH        = 16;
-constexpr int NCONV      = 2;   // conv columns
-constexpr int CN         = 24;  // 128-channel groups per conv column
+constexpr int NVH        = 16;  // value heads a pass of the core
 constexpr int FQ         = 3 * SV;
 constexpr int FW         = 4 * SV;
 constexpr int FEEDN      = 8 * SV;
@@ -62,7 +62,6 @@ constexpr int HEADNORM   = 3 * SV + 3;  // x-head + eg + beta + scale
 // 16-lane vector so a head inside a multi-head object starts on a vector
 // boundary (kernels/attn_gdn_gated.py).
 constexpr int AZGN       = ((3 * SV + 1 + 15) / 16) * 16;  // 400
-constexpr int D_OUT      = 1024;
 constexpr int KGATE      = NVH * SV;                       // gdn attn / aq row length
 // The gated out BO: ssm_out's GEMV activation first (a header tile then one
 // per k_tile), then the gated f32 scratch, then aq and d_a. Mirrors OUTN in
@@ -80,42 +79,53 @@ constexpr int ACT_OFF    = 10496;  // after aq and d_a
 #    define GGML_XDNA_GATED_FMT 1
 #endif
 constexpr int GATED_FMT = GGML_XDNA_GATED_FMT;
-constexpr int ACTN      = (1 + KGATE / (GATED_FMT == 1 ? 128 : 256)) * ACT_TILE_G;
+constexpr int ACT_TILES = KGATE / (GATED_FMT == 1 ? 128 : 256);  // activation tiles a pass writes
+constexpr int ACTN      = (1 + ACT_TILES) * ACT_TILE_G;
 constexpr int OUTN      = ACT_OFF + ACTN;
 // The bigger of the two layouts. Buffers are sized by this one so that a host
 // and an artifact that disagree cannot write past the end of the buffer; the
 // disagreement itself is reported and the run refused.
 constexpr int OUTN_MAX  = ACT_OFF + (1 + KGATE / 128) * ACT_TILE_G;
 
-int64_t state_floats();  // NVH * N_OBJ * ROWS_N (fp32 ssm state floats)
-int64_t feed_blocks();   // NCONV * CN
+// q (and k) groups of the convolution. A layer has NKG of each and n_vh value
+// heads, value head h on group h % NKG (ggml's GATED_DELTA_NET); the core
+// runs once per NVH of them, a pass, up to MAX_PASSES.
+constexpr int NKG        = 16;
+constexpr int MAX_PASSES = 2;
+
+bool    heads_ok(int n_vh);
+int64_t state_floats(int n_vh = NVH);  // n_vh * N_OBJ * ROWS_N (fp32 ssm state floats)
+int64_t channels(int n_vh = NVH);      // the convolution's: q, k and v
+int64_t feed_blocks(int n_vh = NVH);   // a conv block a group of SV channels
 }  // namespace xdna_rec_pack
 
-xdna_rec_geom xdna_rec_pack_geom(void);
+// `d_out` is the residual width, the layer's h_attn / h_out.
+xdna_rec_geom xdna_rec_pack_geom(int64_t d_out, int n_vh = xdna_rec_pack::NVH);
 
 // Static + per-token sources of one fused layer (all ggml-layout host data).
-//  - w_conv     : f32 [4 taps x 6144 ch], element (tap, ch) at tap + 4*ch
+//  - w_conv     : f32 [4 taps x channels(n_vh)], element (tap, ch) at tap + 4*ch
 //  - w_ssm_norm : f32 [128] (ssm_norm gamma, seeded into the core azg lanes)
-//  - w_post_norm: f32 [1024] (post-attention RMS gamma, host FFN norm)
+//  - w_post_norm: f32 [d_out] (post-attention RMS gamma, host FFN norm)
 struct xdna_rec_layer_host {
     int           il          = 0;
+    int           n_vh        = xdna_rec_pack::NVH;
     const float * w_conv      = nullptr;
     const float * w_ssm_norm  = nullptr;
     const float * w_post_norm = nullptr;
 };
 
 // Build the one-time host buffer of a layer run (see xdna_rec_core_begin).
-//   conv_hist : 3 rows x 6144 f32 (oldest first), or nullptr (zeros)
-//   qkv       : 6144 f32 current-token projections (t=0 window)
+//   conv_hist : 3 rows x channels(n_vh) f32 (oldest first), or nullptr (zeros)
+//   qkv       : channels(n_vh) f32 current-token projections (t=0 window)
 void xdna_rec_pack_begin(const xdna_rec_layer_host & h,
                          const float *               conv_hist,
                          const float *               qkv,
                          std::vector<uint8_t> &      feed0);
 
 // Per-token packing helpers. gate is the llama exp-input (softplus*ssm_a)
-// [16], beta is the sigmoided projection [16]; x tails place
+// [n_vh], beta is the sigmoided projection [n_vh]; x tails place
 // [eg, beta, 1/sqrt(SV)] per value head.
-void xdna_rec_pack_x(const float * gate, const float * beta, std::vector<uint8_t> & x);
+void xdna_rec_pack_x(const float * gate, const float * beta, std::vector<uint8_t> & x, int n_vh = xdna_rec_pack::NVH);
 
 // host RMS norm: out = in / sqrt(mean(in^2) + eps) * w
 void xdna_rec_rms_norm(const float * in, const float * w, size_t n, float eps, float * out);
@@ -163,21 +173,35 @@ struct xdna_rec_core {
     size_t               in_w_off = 0;
     size_t               in_a_off = 0;
     std::vector<uint8_t> in_host_a;
+    // A layer past one pass splits it (xdna_rec_core_set_inproj_split): in_*
+    // is qkv alone, into the feed, and z_* is z, into azg - each stream with
+    // one destination, whatever the ratio of the two.
+    bool                 z_split = false;
+    xdna_gemv_geom       z_geom;
+    std::vector<uint8_t> z_packed;  // until the stream is built
+    size_t               z_w_off = 0;
+    size_t               z_a_off = 0;
+
     xdna_buffer *        w6   = nullptr;  // [ssm_out weights | in-proj weights]
     xdna_buffer *        a7   = nullptr;  // [ssm_out activation | in-proj activation]
     // The layer boundary on the prologue (xdna_rec_core_set_rows): the
-    // residual rows every fused layer binds as argument 9, and the two norms'
-    // gammas, rows of a7.
+    // residual rows every fused layer binds as argument 9, their width (the
+    // in-projection's K), and the two norms' gammas, rows of a7.
     bool                 rows = false;
     xdna_buffer *        res  = nullptr;
+    int                  d    = 0;
     std::vector<float>   g_attn, g_post;
     float                eps_attn = 0.0f, eps_post = 0.0f;
     size_t               g_attn_off = 0, g_post_off = 0;
     // The GDN gates on the prologue too: [constants | ssm_alpha | ssm_beta
-    // rows, bf16] in w6 at ab_off, x's tails emitted into x.
+    // rows, bf16] in w6 at ab_off, x's tails emitted into x. The prologue
+    // takes NVH heads; a split in-projection's second one takes the next NVH
+    // from ab_hi.
     bool                 gates = false;
     std::vector<uint8_t> ab;
     size_t               ab_off = 0;
+    std::vector<uint8_t> ab_hi;
+    size_t               ab_hi_off = 0;
 
     bool          pkv_onchip   = false;
     int           act_arg      = 5;
@@ -212,8 +236,8 @@ bool xdna_rec_core_begin(xdna_rec_core * core, const void * feed0, const float *
 bool xdna_rec_core_seed(xdna_rec_core * core, const void * state);
 
 // The recurrent state the device carries, in llama's cache layout: the conv
-// history (3 taps a channel, channel-major, 3*CH floats) and the ssm state
-// (state_floats(), from its bf16 copy). What xdna_rec_core_begin and
+// history (3 taps a channel, channel-major, 3 * channels(n_vh) floats) and the
+// ssm state (state_floats(n_vh), from its bf16 copy). What xdna_rec_core_begin and
 // xdna_rec_core_seed take, read back.
 bool xdna_rec_core_read_state(xdna_rec_core * core, float * conv_hist, float * ssm);
 
@@ -253,7 +277,8 @@ bool xdna_rec_core_set_inproj(xdna_rec_core *               core,
 // (xdna-gemv.h XDNA_RES_*) instead of the host: the in-projection's input is
 // the prologue's norm of F + A, ssm_out drains into S, the FFN's input is the
 // norm of H + S (h_attn into A) and its output lands in F. Call before
-// xdna_rec_core_fuse_so, with the in-projection set.
+// xdna_rec_core_fuse_so, with the in-projection set: its K is the rows'
+// width, and the gammas are that long.
 bool xdna_rec_core_set_rows(xdna_rec_core *      core,
                             struct xdna_buffer * res,
                             const float *        gamma_attn,
@@ -261,9 +286,21 @@ bool xdna_rec_core_set_rows(xdna_rec_core *      core,
                             const float *        gamma_post,
                             float                eps_post);
 
-// And the gates, from the same row: alpha = W_a x, beta = W_b x (NVH rows of
-// D each, f32), dt and a (NVH each) - x's per-head tails (exp(gate), beta,
-// the scale) become the prologue's, and the host writes x no more.
+// The in-projection of a layer past one pass, as two (xdna_rec_inproj_pack_one
+// each): qkv, drained into the feed's windows, then z, into azg's lanes. With
+// the residual rows each has its own prologue, the second one taking the
+// gates of the heads past the first NVH.
+bool xdna_rec_core_set_inproj_split(xdna_rec_core *               core,
+                                    const struct xdna_gemv_geom & qkv_geom,
+                                    const std::vector<uint8_t> &  qkv_packed,
+                                    const struct xdna_gemv_geom & z_geom,
+                                    const std::vector<uint8_t> &  z_packed);
+
+// And the gates, from the same row: alpha = W_a x, beta = W_b x (n_vh rows of
+// D each, f32), dt and a (n_vh each) - x's per-head tails (exp(gate), beta,
+// the scale) become the prologue's, and the host writes x no more. False
+// when the rows do not go through the prologue (xdna_row_gates_ok), or the
+// layer is past one pass without a split in-projection to carry them.
 bool xdna_rec_core_set_gates(xdna_rec_core * core,
                              const float *   w_alpha,
                              const float *   w_beta,

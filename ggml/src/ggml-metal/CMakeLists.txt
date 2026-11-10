@@ -74,6 +74,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/pool.metal
     kernels/misc.metal
     kernels/out_prod.metal
+    kernels/convrot.metal
 )
 
 if (GGML_METAL_EMBED_LIBRARY)

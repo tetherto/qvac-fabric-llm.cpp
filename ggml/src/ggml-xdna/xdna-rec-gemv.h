@@ -16,8 +16,8 @@
 // One artifact serves every shape here, so ssm_out, the gate/up activation and
 // the down projection are three dispatches on one context. The FFN's
 // nonlinearity closes on the cores (the epilogue), so the gate and up halves
-// never come back to the host; only the residual adds stay here, 1024 floats
-// each.
+// never come back to the host; only the residual adds stay here, a residual
+// row (d floats) each.
 
 #include "xdna-gemv.h"
 
@@ -100,6 +100,11 @@ struct xdna_rec_inproj {
 };
 
 bool xdna_rec_inproj_pack(const struct ggml_tensor * w_qkv, const struct ggml_tensor * w_z, xdna_rec_inproj & out);
+
+// One half of a split in-projection (attn_qkv or attn_gate) alone, every
+// output stream full of it in the weight's own order. False when its rows
+// are not a whole number of chunks.
+bool xdna_rec_inproj_pack_one(const struct ggml_tensor * w, xdna_gemv_geom & geom, std::vector<uint8_t> & packed);
 
 // The ssm_out GEMV, for appending its stream to the core's.
 struct xdna_gemv * xdna_rec_gemv_so(xdna_rec_gemv * m);

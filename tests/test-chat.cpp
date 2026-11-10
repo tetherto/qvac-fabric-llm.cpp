@@ -3327,8 +3327,58 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     }
 
     {
+        // Qwen3: a required tool call may follow the reasoning block, in either reasoning format
+        auto tst = peg_tester("models/templates/Qwen-Qwen3-0.6B.jinja");
+
+        tst.test(
+               "<tool_call>\n"
+               "{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n"
+               "</tool_call>")
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect(message_assist_call)
+            .run();
+
+        tst.test(
+               "<think>\nI'm\nthinking\n</think>\n\n"
+               "<tool_call>\n"
+               "{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect(message_assist_call_thoughts)
+            .run();
+
+        tst.test(
+               "<think>\nI'm\nthinking\n</think>\n\n"
+               "<tool_call>\n"
+               "{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect_content("<think>\nI'm\nthinking\n</think>\n\n")
+            .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
+            .run();
+    }
+
+    {
         // Qwen-QwQ-32B (reasoning model)
         auto tst = peg_tester("models/templates/Qwen-QwQ-32B.jinja");
+
+        // A required tool call after the reasoning block the generation prompt opened
+        tst.test(
+               "I'm\nthinking\n</think>\n\n"
+               "<tool_call>\n"
+               "{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect(message_assist_call_thoughts)
+            .run();
 
         // QwQ always has thinking forced open - input starts after the <think>\n in the prompt
         tst.test("Let me think about this...\n</think>\nThe answer is 42.")
@@ -8177,6 +8227,67 @@ static void test_reasoning_budget_message_per_request() {
     }
 }
 
+// Under tool_choice required the grammar accepts end of generation only after a call. Text allowed before the call lets
+// the model answer in prose and never reach it, so the grammar must accept the reasoning block and nothing else first.
+static void test_required_tool_call_grammar_rejects_content() {
+    LOG_DBG("%s\n", __func__);
+
+    const std::string call =
+        "<tool_call>\n"
+        "{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n"
+        "</tool_call>";
+
+    struct template_case {
+        std::string path;
+        bool        thinking_opened_by_prompt;
+    };
+    // Qwen3 opens its reasoning block in the output; QwQ's generation prompt already opened it.
+    for (const auto & tc : { template_case{ "models/templates/Qwen-Qwen3-0.6B.jinja", false },
+                             template_case{ "models/templates/Qwen-QwQ-32B.jinja", true } }) {
+        auto              tmpls     = read_templates(tc.path);
+        const std::string reasoning = tc.thinking_opened_by_prompt ? "I'm\nthinking\n</think>\n\n" :
+                                                                     "<think>\nI'm\nthinking\n</think>\n\n";
+
+        for (auto reasoning_format : { COMMON_REASONING_FORMAT_NONE, COMMON_REASONING_FORMAT_AUTO }) {
+            common_chat_templates_inputs inputs;
+            inputs.messages         = { message_user };
+            inputs.tools            = { special_function_tool };
+            inputs.tool_choice      = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+            inputs.reasoning_format = reasoning_format;
+
+            common_chat_session    session(tmpls.get(), nullptr, inputs, {});
+            common_params_sampling sampling;
+            session.apply_sampling(sampling);
+            const std::string what = "required tool call (" + tc.path + ", " +
+                                     common_reasoning_format_name(reasoning_format) + "): ";
+            if (sampling.grammar_lazy) {
+                throw std::runtime_error(what + "the grammar is lazy");
+            }
+
+            auto accepts = [&](const std::string & output) {
+                auto grammar = build_grammar(session.grammar());
+                if (!grammar) {
+                    throw std::runtime_error(what + "failed to build grammar: " + session.grammar());
+                }
+                return match_string(sampling.generation_prompt + output, grammar.get());
+            };
+
+            if (!tc.thinking_opened_by_prompt && !accepts(call)) {
+                throw std::runtime_error(what + "grammar rejects a bare call");
+            }
+            if (!accepts(reasoning + call)) {
+                throw std::runtime_error(what + "grammar rejects reasoning before the call");
+            }
+            if (!tc.thinking_opened_by_prompt && accepts("Hello! How can I help?\n" + call)) {
+                throw std::runtime_error(what + "grammar accepts content before the call");
+            }
+            if (accepts(reasoning + "Hello! How can I help?\n" + call)) {
+                throw std::runtime_error(what + "grammar accepts content after the reasoning");
+            }
+        }
+    }
+}
+
 static void test_reasoning_effort_caps() {
     LOG_DBG("%s\n", __func__);
 
@@ -8357,6 +8468,7 @@ int main(int argc, char ** argv) {
         test_deepseek_v4_1_message_fields();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
+        test_required_tool_call_grammar_rejects_content();
         test_prompt_parts();
         test_chat_session();
         test_reasoning_budget_tokens_per_request();

@@ -154,7 +154,8 @@ int ggml_metal_pipeline_thread_execution_width(struct ggml_metal_pipeline_with_p
     X(ARGSORT,         argsort)        \
     X(POOL,            pool)           \
     X(MISC,            misc)           \
-    X(OUT_PROD,        out_prod)
+    X(OUT_PROD,        out_prod)       \
+    X(CONVROT,         convrot)
 
 enum ggml_metal_lib_kind {
 #define X(e, s) GGML_METAL_LIB_##e,
@@ -1660,6 +1661,30 @@ static bool ggml_metal_supports_mul_mat_op(
     return mm_path;
 }
 
+static bool ggml_metal_device_supports_mul_mat_convrot(ggml_metal_device_t dev, const struct ggml_tensor * op) {
+    const struct ggml_tensor * a = op->src[0];
+    const struct ggml_tensor * w = op->src[1];
+    const struct ggml_tensor * s = op->src[2];
+    return dev->props.has_simdgroup_mm && dev->props.max_theadgroup_memory_size >= 32768 &&
+        (a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16) &&
+        w->type == GGML_TYPE_I8 && s->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+        ggml_get_op_params_i32(op, 0) == 256 &&
+        a->ne[0] == w->ne[0] && a->ne[0] > 0 && a->ne[0] % 256 == 0 &&
+        w->ne[2] == 1 && w->ne[3] == 1 &&
+        s->ne[0] == w->ne[1] && s->ne[1] == 1 && s->ne[2] == 1 && s->ne[3] == 1 &&
+        op->ne[0] == w->ne[1] && op->ne[1] == a->ne[1] && op->ne[2] == a->ne[2] && op->ne[3] == a->ne[3] &&
+        a->ne[1] <= INT_MAX && w->ne[1] <= INT_MAX && a->ne[2]*a->ne[3] <= UINT_MAX;
+}
+
+static bool ggml_metal_device_supports_convrot(const struct ggml_tensor * op) {
+    const struct ggml_tensor * src = op->src[0];
+    const int32_t group_size = ggml_get_op_params_i32(op, 0);
+    return src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+        ggml_convrot_group_size_is_valid(group_size) &&
+        src->ne[0] > 0 && src->ne[0] % group_size == 0 &&
+        src->ne[0]/group_size <= INT_MAX && src->ne[1] <= INT_MAX && src->ne[2]*src->ne[3] <= UINT_MAX;
+}
+
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
@@ -2196,6 +2221,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0 && op->src[2]->ne[0] <= 128 &&
                 op->src[1]->nb[0] == sizeof(float) && op->src[0]->nb[0] == sizeof(float) &&
                 op->src[5]->nb[0] == sizeof(float) && op->src[6]->nb[1] % 16 == 0;
+        case GGML_OP_MUL_MAT_CONVROT:
+            return ggml_metal_device_supports_mul_mat_convrot(dev, op);
+        case GGML_OP_CONVROT:
+            return ggml_metal_device_supports_convrot(op);
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0 &&
                 op->src[0]->ne[2] == op->src[2]->ne[2] && op->src[1]->ne[2] == op->src[2]->ne[2] &&

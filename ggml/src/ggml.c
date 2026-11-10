@@ -1229,11 +1229,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_DELTA_NET_DEFERRED",
     "GDN_CONV_DEFERRED",
 
+    "MUL_MAT_CONVROT",
+    "CONVROT",
     "SSM_CONV_RAGGED",
     "GATED_DELTA_NET_RAGGED",
 };
 
-static_assert(GGML_OP_COUNT == 129, "GGML_OP_COUNT != 129");
+static_assert(GGML_OP_COUNT == 131, "GGML_OP_COUNT != 131");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1376,11 +1378,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "gated_delta_net_deferred(q,k,v,g,beta,s,rec,idx)",
     "gdn_conv_deferred(x,w,hist,idx)",
 
+    "convrot(X,W,S)",
+    "convrot(x)",
     "ssm_conv_ragged(x,s,w,off)",
     "gated_delta_net_ragged(q,k,v,g,beta,s,off)",
 };
 
-static_assert(GGML_OP_COUNT == 129, "GGML_OP_COUNT != 129");
+static_assert(GGML_OP_COUNT == 131, "GGML_OP_COUNT != 131");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3656,6 +3660,114 @@ void ggml_mul_mat_set_hint(
     const int32_t hint_i32 = (int32_t) hint;
 
     ggml_set_op_params_i32(a, 1, hint_i32);
+}
+
+// ggml_mul_mat_convrot
+
+static bool ggml_mul_mat_convrot_result_fits(int64_t out_features, const struct ggml_tensor * activations) {
+    int64_t elements = out_features;
+    for (int i = 1; i < GGML_MAX_DIMS && activations->ne[i] != 0; ++i) {
+        if (elements > INT64_MAX / activations->ne[i]) {
+            return false;
+        }
+        elements *= activations->ne[i];
+    }
+    return true;
+}
+
+struct ggml_tensor * ggml_mul_mat_convrot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * activations,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * scales,
+        int32_t               group_size) {
+    GGML_ASSERT(activations->type == GGML_TYPE_F32 || activations->type == GGML_TYPE_F16);
+    GGML_ASSERT(weights->type == GGML_TYPE_I8);
+    GGML_ASSERT(scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(!ggml_is_transposed(weights));
+    GGML_ASSERT(group_size == 256);
+
+    GGML_ASSERT(activations->ne[0] > 0 && weights->ne[0] > 0 && weights->ne[1] > 0);
+    GGML_ASSERT(activations->ne[1] >= 0 && activations->ne[2] >= 0 && activations->ne[3] >= 0);
+    GGML_ASSERT(activations->ne[0] == weights->ne[0]);
+    GGML_ASSERT(weights->ne[0] % group_size == 0);
+    GGML_ASSERT(weights->ne[2] == 1 && weights->ne[3] == 1);
+    GGML_ASSERT(scales->ne[0] == weights->ne[1]);
+    GGML_ASSERT(scales->ne[1] == 1 && scales->ne[2] == 1 && scales->ne[3] == 1);
+    GGML_ASSERT(weights->ne[0] <= INT64_MAX / weights->ne[1]);
+    GGML_ASSERT(ggml_mul_mat_convrot_result_fits(weights->ne[1], activations));
+
+    const int64_t ne[4] = { weights->ne[1], activations->ne[1], activations->ne[2], activations->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, group_size);
+
+    result->op     = GGML_OP_MUL_MAT_CONVROT;
+    result->src[0] = activations;
+    result->src[1] = weights;
+    result->src[2] = scales;
+
+    return result;
+}
+
+void ggml_mul_mat_convrot_set_f16_compat(
+        struct ggml_tensor * a,
+        bool                 enabled) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_CONVROT);
+
+    ggml_set_op_params_i32(a, 1, enabled ? 1 : 0);
+}
+
+// ggml_convrot
+
+bool ggml_convrot_group_size_is_valid(int32_t group_size) {
+    const bool power_of_two = (group_size & (group_size - 1)) == 0;
+    const bool even_exponent = (group_size & 0x55555555) != 0;
+    return group_size >= 4 && group_size <= 1024 && power_of_two && even_exponent;
+}
+
+static struct ggml_tensor * ggml_convrot_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int32_t               group_size,
+        bool                  inplace) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_convrot_group_size_is_valid(group_size));
+    GGML_ASSERT(a->ne[0] % group_size == 0);
+
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params_i32(result, 0, group_size);
+
+    result->op     = GGML_OP_CONVROT;
+    result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_convrot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int32_t               group_size) {
+    return ggml_convrot_impl(ctx, a, group_size, false);
+}
+
+struct ggml_tensor * ggml_convrot_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int32_t               group_size) {
+    return ggml_convrot_impl(ctx, a, group_size, true);
+}
+
+struct ggml_tensor * ggml_convrot_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * activations,
+        int32_t               group_size) {
+    GGML_ASSERT(activations->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->ne[0] == activations->ne[0]);
+
+    return ggml_mul_mat(ctx, weights, ggml_convrot(ctx, activations, group_size));
 }
 
 // ggml_mul_mat_id
@@ -8475,6 +8587,11 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, rope_back);
             }
             GGML_ASSERT((!src2 || !src2_needs_grads) && "gradients for freq factors not implemented");
+        } break;
+        case GGML_OP_CONVROT: {
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_convrot(ctx, grad, ggml_get_op_params_i32(tensor, 0)));
+            }
         } break;
         case GGML_OP_IM2COL: {
             if (src1_needs_grads) {

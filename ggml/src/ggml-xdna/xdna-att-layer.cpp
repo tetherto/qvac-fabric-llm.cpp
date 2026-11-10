@@ -21,9 +21,9 @@ namespace {
 using namespace xdna_att_geom;
 
 constexpr int      AW       = ACTT / 4;
-constexpr int      SIDE_W   = 512;                      // a side object, words
-constexpr int      N_PART   = CORES * ST / SIDE_W;      // 66
-constexpr int      N_QKV    = 2 * H * D + 2 * KVH * D;  // q|gate, k, v: 5120
+constexpr int      SIDE_W   = 512;                  // a side object, words
+constexpr int      N_PART   = CORES * ST / SIDE_W;  // 66 a head group
+constexpr int      MAX_GRPS = 2;                    // head groups a layer at most
 // The prologue tile's own streams (gemv_q4.py PRO_SIDE_COL / PRO_EMIT_COL).
 constexpr int      SIDE_COL = 6, SIDE_CH = 1;
 constexpr int      EMIT_COL = 5, EMIT_CH = 0;
@@ -34,17 +34,21 @@ constexpr uint32_t ACT_O_BD = 13;
 constexpr uint32_t EMIT_BD  = 14;
 
 // act-att.cc's words
-constexpr int W_NS = AW - 6, W_NE = AW - 7, W_MODE = 518, W_NPART = 519;
+constexpr int W_NS = AW - 6, W_NE = AW - 7, W_MODE = 518, W_NPART = 519, W_NKV = 519;
 constexpr int F_ATT = 1 << 5;
 
 // The dispatch's arguments. The firmware translates the first five itself;
 // the rest carry the aperture (xdna_seq_ddr_patch).
 constexpr int ARG_R = 3, ARG_W = 5, ARG_FFN = 6, ARG_RES = 7;
 
-// Scratch: the projection's output, then the partial states.
+// Scratch: the projection's output, then each head group's partial states.
 constexpr size_t R_QKV  = 0;
-constexpr size_t R_PART = (size_t) N_QKV * sizeof(float);
-constexpr size_t R_SIZE = R_PART + (size_t) CORES * ST * sizeof(float);
+constexpr size_t R_GRP  = (size_t) CORES * ST * sizeof(float);
+
+// q|gate, k and v of `groups` head groups: 5120 values a group.
+int qkv_rows(int groups) {
+    return groups * (2 * H * D + 2 * KVH * D);
+}
 
 // `n` runs of `run` words, `stride` words apart. A dimension's size is ten
 // bits: a longer run silently becomes a wrong pattern.
@@ -76,7 +80,11 @@ struct xdna_att_layer {
     xdna_gemv_geom     gatt;            // the pool's geometry for the attention phase
     size_t             tb = 0;
     xdna_gemv_ep       w[XDNA_GEMV_COLS], a, o[XDNA_GEMV_COLS];
-    int                n_o = 0;
+    int                n_o    = 0;
+    int                d      = 0;              // the residual width
+    int                groups = 1;              // head groups: a pool run each
+    size_t             pos_b  = 0;              // bytes of a cache position, every kv head
+    size_t             r_part = 0;              // the partial states in the scratch
 
     size_t w_o = 0, w_ffn = 0;                  // weight offsets
     size_t a_qkv = 0, a_att = 0, a_const = 0, a_o = 0, a_gattn = 0, a_gpost = 0, a_size = 0;
@@ -92,9 +100,10 @@ struct xdna_att_layer {
     struct variant {
         xdna_kernel *              kern = nullptr;
         xrt::run                   run;
-        xdna_buffer *              kbo = nullptr;
-        xdna_buffer *              vbo = nullptr;
-        xdna_buffer *              res = nullptr;
+        // the generations of the K, V and residual buffers the run is bound to
+        uint64_t                   kgen = 0;
+        uint64_t                   vgen = 0;
+        uint64_t                   rgen = 0;
         std::vector<xdna_buffer *> args;  // the run's, for a joined token stream
     };
 
@@ -116,9 +125,15 @@ int xdna_att_layer_max_positions(void) {
     return xdna_att_geom::max_positions();
 }
 
-bool xdna_att_layer_fits(const xdna_buffer * kbo, size_t koff, const xdna_buffer * vbo, size_t voff, int n_valid) {
+bool xdna_att_layer_fits(const xdna_buffer * kbo,
+                         size_t              koff,
+                         const xdna_buffer * vbo,
+                         size_t              voff,
+                         int                 n_valid,
+                         size_t              pos_b,
+                         int                 groups) {
     return kbo && vbo && n_valid > 0 && n_valid <= xdna_att_layer_max_positions() &&
-           xdna_att_geom::fits(kbo->bytes, koff, vbo->bytes, voff, n_valid);
+           xdna_att_geom::fits(kbo->bytes, koff, vbo->bytes, voff, n_valid, pos_b, groups);
 }
 
 void xdna_att_layer_free(xdna_att_layer * l) {
@@ -135,19 +150,26 @@ void xdna_att_layer_free(xdna_att_layer * l) {
 
 xdna_att_layer * xdna_att_layer_create(xdna_kernel_pool * pool, const xdna_att_layer_w & wt) {
     if (!pool || !wt.wq || !wt.wk || !wt.wv || !wt.gq || !wt.gk || !wt.wo || !wt.post || !wt.attn_norm ||
-        wt.attn_norm->type != GGML_TYPE_F32 || ggml_nelements(wt.attn_norm) != XDNA_RES_D ||
-        wt.wq->ne[0] != XDNA_RES_D || !wt.gate || !wt.up || !wt.down) {
+        wt.attn_norm->type != GGML_TYPE_F32 || !xdna_res_width_ok(wt.wq->ne[0]) ||
+        ggml_nelements(wt.attn_norm) != wt.wq->ne[0] || !wt.gate || !wt.up || !wt.down) {
         return nullptr;
     }
-    const int64_t K = wt.wq->ne[0];
-    if (wt.wq->ne[1] != (int64_t) 2 * H * D || wt.wk->ne[1] != (int64_t) KVH * D || wt.wv->ne[1] != (int64_t) KVH * D ||
-        wt.wk->ne[0] != K || wt.wv->ne[0] != K || wt.wo->ne[0] != (int64_t) H * D || wt.gq->type != GGML_TYPE_F32 ||
-        wt.gk->type != GGML_TYPE_F32 || wt.post->type != GGML_TYPE_F32 || ggml_nelements(wt.gq) != D ||
-        ggml_nelements(wt.gk) != D || ggml_nelements(wt.post) != wt.wo->ne[1]) {
+    const int64_t K  = wt.wq->ne[0];
+    const int64_t ng = wt.wq->ne[1] / ((int64_t) 2 * H * D);
+    if (ng < 1 || ng > MAX_GRPS || wt.wq->ne[1] != ng * 2 * H * D || wt.wk->ne[1] != ng * KVH * D ||
+        wt.wv->ne[1] != ng * KVH * D || wt.wk->ne[0] != K || wt.wv->ne[0] != K || wt.wo->ne[0] != ng * H * D ||
+        wt.wo->ne[1] != K || wt.gq->type != GGML_TYPE_F32 || wt.gk->type != GGML_TYPE_F32 ||
+        wt.post->type != GGML_TYPE_F32 || ggml_nelements(wt.gq) != D || ggml_nelements(wt.gk) != D ||
+        ggml_nelements(wt.post) != K) {
         return nullptr;
     }
     std::unique_ptr<xdna_att_layer, xdna_att_layer_deleter> l(new xdna_att_layer);
-    l->pool = pool;
+    l->pool         = pool;
+    l->d            = (int) K;
+    l->groups       = (int) ng;
+    l->pos_b        = (size_t) ng * POS_B;
+    l->r_part       = (size_t) qkv_rows(l->groups) * sizeof(float);
+    const int n_qkv = qkv_rows(l->groups);
     l->rg   = xdna_rec_gemv_create(pool, wt.wo, wt.gate, wt.up, wt.down);
     if (!l->rg || !l->rg->ffn || !xdna_gemv_pair_raw_act(l->rg->ffn)) {
         return nullptr;
@@ -159,9 +181,9 @@ xdna_att_layer * xdna_att_layer_create(xdna_kernel_pool * pool, const xdna_att_l
     // q|gate, k and v in one phase: the widest of the three formats holds all
     // of them (q8g16 takes any), which is one pipeline fill instead of two.
     const ggml_tensor * ws[3] = { wt.wq, wt.wk, wt.wv };
-    l->gqkv                   = xdna_gemv_variant(xdna_gemv_type_of(wt.wq), K, N_QKV, false, XDNA_GEMV_SPLIT_FUSED);
+    l->gqkv                   = xdna_gemv_variant(xdna_gemv_type_of(wt.wq), K, n_qkv, false, XDNA_GEMV_SPLIT_FUSED);
     for (int i = 1; i < 3; i++) {
-        const xdna_gemv_geom g = xdna_gemv_variant(xdna_gemv_type_of(ws[i]), K, N_QKV, false, XDNA_GEMV_SPLIT_FUSED);
+        const xdna_gemv_geom g = xdna_gemv_variant(xdna_gemv_type_of(ws[i]), K, n_qkv, false, XDNA_GEMV_SPLIT_FUSED);
         if (!g.valid()) {
             return nullptr;
         }
@@ -170,7 +192,7 @@ xdna_att_layer * xdna_att_layer_create(xdna_kernel_pool * pool, const xdna_att_l
         }
     }
     std::vector<uint8_t> packed;
-    if (!l->gqkv.valid() || l->gqkv.N != N_QKV || !xdna_gemv_pack_weights(l->gqkv, ws, 3, nullptr, packed)) {
+    if (!l->gqkv.valid() || l->gqkv.N != n_qkv || !xdna_gemv_pack_weights(l->gqkv, ws, 3, nullptr, packed)) {
         return nullptr;
     }
     // The pool's own view for the attention phase (attn-dec.cc takes its
@@ -179,8 +201,8 @@ xdna_att_layer * xdna_att_layer_create(xdna_kernel_pool * pool, const xdna_att_l
     l->tb   = l->gatt.tile_bytes();
     xdna_gemv_endpoints(l->gatt, l->w, &l->a, l->o, &l->n_o);
     if (!l->gatt.valid() || l->tb < (size_t) 2 * P * POS_B + 4 || l->n_o * 2 != XDNA_GEMV_COLS ||
-        so->geom.n_tiles() * so->geom.k_tile() != H * D || so->geom.n_out() != 1 || so->geom.fmt != XDNA_WFMT_Q4G32 ||
-        so->geom.k_tile() != 256) {
+        so->geom.n_tiles() * so->geom.k_tile() != l->groups * H * D || so->geom.n_real != K ||
+        so->geom.fmt != XDNA_WFMT_Q4G32 || so->geom.k_tile() != 256) {
         return nullptr;
     }
 
@@ -189,17 +211,17 @@ xdna_att_layer * xdna_att_layer_create(xdna_kernel_pool * pool, const xdna_att_l
     l->w_ffn            = xdna_align_up(l->w_o + so->geom.weight_bytes());
     const size_t ffn_wb = ffn->w2_off + ffn->g2.weight_bytes();
     l->wbuf             = xdna_buffer_alloc(l->dev, l->w_ffn + ffn_wb);
-    // activation: [qkv input | attention header + 2 q tiles | consts | combine]
+    // activation: [qkv input | attention header + 2 q tiles a group | consts | combine]
     l->a_qkv            = 0;
     l->a_att            = xdna_align_up(l->gqkv.act_bytes());
-    l->a_const          = l->a_att + (size_t) 3 * ACTT;
+    l->a_const          = l->a_att + (size_t) (1 + 2 * l->groups) * ACTT;
     l->a_o              = xdna_align_up(l->a_const + (size_t) SIDE_W * 4);
     l->a_gattn          = xdna_align_up(l->a_o + so->geom.act_bytes());
-    l->a_gpost          = l->a_gattn + (size_t) XDNA_RES_D * sizeof(float);
-    l->a_size           = l->a_gpost + (size_t) XDNA_RES_D * sizeof(float);
+    l->a_gpost          = l->a_gattn + (size_t) K * sizeof(float);
+    l->a_size           = l->a_gpost + (size_t) K * sizeof(float);
     l->act              = xdna_buffer_alloc(l->dev, l->a_size);
     l->ids              = xdna_buffer_alloc(l->dev, (size_t) CORES * l->tb);
-    l->r                = xdna_buffer_alloc(l->dev, R_SIZE);
+    l->r                = xdna_buffer_alloc(l->dev, l->r_part + (size_t) l->groups * R_GRP);
     if (!l->wbuf || !l->act || !l->ids || !l->r) {
         return nullptr;
     }
@@ -228,35 +250,110 @@ xdna_att_layer * xdna_att_layer_create(xdna_kernel_pool * pool, const xdna_att_l
     l->gk.assign((const float *) wt.gk->data, (const float *) wt.gk->data + D);
 
     // The combine's activation is fixed: the projection's count header, which
-    // takes the gate while the pool runs the attention, then eight tiles the
-    // prologue fills - the first takes the partial states, every one
-    // quantizes its head.
+    // takes the gate while the pool runs the attention, then a tile a head the
+    // prologue fills - the first of a head group takes that group's partial
+    // states, every one quantizes its head. A pass past the first has its own
+    // copy of the tiles, none of which takes the partials again: a replay of
+    // the first pass's would ask for them twice, and the second ask never
+    // drains.
     uint8_t * a = (uint8_t *) l->act->data;
     std::memset(a, 0, l->a_size);
-    std::memcpy(a + l->a_gattn, wt.attn_norm->data, (size_t) XDNA_RES_D * sizeof(float));
-    std::memcpy(a + l->a_gpost, wt.post->data, (size_t) XDNA_RES_D * sizeof(float));
+    std::memcpy(a + l->a_gattn, wt.attn_norm->data, (size_t) K * sizeof(float));
+    std::memcpy(a + l->a_gpost, wt.post->data, (size_t) K * sizeof(float));
     int32_t * hdr = (int32_t *) (a + l->a_o);
     hdr[0]        = so->geom.n_tiles();
     hdr[1]        = so->geom.n_out();
     hdr[W_MODE]   = 3;
-    hdr[W_NS]     = H / 2;
+    hdr[W_NS]     = l->groups * H / 2;
     hdr[AW - 1]   = 0;
     hdr[AW - 2]   = F_ATT;
-    for (int k = 0; k < so->geom.n_tiles(); k++) {
-        int32_t * t = (int32_t *) (a + l->a_o + (size_t) (1 + k) * ACTT);
-        t[517]      = k;
-        t[W_MODE]   = 2;
-        t[W_NPART]  = N_PART;
-        t[W_NS]     = k == 0 ? N_PART : 0;
-        t[W_NE]     = 0;
-        t[AW - 1]   = 0;  // q4g32 codes
-        t[AW - 2]   = F_ATT;
+    const int nt  = so->geom.n_tiles();
+    for (int c = 0; c < so->geom.n_out(); c++) {
+        for (int k = 0; k < nt; k++) {
+            int32_t * t = (int32_t *) (a + l->a_o + (size_t) (1 + c * nt + k) * ACTT);
+            t[517]      = k;
+            t[W_MODE]   = 2;
+            t[W_NPART]  = N_PART;
+            t[W_NS]     = c == 0 && k % H == 0 ? N_PART : 0;
+            t[W_NE]     = 0;
+            t[AW - 1]   = 0;  // q4g32 codes
+            t[AW - 2]   = F_ATT;
+        }
     }
     l->ffn_out.resize((size_t) ffn->g2.n_real);
     return l.release();
 }
 
 namespace {
+
+// A head group's partial states: one descriptor a stream, on its channel's
+// queue behind the group before's.
+template <typename Take> void partial_outputs(xdna_seq & seq, const xdna_att_layer * l, int g, Take & take) {
+    for (int s = 0; s < l->n_o; s++) {
+        const xdna_gemv_ep & e   = l->o[s];
+        const uint32_t       id  = take(e.col);
+        const uint32_t       off = (uint32_t) (l->r_part + (size_t) g * R_GRP + (size_t) 4 * s * ST * sizeof(float));
+        xdna_bd              bd;
+        bd.buf_len   = PIECES * 4 * PIECE;
+        bd.buf_off   = off;
+        bd.d0_size   = PIECE;
+        bd.d0_stride = 1;
+        bd.d1_size   = 4;
+        bd.d1_stride = ST;
+        bd.d2_stride = PIECE;
+        bd.ax_cache  = 2;
+        xdna_seq_blockwrite(&seq, e.col, 0, id, &bd);
+        xdna_seq_ddr_patch(&seq, e.col, 0, id, ARG_R, off);
+        xdna_seq_issue_token(&seq, e.col, 0, xdna_dma_dir::S2MM, e.ch, 0xF);
+        xdna_seq_push_queue(&seq, e.col, 0, id, xdna_dma_dir::S2MM, e.ch, true, 0);
+    }
+}
+
+// Every column's index object (a run's first weight object) on descriptor idx.
+void index_objects(xdna_seq & seq, const xdna_att_layer * l, const uint32_t * idx) {
+    for (int c = 0; c < XDNA_GEMV_COLS; c++) {
+        const xdna_gemv_ep & e   = l->w[c];
+        const uint32_t       off = (uint32_t) ((size_t) 2 * c * l->tb);
+        xdna_bd              bd;
+        lin(bd, 2 * l->tb, off);
+        xdna_seq_blockwrite(&seq, e.col, 0, idx[c], &bd);
+        xdna_seq_ddr_patch(&seq, e.col, 0, idx[c], ARG_IDS, off);
+        xdna_seq_push_queue(&seq, e.col, 0, idx[c], xdna_dma_dir::MM2S, e.ch, false, 0);
+    }
+}
+
+// The combine's side stream: per head group every core's m and l, then every
+// core's o, one descriptor each, chained.
+void combine_side(xdna_seq & seq, const xdna_att_layer * l) {
+    for (int g = 0; g < l->groups; g++) {
+        const uint32_t base = (uint32_t) (l->r_part + (size_t) g * R_GRP);
+        const uint32_t bd_m = SIDE_BD + 2 * g;
+        xdna_bd        bm, bo;
+        runs(bm, PIECE, CORES, ST, base);
+        // o is 2048 words a core and a dimension's size is ten bits: four
+        // runs of 512 a core, the cores one dimension further out
+        bo.buf_len   = CORES * (ST - PIECE);
+        bo.buf_off   = (uint32_t) (base + (size_t) PIECE * sizeof(float));
+        bo.d0_size   = SIDE_W;
+        bo.d0_stride = 1;
+        bo.d1_size   = (ST - PIECE) / SIDE_W;
+        bo.d1_stride = SIDE_W;
+        bo.d2_stride = ST;
+        bo.ax_cache  = 2;
+        bm.next_bd   = bd_m + 1;
+        bm.use_next  = true;
+        if (g + 1 < l->groups) {
+            bo.next_bd  = bd_m + 2;
+            bo.use_next = true;
+        }
+        xdna_seq_blockwrite(&seq, SIDE_COL, 0, bd_m, &bm);
+        xdna_seq_ddr_patch(&seq, SIDE_COL, 0, bd_m, ARG_R, bm.buf_off);
+        xdna_seq_blockwrite(&seq, SIDE_COL, 0, bd_m + 1, &bo);
+        xdna_seq_ddr_patch(&seq, SIDE_COL, 0, bd_m + 1, ARG_R, bo.buf_off);
+    }
+    xdna_seq_issue_token(&seq, SIDE_COL, 0, xdna_dma_dir::MM2S, SIDE_CH, 0xF);
+    xdna_seq_push_queue(&seq, SIDE_COL, 0, SIDE_BD, xdna_dma_dir::MM2S, SIDE_CH, true, 0);
+}
 
 std::vector<uint32_t>
 build(const xdna_att_layer * l, int n_task, int n_chunks, int row, size_t koff, size_t voff, bool kv_same) {
@@ -269,7 +366,7 @@ build(const xdna_att_layer * l, int n_task, int n_chunks, int row, size_t koff, 
     // 1. q|gate, k, v into the scratch. Its input is the prologue's row:
     //    h = F + A into H, rms_norm(h) * gamma into the tiles.
     const auto row_io = [&](uint32_t acc, uint32_t hres, int g_arg, uint32_t g_off, uint32_t h_out) {
-        xdna_seq_row_io(&seq, ARG_RES, acc, hres, g_arg, g_off, h_out);
+        xdna_seq_row_io(&seq, l->d, ARG_RES, acc, hres, g_arg, g_off, h_out);
     };
     const auto row_wait = [&]() {
         xdna_seq_row_wait(&seq);
@@ -294,30 +391,16 @@ build(const xdna_att_layer * l, int n_task, int n_chunks, int row, size_t koff, 
         return next[col]++;
     };
     // the partial states, a core's 2112 floats back to back: stream s carries
-    // cores 4s..4s+3 as the quarters of each of its 33 objects
-    for (int s = 0; s < l->n_o; s++) {
-        const xdna_gemv_ep & e   = l->o[s];
-        const uint32_t       id  = take(e.col);
-        const uint32_t       off = (uint32_t) (R_PART + (size_t) 4 * s * ST * sizeof(float));
-        xdna_bd              bd;
-        bd.buf_len   = PIECES * 4 * PIECE;
-        bd.buf_off   = off;
-        bd.d0_size   = PIECE;
-        bd.d0_stride = 1;
-        bd.d1_size   = 4;
-        bd.d1_stride = ST;
-        bd.d2_stride = PIECE;
-        bd.ax_cache  = 2;
-        xdna_seq_blockwrite(&seq, e.col, 0, id, &bd);
-        xdna_seq_ddr_patch(&seq, e.col, 0, id, ARG_R, off);
-        xdna_seq_issue_token(&seq, e.col, 0, xdna_dma_dir::S2MM, e.ch, 0xF);
-        xdna_seq_push_queue(&seq, e.col, 0, id, xdna_dma_dir::S2MM, e.ch, true, 0);
+    // cores 4s..4s+3 as the quarters of each of its 33 objects, a run a head
+    // group, queued on its channel one after the other
+    for (int g = 0; g < l->groups; g++) {
+        partial_outputs(seq, l, g, take);
     }
     // this position's K and V rows, from the prologue into the cache
     {
         xdna_bd bk, bv;
-        lin(bk, POS_B, (uint32_t) (koff + (size_t) row * POS_B));
-        lin(bv, POS_B, (uint32_t) (voff + (size_t) row * POS_B));
+        lin(bk, l->pos_b, (uint32_t) (koff + (size_t) row * l->pos_b));
+        lin(bv, l->pos_b, (uint32_t) (voff + (size_t) row * l->pos_b));
         bk.next_bd  = EMIT_BD + 1;
         bk.use_next = true;
         xdna_seq_blockwrite(&seq, EMIT_COL, 0, EMIT_BD, &bk);
@@ -327,11 +410,11 @@ build(const xdna_att_layer * l, int n_task, int n_chunks, int row, size_t koff, 
         xdna_seq_issue_token(&seq, EMIT_COL, 0, xdna_dma_dir::S2MM, EMIT_CH, 0xF);
         xdna_seq_push_queue(&seq, EMIT_COL, 0, EMIT_BD, xdna_dma_dir::S2MM, EMIT_CH, true, 0);
     }
-    // the header and the two prepare tiles
+    // the header and every group's two prepare tiles
     {
         const uint32_t id = take(l->a.col);
         xdna_bd        bd;
-        lin(bd, (size_t) 3 * ACTT, (uint32_t) l->a_att);
+        lin(bd, (size_t) (1 + 2 * l->groups) * ACTT, (uint32_t) l->a_att);
         xdna_seq_blockwrite(&seq, l->a.col, 0, id, &bd);
         xdna_seq_ddr_patch(&seq, l->a.col, 0, id, ARG_ACT, bd.buf_off);
         xdna_seq_push_queue(&seq, l->a.col, 0, id, xdna_dma_dir::MM2S, l->a.ch, false, 0);
@@ -342,86 +425,64 @@ build(const xdna_att_layer * l, int n_task, int n_chunks, int row, size_t koff, 
         xdna_seq_ddr_patch(&seq, l->a.col, 0, ACT_O_BD, ARG_ACT, bo.buf_off);
         xdna_seq_push_queue(&seq, l->a.col, 0, ACT_O_BD, xdna_dma_dir::MM2S, l->a.ch, false, 0);
     }
-    // the side objects: consts, q of heads 0-3, k|v, q of 4-7 for the prepare
-    // tiles, then the gate for the combine's header
+    // the side objects: consts, every kv head's k then v, and every query
+    // head's q for the prepare tiles (the first tile takes the consts, k and
+    // v), then the gate for the combine's header
     {
-        xdna_bd bc, bq0, bkv, bq1, bg;
+        const int hq = l->groups * H, kvh = l->groups * KVH;
+        xdna_bd   bc, bkv, bq, bg;
         lin(bc, (size_t) SIDE_W * 4, (uint32_t) l->a_const);
-        runs(bq0, D, 4, 2 * D, (uint32_t) R_QKV);
-        lin(bkv, (size_t) 2 * KVH * D * sizeof(float), (uint32_t) (R_QKV + (size_t) 2 * H * D * sizeof(float)));
-        runs(bq1, D, 4, 2 * D, (uint32_t) (R_QKV + (size_t) 4 * 2 * D * sizeof(float)));
-        runs(bg, D, H, 2 * D, (uint32_t) (R_QKV + (size_t) D * sizeof(float)));
+        lin(bkv, (size_t) 2 * kvh * D * sizeof(float), (uint32_t) (R_QKV + (size_t) 2 * hq * D * sizeof(float)));
+        runs(bq, D, hq, 2 * D, (uint32_t) R_QKV);
+        runs(bg, D, hq, 2 * D, (uint32_t) (R_QKV + (size_t) D * sizeof(float)));
         bc.next_bd   = SIDE_BD + 1;
         bc.use_next  = true;
-        bq0.next_bd  = SIDE_BD + 2;
-        bq0.use_next = true;
-        bkv.next_bd  = SIDE_BD + 3;
+        bkv.next_bd  = SIDE_BD + 2;
         bkv.use_next = true;
-        bq1.next_bd  = SIDE_BD + 4;
-        bq1.use_next = true;
+        bq.next_bd   = SIDE_BD + 3;
+        bq.use_next  = true;
         xdna_seq_blockwrite(&seq, SIDE_COL, 0, SIDE_BD, &bc);
         xdna_seq_ddr_patch(&seq, SIDE_COL, 0, SIDE_BD, ARG_ACT, bc.buf_off);
-        xdna_seq_blockwrite(&seq, SIDE_COL, 0, SIDE_BD + 1, &bq0);
-        xdna_seq_ddr_patch(&seq, SIDE_COL, 0, SIDE_BD + 1, ARG_R, bq0.buf_off);
-        xdna_seq_blockwrite(&seq, SIDE_COL, 0, SIDE_BD + 2, &bkv);
-        xdna_seq_ddr_patch(&seq, SIDE_COL, 0, SIDE_BD + 2, ARG_R, bkv.buf_off);
-        xdna_seq_blockwrite(&seq, SIDE_COL, 0, SIDE_BD + 3, &bq1);
-        xdna_seq_ddr_patch(&seq, SIDE_COL, 0, SIDE_BD + 3, ARG_R, bq1.buf_off);
-        xdna_seq_blockwrite(&seq, SIDE_COL, 0, SIDE_BD + 4, &bg);
-        xdna_seq_ddr_patch(&seq, SIDE_COL, 0, SIDE_BD + 4, ARG_R, bg.buf_off);
+        xdna_seq_blockwrite(&seq, SIDE_COL, 0, SIDE_BD + 1, &bkv);
+        xdna_seq_ddr_patch(&seq, SIDE_COL, 0, SIDE_BD + 1, ARG_R, bkv.buf_off);
+        xdna_seq_blockwrite(&seq, SIDE_COL, 0, SIDE_BD + 2, &bq);
+        xdna_seq_ddr_patch(&seq, SIDE_COL, 0, SIDE_BD + 2, ARG_R, bq.buf_off);
+        xdna_seq_blockwrite(&seq, SIDE_COL, 0, SIDE_BD + 3, &bg);
+        xdna_seq_ddr_patch(&seq, SIDE_COL, 0, SIDE_BD + 3, ARG_R, bg.buf_off);
         xdna_seq_issue_token(&seq, SIDE_COL, 0, xdna_dma_dir::MM2S, SIDE_CH, 0xF);
         xdna_seq_push_queue(&seq, SIDE_COL, 0, SIDE_BD, xdna_dma_dir::MM2S, SIDE_CH, true, 0);
     }
     // the chunks read the cache: this position's row has to be in it first
     xdna_seq_wait_token(&seq, EMIT_COL, 0, xdna_dma_dir::S2MM, EMIT_CH);
-    uint32_t chain[XDNA_GEMV_COLS];
+    // per column the index object, then the chunks: a group's descriptors
+    // are the last one's again, which emit_chunks has waited for
+    uint32_t idx[XDNA_GEMV_COLS], chain[XDNA_GEMV_COLS];
     for (int c = 0; c < XDNA_GEMV_COLS; c++) {
-        const xdna_gemv_ep & e   = l->w[c];
-        const uint32_t       id  = take(e.col);
-        const uint32_t       off = (uint32_t) ((size_t) 2 * c * l->tb);
-        xdna_bd              bd;
-        lin(bd, 2 * l->tb, off);
-        xdna_seq_blockwrite(&seq, e.col, 0, id, &bd);
-        xdna_seq_ddr_patch(&seq, e.col, 0, id, ARG_IDS, off);
-        xdna_seq_push_queue(&seq, e.col, 0, id, xdna_dma_dir::MM2S, e.ch, false, 0);
-        chain[c] = next[e.col];
-        next[e.col] += 6;
-        ok = ok && next[e.col] <= (e.col == SIDE_COL ? SIDE_BD :
-                                   e.col == EMIT_COL ? EMIT_BD :
-                                   e.col == l->a.col ? ACT_O_BD :
-                                                       16u);
+        const int col = l->w[c].col;
+        idx[c]        = take(col);
+        chain[c]      = next[col];
+        next[col] += 6;
+        ok = ok && next[col] <= (col == SIDE_COL ? SIDE_BD :
+                                 col == EMIT_COL ? EMIT_BD :
+                                 col == l->a.col ? ACT_O_BD :
+                                                   16u);
     }
-    emit_chunks(seq, l->w, l->tb, n_task, n_chunks, chain, koff, voff, argv);
+    for (int g = 0; g < l->groups; g++) {
+        index_objects(seq, l, idx);
+        emit_chunks(seq, l->w, l->tb, n_task, n_chunks, chain, koff + (size_t) g * POS_B, voff + (size_t) g * POS_B,
+                    argv, l->pos_b);
+    }
     xdna_seq_wait_token(&seq, SIDE_COL, 0, xdna_dma_dir::MM2S, SIDE_CH);
-    for (int s = 0; s < l->n_o; s++) {
-        xdna_seq_wait_token(&seq, l->o[s].col, 0, xdna_dma_dir::S2MM, l->o[s].ch);
+    for (int g = 0; g < l->groups; g++) {
+        for (int s = 0; s < l->n_o; s++) {
+            xdna_seq_wait_token(&seq, l->o[s].col, 0, xdna_dma_dir::S2MM, l->o[s].ch);
+        }
     }
 
-    // 3. combine: the partials to the prologue - every core's m and l, then
-    //    every core's o - then attn_output on the tiles it builds, drained
-    //    into the FFN's raw tiles
-    {
-        xdna_bd bm, bo;
-        runs(bm, PIECE, CORES, ST, (uint32_t) R_PART);
-        // o is 2048 words a core and a dimension's size is ten bits: four
-        // runs of 512 a core, the cores one dimension further out
-        bo.buf_len   = CORES * (ST - PIECE);
-        bo.buf_off   = (uint32_t) (R_PART + (size_t) PIECE * sizeof(float));
-        bo.d0_size   = SIDE_W;
-        bo.d0_stride = 1;
-        bo.d1_size   = (ST - PIECE) / SIDE_W;
-        bo.d1_stride = SIDE_W;
-        bo.d2_stride = ST;
-        bo.ax_cache  = 2;
-        bm.next_bd   = SIDE_BD + 1;
-        bm.use_next  = true;
-        xdna_seq_blockwrite(&seq, SIDE_COL, 0, SIDE_BD, &bm);
-        xdna_seq_ddr_patch(&seq, SIDE_COL, 0, SIDE_BD, ARG_R, bm.buf_off);
-        xdna_seq_blockwrite(&seq, SIDE_COL, 0, SIDE_BD + 1, &bo);
-        xdna_seq_ddr_patch(&seq, SIDE_COL, 0, SIDE_BD + 1, ARG_R, bo.buf_off);
-        xdna_seq_issue_token(&seq, SIDE_COL, 0, xdna_dma_dir::MM2S, SIDE_CH, 0xF);
-        xdna_seq_push_queue(&seq, SIDE_COL, 0, SIDE_BD, xdna_dma_dir::MM2S, SIDE_CH, true, 0);
-    }
+    // 3. combine: each group's partials to the prologue - every core's m and
+    //    l, then every core's o - then attn_output on the tiles it builds,
+    //    drained into the FFN's raw tiles
+    combine_side(seq, l);
     {
         xdna_gemv_seq_opts o;
         o.bd_base  = 0;
@@ -469,10 +530,10 @@ bool xdna_att_layer_run(xdna_att_layer * l, const xdna_att_layer_in & in) {
 
 bool xdna_att_layer_finish(const xdna_att_layer_in & in) {
     const int row = in.n_valid - 1;
-    if (!xdna_buffer_sync_from_device_range(in.kbo, POS_B, in.koff + (size_t) row * POS_B)) {
+    if (!xdna_buffer_sync_from_device_range(in.kbo, in.pos_b, in.koff + (size_t) row * in.pos_b)) {
         return false;
     }
-    return xdna_buffer_sync_from_device_range(in.vbo, POS_B, in.voff + (size_t) row * POS_B);
+    return xdna_buffer_sync_from_device_range(in.vbo, in.pos_b, in.voff + (size_t) row * in.pos_b);
 }
 
 xrt::run * xdna_att_layer_start(xdna_att_layer * l, const xdna_att_layer_in & in) {
@@ -486,7 +547,12 @@ xrt::run * xdna_att_layer_start(xdna_att_layer * l, const xdna_att_layer_in & in
             (const void *) in.cosv, (const void *) in.sinv, in.n_valid, in.n_rot);
         return nullptr;
     }
-    if (!xdna_att_layer_fits(in.kbo, in.koff, in.vbo, in.voff, in.n_valid)) {
+    if (in.pos_b != l->pos_b) {
+        GGML_LOG_ERROR("%s: the cache's position stride is %zu bytes, the layer's %zu\n", "xdna-att-layer", in.pos_b,
+                       l->pos_b);
+        return nullptr;
+    }
+    if (!xdna_att_layer_fits(in.kbo, in.koff, in.vbo, in.voff, in.n_valid, in.pos_b, l->groups)) {
         GGML_LOG_ERROR("%s: %d positions do not fit the K/V cache buffers\n", "xdna-att-layer", in.n_valid);
         return nullptr;
     }
@@ -515,14 +581,17 @@ xrt::run * xdna_att_layer_start(xdna_att_layer * l, const xdna_att_layer_in & in
     if (!xdna_kernel_rewrite_insts(v.kern, words.data(), words.size())) {
         return nullptr;  // xdna-runtime names the stream and the reason
     }
-    if (v.kbo != in.kbo || v.vbo != in.vbo || v.res != in.res) {
+    if (v.kgen != in.kbo->gen || v.vgen != in.vbo->gen || v.rgen != in.res->gen) {
         xdna_buffer * args[8] = { in.kbo, l->act, l->ids, l->r, in.vbo, l->wbuf, xdna_gemv_pair_act_buf(l->rg->ffn),
                                   in.res };
         v.run                 = xdna_kernel_run_make(v.kern, args, 8);
         v.args.assign(args, args + 8);
-        v.kbo = in.kbo;
-        v.vbo = in.vbo;
-        v.res = in.res;
+        v.kgen = in.kbo->gen;
+        v.vgen = in.vbo->gen;
+        v.rgen = in.res->gen;
+        GGML_LOG_DEBUG("%s: layer %p binds K %p and V %p (buffers %llu and %llu)\n", "xdna-att-layer", (void *) l,
+                       (void *) in.kbo, (void *) in.vbo, (unsigned long long) in.kbo->gen,
+                       (unsigned long long) in.vbo->gen);
     }
     // The two row inputs' tiles carry their norms' epsilon: written once.
     if (in.eps_attn != l->eps_attn || in.eps_post != l->eps_post) {
@@ -539,25 +608,30 @@ xrt::run * xdna_att_layer_start(xdna_att_layer * l, const xdna_att_layer_in & in
         l->eps_post = in.eps_post;
     }
 
-    // the host's inputs
+    // the host's inputs: the pool's header runs the attention once a head
+    // group, two q tiles each; the first tile takes every kv head (consts, k
+    // and v two heads an object) and emits the position's K and V rows
     uint8_t * a = (uint8_t *) l->act->data;
     {
-        std::memset(a + l->a_att, 0, (size_t) 3 * ACTT);
+        const int nt  = 2 * l->groups;
+        const int kvh = l->groups * KVH;
+        std::memset(a + l->a_att, 0, (size_t) (1 + nt) * ACTT);
         int32_t * hdr = (int32_t *) (a + l->a_att);
         hdr[2]        = 1 + n_chunks;
-        hdr[3]        = 1;
-        for (int t = 0; t < 2; t++) {
+        hdr[3]        = l->groups;
+        for (int t = 0; t < nt; t++) {
             int32_t * w = (int32_t *) (a + l->a_att + (size_t) (1 + t) * ACTT);
             std::memcpy(w, l->gq.data(), D * sizeof(float));
             w[512]    = in.n_valid;
-            w[513]    = t;
+            w[513]    = t % 2;
             w[514]    = 0;
             w[515]    = in.n_rot;
             w[516]    = fbits(in.scale);
             w[517]    = fbits(in.eps);
             w[W_MODE] = 1;
-            w[W_NS]   = t == 0 ? 5 : 2;
-            w[W_NE]   = t == 0 ? 2 : 0;
+            w[W_NKV]  = t == 0 ? kvh : 0;
+            w[W_NS]   = t == 0 ? 1 + kvh + 2 : 2;
+            w[W_NE]   = t == 0 ? kvh : 0;
             w[AW - 2] = F_ATT;
         }
         float * c = (float *) (a + l->a_const);
@@ -571,10 +645,10 @@ xrt::run * xdna_att_layer_start(xdna_att_layer * l, const xdna_att_layer_in & in
     }
     // Any line of the row the host holds would land on top of the array's
     // write: push them out first.
-    if (!xdna_buffer_sync_to_device_range(in.kbo, POS_B, in.koff + (size_t) row * POS_B)) {
+    if (!xdna_buffer_sync_to_device_range(in.kbo, l->pos_b, in.koff + (size_t) row * l->pos_b)) {
         return nullptr;
     }
-    if (!xdna_buffer_sync_to_device_range(in.vbo, POS_B, in.voff + (size_t) row * POS_B)) {
+    if (!xdna_buffer_sync_to_device_range(in.vbo, l->pos_b, in.voff + (size_t) row * l->pos_b)) {
         return nullptr;
     }
 

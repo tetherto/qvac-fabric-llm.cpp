@@ -473,6 +473,29 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
     GGML_UNUSED(max_tensor_size);
 }
 
+static bool ggml_backend_cpu_supports_mul_mat_convrot(const struct ggml_tensor * op) {
+    const struct ggml_tensor * activations = op->src[0];
+    const struct ggml_tensor * weights     = op->src[1];
+    const struct ggml_tensor * scales      = op->src[2];
+    return activations && weights && scales &&
+        (activations->type == GGML_TYPE_F32 || activations->type == GGML_TYPE_F16) &&
+        weights->type == GGML_TYPE_I8 && scales->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+        ggml_get_op_params_i32(op, 0) == 256 &&
+        activations->ne[0] == weights->ne[0] && weights->ne[0] > 0 && weights->ne[0] % 256 == 0 &&
+        weights->ne[2] == 1 && weights->ne[3] == 1 &&
+        scales->ne[0] == weights->ne[1] && scales->ne[1] == 1 && scales->ne[2] == 1 && scales->ne[3] == 1 &&
+        op->ne[0] == weights->ne[1] && op->ne[1] == activations->ne[1] &&
+        op->ne[2] == activations->ne[2] && op->ne[3] == activations->ne[3];
+}
+
+static bool ggml_backend_cpu_supports_convrot(const struct ggml_tensor * op) {
+    const struct ggml_tensor * src = op->src[0];
+    const int32_t group_size = ggml_get_op_params_i32(op, 0);
+    return src && src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+        ggml_convrot_group_size_is_valid(group_size) && src->ne[0] % group_size == 0 &&
+        ggml_are_same_shape(src, op);
+}
+
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
@@ -513,6 +536,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                    (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32) ||
                    (src0->type == GGML_TYPE_TQ2_0 &&
                        (src1->type == GGML_TYPE_Q8_1 || src1->type == GGML_TYPE_Q8_0));
+        case GGML_OP_MUL_MAT_CONVROT:
+            return ggml_backend_cpu_supports_mul_mat_convrot(op);
+        case GGML_OP_CONVROT:
+            return ggml_backend_cpu_supports_convrot(op);
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;
