@@ -1231,9 +1231,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT_CONVROT",
     "CONVROT",
+    "SSM_CONV_RAGGED",
+    "GATED_DELTA_NET_RAGGED",
 };
 
-static_assert(GGML_OP_COUNT == 129, "GGML_OP_COUNT != 129");
+static_assert(GGML_OP_COUNT == 131, "GGML_OP_COUNT != 131");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1378,9 +1380,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "convrot(X,W,S)",
     "convrot(x)",
+    "ssm_conv_ragged(x,s,w,off)",
+    "gated_delta_net_ragged(q,k,v,g,beta,s,off)",
 };
 
-static_assert(GGML_OP_COUNT == 129, "GGML_OP_COUNT != 129");
+static_assert(GGML_OP_COUNT == 131, "GGML_OP_COUNT != 131");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -7703,6 +7707,93 @@ struct ggml_tensor * ggml_gdn_conv_deferred(
     result->src[1] = w;
     result->src[2] = hist;
     result->src[3] = rec_idx;
+
+    return result;
+}
+
+// ggml_ssm_conv_ragged
+
+struct ggml_tensor * ggml_ssm_conv_ragged(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * seq_off,
+        bool                  silu) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && state->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(seq_off->type == GGML_TYPE_I32 && ggml_is_contiguous(seq_off));
+    GGML_ASSERT(x->nb[0] == sizeof(float) && ggml_nrows(x) == x->ne[1]);
+    GGML_ASSERT(ggml_is_contiguous(state) && ggml_is_contiguous(w));
+
+    const int64_t C        = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t d_conv   = w->ne[0];
+    const int64_t n_seqs   = state->ne[2];
+
+    GGML_ASSERT(d_conv >= 2 && w->ne[1] == C);
+    GGML_ASSERT(state->ne[0] == d_conv - 1 && state->ne[1] == C && state->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(seq_off) == n_seqs + 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C*n_tokens + (d_conv - 1)*C*n_seqs);
+
+    ggml_set_op_params_i32(result, 0, silu ? 1 : 0);
+
+    result->op     = GGML_OP_SSM_CONV_RAGGED;
+    result->src[0] = x;
+    result->src[1] = state;
+    result->src[2] = w;
+    result->src[3] = seq_off;
+
+    return result;
+}
+
+// ggml_gated_delta_net_ragged
+
+struct ggml_tensor * ggml_gated_delta_net_ragged(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * seq_off) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 && state->type == GGML_TYPE_F32);
+    GGML_ASSERT(seq_off->type == GGML_TYPE_I32 && ggml_is_contiguous(seq_off));
+
+    const int64_t S_k      = k->ne[0];
+    const int64_t H_k      = k->ne[1];
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = state->ne[3];
+
+    GGML_ASSERT(S_k == S_v && H % H_k == 0);
+    GGML_ASSERT(ggml_are_same_shape(q, k) && q->ne[2] == n_tokens);
+    GGML_ASSERT(q->ne[3] == 1 && v->ne[3] == 1);
+    GGML_ASSERT(g->ne[0] == 1 && g->ne[1] == H && g->ne[2] == n_tokens && g->ne[3] == 1);
+    GGML_ASSERT(ggml_are_same_shape(g, beta));
+    GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H);
+    GGML_ASSERT(ggml_nelements(seq_off) == n_seqs + 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, S_v*H*n_tokens + S_v*S_v*H*n_seqs);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_RAGGED;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = seq_off;
 
     return result;
 }

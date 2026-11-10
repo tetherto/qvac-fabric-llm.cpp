@@ -13474,6 +13474,170 @@ void ggml_compute_forward_gdn_conv_deferred(
     }
 }
 
+// ggml_compute_forward_ssm_conv_ragged
+
+static void ggml_compute_forward_ssm_conv_ragged_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src_x     = dst->src[0];
+    const ggml_tensor * src_state = dst->src[1];
+    const ggml_tensor * src_w     = dst->src[2];
+    const ggml_tensor * src_off   = dst->src[3];
+
+    const int64_t C        = src_x->ne[0];
+    const int64_t n_tokens = src_x->ne[1];
+    const int64_t d_conv   = src_w->ne[0];
+    const int64_t n_win    = d_conv - 1;
+    const int64_t n_seqs   = src_state->ne[2];
+    const bool    silu     = ggml_get_op_params_i32(dst, 0) != 0;
+
+    const int32_t * off = (const int32_t *) src_off->data;
+    const float   * w   = (const float *) src_w->data;
+    const float   * st  = (const float *) src_state->data;
+
+    float * y      = (float *) dst->data;
+    float * st_out = y + C * n_tokens;
+
+    // channels per thread
+    const int64_t dr  = (C + params->nth - 1) / params->nth;
+    const int64_t ic0 = dr * params->ith;
+    const int64_t ic1 = MIN(ic0 + dr, C);
+
+    for (int64_t s = 0; s < n_seqs; ++s) {
+        const int64_t t0 = off[s];
+        const int64_t t1 = off[s + 1];
+
+        for (int64_t c = ic0; c < ic1; ++c) {
+            const float * st_c = st + (s * C + c) * n_win;
+
+            // input p of the seq: the conv state before t0, then x
+            auto u = [&](int64_t p) -> float {
+                if (p >= t0) {
+                    return *(const float *) ((const char *) src_x->data + p * src_x->nb[1] + c * sizeof(float));
+                }
+                return st_c[n_win + p - t0];
+            };
+
+            for (int64_t t = t0; t < t1; ++t) {
+                float sum = 0.0f;
+                for (int64_t j = 0; j < d_conv; ++j) {
+                    sum += u(t - n_win + j) * w[c * d_conv + j];
+                }
+                y[t * C + c] = silu ? sum / (1.0f + expf(-sum)) : sum;
+            }
+
+            for (int64_t j = 0; j < n_win; ++j) {
+                st_out[(s * C + c) * n_win + j] = u(t1 - n_win + j);
+            }
+        }
+    }
+
+    GGML_UNUSED(n_tokens);
+}
+
+void ggml_compute_forward_ssm_conv_ragged(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_ssm_conv_ragged_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_gated_delta_net_ragged
+
+static void ggml_compute_forward_gated_delta_net_ragged_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src_q     = dst->src[0];
+    const ggml_tensor * src_k     = dst->src[1];
+    const ggml_tensor * src_v     = dst->src[2];
+    const ggml_tensor * src_g     = dst->src[3];
+    const ggml_tensor * src_beta  = dst->src[4];
+    const ggml_tensor * src_state = dst->src[5];
+    const ggml_tensor * src_off   = dst->src[6];
+
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_state->ne[3];
+    const int64_t H_k      = src_k->ne[1];
+
+    const int32_t * off = (const int32_t *) src_off->data;
+    const float   * g   = (const float *) src_g->data;
+    const float   * b   = (const float *) src_beta->data;
+
+    float * attn   = (float *) dst->data;
+    float * st_out = attn + S_v * H * n_tokens;
+
+    const float scale = 1.0f / sqrtf((float) S_v);
+
+    float * delta = (float *) params->wdata + params->ith * (S_v + CACHE_LINE_SIZE_F32) + CACHE_LINE_SIZE_F32;
+
+    // one task per (seq, head)
+    const int64_t nr  = n_seqs * H;
+    const int64_t dr  = (nr + params->nth - 1) / params->nth;
+    const int64_t ir0 = dr * params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t is = ir / H;
+        const int64_t h  = ir % H;
+        const int64_t hk = h % H_k;
+
+        // state is stored transposed: M[j*S_v + i] = S[i][j]
+        float * M = st_out + (is * H + h) * S_v * S_v;
+        memcpy(M, (const float *) src_state->data + (is * H + h) * S_v * S_v, S_v * S_v * sizeof(float));
+
+        for (int64_t t = off[is]; t < off[is + 1]; ++t) {
+            const float * q_d = (const float *) ((const char *) src_q->data + t * src_q->nb[2] + hk * src_q->nb[1]);
+            const float * k_d = (const float *) ((const char *) src_k->data + t * src_k->nb[2] + hk * src_k->nb[1]);
+            const float * v_d = (const float *) ((const char *) src_v->data + t * src_v->nb[2] + h  * src_v->nb[1]);
+
+            ggml_vec_scale_f32(S_v * S_v, M, expf(g[t * H + h]));
+
+            const float beta_val = b[t * H + h];
+            for (int64_t j = 0; j < S_v; ++j) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(S_v, &sum, 0, &M[j * S_v], 0, k_d, 0, 1);
+                delta[j] = (v_d[j] - sum) * beta_val;
+            }
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                ggml_vec_mad_f32(S_v, &M[j * S_v], k_d, delta[j]);
+            }
+
+            float * out = attn + (t * H + h) * S_v;
+            for (int64_t j = 0; j < S_v; ++j) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(S_v, &sum, 0, &M[j * S_v], 0, q_d, 0, 1);
+                out[j] = sum * scale;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_gated_delta_net_ragged(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_gated_delta_net_ragged_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_gated_delta_net_back
 
 static void ggml_compute_forward_gated_delta_net_back_f32(

@@ -934,6 +934,22 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
+    // ragged ubatches build other graphs: size the compute buffers for their worst case too, so that switching the plan
+    // to it (process_ubatch) does not grow them
+    if (memory && memory->get_ragged() && !cparams.training) {
+        std::vector<size_t> sizes_ragged(backend_ptrs.size(), 0);
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+                model.hparams.no_alloc, model.hparams.no_alloc ? sizes_ragged.data() : nullptr, true);
+        if (!gf) {
+            throw std::runtime_error("failed to allocate compute ragged buffers");
+        }
+        if (model.hparams.no_alloc) {
+            for (size_t i = 0; i < sizes_ragged.size(); ++i) {
+                backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes_ragged[i]);
+            }
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
@@ -986,6 +1002,9 @@ void llama_context::sched_reserve() {
                 val(n_input_tensors_pp, n_input_tensors_tg).c_str());
     }
 
+    // the last reserve above is an equal-split prompt graph
+    sched_ragged = false;
+
     compute_state->sched = sched.get();
     ++compute_state->generation;
 
@@ -1000,7 +1019,19 @@ void llama_context::synchronize() {
         return;
     }
 
+    // nothing submitted since the last synchronization: return without touching the backends, whose synchronize is not
+    // thread-safe, so that repeated calls (the server samples slots on several threads) are read-only
+    if (!sync_pending) {
+        return;
+    }
+
     ggml_backend_sched_synchronize(sched.get());
+    sync_pending = false;
+
+    // nothing evaluated since the last synchronization: no stats to add
+    if (n_queued_tokens == 0) {
+        return;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1688,6 +1719,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
+
+        // the graphs of ragged and equal-split ubatches differ. for a graph that differs from the planned one the
+        // scheduler plans that graph alone, and then again for each later graph of its kind that is larger: plan the
+        // worst case of the kind of this ubatch instead
+        if (ubatch.is_ragged() != sched_ragged && !sched_plan_ragged(ubatch.is_ragged())) {
+            LLAMA_LOG_ERROR("%s: failed to plan the compute buffers\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -2769,6 +2809,10 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, const lla
 }
 
 void llama_context::output_reorder() {
+    if (output_swaps.empty()) {
+        return;
+    }
+
     const uint64_t n_vocab     = model.vocab.n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
@@ -2972,8 +3016,10 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
-    LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+        bool ragged) {
+    LLAMA_LOG_DEBUG("%s: reserving a graph for %subatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__,
+            ragged ? "ragged " : "", n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
     if (n_tokens % n_seqs != 0) {
@@ -2998,7 +3044,7 @@ ggml_cgraph * llama_context::graph_reserve(
     this->n_outputs = n_outputs;
 
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
-    llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
+    llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs, ragged);
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
@@ -3037,6 +3083,36 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     return gf;
+}
+
+bool llama_context::sched_plan_ragged(bool ragged) {
+    // the worst-case prompt graph of the kind, as the last reserve of sched_reserve does. only qwen35 and qwen35moe use
+    // ragged ubatches, and they reserve with n_seqs = n_seq_max
+    const uint32_t n_seqs       = cparams.n_seq_max;
+    const uint32_t n_tokens     = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+
+    std::vector<size_t> sizes_prev(backend_ptrs.size());
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        sizes_prev[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+    }
+
+    const auto mctx = memory->init_full();
+    if (!mctx || !graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), false, nullptr, ragged)) {
+        return false;
+    }
+
+    sched_ragged = ragged;
+
+    // sched_reserve sized the buffers for both kinds; if they grew anyway, the contexts that share them must re-plan
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        if (ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]) > sizes_prev[i]) {
+            ++compute_state->generation;
+            break;
+        }
+    }
+
+    return true;
 }
 
 llm_graph_params llama_context::graph_params(
@@ -3106,6 +3182,8 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+
+    sync_pending = true;
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {

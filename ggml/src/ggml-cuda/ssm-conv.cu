@@ -204,3 +204,140 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+// ragged conv: one thread per channel walks a block of tokens with a sliding window, which starts from the
+// seq's conv state at each seq start. Threads of a block are consecutive channels, so x and y are coalesced.
+template <bool apply_silu, int d_conv>
+static __global__ void ssm_conv_ragged_f32(
+        const float * __restrict__ x, const float * __restrict__ state, const float * __restrict__ w,
+        const int32_t * __restrict__ seq_off, float * __restrict__ y, float * __restrict__ state_out,
+        const int64_t C, const int64_t x_stride, const int n_seqs, const int n_tokens, const int tokens_per_block) {
+    constexpr int n_win = d_conv - 1;
+
+    const int64_t c       = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int     t_start = blockIdx.y * tokens_per_block;
+    const int     t_end   = min(t_start + tokens_per_block, n_tokens);
+
+    ggml_cuda_pdl_sync();
+
+    if (c >= C) {
+        return;
+    }
+
+    // the seq of the first token of the block
+    int lo = 0;
+    int hi = n_seqs - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) / 2;
+        if (seq_off[mid] <= t_start) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    int s  = lo;
+    int t0 = seq_off[s];
+    int t1 = seq_off[s + 1];
+
+    float wr[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wr[j] = w[c * d_conv + j];
+    }
+
+    // input p of the current seq: its conv state before t0, then x
+    auto load = [&](const int p) -> float {
+        return p >= t0 ? x[(int64_t) p * x_stride + c] : state[((int64_t) s * C + c) * n_win + n_win + p - t0];
+    };
+
+    float win[d_conv];
+    bool  fresh = true;
+
+    for (int t = t_start; t < t_end; ++t) {
+        while (t >= t1) {
+            ++s;
+            t0    = t1;
+            t1    = seq_off[s + 1];
+            fresh = true;
+        }
+        if (fresh) {
+#pragma unroll
+            for (int j = 0; j < d_conv; ++j) {
+                win[j] = load(t - n_win + j);
+            }
+            fresh = false;
+        } else {
+#pragma unroll
+            for (int j = 0; j < n_win; ++j) {
+                win[j] = win[j + 1];
+            }
+            win[n_win] = load(t);
+        }
+
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sum += win[j] * wr[j];
+        }
+        y[(int64_t) t * C + c] = apply_silu ? ggml_cuda_op_silu_single(sum) : sum;
+
+        if (t == t1 - 1) {
+            // the window of the last token holds the last n_win inputs of the seq
+#pragma unroll
+            for (int j = 0; j < n_win; ++j) {
+                state_out[((int64_t) s * C + c) * n_win + j] = win[j + 1];
+            }
+        }
+    }
+}
+
+void ggml_cuda_op_ssm_conv_ragged(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src_x     = dst->src[0];
+    const ggml_tensor * src_state = dst->src[1];
+    const ggml_tensor * src_w     = dst->src[2];
+    const ggml_tensor * src_off   = dst->src[3];
+
+    const int64_t C        = src_x->ne[0];
+    const int64_t n_tokens = src_x->ne[1];
+    const int64_t d_conv   = src_w->ne[0];
+    const int64_t n_seqs   = src_state->ne[2];
+    const bool    silu     = ggml_get_op_params_i32(dst, 0) != 0;
+
+    GGML_ASSERT(src_x->nb[0] == sizeof(float) && src_x->nb[1] % sizeof(float) == 0);
+    GGML_ASSERT(n_tokens <= INT_MAX && n_seqs <= INT_MAX);
+
+    const float * x_d     = (const float *) src_x->data;
+    const float * state_d = (const float *) src_state->data;
+    const float * w_d     = (const float *) src_w->data;
+    const int32_t * off_d = (const int32_t *) src_off->data;
+    float *       y_d     = (float *) dst->data;
+    float *       st_d    = y_d + C * n_tokens;
+
+    const int64_t x_stride = src_x->nb[1] / sizeof(float);
+
+    const int  threads          = 128;
+    const int  tokens_per_block = 32;
+    const dim3 blocks((C + threads - 1) / threads, (n_tokens + tokens_per_block - 1) / tokens_per_block, 1);
+
+    cudaStream_t stream = ctx.stream();
+
+    auto launch = [&](auto D) {
+        constexpr int kD = decltype(D)::value;
+        const ggml_cuda_kernel_launch_params params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+        if (silu) {
+            ggml_cuda_kernel_launch(ssm_conv_ragged_f32<true, kD>, params, x_d, state_d, w_d, off_d, y_d, st_d,
+                C, x_stride, (int) n_seqs, (int) n_tokens, tokens_per_block);
+        } else {
+            ggml_cuda_kernel_launch(ssm_conv_ragged_f32<false, kD>, params, x_d, state_d, w_d, off_d, y_d, st_d,
+                C, x_stride, (int) n_seqs, (int) n_tokens, tokens_per_block);
+        }
+    };
+
+    switch (d_conv) {
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        default: GGML_ABORT("unsupported d_conv %d for the ragged conv", (int) d_conv);
+    }
+}
