@@ -4995,7 +4995,7 @@ struct ggml_tensor * ggml_rope_flux(
         struct ggml_tensor  * b) {
     GGML_ASSERT(a->type == GGML_TYPE_F32);
     GGML_ASSERT(a->ne[0] % 2 == 0);
-    GGML_ASSERT(a->ne[1] <= INT64_MAX / a->ne[3]);
+    GGML_ASSERT(a->ne[3] == 0 || a->ne[1] <= INT64_MAX / a->ne[3]);
 
     if (b != NULL) {
         ggml_rope_flux_check_pe(a, b);
