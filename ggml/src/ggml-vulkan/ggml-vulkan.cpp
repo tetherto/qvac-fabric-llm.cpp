@@ -4450,6 +4450,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_convrot_f32, "mul_mat_convrot_f32", mul_mat_convrot_f32_len, mul_mat_convrot_f32_data, "main", 4, sizeof(vk_op_mul_mat_convrot_push_constants), { 1, 1, 1 }, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_convrot_f16, "mul_mat_convrot_f16", mul_mat_convrot_f16_len, mul_mat_convrot_f16_data, "main", 4, sizeof(vk_op_mul_mat_convrot_push_constants), { 1, 1, 1 }, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_convrot_f32, "convrot_f32", convrot_f32_len, convrot_f32_data, "main", 2, sizeof(vk_op_convrot_push_constants), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_rope_flux_f32, "rope_flux_f32", rope_flux_f32_len, rope_flux_f32_data, "main", 3, sizeof(vk_op_rope_flux_push_constants), { 1, 1, 1 }, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_convrot_reconstruct_f32, "convrot_reconstruct_f32", convrot_reconstruct_f32_len, convrot_reconstruct_f32_data, "main", 3, 3 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_convrot_reconstruct_f16, "convrot_reconstruct_f16", convrot_reconstruct_f16_len, convrot_reconstruct_f16_data, "main", 3, 3 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_convrot_convert_f32_f16, "convrot_convert_f32_f16", convrot_convert_f32_f16_len, convrot_convert_f32_f16_data, "main", 2, 3 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
@@ -9315,6 +9316,48 @@ static void ggml_vk_convrot(ggml_backend_vk_context * ctx, vk_context & subctx, 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, src, true), ggml_vk_tensor_subbuffer(ctx, dst, true) },
         pc, { groups_x, CEIL_DIV(total_groups, groups_x), 1 });
+}
+
+static constexpr uint32_t rope_flux_workgroup_size = 256;
+
+static uint32_t ggml_vk_f32_stride(const ggml_tensor * t, int dim) {
+    return t ? uint32_t(t->nb[dim] / sizeof(float)) : 0;
+}
+
+static void ggml_vk_rope_flux(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x  = dst->src[0];
+    const ggml_tensor * pe = dst->src[1];
+    GGML_ASSERT(((vk_tensor_offset(x) + x->view_offs) & 3) == 0);
+    GGML_ASSERT(!pe || ((vk_tensor_offset(pe) + pe->view_offs) & 3) == 0);
+    GGML_ASSERT(((vk_tensor_offset(dst) + dst->view_offs) & 3) == 0);
+
+    const uint32_t pairs = uint32_t(ggml_nelements(dst) / 2);
+    const uint32_t groups = CEIL_DIV(pairs, rope_flux_workgroup_size);
+    const uint32_t groups_x = std::min(groups, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    const vk_op_rope_flux_push_constants pc = {
+        pairs,
+        uint32_t(x->ne[0]),
+        uint32_t(x->ne[1]),
+        uint32_t(x->ne[2]),
+        uint32_t(get_misalign_bytes(ctx, x) / sizeof(float)),
+        pe ? uint32_t(get_misalign_bytes(ctx, pe) / sizeof(float)) : 0,
+        uint32_t(get_misalign_bytes(ctx, dst) / sizeof(float)),
+        pe != nullptr,
+        ggml_vk_f32_stride(x, 0),
+        ggml_vk_f32_stride(x, 1),
+        ggml_vk_f32_stride(x, 2),
+        ggml_vk_f32_stride(x, 3),
+        ggml_vk_f32_stride(pe, 0),
+        ggml_vk_f32_stride(pe, 1),
+        ggml_vk_f32_stride(pe, 2),
+        ggml_vk_f32_stride(pe, 3),
+    };
+
+    vk_pipeline & pipeline = ctx->device->pipeline_rope_flux_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, pe ? pe : x, true), ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { groups_x, CEIL_DIV(groups, groups_x), 1 });
 }
 
 // Keep this in sync with the width list in ggml_vk_load_shaders.
@@ -16744,6 +16787,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_convrot(ctx, compute_ctx, node);
 
         break;
+    case GGML_OP_ROPE_FLUX:
+        ggml_vk_rope_flux(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_MUL_MAT_ID:
         ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
 
@@ -20212,7 +20259,7 @@ static bool ggml_vk_supports_mul_mat_convrot(const vk_device & device, const ggm
         ggml_is_contiguous(a) && ggml_is_contiguous(w) && ggml_is_contiguous(s) && ggml_is_contiguous(op);
 }
 
-static bool ggml_vk_convrot_tensor_addressable(const vk_device & device, const ggml_tensor * t) {
+static bool ggml_vk_f32_tensor_addressable(const vk_device & device, const ggml_tensor * t) {
     const uint64_t alignment = device->properties.limits.minStorageBufferOffsetAlignment;
     if ((t->view_offs & 3) != 0 || ggml_nbytes(t) > device->properties.limits.maxStorageBufferRange - (alignment - 1)) {
         return false;
@@ -20236,7 +20283,21 @@ static bool ggml_vk_supports_convrot(const vk_device & device, const ggml_tensor
     const uint64_t max_groups = (uint64_t) device->properties.limits.maxComputeWorkGroupCount[0] *
                                 device->properties.limits.maxComputeWorkGroupCount[1];
     return total_groups <= UINT32_MAX && total_groups <= max_groups &&
-           ggml_vk_convrot_tensor_addressable(device, src) && ggml_vk_convrot_tensor_addressable(device, op);
+           ggml_vk_f32_tensor_addressable(device, src) && ggml_vk_f32_tensor_addressable(device, op);
+}
+
+static bool ggml_vk_supports_rope_flux(const vk_device & device, const ggml_tensor * op) {
+    const ggml_tensor * x  = op->src[0];
+    const ggml_tensor * pe = op->src[1];
+    if (x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) || (pe && pe->type != GGML_TYPE_F32)) {
+        return false;
+    }
+    const uint64_t groups = CEIL_DIV((uint64_t) ggml_nelements(op) / 2, rope_flux_workgroup_size);
+    const uint64_t max_groups = (uint64_t) device->properties.limits.maxComputeWorkGroupCount[0] *
+                                device->properties.limits.maxComputeWorkGroupCount[1];
+    return (uint64_t) ggml_nelements(op) <= UINT32_MAX && groups <= max_groups &&
+           ggml_vk_f32_tensor_addressable(device, x) && (!pe || ggml_vk_f32_tensor_addressable(device, pe)) &&
+           ggml_vk_f32_tensor_addressable(device, op);
 }
 
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
@@ -20321,6 +20382,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return ggml_vk_supports_mul_mat_convrot(device, op);
         case GGML_OP_CONVROT:
             return ggml_vk_supports_convrot(device, op);
+        case GGML_OP_ROPE_FLUX:
+            return ggml_vk_supports_rope_flux(device, op);
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {

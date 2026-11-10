@@ -214,6 +214,25 @@ struct vk_op_convrot_push_constants {
     uint32_t total_groups;
 };
 
+struct vk_op_rope_flux_push_constants {
+    uint32_t pairs;
+    uint32_t d_head;
+    uint32_t n_head;
+    uint32_t length;
+    uint32_t x_offset;
+    uint32_t pe_offset;
+    uint32_t dst_offset;
+    uint32_t has_pe;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+    uint32_t pe_nb0;
+    uint32_t pe_nb1;
+    uint32_t pe_nb2;
+    uint32_t pe_nb3;
+};
+
 struct vk_op_dsv4_hc_comb_push_constants {
     uint32_t n_tokens;
 
