@@ -689,6 +689,10 @@ extern "C" {
         GGML_OP_MUL_MAT_CONVROT,
         GGML_OP_CONVROT,
 
+        // Flux RoPE: rotates each even/odd pair by a precomputed 2x2 matrix and
+        // permutes [d_head, n_head, L, N] into the flash-attention layout.
+        GGML_OP_ROPE_FLUX,
+
         GGML_OP_COUNT,
     };
 
@@ -2276,6 +2280,17 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow),
         "use ggml_rope_ext_inplace instead");
+
+    // Fused Flux RoPE: rotates every (even, odd) pair of a by the precomputed
+    // matrix b and permutes the result for flash attention.
+    // a: [d_head, n_head, L, N] F32, may be non-contiguous
+    // b: [2, 2, d_head/2, L] F32 with b[i, j] multiplying input component i into
+    //    output component j, or NULL to permute only
+    // result: [d_head, L, N*n_head] F32, contiguous
+    GGML_API struct ggml_tensor * ggml_rope_flux(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
 
     // compute correction dims for YaRN RoPE scaling
     GGML_API void ggml_rope_yarn_corr_dims(
