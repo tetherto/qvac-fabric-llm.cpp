@@ -1678,6 +1678,13 @@ static bool ggml_metal_device_supports_mul_mat_convrot(ggml_metal_device_t dev, 
         a->ne[1] <= INT_MAX && w->ne[1] <= INT_MAX && a->ne[2]*a->ne[3] <= UINT_MAX;
 }
 
+static bool ggml_metal_device_supports_rope_flux(const struct ggml_tensor * op) {
+    const struct ggml_tensor * x  = op->src[0];
+    const struct ggml_tensor * pe = op->src[1];
+    return x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+        (pe == NULL || pe->type == GGML_TYPE_F32) && ggml_nelements(op) <= INT32_MAX;
+}
+
 static bool ggml_metal_device_supports_convrot(const struct ggml_tensor * op) {
     const struct ggml_tensor * src = op->src[0];
     const int32_t group_size = ggml_get_op_params_i32(op, 0);
@@ -2255,6 +2262,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return ggml_metal_device_supports_mul_mat_convrot(dev, op);
         case GGML_OP_CONVROT:
             return ggml_metal_device_supports_convrot(op);
+        case GGML_OP_ROPE_FLUX:
+            return ggml_metal_device_supports_rope_flux(op);
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0 &&
                 op->src[0]->ne[2] == op->src[2]->ne[2] && op->src[1]->ne[2] == op->src[2]->ne[2] &&
