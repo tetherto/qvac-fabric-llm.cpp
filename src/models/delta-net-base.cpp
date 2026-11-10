@@ -459,8 +459,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     // gathered, not read in place: a fused concat + conv + write-back (the CUDA NVRTC pass) must not read and write
     // the same cache rows, and decode and prompt ubatches build the same nodes, so the reserve covers both. the copy
-    // is small
-    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    // is small. a single cell on Metal (rs_inplace) reads it in place: the Metal conv step reads it before it writes it
+    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs, nullptr, inp->s_base_inplace && !inp->rec_idx);
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);

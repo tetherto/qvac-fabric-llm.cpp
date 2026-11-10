@@ -85,11 +85,15 @@ public:
     // the rows recorded by the last ubatch. each cell has two record slots so that a ubatch never
     // overwrites the slot it replays from. rollback then only changes how many rows get replayed.
     bool    gdn_deferred = false;
-    bool    gdn_inplace  = false; // update the base states in place
+    bool    gdn_inplace  = false; // update the base states in place (single cell only)
 
     // the graph takes ragged ubatches (llama_batch_allocr::split_ragged): the conv and gated delta net ops
     // get per-sequence token ranges, so one ubatch can mix sequences of different lengths
     bool    rs_ragged    = false;
+
+    // without rollback snapshots or the deferred commit, a single cell always reads and writes its own row,
+    // so the graphs can use the cache rows in place instead of gathering them
+    bool    rs_inplace   = false;
     int64_t gdn_rec_size = 0; // floats per record slot
 
     int64_t gdn_conv_channels() const { return hparams.ssm_d_inner + 2*hparams.ssm_n_group*hparams.ssm_d_state; }
