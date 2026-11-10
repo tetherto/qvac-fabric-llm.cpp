@@ -814,13 +814,6 @@ llama_model_loader::llama_model_loader(
         // this is a way to mark that we have "guessed" the file type
         ftype = (llama_ftype) (ftype | LLAMA_FTYPE_GUESSED);
 
-        {
-            uint32_t ftype_val = 0;
-            if (get_key(LLM_KV_GENERAL_FILE_TYPE, ftype_val, false)) {
-                ftype = (llama_ftype) ftype_val;
-            }
-        }
-
         LLAMA_LOG_INFO("%s: Dumping metadata keys/values. Note: KV overrides do not apply in this output.\n", __func__);
 
         for (int i = 0; i < n_kv; i++) {
@@ -849,6 +842,11 @@ llama_model_loader::llama_model_loader(
 
             LLAMA_LOG_INFO("%s: - type %4s: %4d tensors\n", __func__, ggml_type_name(kv.first), kv.second);
         }
+    }
+
+    uint32_t ftype_val = 0;
+    if (get_key(LLM_KV_GENERAL_FILE_TYPE, ftype_val, false)) {
+        ftype = (llama_ftype) ftype_val;
     }
 
     if (this->use_mmap && !llama_mmap::SUPPORTED) {

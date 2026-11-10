@@ -119,7 +119,7 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
-    llama_ftype ftype;
+    llama_ftype ftype = LLAMA_FTYPE_GUESSED;
     llama_fver  fver;
 
     llama_mmaps mappings;
