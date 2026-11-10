@@ -429,6 +429,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
         conv_qkv_mix = ggml_silu(ctx0, conv_output_proper);
         cb(conv_qkv_mix, "conv_output_silu", il);
+
+        // right after the conv state copy, so backends can fuse the conv step with it
+        ggml_build_forward_expand(gf, conv_qkv_mix);
     }
 
     ggml_tensor * state = build_rs_ssm(inp, ssm_states_all, n_seqs);
