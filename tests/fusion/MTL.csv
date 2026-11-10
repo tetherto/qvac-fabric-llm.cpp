@@ -428,20 +428,28 @@ qwen2vl             ,0   ,any     ,RMS_NORM+MUL                ,      5
 qwen3               ,0   ,any     ,RMS_NORM+MUL                ,      5
 qwen3               ,0   ,any     ,RMS_NORM+MUL+ROPE           ,      2
 qwen3               ,0   ,any     ,RMS_NORM+MUL+ROPE+SET_ROWS  ,      2
-qwen35              ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
-qwen35              ,0   ,any     ,RMS_NORM+MUL                ,      8
-qwen35              ,0   ,any     ,RMS_NORM+SCALE              ,      2
-qwen35              ,0   ,any     ,SSM_CONV+UNARY              ,      1
-qwen35              ,0   ,any     ,UNARY+MUL                   ,      3
+qwen35              ,0   ,decode  ,ADD+UNARY+MUL+UNARY+GATED_DELTA_NET+CPY,      1
+qwen35              ,0   ,decode  ,CONCAT+CPY+SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE,      1
+qwen35              ,0   ,prefill ,GATED_DELTA_NET+CPY         ,      1
+qwen35              ,0   ,any     ,RMS_NORM+MUL                ,      7
+qwen35              ,0   ,any     ,RMS_NORM+MUL+UNARY+MUL      ,      1
+qwen35              ,0   ,prefill ,RMS_NORM+SCALE              ,      2
+qwen35              ,0   ,prefill ,SSM_CONV+UNARY              ,      1
+qwen35              ,0   ,prefill ,UNARY+MUL                   ,      2
+qwen35              ,0   ,decode  ,UNARY+MUL                   ,      1
 qwen35moe           ,1   ,any     ,ADD+ADD                     ,      2
-qwen35moe           ,1   ,any     ,GATED_DELTA_NET+CPY         ,      1
+qwen35moe           ,1   ,decode  ,ADD+UNARY+MUL+UNARY+GATED_DELTA_NET+CPY,      1
+qwen35moe           ,1   ,decode  ,CONCAT+CPY+SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE,      1
+qwen35moe           ,1   ,prefill ,GATED_DELTA_NET+CPY         ,      1
 qwen35moe           ,1   ,any     ,MUL+ADD                     ,      4
 qwen35moe           ,1   ,decode  ,MUL_MAT_ID+GLU              ,      2
-qwen35moe           ,1   ,any     ,RMS_NORM+MUL                ,      8
-qwen35moe           ,1   ,any     ,RMS_NORM+SCALE              ,      2
+qwen35moe           ,1   ,any     ,RMS_NORM+MUL                ,      7
+qwen35moe           ,1   ,any     ,RMS_NORM+MUL+UNARY+MUL      ,      1
+qwen35moe           ,1   ,prefill ,RMS_NORM+SCALE              ,      2
 qwen35moe           ,1   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
-qwen35moe           ,1   ,any     ,SSM_CONV+UNARY              ,      1
-qwen35moe           ,1   ,any     ,UNARY+MUL                   ,      3
+qwen35moe           ,1   ,prefill ,SSM_CONV+UNARY              ,      1
+qwen35moe           ,1   ,prefill ,UNARY+MUL                   ,      2
+qwen35moe           ,1   ,decode  ,UNARY+MUL                   ,      1
 qwen3moe            ,1   ,any     ,MUL+ADD                     ,      4
 qwen3moe            ,1   ,decode  ,MUL_MAT_ID+MUL              ,      2
 qwen3moe            ,1   ,any     ,RMS_NORM+MUL                ,      5

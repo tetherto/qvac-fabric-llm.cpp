@@ -75,6 +75,106 @@ kernel void kernel_ssm_conv_f32_f32_4(
     x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
 }
 
+// one decode step of a depthwise conv with d_conv = 4 (CONCAT + SSM_CONV + SILU + the conv state CPY): the window is
+// the 3 state columns and the new input x, y = silu(w . window), and the new state is the last 3 window columns. one
+// thread per channel reads its state before it writes it, so the state may be updated in place
+kernel void kernel_ssm_conv_state_f32(
+        constant ggml_metal_kargs_ssm_conv_state & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * src2,
+        device       char * dst,
+        device       char * dst_s,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tpitg[[thread_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+    const int c  = tgpig.x*ntg.x + tpitg;
+    const int is = tgpig.y;
+
+    if (c >= args.C) {
+        return;
+    }
+
+    device const float * s = (device const float *) (src0 + c*args.nb01 + is*args.nb02);
+
+    const float4 v = float4(s[0], s[1], s[2], *(device const float *) (src1 + c*args.nb11 + is*args.nb12));
+
+    float sumf = 0.0f;
+    sumf += dot(v, ((device const float4 *) src2)[c]);
+
+    ((device float *) (dst + is*args.nb2))[c] = sumf/(1.0f + exp(-sumf));
+
+    device float * so = (device float *) (dst_s + is*args.nbs1) + 3*c;
+    so[0] = v[1];
+    so[1] = v[2];
+    so[2] = v[3];
+}
+
+// kernel_ssm_conv_state_f32 followed by the L2 norms of the q and k heads (RMS_NORM + SCALE). one simdgroup per head of
+// hd <= 128 channels, 4 channels per thread, so the norms reduce as kernel_rms_norm_fuse_impl does for float4 rows.
+// every head goes to dst; the leading n_q heads also go normalized to dst_q, the next n_k to dst_k
+kernel void kernel_ssm_conv_state_norm_f32(
+        constant ggml_metal_kargs_ssm_conv_state_norm & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * src2,
+        device       char * dst,
+        device       char * dst_s,
+        device       char * dst_q,
+        device       char * dst_k,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int ih = tgpig.x;
+    const int is = tgpig.y;
+
+    const bool act = tiisg < args.hd/4;
+    const int  c0  = ih*args.hd + 4*tiisg;
+
+    float4 y = 0.0f;
+
+    if (act) {
+        device float * so = (device float *) (dst_s + is*args.nbs1) + 3*c0;
+
+        FOR_UNROLL (short j = 0; j < 4; ++j) {
+            const int c = c0 + j;
+
+            device const float * s = (device const float *) (src0 + c*args.nb01 + is*args.nb02);
+
+            const float4 v = float4(s[0], s[1], s[2], *(device const float *) (src1 + c*args.nb11 + is*args.nb12));
+
+            float sumf = 0.0f;
+            sumf += dot(v, ((device const float4 *) src2)[c]);
+
+            y[j] = sumf/(1.0f + exp(-sumf));
+
+            so[3*j + 0] = v[1];
+            so[3*j + 1] = v[2];
+            so[3*j + 2] = v[3];
+        }
+
+        *(device float4 *) ((device float *) (dst + is*args.nb2) + c0) = y;
+    }
+
+    if (ih < args.n_q + args.n_k) {
+        float sumf = 0.0f;
+        sumf += dot(y, y);
+        sumf = simd_sum(sumf);
+
+        const float mean  = sumf/args.hd;
+        const float scale = 1.0f/sqrt(mean + args.eps);
+
+        if (act) {
+            const float4 yn = (y*scale)*args.scale + args.bias;
+
+            if (ih < args.n_q) {
+                *(device float4 *) (dst_q + is*args.nbq3 + ih*args.nbq1 + 16*tiisg) = yn;
+            } else {
+                *(device float4 *) (dst_k + is*args.nbk3 + (ih - args.n_q)*args.nbk1 + 16*tiisg) = yn;
+            }
+        }
+    }
+}
+
 // Batched version: each threadgroup processes multiple tokens for better efficiency
 // Thread layout: each thread handles one token, threadgroup covers BATCH_SIZE tokens
 kernel void kernel_ssm_conv_f32_f32_batched(
