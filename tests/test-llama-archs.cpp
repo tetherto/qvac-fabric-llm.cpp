@@ -2454,9 +2454,13 @@ static int test_glm5_kpool_sequences() {
         const auto logits1 = run(ctx, n_prefix, n_prefix + 1, {1}, 70);
         const auto scores1 = visible_scores();
 
+        // Seq 1 keeps the cells seq 0 gives up (0, 1, 2 and 4), so the new token lands on the same
+        // cell as above. Its only pool ends on cell 4: no clash and no private row here.
         auto ref0 = new_ctx();
-        run(ref0.get(), 0, n_prefix, {0}, 10);
+        run(ref0.get(), 0, n_prefix, {0, 1}, 10);
         edit(ref0.get());
+        llama_memory_seq_rm(llama_get_memory(ref0.get()), 1, 3, 4);
+        llama_memory_seq_rm(llama_get_memory(ref0.get()), 1, 5, -1);
         ok &= check_close(run(ref0.get(), n_prefix, n_prefix + 1, {0}, 60), logits0, "rep clash: seq 0 logits");
         ok &= check(visible_scores().size() == scores0.size() && nmse(visible_scores(), scores0) < 1e-6, "rep clash: seq 0 scores");
 
