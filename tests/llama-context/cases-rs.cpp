@@ -281,6 +281,10 @@ struct case_rollback : ctx_test {
             logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
 
             const logits_diff diff = compare_logits(logits_src, logits_dst, n_vocab);
+            if (!(diff.nmse() <= nmse_eps)) {
+                TLOG_ERR("%s: replay position %d: max diff %.9e, nmse %.9e, first index %lld, non-finite %zu\n",
+                         __func__, pos, (double) diff.diff_max, diff.nmse(), (long long) diff.i_first, diff.n_nan);
+            }
             CTX_REQUIRE(diff.nmse() <= nmse_eps,
                     "replay logits mismatch at position " + std::to_string(pos) + ", nmse " + std::to_string(diff.nmse()));
         }
@@ -330,6 +334,10 @@ struct case_rollback : ctx_test {
             }
 
             const logits_diff diff = compare_logits(logits_src_replay[i].data(), logits_dirty, n_vocab);
+            if (!(diff.nmse() <= nmse_eps)) {
+                TLOG_ERR("%s: dirty replay position %d: max diff %.9e, nmse %.9e, first index %lld, non-finite %zu\n",
+                         __func__, pos, (double) diff.diff_max, diff.nmse(), (long long) diff.i_first, diff.n_nan);
+            }
             CTX_REQUIRE(diff.nmse() <= nmse_eps,
                     "dirty-ctx logits mismatch at position " + std::to_string(pos) + ", nmse " + std::to_string(diff.nmse()));
         }
