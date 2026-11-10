@@ -215,6 +215,19 @@ static void test_seq_cells_match_brute_force() {
     llama_kv_cells cells;
     cells.resize(N_CELLS);
 
+    // the mask lets slice attend to cell c
+    const auto attends = [&](const llama_kv_rows_slice & slice, int32_t c) {
+        if (cells.is_empty(c) || cells.pos_get(c) < slice.p_min) {
+            return false;
+        }
+        for (const llama_seq_id t : slice.seq_ids) {
+            if (cells.seq_has(c, t)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     std::vector<int32_t> data;
 
     for (int step = 0; step < 20000; ++step) {
@@ -292,28 +305,51 @@ static void test_seq_cells_match_brute_force() {
             slice.p_min = rnd(0, 1) ? -1 : rnd(0, 400);
         }
 
-        data.assign(slices.size()*N_CELLS, -2);
-        cells.get_seq_cells(slices, data.data(), N_CELLS);
-
+        // the cells each slice attends to, in cell order
+        std::vector<std::vector<int32_t>> listed(slices.size());
+        size_t n_longest = 1;
         for (size_t is = 0; is < slices.size(); ++is) {
-            const auto & slice = slices[is];
-
-            std::vector<int32_t> expected;
             for (uint32_t c = 0; c < N_CELLS; ++c) {
-                bool has = false;
-                for (const llama_seq_id t : slice.seq_ids) {
-                    has = has || (!cells.is_empty(c) && cells.seq_has(c, t));
-                }
-                if (has && cells.pos_get(c) >= slice.p_min) {
-                    expected.push_back(c);
+                if (attends(slices[is], c)) {
+                    listed[is].push_back(c);
                 }
             }
-            // padding: the cells after the last listed one, then -1 past the end of the cache
-            for (int32_t c = expected.empty() ? 0 : expected.back() + 1; expected.size() < N_CELLS; ++c) {
-                expected.push_back(c < (int32_t) N_CELLS ? c : -1);
-            }
+            n_longest = std::max(n_longest, listed[is].size());
+        }
 
-            GGML_ASSERT(std::equal(expected.begin(), expected.end(), data.begin() + is*N_CELLS));
+        // lists as long as the cache over a view of the whole cache, as long as the longest list over a view of the used
+        // cells (both shorter in llama_kv_cache), and in between
+        const uint32_t n_used = cells.used_max_p1();
+        const std::pair<int64_t, uint32_t> shapes[] = {
+            { N_CELLS, N_CELLS },
+            { (int64_t) n_longest, n_used },
+            { rnd((int) n_longest, N_CELLS), (uint32_t) rnd((int) n_used, N_CELLS) },
+        };
+
+        for (const auto & [n_per_seq, n_kv] : shapes) {
+            data.assign(slices.size()*n_per_seq, -2);
+            cells.get_seq_cells(slices, data.data(), n_per_seq, n_kv);
+
+            for (size_t is = 0; is < slices.size(); ++is) {
+                const int32_t * list = data.data() + is*n_per_seq;
+                const size_t    n    = listed[is].size();
+
+                GGML_ASSERT(std::equal(listed[is].begin(), listed[is].end(), list));
+
+                for (int64_t k = n; k < n_per_seq; ++k) {
+                    if (list[k] < 0) {
+                        // -1 only once the view ends, then to the end of the list
+                        GGML_ASSERT((k == 0 ? 0 : list[k - 1] + 1) >= (int32_t) n_kv);
+                        GGML_ASSERT(std::all_of(list + k, list + n_per_seq, [](int32_t c) { return c == -1; }));
+                        break;
+                    }
+
+                    // padding: in the K/V view, hidden by the mask, and consecutive with the entry before it
+                    GGML_ASSERT(list[k] < (int32_t) n_kv);
+                    GGML_ASSERT(!attends(slices[is], list[k]));
+                    GGML_ASSERT(k == 0 || list[k] == list[k - 1] + 1);
+                }
+            }
         }
 
         for (llama_seq_id t = 0; t < N_SEQS; ++t) {
