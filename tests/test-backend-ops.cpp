@@ -6697,6 +6697,90 @@ struct test_qwen35_elementwise : public test_case {
     }
 };
 
+// one decode step of the gated delta net conv: CONCAT(state, transpose(x)) -> SSM_CONV -> SILU, and the copy of the last 3
+// concat columns into the conv state cache, adjacent as the qwen35 graphs build it (Metal fuses them into one kernel).
+// with inplace the state is the cache row the copy writes. Verified nodes: the SiLU output and the new state.
+struct test_ssm_conv_state : public test_case {
+    const int64_t channels, n_t, n_s;
+    const bool inplace;
+    const bool extra_reader; // a whole-concat reader: no fusion
+
+    static constexpr const char * fusion_label = "CONCAT+CPY+SSM_CONV+UNARY";
+
+    mutable bool has_fusion_label = false;
+
+    std::vector<ggml_tensor *> verify;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_STATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(channels, n_t, n_s, inplace, extra_reader);
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const int64_t count = backend_fusion_label_count(backend, fusion_label);
+        has_fusion_label = count >= 0;
+        return has_fusion_label ? (uint64_t) count : 0;
+    }
+
+    bool expect_fusion()    override { return has_fusion_label &&   n_t == 1 && !extra_reader;  }
+    bool expect_no_fusion() override { return has_fusion_label && !(n_t == 1 && !extra_reader); }
+
+    test_ssm_conv_state(int64_t channels = 64, int64_t n_t = 1, int64_t n_s = 1, bool inplace = false, bool extra_reader = false)
+        : channels(channels), n_t(n_t), n_s(n_s), inplace(inplace), extra_reader(extra_reader) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        const int64_t C = channels;
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * C, n_s + 1);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * dst = ggml_view_2d(ctx, cache, 3 * C, n_s, cache->nb[1], cache->nb[1]);
+
+        ggml_tensor * state;
+        if (inplace) {
+            // a separate view of the row the cpy writes, as the graphs build it
+            state = ggml_reshape_3d(ctx, ggml_view_2d(ctx, cache, 3 * C, n_s, cache->nb[1], cache->nb[1]), 3, C, n_s);
+        } else {
+            state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, C, n_s);
+            ggml_set_name(state, "state");
+        }
+        ggml_tensor * x_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_t, n_s);
+        ggml_set_name(x_src, "x_src");
+        ggml_tensor * x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, like the qkv projection
+        ggml_tensor * kern = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
+        ggml_set_name(kern, "kernel");
+
+        ggml_tensor * cc   = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        ggml_tensor * tail = ggml_view_3d(ctx, cc, 3, C, n_s, cc->nb[1], cc->nb[2], ggml_row_size(cc->type, n_t));
+        ggml_tensor * cpy  = ggml_cpy(ctx, tail, dst);
+        if (gf) {
+            ggml_build_forward_expand(gf, cpy);
+        }
+        verify.push_back(cpy);
+
+        ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, cc, kern));
+        ggml_set_name(out, "out");
+        if (gf) {
+            ggml_build_forward_expand(gf, out);
+        }
+        verify.push_back(out);
+
+        if (extra_reader) {
+            ggml_tensor * whole = ggml_scale(ctx, cc, 2.0f);
+            ggml_set_name(whole, "whole");
+            verify.push_back(whole);
+            return ggml_add(ctx, ggml_sum(ctx, whole), ggml_sum(ctx, out));
+        }
+        return out;
+    }
+};
+
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
 
@@ -18561,6 +18645,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_ragged(16, 128, 3, {1, 70, 2, 1, 15}));
     test_cases.emplace_back(new test_gated_delta_net_ragged(16, 128, 3, {200, 1, 33, 300}));
     test_cases.emplace_back(new test_gated_delta_net_ragged(16, 128, 2, {64, 64}));
+    
+    // the decode conv step with its state copy (Metal CONCAT + CPY + SSM_CONV + SILU); 10240 = Qwen3.5 27B channels
+    for (bool inplace : {false, true}) {
+        for (int64_t ns : {1, 2}) {
+            test_cases.emplace_back(new test_ssm_conv_state(130,   1, ns, inplace));
+            test_cases.emplace_back(new test_ssm_conv_state(10240, 1, ns, inplace));
+        }
+        test_cases.emplace_back(new test_ssm_conv_state(130, 2, 1, inplace));       // two new columns: no fusion
+        test_cases.emplace_back(new test_ssm_conv_state(130, 1, 1, inplace, true)); // another concat reader: no fusion
+    }
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     // one token per seq: the CUDA decode kernel (S_v 64 / 128), with k-head broadcast, snapshots, a q shared by the seqs
     // and non-contiguous q/k/v

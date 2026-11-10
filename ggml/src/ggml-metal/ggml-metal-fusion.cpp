@@ -239,6 +239,106 @@ static bool ggml_metal_fusion_check_ssm_conv_silu(
     return true;
 }
 
+// CONCAT + CPY + SSM_CONV + UNARY(silu): one decode step of a d_conv = 4 conv, as the gated delta net layers build it.
+// the concat of the conv state and the new input feeds only the conv and the cpy of its last 3 columns into the conv
+// state cache, so the kernel reads the state and the input directly, writes the new state and the silu output, and
+// the concat is elided (unsafe = true). the state may be the cache row the cpy writes: each channel is updated in
+// place by the thread that read it
+static bool ggml_metal_fusion_ssm_conv_state_ok(
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    const ggml_tensor * cc   = nodes[0];
+    const ggml_tensor * cpy  = nodes[1];
+    const ggml_tensor * conv = nodes[2];
+    const ggml_tensor * un   = nodes[3];
+    const ggml_tensor * tail = cpy->src[0];
+    const ggml_tensor * dst  = cpy->src[1];
+    const ggml_tensor * st   = cc->src[0];
+    const ggml_tensor * x    = cc->src[1];
+    const ggml_tensor * w    = conv->src[1];
+
+    const int64_t C      = st->ne[1];
+    const int64_t n_seqs = st->ne[2];
+
+    if (ggml_get_op_params_i32(cc, 0) != 0 || cc->type != GGML_TYPE_F32 || st->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+        st->ne[0] != 3 || st->ne[3] != 1 || st->nb[0] != sizeof(float) ||
+        x->ne[1] != C || x->ne[2] != n_seqs || x->ne[3] != 1) {
+        return false;
+    }
+
+    // a single new column: the decode step
+    if (mode == GGML_METAL_FUSION_FULL && x->ne[0] != 1) {
+        return false;
+    }
+
+    if (conv->src[0] != cc || w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != C || !ggml_is_contiguous(w)) {
+        return false;
+    }
+
+    if (un->src[0] != conv || un->src[1] || ggml_get_unary_op(un) != GGML_UNARY_OP_SILU ||
+        un->type != GGML_TYPE_F32 || !ggml_is_contiguous(un)) {
+        return false;
+    }
+
+    // the cpy stores the last 3 columns, the new state, into contiguous cache rows
+    if (tail->view_src != cc || tail->view_offs != (size_t) (cc->ne[0] - 3)*sizeof(float) ||
+        tail->ne[0] != 3 || tail->ne[1] != C || tail->ne[2] != n_seqs || tail->ne[3] != 1 ||
+        tail->nb[1] != cc->nb[1] || tail->nb[2] != cc->nb[2]) {
+        return false;
+    }
+
+    if (tail->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 ||
+        dst->ne[0] != 3*C || ggml_nrows(dst) != n_seqs || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    // the concat and the tail view are elided: they may have no consumers outside the group
+    int raw_idxs[5] = { node_idxs[idx], -1, node_idxs[idx + 1], node_idxs[idx + 2], node_idxs[idx + 3] };
+    for (int i = raw_idxs[0] + 1; i < raw_idxs[2]; ++i) {
+        if (gf->nodes[i] == tail) {
+            raw_idxs[1] = i;
+            break;
+        }
+    }
+    if (raw_idxs[1] < 0) {
+        return false;
+    }
+
+    static const ggml_op ops[5] = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_UNARY };
+    const int outputs[2] = { raw_idxs[2], raw_idxs[4] };
+    if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, 5, ops, outputs, 2)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        // the state is read in place or from elsewhere; a partial overlap would let a thread overwrite another's state
+        if (ggml_metal_fusion_partial_overlap(st, dst)) {
+            return false;
+        }
+        if (ggml_metal_fusion_overlap(un, st) || ggml_metal_fusion_overlap(un, x) || ggml_metal_fusion_overlap(un, dst) ||
+            ggml_metal_fusion_overlap(dst, x) || ggml_metal_fusion_overlap(dst, w)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool ggml_metal_fusion_check_ssm_conv_state(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(fusion);
+
+    return ggml_metal_fusion_ssm_conv_state_ok(nodes, gf, node_idxs, idx, mode);
+}
+
 // ADD x N: each ADD reads the previous ADD as src0, and all addends must share layout
 // (and, in FULL mode, live in the same Metal buffer)
 static bool ggml_metal_fusion_check_add_chain(
@@ -1449,7 +1549,6 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_gdn_deferred_cache = { GGML_OP_GATED_DELTA_NET_DEFERRED, GGML_OP_CPY };
-
 // the RESHAPE is an empty op: it is part of the raw pattern (alloc deps) but not of the fused chain
 static const std::vector<ggml_op> ops_fwht_signed = { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_rms_norm_fwht = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
@@ -1471,7 +1570,8 @@ static const std::vector<ggml_op> ops_rms_norm_rope_rs_set = { GGML_OP_RMS_NORM,
 static const std::vector<ggml_op> ops_rms_norm_rope_vw_set = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
-
+// the views are the tail of the concat and the cache rows; they make the raw sequence the alloc deps match
+static const std::vector<ggml_op> ops_ssm_conv_state = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_UNARY };
 static const std::vector<ggml_op> ops_mul_mv_glu         = { GGML_OP_MUL_MAT,    GGML_OP_MUL_MAT,    GGML_OP_GLU };
 static const std::vector<ggml_op> ops_mul_mv_id_glu      = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
 static const std::vector<ggml_op> ops_mul_mv_id_glu_stkd = { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU };
@@ -1668,6 +1768,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
+    { GGML_METAL_FUSION_SSM_CONV_STATE, ops_ssm_conv_state,         {1},    true,  ggml_metal_fusion_check_ssm_conv_state },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
     { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_glu,             {},     true,  ggml_metal_fusion_check_mul_mv_glu },
     { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_id_glu,          {},     true,  ggml_metal_fusion_check_mul_mv_glu },
@@ -1769,6 +1870,10 @@ void ggml_metal_fusion_add_alloc_deps(
             // which also fire when this one does not: rescan from the first mat-vec so they get their deps
             if (best->id == GGML_METAL_FUSION_RMS_NORM_MUL_MV) {
                 i += 1;
+                continue;
+            }
+            // the decode conv step holds SSM_CONV + UNARY, which fires in prefill: rescan so it gets its deps
+            if (best->id == GGML_METAL_FUSION_SSM_CONV_STATE) {
                 continue;
             }
             i += best_raw - 1;
@@ -1986,7 +2091,8 @@ static bool ggml_metal_fusion_check_memory_ranges(
                     // ADD chain, and the signed FWHT, whose RESHAPE keeps the element order.
                     const bool inplace_ok =
                         (fusion->id == GGML_METAL_FUSION_ADD_CHAIN   && ggml_are_same_layout(src, dst)) ||
-                        (fusion->id == GGML_METAL_FUSION_FWHT_SIGNED && ggml_metal_fusion_same_linear_layout(src, dst));
+                        (fusion->id == GGML_METAL_FUSION_FWHT_SIGNED && ggml_metal_fusion_same_linear_layout(src, dst)) ||
+                        (fusion->id == GGML_METAL_FUSION_SSM_CONV_STATE && ggml_metal_fusion_same_linear_layout(src, dst));
                     if (src->data == dst->data && inplace_ok) {
                         continue;
                     }

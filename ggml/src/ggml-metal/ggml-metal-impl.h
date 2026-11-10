@@ -1193,6 +1193,16 @@ typedef struct {
 } ggml_metal_kargs_ssm_conv;
 
 typedef struct {
+    int32_t  C;     // channels
+    uint64_t nb01;  // conv state [3, C, n_seqs] strides
+    uint64_t nb02;
+    uint64_t nb11;  // new input [1, C, n_seqs] strides
+    uint64_t nb12;
+    uint64_t nb2;   // dst [C, 1, n_seqs] seq stride
+    uint64_t nbs1;  // new conv state [3*C, n_seqs] row stride
+} ggml_metal_kargs_ssm_conv_state;
+
+typedef struct {
     int64_t  d_state;
     int64_t  d_inner;
     int64_t  n_head;
