@@ -469,11 +469,15 @@ public:
     }
 
     // get the lists of the cells that contain any of the sequences of each slice, in cell order
-    // one list of max `n_per_seq` for each slice, padded with the cells that follow its last cell, then with -1
+    // one list of max `n_per_seq` for each slice, padded with the cells that follow its last cell, below `n_kv`, then with -1
+    // `n_kv` is the number of rows of the K/V views the lists index
     // the cells of slice s at a position below slices[s].p_min are skipped
     LLAMA_ATTRIBUTE_NOINLINE
-    void get_seq_cells(const std::vector<llama_kv_rows_slice> & slices, int32_t * data, int64_t n_per_seq) const {
+    void get_seq_cells(const std::vector<llama_kv_rows_slice> & slices, int32_t * data, int64_t n_per_seq, uint32_t n_kv) const {
         assert(slices.size() >= 1);
+
+        // the listed cells are below used_max_p1()
+        GGML_ASSERT(used_max_p1() <= n_kv && n_kv <= size());
 
         const int64_t n_slices = (int64_t) slices.size();
 
@@ -504,10 +508,10 @@ public:
             }
 
             // pad with the cells after the last one: the mask hides them (the list holds every cell the slice attends to, in
-            // cell order), and the end of the list stays consecutive, which backends read like the dense cache; -1 past the
-            // end of the cache
+            // cell order), and the end of the list stays consecutive, which backends read like the dense cache; -1 from
+            // n_kv on, as some backends copy only the n_kv rows of the K/V views
             int32_t next = dst > data + s*n_per_seq ? dst[-1] + 1 : 0;
-            for (; dst < end && next < (int32_t) size(); ++dst, ++next) {
+            for (; dst < end && next < (int32_t) n_kv; ++dst, ++next) {
                 *dst = next;
             }
 
