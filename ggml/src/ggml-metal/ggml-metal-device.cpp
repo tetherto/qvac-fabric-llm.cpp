@@ -624,8 +624,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_state(ggml_metal_library_t lib) {
-    const char * name = "kernel_ssm_conv_state_f32";
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_state(ggml_metal_library_t lib, bool norm) {
+    const char * name = norm ? "kernel_ssm_conv_state_norm_f32" : "kernel_ssm_conv_state_f32";
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {

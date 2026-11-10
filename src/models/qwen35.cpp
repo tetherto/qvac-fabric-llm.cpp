@@ -440,10 +440,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         ggml_build_forward_expand(gf, conv_qkv_mix);
     }
 
-    ggml_tensor * state = build_rs_ssm(inp, ssm_states_all, n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
-
     // Calculate the total conv dimension
     int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
     int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
@@ -477,7 +473,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     if (!deferred) {
         q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
         k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+
+        // right after the conv step, so backends can fuse the norms with it
+        ggml_build_forward_expand(gf, q_conv);
+        ggml_build_forward_expand(gf, k_conv);
     }
+
+    ggml_tensor * state = build_rs_ssm(inp, ssm_states_all, n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    cb(state, "state_predelta", il);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
