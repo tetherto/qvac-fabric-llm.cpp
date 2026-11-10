@@ -54,6 +54,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_RMS_NORM_MUL_MV, // RMS_NORM + MUL + MUL_MAT x N (norm folded into each single-row mat-vec)
     GGML_METAL_FUSION_RMS_NORM_ROPE,   // RMS_NORM + MUL + ROPE (+ SET_ROWS) (per-head Q/K norms, K-cache write)
     GGML_METAL_FUSION_SSM_CONV_STATE,  // CONCAT + CPY + SSM_CONV + UNARY(silu) (decode conv step with its conv state update)
+    GGML_METAL_FUSION_RMS_NORM_MUL_MV_GLU, // RMS_NORM + MUL + MUL_MAT + MUL_MAT + GLU (norm folded into the decode gate/up + swiglu)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

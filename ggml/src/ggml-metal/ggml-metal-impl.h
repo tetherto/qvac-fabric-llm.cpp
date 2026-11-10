@@ -42,6 +42,7 @@
 #define N_SG_Q4_0 2
 // glu holds 2 accs per row, so use fewer rows per simdgroup
 #define N_R0_Q4_0_GLU 1
+#define N_R0_Q4_0_GLU_NORM 2 // the norm variant also reads the norm weight: more rows per simdgroup share both reads
 
 #define N_R0_Q4_1 4
 #define N_SG_Q4_1 2
