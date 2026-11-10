@@ -3361,6 +3361,24 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_content("<think>\nI'm\nthinking\n</think>\n\n")
             .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
             .run();
+
+        // Continuing a message that already holds content keeps that content before a required call
+        tst.test(
+               "world!\n"
+               "<tool_call>\n"
+               "{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_content })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\n")
+            .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
+            .run();
     }
 
     {
