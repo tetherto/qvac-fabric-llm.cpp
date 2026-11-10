@@ -2377,6 +2377,17 @@ static int test_glm5_kpool_sequences() {
         }
         return ok;
     };
+    auto check_close = [&](const std::vector<float> & a, const std::vector<float> & b, const char * what) {
+        const double error = nmse(a, b);
+        if (!(error < 1e-6)) {
+            float max_diff = 0.0f;
+            for (size_t i = 0; i < a.size(); ++i) {
+                max_diff = std::max(max_diff, std::abs(a[i] - b[i]));
+            }
+            printf("GLM5 k-pool %s: nmse %.9e, max diff %.9e\n", what, error, (double) max_diff);
+        }
+        return check(error < 1e-6, what);
+    };
     bool ok = true;
 
     // Without edits every live cell of a sequence is visible.
@@ -2446,12 +2457,12 @@ static int test_glm5_kpool_sequences() {
         auto ref0 = new_ctx();
         run(ref0.get(), 0, n_prefix, {0}, 10);
         edit(ref0.get());
-        ok &= check(nmse(run(ref0.get(), n_prefix, n_prefix + 1, {0}, 60), logits0) < 1e-6, "rep clash: seq 0 logits");
+        ok &= check_close(run(ref0.get(), n_prefix, n_prefix + 1, {0}, 60), logits0, "rep clash: seq 0 logits");
         ok &= check(visible_scores().size() == scores0.size() && nmse(visible_scores(), scores0) < 1e-6, "rep clash: seq 0 scores");
 
         auto ref1 = new_ctx();
         run(ref1.get(), 0, n_prefix, {0}, 10);
-        ok &= check(nmse(run(ref1.get(), n_prefix, n_prefix + 1, {0}, 70), logits1) < 1e-6, "rep clash: seq 1 logits");
+        ok &= check_close(run(ref1.get(), n_prefix, n_prefix + 1, {0}, 70), logits1, "rep clash: seq 1 logits");
         ok &= check(visible_scores().size() == scores1.size() && nmse(visible_scores(), scores1) < 1e-6, "rep clash: seq 1 scores");
     }
 
