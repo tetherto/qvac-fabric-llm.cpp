@@ -10260,6 +10260,8 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
 
     const uint32_t slope = Br * acctype;
 
+    const uint32_t v_visible = params.path == FA_COOPMAT1 ? Bc * sizeof(uint32_t) : 0;
+
     const uint32_t qjl_proj_k = qjl_full_proj ? hsk : qjl_quant_k;
     const uint32_t qjl_proj = qjl_quant_k ? Br * qjl_proj_k * sizeof(float) : 0;
     const uint32_t qjl_corr = (qjl_quant_k && params.path == FA_COOPMAT2) ? Br * Bc * sizeof(float) : 0;
@@ -10271,7 +10273,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
         pvsh = Br * osh_stride * pvsh_elem_size;
     }
 
-    uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + qjl_proj + qjl_corr + params.limit_occupancy_shmem * 16;
+    uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + v_visible + qjl_proj + qjl_corr + params.limit_occupancy_shmem * 16;
 
     // flip only runs for F16/BF16 K/V, so it never carries the TBQ QJL buffers
     if (params.flip) {
