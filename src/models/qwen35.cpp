@@ -388,6 +388,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
+    // the norm feeds the four input projections: keep them together, so backends can fold the norm into them
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_build_forward_expand(gf, z);
+    ggml_build_forward_expand(gf, beta);
+    ggml_build_forward_expand(gf, alpha);
+
     // with the deferred commit the gdn op activates the gates itself
     const bool raw_gates = inp->rec_idx != nullptr;
 
