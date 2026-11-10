@@ -137,6 +137,7 @@ falcon-h1           ,0   ,any     ,ADD+ADD                     ,      2
 falcon-h1           ,0   ,any     ,RMS_NORM+MUL                ,      9
 flint               ,0   ,any     ,ADD+ADD                     ,      1
 flint               ,0   ,any     ,MUL+ADD                     ,      2
+flint               ,0   ,decode  ,MUL_MAT_ID+MUL              ,      1
 flint               ,0   ,any     ,RMS_NORM+MUL                ,      7
 flint               ,0   ,any     ,RMS_NORM+MUL+ROPE           ,      2
 gemma               ,0   ,prefill ,MUL_MAT+ADD                 ,      2
@@ -273,6 +274,7 @@ laguna              ,0   ,decode  ,ADD+ADD                     ,      1
 laguna              ,0   ,any     ,MUL+ADD                     ,      2
 laguna              ,0   ,prefill ,MUL_MAT+ADD                 ,      2
 laguna              ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
+laguna              ,0   ,decode  ,MUL_MAT_ID+MUL              ,      1
 laguna              ,0   ,decode  ,MUL_MAT_ID+MUL_MAT_ID+GLU   ,      1
 laguna              ,0   ,any     ,RMS_NORM+MUL                ,      5
 laguna              ,0   ,any     ,RMS_NORM+MUL+ROPE           ,      4
@@ -287,8 +289,11 @@ lfm2moe             ,1   ,decode  ,MUL_MAT_ID+MUL_MAT_ID+GLU   ,      1
 lfm2moe             ,1   ,any     ,RMS_NORM+MUL                ,      5
 lfm2moe             ,1   ,any     ,RMS_NORM+MUL+ROPE           ,      1
 lfm2moe             ,1   ,any     ,RMS_NORM+MUL+ROPE+SET_ROWS  ,      1
+lfm3                ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      3
 lfm3                ,0   ,any     ,RMS_NORM+MUL                ,     13
 lfm3                ,0   ,any     ,RMS_NORM+MUL+ROPE           ,      4
+limite              ,0   ,prefill ,MUL_MAT+ADD                 ,      4
+limite              ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      4
 llada               ,0   ,prefill ,MUL_MAT+ADD                 ,      2
 llada               ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
 llada               ,0   ,any     ,RMS_NORM+MUL                ,      5
@@ -345,9 +350,8 @@ minimax-01          ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,
 minimax-m2          ,0   ,any     ,MUL+ADD                     ,      4
 minimax-m2          ,0   ,decode  ,MUL_MAT_ID+MUL_MAT_ID+GLU   ,      2
 minimax-m2          ,0   ,any     ,RMS_NORM+MUL                ,      9
-minimax-m3          ,0   ,decode  ,ADD+ADD                     ,      1
+minimax-m3          ,0   ,any     ,ADD+ADD                     ,      1
 minimax-m3          ,0   ,any     ,MUL+ADD                     ,      2
-minimax-m3          ,0   ,prefill ,MUL_MAT+ADD                 ,      2
 minimax-m3          ,0   ,any     ,RMS_NORM+MUL                ,     11
 mistral-large4      ,0   ,any     ,ADD+ADD                     ,      3
 mistral-large4      ,0   ,any     ,MUL+ADD                     ,      6
@@ -363,6 +367,7 @@ mistral4            ,0   ,any     ,MUL+ADD                     ,      2
 mistral4            ,0   ,prefill ,MUL_MAT+ADD                 ,      2
 mistral4            ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
 mistral4            ,0   ,decode  ,MUL_MAT_ID+GLU              ,      1
+mistral4            ,0   ,decode  ,MUL_MAT_ID+MUL              ,      1
 mistral4            ,0   ,any     ,RMS_NORM+MUL                ,      9
 mpt                 ,0   ,any     ,NORM+MUL+ADD                ,      5
 muse-glimmer        ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
@@ -464,6 +469,7 @@ qwen3moe            ,1   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,
 qwen3next           ,0   ,any     ,ADD+ADD                     ,      2
 qwen3next           ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
 qwen3next           ,0   ,any     ,MUL+ADD                     ,      4
+qwen3next           ,0   ,prefill ,MUL_MAT+ADD                 ,      1
 qwen3next           ,0   ,decode  ,MUL_MAT_ID+GLU              ,      2
 qwen3next           ,0   ,any     ,RMS_NORM+MUL                ,      6
 qwen3next           ,0   ,any     ,RMS_NORM+MUL+ROPE           ,      1
