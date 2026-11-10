@@ -146,6 +146,17 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
         // LLAMA_GDN_DEFERRED=2 keeps gathering the base states (for A/B runs)
         gdn_inplace  = gdn_deferred && atoi(env) != 2;
+
+        rs_inplace = offload && !gdn_deferred && n_rs_seq == 0 && mem_size == 1;
+        // Metal only: other backends fuse the gdn cache write through a binding that may not alias the state (WebGPU),
+        // or match the gathered states in their own fusions (XDNA)
+        for (int32_t il = 0; rs_inplace && il < n_layer; ++il) {
+            if (filter && !filter(il)) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(model.dev_layer(il));
+            rs_inplace = reg != nullptr && strcmp(ggml_backend_reg_name(reg), "MTL") == 0;
+        }
         if (gdn_deferred) {
             const int64_t H_v = hparams.ssm_dt_rank;
             const int64_t S_v = hparams.ssm_d_inner / H_v;
@@ -1795,7 +1806,8 @@ bool llama_memory_recurrent_context::get_gdn_deferred() const {
 bool llama_memory_recurrent_context::get_s_base_inplace(uint32_t n_seqs) const {
     GGML_UNUSED(n_seqs);
 
-    return mem->gdn_inplace;
+    // gdn_inplace and rs_inplace imply a single cell, which always keeps its own base state (also in the reserved graph)
+    return mem->gdn_inplace || mem->rs_inplace;
 }
 
 int64_t llama_memory_recurrent_context::get_gdn_k() const {
