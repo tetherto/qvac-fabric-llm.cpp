@@ -536,6 +536,97 @@ static bool ggml_metal_fusion_check_gdn_cache(
     return true;
 }
 
+// ADD + UNARY(softplus) + MUL + UNARY(sigmoid) + GATED_DELTA_NET + CPY: the decode gates of a gated delta net layer,
+// g = softplus(alpha + dt)*a and beta = sigmoid(beta), feed only the gdn, which activates them itself from the raw
+// alpha and beta (one value per head), as in GDN_CACHE (unsafe = true)
+static bool ggml_metal_fusion_check_gdn_gates(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * add = nodes[0];
+    const ggml_tensor * sp  = nodes[1];
+    const ggml_tensor * mul = nodes[2];
+    const ggml_tensor * sig = nodes[3];
+    const ggml_tensor * gdn = nodes[4];
+
+    if (!ggml_metal_fusion_check_gdn_cache(fusion, nodes + 4, gf, node_idxs, idx + 4, mode)) {
+        return false;
+    }
+
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || ggml_get_op_params_i32(gdn, 0) != 1) {
+        return false;
+    }
+
+    const ggml_tensor * g = gdn->src[3];
+    const ggml_tensor * b = gdn->src[4];
+
+    const ggml_tensor * alpha = add->src[0];
+    const ggml_tensor * dt    = add->src[1];
+    const ggml_tensor * a     = mul->src[1];
+    const ggml_tensor * beta  = sig->src[0];
+
+    const int64_t H   = gdn->src[2]->ne[1];
+    const int64_t n_g = H*gdn->src[2]->ne[2]*gdn->src[2]->ne[3];
+
+    if (sp->src[0] != add || ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS || mul->src[0] != sp ||
+        ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || b != sig || g->op != GGML_OP_RESHAPE || g->src[0] != mul) {
+        return false;
+    }
+
+    if (g->ne[0] != 1 || ggml_nelements(mul) != n_g || ggml_nelements(sig) != n_g) {
+        return false;
+    }
+
+    for (const ggml_tensor * t : { alpha, dt, a, beta, (const ggml_tensor *) add, (const ggml_tensor *) mul, (const ggml_tensor *) sig }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+
+    // per-head dt and a, broadcast over the tokens and sequences
+    if (alpha->ne[0] != H || ggml_nelements(alpha) != n_g || ggml_nelements(beta) != n_g ||
+        dt->ne[0] != H || ggml_nelements(dt) != H || a->ne[0] != H || ggml_nelements(a) != H ||
+        !ggml_are_same_shape(add, alpha) || !ggml_are_same_shape(mul, add)) {
+        return false;
+    }
+
+    // the gate chain and the sigmoid are elided: their only consumer is the gdn
+    int raw_idxs[6] = { node_idxs[idx], node_idxs[idx + 1], node_idxs[idx + 2], -1, node_idxs[idx + 3], node_idxs[idx + 4] };
+    for (int i = raw_idxs[2] + 1; i < raw_idxs[5]; ++i) {
+        if (gf->nodes[i] == g) {
+            raw_idxs[3] = i;
+        }
+    }
+    if (raw_idxs[3] < 0) {
+        return false;
+    }
+
+    static const ggml_op ops[6] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_UNARY, GGML_OP_GATED_DELTA_NET };
+    const int outputs[1] = { raw_idxs[5] };
+    if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, 6, ops, outputs, 1)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        // the sequential decode kernel (the chunked prefill kernel has no raw gates)
+        if (gdn->src[2]->ne[2] != 1) {
+            return false;
+        }
+
+        const ggml_tensor * cache = nodes[5]->src[1];
+        for (const ggml_tensor * t : { alpha, dt, a, beta }) {
+            if (ggml_metal_fusion_overlap(gdn, t) || ggml_metal_fusion_overlap(cache, t)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 // GATED_DELTA_NET_DEFERRED + CPY: the trailing cpy stores the new base state into the recurrent
 // cache, so the kernel writes it there directly. as with GDN_CACHE the gdn output has other
 // consumers (the attn view), so the structural checks live entirely in this callback.
@@ -1713,6 +1804,14 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_gdn_deferred_cache = { GGML_OP_GATED_DELTA_NET_DEFERRED, GGML_OP_CPY };
+// the raw sequences as the qwen35 graphs build them, with the state read in place or gathered
+static const std::vector<ggml_op> ops_gdn_gates_inplace = {
+    GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_RESHAPE,
+    GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
+static const std::vector<ggml_op> ops_gdn_gates = {
+    GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_UNARY, GGML_OP_RESHAPE,
+    GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
+
 // the RESHAPE is an empty op: it is part of the raw pattern (alloc deps) but not of the fused chain
 static const std::vector<ggml_op> ops_fwht_signed = { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_rms_norm_fwht = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
@@ -1925,6 +2024,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SNAKE,          ops_snake,                  {},     false, ggml_metal_fusion_check_snake },
     { GGML_METAL_FUSION_GDN_CACHE,      ops_gdn_cache,              {},     true,  ggml_metal_fusion_check_gdn_cache },
     { GGML_METAL_FUSION_GDN_DEFERRED_CACHE, ops_gdn_deferred_cache, {},     true,  ggml_metal_fusion_check_gdn_deferred_cache },
+    { GGML_METAL_FUSION_GDN_GATES,      ops_gdn_gates_inplace,      {},     true,  ggml_metal_fusion_check_gdn_gates },
+    { GGML_METAL_FUSION_GDN_GATES,      ops_gdn_gates,              {},     true,  ggml_metal_fusion_check_gdn_gates },
     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe,               {1},    true,  ggml_metal_fusion_check_topk_moe },
     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe_scale,         {1},    true,  ggml_metal_fusion_check_topk_moe },
     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe_norm,          {1},    true,  ggml_metal_fusion_check_topk_moe },
@@ -2045,6 +2146,10 @@ void ggml_metal_fusion_add_alloc_deps(
             }
             // the decode conv step holds SSM_CONV + UNARY and NORM + SCALE, which fire in prefill: rescan so they get their deps
             if (best->id == GGML_METAL_FUSION_SSM_CONV_STATE || best->id == GGML_METAL_FUSION_SSM_CONV_STATE_NORM) {
+                continue;
+            }
+            // the decode gates hold UNARY + MUL and GATED_DELTA_NET + CPY, which fire in prefill: rescan likewise
+            if (best->id == GGML_METAL_FUSION_GDN_GATES) {
                 continue;
             }
             i += best_raw - 1;

@@ -880,11 +880,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(ggml_metal_library_t lib, const ggml_tensor * op, bool raw_gates) {
     // The MLX-style SIMD-group path currently handles scalar-gate prefill
     // with one final-state snapshot. Other layouts and modes use the sequential kernel.
     // The chunked solve requires L2-normalized keys for stable results.
-    const bool use_mlx_c8 =
+    const bool use_mlx_c8 = !raw_gates &&
         ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_simdgroup_mm &&
         op->src[0]->type == GGML_TYPE_F32 &&
         op->src[1]->type == GGML_TYPE_F32 &&
@@ -951,8 +951,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     GGML_ASSERT(op->ne[0] == ne20 * ne21);
     GGML_ASSERT(ne20 % 32 == 0);
 
+    GGML_ASSERT(!raw_gates || ne30 == 1);
+
     snprintf(base, 256, "kernel_gated_delta_net_%s_%d", ggml_type_name(op->src[0]->type), nsg);
-    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d_nt=%d", base, ne20, ne30, K, nt_fc);
+    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d_nt=%d_raw=%d", base, ne20, ne30, K, nt_fc, raw_gates);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -962,6 +964,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
         ggml_metal_cv_set_int16(cv, ne30,  FC_GATED_DELTA_NET + 1);
         ggml_metal_cv_set_int16(cv, K,     FC_GATED_DELTA_NET + 2);
         ggml_metal_cv_set_int16(cv, nt_fc, FC_GATED_DELTA_NET + 3);
+        ggml_metal_cv_set_bool (cv, raw_gates, FC_GATED_DELTA_NET + 4);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
