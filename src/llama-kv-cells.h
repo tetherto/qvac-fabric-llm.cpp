@@ -469,7 +469,7 @@ public:
     }
 
     // get the lists of the cells that contain any of the sequences of each slice, in cell order
-    // one list of max `n_per_seq` for each slice, padded with -1
+    // one list of max `n_per_seq` for each slice, padded with the cells that follow its last cell, then with -1
     // the cells of slice s at a position below slices[s].p_min are skipped
     LLAMA_ATTRIBUTE_NOINLINE
     void get_seq_cells(const std::vector<llama_kv_rows_slice> & slices, int32_t * data, int64_t n_per_seq) const {
@@ -501,6 +501,14 @@ public:
                         *dst++ = i;
                     }
                 }
+            }
+
+            // pad with the cells after the last one: the mask hides them (the list holds every cell the slice attends to, in
+            // cell order), and the end of the list stays consecutive, which backends read like the dense cache; -1 past the
+            // end of the cache
+            int32_t next = dst > data + s*n_per_seq ? dst[-1] + 1 : 0;
+            for (; dst < end && next < (int32_t) size(); ++dst, ++next) {
+                *dst = next;
             }
 
             std::fill(dst, end, -1);
