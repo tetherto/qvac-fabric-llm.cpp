@@ -155,6 +155,16 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
     return p.eps();
 }
 
+// Whether only the reasoning block may precede the tool call. Upstream allows content before a forced call since
+// ggml-org/llama.cpp#22654; this fork keeps a required call strict, so keep these branches on a rebase. A continued
+// message that already holds content keeps it, since that content is part of the prompt the grammar must accept.
+static bool requires_call_after_reasoning(const generation_params & inputs) {
+    const bool continues_content = inputs.has_continuation() &&
+                                   inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT &&
+                                   !inputs.continue_msg.render_content().empty();
+    return inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED && !continues_content;
+}
+
 // What may precede a required tool call: the reasoning block and whitespace, nothing else. Optional content before the
 // call lets the model answer in text and never reach it, since the grammar accepts end of generation only after a call.
 // Without reasoning extraction the block is kept as content, so a thinking model can still think before calling.
@@ -240,7 +250,7 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
             format.fun_name_is_key, format.id_field, format.gen_id_field, format.parameter_order, format.openai_wrapper_trigger);
     }
 
-    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+    if (requires_call_after_reasoning(inputs)) {
         return build_required_call_preamble(ctx) + p.space() + tools_parser + p.end();
     }
 
@@ -374,7 +384,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
         tool_calls = p.optional(tool_calls);
     }
 
-    if (require_calls) {
+    if (requires_call_after_reasoning(inputs)) {
         return build_required_call_preamble(ctx) + p.space() + tool_calls + p.end();
     }
 
@@ -497,7 +507,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
         tool_calls = p.optional(tool_calls);
     }
 
-    if (require_tools) {
+    if (requires_call_after_reasoning(inputs)) {
         return build_required_call_preamble(ctx) + p.space() + tool_calls + p.end();
     }
 
