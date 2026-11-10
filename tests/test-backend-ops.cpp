@@ -12948,6 +12948,75 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Changing values masked in every query must not change the output on the same backend.
+struct test_flash_attn_ext_masked_values : public test_flash_attn_ext {
+    ggml_tensor * candidate = nullptr;
+    ggml_tensor * reference = nullptr;
+
+    test_flash_attn_ext_masked_values(int64_t hs, int64_t kv, int64_t nb)
+        : test_flash_attn_ext(hs, hs, 2, {4, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32,
+                              GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, false) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return "FLASH_ATTN_EXT_MASKED_VALUES";
+    }
+
+    double max_err(ggml_backend_t) override {
+        return 0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    std::pair<ggml_tensor *, ggml_tensor *> backend_self_compare_nodes() override {
+        return {candidate, reference};
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        candidate = test_flash_attn_ext::build_graph(ctx);
+        ggml_tensor * v_clean = ggml_new_tensor_4d(ctx, type_V, hsv, kv, nh, 1);
+        ggml_set_name(v_clean, "v_clean");
+        reference = ggml_flash_attn_ext(ctx, candidate->src[0], candidate->src[1], v_clean, candidate->src[3], scale, 0, 0);
+        ggml_flash_attn_ext_add_sinks(reference, candidate->src[4]);
+        ggml_prec_set_acc(reference, prec);
+        ggml_set_name(reference, "reference");
+        return ggml_add(ctx, candidate, reference);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        const int64_t visible = 7 + std::min<int64_t>(nb - 1, 4);
+        for (const char * name : {"q", "k", "v", "v_clean", "m", "s"}) {
+            ggml_tensor * t = ggml_get_tensor(ctx, name);
+            std::vector<float> data(ggml_nelements(t));
+            for (size_t i = 0; i < data.size(); ++i) {
+                data[i] = float(int((i * 13 + i / 7) % 101) - 50) / 53.0f;
+                if (strcmp(name, "m") == 0) {
+                    const int64_t query = (i / kv) % nb;
+                    data[i] = int64_t(i % kv) < 7 + query % 5 ? 0.0f : -INFINITY;
+                } else if (strcmp(name, "v") == 0 || strcmp(name, "v_clean") == 0) {
+                    if (int64_t((i / hsv) % kv) >= visible) {
+                        data[i] = strcmp(name, "v") == 0 ? -1.0f : 0.0f;
+                    }
+                }
+            }
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else {
+                std::vector<ggml_fp16_t> half(data.size());
+                ggml_fp32_to_fp16_row(data.data(), half.data(), data.size());
+                ggml_backend_tensor_set(t, half.data(), 0, half.size() * sizeof(ggml_fp16_t));
+            }
+        }
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -17930,6 +17999,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
+    for (int64_t hs : {64, 128, 256}) {
+        for (int64_t kv : {256, 257}) {
+            for (int64_t nb : {1, 4, 17}) {
+                test_cases.emplace_back(new test_flash_attn_ext_masked_values(hs, kv, nb));
+            }
+        }
     }
 
     // multi-row prefill FA shapes (Vulkan GGML_VK_FA_MR, on by default for head size 256 on RADV RDNA3; =1 also
