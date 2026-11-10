@@ -281,12 +281,17 @@ struct vk_matmul_pipeline_key {
     ggml_type type_b;
     bool mul_mat_id;
     bool f16acc;
+    bool full_f32 = false;
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, full_f32)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.full_f32);
     }
 };
+
+inline vk_matmul_pipeline_key ggml_vk_full_f32_matmul_key() {
+    return { GGML_TYPE_F32, GGML_TYPE_F32, false, false, true };
+}
 
 struct vk_matmul_pipeline_pair {
     vk_pipeline unaligned;
@@ -1032,6 +1037,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
     vk_pipeline pipeline_fwht_f32[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_fwht_f16[GGML_VK_FWHT_NUM_SIZES];
+    vk_pipeline pipeline_mul_mat_convrot_f32, pipeline_mul_mat_convrot_f16;
+    vk_pipeline pipeline_convrot_f32;
+    vk_pipeline pipeline_convrot_reconstruct_f32, pipeline_convrot_reconstruct_f16;
+    vk_pipeline pipeline_convrot_convert_f32_f16, pipeline_convrot_convert_f16_f32, pipeline_convrot_round_f16;
+    vk_pipeline pipeline_convrot_convert_i8_f16, pipeline_convrot_activation_split_f32, pipeline_convrot_activation_split_f16, pipeline_convrot_combine;
+    vk_pipeline pipeline_convrot_tile_weights, pipeline_convrot_tile_activation, pipeline_convrot_accumulate;
     // rows a workgroup covers, chosen per width when the pipeline is built
     uint32_t fwht_rows_per_wg[GGML_VK_FWHT_NUM_SIZES] = {};
     vk_pipeline pipeline_cumsum_f32;
@@ -1575,6 +1586,13 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset, prealloc_size_tile;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, prealloc_tile, sync_staging;
+    // ConvRot scratch, kept apart from the GEMM scratch that prealloc_x/y may resize
+    size_t prealloc_size_convrot_w = 0, prealloc_size_convrot_a = 0;
+    vk_buffer prealloc_convrot_w, prealloc_convrot_a;
+    size_t prealloc_size_convrot_low_a = 0, prealloc_size_convrot_low_d = 0;
+    vk_buffer prealloc_convrot_low_a, prealloc_convrot_low_d, prealloc_convrot_flag;
+    size_t prealloc_size_convrot_tile_a = 0, prealloc_size_convrot_tile_d = 0;
+    vk_buffer prealloc_convrot_tile_hi, prealloc_convrot_tile_lo, prealloc_convrot_tile_d;
     // memoized capacity decisions for the FA scratch in prealloc_x, see ggml_vk_fa_scratch_fits
     vk_fa_scratch_gate fa_dequant_gate; // the K/V scratch alone
     vk_fa_scratch_gate fa_vt_gate;      // K/V scratch + V^T

@@ -1,0 +1,19 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "convrot_f16.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform parameter { uint count; uint width; uint src_width; uint row_start; uint k_start; uint src_offset; };
+layout(binding = 0, std430) readonly buffer S { uint src[]; };
+layout(binding = 1, std430) writeonly buffer D { uint dst[]; };
+void main() {
+    const uint id = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256 + gl_LocalInvocationID.x;
+    if (2 * id >= count) return;
+    const uint index = src_offset + (row_start + 2 * id / width) * src_width + k_start + (2 * id % width);
+#ifdef SRC_I8
+    const int a = bitfieldExtract(int(src[index / 4]), int((index % 4) * 8), 8);
+    const int b = bitfieldExtract(int(src[(index + 1) / 4]), int(((index + 1) % 4) * 8), 8);
+    dst[id] = convrot_pack_f16_rne(vec2(float(a), float(b)));
+#else
+    dst[id] = src[index / 2];
+#endif
+}

@@ -571,6 +571,8 @@ target_include_directories(test-backend-buffer-size PRIVATE ${PROJECT_SOURCE_DIR
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 
+llama_build_and_test(test-convrot.cpp LINK ggml)
+
 # Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
 # GGML_VK_TBQ_COPY_SG_SIZE values to exercise the shader's cross-subgroup stitch
 # path on hardware that only exposes one native subgroup size. Auto-skips when no

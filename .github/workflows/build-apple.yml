@@ -144,7 +144,7 @@ jobs:
           cd build
           # Metal Paravirtual devices are difficult to support -> disable
           # ref: https://github.com/ggml-org/llama.cpp/pull/19802#issuecomment-4013704023
-          ctest -L main -E "test-llama-archs|test-glm5-kpool-sequences|test-llama-context|test-save-load-state|test-recurrent-state-rollback" --verbose --timeout 1800
+          ctest -L main -E "test-llama-archs|test-glm5-kpool-sequences|test-llama-context|test-save-load-state|test-recurrent-state-rollback|test-convrot" --verbose --timeout 1800
 
   macos-latest-x64:
     runs-on: macos-15-intel
