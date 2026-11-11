@@ -17,6 +17,8 @@ void check(bool condition, const char * message) {
 
 constexpr size_t GUARD_BYTES   = 37;
 constexpr size_t PAYLOAD_BYTES = 160;
+constexpr size_t CHUNK_BYTES = 64;
+constexpr size_t CAPACITY_BYTES = 256;
 
 // Host-portable buffer type whose physical allocation carries a guard that the
 // buffer does not report, like the Hexagon shared buffer. Its allocator is the
@@ -26,6 +28,9 @@ struct fixture {
     ggml_backend_device dev = {};
     ggml_backend_buffer_type buft = {};
     std::vector<size_t> physical_sizes;
+    ggml_backend backend = {};
+    size_t chunk_bytes = SIZE_MAX;
+    size_t capacity_bytes = SIZE_MAX;
 
     static fixture & get(ggml_backend_buffer_type_t type) {
         return *static_cast<fixture *>(type->context);
@@ -36,13 +41,22 @@ struct fixture {
     static size_t predict(ggml_backend_buffer_type_t, size_t size) {
         return physical(size);
     }
+    static size_t capacity(ggml_backend_buffer_type_t type) {
+        return get(type).capacity_bytes;
+    }
+    static ggml_backend_buffer_type_t buffer_type(ggml_backend_dev_t device) {
+        return &static_cast<fixture *>(device->context)->buft;
+    }
     static void * proc(ggml_backend_reg_t, const char * name) {
+        if (std::strcmp(name, "ggml_backend_get_buffer_capacity") == 0) {
+            return reinterpret_cast<void *>(capacity);
+        }
         return std::strcmp(name, "ggml_backend_buft_get_buffer_alloc_size") == 0 ?
             reinterpret_cast<void *>(predict) : nullptr;
     }
     static const char * name(ggml_backend_buffer_type_t) { return "guard-probe"; }
     static size_t alignment(ggml_backend_buffer_type_t) { return 16; }
-    static size_t maximum(ggml_backend_buffer_type_t) { return SIZE_MAX; }
+    static size_t maximum(ggml_backend_buffer_type_t type) { return get(type).chunk_bytes; }
     static bool is_host(ggml_backend_buffer_type_t) { return true; }
     static void free_buffer(ggml_backend_buffer_t buffer) {
         ggml_backend_buffer_free(static_cast<ggml_backend_buffer_t>(buffer->context));
@@ -65,6 +79,9 @@ struct fixture {
     fixture() {
         reg.iface.get_proc_address = proc;
         dev.reg = &reg;
+        dev.context = this;
+        dev.iface.get_buffer_type = buffer_type;
+        backend.device = &dev;
         buft.device = &dev;
         buft.context = this;
         buft.iface.get_name = name;
@@ -109,6 +126,66 @@ void check_identity_without_procedure() {
         "CPU buffer size changed");
 }
 
+void check_capacity_extension() {
+    fixture f;
+    f.chunk_bytes = CHUNK_BYTES;
+    f.capacity_bytes = CAPACITY_BYTES;
+    check(ggml_backend_buft_get_max_capacity(&f.buft) == CAPACITY_BYTES, "logical capacity query");
+    check(ggml_backend_get_max_buffer_capacity(&f.backend) == CAPACITY_BYTES, "backend capacity query");
+    check(ggml_backend_buft_get_max_size(&f.buft) == CHUNK_BYTES, "capacity query changed chunk limit");
+    check(ggml_backend_get_max_size(&f.backend) == CHUNK_BYTES, "backend chunk limit changed");
+    check(ggml_backend_is_buffer_size_supported(&f.backend, CHUNK_BYTES + 1), "capacity capped by chunk size");
+    check(ggml_backend_buft_is_size_supported(&f.buft, CAPACITY_BYTES), "capacity boundary rejected");
+    check(ggml_backend_is_buffer_size_supported(&f.backend, CAPACITY_BYTES), "backend capacity boundary rejected");
+    check(!ggml_backend_buft_is_size_supported(&f.buft, CAPACITY_BYTES + 1), "capacity overflow accepted");
+    check(!ggml_backend_is_buffer_size_supported(&f.backend, SIZE_MAX), "oversize request accepted");
+    check(f.physical_sizes.empty(), "capacity preflight allocated a buffer");
+
+    fixture other;
+    other.capacity_bytes = CHUNK_BYTES;
+    other.buft.device = &f.dev;
+    check(ggml_backend_buft_get_max_capacity(&other.buft) == CHUNK_BYTES, "extension received wrong buffer type");
+}
+
+void check_capacity_boundaries() {
+    fixture f;
+    f.chunk_bytes = CHUNK_BYTES;
+    f.capacity_bytes = 0;
+    check(ggml_backend_buft_is_size_supported(&f.buft, 0), "zero capacity rejected empty buffer");
+    check(ggml_backend_is_buffer_size_supported(&f.backend, 0), "backend rejected empty buffer");
+    check(!ggml_backend_buft_is_size_supported(&f.buft, 1), "zero capacity ignored");
+    check(!ggml_backend_is_buffer_size_supported(&f.backend, 1), "backend ignored zero capacity");
+    f.capacity_bytes = SIZE_MAX;
+    check(ggml_backend_buft_is_size_supported(&f.buft, SIZE_MAX), "unspecified capacity rejected");
+    check(ggml_backend_is_buffer_size_supported(&f.backend, SIZE_MAX), "backend unspecified capacity rejected");
+    check(f.physical_sizes.empty(), "boundary preflight allocated a buffer");
+}
+
+void * missing_capacity_proc(ggml_backend_reg_t, const char *) {
+    return nullptr;
+}
+
+void check_capacity_fallback() {
+    fixture f;
+    f.chunk_bytes = CHUNK_BYTES;
+    f.reg.iface.get_proc_address = missing_capacity_proc;
+    check(ggml_backend_buft_get_max_capacity(&f.buft) == CHUNK_BYTES, "missing extension fallback");
+    check(ggml_backend_is_buffer_size_supported(&f.backend, CHUNK_BYTES), "fallback boundary rejected");
+    check(!ggml_backend_is_buffer_size_supported(&f.backend, CHUNK_BYTES + 1), "fallback overflow accepted");
+    f.reg.iface.get_proc_address = nullptr;
+    check(ggml_backend_get_max_buffer_capacity(&f.backend) == CHUNK_BYTES, "missing procedure lookup fallback");
+    f.dev.reg = nullptr;
+    check(ggml_backend_buft_get_max_capacity(&f.buft) == CHUNK_BYTES, "missing registry fallback");
+    f.buft.device = nullptr;
+    check(ggml_backend_buft_get_max_capacity(&f.buft) == CHUNK_BYTES, "device-less buffer fallback");
+    f.buft.iface.get_max_size = nullptr;
+    check(ggml_backend_buft_get_max_capacity(&f.buft) == SIZE_MAX, "unspecified chunk limit fallback");
+    check(ggml_backend_buft_is_size_supported(&f.buft, SIZE_MAX), "unspecified fallback preflight");
+    check(f.physical_sizes.empty(), "fallback preflight allocated a buffer");
+    auto * cpu = ggml_backend_cpu_buffer_type();
+    check(ggml_backend_buft_get_max_capacity(cpu) == ggml_backend_buft_get_max_size(cpu), "CPU limit changed");
+}
+
 } // namespace
 
 int main() try {
@@ -116,6 +193,9 @@ int main() try {
     check_query_matches_allocator();
     check_zero_and_overflow();
     check_identity_without_procedure();
+    check_capacity_extension();
+    check_capacity_boundaries();
+    check_capacity_fallback();
     std::puts("test-backend-buffer-size: all checks passed");
     return 0;
 } catch (const std::exception & error) {

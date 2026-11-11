@@ -194,6 +194,19 @@ size_t ggml_backend_buft_get_max_size(ggml_backend_buffer_type_t buft) {
     return SIZE_MAX;
 }
 
+size_t ggml_backend_buft_get_max_capacity(ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(buft);
+    ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    auto get_capacity = reg ? reinterpret_cast<ggml_backend_get_buffer_capacity_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_buffer_capacity")) : nullptr;
+    return get_capacity ? get_capacity(buft) : ggml_backend_buft_get_max_size(buft);
+}
+
+bool ggml_backend_buft_is_size_supported(ggml_backend_buffer_type_t buft, size_t size) {
+    return size <= ggml_backend_buft_get_max_capacity(buft);
+}
+
 size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     GGML_ASSERT(buft);
     // get_alloc_size is optional, defaults to ggml_nbytes
@@ -476,6 +489,14 @@ static bool ggml_backend_tensor_batch_is_2d(
     *stride_data   = stride_data0;
 
     return true;
+}
+
+size_t ggml_backend_get_max_buffer_capacity(ggml_backend_t backend) {
+    return ggml_backend_buft_get_max_capacity(ggml_backend_get_default_buffer_type(backend));
+}
+
+bool ggml_backend_is_buffer_size_supported(ggml_backend_t backend, size_t size) {
+    return ggml_backend_buft_is_size_supported(ggml_backend_get_default_buffer_type(backend), size);
 }
 
 static void ggml_backend_tensor_check_bounds(
