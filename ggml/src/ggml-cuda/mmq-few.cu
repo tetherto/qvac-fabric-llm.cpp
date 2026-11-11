@@ -1121,16 +1121,14 @@ static void launch_mul_mat_q_few_wmma_switch_ncols(const ggml_tensor * src0, con
     }
 }
 
-// Min. and max. number of src1 columns for RDNA3, 0 if the type is not supported. Tuned on the Radeon 8060S (gfx1151),
-// the Q4_K and Q5_K min. in a full decode graph. Below the min. MMVQ is faster. With Q8_0 and Q5_K MMQ is faster up to
-// 16 columns, with Q6_K 2 column groups spill registers.
+// Min. and max. number of src1 columns for RDNA3, 0 if the type is not used. Tuned on the Radeon 8060S (gfx1151) in full
+// decode graphs: MMVQ is faster below the min., MMQ above the max. With 2 column groups all types spill registers.
 static int2 mmq_few_wmma_ncols_range(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_K:   return make_int2( 4, 16);
         case GGML_TYPE_Q5_K:   return make_int2( 4,  8);
         case GGML_TYPE_Q6_K:   return make_int2( 6, 16);
-        case GGML_TYPE_Q8_0:   return make_int2(17, 24);
-        case GGML_TYPE_IQ4_NL: return make_int2( 7, 24);
+        case GGML_TYPE_IQ4_NL: return make_int2( 7,  8);
         default:               return make_int2( 0,  0);
     }
 }
