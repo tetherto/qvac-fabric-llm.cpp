@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-vulkan/ggml-vulkan-capacity.h"
 
 #include <cstdio>
 #include <cstring>
@@ -186,6 +187,49 @@ void check_capacity_fallback() {
     check(ggml_backend_buft_get_max_capacity(cpu) == ggml_backend_buft_get_max_size(cpu), "CPU limit changed");
 }
 
+void check_vulkan_capacity_limits() {
+    constexpr uint64_t GIB = uint64_t{1} << 30;
+    const size_t expected = static_cast<size_t>(std::min(uint64_t{3} * GIB, uint64_t{SIZE_MAX}));
+    check(ggml_vk_buffer_capacity(4 * GIB, 3 * GIB, GIB, false, false) == expected,
+          "Vulkan allocation limit confused with descriptor range");
+    check(ggml_vk_buffer_capacity(3 * GIB, 4 * GIB, GIB, true, true) == expected,
+          "Vulkan buffer limit ignored");
+    check(ggml_vk_buffer_capacity(4 * GIB, 3 * GIB, GIB, true, false) == expected,
+          "Vulkan indexing feature changed allocation capacity");
+    check(ggml_vk_buffer_capacity(4 * GIB, 3 * GIB, GIB, false, true) == expected,
+          "Vulkan device address feature changed allocation capacity");
+    check(ggml_vk_buffer_capacity(0, 4 * GIB, GIB, true, true) == 0, "Vulkan zero buffer limit");
+    check(ggml_vk_buffer_capacity(4 * GIB, 0, GIB, true, true) == 0, "Vulkan zero allocation limit");
+    check(ggml_vk_buffer_capacity(UINT64_MAX, UINT64_MAX, GIB, false, false) == SIZE_MAX,
+          "Vulkan capacity exceeds size_t");
+}
+
+void check_vulkan_device_capacity(ggml_backend_dev_t device) {
+    auto * buft = ggml_backend_dev_buffer_type(device);
+    const size_t capacity = ggml_backend_buft_get_max_capacity(buft);
+    check(ggml_backend_buft_is_size_supported(buft, capacity), "Vulkan capacity boundary rejected");
+    if (capacity < SIZE_MAX) {
+        check(!ggml_backend_buft_is_size_supported(buft, capacity + 1), "Vulkan capacity overflow accepted");
+        check(ggml_backend_buft_alloc_buffer(buft, capacity + 1) == nullptr, "Vulkan oversized allocation accepted");
+    }
+    auto * host = ggml_backend_dev_host_buffer_type(device);
+    if (host != nullptr) {
+        check(ggml_backend_buft_get_max_capacity(host) == SIZE_MAX, "Vulkan host fallback has a finite capacity");
+    }
+}
+
+void check_vulkan_capacity_provider() {
+    auto * reg = ggml_backend_reg_by_name("Vulkan");
+    if (reg == nullptr) {
+        return;
+    }
+    check(ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_buffer_capacity") != nullptr,
+          "Vulkan capacity provider missing");
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+        check_vulkan_device_capacity(ggml_backend_reg_dev_get(reg, i));
+    }
+}
+
 } // namespace
 
 int main() try {
@@ -196,6 +240,8 @@ int main() try {
     check_capacity_extension();
     check_capacity_boundaries();
     check_capacity_fallback();
+    check_vulkan_capacity_limits();
+    check_vulkan_capacity_provider();
     std::puts("test-backend-buffer-size: all checks passed");
     return 0;
 } catch (const std::exception & error) {
