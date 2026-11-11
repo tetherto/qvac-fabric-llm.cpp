@@ -65,11 +65,12 @@ def test_dflash_target_mrope_sections(tmp_path, monkeypatch, target_config, uses
 
 
 DSPINE_LAYERS = 5
+DSPINE_BRIDGE_EPS = 1e-06
 
 # the DSpine keys of the released tencent/Qwen3-8B-DSpine-b16 config
 DSPINE_CONFIG = {
     "draft_block_causal": True,
-    "selected_prefix_code_bridge": {"code_size": 1024, "eps": 1e-06, "kappa": 10.0, "rank": 512},
+    "selected_prefix_code_bridge": {"code_size": 1024, "eps": DSPINE_BRIDGE_EPS, "kappa": 10.0, "rank": 512},
     "selected_prefix_decode_mode": "serial",
     "selected_prefix_feature_layers": [1, 2, 3, 4, 5],
     "selected_prefix_feature_write_mode": "independent",
@@ -133,7 +134,7 @@ def test_dspine_writes_bridge_metadata(monkeypatch, extra_hparams):
 
     calls = model.gguf_writer.calls
     assert calls["add_dspine_head_topk"] == [(16,)]
-    assert calls["add_dspine_eps"] == [(DSPINE_CONFIG["selected_prefix_code_bridge"]["eps"],)]
+    assert calls["add_dspine_eps"] == [(DSPINE_BRIDGE_EPS,)]
     assert calls["add_causal_attention"] == [(True,)]
 
 
