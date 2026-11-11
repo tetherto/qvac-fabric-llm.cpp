@@ -1,4 +1,5 @@
 #include "ggml-vulkan-common.h"
+#include "ggml-vulkan-capacity.h"
 
 #ifdef __APPLE__
 #include <pthread.h>
@@ -17214,9 +17215,28 @@ const char * ggml_backend_vk_buffer_type_name(ggml_backend_buffer_type_t buft) {
     return ctx->name.c_str();
 }
 
+static size_t ggml_backend_vk_buffer_type_get_max_capacity(ggml_backend_buffer_type_t buft) {
+    if (buft->context == nullptr) {
+        return SIZE_MAX;
+    }
+
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+    return ggml_vk_buffer_capacity(
+        ctx->device->max_buffer_size,
+        ctx->device->max_memory_allocation_size,
+        (uint64_t) ctx->device->properties.limits.maxStorageBufferRange,
+        ctx->device->shader_64b_indexing,
+        ctx->device->buffer_device_address);
+}
+
 ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_type_alloc_buffer(" << size << ")");
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+
+    if (size > ggml_backend_vk_buffer_type_get_max_capacity(buft)) {
+        VK_LOG_DEBUG("ggml_backend_vk_buffer_type_alloc_buffer: requested size exceeds logical buffer capacity\n");
+        return nullptr;
+    }
 
     vk_buffer dev_buffer = nullptr;
     try {
@@ -21437,6 +21457,9 @@ static uint64_t ggml_backend_vk_fwht_fusion_count(ggml_backend_t backend) {
 
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_get_buffer_capacity") == 0) {
+        return (void *) ggml_backend_vk_buffer_type_get_max_capacity;
+    }
     if (strcmp(name, "ggml_backend_supports_efficient_fa") == 0) {
         return (void *)ggml_backend_vk_supports_efficient_fa;
     }
