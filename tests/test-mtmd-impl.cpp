@@ -3,8 +3,13 @@
 #include "mtmd-audio.h"
 #include "mtmd-image.h"
 #include "mtmd-internal.h"
+#include "ggml-cpp.h"
+#include "gguf.h"
 
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -44,6 +49,27 @@ struct test_registry {
 //
 // mtmd_image
 //
+
+MAKE_TEST(test_image_preprocessor_longest_edge) {
+    clip_hparams hparams;
+    hparams.image_longest_edge = 1540;
+    hparams.patch_size = 14;
+    hparams.n_merge = 2;
+
+    const std::vector<std::pair<clip_image_size, clip_image_size>> cases = {
+        { {  463,  463 }, {  476,  476 } },
+        { {  463,  300 }, {  476,  308 } },
+        { {  448,  280 }, {  448,  280 } },
+        { { 2000, 1000 }, { 1540,  784 } },
+    };
+
+    for (const auto & [input, expected] : cases) {
+        const clip_image_size actual = mtmd_image_preprocessor_longest_edge::get_target_size(hparams, input);
+        const std::string name = std::to_string(input.width) + "x" + std::to_string(input.height);
+        t.assert_equal(name + " width", expected.width, actual.width);
+        t.assert_equal(name + " height", expected.height, actual.height);
+    }
+}
 
 MAKE_TEST(test_image_preprocessor_lfm2) {
     clip_hparams hparams;
@@ -184,6 +210,80 @@ MAKE_TEST(test_audio_preprocessor_conformer) {
     for (const auto & [bin, frame, expected] : cases) {
         const float actual = mel.data[bin * mel.n_len + frame];
         t.assert_true("mel[" + std::to_string(bin) + "][" + std::to_string(frame) + "] = " + std::to_string(actual) + ", expected " + std::to_string(expected), std::fabs(actual - expected) < 1e-3f);
+    }
+}
+
+MAKE_TEST(test_sam_relpos_quantization) {
+    struct temp_files {
+        std::string input;
+        std::string output;
+        ~temp_files() {
+            std::remove(input.c_str());
+            std::remove(output.c_str());
+        }
+    };
+    const std::string prefix = "test-mtmd-sam-relpos-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    temp_files files{prefix + "-input.gguf", prefix + "-output.gguf"};
+    ggml_context_ptr ctx(ggml_init({4*1024*1024, nullptr, false}));
+    gguf_context_ptr source(gguf_init_empty());
+    gguf_set_val_str(source.get(), "general.architecture", "clip");
+    gguf_set_val_u32(source.get(), "general.file_type", LLAMA_FTYPE_ALL_F32);
+
+    const char * names[] = {
+        "v.sam.blk.0.attn.pos_h.weight", "v.sam.blk.0.attn.pos_w.weight",
+        "v.sam.blk.2.attn.pos_h.weight", "v.sam.blk.2.attn.pos_w.weight",
+        "v.blk.0.attn_q.weight",
+    };
+    std::vector<ggml_tensor *> tensors;
+    for (int i = 0; i < 5; ++i) {
+        ggml_tensor * tensor = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, i == 4 ? 256 : 64, i == 4 ? 256 : (i < 2 ? 27 : 127));
+        ggml_set_name(tensor, names[i]);
+        auto * data = static_cast<float *>(tensor->data);
+        for (int64_t j = 0; j < ggml_nelements(tensor); ++j) {
+            data[j] = std::sin(0.13f*j) + 0.1f*std::cos(0.07f*j);
+        }
+        gguf_add_tensor(source.get(), tensor);
+        tensors.push_back(tensor);
+    }
+    if (!t.assert_true("write SAM fixture", gguf_write_to_file(source.get(), files.input.c_str(), false))) {
+        return;
+    }
+    const llama_ftype types[] = {
+        LLAMA_FTYPE_MOSTLY_F16, LLAMA_FTYPE_MOSTLY_BF16, LLAMA_FTYPE_MOSTLY_Q8_0,
+        LLAMA_FTYPE_MOSTLY_Q3_K_S, LLAMA_FTYPE_MOSTLY_Q3_K_M,
+        LLAMA_FTYPE_MOSTLY_Q4_0, LLAMA_FTYPE_MOSTLY_Q4_K_M,
+    };
+    for (llama_ftype type : types) {
+        llama_model_quantize_params params = llama_model_quantize_default_params();
+        params.ftype = type;
+        params.nthread = 1;
+        if (!t.assert_equal("quantize SAM fixture", 0u, llama_model_quantize(files.input.c_str(), files.output.c_str(), &params))) {
+            continue;
+        }
+        ggml_context * output_ctx = nullptr;
+        gguf_context_ptr output(gguf_init_from_file(files.output.c_str(), {false, &output_ctx}));
+        ggml_context_ptr data_ctx(output_ctx);
+        if (!t.assert_true("read quantized SAM fixture", output != nullptr && data_ctx != nullptr)) {
+            continue;
+        }
+        ggml_tensor * matrix = ggml_get_tensor(data_ctx.get(), names[4]);
+        if (t.assert_true("ordinary matrix exists", matrix != nullptr)) {
+            t.assert_true("ordinary matrix changes type", matrix->type != GGML_TYPE_F32);
+        }
+        for (int i = 0; i < 4; ++i) {
+            ggml_tensor * tensor = ggml_get_tensor(data_ctx.get(), names[i]);
+            if (!t.assert_true("SAM relative position exists", tensor != nullptr) ||
+                !t.assert_equal("SAM relative position remains F32", GGML_TYPE_F32, tensor->type)) {
+                continue;
+            }
+            t.assert_true("SAM relative position values unchanged", ggml_nbytes(tensor) == ggml_nbytes(tensors[i]) &&
+                std::memcmp(tensor->data, tensors[i]->data, ggml_nbytes(tensor)) == 0);
+            // DeepSeek OCR resizes these tables before gathering attention positions.
+            ggml_tensor * cur = ggml_cont(ctx.get(), ggml_permute(ctx.get(), tensor, 1, 0, 2, 3));
+            cur = ggml_reshape_3d(ctx.get(), cur, tensor->ne[1], 1, tensor->ne[0]);
+            cur = ggml_interpolate(ctx.get(), cur, tensor->ne[1] + 3, 1, tensor->ne[0], 1, GGML_SCALE_MODE_BILINEAR);
+            t.assert_equal("SAM interpolation graph type", GGML_TYPE_F32, cur->type);
+        }
     }
 }
 

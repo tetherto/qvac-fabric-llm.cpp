@@ -171,6 +171,16 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
     GGML_UNUSED(backend);
 }
 
+static size_t ggml_backend_cpu_get_work_size(ggml_backend_t backend) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    return cpu_ctx->work_size;
+}
+
+static size_t ggml_backend_cpu_graph_get_work_size(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    return ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool).work_size;
+}
+
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
@@ -497,11 +507,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
             }
-            return
-                src1->type == GGML_TYPE_F32 ||
-                src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
-                (src0->type == GGML_TYPE_TQ2_0 &&
-                    (src1->type == GGML_TYPE_Q8_1 || src1->type == GGML_TYPE_Q8_0));
+            // BF16 in src1 is widened into the F32 work buffer
+            return src1->type == GGML_TYPE_F32 ||
+                   src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
+                   (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32) ||
+                   (src0->type == GGML_TYPE_TQ2_0 &&
+                       (src1->type == GGML_TYPE_Q8_1 || src1->type == GGML_TYPE_Q8_0));
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;
@@ -708,6 +719,15 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_get_work_size") == 0) {
+        return (void *)ggml_backend_cpu_get_work_size;
+    }
+    if (strcmp(name, "ggml_backend_graph_get_work_size") == 0) {
+        return (void *)ggml_backend_cpu_graph_get_work_size;
+    }
+    if (strcmp(name, "ggml_graph_plan") == 0) {
+        return (void *)ggml_graph_plan;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

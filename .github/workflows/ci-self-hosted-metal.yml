@@ -34,6 +34,7 @@ on:
       'ggml/src/ggml-metal/**'
     ]
 
+cache-mode: none
 permissions:
   contents: read
 

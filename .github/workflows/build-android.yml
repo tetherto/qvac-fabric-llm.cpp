@@ -20,6 +20,7 @@ on:
       - '.github/workflows/build-android.yml'
       - 'examples/llama.android/**'
 
+cache-mode: none
 permissions:
   contents: read
 
@@ -73,6 +74,10 @@ jobs:
     defaults:
       run:
         shell: bash
+
+    permissions:
+      actions: write
+      contents: read
 
     steps:
       - name: Clone

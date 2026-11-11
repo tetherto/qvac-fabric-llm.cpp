@@ -3,6 +3,10 @@ name: UI
 on:
   workflow_dispatch:
     inputs:
+      sha:
+        description: 'Commit SHA1 to build'
+        required: false
+        type: string
   push:
     branches:
       - master
@@ -21,7 +25,9 @@ on:
       'tools/server/tests/**.*'
     ]
 
+cache-mode: none
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -42,13 +48,16 @@ env:
 # commits from the same non-master ref share a group and cancel each other.
 # See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.sha || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 jobs:
   ui-build:
     name: Build static output
     uses: ./.github/workflows/ui-build.yml
+    permissions:
+      actions: write
+      contents: read
 
   ui-checks:
     name: Checks
@@ -60,7 +69,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
 
       - name: Setup Node.js
         id: node
@@ -118,7 +127,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
 
       - name: Setup Node.js
         id: node

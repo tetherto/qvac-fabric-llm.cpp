@@ -134,8 +134,6 @@ void main() {
         const float qd_inv = qd != 0.0f ? 1.0f / qd : 0.0f;
         vals = round(vals * qd_inv);
 
-        Qf[buf_ib].qs[buf_iqs] = pack32(i8vec4(vals));
-
 #ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
     #define IS_FA_TYPE_Q8_0 (FaTypeK == GGML_TYPE_Q8_0)
 #elif defined(DATA_A_Q8_0) || defined(DATA_A_IQ4_NL)
@@ -144,18 +142,15 @@ void main() {
     #define IS_FA_TYPE_Q8_0 false
 #endif
 
-        // Q8_0 K only needs (qd, _); the asymmetric Q4_*/Q5_* family also stores
-        // the row-sum scaled by qd, used in k_dot_correction.
-        if (IS_FA_TYPE_Q8_0) {
-            if (buf_iqs == 0) {
-                Qf[buf_ib].ds = FLOAT_TYPEV2(qd, 0.0f);
-            }
-        } else {
-            const float thread_sum = vals.x + vals.y + vals.z + vals.w;
-            const float sum = subgroupClusteredAdd(thread_sum, 8);
+        const float thread_sum = vals.x + vals.y + vals.z + vals.w;
+        // Q8_0 K does not use the row sum.
+        const float sum = IS_FA_TYPE_Q8_0 ? 0.0f : subgroupClusteredAdd(thread_sum, 8);
+
+        if (r < Br) {
+            Qf[buf_ib].qs[buf_iqs] = pack32(i8vec4(vals));
 
             if (buf_iqs == 0) {
-                Qf[buf_ib].ds = FLOAT_TYPEV2(qd, sum * qd);
+                Qf[buf_ib].ds = IS_FA_TYPE_Q8_0 ? FLOAT_TYPEV2(qd, 0.0f) : FLOAT_TYPEV2(qd, sum * qd);
             }
         }
 #endif
@@ -297,8 +292,9 @@ void main() {
                 const uint32_t block = ib % (HSK / 32);
                 if (idx + gl_WorkGroupSize.x <= quant_iters || c < Bc) {
                     const uint buf_ib = c * qf_stride + block;
-                    if (!KV_bounds_check || j * Bc + c < KV) {
-                        const uint global_ib = (j * Bc + c) * k_stride + block;
+                    uint32_t kcol;
+                    if (fa_kv_index(j * Bc + c, kcol)) {
+                        const uint global_ib = kcol * k_stride + block;
                         k_block_to_shmem(buf_ib, global_ib, iqs, k_offset);
                     } else {
                         k_block_to_shmem_zero(buf_ib, iqs);
@@ -415,7 +411,8 @@ void main() {
                                 (hsk4 % 2 == 0) ? 2 : 1;
 
         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
-            if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
+            uint32_t kcol;
+            if (!fa_kv_index(j * Bc + c * cols_per_iter + col_tid, kcol)) {
                 continue;
             }
 
@@ -453,9 +450,9 @@ void main() {
                         }
                     }
                 } else {
-                    const uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d_tid * (HSK_per_thread / 4) + d_block);
-                    const uint ib = coord / BLOCK_SIZE;
-                    const uint iqs = (coord % BLOCK_SIZE);
+                    const uint coord = kcol * k_stride * BLOCK_SIZE_K + 4 * (d_tid * (HSK_per_thread / 4) + d_block);
+                    const uint ib = coord / BLOCK_SIZE_K;
+                    const uint iqs = (coord % BLOCK_SIZE_K);
 
 #if QUANT_AUXF == 1
                     k_dm = ACC_TYPEV2(get_k_d(ib, k_offset), 0.0);

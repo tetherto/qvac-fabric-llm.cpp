@@ -10,6 +10,9 @@
 #include <string>
 #include <map>
 
+// staging buffer size for direct I/O reads, 64MB works well for NVMe drives
+#define LLAMA_DIRECT_IO_BUFFER_SIZE (64 * 1024 * 1024)
+
 struct llama_file;
 struct llama_mmap;
 struct llama_mlock;

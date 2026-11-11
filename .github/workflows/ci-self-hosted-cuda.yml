@@ -33,6 +33,7 @@ on:
       'ggml/src/ggml-cuda/**'
     ]
 
+cache-mode: none
 permissions:
   contents: read
 
@@ -61,7 +62,7 @@ jobs:
   gpu-cuda:
     needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
-    # runs-on: "hf-jobs-t4-small:cuda13"
+    # runs-on: "hf-jobs-t4-medium:cuda13"
     runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:

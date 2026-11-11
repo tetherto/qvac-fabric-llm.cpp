@@ -40,6 +40,7 @@ on:
       '**/*.inc'
     ]
 
+cache-mode: none
 permissions:
   contents: read
 
@@ -87,6 +88,7 @@ jobs:
         uses: ggml-org/ccache-action@v1.2.24
         with:
           key: cpu-${{ matrix.os }}-${{ steps.cpu_info.outputs.cpu_hash }}
+          restore: false
           save: false
 
       - name: Build Dependencies
@@ -159,7 +161,7 @@ jobs:
             -DGGML_VECTOR_INDEX=ON \
             -DBUILD_SHARED_LIBS=OFF
           cmake --build build-vector-index-static --target test-vector-index test-vector-index-hooks test-vector-index-faults -j $(nproc)
-          ctest --test-dir build-vector-index-static -R '^test-vector-index(-hooks|-faults)?$' --output-on-failure
+          ctest --test-dir build-vector-index-static -R '^test-vector-index(-hooks|-hooks-full|-faults)?$' --output-on-failure
 
       - name: Vector-index package smoke
         if: ${{ matrix.build == 'x64' || matrix.build == 'arm64' }}
@@ -256,11 +258,13 @@ jobs:
           ./bin/llama-completion -m stories260K.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
 
   windows:
-    permissions:
-      contents: read
-      actions: write
     name: windows / ${{ matrix.build }}
     runs-on: windows-2025
+
+    cache-mode: write
+    permissions:
+      actions: write
+      contents: read
 
     env:
       OPENBLAS_VERSION: 0.3.23

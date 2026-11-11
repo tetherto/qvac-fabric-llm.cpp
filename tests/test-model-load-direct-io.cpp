@@ -221,7 +221,7 @@ static void test_load(fixture & f, int threads, bool validate, bool async = fals
               "tensor allocation failed");
         offset += ggml_nbytes(tensor);
     }
-    llama_buf_map buffers = {{0, buffer.get()}};
+    std::vector<ggml_backend_buffer_t> buffers = {buffer.get()};
     check(loader.load_all_data(loader.size_data, ctx.get(), buffers, nullptr, nullptr, nullptr), "load failed");
     if (track_staging) {
         fprintf(stderr, "staging: %zu workers retained %zu bytes\n", usage.capacities.size(), usage.retained_bytes());

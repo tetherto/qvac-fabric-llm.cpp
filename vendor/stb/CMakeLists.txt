@@ -6,3 +6,7 @@ add_library(vendor::stb ALIAS stb)
 target_include_directories(stb INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>
     $<INSTALL_INTERFACE:${LLAMA_INCLUDE_INSTALL_DIR}>)
+
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(stb INTERFACE -Wno-maybe-uninitialized)
+endif()

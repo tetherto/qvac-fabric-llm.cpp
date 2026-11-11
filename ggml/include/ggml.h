@@ -913,6 +913,7 @@ extern "C" {
 
     // use this to compute the memory overhead of a tensor
     GGML_API size_t ggml_tensor_overhead(void);
+    GGML_API size_t ggml_context_overhead(void);
 
     GGML_API bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbytes);
 
@@ -965,9 +966,8 @@ extern "C" {
 
     GGML_API void * ggml_new_buffer(struct ggml_context * ctx, size_t nbytes);
 
-    GGML_API struct ggml_tensor * ggml_dup_tensor       (struct ggml_context * ctx, const struct ggml_tensor * src);
-    GGML_API struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, const struct ggml_tensor * src);
-    GGML_API struct ggml_tensor * ggml_view_tensor      (struct ggml_context * ctx, struct ggml_tensor * src);
+    GGML_API struct ggml_tensor * ggml_dup_tensor (struct ggml_context * ctx, const struct ggml_tensor * src);
+    GGML_API struct ggml_tensor * ggml_view_tensor(struct ggml_context * ctx, struct ggml_tensor * src);
 
     // Context tensor enumeration and lookup
     GGML_API struct ggml_tensor * ggml_get_first_tensor(const struct ggml_context * ctx);
@@ -1644,6 +1644,11 @@ extern "C" {
             enum ggml_op_hint    hint);
 
     // indirect matrix multiplication
+    //
+    // [TAG_MUL_MAT_ID_DUPLICATE_ID]
+    // note: this op has undefined behaviour if a given `a` is referenced more than once for a given `b`
+    //       (i.e. duplicate experts per token are not guaranteed to be supported in all backends)
+    // TODO: add backend support: https://github.com/ggml-org/llama.cpp/pull/29998#issuecomment-6153742533
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
@@ -2895,6 +2900,24 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // same as ggml_flash_attn_ext, but each q slice attends to its own list of K/V rows
+    // q:       [n_embd_k, n_batch, n_head,    ne3]
+    // k:       [n_embd_k, n_rows,  n_head_kv, 1  ] shared by all q slices
+    // v:       [n_embd_v, n_rows,  n_head_kv, 1  ]
+    // mask:    [n_kv,     n_batch, ne32,      ne3]
+    // kv_rows: [n_kv,     ne3] I32, mask column i of slice i3 uses row kv_rows[i, i3] of k and v
+    // negative rows are padding, their mask entries must be -inf
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * kv_rows,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec),
@@ -3077,6 +3100,7 @@ extern "C" {
     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

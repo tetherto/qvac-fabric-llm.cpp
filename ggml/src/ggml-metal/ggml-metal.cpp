@@ -235,6 +235,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_flash_attn_ext_extra_tmp(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_kv_f16(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_idx(tensor);
+                res += ggml_metal_op_flash_attn_ext_extra_rows(tensor);
             } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
@@ -310,12 +311,14 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_shared(int devi
 
             ggml_backend_buffer_type buft = {
                 /* .iface = */ {
-                    /* .get_name         = */ ggml_backend_metal_buffer_type_shared_get_name,
-                    /* .alloc_buffer     = */ ggml_backend_metal_buffer_type_shared_alloc_buffer,
-                    /* .get_alignment    = */ ggml_backend_metal_buffer_type_shared_get_alignment,
-                    /* .get_max_size     = */ ggml_backend_metal_buffer_type_shared_get_max_size,
-                    /* .get_alloc_size   = */ ggml_backend_metal_buffer_type_shared_get_alloc_size,
-                    /* .is_host          = */ ggml_backend_metal_buffer_type_shared_is_host,
+                    /* .get_name            = */ ggml_backend_metal_buffer_type_shared_get_name,
+                    /* .alloc_buffer        = */ ggml_backend_metal_buffer_type_shared_alloc_buffer,
+                    /* .alloc_buffer_n      = */ NULL,
+                    /* .get_alignment       = */ ggml_backend_metal_buffer_type_shared_get_alignment,
+                    /* .get_max_size        = */ ggml_backend_metal_buffer_type_shared_get_max_size,
+                    /* .get_alloc_size      = */ ggml_backend_metal_buffer_type_shared_get_alloc_size,
+                    /* .get_alloc_size_n    = */ NULL,
+                    /* .is_host             = */ ggml_backend_metal_buffer_type_shared_is_host,
                 },
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),
                 /* .context = */ raw_ctx,
@@ -385,12 +388,14 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_private(int dev
 
             ggml_backend_buffer_type buft = {
                 /* .iface = */ {
-                    /* .get_name         = */ ggml_backend_metal_buffer_type_private_get_name,
-                    /* .alloc_buffer     = */ ggml_backend_metal_buffer_type_private_alloc_buffer,
-                    /* .get_alignment    = */ ggml_backend_metal_buffer_type_private_get_alignment,
-                    /* .get_max_size     = */ ggml_backend_metal_buffer_type_private_get_max_size,
-                    /* .get_alloc_size   = */ ggml_backend_metal_buffer_type_private_get_alloc_size,
-                    /* .is_host          = */ ggml_backend_metal_buffer_type_private_is_host,
+                    /* .get_name            = */ ggml_backend_metal_buffer_type_private_get_name,
+                    /* .alloc_buffer        = */ ggml_backend_metal_buffer_type_private_alloc_buffer,
+                    /* .alloc_buffer_n      = */ NULL,
+                    /* .get_alignment       = */ ggml_backend_metal_buffer_type_private_get_alignment,
+                    /* .get_max_size        = */ ggml_backend_metal_buffer_type_private_get_max_size,
+                    /* .get_alloc_size      = */ ggml_backend_metal_buffer_type_private_get_alloc_size,
+                    /* .get_alloc_size_n    = */ NULL,
+                    /* .is_host             = */ ggml_backend_metal_buffer_type_private_is_host,
                 },
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),
                 /* .context = */ raw_ctx,
@@ -463,12 +468,14 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_mapped(int devi
             //       https://github.com/ggml-org/llama.cpp/pull/15832#discussion_r2333177099
             ggml_backend_buffer_type buft = {
                 /* .iface = */ {
-                    /* .get_name         = */ ggml_backend_metal_buffer_type_mapped_get_name,
-                    /* .alloc_buffer     = */ ggml_backend_metal_buffer_type_mapped_alloc_buffer,
-                    /* .get_alignment    = */ ggml_backend_metal_buffer_type_mapped_get_alignment,
-                    /* .get_max_size     = */ ggml_backend_metal_buffer_type_mapped_get_max_size,
-                    /* .get_alloc_size   = */ ggml_backend_metal_buffer_type_mapped_get_alloc_size,
-                    /* .is_host          = */ ggml_backend_metal_buffer_type_mapped_is_host,
+                    /* .get_name            = */ ggml_backend_metal_buffer_type_mapped_get_name,
+                    /* .alloc_buffer        = */ ggml_backend_metal_buffer_type_mapped_alloc_buffer,
+                    /* .alloc_buffer_n      = */ NULL,
+                    /* .get_alignment       = */ ggml_backend_metal_buffer_type_mapped_get_alignment,
+                    /* .get_max_size        = */ ggml_backend_metal_buffer_type_mapped_get_max_size,
+                    /* .get_alloc_size      = */ ggml_backend_metal_buffer_type_mapped_get_alloc_size,
+                    /* .get_alloc_size_n    = */ NULL,
+                    /* .is_host             = */ ggml_backend_metal_buffer_type_mapped_is_host,
                 },
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),
                 /* .context = */ raw_ctx,
@@ -541,10 +548,99 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
     return ggml_metal_cpy_tensor_async(ctx_src, ctx_dst, src, dst);
 }
 
-static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+#ifdef GGML_METAL_CUSTOM_OPS
+bool ggml_backend_metal_tensor_is_shared(const ggml_tensor * tensor) {
+    auto * buffer = tensor->buffer;
+    return buffer && ggml_backend_buffer_is_metal(buffer) && ggml_metal_buffer_is_shared((ggml_metal_buffer_t) buffer->context);
+}
+
+void ggml_backend_metal_shared_event(ggml_backend_t backend, void * event, uint64_t value, bool wait) {
+    ggml_metal_shared_event((ggml_metal_t) backend->context, event, value, wait);
+}
+
+struct metal_custom_op {
+    ggml_custom_op_t tag;
+    ggml_metal_custom_execute execute;
+};
+static std::mutex custom_mutex;
+static std::vector<metal_custom_op> custom_ops;
+
+void ggml_backend_metal_set_custom_serial(ggml_custom_op_t tag, ggml_metal_custom_execute execute) {
+    std::lock_guard<std::mutex> lock(custom_mutex);
+    if (!tag) {
+        custom_ops.clear();
+        return;
+    }
+    for (auto it = custom_ops.begin(); it != custom_ops.end(); ++it) {
+        if (it->tag != tag) { continue; }
+        if (execute) { it->execute = execute; } else { custom_ops.erase(it); }
+        return;
+    }
+    if (execute) { custom_ops.push_back({tag, execute}); }
+}
+
+// executor and userdata of a registered GGML_OP_CUSTOM node, or nullptr
+static ggml_metal_custom_execute ggml_backend_metal_custom_op(const ggml_tensor * tensor, void ** userdata) {
+    if (tensor->op != GGML_OP_CUSTOM) { return nullptr; }
+    ggml_custom_op_params params;
+    memcpy(&params, tensor->op_params, sizeof(params));
+    std::lock_guard<std::mutex> lock(custom_mutex);
+    for (const auto & entry : custom_ops) {
+        if (params.fun != entry.tag) { continue; }
+        *userdata = params.userdata;
+        return entry.execute;
+    }
+    return nullptr;
+}
+
+static bool ggml_backend_metal_custom_matches(const ggml_tensor * tensor) {
+    void * userdata = nullptr;
+    return ggml_backend_metal_custom_op(tensor, &userdata) != nullptr;
+}
+#endif
+
+static enum ggml_status ggml_backend_metal_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
+#ifdef GGML_METAL_CUSTOM_OPS
+    int first = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        void * userdata = nullptr;
+        const auto execute = ggml_backend_metal_custom_op(node, &userdata);
+        if (!execute) { continue; }
+        if (first < i) {
+            auto before = ggml_graph_view(cgraph, first, i);
+            const auto status = ggml_metal_graph_compute(ctx, &before);
+            if (status != GGML_STATUS_SUCCESS) { return status; }
+        }
+        if (!execute(backend, node, userdata)) { return GGML_STATUS_FAILED; }
+        first = i + 1;
+    }
+    if (first != 0) {
+        auto after = ggml_graph_view(cgraph, first, cgraph->n_nodes);
+        return ggml_metal_graph_compute(ctx, &after);
+    }
+#endif
     return ggml_metal_graph_compute(ctx, cgraph);
+}
+
+static int ggml_backend_metal_default_n_cb(void);
+
+static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+#ifdef GGML_METAL_CUSTOM_OPS
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        void * userdata = nullptr;
+        if (!ggml_backend_metal_custom_op(cgraph->nodes[i], &userdata)) { continue; }
+        auto * ctx = (ggml_metal_t) backend->context;
+        const int saved_n_cb = ggml_metal_get_n_cb(ctx);
+        ggml_metal_set_n_cb(ctx, 0);
+        const auto status = ggml_backend_metal_graph_compute_impl(backend, cgraph);
+        ggml_metal_set_n_cb(ctx, saved_n_cb);
+        return status;
+    }
+#endif
+    return ggml_backend_metal_graph_compute_impl(backend, cgraph);
 }
 
 static void ggml_backend_metal_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -763,6 +859,10 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
 }
 
 static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+#ifdef GGML_METAL_CUSTOM_OPS
+    if (ggml_backend_metal_custom_matches(op)) { return true; }
+#endif
+
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
     if (op->op == GGML_OP_GATED_DELTA_NET_DEFERRED && !ggml_backend_dev_supports_inplace_src(dev, op->src[6])) {

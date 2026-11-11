@@ -19,7 +19,7 @@ extern "C" {
 struct ggml_metal_device_props;
 
 // the maximum number of nodes that can be fused in a single kernel
-// (also the most non-view nodes of a packed fusion group during graph optimization)
+// (also the maximum length of a packed fusion group during graph optimization)
 #define GGML_METAL_FUSION_MAX 16
 
 typedef enum ggml_metal_fusion_mode {
@@ -36,23 +36,21 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_NORM_MUL,     // NORM/RMS_NORM + MUL
     GGML_METAL_FUSION_NORM_MUL_ADD, // NORM/RMS_NORM + MUL + ADD
     GGML_METAL_FUSION_NORM_SCALE,   // NORM/RMS_NORM + SCALE
-    GGML_METAL_FUSION_RMS_NORM_GATE, // RMS_NORM + MUL + UNARY(SILU) + MUL (gated norm)
     GGML_METAL_FUSION_ADD_CHAIN,    // ADD x N (N in [2, 7])
     GGML_METAL_FUSION_SNAKE,        // MUL + SIN + SQR + MUL + ADD
     GGML_METAL_FUSION_GDN_CACHE,    // GATED_DELTA_NET + CPY (write snapshots into the recurrent cache)
     GGML_METAL_FUSION_TOPK_MOE,     // SOFT_MAX + ARGSORT + GET_ROWS + norm/scale (MoE routing)
     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
-    GGML_METAL_FUSION_DW_NORM_CHANNEL, // CONV_1D_DW_DIRECT + NORM_CHANNEL
+    GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA or one-row PQ2_0/Q4_0/MXFP4 mat-vec store)
     GGML_METAL_FUSION_MUL_MV_GLU,   // MUL_MAT(_ID) up + gate + GLU (swiglu), single-token decode
     GGML_METAL_FUSION_MUL_MV_ID_MUL, // MUL_MAT_ID + MUL (routing weights), mat-vec path; yields to MOE_REDUCE
     GGML_METAL_FUSION_UNARY_MUL,    // UNARY (silu/sigmoid/softplus) + MUL
     GGML_METAL_FUSION_GDN_DEFERRED_CACHE, // GATED_DELTA_NET_DEFERRED + CPY (write the new base into the recurrent cache)
     GGML_METAL_FUSION_FWHT_SIGNED,  // MUL + MUL_MAT(hadamard) (sign vector folded into the FWHT)
-    GGML_METAL_FUSION_RMS_NORM_FWHT, // RMS_NORM + MUL + MUL + MUL_MAT(hadamard) (normalized row into the signed FWHT)
-    GGML_METAL_FUSION_CONT_FWHT,     // CONT + MUL + MUL_MAT(hadamard) (the signed FWHT gathers the CONT source)
-    GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA or one-row PQ2_0/Q4_0/MXFP4 mat-vec store)
-    GGML_METAL_FUSION_CPY_BATCH,    // CPY x N (N in [2, GGML_METAL_CPY_BATCH_MAX]), one dispatch
+    GGML_METAL_FUSION_RMS_NORM_GATE, // RMS_NORM + MUL + UNARY(silu) + MUL (gated norm)
+    GGML_METAL_FUSION_RMS_NORM_FWHT, // RMS_NORM + MUL + MUL + MUL_MAT(hadamard) (norm folded into the signed FWHT)
+    GGML_METAL_FUSION_CONT_FWHT,     // CONT + MUL + MUL_MAT(hadamard) (gather folded into the signed FWHT)
     GGML_METAL_FUSION_RMS_NORM_MUL_MV, // RMS_NORM + MUL + MUL_MAT x N (norm folded into each single-row mat-vec)
     GGML_METAL_FUSION_RMS_NORM_ROPE,   // RMS_NORM + MUL + ROPE (+ SET_ROWS) (per-head Q/K norms, K-cache write)
 } ggml_metal_fusion_id;
@@ -105,7 +103,6 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
         const int * node_idxs,
         int n_idxs,
         int idx,
-        const struct ggml_metal_device_props * props,
         ggml_metal_fusion_mode mode,
         int * n_out);
 
@@ -115,7 +112,7 @@ bool ggml_metal_fusion_rms_norm_fwht_write_norm(const struct ggml_cgraph * gf, c
 
 // optimize phase: maximum number of nodes starting at idx (a raw sequential graph index) that
 // could be fused on a device with props, chaining patterns back-to-back. returns at least 1.
-int ggml_metal_fusion_max(const struct ggml_cgraph * gf, int idx, const struct ggml_metal_device_props * props);
+int ggml_metal_fusion_max(const struct ggml_cgraph * gf, int idx);
 
 #ifdef __cplusplus
 }

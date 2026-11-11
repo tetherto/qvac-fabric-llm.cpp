@@ -15,6 +15,7 @@ on:
       '**/*.cpp'
     ]
 
+cache-mode: none
 permissions:
   contents: read
 

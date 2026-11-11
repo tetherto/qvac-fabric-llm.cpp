@@ -14,8 +14,6 @@
 // llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
 // the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
-// TODO: this memory module is pending complete reimplementation - do not use for model other than Qwen4
-
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
@@ -79,19 +77,6 @@ public:
     //
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
-
-    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
-    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
-    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
-    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
-    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
-    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
-    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
-    // the caller then adds the attention mask, the only part of the bias that varies within a block
-    // causal_attn selects the rule: causal forces the query's own block on, non-causal lets every visible block compete on score
-    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, bool causal_attn) const;
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -221,9 +206,6 @@ public:
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
-    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, bool causal_attn) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;

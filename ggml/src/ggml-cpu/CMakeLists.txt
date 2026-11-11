@@ -441,7 +441,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             endif()
         endif()
 
-        if (GGML_BACKEND_DL)
+        if (GGML_BACKEND_DL AND NOT GGML_BACKEND_EMBEDDED)
             if (GGML_NATIVE)
                 # the feature check relies on ARCH_DEFINITIONS, but it is not set with GGML_NATIVE
                 message(FATAL_ERROR "GGML_NATIVE is not compatible with GGML_BACKEND_DL, consider using GGML_CPU_ALL_VARIANTS")
@@ -625,7 +625,12 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             foreach (ZHW RANGE 15 17)
                 if(DEFINED GGML_INTERNAL_Z${ZHW})
                     message(STATUS "z${ZHW} cross-compile target")
-                    list(APPEND ARCH_FLAGS -march=z${ZHW})
+                    if (ZHW EQUAL 17)
+                        # z17 is an alias of arch15, use the arch level for wider toolchain support
+                        list(APPEND ARCH_FLAGS -march=arch15)
+                    else()
+                        list(APPEND ARCH_FLAGS -march=z${ZHW})
+                    endif()
                 endif()
             endforeach()
         endif()
@@ -677,9 +682,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
         # Fetch KleidiAI sources:
         include(FetchContent)
-        set(KLEIDIAI_COMMIT_TAG "v1.24.0")
+        set(KLEIDIAI_COMMIT_TAG "v1.31.0")
         set(KLEIDIAI_DOWNLOAD_URL "https://github.com/ARM-software/kleidiai/releases/download/${KLEIDIAI_COMMIT_TAG}/kleidiai-${KLEIDIAI_COMMIT_TAG}-src.tar.gz")
-        set(KLEIDIAI_RELEASE_ARCHIVE_MD5  "2f02ebe29573d45813e671eb304f2a00")
+        set(KLEIDIAI_RELEASE_ARCHIVE_MD5  "930495f3aeb16b25dc18a2bde45924f4")
 
         set(KLEIDIAI_FETCH_ARGS
             URL ${KLEIDIAI_DOWNLOAD_URL}

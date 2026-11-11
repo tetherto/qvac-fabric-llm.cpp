@@ -6,14 +6,12 @@
 #include <vector>
 
 static bool decode_prompt(llama_context * ctx, const std::vector<llama_token> & tokens) {
-    llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+    common_batch batch(ctx);
     for (size_t i = 0; i < tokens.size(); ++i) {
-        common_batch_add(batch, tokens[i], i, { 0 }, i == tokens.size() - 1);
+        batch.add(tokens[i], i, 0, i == tokens.size() - 1);
     }
 
-    const bool ok = llama_decode(ctx, batch) == 0;
-    llama_batch_free(batch);
-    return ok;
+    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
 }
 
 int main(int argc, char ** argv) {

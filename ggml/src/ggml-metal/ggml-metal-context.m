@@ -688,7 +688,7 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //const int64_t t_start = ggml_time_us();
 
     if (ctx->use_graph_optimize) {
-        ggml_graph_optimize(gf, ggml_metal_device_get_props(ctx->dev));
+        ggml_graph_optimize(gf);
     }
 
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);
@@ -725,6 +725,29 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
         [cmd_buf retain];
     }
 }
+
+#ifdef GGML_METAL_CUSTOM_OPS
+void ggml_metal_shared_event(ggml_metal_t ctx, void * event, uint64_t value, bool wait) {
+    @autoreleasepool {
+        id<MTLSharedEvent> ev = (id<MTLSharedEvent>) event;
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+
+        if (wait) {
+            [cmd_buf encodeWaitForEvent:ev value:value];
+        } else {
+            [cmd_buf encodeSignalEvent:ev value:value];
+        }
+
+        [cmd_buf commit];
+
+        [ctx->cmd_bufs_ext addObject:cmd_buf];
+        ctx->cmd_buf_last = cmd_buf;
+
+        [cmd_buf retain];
+    }
+}
+#endif
 
 ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
     return ctx->ev_cpy;
@@ -814,3 +837,5 @@ bool ggml_metal_supports_family(ggml_metal_t ctx, int family) {
 void ggml_metal_capture_next_compute(ggml_metal_t ctx) {
     ctx->capture_compute = 1;
 }
+
+int ggml_metal_get_n_cb(ggml_metal_t ctx) { return ctx->n_cb; }

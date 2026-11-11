@@ -1,12 +1,10 @@
 #include "ggml-metal-common.h"
 #include "ggml-metal-fusion.h"
-#include "ggml-metal-impl.h"
 
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
-#include <algorithm>
 #include <vector>
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
@@ -50,13 +48,11 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
 
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
+    const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne21 = op->src[2]->ne[1];
 
-    return has_simdgroup_mm && ne00 >= 64 && ne21 >= 32;
+    return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 32;
 }
-
-// the most src1 rows of the few-row MMA kernels
-static constexpr int64_t GGML_METAL_MMA_ROWS_MAX = 16;
 
 // src1 rows per 8x8 simdgroup matrix tile of the few-row MMA kernels
 static constexpr int64_t GGML_METAL_MMA_TILE_ROWS = 8;
@@ -83,7 +79,6 @@ static bool ggml_metal_mul_mv_mma_type_supported(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
-        case GGML_TYPE_BF16:
         case GGML_TYPE_PQ2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
@@ -93,6 +88,7 @@ static bool ggml_metal_mul_mv_mma_type_supported(enum ggml_type type) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_MXFP4:
@@ -149,7 +145,25 @@ static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
     }
 }
 
-static bool ggml_metal_mul_mat_mma_shape_ok(const struct ggml_tensor * op) {
+// the most src1 rows of the few-row MMA kernels; rows past the 16 of one threadgroup run as more threadgroups. Measured on
+// an M3 Ultra over the FFN mat-muls of Qwen3.8-27B (gate/up 17408x5120, down 5120x17408), where they beat mul_mm; Q6_K and
+// the types not measured keep 16
+static int64_t ggml_metal_mul_mv_mma_rows_max(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+            return 64;
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q5_K:
+            return 48;
+        default:
+            return 16;
+    }
+}
+
+bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
 
@@ -157,30 +171,13 @@ static bool ggml_metal_mul_mat_mma_shape_ok(const struct ggml_tensor * op) {
     const bool batch_ok = src1->ne[2] <= INT16_MAX && src1->ne[2]/src0->ne[2] <= INT16_MAX && src1->ne[3]/src0->ne[3] <= INT16_MAX;
 
     return ggml_metal_mul_mat_mma_type_ok(op) && batch_ok &&
-        src1->type == GGML_TYPE_F32 && src1->ne[1] >= ggml_metal_mul_mv_mma_rows_min(src0->type) && src1->ne[1] <= GGML_METAL_MMA_ROWS_MAX &&
+        src1->type == GGML_TYPE_F32 && src1->ne[1] >= ggml_metal_mul_mv_mma_rows_min(src0->type) && src1->ne[1] <= ggml_metal_mul_mv_mma_rows_max(src0->type) &&
         !ggml_is_transposed(src0) && !ggml_is_transposed(src1) &&
         src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 && src1->nb[3] % 16 == 0;
 }
 
-static bool ggml_metal_mma_device_ok(bool has_native_simdgroup_mm, bool has_tensor) {
-    return has_native_simdgroup_mm && !has_tensor;
-}
-
-bool ggml_metal_mul_mat_use_mma(const struct ggml_tensor * op, bool has_native_simdgroup_mm, bool has_tensor) {
-    // the FWHT kernel takes the hadamard mat-muls first. SIZE_MAX: never take a mat-mul that FWHT could take
-    // on some device, so the answer does not depend on the threadgroup memory
-    return ggml_metal_mma_device_ok(has_native_simdgroup_mm, has_tensor) && !ggml_metal_op_mul_mat_use_fwht(op, SIZE_MAX) &&
-        ggml_metal_mul_mat_mma_shape_ok(op);
-}
-
-bool ggml_metal_mul_mat_may_use_mma(const struct ggml_tensor * op, bool has_native_simdgroup_mm, bool has_tensor) {
-    return ggml_metal_mma_device_ok(has_native_simdgroup_mm, has_tensor) &&
-        ggml_get_op_params_i32(op, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
-        ggml_metal_mul_mv_mma_type_supported(op->src[0]->type) && op->src[1]->type == GGML_TYPE_F32;
-}
-
-bool ggml_metal_mul_mat_use_nc(const struct ggml_tensor * op) {
-    return op->src[0]->type == GGML_TYPE_Q4_0 && op->src[1]->ne[1] == N_NC_Q4_0;
+bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op) {
+    return ggml_metal_mul_mv_mma_type_supported(op->src[0]->type) && op->src[1]->type == GGML_TYPE_F32;
 }
 
 bool ggml_metal_mul_mat_mv_may_add(const struct ggml_tensor * op) {
@@ -192,35 +189,6 @@ bool ggml_metal_mul_mat_mv_may_add(const struct ggml_tensor * op) {
 
 bool ggml_metal_mul_mat_mv_use_add(const struct ggml_tensor * op) {
     return ggml_metal_mul_mat_mv_may_add(op) && op->src[1]->ne[1] == 1;
-}
-
-// true if t is or views a tensor in a buffer marked as weights, such as a bias; the model loader marks its buffers before
-// any graph is optimized, and tensors in unmarked or not yet allocated buffers count as non-weights in both phases
-static bool ggml_metal_tensor_is_weight(const struct ggml_tensor * t) {
-    const ggml_tensor * base = t->view_src != NULL ? t->view_src : t;
-
-    return base->buffer != NULL && ggml_backend_buffer_get_usage(base->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
-}
-
-const struct ggml_tensor * ggml_metal_mul_mat_add_operand(const struct ggml_tensor * mm, const struct ggml_tensor * add) {
-    if (add->op != GGML_OP_ADD || (add->src[0] == mm) == (add->src[1] == mm)) {
-        return NULL;
-    }
-
-    const ggml_tensor * other = add->src[0] == mm ? add->src[1] : add->src[0];
-
-    const bool ok = other->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && !ggml_metal_tensor_is_weight(other);
-
-    return ok ? other : NULL;
-}
-
-const struct ggml_tensor * ggml_metal_mul_mat_add_residual(const struct ggml_tensor * mm, const struct ggml_tensor * add) {
-    const ggml_tensor * res = ggml_metal_mul_mat_add_operand(mm, add);
-
-    const bool ok = res != NULL && ggml_are_same_shape(res, mm) &&
-        ggml_is_contiguous(res) && ggml_is_contiguous(mm) && ggml_is_contiguous(add);
-
-    return ok ? res : NULL;
 }
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)
@@ -238,9 +206,6 @@ struct ggml_mem_ranges {
     std::vector<ggml_mem_range> ranges;
 
     int debug = 0;
-
-    // narrowed ranges depend on view offsets and sizes, which change between graphs with the same nodes
-    bool narrow_dst_views = true;
 };
 
 ggml_mem_ranges_t ggml_mem_ranges_init(int debug) {
@@ -266,37 +231,31 @@ static bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
     return true;
 }
 
-static ggml_mem_range ggml_mem_range_from_tensor(const ggml_tensor * tensor, ggml_mem_range_type pt, bool narrow_dst_views) {
-    // use the base tensor, except that a written view is narrowed to its own extent if narrow_dst_views
-    const ggml_tensor * base = tensor->view_src ? tensor->view_src : tensor;
+static ggml_mem_range ggml_mem_range_from_tensor(const ggml_tensor * tensor, ggml_mem_range_type pt) {
+    // always use the base tensor
+    tensor = tensor->view_src ? tensor->view_src : tensor;
 
-    GGML_ASSERT(!base->view_src);
+    GGML_ASSERT(!tensor->view_src);
 
     ggml_mem_range mr;
 
-    if (base->buffer) {
+    if (tensor->buffer) {
         // when the tensor is allocated, use the actual memory address range in the buffer
         //
         // take the actual allocated size with ggml_backend_buft_get_alloc_size()
         // this can be larger than the tensor size if the buffer type allocates extra memory
         // ref: https://github.com/ggml-org/llama.cpp/pull/15966
         mr = {
-            /*.pb =*/ (uint64_t) base->buffer,
-            /*.p0 =*/ (uint64_t) base->data,
-            /*.p1 =*/ (uint64_t) base->data + ggml_backend_buft_get_alloc_size(base->buffer->buft, base),
+            /*.pb =*/ (uint64_t) tensor->buffer,
+            /*.p0 =*/ (uint64_t) tensor->data,
+            /*.p1 =*/ (uint64_t) tensor->data + ggml_backend_buft_get_alloc_size(tensor->buffer->buft, tensor),
             /*.pt =*/ pt,
         };
-
-        // ops write only inside their destination view, so writes to disjoint views of one tensor do not conflict
-        if (narrow_dst_views && pt == MEM_RANGE_TYPE_DST && tensor != base && tensor->data) {
-            mr.p0 = (uint64_t) tensor->data;
-            mr.p1 = mr.p0 + ggml_nbytes(tensor);
-        }
     } else {
         // otherwise, the pointer address is used as an unique id of the memory ranges
         //   that the tensor will be using when it is allocated
         mr = {
-            /*.pb =*/ (uint64_t) base,
+            /*.pb =*/ (uint64_t) tensor,
             /*.p0 =*/ 0,    //
             /*.p1 =*/ 1024, // [0, 1024) is a dummy range, not used
             /*.pt =*/ pt,
@@ -307,11 +266,11 @@ static ggml_mem_range ggml_mem_range_from_tensor(const ggml_tensor * tensor, ggm
 }
 
 static ggml_mem_range ggml_mem_range_from_tensor_src(const ggml_tensor * tensor) {
-    return ggml_mem_range_from_tensor(tensor, MEM_RANGE_TYPE_SRC, false);
+    return ggml_mem_range_from_tensor(tensor, MEM_RANGE_TYPE_SRC);
 }
 
-static ggml_mem_range ggml_mem_range_from_tensor_dst(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
-    return ggml_mem_range_from_tensor(tensor, MEM_RANGE_TYPE_DST, mrs->narrow_dst_views);
+static ggml_mem_range ggml_mem_range_from_tensor_dst(const ggml_tensor * tensor) {
+    return ggml_mem_range_from_tensor(tensor, MEM_RANGE_TYPE_DST);
 }
 
 static bool ggml_mem_ranges_add_src(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
@@ -329,7 +288,7 @@ static bool ggml_mem_ranges_add_src(ggml_mem_ranges_t mrs, const ggml_tensor * t
 static bool ggml_mem_ranges_add_dst(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     GGML_ASSERT(tensor);
 
-    ggml_mem_range mr = ggml_mem_range_from_tensor_dst(mrs, tensor);
+    ggml_mem_range mr = ggml_mem_range_from_tensor_dst(tensor);
 
     if (mrs->debug > 2) {
         GGML_LOG_DEBUG("%s: add dst range buf=%lld, [%lld, %lld)\n", __func__, mr.pb, mr.p0, mr.p1);
@@ -338,23 +297,14 @@ static bool ggml_mem_ranges_add_dst(ggml_mem_ranges_t mrs, const ggml_tensor * t
     return ggml_mem_ranges_add(mrs, mr);
 }
 
-// whether node reads its source i; the destination operand of a copy is written through the node itself, never read
-static bool ggml_mem_range_reads_src(const ggml_tensor * node, int i) {
-    return node->src[i] && !(node->op == GGML_OP_CPY && i == 1);
-}
-
-static bool ggml_mem_ranges_add_srcs(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
+bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     for (int i = 0; i < GGML_MAX_SRC; i++) {
-        if (ggml_mem_range_reads_src(tensor, i) && !ggml_mem_ranges_add_src(mrs, tensor->src[i])) {
-            return false;
+        if (tensor->src[i]) {
+            ggml_mem_ranges_add_src(mrs, tensor->src[i]);
         }
     }
 
-    return true;
-}
-
-bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
-    return ggml_mem_ranges_add_srcs(mrs, tensor) && ggml_mem_ranges_add_dst(mrs, tensor);
+    return ggml_mem_ranges_add_dst(mrs, tensor);
 }
 
 static bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
@@ -371,7 +321,7 @@ static bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
             continue;
         }
 
-        if (mr.p0 < cmp.p1 && mr.p1 > cmp.p0) {
+        if (mr.p0 < cmp.p1 && mr.p1 >= cmp.p0) {
             if (mrs->debug > 2) {
                 GGML_LOG_DEBUG("%s: the %s range buf=%lld, [%lld, %lld) overlaps with a previous %s range buf=%lld, [%lld, %lld)\n",
                         __func__,
@@ -401,25 +351,23 @@ static bool ggml_mem_ranges_check_src(ggml_mem_ranges_t mrs, const ggml_tensor *
 static bool ggml_mem_ranges_check_dst(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     GGML_ASSERT(tensor);
 
-    ggml_mem_range mr = ggml_mem_range_from_tensor_dst(mrs, tensor);
+    ggml_mem_range mr = ggml_mem_range_from_tensor_dst(tensor);
 
     const bool res = ggml_mem_ranges_check(mrs, mr);
 
     return res;
 }
 
-static bool ggml_mem_ranges_check_srcs(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
+bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     for (int i = 0; i < GGML_MAX_SRC; i++) {
-        if (ggml_mem_range_reads_src(tensor, i) && !ggml_mem_ranges_check_src(mrs, tensor->src[i])) {
-            return false;
+        if (tensor->src[i]) {
+            if (!ggml_mem_ranges_check_src(mrs, tensor->src[i])) {
+                return false;
+            }
         }
     }
 
-    return true;
-}
-
-bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
-    return ggml_mem_ranges_check_srcs(mrs, tensor) && ggml_mem_ranges_check_dst(mrs, tensor);
+    return ggml_mem_ranges_check_dst(mrs, tensor);
 }
 
 struct node_info {
@@ -433,11 +381,6 @@ struct node_info {
 
     const ggml_tensor * dst() const {
         return fused.empty() ? node : fused.back();
-    }
-
-    template <typename F>
-    bool all_nodes(F && f) const {
-        return f(node) && std::all_of(fused.begin(), fused.end(), f);
     }
 
     bool is_empty() const {
@@ -462,36 +405,74 @@ struct node_info {
 };
 
 static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node_info> & nodes) {
-    // helper to add the src and dst ranges of every node of a group
+    // helper to add node src and dst ranges
     const auto & h_add = [](ggml_mem_ranges_t mrs, const node_info & node) {
-        // only external sources matter: sources produced by the fused group are internal.
-        // all fused tensors are produced by the fused kernel
-        return node.all_nodes([&](const ggml_tensor * t) {
-            for (int i = 0; i < GGML_MAX_SRC; i++) {
-                if (ggml_mem_range_reads_src(t, i) && !node.is_output(t->src[i]) &&
-                    !ggml_mem_ranges_add_src(mrs, t->src[i])) {
+        // only external sources matter: sources produced by the fused group are internal
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const ggml_tensor * src = node.node->src[i];
+            if (src && !node.is_output(src)) {
+                if (!ggml_mem_ranges_add_src(mrs, src)) {
                     return false;
                 }
             }
+        }
 
-            return ggml_mem_ranges_add_dst(mrs, t);
-        });
+        for (const auto * fused : node.fused) {
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                const ggml_tensor * src = fused->src[i];
+                if (src && !node.is_output(src)) {
+                    if (!ggml_mem_ranges_add_src(mrs, src)) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // all fused tensors are produced by the fused kernel
+        if (!ggml_mem_ranges_add_dst(mrs, node.node)) {
+            return false;
+        }
+        for (const auto * fused : node.fused) {
+            if (!ggml_mem_ranges_add_dst(mrs, fused)) {
+                return false;
+            }
+        }
+
+        return true;
     };
 
-    // helper to check if a group can run concurrently with the existing set of nodes
+    // helper to check if a node can run concurrently with the existing set of nodes
     const auto & h_check = [](ggml_mem_ranges_t mrs, const node_info & node) {
-        // only external sources matter: sources produced by the fused group are internal.
-        // all fused tensors are produced by the fused kernel
-        return node.all_nodes([&](const ggml_tensor * t) {
-            for (int i = 0; i < GGML_MAX_SRC; i++) {
-                if (ggml_mem_range_reads_src(t, i) && !node.is_output(t->src[i]) &&
-                    !ggml_mem_ranges_check_src(mrs, t->src[i])) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const ggml_tensor * src = node.node->src[i];
+            if (src && !node.is_output(src)) {
+                if (!ggml_mem_ranges_check_src(mrs, src)) {
                     return false;
                 }
             }
+        }
 
-            return ggml_mem_ranges_check_dst(mrs, t);
-        });
+        for (const auto * fused : node.fused) {
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                const ggml_tensor * src = fused->src[i];
+                if (src && !node.is_output(src)) {
+                    if (!ggml_mem_ranges_check_src(mrs, src)) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        if (!ggml_mem_ranges_check_dst(mrs, node.node)) {
+            return false;
+        }
+        for (const auto * fused : node.fused) {
+            if (!ggml_mem_ranges_check_dst(mrs, fused)) {
+                return false;
+            }
+        }
+
+        return true;
     };
 
     // perform reorders only across these types of ops
@@ -542,10 +523,6 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
 
     // the memory ranges for the set of nodes that haven't been processed yet, when looking forward for a node to reorder
     ggml_mem_ranges_t mrs1 = ggml_mem_ranges_init(0);
-
-    // an order that depends on view extents changes the graph allocation between ubatches with the same nodes
-    mrs0->narrow_dst_views = false;
-    mrs1->narrow_dst_views = false;
 
     for (int i0 = 0; i0 < n; i0++) {
         if (used[i0]) {
@@ -616,7 +593,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     return res;
 }
 
-void ggml_graph_optimize(ggml_cgraph * gf, const ggml_metal_device_props * props) {
+void ggml_graph_optimize(ggml_cgraph * gf) {
     const int n = gf->n_nodes;
 
     std::vector<node_info> nodes;
@@ -634,7 +611,7 @@ void ggml_graph_optimize(ggml_cgraph * gf, const ggml_metal_device_props * props
             /*.fused =*/ {},
         };
 
-        const int f = ggml_metal_fusion_max(gf, i, props);
+        const int f = ggml_metal_fusion_max(gf, i);
 
         // add the fused tensors into the node info so we can unfuse them later
         for (int k = 1; k < f; k++) {

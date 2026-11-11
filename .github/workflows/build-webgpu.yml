@@ -25,6 +25,7 @@ on:
       'ggml/src/ggml-webgpu/**'
     ]
 
+cache-mode: none
 permissions:
   contents: read
 
@@ -78,7 +79,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: webgpu-macos-latest
+          restore: false
           save: false
 
       - name: Dawn Dependency
@@ -136,11 +137,11 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
-      # - name: ccache
-      #   uses: ggml-org/ccache-action@v1.2.24
-      #   with:
-      #     key: webgpu-ubuntu-24.04
-      #     save: false
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          restore: false
+          save: false
 
       - name: Dependencies
         id: depends
