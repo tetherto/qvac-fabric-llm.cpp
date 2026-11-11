@@ -5,6 +5,8 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <cmath>
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_EMBEDDING_SCALE, hparams.f_embedding_scale, false);
@@ -50,11 +52,11 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     // DSpine packs [top_k candidates, top_k x top_k transition scores] into one n_embd row per block position
     if (ml.get_key(LLM_KV_DSPINE_HEAD_TOPK, hparams.dspine_head_topk, false)) {
-        ml.get_key(LLM_KV_DSPINE_EPS, hparams.dspine_eps);
+        ml.get_key(LLM_KV_DSPINE_EPS, hparams.dspine_eps, false);
         bool causal = false;
         ml.get_key(LLM_KV_ATTENTION_CAUSAL, causal, false);
         const uint32_t top_k = hparams.dspine_head_topk;
-        if (!causal || !(hparams.dspine_eps > 0.0f) || top_k < 2 || top_k > 64 || (top_k & (top_k - 1)) != 0 || hparams.dflash_block_size < 2 || has_lilicorr ||
+        if (!causal || !std::isfinite(hparams.dspine_eps) || !(hparams.dspine_eps > 0.0f) || top_k < 2 || top_k > 64 || (top_k & (top_k - 1)) != 0 || hparams.dflash_block_size < 2 || has_lilicorr ||
                 hparams.dflash_selector_top_k > 0 || (uint64_t) top_k * (top_k + 1) > hparams.n_embd) {
             throw std::runtime_error("invalid DSpine DFlash metadata");
         }
@@ -267,6 +269,10 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         }
         const int64_t code_size = codebook_meta->ne[0];
         const int64_t rank      = gate_meta->ne[1];
+        // checked before any tensor is created: the buffer probe of a zero-size weight aborts
+        if (code_size <= 0 || rank <= 0 || n_vocab < (int64_t) hparams.dspine_head_topk) {
+            throw std::runtime_error("invalid DSpine code bridge size");
+        }
 
         dspine_codebook  = create_tensor(tn(LLM_TENSOR_DSPINE_CODEBOOK,  "weight"), { code_size, n_vocab }, 0);
         dspine_gate      = create_tensor(tn(LLM_TENSOR_DSPINE_GATE,      "weight"), { code_size, rank }, 0);
@@ -1020,10 +1026,17 @@ static void build_dspine_lattice(llm_graph_context & g, const llama_model & mode
     ggml_tensor * raw   = ggml_reshape_4d(ctx0, dspine_block_rows(ctx0, ggml_reshape_3d(ctx0, state.raw, n_embd, n_rows, n_blocks), 1, n_pos), n_embd, 1, n_pos, n_blocks);
     ggml_tensor * rms   = ggml_reshape_4d(ctx0, dspine_block_rows(ctx0, ggml_reshape_3d(ctx0, state.rms, 1, n_rows, n_blocks), 1, n_pos), 1, 1, n_pos, n_blocks);
 
-    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_add(ctx0, ggml_add(ctx0, g.build_lora_mm(model.dspine_pred_gate, codes), query), model.dspine_gate_b));
-    ggml_tensor * msg  = ggml_mul(ctx0, gate, g.build_lora_mm(model.dspine_prev, codes)); // [rank, top_k, n_pos, n_blocks]
+    // the CPU repack kernels take no 4D src1; merging only the position and block dims keeps ne11 = top_k for the GPU kernels
+    const int64_t n_mats   = n_pos * n_blocks;
+    ggml_tensor * codes_3d = ggml_reshape_3d(ctx0, codes, code_size, top_k, n_mats);
+    ggml_tensor * sender   = ggml_reshape_4d(ctx0, g.build_lora_mm(model.dspine_pred_gate, codes_3d), rank, top_k, n_pos, n_blocks);
+    ggml_tensor * value    = ggml_reshape_4d(ctx0, g.build_lora_mm(model.dspine_prev,      codes_3d), rank, top_k, n_pos, n_blocks);
 
-    ggml_tensor * refined = ggml_add(ctx0, ggml_mul(ctx0, g.build_lora_mm(last.dspine_write, msg), rms), raw);
+    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_add(ctx0, ggml_add(ctx0, sender, query), model.dspine_gate_b));
+    ggml_tensor * msg  = ggml_reshape_3d(ctx0, ggml_mul(ctx0, gate, value), rank, top_k, n_mats);
+
+    ggml_tensor * delta   = ggml_reshape_4d(ctx0, g.build_lora_mm(last.dspine_write, msg), n_embd, top_k, n_pos, n_blocks);
+    ggml_tensor * refined = ggml_add(ctx0, ggml_mul(ctx0, delta, rms), raw);
     refined = g.build_norm(refined, model.output_norm, NULL, LLM_NORM_RMS, -1);
 
     ggml_tensor * head = ggml_get_rows(ctx0, output, ggml_reshape_1d(ctx0, cand_pos, top_k * n_pos * n_blocks));

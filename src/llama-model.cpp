@@ -3744,6 +3744,10 @@ int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
     return model->hparams.dflash_selector_top_k > 0 ? model->hparams.dflash_selector_top_k : model->hparams.dspine_head_topk;
 }
 
+bool llama_model_is_dspine(const llama_model * model) {
+    return model->hparams.dspine_head_topk > 0;
+}
+
 int32_t llama_model_n_head(const llama_model * model) {
     return model->hparams.n_head();
 }

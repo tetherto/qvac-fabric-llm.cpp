@@ -1106,12 +1106,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         // the DSpine code bridge and lattice need whole blocks, so the blocks of all sequences must fit one draft ubatch
-        {
-            char buf[16] = {};
-            const bool is_dspine = llama_model_meta_val_str(model_dft, "dflash.dspine.head_topk", buf, sizeof(buf)) >= 0;
-            if (is_dspine && (int64_t) n_seq * (this->params.n_max + 1) > (int64_t) llama_n_ubatch(ctx_dft)) {
-                throw std::runtime_error("DSpine draft needs --spec-draft-n-ubatch >= n_parallel * (--spec-draft-n-max + 1)");
-            }
+        if (llama_model_is_dspine(model_dft) && (int64_t) n_seq * (this->params.n_max + 1) > (int64_t) llama_n_ubatch(ctx_dft)) {
+            throw std::runtime_error("DSpine draft needs --spec-draft-n-ubatch >= n_parallel * (--spec-draft-n-max + 1)");
         }
 
         batch        = common_batch(ctx_dft);

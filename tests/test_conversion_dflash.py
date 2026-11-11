@@ -110,6 +110,33 @@ def test_dspine_released_configs(extra_hparams):
     assert dspine_model(DSPINE_CONFIG, extra_hparams)._dspine_head_topk() == 16
 
 
+class RecordingWriter:
+    """Records every add_* call, so a test checks only the keys it names."""
+
+    def __init__(self):
+        self.calls: dict[str, list[tuple]] = {}
+
+    def __getattr__(self, name: str):
+        if not name.startswith("add_"):
+            raise AttributeError(name)
+        return lambda *args: self.calls.setdefault(name, []).append(args)
+
+
+@pytest.mark.parametrize("extra_hparams", ({}, DSPINE_27B_HPARAMS))
+def test_dspine_writes_bridge_metadata(monkeypatch, extra_hparams):
+    monkeypatch.setattr(Qwen3Model, "set_gguf_parameters", lambda _self: None)
+    model = dspine_model(DSPINE_CONFIG, extra_hparams)
+    model.target_model_dir = None
+    model.gguf_writer = RecordingWriter()
+
+    model.set_gguf_parameters()
+
+    calls = model.gguf_writer.calls
+    assert calls["add_dspine_head_topk"] == [(16,)]
+    assert calls["add_dspine_eps"] == [(DSPINE_CONFIG["selected_prefix_code_bridge"]["eps"],)]
+    assert calls["add_causal_attention"] == [(True,)]
+
+
 @pytest.mark.parametrize("config, extra_hparams", (
     (with_config(selected_prefix_terminal=True), {}),
     (with_config(selected_prefix_decode_mode="parallel"), {}),
