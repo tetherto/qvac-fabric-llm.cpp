@@ -27,15 +27,16 @@ extern "C" {
 //     from 43-50 to 52-59.
 // 115 adds MUL_MAT_CONVROT and CONVROT to the ggml_op enum.
 // 116 adds SSM_CONV_RAGGED and GATED_DELTA_NET_RAGGED to the ggml_op enum.
+// 117 adds ROPE_FLUX to the ggml_op enum.
 // A minor bump is additive: the client still accepts a server with an older
 // minor and must gate every command introduced by a later minor on the minor
 // the server announces at HELLO.
-#define RPC_PROTO_MAJOR_VERSION    116
+#define RPC_PROTO_MAJOR_VERSION    117
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 131, "GGML_OP_COUNT has changed - update the RPC protocol version");
+static_assert(GGML_OP_COUNT == 132, "GGML_OP_COUNT has changed - update the RPC protocol version");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

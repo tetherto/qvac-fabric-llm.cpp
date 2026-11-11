@@ -1,0 +1,36 @@
+#version 450
+// Existing ROPE_FLUX: [D,H,L,B] -> [D,L,H*B], with optional shared PE.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform parameter {
+    uint pairs; uint d; uint heads; uint length;
+    uint x_offset; uint pe_offset; uint dst_offset; uint has_pe;
+    uint xs0; uint xs1; uint xs2; uint xs3;
+    uint ps0; uint ps1; uint ps2; uint ps3;
+};
+layout(binding = 0, std430) readonly buffer X { float x[]; };
+layout(binding = 1, std430) readonly buffer P { float pe[]; };
+layout(binding = 2, std430) writeonly buffer Y { float y[]; };
+void main() {
+    const uint id = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256 + gl_LocalInvocationID.x;
+    if (id >= pairs) return;
+    const uint pair = id % (d / 2);
+    const uint row = id / (d / 2);
+    const uint l = row % length;
+    const uint bh = row / length;
+    const uint h = bh % heads;
+    const uint b = bh / heads;
+    const uint xi = x_offset + b * xs3 + l * xs2 + h * xs1 + 2 * pair * xs0;
+    const float a = x[xi];
+    const float c = x[xi + xs0];
+    precise float even = a;
+    precise float odd = c;
+    if (has_pe != 0) {
+        const uint pi = pe_offset + l * ps3 + pair * ps2;
+        // PE uses GGML dimension 0 for the two input components, dimension
+        // 1 for the output component; do not transpose its 2x2 matrix.
+        even = a * pe[pi] + c * pe[pi + ps0];
+        odd = a * pe[pi + ps1] + c * pe[pi + ps1 + ps0];
+    }
+    y[dst_offset + 2 * id] = even;
+    y[dst_offset + 2 * id + 1] = odd;
+}

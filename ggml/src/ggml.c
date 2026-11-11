@@ -1233,9 +1233,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CONVROT",
     "SSM_CONV_RAGGED",
     "GATED_DELTA_NET_RAGGED",
+
+    "ROPE_FLUX",
 };
 
-static_assert(GGML_OP_COUNT == 131, "GGML_OP_COUNT != 131");
+static_assert(GGML_OP_COUNT == 132, "GGML_OP_COUNT != 132");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1382,9 +1384,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "convrot(x)",
     "ssm_conv_ragged(x,s,w,off)",
     "gated_delta_net_ragged(q,k,v,g,beta,s,off)",
+
+    "rope_flux(x,pe)",
 };
 
-static_assert(GGML_OP_COUNT == 131, "GGML_OP_COUNT != 131");
+static_assert(GGML_OP_COUNT == 132, "GGML_OP_COUNT != 132");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4943,6 +4947,37 @@ void ggml_rope_yarn_corr_dims(
     float end   =  ceilf(ggml_rope_yarn_corr_dim(n_dims, n_ctx_orig, beta_slow, freq_base));
     dims[0] = MAX(0, start);
     dims[1] = MIN(n_dims - 1, end);
+}
+
+// ggml_rope_flux
+
+static void ggml_rope_flux_check_pe(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->ne[0] == 2 && b->ne[1] == 2);
+    GGML_ASSERT(b->ne[2] == a->ne[0] / 2);
+    GGML_ASSERT(b->ne[3] == a->ne[2]);
+}
+
+struct ggml_tensor * ggml_rope_flux(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] % 2 == 0);
+    GGML_ASSERT(a->ne[3] == 0 || a->ne[1] <= INT64_MAX / a->ne[3]);
+
+    if (b != NULL) {
+        ggml_rope_flux_check_pe(a, b);
+    }
+
+    const int64_t ne[4] = { a->ne[0], a->ne[2], a->ne[3] * a->ne[1], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne);
+
+    result->op     = GGML_OP_ROPE_FLUX;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
 }
 
 // ggml_rope_back

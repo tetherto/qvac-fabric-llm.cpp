@@ -510,6 +510,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_rope(ctx, idx);
             } break;
+        case GGML_OP_ROPE_FLUX:
+            {
+                n_fuse = ggml_metal_op_rope_flux(ctx, idx);
+            } break;
         case GGML_OP_IM2COL:
             {
                 n_fuse = ggml_metal_op_im2col(ctx, idx);
@@ -6168,6 +6172,46 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
 
     return n_fuse;
+}
+
+int ggml_metal_op_rope_flux(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const ggml_tensor * x  = op->src[0];
+    const ggml_tensor * pe = op->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(op) <= INT32_MAX);
+
+    ggml_metal_kargs_rope_flux args = {
+        /* .d_head = */ (int32_t) x->ne[0],
+        /* .n_head = */ (int32_t) x->ne[1],
+        /* .L      = */ (int32_t) x->ne[2],
+        /* .N      = */ (int32_t) x->ne[3],
+        /* .nb00   = */ x->nb[0],
+        /* .nb01   = */ x->nb[1],
+        /* .nb02   = */ x->nb[2],
+        /* .nb03   = */ x->nb[3],
+        /* .pe_nb0 = */ pe ? pe->nb[0] : 0,
+        /* .pe_nb1 = */ pe ? pe->nb[1] : 0,
+        /* .pe_nb2 = */ pe ? pe->nb[2] : 0,
+        /* .pe_nb3 = */ pe ? pe->nb[3] : 0,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_rope_flux(ctx->lib, op);
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(x), 1);
+    if (pe) {
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(pe), 2);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op), 3);
+    } else {
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op), 2);
+    }
+
+    const int nth = 256;
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (int) ((ggml_nelements(op) + nth - 1)/nth), 1, 1, nth, 1, 1);
+
+    return 1;
 }
 
 int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {

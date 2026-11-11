@@ -974,6 +974,8 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             ggml_mul_mat_convrot_set_f16_compat(tensor_clone, ggml_get_op_params_i32(tensor, 1) != 0);
         } else if (tensor->op == GGML_OP_CONVROT) {
             tensor_clone = ggml_convrot(ggml_ctx, src_clone[0], ggml_get_op_params_i32(tensor, 0));
+        } else if (tensor->op == GGML_OP_ROPE_FLUX) {
+            tensor_clone = ggml_rope_flux(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {
             tensor_clone = ggml_mul_mat_id(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID_BACK_A) {

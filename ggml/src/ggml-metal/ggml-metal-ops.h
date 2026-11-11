@@ -86,6 +86,7 @@ int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_group_norm        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_norm              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rope              (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_rope_flux         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_im2col            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_conv_2d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_conv_2d_dw        (ggml_metal_op_t ctx, int idx);

@@ -413,6 +413,21 @@ typedef struct {
     float    sin_sign;
 } ggml_metal_kargs_rope;
 
+typedef struct {
+    int32_t  d_head;
+    int32_t  n_head;
+    int32_t  L;
+    int32_t  N;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t pe_nb0;
+    uint64_t pe_nb1;
+    uint64_t pe_nb2;
+    uint64_t pe_nb3;
+} ggml_metal_kargs_rope_flux;
+
 // fused RMS_NORM + MUL + ROPE (+ SET_ROWS): the rows are normalized, weighted and rotated over their full width
 typedef struct {
     int32_t  ne00;     // row width: the norm width and the RoPE dims
