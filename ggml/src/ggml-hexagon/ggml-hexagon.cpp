@@ -5487,6 +5487,18 @@ static bool ggml_hexagon_precompute_cpy_params(
         return true;
     }
 
+    const bool strided_conversion = same_extents && !sameshape &&
+                                    ((src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) ||
+                                     (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32));
+    if (strided_conversion) {
+        kparams->kernel_type             = HTP_COPY_KERNEL_STRIDED_CONVERT;
+        kparams->total_rows              = (uint32_t) (src0->ne[1] * src0->ne[2] * src0->ne[3]);
+        kparams->n_threads               = sess->n_threads > 0 ? (uint8_t) sess->n_threads : 4;
+        kparams->u.strided.div_ne01      = init_fastdiv_values((uint32_t) src0->ne[1]);
+        kparams->u.strided.div_ne02_ne01 = init_fastdiv_values((uint32_t) (src0->ne[2] * src0->ne[1]));
+        return true;
+    }
+
     if (!sameshape) {
         return false;
     }
