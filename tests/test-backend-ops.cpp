@@ -16914,6 +16914,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 4608, {1, 1}, {1, 1}));
         }
     }
+    // K not a multiple of 256 in 16 byte aligned rows: the few-row MMQ must decline these views
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 20, 2080, {1, 1}, {1, 1}, {0, 1, 2, 3}, 2304));
+    }
 
     // small m (2..8) with n above MMVF_MAX_BATCH_SIZE: operand swap with a transposed result.
     // m = 4, k = 10240 is the Flash-Next hyper-connection inject projection ([n_embd*hc, hc] f32);

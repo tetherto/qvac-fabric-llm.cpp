@@ -1235,7 +1235,7 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
 #endif // GGML_CUDA_FORCE_CUBLAS
 
     if (mmq_few_use_wmma(cc)) {
-        return !mmq_few_wmma_supported(type) || ne00 < 8*QK_K ? 0 : mmq_few_wmma_ncols_range(type).x;
+        return !mmq_few_wmma_supported(type) || ne00 < 8*QK_K || ne00 % QK_K != 0 ? 0 : mmq_few_wmma_ncols_range(type).x;
     }
 
     // NVIDIA Ampere to Blackwell
