@@ -3993,9 +3993,10 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
     //TODO: call the remote backend and cache the results
-    // only the CPU and CUDA backends have the ragged ops
+    // the client cannot query the remote backend, and these ops are missing on some backends
     return op->op != GGML_OP_MUL_MAT_CONVROT && op->op != GGML_OP_CONVROT &&
-           op->op != GGML_OP_SSM_CONV_RAGGED && op->op != GGML_OP_GATED_DELTA_NET_RAGGED;
+           op->op != GGML_OP_SSM_CONV_RAGGED && op->op != GGML_OP_GATED_DELTA_NET_RAGGED &&
+           op->op != GGML_OP_GATED_DELTA_NET_DEFERRED && op->op != GGML_OP_GDN_CONV_DEFERRED;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
