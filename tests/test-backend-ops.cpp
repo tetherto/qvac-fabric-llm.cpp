@@ -16452,6 +16452,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cpy(type_src, type_dst, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3})); // cpy not-contiguous
         }
     }
+    // f32 <-> f16 conversions of a permuted source whose rows are not packed (the speech encoders cast
+    // permuted attention operands this way; the second case also writes a permuted destination)
+    for (ggml_type type_src : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        const ggml_type type_dst = type_src == GGML_TYPE_F32 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        test_cases.emplace_back(new test_cpy(type_src, type_dst, {16, 138, 256, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}));
+        test_cases.emplace_back(new test_cpy(type_src, type_dst, {32, 32, 256, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}, {0, 2, 1, 3}));
+    }
     for (ggml_type type_src : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         test_cases.emplace_back(new test_cpy(type_src, GGML_TYPE_F8_E4M3, {32, 2, 3, 4}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {64, 2, 3, 4}));
         test_cases.emplace_back(new test_cpy(type_src, GGML_TYPE_F8_E4M3, {32, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}, {1, 0, 2, 3}));
