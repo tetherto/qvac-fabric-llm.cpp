@@ -2973,7 +2973,8 @@ static bool ggml_thread_cpumask_is_valid(const bool * mask) {
 
 // qvac-fabric (tetherto/qvac#5537): on Linux and Android, threads inherit their creator's affinity,
 // and a saved mask cannot be restored exactly (sched_getaffinity reports it narrowed by the cpuset
-// and the active CPUs), so the affinity of a thread ggml does not own is never changed there.
+// and the active CPUs), so the threadpool mask is not applied to a thread ggml does not own there.
+// NUMA mode still pins every compute thread, the caller included, and then resets it to all CPUs.
 static void ggml_thread_apply_caller_affinity(bool * mask) {
 #if defined(__linux__)
     UNUSED(mask);
@@ -3005,10 +3006,7 @@ static struct ggml_thread_affinity_scope ggml_thread_affinity_begin(int ith, boo
         return scope;
     }
 #if defined(__linux__)
-    if (sched_getaffinity(0, sizeof(scope.saved), &scope.saved) != 0) {
-        return scope;
-    }
-    scope.valid = true;
+    scope.valid = sched_getaffinity(0, sizeof(scope.saved), &scope.saved) == 0;
 #endif
     ggml_thread_apply_affinity(mask);
     return scope;
@@ -3626,6 +3624,7 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
 
     if (threadpool->pause) {
        // Update main thread prio and affinity to match the threadpool settings
+       // (affinity: not on Linux/Android, see ggml_thread_apply_caller_affinity)
        ggml_thread_apply_priority(threadpool->prio);
        ggml_thread_apply_caller_affinity(threadpool->workers[0].cpumask);
 
@@ -3703,6 +3702,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume
+        // (affinity: not on Linux/Android, see ggml_thread_apply_caller_affinity)
         ggml_thread_apply_priority(threadpool->prio);
         ggml_thread_apply_caller_affinity(threadpool->workers[0].cpumask);
     }
