@@ -41,7 +41,7 @@ while gpu_busy; do
   [ $(date +%s) -gt $deadline ] && fail "GPU busy for 6 hours ($(cat $LOCK 2>/dev/null; nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader | tr '\n' ' '))"
   sleep 60
 done
-echo "$USER weekly bench ($([ $HEAVY = 1 ] && echo heavy || echo cron)) since $(date +%H:%M) UTC" > $LOCK
+echo "${USER:-$(id -un)} weekly bench ($([ $HEAVY = 1 ] && echo heavy || echo cron)) since $(date +%H:%M) UTC" > $LOCK
 trap 'rm -f $LOCK' EXIT
 echo "lock taken $(date)"
 # stop our own engines if the shared machine runs out of memory (first-use kernel builds once did)

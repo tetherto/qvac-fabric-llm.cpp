@@ -6,7 +6,8 @@ usage: summarize.py <run dir> [--status ok|failed] [--reason TEXT]
 Results come from <run dir>/results.jsonl, written by bench_client.py under labels <kind>-<engine>-<mode>[-<profile>]:
 conc (no speculation or Splash's DFlash2, C = 1..16), concspec (MTP and DFlash2, C = 1, 4, 8), spec (one request,
 four prompts) and depth (one request per prompt length). The profile defaults to "standard"; a machine may add others
-(the Spark's "heavy"). llama-bench output is bench-<engine>.jsonl.
+(the Spark's "heavy"). bench-<engine>.jsonl holds one-sequence prefill and decode in llama-bench's shape: from
+llama-bench until 2026-11-08, from llama-server's own timings (single_server.py, "tool": "llama-server") since.
 
 Problems are listed, not hidden: `errors` copies <run dir>/errors.jsonl (run_engine.sh's rows: label, step, reason in
 "error", time in "at"), and any error other than a failed warm-up makes an "ok" run "partial". `short_by_label` names
@@ -25,21 +26,25 @@ from collections import defaultdict
 
 MACHINE = "mac-m3-ultra"
 NAMES = {"up": "llama.cpp master", "fab": "qvac-fabric PR stack", "mlx": "mlx-lm", "omlx": "oMLX",
-         "sglang": "SGLang", "splash": "Splash"}
-BACKEND = {"up": "metal", "fab": "metal", "mlx": "mlx", "omlx": "mlx", "sglang": "mlx", "splash": "metal"}
-WEIGHTS = {"up": "Q4_0 GGUF (pure)", "fab": "Q4_0 GGUF (pure)", "mlx": "MLX 4-bit g64", "omlx": "MLX 4-bit g64",
-           "sglang": "MLX 4-bit g64", "splash": "MLX 4-bit g64"}
+         "sglang": "SGLang", "splash": "Splash", "uzu": "Uzu", "tf": "TensorFold"}
+BACKEND = {"up": "metal", "fab": "metal", "mlx": "mlx", "omlx": "mlx", "sglang": "mlx", "splash": "metal", "uzu": "metal",
+           "tf": "metal"}
+WEIGHTS = {"up": "Q4_0 GGUF (pure)", "fab": "Q4_0 GGUF (pure), FFN partly on the Neural Engines (Core ML)",
+           "mlx": "MLX 4-bit g64", "omlx": "MLX 4-bit g64", "sglang": "MLX 4-bit g64", "splash": "MLX 4-bit g64",
+           "uzu": "Mirai-M 4-bit g64 (Uzu format)", "tf": "TensorFold MLX 4-bit (TensorFold/Qwen3.8-27B-MLX-4bit)"}
 DRAFT = {("up", "mtp"): "GGUF MTP layer", ("fab", "mtp"): "GGUF MTP layer",
          ("up", "dflash2"): "DFlash2 Q4_0 GGUF", ("fab", "dflash2"): "DFlash2 Q4_0 GGUF",
          ("omlx", "mtp"): "MTP head 4-bit (mlx-community)", ("omlx", "dflash2"): "DFlash2 bf16",
-         ("splash", "dflash2"): "DFlash2 bf16, 4-bit at load"}
+         ("splash", "dflash2"): "DFlash2 bf16, 4-bit at load", ("tf", "dflash2"): "DFlash2 (z-lab) + prompt-copy drafts"}
 # the matrix weekly.sh runs: (kind, engine, mode)
-EXPECTED = [("conc", e, m) for e, m in (("omlx", "ar"), ("sglang", "ar"), ("splash", "dflash2"), ("fab", "ar"), ("up", "ar"), ("mlx", "ar"))] \
+EXPECTED = [("conc", e, m) for e, m in (("omlx", "ar"), ("sglang", "ar"), ("splash", "dflash2"), ("fab", "ar"), ("up", "ar"), ("mlx", "ar"),
+                                        ("uzu", "ar"), ("tf", "ar"))] \
     + [("spec", e, m) for e, m in (("up", "ar"), ("up", "mtp"), ("up", "dflash2"), ("fab", "ar"), ("fab", "mtp"), ("fab", "dflash2"),
-                                   ("omlx", "ar"), ("omlx", "mtp"), ("omlx", "dflash2"), ("splash", "dflash2"), ("mlx", "ar"), ("sglang", "ar"))] \
-    + [("concspec", e, m) for e in ("up", "fab", "omlx") for m in ("mtp", "dflash2")] \
+                                   ("omlx", "ar"), ("omlx", "mtp"), ("omlx", "dflash2"), ("splash", "dflash2"), ("mlx", "ar"), ("sglang", "ar"),
+                                   ("uzu", "ar"), ("tf", "ar"), ("tf", "dflash2"))] \
+    + [("concspec", e, m) for e in ("up", "fab", "omlx") for m in ("mtp", "dflash2")] + [("concspec", "tf", "dflash2")] \
     + [("depth", e, m) for e, m in (("up", "ar"), ("fab", "ar"), ("omlx", "ar"), ("mlx", "ar"), ("sglang", "ar"), ("splash", "dflash2"),
-                                    ("up", "dflash2"), ("fab", "dflash2"), ("omlx", "dflash2"))]
+                                    ("uzu", "ar"), ("tf", "ar"), ("up", "dflash2"), ("fab", "dflash2"), ("omlx", "dflash2"), ("tf", "dflash2"))]
 PROMPTS = ["code", "rewrite", "story", "explain"]
 
 
@@ -90,7 +95,8 @@ def versions(run):
             m = re.match(r"""(\w+)=['"](.*)['"]$""", line.strip())
             if m:
                 env[m.group(1)] = m.group(2)
-    keys = {"up": "UP_VER", "fab": "FAB_VER", "mlx": "MLX_VER", "omlx": "OMLX_VER", "sglang": "SGL_VER", "splash": "SPLASH_VER"}
+    keys = {"up": "UP_VER", "fab": "FAB_VER", "mlx": "MLX_VER", "omlx": "OMLX_VER", "sglang": "SGL_VER", "splash": "SPLASH_VER",
+            "uzu": "UZU_VER", "tf": "TF_VER"}
     return [{"engine": e, "name": NAMES[e], "version": env.get(k), "backend": BACKEND[e], "weights": WEIGHTS[e]} for e, k in keys.items()]
 
 
@@ -104,8 +110,9 @@ def main():
 
     single = []
     for e in ("up", "fab"):
-        row = {"engine": e, "backend": BACKEND[e], "tg128": None, "pp512": None}
+        row: dict = {"engine": e, "backend": BACKEND[e], "tg128": None, "pp512": None, "tool": "llama-bench"}
         for r in read_jsonl(os.path.join(run, f"bench-{e}.jsonl")):
+            row["tool"] = r.get("tool", "llama-bench")
             if r.get("n_prompt") == 0:
                 row["tg128"] = round(r["avg_ts"], 2)
             elif r.get("n_gen") == 0:

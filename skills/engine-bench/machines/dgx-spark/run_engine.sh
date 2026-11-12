@@ -9,7 +9,8 @@
 # to first token). Sharing a server across jobs saves vLLM's and SGLang's ~5-minute start.
 # Server sizing:
 #   standard: llama.cpp -np 1 -c 16384 for --mode spec, -np 32 -kvu -c 65536 for --mode conc, -np 1 -c 40960 for a
-#             depth sweep; vLLM and SGLang 32 running requests, 40960-token context.
+#             depth sweep; vLLM and SGLang 32 running requests (SGLang DFlash2: 8, env SGL_MAXREQ), 40960-token
+#             context.
 #   heavy:    tuned for throughput. llama.cpp -np 64 -kvu -c 262144 (DFlash2: -np 32 -c 131072); vLLM 64 sequences, CUDA graphs captured up to 512
 #             tokens (64 sequences x 8 with DFlash2), 8192 batched tokens, 131072 context; SGLang 64 running requests,
 #             decode CUDA graphs up to 64, 8192-token prefill chunks, 131072 context (env SGL_MAXREQ lowers the 64).
@@ -75,6 +76,10 @@ case $ENG in
     if [ $PROFILE = heavy ]; then CMD+=(--max-running-requests ${SGL_MAXREQ:-64} --cuda-graph-max-bs-decode ${SGL_MAXREQ:-64} --chunked-prefill-size 8192 --context-length 131072)
       # 64 requests with speculation need more Mamba state than 0.6 leaves (seen 2026-10-21)
       [ $MODE != ar ] && for i in "${!CMD[@]}"; do [ "${CMD[$i]}" = "--mem-fraction-static" ] && CMD[$((i + 1))]=0.68; done
+    # standard DFlash2: without the radix cache SGLang reserves recurrent state for every running request plus a copy
+    # per draft position (block 8), ~1.3 GB per request: 42 GB at 32, which left a 662-4413-token KV pool (the 861-token
+    # rewrite prompt was rejected, C=8 retracted requests). Its server runs only spec and concspec (C <= 8).
+    elif [ $MODE = dflash2 ]; then CMD+=(--max-running-requests ${SGL_MAXREQ:-8} --context-length 40960)
     else CMD+=(--max-running-requests 32 --context-length 40960); fi
     case $MODE in
       mtp) CMD+=(--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4) ;;

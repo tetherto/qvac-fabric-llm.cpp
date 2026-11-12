@@ -2,7 +2,9 @@
 """OpenAI-compatible load generator for llama-server vs mlx_lm.server.
 
 Uses /v1/completions with a hand-formatted Qwen chat prompt so both servers see
-identical tokens (no chat-template differences).
+identical tokens (no chat-template differences). --chat sends the same user text
+through /v1/chat/completions with thinking off instead, for servers without
+/v1/completions (Uzu); Qwen's template then renders the same prompt.
 """
 import zlib
 import argparse
@@ -56,11 +58,11 @@ def make_doc_prompts(corpus, n, approx_tokens, nonce, long_output=False):
         if long_output:
             # open-ended task that runs far past any max_tokens we use, so no engine needs EOS suppression
             topic = ESSAY_TOPICS[i % len(ESSAY_TOPICS)]
-            out.append(fmt(f"[req {nonce}-{i}] Background document:\n\n{chunk}\n\nUsing the document above only as loose background, "
-                           f"write an extremely long, exhaustive essay of at least 5000 words on {topic}. "
-                           f"Cover every aspect in depth, with many sections and examples. Do not stop early."))
+            out.append(f"[req {nonce}-{i}] Background document:\n\n{chunk}\n\nUsing the document above only as loose background, "
+                       f"write an extremely long, exhaustive essay of at least 5000 words on {topic}. "
+                       f"Cover every aspect in depth, with many sections and examples. Do not stop early.")
         else:
-            out.append(fmt(f"[req {nonce}-{i}] Summarize the following document in detail, section by section:\n\n{chunk}"))
+            out.append(f"[req {nonce}-{i}] Summarize the following document in detail, section by section:\n\n{chunk}")
     return out
 
 
@@ -76,7 +78,8 @@ def request(url, body, timeout=1800) -> dict:
     u = urlparse(url)
     conn = http.client.HTTPConnection(u.hostname, u.port, timeout=timeout)
     t0 = time.perf_counter()
-    conn.request("POST", "/v1/completions", body=json.dumps(body), headers={"Content-Type": "application/json"})
+    path = "/v1/chat/completions" if "messages" in body else "/v1/completions"
+    conn.request("POST", path, body=json.dumps(body), headers={"Content-Type": "application/json"})
     resp = conn.getresponse()
     if resp.status != 200:
         raise RuntimeError(f"HTTP {resp.status}: {resp.read()[:500]}")
@@ -98,11 +101,13 @@ def request(url, body, timeout=1800) -> dict:
         if ev.get("usage"):
             usage = ev["usage"]
         ch = ev.get("choices") or []
-        if ch and ch[0].get("text"):
+        delta = (ch[0].get("delta") or {}) if ch else {}
+        piece = (ch[0].get("text") or delta.get("content") or delta.get("reasoning_content")) if ch else None
+        if piece:
             if t_first is None:
                 t_first = time.perf_counter()
             n_chunks += 1
-            text.append(ch[0]["text"])
+            text.append(piece)
         if ev.get("timings"):
             usage = usage or {}
             usage["timings"] = ev["timings"]
@@ -114,9 +119,14 @@ def request(url, body, timeout=1800) -> dict:
                 p_tok=ptok, text="".join(text), timings=(usage or {}).get("timings"))
 
 
-def base_body(args, prompt, max_tokens, ban_eos):
-    b: dict = dict(prompt=prompt, max_tokens=max_tokens, temperature=0.0, top_p=1.0, stream=True,
+def base_body(args, user, max_tokens, ban_eos):
+    b: dict = dict(max_tokens=max_tokens, temperature=0.0, top_p=1.0, stream=True,
                    stream_options={"include_usage": True}, cache_prompt=False)
+    if args.chat:
+        b["messages"] = [{"role": "user", "content": user}]
+        b["chat_template_kwargs"] = {"enable_thinking": False}
+    else:
+        b["prompt"] = fmt(user)
     if args.model:
         b["model"] = args.model
     if ban_eos and not args.long_output:
@@ -129,7 +139,7 @@ def run_conc(args):
     corpus = load_corpus(args.corpus)
     results = []
     # warmup
-    request(args.url, base_body(args, fmt("Hello, say hi."), 16, True))
+    request(args.url, base_body(args, "Hello, say hi.", 16, True))
     for C in [int(c) for c in args.concurrency.split(",")]:
         nonce = f"{args.label}-{C}-{time.time_ns()}"
         nreq = C * args.rounds
@@ -175,12 +185,12 @@ def run_spec(args):
     off = rnd.randrange(0, len(corpus) - 4000)
     prompts: dict[str, str] = {k: v or "" for k, v in SPEC_PROMPTS.items()}
     prompts["rewrite"] = "Rewrite the following text verbatim, but fix any typos and convert headings to bold text:\n\n" + corpus[off:off + 3000]
-    request(args.url, base_body(args, fmt("Hello, say hi."), 16, False))
+    request(args.url, base_body(args, "Hello, say hi.", 16, False))
     results = []
     for name, p in prompts.items():
         for rep in range(args.reps):
             prefix = f"[spec-{rep}]\n" if args.fixed_prefix else f"[{args.label}-{rep}-{time.time_ns()}]\n"
-            r = request(args.url, base_body(args, fmt(prefix + p), args.gen, False))
+            r = request(args.url, base_body(args, prefix + p, args.gen, False))
             dec_tps = (r["n_tok"] - 1) / (r["t_end"] - r["t_first"]) if r["n_tok"] > 1 else None
             row = dict(mode="spec", label=args.label, prompt=name, rep=rep, n_tok=r["n_tok"], p_tok=r["p_tok"],
                        ttft_s=round(r["t_first"] - r["t0"], 3), e2e_s=round(r["t_end"] - r["t0"], 2),
@@ -209,6 +219,7 @@ if __name__ == "__main__":
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default=None, help="model id to send (required by some servers, e.g. oMLX)")
     ap.add_argument("--long-output", action="store_true", help="open-ended essay prompts, no EOS suppression")
+    ap.add_argument("--chat", action="store_true", help="send /v1/chat/completions with thinking off instead of a formatted prompt")
     ap.add_argument("--eos-ids", type=lambda s: [int(x) for x in s.split(",")], default=EOS_IDS)
     a = ap.parse_args()
     rows = run_conc(a) if a.mode == "conc" else run_spec(a)

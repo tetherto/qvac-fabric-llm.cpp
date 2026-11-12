@@ -3,9 +3,11 @@
 
 usage: report.py <summary.json or run dir>... [--previous <summary.json or run dir>...] [--threshold 5] [-o report.md]
 
-One section per run: hardware, versions, problems (status, missing cells, errors, short outputs, notes), llama-bench,
-one request per speculative mode, concurrency with and without speculation, long-prompt concurrency, and prefill and
-decode by depth, each per profile. With --previous, each run is compared with the previous run of the same machine:
+One section per run: hardware, versions, weights provenance, problems (status, missing cells, errors, short outputs,
+output checks, notes), one-sequence prefill and decode (llama-bench, or llama-server timings where `single` rows say
+"tool": "llama-server"), one request per speculative mode, concurrency with and without speculation, long-prompt
+concurrency, and prefill and decode by depth, each per profile. Any machine id and engine key works; names come from
+the run's `versions`. With --previous, each run is compared with the previous run of the same machine:
 every metric that moved by more than the threshold is listed with its job's start time, and whether the engine's
 version changed. Drops that cluster in one time window, or hit engines whose version did not change, usually mean
 another user loaded the shared machine: re-run those jobs before trusting them.
@@ -13,11 +15,13 @@ another user loaded the shared machine: re-run those jobs before trusting them.
 import argparse
 import json
 import os
+import re
 import sys
 
 MODES = ["ar", "mtp", "dflash2"]
 MODE_NAME = {"ar": "no speculation", "mtp": "MTP", "dflash2": "DFlash2"}
 LONG_PROMPT = 2000  # mean prompt tokens per request from which a conc row counts as a long-prompt run
+SINGLE_KEY = re.compile(r"(pp|tg)(\d+)$")  # one-sequence columns: pp512, pp4096, tg128, ...
 
 
 def load(path):
@@ -70,10 +74,39 @@ class Run:
         n = self.names.get(r["engine"], r["engine"])
         return f"{n} ({r.get('backend')})" if r["engine"] in self.multi else n
 
+    def mode_name(self, ref):
+        """'fab ar' (a check's reference) -> 'qvac-fabric ... no speculation'."""
+        e, _, m = ref.partition(" ")
+        return f"{self.names.get(e, e)} {MODE_NAME.get(m, m)}".strip()
+
     def order(self, rows):
         seen = {v["engine"]: i for i, v in enumerate(self.s.get("versions", []))}
         return sorted(rows, key=lambda r: (seen.get(r["engine"], 99), r["engine"], str(r.get("backend")),
                                            MODES.index(r["mode"]) if r.get("mode") in MODES else 9))
+
+
+def single_keys(rows):
+    """pp<N> columns by size, then tg<N>."""
+    keys = {m.groups() for r in rows for k in r if (m := SINGLE_KEY.match(k))}
+    return [f"{a}{n}" for a, n in sorted(keys, key=lambda x: (x[0] == "tg", int(x[1])))]
+
+
+def tool(r):
+    return r.get("tool") or "llama-bench"
+
+
+def job_time(jobs, kinds, r):
+    """Start time of the job behind a row: label <kind>-<engine>-<mode>[-<profile>][-<backend>]."""
+    prof = r.get("profile", "standard")
+    for kind in kinds:
+        base = "-".join(x for x in (kind, r["engine"], r.get("mode", "ar"), None if prof == "standard" else prof) if x)
+        if base in jobs:
+            return jobs[base]
+        hits = [j for j in jobs if j.startswith(base + "-")]
+        best = [j for j in hits if j == f"{base}-{r.get('backend')}"] or hits
+        if best:
+            return jobs[best[0]]
+    return ""
 
 
 def profiles(rows):
@@ -86,7 +119,11 @@ def section(run):
     hw = s.get("hardware", {})
     out += [f"## {s.get('machine')} - {s.get('date')} ({s.get('status')})", ""]
     out += [f"- **Hardware:** {hw.get('chip', '?')}; {hw.get('gpu', '?')}; {hw.get('memory_gb', '?')} GB; {hw.get('os', '?')}"]
-    out += [f"- **Run:** {s.get('started', '?')} to {s.get('finished', '?')}"]
+    if hw.get("nodes") or hw.get("link"):
+        nodes = hw.get("nodes")
+        out += [f"- **Nodes:** {', '.join(nodes) if isinstance(nodes, list) else nodes or '?'}"
+                + (f"; link: {hw['link']}" if hw.get("link") else "")]
+    out += [f"- **Run:** {s.get('started', '?')} to {s.get('finished', '?')}" + (f" on {s['host']}" if s.get("host") else "")]
     if s.get("reason"):
         out += [f"- **Reason:** {s['reason']}"]
     out += [""]
@@ -94,6 +131,9 @@ def section(run):
     out += table(["engine", "version", "backend", "weights"],
                  [[v.get("name", v["engine"]), v.get("version", ""), v.get("backend", ""), v.get("weights", "")]
                   for v in s.get("versions", [])])
+    prov = s.get("provenance") or {}
+    if prov:
+        out += ["### Weights provenance", ""] + [f"- {k}: {v}" for k, v in prov.items()] + [""]
 
     probs = []
     for m in s.get("missing") or []:
@@ -107,16 +147,24 @@ def section(run):
         probs.append(f"- short outputs: {s['short_outputs']} requests stopped before the requested length")
     for c in s.get("checks") or []:
         if c.get("same") is not None and c.get("of") and c["same"] < c["of"]:
-            probs.append(f"- output check: {c['engine']} {c['mode']} ({c.get('profile')}) matched {c.get('reference')} on "
-                         f"{c['same']} of {c['of']} texts")
+            probs.append(f"- output check: {run.mode_name(c['engine'] + ' ' + c['mode'])} ({c.get('profile')}) matched "
+                         f"{run.mode_name(c.get('reference') or '')} on {c['same']} of {c['of']} texts")
+    for r in run.order(s.get("spec", [])):
+        if r.get("differs"):
+            ref = run.names.get("up", "up") if r["mode"] == "ar" else "its own run"
+            probs.append(f"- output check: {run.eng(r)} {MODE_NAME.get(r['mode'], r['mode'])} ({r.get('profile', 'standard')}): "
+                         f"the start of the text differs from {ref} without speculation on: {r['differs']}")
     for n in s.get("notes") or []:
         probs.append(f"- note: {n}")
     out += ["### Problems", ""] + (probs or ["- none recorded"]) + [""]
 
     single = run.order(s.get("single", []))
-    if single:
-        out += ["### llama-bench, one sequence (t/s)", ""]
-        out += table(["engine", "pp512", "tg128"], [[run.eng(r), fmt(r.get("pp512")), fmt(r.get("tg128"))] for r in single])
+    for t in sorted({tool(r) for r in single}):
+        part = [r for r in single if tool(r) == t]
+        keys = single_keys(part)
+        how = "llama-server timings" if t == "llama-server" else t
+        out += [f"### One sequence, {how} (t/s)", ""]
+        out += table(["engine"] + keys, [[run.eng(r)] + [fmt(r.get(k)) for k in keys] for r in part])
 
     for prof, rows in profiles(s.get("spec", [])):
         out += [f"### One request, decode t/s by mode ({prof})", ""]
@@ -128,10 +176,12 @@ def section(run):
             cells = []
             for m in MODES:
                 r = ms.get(m)
-                cells.append("-" if not r else fmt(r.get("mean")) + (f" ({r['acc']:.0f}% acc)" if r.get("acc") else ""))
+                extra = ", ".join(x for x in (f"{r['acc']:.0f}% acc" if r and r.get("acc") else "", (r or {}).get("flags") or "") if x)
+                cells.append("-" if not r else fmt(r.get("mean")) + (f" ({extra})" if extra else ""))
             body.append([run.eng({"engine": e, "backend": b})] + cells)
         out += table(["engine"] + [MODE_NAME[m] for m in MODES], body)
 
+    cacc = s.get("concspec_acc") or {}
     for prof, rows in profiles(s.get("conc", [])):
         short = [r for r in rows if (r.get("prompt") or 0) < LONG_PROMPT]
         long_ = [r for r in rows if (r.get("prompt") or 0) >= LONG_PROMPT]
@@ -148,6 +198,8 @@ def section(run):
                     keyed.setdefault((r["engine"], r.get("backend"), r["mode"]), {})[r["c"]] = r
                 for (e, b, m), byc in keyed.items():
                     name = run.eng({"engine": e, "backend": b}) + (f" {MODE_NAME[m]}" if spec or m != "ar" else "")
+                    a = cacc.get(f"{e}/{m}" + ("" if prof == "standard" else f"/{prof}"))
+                    name += f" ({a:.0f}% acc)" if a else ""
                     body.append([name] + [f"{fmt(byc[c]['gen'])} ({fmt(byc[c].get('ttft'), 2)})" if c in byc else "-"
                                           for c in cs])
                 out += table(["engine"] + [f"C={c}" for c in cs], body)
@@ -174,45 +226,48 @@ def section(run):
 
 
 def metrics(run):
-    """(key, label, value, job label) for every number worth comparing between runs."""
+    """(key, label, value, job start time, tool) for every number worth comparing between runs."""
     s, out = run.s, []
+    jobs = s.get("jobs") or {}
     for r in s.get("single", []):
-        for k in ("pp512", "tg128"):
-            out.append((("single", r["engine"], r.get("backend"), k), f"{run.eng(r)} llama-bench {k}", r.get(k), None))
+        for k in single_keys([r]):
+            out.append((("single", r["engine"], r.get("backend"), k), f"{run.eng(r)} one sequence {k}", r.get(k),
+                        job_time(jobs, ("single",), r), tool(r)))
     for r in s.get("spec", []):
         p = r.get("profile", "standard")
         out.append((("spec", r["engine"], r.get("backend"), r["mode"], p), f"{run.eng(r)} one request {MODE_NAME[r['mode']]}",
-                    r.get("mean"), f"spec-{r['engine']}-{r['mode']}"))
+                    r.get("mean"), job_time(jobs, ("spec",), r), None))
     for r in s.get("conc", []):
         p = r.get("profile", "standard")
         lng = (r.get("prompt") or 0) >= LONG_PROMPT
-        kind = "concspec" if r["mode"] != "ar" else "conc"
+        # speculative modes run as concspec, except engines that always speculate (Splash runs as conc)
+        kinds = ("concspec", "conc") if r["mode"] != "ar" else ("conc",)
         out.append((("conc", r["engine"], r.get("backend"), r["mode"], p, lng, r["c"]),
                     f"{run.eng(r)} {MODE_NAME[r['mode']]} C={r['c']}{' long' if lng else ''} total", r.get("gen"),
-                    f"{kind}-{r['engine']}-{r['mode']}"))
+                    job_time(jobs, kinds, r), None))
     bks = buckets([r["depth"] for r in s.get("depth", [])])
     for r in s.get("depth", []):
         b = next(name for name, members in bks if r["depth"] in members)
         for k, what in (("pp", "prefill"), ("tg", "decode")):
             out.append((("depth", r["engine"], r.get("backend"), r["mode"], r.get("profile", "standard"), b, k),
-                        f"{run.eng(r)} {MODE_NAME[r['mode']]} {what} at {b}", r.get(k), f"depth-{r['engine']}-{r['mode']}"))
+                        f"{run.eng(r)} {MODE_NAME[r['mode']]} {what} at {b}", r.get(k), job_time(jobs, ("depth",), r), None))
     return out
 
 
 def compare(run, prev, threshold):
-    old = {k: v for k, _, v, _ in metrics(prev)}
-    jobs = run.s.get("jobs") or {}
+    old = {k: (v, t) for k, _, v, _, t in metrics(prev)}
     rows = []
-    for k, label, v, job in metrics(run):
-        o = old.get(k)
+    for k, label, v, started, t in metrics(run):
+        o, ot = old.get(k, (None, None))
         if not o or v is None:
             continue
         d = 100.0 * (v - o) / o
         if abs(d) <= threshold:
             continue
         ver = "changed" if run.vers.get((k[1], k[2])) != prev.vers.get((k[1], k[2])) else "same"
-        t = next((jobs[j] for j in jobs if job and (j == job or j.startswith(job + "-"))), "")
-        rows.append((abs(d), [label, fmt(o), fmt(v), f"{d:+.1f}%", ver, t]))
+        if t != ot:
+            ver += f", {ot} -> {t}"
+        rows.append((abs(d), [label, fmt(o), fmt(v), f"{d:+.1f}%", ver, started]))
     rows.sort(key=lambda x: -x[0])
     out = [f"### Changes over {threshold:g}% since {prev.s.get('date')}", ""]
     if not rows:
@@ -237,7 +292,8 @@ def main():
             prev[r.s["machine"]] = r
     out = ["# Qwen3.8-27B engine benchmark report", "",
            "Totals and per-request rates are measured by bench_client.py through each engine's OpenAI-compatible server "
-           "(greedy, prefix caching off). Prefill t/s by depth is prompt tokens / time to first token. Numbers from "
+           "(greedy, prefix caching off). Prefill t/s by depth is prompt tokens / time to first token. One-sequence "
+           "tables come from llama-bench or from llama-server's own timings, as their titles say. Numbers from "
            "different machines use different weights formats (see Versions) and are not directly comparable.", ""]
     for run in runs:
         out += section(run)

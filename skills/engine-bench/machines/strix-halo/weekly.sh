@@ -32,7 +32,7 @@ while [ -e $LOCK ] || ps -eo args | grep -E "$BUSY" | grep -v grep >/dev/null ||
   [ $(date +%s) -gt $deadline ] && fail "GPU busy for 6 hours ($(cat $LOCK 2>/dev/null; ps -eo user,args | grep -E "$BUSY" | grep -v grep | head -3))"
   sleep 60
 done
-echo "$USER weekly bench since $(date +%H:%M) (pid $$)" > $LOCK
+echo "${USER:-$(id -un)} weekly bench since $(date +%H:%M) (pid $$)" > $LOCK
 trap 'rm -f $LOCK' EXIT
 echo "lock taken $(date)"
 

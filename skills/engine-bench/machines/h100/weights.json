@@ -1,0 +1,51 @@
+{
+    "machine": "h100",
+    "engines": {
+        "up": {
+            "name": "llama.cpp master",
+            "weights": "Q8_0 GGUF (unsloth @ 4ca7207)",
+            "draft": {
+                "mtp": "model MTP layer (Q8_0 in the GGUF)",
+                "dflash2": "DFlash2 Q8_0 GGUF"
+            }
+        },
+        "fab": {
+            "name": "qvac-fabric temp-11259",
+            "weights": "Q8_0 GGUF (unsloth @ 4ca7207)",
+            "draft": {
+                "mtp": "model MTP layer (Q8_0 in the GGUF)",
+                "dflash2": "DFlash2 Q8_0 GGUF"
+            }
+        },
+        "fab0": {
+            "name": "qvac-fabric temp-11259, deferred off",
+            "weights": "Q8_0 GGUF (unsloth @ 4ca7207)",
+            "draft": {
+                "mtp": "model MTP layer (Q8_0 in the GGUF)",
+                "dflash2": "DFlash2 Q8_0 GGUF"
+            }
+        },
+        "vllm": {
+            "name": "vLLM",
+            "weights": "FP8 (Qwen, e4m3 128x128 blocks)",
+            "draft": {
+                "mtp": "model MTP head (FP8)",
+                "dflash2": "DFlash2 bf16"
+            }
+        },
+        "sglang": {
+            "name": "SGLang",
+            "weights": "FP8 (Qwen, e4m3 128x128 blocks)",
+            "draft": {
+                "mtp": "model MTP head (FP8)",
+                "dflash2": "DFlash2 bf16"
+            }
+        }
+    },
+    "provenance": {
+        "hf": "Qwen/Qwen3.8-27B-FP8 @ 017b9c7 (block-wise FP8 e4m3, 128x128 weight blocks, dynamic activation scales; MTP head FP8; 29 GB)",
+        "gguf": "unsloth/Qwen3.8-27B-GGUF @ 4ca7207, Qwen3.8-27B-Q8_0.gguf (Q8_0 from the BF16 model, MTP layer included as blk.64; 29.0 GB)",
+        "draft_hf": "z-lab/Qwen3.8-27B-DFlash2 @ 50307d4, bf16",
+        "draft_gguf": "z-lab/Qwen3.8-27B-DFlash2-GGUF @ 2d9571f, Q8_0"
+    }
+}

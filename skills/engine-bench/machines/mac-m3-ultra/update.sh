@@ -1,9 +1,10 @@
 #!/bin/bash
 # usage: update.sh <run dir>
-# Brings every engine to its latest version: llama.cpp master and the qvac-fabric PR stack branch (rebuilt when their
-# head moves), mlx-lm and mlx from PyPI, oMLX, SGLang and Splash from their latest GitHub releases. Each new version is
-# installed into its own folder and only becomes current once it installs and passes a quick check, so a failed
-# update keeps the previous install. Writes engines.env (paths and versions) and <run dir>/updates.txt.
+# Brings every engine to its latest version: llama.cpp master and qvac-fabric's temp branch with its Core ML FFN
+# sidecar (rebuilt when their head moves), mlx-lm, mlx and Uzu's Python package from PyPI, oMLX, SGLang, Splash and
+# TensorFold from their latest GitHub releases. Each new version is installed into its own folder and only becomes
+# current once it installs and passes a quick check, so a failed update keeps the previous install. Writes
+# engines.env (paths, versions, qvac-fabric's server flags) and <run dir>/updates.txt.
 set -u
 RUN=$1; W=${BENCH_DIR:-$HOME/bench-weekly}
 export PATH=/opt/homebrew/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin
@@ -16,9 +17,9 @@ gh_latest() { curl -sSf https://api.github.com/repos/$1/releases/latest | python
 pypi_latest() { curl -sSf https://pypi.org/pypi/$1/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])'; }
 
 # llama.cpp-style tree: fetch the branch head, build static llama-server/llama-bench, copy them to bin/<name>-<sha>
-# usage: build_llama <name> <url> <branch>; on success sets NEW_BIN and NEW_VER
+# usage: build_llama <name> <url> <branch> [extra cmake flags...]; on success sets NEW_BIN and NEW_VER
 build_llama() {
-  local name=$1 url=$2 br=$3 src=$W/src/$1 sha day dst
+  local name=$1 url=$2 br=$3 src=$W/src/$1 sha day dst; shift 3
   if [ ! -d $src/.git ]; then
     git clone -q --depth 1 --branch $br $url $src || return 1
   else
@@ -28,7 +29,7 @@ build_llama() {
   dst=$W/bin/$name-$sha
   if [ ! -x $dst/llama-server ]; then
     cmake -S $src -B $src/build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
-        -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF > $RUN/logs/cmake-$name.log 2>&1 || return 1
+        -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF "$@" > $RUN/logs/cmake-$name.log 2>&1 || return 1
     cmake --build $src/build -j 16 --target llama-server llama-bench > $RUN/logs/build-$name.log 2>&1 || return 1
     mkdir -p $dst.tmp && cp $src/build/bin/llama-server $src/build/bin/llama-bench $dst.tmp/ && mv $dst.tmp $dst || return 1
   fi
@@ -42,8 +43,13 @@ update_llama() {
   UP_BIN=$NEW_BIN; UP_VER=$NEW_VER
 }
 
+# qvac-fabric: the newest temp branch, built with -DLLAMA_COREML=ON. FAB_ARGS turns the Core ML FFN sidecar on: part of
+# each prefill FFN runs on the Neural Engines (programs compiled into the cache on first start, 1-2 min, about 8 GB)
+FAB_BRANCH=${FAB_BRANCH:-temp-11739}
+FAB_ARGS="--coreml-ffn --coreml-ffn-cache $W/coreml-ffn-cache -ub 2048"
 update_fabric() {
-  build_llama fabric https://github.com/tetherto/qvac-fabric-llm.cpp.git temp-11259 || return 1
+  build_llama fabric https://github.com/tetherto/qvac-fabric-llm.cpp.git $FAB_BRANCH -DLLAMA_COREML=ON || return 1
+  NEW_VER="$NEW_VER, Core ML FFN sidecar on"
   [ "${FAB_VER:-}" != "$NEW_VER" ] && note "qvac-fabric: ${FAB_VER:-none} -> $NEW_VER" || note "qvac-fabric: unchanged, $NEW_VER"
   FAB_BIN=$NEW_BIN; FAB_VER=$NEW_VER
 }
@@ -102,7 +108,35 @@ update_splash() {
   SPLASH_DIR=$d/splash-$ver-arm64-macos26; SPLASH_VER=$ver
 }
 
-for e in llama fabric mlx omlx sglang splash; do
+update_uzu() {
+  # Mirai's Python package, served by uzu_server.py: the prebuilt `mirai` CLI needs a macOS login keychain to start,
+  # which cron and SSH sessions do not have
+  local ver d
+  ver=$(pypi_latest uzu) || return 1
+  [ "${UZU_VER:-}" = "$ver" ] && [ -x "${UZU_PY:-}" ] && { note "Uzu: unchanged, $ver"; return 0; }
+  d=$W/venvs/uzu-$ver; rm -rf $d
+  { uv venv -q -p 3.12 $d && uv pip install --python $d/bin/python "uzu==$ver" aiohttp; } > $RUN/logs/install-uzu.log 2>&1 || return 1
+  $d/bin/python -c "import uzu, aiohttp" || return 1
+  note "Uzu: ${UZU_VER:-none} -> $ver"
+  UZU_PY=$d/bin/python; UZU_VER=$ver
+}
+
+update_tensorfold() {
+  # the macOS release archive, unpacked into its own folder (a system-wide /opt/tensorfold, if any, is left alone)
+  local tag ver d a u
+  tag=$(gh_latest ashhart/TensorFold) || return 1; ver=${tag#v}
+  [ "${TF_VER:-}" = "$ver" ] && [ -x "${TF_BIN:-}" ] && { note "TensorFold: unchanged, $ver"; return 0; }
+  d=$W/engines/tensorfold-$ver; rm -rf $d; mkdir -p $d
+  a=tensorfold-$ver-macos-arm64.tar.gz; u=https://github.com/ashhart/TensorFold/releases/download/$tag
+  curl -sSfL -o $d/$a $u/$a && curl -sSfL -o $d/$a.sha256 $u/$a.sha256 || return 1
+  [ "$(shasum -a 256 $d/$a | cut -d' ' -f1)" = "$(cut -d' ' -f1 $d/$a.sha256)" ] || { echo "TensorFold checksum mismatch"; return 1; }
+  tar -xzf $d/$a -C $d && rm -f $d/$a || return 1
+  [ "$($d/tensorfold-$ver-macos-arm64/bin/tensorfold-native --version 2>/dev/null | awk '{print $2}')" = "$ver" ] || return 1
+  note "TensorFold: ${TF_VER:-none} -> $ver"
+  TF_BIN=$d/tensorfold-$ver-macos-arm64/bin/tensorfold-native; TF_VER=$ver
+}
+
+for e in llama fabric mlx omlx sglang splash uzu tensorfold; do
   update_$e || { note "$e: update FAILED, keeping the previous install"; ERR=1; }
 done
 
@@ -111,6 +145,7 @@ UP_BIN='${UP_BIN:-}'
 UP_VER='${UP_VER:-}'
 FAB_BIN='${FAB_BIN:-}'
 FAB_VER='${FAB_VER:-}'
+FAB_ARGS='${FAB_ARGS:-}'
 MLX_PY='${MLX_PY:-}'
 MLX_VER='${MLX_VER:-}'
 OMLX_DIR='${OMLX_DIR:-}'
@@ -119,6 +154,10 @@ SGL_DIR='${SGL_DIR:-}'
 SGL_VER='${SGL_VER:-}'
 SPLASH_DIR='${SPLASH_DIR:-}'
 SPLASH_VER='${SPLASH_VER:-}'
+UZU_PY='${UZU_PY:-}'
+UZU_VER='${UZU_VER:-}'
+TF_BIN='${TF_BIN:-}'
+TF_VER='${TF_VER:-}'
 EOF
 mv $W/engines.env.new $W/engines.env
 
@@ -132,4 +171,5 @@ prune() { # <dir> <glob prefix> <current path>
 }
 prune $W/bin llama- "$UP_BIN"; prune $W/bin fabric- "$FAB_BIN"; prune $W/venvs mlx-lm- "$(dirname "$(dirname "${MLX_PY:-x/x/x}")")"
 prune $W/engines omlx- "${OMLX_DIR:-}"; prune $W/engines sglang- "${SGL_DIR:-}"; prune $W/engines splash- "${SPLASH_DIR:-}"
+prune $W/venvs uzu- "$(dirname "$(dirname "${UZU_PY:-x/x/x}")")"; prune $W/engines tensorfold- "${TF_BIN:-}"
 exit $ERR
