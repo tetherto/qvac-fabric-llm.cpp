@@ -4,6 +4,7 @@
 #include "ggml-vulkan/ggml-vulkan-capacity.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -17,6 +18,23 @@ void check(bool condition, const char * message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+void set_test_limit(const char * name, size_t value) {
+    const std::string text = std::to_string(value);
+#ifdef _WIN32
+    const int result = _putenv_s(name, text.c_str());
+#else
+    const int result = setenv(name, text.c_str(), 1);
+#endif
+    check(result == 0, "could not configure Vulkan test limits");
+}
+
+void configure_test_limits() {
+    constexpr size_t BUFFER_LIMIT = 2 * DEVICE_CAPACITY;
+    set_test_limit("GGML_VK_FORCE_MAX_ALLOCATION_SIZE", DEVICE_CAPACITY);
+    set_test_limit("GGML_VK_FORCE_MAX_BUFFER_SIZE", BUFFER_LIMIT);
+    set_test_limit("GGML_VK_SUBALLOCATION_BLOCK_SIZE", CHUNK_SIZE);
 }
 
 void check_vulkan_capacity_limits() {
@@ -125,6 +143,7 @@ void check_vulkan_provider() {
 }
 
 int main() try {
+    configure_test_limits();
     check_vulkan_capacity_limits();
     check_vulkan_provider();
     std::puts("test-vulkan-buffer-capacity: all checks passed");
