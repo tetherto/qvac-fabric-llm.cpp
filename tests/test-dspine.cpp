@@ -840,6 +840,48 @@ static int run_load_cases() {
     return failures;
 }
 
+static constexpr size_t  LATTICE_DRAFTS = 15;
+static constexpr int32_t KEEP_SHORT     = 7;
+
+// a lattice path whose first KEEP_SHORT transitions have probability p_head and the rest p_tail
+struct keep_case {
+    const char * name;
+    float        p_head;
+    float        p_tail;
+    size_t       n;
+    int32_t      n_short;
+    float        long_cost;
+    size_t       expected;
+};
+
+static bool run_keep_case(const keep_case & c) {
+    std::vector<float> path_p(c.n, c.p_tail);
+    std::fill(path_p.begin(), path_p.begin() + std::min(c.n, (size_t) KEEP_SHORT), c.p_head);
+    const size_t kept = common_speculative_lattice_keep(path_p.data(), c.n, c.n_short, c.long_cost);
+    if (kept != c.expected) {
+        fprintf(stderr, "FAIL: %s: kept %zu drafts, expected %zu\n", c.name, kept, c.expected);
+    }
+    return kept == c.expected;
+}
+
+// at p = 0.5 the short and full drafts expect 1 - 2^-7 and 1 - 2^-15 accepted tokens: break-even at a cost of ~1.0039
+static int run_keep_cases() {
+    static const keep_case cases[] = {
+        { "rule off",                        0.99f, 0.1f,  LATTICE_DRAFTS, 0,          1.4f,   LATTICE_DRAFTS },
+        { "path no longer than n_short",     0.99f, 0.99f, 5,              KEEP_SHORT, 1.4f,   5              },
+        { "confident path pays its cost",    0.99f, 0.99f, LATTICE_DRAFTS, KEEP_SHORT, 1.4f,   LATTICE_DRAFTS },
+        { "fading path does not pay",        0.99f, 0.1f,  LATTICE_DRAFTS, KEEP_SHORT, 1.4f,   KEEP_SHORT     },
+        { "no extra cost keeps every draft", 0.99f, 0.1f,  LATTICE_DRAFTS, KEEP_SHORT, 1.0f,   LATTICE_DRAFTS },
+        { "cost just above break-even",      0.5f,  0.5f,  LATTICE_DRAFTS, KEEP_SHORT, 1.005f, KEEP_SHORT     },
+        { "cost just below break-even",      0.5f,  0.5f,  LATTICE_DRAFTS, KEEP_SHORT, 1.003f, LATTICE_DRAFTS },
+    };
+    int failures = 0;
+    for (const auto & c : cases) {
+        failures += run_keep_case(c) ? 0 : 1;
+    }
+    return failures;
+}
+
 static int expect(bool ok, const char * failure) {
     if (!ok) {
         fprintf(stderr, "FAIL: %s\n", failure);
@@ -853,6 +895,7 @@ int main() {
     printf("%s: CPU repacks Q4_0 %d (features: %s)\n", __func__, cpu_repacks_q4_0(), joined(cpu_features()).c_str());
 
     int failures = run_load_cases();
+    failures += run_keep_cases();
     failures += expect(check_dspine_detected(), "a DSpine draft is not reported by llama_model_is_dspine");
     failures += expect(check_lattice(1, BLOCK_SIZE), "DSpine lattice of one block does not match the reference");
     failures += expect(check_lattice(MAX_BLOCKS, BLOCK_SIZE), "DSpine lattice of two blocks in one ubatch does not match the reference");
