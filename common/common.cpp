@@ -1246,6 +1246,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // a draft model for another model aborts on a ggml assert once it is fitted or loaded next to this one
+    const std::string draft_mismatch = common_speculative_draft_mismatch(params, params.model.path);
+    if (!draft_mismatch.empty()) {
+        COM_ERR("the draft model '%s' does not match the model '%s': %s\n",
+                params.speculative.draft.mparams.path.c_str(), params.model.path.c_str(), draft_mismatch.c_str());
+        return;
+    }
+
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");

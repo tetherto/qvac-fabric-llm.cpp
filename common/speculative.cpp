@@ -2527,7 +2527,12 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
 
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
     if (arch != "dflash") {
-        const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
+        const int64_t block_count_id = gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str());
+        if (block_count_id < 0 || gguf_get_kv_type(gguf_ctx.get(), block_count_id) != GGUF_TYPE_UINT32 ||
+                gguf_get_val_u32(gguf_ctx.get(), block_count_id) == 0) {
+            return {};
+        }
+        const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), block_count_id);
 
         if (gguf_find_tensor(gguf_ctx.get(), ("blk." + std::to_string(block_count - 1) + ".nextn.eh_proj.weight").c_str()) >= 0) {
             return { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
@@ -2544,6 +2549,162 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
     SPC_INF("auto-detected speculative type '%s' from the draft model metadata\n", common_speculative_type_to_str(type).c_str());
 
     return { type };
+}
+
+// the header values the draft/model match depends on; 0 or empty when absent
+struct common_speculative_gguf_header {
+    std::string          arch;
+    int64_t              n_embd     = 0; // <arch>.embedding_length
+    int64_t              n_embd_out = 0; // <arch>.embedding_length_out, else n_embd, as llama_hparams::n_embd_out()
+    int64_t              n_layer    = 0; // <arch>.block_count without the nextn layers, as llama_hparams::n_layer()
+    int64_t              n_vocab    = 0; // the tokenizer's tokens, else <arch>.vocab_size, as the vocab loader
+    int64_t              block_size = 0; // <arch>.block_size
+    bool                 has_markov = false;
+    std::vector<int64_t> target_layers;
+};
+
+// a scalar of any integer type, as the model loader reads it from its string form; negative values read as 0
+static int64_t common_speculative_gguf_int(const gguf_context * ctx, const std::string & key) {
+    const int64_t id = gguf_find_key(ctx, key.c_str());
+    if (id < 0) {
+        return 0;
+    }
+    switch (gguf_get_kv_type(ctx, id)) {
+        case GGUF_TYPE_UINT8:  return gguf_get_val_u8 (ctx, id);
+        case GGUF_TYPE_UINT16: return gguf_get_val_u16(ctx, id);
+        case GGUF_TYPE_UINT32: return gguf_get_val_u32(ctx, id);
+        case GGUF_TYPE_UINT64: return (int64_t) std::min<uint64_t>(gguf_get_val_u64(ctx, id), INT64_MAX);
+        case GGUF_TYPE_INT8:   return std::max<int64_t>(0, gguf_get_val_i8 (ctx, id));
+        case GGUF_TYPE_INT16:  return std::max<int64_t>(0, gguf_get_val_i16(ctx, id));
+        case GGUF_TYPE_INT32:  return std::max<int64_t>(0, gguf_get_val_i32(ctx, id));
+        case GGUF_TYPE_INT64:  return std::max<int64_t>(0, gguf_get_val_i64(ctx, id));
+        default:               return 0;
+    }
+}
+
+// an array of any integer type; gguf_get_arr_data asserts on a string array, so other element types read as empty
+static std::vector<int64_t> common_speculative_gguf_int_array(const gguf_context * ctx, const std::string & key) {
+    std::vector<int64_t> values;
+    const int64_t id = gguf_find_key(ctx, key.c_str());
+    if (id < 0 || gguf_get_kv_type(ctx, id) != GGUF_TYPE_ARRAY) {
+        return values;
+    }
+    const size_t n = gguf_get_arr_n(ctx, id);
+    const auto read = [&](auto typed) {
+        using T = decltype(typed);
+        const T * items = static_cast<const T *>(gguf_get_arr_data(ctx, id));
+        for (size_t i = 0; i < n; ++i) {
+            values.push_back((int64_t) items[i]);
+        }
+    };
+    switch (gguf_get_arr_type(ctx, id)) {
+        case GGUF_TYPE_UINT8:  read(uint8_t {}); break;
+        case GGUF_TYPE_INT8:   read(int8_t  {}); break;
+        case GGUF_TYPE_UINT16: read(uint16_t{}); break;
+        case GGUF_TYPE_INT16:  read(int16_t {}); break;
+        case GGUF_TYPE_UINT32: read(uint32_t{}); break;
+        case GGUF_TYPE_INT32:  read(int32_t {}); break;
+        case GGUF_TYPE_UINT64: read(uint64_t{}); break; // past INT64_MAX reads as negative, which is no layer either
+        case GGUF_TYPE_INT64:  read(int64_t {}); break;
+        default: break;
+    }
+    return values;
+}
+
+static bool common_speculative_read_header(const std::string & path, common_speculative_gguf_header & hdr) {
+    const gguf_init_params gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    gguf_context_ptr ctx(gguf_init_from_file(path.c_str(), gguf_params));
+    if (!ctx) {
+        return false;
+    }
+    const int64_t arch_id = gguf_find_key(ctx.get(), "general.architecture");
+    if (arch_id < 0 || gguf_get_kv_type(ctx.get(), arch_id) != GGUF_TYPE_STRING) {
+        return false;
+    }
+    hdr.arch = gguf_get_val_str(ctx.get(), arch_id);
+    const std::string p = hdr.arch + ".";
+
+    hdr.n_embd     = common_speculative_gguf_int(ctx.get(), p + "embedding_length");
+    hdr.n_embd_out = common_speculative_gguf_int(ctx.get(), p + "embedding_length_out");
+    if (hdr.n_embd_out == 0) {
+        hdr.n_embd_out = hdr.n_embd;
+    }
+    const int64_t n_layer_all   = common_speculative_gguf_int(ctx.get(), p + "block_count");
+    const int64_t n_layer_nextn = common_speculative_gguf_int(ctx.get(), p + "nextn_predict_layers");
+    hdr.n_layer = n_layer_all > n_layer_nextn ? n_layer_all - n_layer_nextn : 0;
+
+    const int64_t tokens_id = gguf_find_key(ctx.get(), "tokenizer.ggml.tokens");
+    if (tokens_id >= 0 && gguf_get_kv_type(ctx.get(), tokens_id) == GGUF_TYPE_ARRAY) {
+        hdr.n_vocab = (int64_t) gguf_get_arr_n(ctx.get(), tokens_id);
+    } else {
+        hdr.n_vocab = common_speculative_gguf_int(ctx.get(), p + "vocab_size");
+    }
+
+    hdr.block_size    = common_speculative_gguf_int(ctx.get(), p + "block_size");
+    hdr.has_markov    = gguf_find_tensor(ctx.get(), "markov_w1.weight") >= 0;
+    hdr.target_layers = common_speculative_gguf_int_array(ctx.get(), p + "target_layers");
+    return true;
+}
+
+std::string common_speculative_draft_mismatch(const common_params & params, const std::string & path_target) {
+    const auto & spec = params.speculative;
+    const auto has_type = [&](common_speculative_type type) {
+        return std::find(spec.types.begin(), spec.types.end(), type) != spec.types.end();
+    };
+    const bool is_dflash = has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) || has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+    const bool is_mtp    = has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    if (spec.draft.mparams.path.empty() || (!is_dflash && !is_mtp)) {
+        return "";
+    }
+
+    common_speculative_gguf_header dft;
+    common_speculative_gguf_header tgt;
+    if (!common_speculative_read_header(spec.draft.mparams.path, dft) || !common_speculative_read_header(path_target, tgt)) {
+        return "";
+    }
+
+    std::string reason;
+    const auto add = [&reason](const std::string & part) {
+        reason += reason.empty() ? "" : "; ";
+        reason += part;
+    };
+    // the draft vocabulary sizes the draft model's token embeddings and Markov head, which are indexed with the
+    // model's token ids; a d2t map only shrinks the output head and scatters it back to that vocabulary
+    if (dft.n_vocab > 0 && tgt.n_vocab > 0 && dft.n_vocab != tgt.n_vocab) {
+        add(std::to_string(dft.n_vocab) + " tokens, the model's " + std::to_string(tgt.n_vocab));
+    }
+
+    if (dft.arch == "dflash") {
+        if (!is_dflash) {
+            return reason;
+        }
+        // the input projection takes each target layer's hidden state at the draft model's own width
+        if (dft.n_embd > 0 && tgt.n_embd > 0 && dft.n_embd != tgt.n_embd) {
+            add("hidden width " + std::to_string(dft.n_embd) + ", the model's " + std::to_string(tgt.n_embd));
+        }
+        // the layer inputs 0 through n_layer are extracted, the last being the final hidden state
+        if (tgt.n_layer > 0) {
+            for (const int64_t il : dft.target_layers) {
+                if (il < 0 || il > tgt.n_layer) {
+                    add("it reads target layer " + std::to_string(il) + ", the model has " + std::to_string(tgt.n_layer) + " layers");
+                    break;
+                }
+            }
+        }
+        // the Markov head is built under draft-dspark and draft-dflash alike and asserts a positive block size
+        if (dft.has_markov && dft.block_size <= 0) {
+            add("it has a DSpark Markov head but no positive dflash.block_size");
+        }
+    } else if (is_mtp) {
+        // an external MTP head reads the model's output hidden state
+        if (dft.n_embd_out > 0 && tgt.n_embd_out > 0 && dft.n_embd_out != tgt.n_embd_out) {
+            add("hidden width " + std::to_string(dft.n_embd_out) + ", the model's " + std::to_string(tgt.n_embd_out));
+        }
+    }
+    return reason;
 }
 
 static uint32_t common_get_enabled_speculative_configs(const std::vector<common_speculative_type> & configs) {
