@@ -1678,6 +1678,13 @@ static bool ggml_metal_device_supports_mul_mat_convrot(ggml_metal_device_t dev, 
         a->ne[1] <= INT_MAX && w->ne[1] <= INT_MAX && a->ne[2]*a->ne[3] <= UINT_MAX;
 }
 
+static bool ggml_metal_device_supports_im2col_3d(const struct ggml_tensor * op) {
+    const struct ggml_tensor * input = op->src[1];
+    return input->type == GGML_TYPE_F32 && input->nb[0] == sizeof(float) &&
+        (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+        op->ne[1] <= INT_MAX && op->ne[2]*op->ne[3] <= INT_MAX;
+}
+
 static bool ggml_metal_device_supports_rope_flux(const struct ggml_tensor * op) {
     const struct ggml_tensor * x  = op->src[0];
     const struct ggml_tensor * pe = op->src[1];
@@ -1982,6 +1989,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
+        case GGML_OP_IM2COL_3D:
+            return ggml_metal_device_supports_im2col_3d(op);
         case GGML_OP_CONV_2D:
             return ggml_is_contiguous(op->src[0]) &&
                    op->src[1]->type == GGML_TYPE_F32 &&

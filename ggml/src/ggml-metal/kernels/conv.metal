@@ -118,6 +118,54 @@ kernel void kernel_im2col_ext(
 template [[host_name("kernel_im2col_ext_f32")]] kernel im2col_ext_t kernel_im2col_ext<float>;
 template [[host_name("kernel_im2col_ext_f16")]] kernel im2col_ext_t kernel_im2col_ext<half>;
 
+typedef void (im2col_3d_t)(
+        constant ggml_metal_kargs_im2col_3d & args,
+        device const char * src1,
+        device       char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]);
+
+template <typename T>
+kernel void kernel_im2col_3d(
+        constant ggml_metal_kargs_im2col_3d & args,
+        device const char * src1,
+        device       char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+    const int64_t i0 = (int64_t) tgpig[0]*ntg[0] + tpitg[0];
+    if (i0 >= args.ne0) {
+        return;
+    }
+
+    const int64_t iow = tgpig[1];
+    const int64_t ioh = tgpig[2] % args.OH;
+    const int64_t i3  = tgpig[2] / args.OH;
+    const int64_t iod = i3 % args.OD;
+    const int64_t in  = i3 / args.OD;
+
+    const int64_t ikw = i0 % args.KW;
+    const int64_t ikh = i0 / args.KW % args.KH;
+    const int64_t ikd = i0 / (args.KW*args.KH) % args.KD;
+    const int64_t iic = i0 / (args.KW*args.KH*args.KD);
+
+    const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
+    const int64_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
+    const int64_t iid = iod*args.s2 + ikd*args.d2 - args.p2;
+
+    float value = 0.0f;
+    if (iid >= 0 && iid < args.ID && iih >= 0 && iih < args.IH && iiw >= 0 && iiw < args.IW) {
+        value = *((device const float *) (src1 + (in*args.IC + iic)*args.nb13 + iid*args.nb12 + iih*args.nb11 + iiw*args.nb10));
+    }
+
+    device T * pdst = (device T *) (dst + i3*args.nb3 + ioh*args.nb2 + iow*args.nb1);
+    pdst[i0] = (T) value;
+}
+
+template [[host_name("kernel_im2col_3d_f32")]] kernel im2col_3d_t kernel_im2col_3d<float>;
+template [[host_name("kernel_im2col_3d_f16")]] kernel im2col_3d_t kernel_im2col_3d<half>;
+
 template <typename T>
 kernel void kernel_col2im_1d(
         constant ggml_metal_kargs_col2im_1d & args,
