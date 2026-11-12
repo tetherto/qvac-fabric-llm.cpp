@@ -52,7 +52,7 @@ static fill_fn dspark(int64_t n_vocab = N_VOCAB, bool block_size = true, bool d2
         gguf_set_val_u32(gguf, "dflash.embedding_length", N_EMBD);
         gguf_set_val_u32(gguf, "dflash.block_count", 5);
         if (block_size) {
-            gguf_set_val_u16(gguf, "dflash.block_size", 7);
+            gguf_set_val_u32(gguf, "dflash.block_size", 7);
         }
         const int32_t layers[] = { 3, 10, 28 };
         gguf_set_arr_data(gguf, "dflash.target_layers", GGUF_TYPE_INT32, layers, 3);
@@ -124,6 +124,19 @@ int main() {
 
     const std::string no_block = write_gguf("test-sdm-dspark-no-block.gguf", dspark(N_VOCAB, false));
     expect("a markov head needs a block size", mismatch(DFLASH, no_block, fits),
+            "it has a DSpark Markov head but no positive dflash.block_size");
+    // the loader takes only a u32, and the graph's std::stoi only a value within int32
+    const auto block = [](const char * name, const std::function<void(gguf_context *)> & set) {
+        return write_gguf(name, [&](gguf_context * gguf, ggml_context * ctx) {
+            dspark(N_VOCAB, false)(gguf, ctx);
+            set(gguf);
+        });
+    };
+    expect("a u16 block size is no block size",
+            mismatch(DSPARK, block("test-sdm-block-u16.gguf", [](gguf_context * gguf) { gguf_set_val_u16(gguf, "dflash.block_size", 7); }), fits),
+            "it has a DSpark Markov head but no positive dflash.block_size");
+    expect("a block size past int32 is no block size",
+            mismatch(DSPARK, block("test-sdm-block-big.gguf", [](gguf_context * gguf) { gguf_set_val_u32(gguf, "dflash.block_size", 3000000000u); }), fits),
             "it has a DSpark Markov head but no positive dflash.block_size");
 
     // a split draft model: the metadata is in the first file, and the Markov head may be in any file

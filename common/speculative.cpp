@@ -2558,12 +2558,12 @@ struct common_speculative_gguf_header {
     int64_t              n_embd_out = 0; // <arch>.embedding_length_out, else n_embd, as llama_hparams::n_embd_out()
     int64_t              n_layer    = 0; // <arch>.block_count without the nextn layers, as llama_hparams::n_layer()
     int64_t              n_vocab    = 0; // the tokenizer's tokens, else <arch>.vocab_size, as the vocab loader
-    int64_t              block_size = 0; // <arch>.block_size
+    int64_t              block_size = 0; // <arch>.block_size if a u32 within int32, as the loader and the graph read it
     bool                 has_markov = false;
     std::vector<int64_t> target_layers;
 };
 
-// a scalar of any integer type, as the model loader reads it from its string form; negative values read as 0
+// a scalar of any integer type; negative values read as 0
 static int64_t common_speculative_gguf_int(const gguf_context * ctx, const std::string & key) {
     const int64_t id = gguf_find_key(ctx, key.c_str());
     if (id < 0) {
@@ -2670,7 +2670,12 @@ static bool common_speculative_read_header(const std::string & path, common_spec
         hdr.n_vocab = common_speculative_gguf_int(ctx.get(), p + "vocab_size");
     }
 
-    hdr.block_size    = common_speculative_gguf_int(ctx.get(), p + "block_size");
+    // the loader reads it into a uint32_t, refusing any other type, and the Markov head parses it with std::stoi
+    const int64_t block_size_id = gguf_find_key(ctx.get(), (p + "block_size").c_str());
+    if (block_size_id >= 0 && gguf_get_kv_type(ctx.get(), block_size_id) == GGUF_TYPE_UINT32 &&
+            gguf_get_val_u32(ctx.get(), block_size_id) <= (uint32_t) INT32_MAX) {
+        hdr.block_size = gguf_get_val_u32(ctx.get(), block_size_id);
+    }
     hdr.has_markov    = gguf_find_tensor(ctx.get(), "markov_w1.weight") >= 0;
     hdr.target_layers = common_speculative_gguf_int_array(ctx.get(), p + "target_layers");
 
