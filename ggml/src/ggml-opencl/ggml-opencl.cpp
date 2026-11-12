@@ -11090,12 +11090,31 @@ static void ggml_cl_set_pq2_0_layout_args(cl_kernel kernel, const ggml_tensor * 
     CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_int), &nb_row));
 }
 
+static bool ggml_opencl_upload_converts_on_device(const ggml_tensor * tensor) {
+#ifdef GGML_OPENCL_SOA_Q
+    if (ggml_is_quantized(tensor->type)) {
+        return true;
+    }
+#endif
+    return tensor->type == GGML_TYPE_BF16;
+}
+
+static std::unique_lock<std::mutex> ggml_opencl_lock_converting_upload(const ggml_tensor * tensor) {
+    static std::mutex converting_upload_mutex;
+    if (!ggml_opencl_upload_converts_on_device(tensor)) {
+        return {};
+    }
+    return std::unique_lock<std::mutex>(converting_upload_mutex);
+}
+
 static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
     ggml_backend_opencl_context * backend_ctx = dev_ctx->backend_ctx;
 
     cl_context context = backend_ctx->context;
     cl_command_queue queue = backend_ctx->queue;
+
+    const std::unique_lock<std::mutex> converting_upload_lock = ggml_opencl_lock_converting_upload(tensor);
 
 #ifdef GGML_OPENCL_SOA_Q
     if (tensor->type == GGML_TYPE_Q1_0 || tensor->type == GGML_TYPE_PQ2_0) {
