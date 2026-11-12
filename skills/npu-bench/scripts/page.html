@@ -1,0 +1,269 @@
+<title>Qwen3.5 on the AMD NPU</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: dark-first. Title + switchers, summary grid, per-model tiles and charts, then the small print */
+:root{
+  --bg:#0b0e0d; --surface:#0f1b17; --surface2:#14261f; --fg:#eef4f1; --muted:#93a39c; --line:#1f3a31;
+  --plot:#0a0b0b; --plotline:#1e2221; --plotfg:#9aa3a0;
+  --xdna:#6fe0c4; --flm:#d9a066; --accent:#6fe0c4; --onacc:#06130f;
+  --disp:"Bricolage Grotesque","IBM Plex Sans",system-ui,sans-serif; --sans:"IBM Plex Sans",-apple-system,"Segoe UI",Roboto,sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+  color-scheme:dark}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 var(--sans);padding-block:28px 64px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.wrap{max-width:1080px;margin:0 auto}
+.top{display:flex;flex-wrap:wrap;gap:16px 32px;align-items:flex-end;justify-content:space-between}
+.eyebrow{font:500 12px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--accent)}
+h1{font:800 clamp(30px,6vw,52px)/1.02 var(--disp);letter-spacing:-.02em;margin:6px 0 0;text-wrap:balance}
+h1 span{color:var(--accent)}
+h2{font:700 24px/1.2 var(--disp);margin:48px 0 4px;letter-spacing:-.01em;text-wrap:balance}
+.controls{display:flex;flex-wrap:wrap;gap:10px 20px}
+.ctl{display:flex;flex-direction:column;gap:4px}
+.lbl{font:500 10.5px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.seg{display:inline-flex;flex-wrap:wrap;gap:4px}
+button.s{font:500 13px var(--sans);color:var(--fg);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:5px 14px;cursor:pointer}
+button.s[aria-pressed="true"]{background:var(--accent);color:var(--onacc);border-color:var(--accent);font-weight:600}
+button.s:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.hero{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:24px 0 8px}
+.stat{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px 18px;min-width:0}
+.stat .k{font:500 11px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.stat{background:linear-gradient(180deg,var(--surface2),var(--surface))}
+.stat .big{font:800 clamp(40px,6vw,56px)/1 var(--disp);letter-spacing:-.03em;color:var(--accent);margin:10px 0 2px}
+.stat.lose .big{color:var(--flm)} .stat.lose{border-color:var(--flm)} .stat.win{border-color:var(--accent)}
+.stat.na .big{color:var(--muted)}
+.stat .txt{font-weight:600}
+.stat .sub{font:12px var(--mono);color:var(--muted);margin-top:10px;display:flex;flex-direction:column;gap:2px}
+.stat .sub span{display:flex;align-items:center;gap:6px}.stat .sub b{margin-left:auto;color:var(--fg);font-weight:500}.stat .sub i{width:8px;height:8px;border-radius:2px}.stat .sub em{font-style:normal;margin-top:4px}
+.note{color:var(--muted);font-size:13.5px;max-width:80ch;margin:6px 0}
+.cap{margin:0 0 8px;font-size:13.5px;color:var(--plotfg)} .cap b{color:var(--fg)}
+.foot{margin:10px 0 4px;font-size:12.5px;color:var(--plotfg)}
+.card{background:var(--plot);border:1px solid var(--plotline);border-radius:14px;padding:16px 14px 8px;margin:12px 0}
+.sg{display:grid;grid-template-columns:72px repeat(5,minmax(0,1fr));gap:6px;align-items:stretch}
+.sg .h{font:500 10.5px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--plotfg);display:flex;align-items:center;justify-content:center}
+.sg .rl{font:600 14px var(--disp);color:var(--fg);display:flex;align-items:center}
+.sg .c{border-radius:8px;padding:10px 4px;text-align:center;border:1px solid var(--plotline);min-width:0}
+.sg .c b{display:block;font:700 clamp(15px,2.6vw,22px) var(--disp)} .sg .c small{display:block;font:11px var(--mono);color:var(--plotfg)}
+.sg .c.w b{color:var(--xdna)} .sg .c.l b{color:var(--flm)} .sg .c.na b{color:var(--plotfg)}
+.card svg{width:100%;height:auto;display:block}
+svg text{font-family:var(--sans);fill:var(--plotfg);font-size:11px} svg .t{fill:var(--fg)}
+.legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px;margin:12px 0}
+.chip{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:13px;min-width:0}
+.chip b{display:flex;align-items:center;gap:8px;font-size:14px}.sw{width:12px;height:12px;border-radius:3px;flex:none}
+.chip span.d{color:var(--muted);display:block;margin-top:2px}
+section.what{margin:22px 0 0;background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:12px;padding:6px 18px 10px}
+section.what h3{margin:10px 0 2px;font:700 16px var(--disp);color:var(--accent)}
+section.what p{margin:6px 0;max-width:84ch;font-size:14px}
+a{color:var(--accent)}
+code{font-family:var(--mono);font-size:.88em;color:var(--accent)}
+details{margin-top:48px;border-top:1px solid var(--line);padding-top:16px}
+summary{font:700 20px var(--disp);cursor:pointer}
+summary:focus-visible{outline:2px solid var(--accent);outline-offset:4px}
+details ul{padding-left:20px;max-width:80ch} details li{margin:6px 0}
+#tip{position:fixed;z-index:20;pointer-events:none;background:var(--surface2);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12.5px;box-shadow:0 8px 24px rgba(0,0,0,.35);max-width:300px;display:none}
+#tip div{display:flex;align-items:center;gap:6px;margin-top:3px} #tip div span{margin-left:auto;padding-left:14px;font-family:var(--mono);font-size:12px}
+#tip i{width:9px;height:9px;border-radius:2px;flex:none} #tip em{font-style:normal;color:var(--muted)} #tip small{display:block;color:var(--muted);margin-top:5px;font-size:11px}
+svg .hit:hover{fill:var(--fg);fill-opacity:.07}
+.sg .c.hit:hover{outline:1px solid var(--fg)}
+</style>
+<div class="wrap">
+<div class="top">
+  <div><div class="eyebrow">qvac-fabric xdna &middot; Strix Halo NPU</div><h1>Qwen3.5 on <span>xdna</span> vs FastFlowLM</h1></div>
+  <div class="controls">
+    <div class="ctl"><span class="lbl">View</span><span class="seg" id="views"></span></div>
+    <div class="ctl dctl" hidden><span class="lbl">Model size</span><span class="seg" id="models"></span></div>
+    <div class="ctl dctl" hidden><span class="lbl">Text length</span><span class="seg" id="ctxs"></span></div>
+  </div>
+</div>
+
+<section class="what" id="xdnaIntro">
+  <h3>What is the xdna backend?</h3>
+  <div id="introText"></div>
+</section>
+
+<div id="summary">
+  <h2>xdna vs FastFlowLM, all models and contexts</h2>
+  <p class="note" id="summaryNote"></p>
+  <span class="seg" id="sumTabs" style="margin-top:8px"></span>
+  <div class="card"><div id="sumGrid"></div><p class="foot" id="sumFoot"></p></div>
+  <div class="card"><div id="sumLines"></div></div>
+</div>
+
+<div id="detail" hidden>
+<div class="hero" id="hero"></div>
+<p class="note" id="heroNote"></p>
+
+<h2>Speed</h2>
+<p class="note" id="speedNote"></p>
+<span class="seg" id="speedTabs" style="margin-top:8px"></span>
+<div class="card"><div id="speedChart"></div></div>
+
+<h2>Energy</h2>
+<p class="note" id="energyNote"></p>
+<span class="seg" id="energyTabs" style="margin-top:8px"></span>
+<div class="card"><div id="energyChart"></div><p class="foot" id="energyFoot"></p></div>
+</div>
+
+<details>
+<summary>Method and caveats</summary>
+<div class="legend" id="legend"></div>
+<ul id="method"></ul>
+</details>
+</div>
+
+<script>const PAGE=/*PAGE_JSON*/null;</script>
+<script>
+const P=PAGE, TXT=P.text, DATA=P.cells, TOK=P.tokens;
+const MODELS=P.models, LABEL=P.labels;
+const CTX=P.contexts.map(c=>c%1024===0?`${c/1024}k`:String(c));
+const RT=P.runtimes.map(r=>r.id);
+const RTNAME=Object.fromEntries(P.runtimes.map(r=>[r.id,r.name]));
+const RTDESC=Object.fromEntries(P.runtimes.map(r=>[r.id,[r.src,r.desc]]));
+const X='\u00d7', DOT='\u00b7', PM='\u00b1';
+const MAXTOK=P.maxTokens, EARLY_TOKENS=MAXTOK/2, EARLY_K=new Set(['req','dj','tpj']);
+const col=r=>`var(--${r})`;
+const M={
+ prefill:{k:'prefill',name:'Prefill',unit:'tokens/s',hi:true,f:v=>v.toFixed(0),cap:'Prompt processing rate, prompt tokens / TTFT of the timed requests. Higher is faster.'},
+ decode:{k:'decode',name:'Decode',unit:'tokens/s',hi:true,f:v=>v.toFixed(1),cap:'Generation rate after the first token, completion tokens / (total - TTFT). Higher is faster.'},
+ ttft:{k:'ttft',name:'Time to first token',unit:'s',hi:false,f:v=>v.toFixed(2),cap:'Latency before the first generated token, timed requests. Lower is better.'},
+ req:{k:'req',name:'Whole request',unit:'J',hi:false,f:v=>v.toFixed(0),cap:`Energy for the whole request, up to ${MAXTOK} generated tokens and the 10 s tail, idle baseline subtracted. Lower is cheaper.`},
+ pj:{k:'pj',name:'Prefill energy',unit:'J per 1k prompt tokens',hi:false,f:v=>v.toFixed(1),cap:'Energy in the prefill window per 1000 prompt tokens. Lower is cheaper.'},
+ dj:{k:'dj',name:'Decode energy',unit:'J per generated token',hi:false,f:v=>v.toFixed(3),cap:'Energy in the decode window per generated token. Lower is cheaper.'},
+ tpj:{k:'tpj',name:'Tokens per joule',unit:'generated tokens / J',hi:true,f:v=>v.toFixed(2),cap:'Decode tokens bought by one joule. Higher is better.'}};
+const VIEWS=[['summary','Summary'],['detail','Per model']];
+const st={model:MODELS[MODELS.length-1],ctx:Math.min(1,CTX.length-1),speed:'prefill',energy:'req',view:'summary',sum:'prefill'};
+const viewOf=h=>VIEWS.some(v=>v[0]===h)?h:null;
+try{st.view=viewOf(location.hash.slice(1))||st.view}catch(e){}
+const $=id=>document.getElementById(id);
+const val=(m,k,rt,c)=>{const a=DATA[m]&&DATA[m][k]&&DATA[m][k][rt];return a?a[c]:null};
+const mean=(m,k,rt,c)=>{const v=val(m,k,rt,c);return v?v[0]:null};
+const fmt=(k,v)=>v==null?'n/a':M[k].f(v);
+const tok=(m,rt,c)=>TOK[m]&&TOK[m][rt]?TOK[m][rt][c]:null;
+const early=(m,k,rt,c)=>{const t=tok(m,rt,c);return EARLY_K.has(k)&&t!=null&&t<EARLY_TOKENS};
+const earlyTxt=(m,rt,c)=>`${RTNAME[rt]} averaged ${tok(m,rt,c).toFixed(0)} of ${MAXTOK} tokens`;
+const star=(m,k,rt,c)=>mean(m,k,rt,c)!=null&&early(m,k,rt,c)?'*':'';
+const esc=s=>s.replace(/"/g,'&quot;');
+
+function seg(el,items,cur,on){el.innerHTML='';items.forEach(([v,l])=>{const b=document.createElement('button');b.className='s';b.textContent=l;b.setAttribute('aria-pressed',String(v===cur));b.onclick=()=>on(v);el.appendChild(b)})}
+
+/* grouped bar chart. cats: [{label, ctx, vals:{rt:[mean,sd]|null}}] */
+function chart(m,cats,k,ylabel){
+  const W=720,H=300,L=56,R=12,T=14,B=44;
+  const maxv=Math.max(...cats.flatMap(c=>RT.map(r=>c.vals[r]?c.vals[r][0]+c.vals[r][1]:0)))||1;
+  const nice=(x)=>{const p=Math.pow(10,Math.floor(Math.log10(x)));const f=x/p;return (f<=1?1:f<=2?2:f<=2.5?2.5:f<=5?5:10)*p};
+  const top=nice(maxv*1.02), y=v=>T+(H-T-B)*(1-v/top);
+  let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${M[k].name} by backend">`;
+  for(let i=0;i<=4;i++){const v=top*i/4, yy=y(v);
+    s+=`<line x1="${L}" x2="${W-R}" y1="${yy}" y2="${yy}" stroke="var(--plotline)"/><text x="${L-6}" y="${yy+4}" text-anchor="end">${+v.toPrecision(3)}</text>`}
+  s+=`<text transform="translate(12 ${(T+H-B)/2}) rotate(-90)" text-anchor="middle">${ylabel}</text>`;
+  const gw=(W-L-R)/cats.length, bw=Math.min(26,gw*.78/RT.length);
+  cats.forEach((c,i)=>{
+    const x0=L+gw*i+gw/2-bw*RT.length/2;
+    RT.forEach((r,j)=>{const x=x0+j*bw, cv=c.vals[r];
+      if(!cv){s+=`<text x="${x+bw/2}" y="${y(0)-4}" text-anchor="middle" style="font-size:9px">n/a</text>`;return}
+      const [v,sd]=cv;
+      s+=`<rect x="${x+1}" y="${y(v)}" width="${bw-2}" height="${Math.max(0,y(0)-y(v))}" fill="${col(r)}" rx="2"></rect>`;
+      if(sd>0){const cx=x+bw/2;s+=`<path d="M${cx} ${y(Math.max(0,v-sd))}V${y(v+sd)}M${cx-3} ${y(v+sd)}h6M${cx-3} ${y(Math.max(0,v-sd))}h6" stroke="var(--fg)" stroke-width="1" fill="none" opacity=".55"/>`}
+      if(early(m,k,r,c.ctx))s+=`<text x="${x+bw/2}" y="${y(v+sd)-4}" text-anchor="middle" class="t">*</text>`});
+    const b=c.vals.flm?c.vals.flm[0]:null;
+    const tip=`<b>${c.label}</b>`+RT.map(r=>{const cv=c.vals[r];const txt=cv?`${M[k].f(cv[0])}${star(m,k,r,c.ctx)} ${PM}${M[k].f(cv[1])} <em>${b?(cv[0]/b).toFixed(2)+'x':''}</em>`:'n/a';return `<div><i style="background:${col(r)}"></i>${RTNAME[r]}<span>${txt}</span></div>`}).join('')+
+      RT.filter(r=>early(m,k,r,c.ctx)).map(r=>`<small>* ${earlyTxt(m,r,c.ctx)}.</small>`).join('')+
+      `<small>${M[k].unit}. The x figure compares with flm (1.00x).</small>`;
+    s+=`<rect class="hit" x="${L+gw*i}" y="${T}" width="${gw}" height="${H-T-B}" fill="transparent" data-tip="${esc(tip)}"/>`;
+    s+=`<text class="t" x="${L+gw*i+gw/2}" y="${H-B+18}" text-anchor="middle" style="font-size:12px">${c.label}</text>`});
+  RT.forEach((r,j)=>{const x=L+j*150;s+=`<rect x="${x}" y="${H-14}" width="10" height="10" rx="2" fill="${col(r)}"/><text x="${x+15}" y="${H-5}">${RTNAME[r]}</text>`});
+  return s+'</svg>';
+}
+const ctxCats=(m,k)=>CTX.map((c,i)=>({label:c,ctx:i,vals:Object.fromEntries(RT.map(r=>[r,val(m,k,r,i)]))}));
+function chartFoot(m,k){
+  const notes=[];RT.forEach(r=>CTX.forEach((c,i)=>{if(val(m,k,r,i)&&early(m,k,r,i))notes.push(`${c}: ${earlyTxt(m,r,i)}`)}));
+  const na=[];RT.forEach(r=>CTX.forEach((c,i)=>{if(!val(m,k,r,i))na.push(`${RTNAME[r]} ${c}`)}));
+  return (notes.length?`* Fewer than ${EARLY_TOKENS} generated tokens on average (flm stopped early): ${notes.join('; ')}. `:'')+(na.length?`n/a: ${na.join(', ')} (no figure, or a decode energy that computes to zero or below).`:'');
+}
+
+function hero(){
+  const m=st.model,c=st.ctx,g=(k,r)=>mean(m,k,r,c),L=CTX[c];
+  const T=[['Prefill','prefill',true,'tokens/s'],['Decode','decode',true,'tokens/s'],['Time to first token','ttft',false,'s'],['Decode energy','dj',false,'J/token'],['Prefill energy','pj',false,'J / 1k tokens']].map(([n,k,hi,u])=>{
+    const a=g(k,'xdna'),b=g(k,'flm');
+    const rows=RT.map(r=>`<span><i style="background:${col(r)}"></i>${RTNAME[r]} <b>${fmt(k,g(k,r))}${star(m,k,r,c)}</b></span>`).join('');
+    const sub=`<div class="sub">${rows}<em>${u}${star(m,k,'flm',c)?` ${DOT} * ${earlyTxt(m,'flm',c)}`:''}</em></div>`;
+    if(a==null||b==null)return `<div class="stat na"><div class="k">${n}</div><div class="big">n/a</div><div class="txt">no ${a==null?'xdna':'flm'} figure</div>${sub}</div>`;
+    const adv=hi?a/b:b/a, good=adv>=1, mag=good?adv:1/adv;
+    const word=hi?(good?'faster':'slower'):(k==='ttft'?(good?'shorter':'longer'):(good?'less energy':'more energy'));
+    return `<div class="stat ${good?'win':'lose'}"><div class="k">${n}</div><div class="big">${mag.toFixed(2)}${X}</div><div class="txt">${word} than flm</div>${sub}</div>`});
+  $('hero').innerHTML=T.join('');
+  $('heroNote').innerHTML=`<b>xdna vs FastFlowLM</b> on Qwen3.5 ${LABEL[m]} at ${L}, mean over iterations. Each box divides one value by the other: above 1.00${X} xdna is ahead, and a loss is shown at the same size as a win (mint is a win, amber a loss).`;
+}
+
+function adv(m,k,c){const hi=M[k].hi,a=mean(m,k,'xdna',c),b=mean(m,k,'flm',c);if(a==null||b==null)return null;return hi?a/b:b/a}
+const SUMK=['prefill','decode','ttft','dj','pj','req'];
+const LCOL=['#6fe0c4','#f1f6f4','#3aa88f','#b9a6ff'];
+function linePlot(fn,ticks,ylabel,aria){
+  const W=720,H=280,L=56,R=16,T=14,B=48;
+  const all=MODELS.flatMap(m=>CTX.map((c,i)=>fn(m,i))).filter(x=>x!=null);
+  const lo=Math.min(0.5,Math.min(...all)*0.9),hi=Math.max(1.5,Math.max(...all)*1.08);
+  const y=v=>T+(H-T-B)*(1-(Math.log(v)-Math.log(lo))/(Math.log(hi)-Math.log(lo)));
+  const x=i=>L+(W-L-R)*(i+.5)/CTX.length;
+  let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${aria}">`;
+  ticks.filter(v=>v>=lo&&v<=hi).forEach(v=>{s+=`<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="${v===1?'var(--xdna)':'var(--plotline)'}" ${v===1?'stroke-dasharray="4 4"':''}/><text x="${L-6}" y="${y(v)+4}" text-anchor="end" ${v===1?'style="fill:var(--xdna)"':''}>${v}${X}</text>`});
+  s+=`<text transform="translate(12 ${(T+H-B)/2}) rotate(-90)" text-anchor="middle">${ylabel}</text>`;
+  CTX.forEach((c,i)=>s+=`<text class="t" x="${x(i)}" y="${H-B+18}" text-anchor="middle">${c}</text>`);
+  MODELS.forEach((m,j)=>{
+    const lc=LCOL[j%LCOL.length], pts=CTX.map((c,i)=>[i,fn(m,i)]).filter(p=>p[1]!=null);
+    s+=`<polyline fill="none" stroke="${lc}" stroke-width="2" points="${pts.map(p=>x(p[0])+','+y(p[1])).join(' ')}"/>`;
+    pts.forEach(p=>s+=`<circle cx="${x(p[0])}" cy="${y(p[1])}" r="3.5" fill="${lc}"><title>${LABEL[m]} ${CTX[p[0]]}: ${p[1].toFixed(2)}${X}</title></circle>`);
+    s+=`<rect x="${L+j*90}" y="${H-14}" width="10" height="10" rx="2" fill="${lc}"/><text x="${L+j*90+15}" y="${H-5}">${LABEL[m]}</text>`});
+  return s+'</svg>';
+}
+function cell(a,words,tip,mark=''){
+  if(a==null)return `<div class="c na"><b>n/a</b><small>no figure</small></div>`;
+  const good=a>=1,mag=good?a:1/a,str=Math.min(1,Math.log(mag)/Math.log(3)),rgb=good?'111,224,196':'217,160,102';
+  return `<div class="c hit ${good?'w':'l'}" style="background:rgba(${rgb},${(0.06+0.3*str).toFixed(3)})" data-tip="${esc(tip(good,mag))}"><b>${mag.toFixed(2)}${X}</b><small>${good?words[0]:words[1]}${mark}</small></div>`;
+}
+const gridHead=()=>`<div class="sg" style="grid-template-columns:72px repeat(${CTX.length},minmax(0,1fr))"><div></div>`+CTX.map(c=>`<div class="h">${c}</div>`).join('');
+function summary(){
+  const k=st.sum, words=[M[k].hi?'faster':k==='ttft'?'shorter':'less energy', M[k].hi?'slower':k==='ttft'?'longer':'more energy'];
+  let h=`<p class="cap"><b>${M[k].name}</b> ${DOT} xdna against flm ${DOT} ${M[k].hi?'ratio xdna / flm':'ratio flm / xdna'}, above 1.00${X} xdna is ahead</p>`+gridHead();
+  MODELS.forEach(m=>{h+=`<div class="rl">${LABEL[m]}</div>`;CTX.forEach((c,i)=>{
+    const tip=(good,mag)=>`<b>${LABEL[m]} ${DOT} ${c}</b>`+RT.map(r=>`<div><i style="background:${col(r)}"></i>${RTNAME[r]}<span>${fmt(k,mean(m,k,r,i))}${star(m,k,r,i)} ${M[k].unit}</span></div>`).join('')+
+      (early(m,k,'flm',i)?`<small>* ${earlyTxt(m,'flm',i)}.</small>`:'')+`<small>xdna ${good?'ahead of':'behind'} flm by ${mag.toFixed(2)}${X}</small>`;
+    h+=cell(adv(m,k,i),words,tip,early(m,k,'flm',i)?' *':'')})});
+  $('sumGrid').innerHTML=h+'</div>';
+  const notes=[];MODELS.forEach(m=>CTX.forEach((c,i)=>{if(early(m,k,'flm',i))notes.push(`${LABEL[m]} ${c} ${tok(m,'flm',i).toFixed(0)}`)}));
+  $('sumFoot').textContent=notes.length?`* flm stopped before ${MAXTOK} tokens: mean generated tokens ${notes.join(', ')}. Its energy per request is then not comparable, and its energy per token rests on a short decode window.`:'';
+  $('sumFoot').hidden=!notes.length;
+  $('sumLines').innerHTML=`<p class="cap"><b>${M[k].name}</b> ${DOT} the same ratios as lines, one per model size. Above the dashed line xdna is ahead.</p>`+linePlot((m,i)=>adv(m,k,i),[0.25,0.5,0.75,1,1.5,2,3,4,6],'xdna advantage over flm','xdna advantage over flm');
+}
+
+function render(){
+  seg($('views'),VIEWS,st.view,v=>{st.view=v;render()});
+  seg($('models'),MODELS.map(m=>[m,LABEL[m]]),st.model,v=>{st.model=v;render()});
+  seg($('ctxs'),CTX.map((c,i)=>[i,c]),st.ctx,v=>{st.ctx=v;render()});
+  seg($('speedTabs'),['prefill','decode','ttft'].map(k=>[k,M[k].name]),st.speed,v=>{st.speed=v;render()});
+  seg($('energyTabs'),['req','pj','dj','tpj'].map(k=>[k,M[k].name]),st.energy,v=>{st.energy=v;render()});
+  seg($('sumTabs'),SUMK.map(k=>[k,M[k].name]),st.sum,v=>{st.sum=v;render()});
+  $('summary').hidden=st.view!=='summary';$('detail').hidden=st.view!=='detail';
+  try{if(location.hash.slice(1)!==st.view)history.replaceState(null,'','#'+st.view)}catch(e){}
+  document.querySelectorAll('.dctl').forEach(e=>e.hidden=st.view!=='detail');
+  summary();
+  hero();
+  const sk=st.speed,ek=st.energy,md=LABEL[st.model];
+  $('speedChart').innerHTML=`<p class="cap"><b>${M[sk].name}</b> ${DOT} Qwen3.5 ${md} ${DOT} ${M[sk].cap}</p>`+chart(st.model,ctxCats(st.model,sk),sk,M[sk].unit);
+  $('energyChart').innerHTML=`<p class="cap"><b>${M[ek].name}</b> ${DOT} Qwen3.5 ${md} ${DOT} ${M[ek].cap}</p>`+chart(st.model,ctxCats(st.model,ek),ek,M[ek].unit);
+  const ef=chartFoot(st.model,ek);$('energyFoot').textContent=ef;$('energyFoot').hidden=!ef;
+}
+$('introText').innerHTML=TXT.intro.map(p=>`<p>${p}</p>`).join('');
+['summaryNote','speedNote','energyNote'].forEach(id=>$(id).innerHTML=TXT[id]);
+$('method').innerHTML=TXT.method.map(li=>`<li>${li}</li>`).join('');
+$('legend').innerHTML=RT.map(r=>`<div class="chip"><b><span class="sw" style="background:${col(r)}"></span>${RTNAME[r]}</b><span class="d">${RTDESC[r][0]} ${DOT} ${RTDESC[r][1]}</span></div>`).join('');
+const tipEl=document.createElement('div');tipEl.id='tip';document.body.appendChild(tipEl);
+function showTip(e){const h=e.target.closest&&e.target.closest('.hit');if(!h){tipEl.style.display='none';return}
+  tipEl.innerHTML=h.dataset.tip;tipEl.style.display='block';
+  const w=tipEl.offsetWidth,hh=tipEl.offsetHeight;let x=e.clientX+14,y=e.clientY+14;
+  if(x+w>innerWidth-8)x=e.clientX-w-14;if(y+hh>innerHeight-8)y=innerHeight-hh-8;tipEl.style.left=Math.max(8,x)+'px';tipEl.style.top=Math.max(8,y)+'px'}
+document.addEventListener('pointermove',showTip);document.addEventListener('pointerdown',showTip);
+document.addEventListener('pointerleave',()=>tipEl.style.display='none');
+addEventListener('hashchange',()=>{const v=viewOf(location.hash.slice(1));if(v&&v!==st.view){st.view=v;render()}});
+
+render();
+</script>
