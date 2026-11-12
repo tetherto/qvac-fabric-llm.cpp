@@ -3573,9 +3573,11 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     if (threadpool->pause) {
        // Update main thread prio and affinity to match the threadpool settings
        ggml_thread_apply_priority(threadpool->prio);
+#if !defined(__linux__)
        if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
            ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
        }
+#endif
 
        // resume does cond broadcast
        ggml_threadpool_resume_locked(threadpool);
@@ -3652,9 +3654,11 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume
         ggml_thread_apply_priority(threadpool->prio);
+#if !defined(__linux__)
         if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
             ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
         }
+#endif
     }
 #endif // GGML_USE_OPENMP
 
@@ -3664,6 +3668,40 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp) {
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
+
+#if defined(__linux__)
+struct ggml_affinity_scope {
+    cpu_set_t saved;
+    bool valid;
+};
+
+static struct ggml_affinity_scope ggml_affinity_save(const bool * mask) {
+    struct ggml_affinity_scope scope = { .valid = false };
+    if (!ggml_thread_cpumask_is_valid(mask)) {
+        return scope;
+    }
+    if (sched_getaffinity(0, sizeof(scope.saved), &scope.saved) != 0) {
+        GGML_LOG_WARN("could not save caller CPU affinity: %s\n", strerror(errno));
+        return scope;
+    }
+    scope.valid = true;
+    return scope;
+}
+
+static struct ggml_affinity_scope ggml_affinity_begin(const bool * mask) {
+    struct ggml_affinity_scope scope = ggml_affinity_save(mask);
+    if (scope.valid) {
+        ggml_thread_apply_affinity(mask);
+    }
+    return scope;
+}
+
+static void ggml_affinity_end(const struct ggml_affinity_scope * scope) {
+    if (scope->valid && sched_setaffinity(0, sizeof(scope->saved), &scope->saved) != 0) {
+        GGML_LOG_WARN("could not restore caller CPU affinity: %s\n", strerror(errno));
+    }
+}
+#endif
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
@@ -3693,6 +3731,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+#if defined(__linux__)
+    struct ggml_affinity_scope caller_affinity = ggml_affinity_save(threadpool->workers[0].cpumask);
+#endif
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -3708,14 +3749,28 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             int ith = omp_get_thread_num();
 
             ggml_thread_apply_priority(threadpool->prio);
+#if defined(__linux__)
+            // OpenMP workers are shared with other pools, so scope their affinity too.
+            struct ggml_affinity_scope affinity = ggml_affinity_begin(threadpool->workers[ith].cpumask);
+#else
             if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
                 ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
             }
+#endif
             ggml_graph_compute_thread(&threadpool->workers[ith]);
+#if defined(__linux__)
+            ggml_affinity_end(&affinity);
+#endif
         }
     } else {
         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
+#if defined(__linux__)
+        struct ggml_affinity_scope affinity = ggml_affinity_begin(threadpool->workers[0].cpumask);
+#endif
         ggml_graph_compute_thread(&threadpool->workers[0]);
+#if defined(__linux__)
+        ggml_affinity_end(&affinity);
+#endif
     }
 #else
     if (n_threads > threadpool->n_threads) {
@@ -3723,6 +3778,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         n_threads = threadpool->n_threads;
     }
 
+#if defined(__linux__)
+    if (caller_affinity.valid) {
+        ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
+    }
+#endif
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
@@ -3732,6 +3792,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+#if defined(__linux__)
+    ggml_affinity_end(&caller_affinity);
+#endif
 
     enum ggml_status ret = threadpool->ec;
 
