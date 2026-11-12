@@ -118,6 +118,12 @@ The draft ubatch (`--spec-draft-n-ubatch`, default `--ubatch-size`) must hold on
 The draft reads rows of the target output head directly, so a head in a repacked or row-split buffer stops the draft context with an error.
 Load the target with `--no-repack` and without `-sm row` in that case.
 
+The verify cost of a step can jump with the number of drafted tokens, for example on Metal past 8 rows.
+With a lattice drafter such as DFlash2 or DSpine, `--spec-draft-n-short N` keeps only the first N drafts of a step unless the full draft pays for its cost.
+The expected accepted tokens come from the lattice's own transition probabilities, and `--spec-draft-long-cost R` is the time of a step with `--spec-draft-n-max` drafts relative to a step with N drafts.
+Take R from two runs, one with `--spec-draft-n-max` at each value.
+Every step still decodes the full draft block, so compare the result with `--spec-draft-n-max N` alone.
+
 See:
 
 - #22105
@@ -300,6 +306,14 @@ Use exactly one of these options:
 --spec-draft-p-min, --draft-p-min       P
                                         minimum speculative decoding probability (greedy) (default: 0.00)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
+--spec-draft-n-short                    N
+                                        lattice drafters such as DFlash2 and DSpine: keep only N drafts in a step unless the expected accepted tokens of
+                                        the full draft pay for --spec-draft-long-cost (default: 0, 0 = off)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_SHORT)
+--spec-draft-long-cost                  R
+                                        time of a step with --spec-draft-n-max drafts relative to one with --spec-draft-n-short drafts
+                                        (default: 1.00)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_LONG_COST)
 --spec-draft-vocab                      B:E[,B:E...]
                                         token id ranges [B, E) a DFlash2 drafter may propose; the target still verifies over the full vocabulary
                                         (default: full vocabulary)

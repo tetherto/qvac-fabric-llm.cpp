@@ -270,6 +270,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
 | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
 | `--spec-draft-p-min, --draft-p-min P` | minimum speculative decoding probability (greedy) (default: 0.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_MIN) |
+| `--spec-draft-n-short N` | lattice drafters such as DFlash2 and DSpine: keep only N drafts in a step unless the expected accepted tokens of<br/>the full draft pay for --spec-draft-long-cost (default: 0, 0 = off)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_SHORT) |
+| `--spec-draft-long-cost R` | time of a step with --spec-draft-n-max drafts relative to one with --spec-draft-n-short drafts<br/>(default: 1.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_LONG_COST) |
 | `--spec-draft-vocab B:E[,B:E...]` | token id ranges [B, E) a DFlash2 drafter may propose; the target still verifies over the full vocabulary<br/>(default: full vocabulary)<br/>(env: LLAMA_ARG_SPEC_DRAFT_VOCAB) |
 | `--spec-draft-backend-sampling, --no-spec-draft-backend-sampling` | offload draft sampling to the backend (default: enabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING) |
 | `--spec-draft-sampling {greedy,probabilistic}` | how the draft is sampled: greedy takes its argmax, probabilistic samples it and has the target verify by rejection sampling (default: greedy)<br/>(env: LLAMA_ARG_SPEC_DRAFT_SAMPLING) |
