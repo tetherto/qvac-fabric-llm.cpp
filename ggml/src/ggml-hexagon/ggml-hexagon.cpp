@@ -8036,14 +8036,21 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_device_get_host_buffer_ty
     return &dev_ctx->host_buffer_type;
 }
 
+static constexpr uint32_t HEXAGON_STRIDED_CONVERT_SCHED_MAX_ELEMS = 8192;
+
+static bool ggml_hexagon_cpy_beats_cpu_fallback(const struct htp_copy_kernel_params & kparams) {
+    return kparams.kernel_type != HTP_COPY_KERNEL_STRIDED_CONVERT ||
+           kparams.total_elems <= HEXAGON_STRIDED_CONVERT_SCHED_MAX_ELEMS;
+}
+
 static bool ggml_hexagon_supported_cpy(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     struct htp_copy_kernel_params kparams;
-    return ggml_hexagon_precompute_cpy_params(sess, op, &kparams);
+    return ggml_hexagon_precompute_cpy_params(sess, op, &kparams) && ggml_hexagon_cpy_beats_cpu_fallback(kparams);
 }
 
 static bool ggml_hexagon_supported_cont(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     struct htp_copy_kernel_params kparams;
-    return ggml_hexagon_precompute_cpy_params(sess, op, &kparams);
+    return ggml_hexagon_precompute_cpy_params(sess, op, &kparams) && ggml_hexagon_cpy_beats_cpu_fallback(kparams);
 }
 
 static bool ggml_hexagon_supported_repeat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
