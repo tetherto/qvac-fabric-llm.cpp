@@ -17216,7 +17216,7 @@ const char * ggml_backend_vk_buffer_type_name(ggml_backend_buffer_type_t buft) {
 }
 
 static size_t ggml_backend_vk_buffer_type_get_max_capacity(ggml_backend_buffer_type_t buft) {
-    if (buft->context == nullptr) {
+    if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
         return SIZE_MAX;
     }
 
@@ -17233,8 +17233,9 @@ ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buff
     VK_LOG_MEMORY("ggml_backend_vk_buffer_type_alloc_buffer(" << size << ")");
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
 
-    if (size > ggml_backend_vk_buffer_type_get_max_capacity(buft)) {
-        VK_LOG_DEBUG("ggml_backend_vk_buffer_type_alloc_buffer: requested size exceeds logical buffer capacity\n");
+    const size_t capacity = ggml_backend_vk_buffer_type_get_max_capacity(buft);
+    if (size > capacity) {
+        GGML_LOG_WARN("%s: requested size %zu exceeds logical buffer capacity %zu\n", __func__, size, capacity);
         return nullptr;
     }
 
@@ -20266,8 +20267,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
     const bool uses_bda = (op->op == GGML_OP_IM2COL || op->op == GGML_OP_IM2COL_3D) &&
                           device->shader_int64 && device->buffer_device_address;
 
+    const size_t capacity = ggml_backend_vk_buffer_type_get_max_capacity(&device->buffer_type);
     auto const & tensor_size_supported = [&](size_t tensor_size) {
-        if (tensor_size > device->max_buffer_size) {
+        if (tensor_size > capacity) {
             return false;
         }
         // For im2col shaders using BDA, maxStorageBufferRange limit doesn't apply.
@@ -20279,7 +20281,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         }
         return true;
     };
-    // reject any tensors larger than the max buffer size
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && !tensor_size_supported(ggml_nbytes(op->src[i]))) {
             return false;
