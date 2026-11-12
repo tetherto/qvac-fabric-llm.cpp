@@ -13038,14 +13038,24 @@ struct ggml_backend_opencl_buffer_context {
     }
 
     ~ggml_backend_opencl_buffer_context() {
-        for (cl_mem buf : buffer) {
-            CL_CHECK(clReleaseMemObject(buf));
-        }
+        release_images();
+        delete_tensor_extras();
+        release_parent_buffers();
+    }
+
+    void release_images() {
         for (cl_mem im : img) {
             CL_CHECK(clReleaseMemObject(im));
         }
+    }
 
-        // Delete all extras to trigger their destructors
+    void release_parent_buffers() {
+        for (cl_mem buf : buffer) {
+            CL_CHECK(clReleaseMemObject(buf));
+        }
+    }
+
+    void delete_tensor_extras() {
         for (ggml_tensor_extra_cl * e : temp_tensor_extras) {
             delete e;
         }
