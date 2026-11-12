@@ -572,6 +572,9 @@ llama_build_and_test(test-backend-memory.cpp LINK ggml)
 llama_build_and_test(test-backend-buffer-size.cpp LINK ggml)
 target_include_directories(test-backend-buffer-size PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+llama_build_and_test(test-vulkan-buffer-capacity.cpp LINK ggml)
+target_include_directories(test-vulkan-buffer-capacity PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 
 llama_build_and_test(test-convrot.cpp LINK ggml)
