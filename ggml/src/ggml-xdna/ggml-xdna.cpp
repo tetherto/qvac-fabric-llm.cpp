@@ -1356,6 +1356,20 @@ static void xdna_tail_scan(const ggml_cgraph * cgraph, std::vector<xdna_tail_pla
             p.n_lout->type != GGML_TYPE_F32 || p.n_resid->type != GGML_TYPE_F32) {
             continue;
         }
+        // The tail's GEMV reads attn_output only as Q4_K, Q5_K or Q6_K; the FFN weights already passed xdna_weights_fit.
+        // A layer with another attn_output runs per op.
+        const ggml_tensor * w_o = p.n_o->src[0];
+        if (xdna_wfmt_gemv_for(xdna_gemv_type_of(w_o)) == XDNA_WFMT_NONE) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                GGML_LOG_WARN(
+                    "%s: the attention tail reads attn_output as Q4_K, Q5_K or Q6_K; this model's %s is %s: "
+                    "that layer runs per op\n",
+                    "ggml-xdna", ggml_get_name(w_o), ggml_type_name(w_o->type));
+            }
+            continue;
+        }
         plans.push_back(p);
     }
 }
