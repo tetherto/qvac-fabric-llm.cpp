@@ -270,6 +270,14 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
 
+    argv = {"binary_name", "--spec-draft-n-short", "7", "--spec-draft-long-cost", "1.4"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.draft.n_short == 7);
+    assert(params.speculative.draft.long_cost == 1.4f);
+
+    argv = {"binary_name", "--spec-draft-long-cost", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
     {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-len", "3.4"};
