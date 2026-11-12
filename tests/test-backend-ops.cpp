@@ -18671,6 +18671,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {1, 1}, n, n, false, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
             test_cases.emplace_back(new test_flash_attn_ext(80, 80, 8, {1, 1}, n, n, false, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
+        for (bool mask : {false, true}) {
+            test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {1, 1}, 256, 4100, mask, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
         // n_q not a multiple of the query tile and n_kv leaving a partial final
         // KV tile for any pow2 tile size (513 = 16*32 + 1): out-of-range query
         // lanes must stay in the tile loop for the barriers yet not contribute
