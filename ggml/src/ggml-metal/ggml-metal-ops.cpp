@@ -6053,6 +6053,8 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
         /*.nb00 =*/ nb00,
         /*.nb01 =*/ nb01,
         /*.nb02 =*/ nb02,
+        /*.nb03 =*/ nb03,
+        /*.nb3  =*/ nb3,
         /*.ngrp =*/ ngrp,
         /*.eps  =*/ eps,
     };
@@ -6076,7 +6078,7 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, ngrp, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, ngrp*ne03, 1, 1, nth, 1, 1);
 
     return 1;
 }
