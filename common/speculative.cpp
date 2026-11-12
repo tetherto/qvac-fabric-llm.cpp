@@ -2611,6 +2611,33 @@ static std::vector<int64_t> common_speculative_gguf_int_array(const gguf_context
     return values;
 }
 
+// whether tensor is in another file of the split model whose file split_no of split_count is path, named as the
+// model loader finds the files
+static bool common_speculative_tensor_in_other_splits(const std::string & path, int64_t split_no, int64_t split_count, const char * tensor) {
+    if (split_no < 0 || split_no >= split_count || split_count > UINT16_MAX) {
+        return false;
+    }
+    std::vector<char> buf(path.size() + 64);
+    if (llama_split_prefix(buf.data(), buf.size(), path.c_str(), (int32_t) split_no, (int32_t) split_count) <= 0) {
+        return false;
+    }
+    const std::string prefix(buf.data());
+    for (int64_t i = 0; i < split_count; ++i) {
+        if (i == split_no || llama_split_path(buf.data(), buf.size(), prefix.c_str(), (int32_t) i, (int32_t) split_count) <= 0) {
+            continue;
+        }
+        const gguf_init_params gguf_params = {
+            /* .no_alloc = */ true,
+            /* .ctx      = */ nullptr,
+        };
+        gguf_context_ptr ctx(gguf_init_from_file(buf.data(), gguf_params));
+        if (ctx && gguf_find_tensor(ctx.get(), tensor) >= 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool common_speculative_read_header(const std::string & path, common_speculative_gguf_header & hdr) {
     const gguf_init_params gguf_params = {
         /* .no_alloc = */ true,
@@ -2646,6 +2673,12 @@ static bool common_speculative_read_header(const std::string & path, common_spec
     hdr.block_size    = common_speculative_gguf_int(ctx.get(), p + "block_size");
     hdr.has_markov    = gguf_find_tensor(ctx.get(), "markov_w1.weight") >= 0;
     hdr.target_layers = common_speculative_gguf_int_array(ctx.get(), p + "target_layers");
+
+    // the loader assembles every file's tensors into one model, while the metadata is only in the first
+    const int64_t split_count = common_speculative_gguf_int(ctx.get(), "split.count");
+    if (!hdr.has_markov && split_count > 1) {
+        hdr.has_markov = common_speculative_tensor_in_other_splits(path, common_speculative_gguf_int(ctx.get(), "split.no"), split_count, "markov_w1.weight");
+    }
     return true;
 }
 

@@ -126,6 +126,29 @@ int main() {
     expect("a markov head needs a block size", mismatch(DFLASH, no_block, fits),
             "it has a DSpark Markov head but no positive dflash.block_size");
 
+    // a split draft model: the metadata is in the first file, and the Markov head may be in any file
+    const auto split = [](bool block_size) {
+        const std::string prefix = block_size ? "test-sdm-split-bs" : "test-sdm-split";
+        write_gguf((prefix + "-00002-of-00002.gguf").c_str(), [](gguf_context * gguf, ggml_context * ctx) {
+            gguf_set_val_u16(gguf, "split.no", 1);
+            gguf_set_val_u16(gguf, "split.count", 2);
+            add_tensor(gguf, ctx, "markov_w1.weight");
+        });
+        return write_gguf((prefix + "-00001-of-00002.gguf").c_str(), [=](gguf_context * gguf, ggml_context *) {
+            gguf_set_val_str(gguf, "general.architecture", "dflash");
+            gguf_set_val_u32(gguf, "dflash.embedding_length", N_EMBD);
+            if (block_size) {
+                gguf_set_val_u32(gguf, "dflash.block_size", 7);
+            }
+            set_tokens(gguf, N_VOCAB);
+            gguf_set_val_u16(gguf, "split.no", 0);
+            gguf_set_val_u16(gguf, "split.count", 2);
+        });
+    };
+    expect("a markov head in another split needs a block size", mismatch(DSPARK, split(false), fits),
+            "it has a DSpark Markov head but no positive dflash.block_size");
+    expect("a split dspark model with a block size fits", mismatch(DSPARK, split(true), fits), "");
+
     // gguf_get_arr_data asserts on a string array
     const std::string str_layers = write_gguf("test-sdm-dspark-str-layers.gguf", [](gguf_context * gguf, ggml_context * ctx) {
         dspark()(gguf, ctx);
