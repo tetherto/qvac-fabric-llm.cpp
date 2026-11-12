@@ -20763,6 +20763,18 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
     backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, dst);
 }
 
+static void ggml_cl_group_norm_enqueue_batch(ggml_backend_opencl_context * backend_ctx, cl_kernel kernel,
+        const ggml_tensor * src0, cl_ulong offset0, const ggml_tensor * dst, cl_ulong offsetd,
+        size_t * global_work_size, size_t * local_work_size) {
+    for (int64_t i3 = 0; i3 < src0->ne[3]; ++i3) {
+        const cl_ulong offset0_i3 = offset0 + i3*src0->nb[3];
+        const cl_ulong offsetd_i3 = offsetd + i3*dst->nb[3];
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0_i3));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd_i3));
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    }
+}
+
 static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -20800,9 +20812,7 @@ static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0,
     }
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
-    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
-    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
     CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &ne));
     CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &group_size));
     CL_CHECK(clSetKernelArg(kernel, 6, sizeof(float),    &eps));
@@ -20810,7 +20820,7 @@ static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0,
     size_t global_work_size[] = {(size_t)n_groups*sgs, 1, 1};
     size_t local_work_size[] = {(size_t)sgs, 1, 1};
 
-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    ggml_cl_group_norm_enqueue_batch(backend_ctx, kernel, src0, offset0, dst, offsetd, global_work_size, local_work_size);
 }
 
 static void ggml_cl_l2_norm(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
