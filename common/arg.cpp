@@ -4398,6 +4398,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-n-short"}, "N",
+        string_format("lattice drafters such as DFlash2 and DSpine: keep only N drafts in a step unless the expected accepted tokens of\n"
+                      "the full draft pay for --spec-draft-long-cost (default: %d, 0 = off)", params.speculative.draft.n_short),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_short = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_SHORT"));
+    add_opt(common_arg(
+        {"--spec-draft-long-cost"}, "R",
+        string_format("time of a step with --spec-draft-n-max drafts relative to one with --spec-draft-n-short drafts\n"
+                      "(default: %.2f)", (double) params.speculative.draft.long_cost),
+        [](common_params & params, const std::string & value) {
+            const float cost = std::stof(value);
+            if (!(cost > 0.0f)) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.long_cost = cost;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_LONG_COST"));
+    add_opt(common_arg(
         {"--spec-draft-vocab"}, "B:E[,B:E...]",
         "token id ranges [B, E) a DFlash2 drafter may propose; the target still verifies over the full vocabulary\n"
         "(default: full vocabulary)",

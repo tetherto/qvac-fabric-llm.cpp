@@ -983,6 +983,36 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// softmax of a lattice row's transition scores at its argmax, i.e. 1 / sum(exp(s_k - s_max))
+static float lattice_argmax_prob(const float * scores, int32_t n, int32_t i_max) {
+    float sum = 0.0f;
+    for (int32_t k = 0; k < n; ++k) {
+        sum += std::exp(scores[k] - scores[i_max]);
+    }
+    return 1.0f / sum;
+}
+
+// expected accepted drafts among the first n transitions of a lattice path
+static float lattice_expected_accepted(const float * path_p, size_t n) {
+    float p_all = 1.0f;
+    float sum   = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        p_all *= path_p[i];
+        sum   += p_all;
+    }
+    return sum;
+}
+
+size_t common_speculative_lattice_keep(const float * path_p, size_t n, int32_t n_short, float long_cost) {
+    if (n_short <= 0 || n <= (size_t) n_short) {
+        return n;
+    }
+    // every step also yields the target's own next token
+    const float tokens_long  = 1.0f + lattice_expected_accepted(path_p, n);
+    const float tokens_short = 1.0f + lattice_expected_accepted(path_p, (size_t) n_short);
+    return tokens_long >= long_cost * tokens_short ? n : (size_t) n_short;
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1098,9 +1128,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
-        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_short=%d, long_cost=%.2f\n", __func__, this->params.n_max,
+                this->params.n_min, this->params.p_min, this->params.n_short, this->params.long_cost);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
+        if (is_dflash2 && this->params.probabilistic && this->params.n_short > 0) {
+            LOG_WRN("%s: --spec-draft-n-short applies to greedy drafts only, a sampled draft is never shortened by it\n", __func__);
+        }
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
@@ -1415,6 +1449,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 std::vector<int32_t> sorted_idx;
 
                 int32_t predecessor = 0;
+                std::vector<float> path_p;
                 for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
@@ -1422,7 +1457,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
-                    if (params.p_min > 0.0f || sample) {
+                    float p;
+                    if (sample) {
                         // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
                         probs.resize(top_k);
                         float sum = 0.0f;
@@ -1430,12 +1466,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             probs[k] = std::exp((scores[k] - scores[predecessor]) / temp);
                             sum += probs[k];
                         }
-                        if (1.0f / sum < params.p_min) {
-                            break;
-                        }
+                        p = 1.0f / sum;
                         for (int32_t k = 0; k < top_k; ++k) {
                             probs[k] /= sum;
                         }
+                    } else {
+                        p = lattice_argmax_prob(scores, top_k, predecessor);
+                    }
+                    if (p < params.p_min) {
+                        break;
                     }
                     if (sample) {
                         // ggml_top_k leaves candidates unordered, so walk them by token id to keep a seed's draft stable
@@ -1462,6 +1501,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                     }
                     result.push_back((llama_token) row[predecessor]);
+                    path_p.push_back(p);
+                }
+                // the keep rule reads transitions past the drafts it keeps, so on a sampled draft it would keep a token
+                // depending on the token's own continuation, and the verifier's q would no longer be its distribution
+                if (!sample) {
+                    result.resize(common_speculative_lattice_keep(path_p.data(), result.size(), params.n_short, params.long_cost));
                 }
 
                 if (result.size() < (size_t) params.n_min) {
