@@ -622,6 +622,11 @@ llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK 
 
 llama_build_and_test(test-convrot.cpp LINK ggml)
 
+if (GGML_OPENCL)
+    find_package(Threads REQUIRED)
+    llama_build_and_test(test-opencl-concurrent-upload.cpp LINK ggml Threads::Threads)
+endif()
+
 # Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
 # GGML_VK_TBQ_COPY_SG_SIZE values to exercise the shader's cross-subgroup stitch
 # path on hardware that only exposes one native subgroup size. Auto-skips when no
