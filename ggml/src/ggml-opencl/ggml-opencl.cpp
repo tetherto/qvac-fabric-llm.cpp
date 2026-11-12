@@ -11397,6 +11397,10 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         if (!ggml_is_contiguous(gn->src[0]) || !ggml_is_contiguous(w) || !ggml_is_contiguous(b)) {
             return false;
         }
+
+        if (gn->src[0]->ne[3] != 1 || !ggml_are_same_shape(w, gn) || !ggml_are_same_shape(b, gn)) {
+            return false;
+        }
     }
 
     return true;
@@ -20715,6 +20719,18 @@ static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
 }
 
+static size_t ggml_cl_group_norm_subgroup_size(const ggml_backend_opencl_context * backend_ctx) {
+    constexpr size_t adreno_subgroup_size = 64;
+    constexpr size_t intel_subgroup_size  = 32;
+    if (backend_ctx->gpu_family == ADRENO) {
+        return adreno_subgroup_size;
+    }
+    if (backend_ctx->gpu_family == INTEL) {
+        return intel_subgroup_size;
+    }
+    GGML_ABORT("Unsupported GPU");
+}
+
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor) {
     GGML_ASSERT(gn_tensor && mul_tensor && add_tensor);
 
@@ -20741,11 +20757,10 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
     memcpy(&eps, (char *)gn_tensor->op_params + sizeof(int), sizeof(float));
 
     cl_kernel kernel = backend_ctx->kernel_group_norm_mul_add;
-    int max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
     int ne = ggml_nelements(src0);
     int group_size = ne / groups;
 
-    size_t lws[] = { (size_t)MIN(max_workgroup_size, group_size) };
+    size_t lws[] = { ggml_cl_group_norm_subgroup_size(backend_ctx) };
     size_t gws[] = { (size_t)groups * lws[0] };
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra0->data_device));
@@ -20802,14 +20817,7 @@ static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0,
 
     cl_kernel kernel = backend_ctx->kernel_group_norm;
 
-    size_t sgs = 64;
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    size_t sgs = ggml_cl_group_norm_subgroup_size(backend_ctx);
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
