@@ -386,8 +386,8 @@ template [[host_name("kernel_l2_norm_f32_f32_4")]] kernel kernel_l2_norm_t kerne
 
 kernel void kernel_group_norm_f32(
         constant ggml_metal_kargs_group_norm & args,
-        device const float * src0,
-        device       float * dst,
+        device const char  * src0,
+        device       char  * dst,
         threadgroup float  * buf [[threadgroup(0)]],
         uint tgpig[[threadgroup_position_in_grid]],
         uint tpitg[[thread_position_in_threadgroup]],
@@ -397,7 +397,13 @@ kernel void kernel_group_norm_f32(
     const int64_t ne = args.ne00*args.ne01*args.ne02;
     const int64_t gs = args.ne00*args.ne01*((args.ne02 + args.ngrp - 1) / args.ngrp);
 
-    int start = tgpig * gs;
+    const uint i3   = tgpig / args.ngrp;
+    const uint igrp = tgpig % args.ngrp;
+
+    device const float * x = (device const float *) (src0 + i3*args.nb03);
+    device       float * y = (device       float *) (dst  + i3*args.nb3);
+
+    int start = igrp * gs;
     int end   = start + gs;
 
     start += tpitg;
@@ -409,7 +415,7 @@ kernel void kernel_group_norm_f32(
     float tmp = 0.0f; // partial sum for thread in warp
 
     for (int j = start; j < end; j += ntg) {
-        tmp += src0[j];
+        tmp += x[j];
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -435,8 +441,8 @@ kernel void kernel_group_norm_f32(
     tmp = 0.0f;
 
     for (int j = start; j < end; j += ntg) {
-        float xi = src0[j] - mean;
-        dst[j] = xi;
+        float xi = x[j] - mean;
+        y[j] = xi;
         tmp += xi * xi;
     }
 
@@ -461,7 +467,7 @@ kernel void kernel_group_norm_f32(
     const float variance = tmp / gs;
     const float scale = 1.0f/sqrt(variance + args.eps);
     for (int j = start; j < end; j += ntg) {
-        dst[j] *= scale;
+        y[j] *= scale;
     }
 }
 
