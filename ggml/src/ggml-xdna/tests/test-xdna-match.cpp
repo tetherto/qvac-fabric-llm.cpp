@@ -125,6 +125,34 @@ static int check_fused_weights(ggml_context * ctx) {
     return count_failures(cases);
 }
 
+// The in-projection and attn_output the fused decode's GEMV reads, and the first it does not.
+static int check_fused_gemv_weights(ggml_context * ctx) {
+    ggml_tensor *       x         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, QK_ROW, 1);
+    ggml_tensor *       qkv4      = read_weight(ctx, GGML_TYPE_Q4_K, "blk.0.attn_qkv.weight", x);
+    ggml_tensor *       qkv5      = read_weight(ctx, GGML_TYPE_Q5_K, "blk.1.attn_qkv.weight", x);
+    ggml_tensor *       z6        = read_weight(ctx, GGML_TYPE_Q6_K, "blk.0.attn_gate.weight", x);
+    ggml_tensor *       o4        = read_weight(ctx, GGML_TYPE_Q4_K, "blk.3.attn_output.weight", x);
+    ggml_tensor *       qkv8      = read_weight(ctx, GGML_TYPE_Q8_0, "blk.2.attn_qkv.weight", x);
+    ggml_tensor *       qkv16     = read_weight(ctx, GGML_TYPE_F16, "blk.4.attn_qkv.weight", x);
+    ggml_tensor *       z8        = read_weight(ctx, GGML_TYPE_Q8_0, "blk.2.attn_gate.weight", x);
+    ggml_tensor *       o8        = read_weight(ctx, GGML_TYPE_Q8_0, "blk.7.attn_output.weight", x);
+    ggml_tensor *       gate8     = read_weight(ctx, GGML_TYPE_Q8_0, "blk.2.ffn_gate.weight", x);
+    const ggml_tensor * k_quant[] = { qkv4, qkv5, z6, o4 };
+    const ggml_tensor * gate_q8[] = { qkv5, z8 };
+
+    const match_case cases[] = {
+        { "a K-quant in-projection and attn_output read", xdna_fused_gemv_uncovered(k_quant, 4, true),  nullptr       },
+        { "a Q8_0 attn_qkv is not read",                  xdna_fused_gemv_uncovered(&qkv8,   1, true),  qkv8->src[0]  },
+        { "an F16 attn_qkv is not read",                  xdna_fused_gemv_uncovered(&qkv16,  1, true),  qkv16->src[0] },
+        { "a Q8_0 attn_gate is not read",                 xdna_fused_gemv_uncovered(gate_q8, 2, true),  z8->src[0]    },
+        { "a Q8_0 attn_output is not read",               xdna_fused_gemv_uncovered(&o8,     1, true),  o8->src[0]    },
+        { "with the tails off attn_output is not read",   xdna_fused_gemv_uncovered(&o8,     1, false), nullptr       },
+        { "with the tails off attn_qkv still is",         xdna_fused_gemv_uncovered(&qkv8,   1, false), qkv8->src[0]  },
+        { "an FFN weight is the fused set's to check",    xdna_fused_gemv_uncovered(&gate8,  1, true),  nullptr       },
+    };
+    return count_failures(cases);
+}
+
 // A weight `name` of ne0 x ne1, and a node that reads it.
 static ggml_tensor * read_shaped(ggml_context * ctx, const char * name, int64_t ne0, int64_t ne1) {
     ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
@@ -254,7 +282,8 @@ int main(void) {
     const ggml_init_params params = { ggml_tensor_overhead() * MAX_TENSORS, nullptr, true };
     ggml_context *         ctx    = ggml_init(params);
     const int              failures = check_state_gather(ctx) + check_row_crop(ctx) + check_fused_weights(ctx) +
-                                      check_layer_census(ctx) + check_census_keeps_name() + check_route_fused();
+                                      check_fused_gemv_weights(ctx) + check_layer_census(ctx) +
+                                      check_census_keeps_name() + check_route_fused();
     ggml_free(ctx);
     if (failures) {
         std::printf("test-xdna-match: %d failures\n", failures);

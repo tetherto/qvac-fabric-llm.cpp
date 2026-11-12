@@ -1297,11 +1297,6 @@ static bool xdna_tail_on(void) {
     return v;
 }
 
-// Whether the decode GEMV of a fused run reads weight `w`: Q4_K, Q5_K or Q6_K.
-static bool xdna_gemv_reads(const ggml_tensor * w) {
-    return w && xdna_wfmt_gemv_for(xdna_gemv_type_of(w)) != XDNA_WFMT_NONE;
-}
-
 static void xdna_tail_scan(const ggml_cgraph * cgraph, std::vector<xdna_tail_plan> & plans) {
     plans.clear();
     std::map<int, xdna_tail_plan> m;
@@ -1359,19 +1354,6 @@ static void xdna_tail_scan(const ggml_cgraph * cgraph, std::vector<xdna_tail_pla
         }
         if (!p.n_hres || p.n_hres->type != GGML_TYPE_F32 || ggml_nelements(p.n_hres) != p.n_o->ne[0] ||
             p.n_lout->type != GGML_TYPE_F32 || p.n_resid->type != GGML_TYPE_F32) {
-            continue;
-        }
-        // The FFN weights already passed xdna_weights_fit. A layer with an attn_output the GEMV does not read runs per op.
-        const ggml_tensor * w_o = p.n_o->src[0];
-        if (!xdna_gemv_reads(w_o)) {
-            static bool said = false;
-            if (!said) {
-                said = true;
-                GGML_LOG_WARN(
-                    "%s: the attention tail reads attn_output as Q4_K, Q5_K or Q6_K; this model's %s is %s: "
-                    "that layer runs per op\n",
-                    "ggml-xdna", ggml_get_name(w_o), ggml_type_name(w_o->type));
-            }
             continue;
         }
         plans.push_back(p);
@@ -2193,10 +2175,13 @@ static bool xdna_width_fits(int64_t d) {
     return false;
 }
 
-// The fused layers read only their own weight formats (xdna_fused_weight_ok); a chunk with any other is
-// left to the same route as a width they do not take, and one warning names the first such weight.
+// The fused layers read only their own weight formats (xdna_fused_weight_ok, xdna_fused_gemv_ok); a chunk with any
+// other is left to the same route as a width they do not take, and one warning names the first such weight.
 static bool xdna_weights_fit(const ggml_cgraph * cgraph) {
     const ggml_tensor * w = xdna_fused_uncovered(cgraph->nodes, cgraph->n_nodes, xdna_rec_pack::GATED_FMT);
+    if (!w) {
+        w = xdna_fused_gemv_uncovered(cgraph->nodes, cgraph->n_nodes, xdna_tail_on());
+    }
     if (!w) {
         return true;
     }
@@ -2204,8 +2189,8 @@ static bool xdna_weights_fit(const ggml_cgraph * cgraph) {
     if (!said) {
         said = true;
         GGML_LOG_WARN(
-            "%s: the fused decode layers read ssm_out as %s, the FFN's gate and up as Q4_K and its down as "
-            "Q4_K or Q6_K; this model's %s is %s: %s\n",
+            "%s: the fused decode layers read ssm_out as %s, the FFN's gate and up as Q4_K, its down as Q4_K or "
+            "Q6_K, and attn_qkv, attn_gate and attn_output as Q4_K, Q5_K or Q6_K; this model's %s is %s: %s\n",
             "ggml-xdna", xdna_rec_pack::GATED_FMT == 0 ? "Q4_K" : "Q5_K or Q6_K", ggml_get_name(w),
             ggml_type_name(w->type), xdna_misfit_route());
     }
@@ -2550,22 +2535,6 @@ static bool xdna_rec_scan(ggml_backend_xdna_context *  ctx,
                             ggml_nelements(p.n_act) == p.n_act->ne[0];
         if (!inproj) {
             p.n_act = nullptr;
-        }
-        // The fused stream packs the in-projection for the GEMV. A layer with a weight it does not read runs per op.
-        const ggml_tensor * w_ip = !inproj                           ? nullptr :
-                                   !xdna_gemv_reads(p.n_qkv->src[0]) ? p.n_qkv->src[0] :
-                                   !xdna_gemv_reads(p.n_z->src[0])   ? p.n_z->src[0] :
-                                                                       nullptr;
-        if (w_ip) {
-            static bool said = false;
-            if (!said) {
-                said = true;
-                GGML_LOG_WARN(
-                    "%s: the fused layer reads attn_qkv and attn_gate as Q4_K, Q5_K or Q6_K; this model's %s is %s: "
-                    "that layer runs per op\n",
-                    "ggml-xdna", ggml_get_name(w_ip), ggml_type_name(w_ip->type));
-            }
-            continue;
         }
         const ggml_tensor * need[] = {
             inproj ? p.n_act : p.n_qkv, inproj ? p.n_act : p.n_z, p.n_gate, p.n_beta, p.n_convst, p.n_sstate

@@ -60,16 +60,15 @@ recurrent state stays on the device between tokens.
 
 It covers one weight set: `Q4_K` for the FFN gate and up, `Q4_K`/`Q5_K`/`Q6_K`
 for `ssm_out`, `Q4_K`/`Q6_K` for the FFN down, plus a `GGML_XDNA_GATED_FMT` that
-matches the `ssm_out` layout. A model with any other format in those weights
+matches the `ssm_out` layout, and `Q4_K`/`Q5_K`/`Q6_K` for the in-projection
+(`attn_qkv`, `attn_gate`) and, unless `GGML_XDNA_ATTN_TAIL=0`, an attention
+layer's `attn_output`. A model with any other format in those weights
 is not handed to the fused layers: one warning names the first such weight, and
 its decode runs as for a width they do not take (below). When `ssm_out` is the
 only such weight - a stock `Qwen/Qwen3.5-0.8B Q4_K_M` leaves half of its
 `ssm_out` at `Q8_0` - requantizing it is the way onto the fused path (see
 Build). `GGML_XDNA_FUSED_LAYER=0` is a bisection switch, not a way to run such
-a model on the fused layers. A recurrent layer's in-projection (`attn_qkv`,
-`attn_gate`) and an attention layer's tail (`attn_output`) are read as `Q4_K`,
-`Q5_K` or `Q6_K`; a layer with another type runs per op, and one warning names
-the first such weight.
+a model on the fused layers.
 
 The layers take the residual width from the model: any multiple of 512 up to
 4096 (`XDNA_RES_MAX_D`, what the residual rows the layers hand each other are
@@ -651,7 +650,9 @@ Diagnostics - nothing is measured unless they are set:
   requantize, e.g.
   `llama-quantize --tensor-type ssm_out=q5_K model-f16.gguf out.gguf Q4_K_M`.
   An FFN outside `Q4_K` gate/up and `Q4_K`/`Q6_K` down has no rebuild that
-  takes it.
+  takes it. An `attn_qkv`, `attn_gate` or `attn_output` outside
+  `Q4_K`/`Q5_K`/`Q6_K` takes the requantize too, e.g.
+  `--tensor-type attn_qkv=q5_K`.
 - **`the fused decode layers take Qwen3.5's gated delta net and attention layers
   with a dense FFN, this model's ...: its decode runs on the host`** - a model
   wider than 1024 whose layers the fused layers do not run (a dense model, a
