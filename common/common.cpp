@@ -1326,6 +1326,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto cparams = common_context_params_to_llama(params);
 
     common_fit_apply(params, mparams, cparams);
+    // a draft model for another model aborts on a ggml assert once it is fitted or loaded next to this one
+    const std::string draft_mismatch = common_speculative_draft_mismatch(params, params.model.path);
+    if (!draft_mismatch.empty()) {
+        COM_ERR("the draft model '%s' does not match the model '%s': %s\n",
+                params.speculative.draft.mparams.path.c_str(), params.model.path.c_str(), draft_mismatch.c_str());
+        return;
+    }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
