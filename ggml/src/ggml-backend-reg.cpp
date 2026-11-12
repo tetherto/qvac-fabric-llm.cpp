@@ -810,6 +810,8 @@ void ggml_backend_load_all() {
 
 #ifdef __ANDROID__
 namespace {
+constexpr int kAdrenoVersionVulkanUnavailable = -2;
+
 // Parses adreno version from gpu description or returns -1 if its not Adreno GPU or -3 if failed to parse the version
 int adrenoVersion(const std::string & gpuDescription) {
     std::regex  adrenoRegex(R"((\d+))");
@@ -827,10 +829,11 @@ int adrenoVersion(const std::string & gpuDescription) {
     return -1;
 }
 
-// Returns smallest Adreno version among GPU devices or -1 if there is no adreno GPU
+// Returns smallest Adreno version among GPU devices, -1 if there is no adreno GPU, or
+// kAdrenoVersionVulkanUnavailable if the Vulkan backend is not loaded
 int minAdrenoVersion(ggml_backend_reg_t vulkanBackend) {
     if (!vulkanBackend) {
-        return -2;
+        return kAdrenoVersionVulkanUnavailable;
     }
     int minFoundVersion = std::numeric_limits<int>::max();
     for (size_t i = 0; i < vulkanBackend->iface.get_device_count(vulkanBackend); i++) {
@@ -883,7 +886,10 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     // Use Vulkan backend to obtain GPU information
     ggml_backend_reg_t vulkanBackend           = ggml_backend_reg_by_name("vulkan");
     int                devicesMinAdrenoVersion = minAdrenoVersion(vulkanBackend);
-    if (devicesMinAdrenoVersion <= 0) {
+    if (devicesMinAdrenoVersion == kAdrenoVersionVulkanUnavailable) {
+        GGML_LOG_INFO("%s: Vulkan backend unavailable for Adreno detection; keeping OpenCL backend available\n",
+                      __func__);
+    } else if (devicesMinAdrenoVersion <= 0) {
         GGML_LOG_INFO(
             "%s: no adreno GPU version found (%d) removing OpenCL backend (if any) to rely on Vulkan/cpu only\n",
             __func__, devicesMinAdrenoVersion);
