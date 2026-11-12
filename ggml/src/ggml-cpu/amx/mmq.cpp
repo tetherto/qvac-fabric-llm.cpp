@@ -1334,9 +1334,9 @@ struct tinygemm_kernel_avx<float, ggml_fp16_t, float, BLOCK_M, BLOCK_N, BLOCK_K>
 
 #define LAUNCH_TINYGEMM_KERNEL_AVX(MB_SIZE, NB_SIZE)                                \
     tinygemm_kernel_avx<float, type, float, MB_SIZE, NB_SIZE, blck_size>::apply(    \
-        K, (const float *)src1->data + src1_offset + mb_start * K,                  \
-        (const type *)src0->data + src0_offset + nb_start * K,                      \
-        (float *)dst->data + dst_offset + mb_start * ldc + nb_start, ldc)
+        K, (const float *)((const char *)src1->data + src1_offset) + mb_start * K,  \
+        (const type *)((const char *)src0->data + src0_offset) + nb_start * K,      \
+        (float *)((char *)dst->data + dst_offset) + mb_start * ldc + nb_start, ldc)
 
 
 // re-organize in the format {NB, KB, TILE_SIZE}:
@@ -1987,7 +1987,7 @@ struct tinygemm_kernel_vnni<block_q8_K, block_iq4_xs, float, BLOCK_M, BLOCK_N, B
     tinygemm_kernel_vnni<vec_dot_type, type, float, 1, NB_SIZE, blck_size>::apply(             \
         KB, wdata_batch,                                                                       \
         (const char *)src0->data + src0_offset + PACKED_INDEX(nb * kTilesN, 0, KB, TILE_SIZE), \
-        (float *) dst->data + dst_offset + nb_start, ldc)
+        (float *) ((char *) dst->data + dst_offset) + nb_start, ldc)
 
 template <typename TA, typename TB, typename TC, int BLOCK_K,
           typename std::enable_if<!is_type_qkk<TB>::value, int>::type = 0>
@@ -2301,10 +2301,11 @@ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * d
 }
 
 // ne2 is passed explicitly to help compiler optimize repeated calls
-inline int64_t ggml_batch_offset(const ggml_tensor * t, int64_t batch_idx, int64_t ne2) {
-    const int64_t i2 = batch_idx % ne2;
-    const int64_t i3 = batch_idx / ne2;
-    return i3 * t->nb[3] + i2 * t->nb[2];
+// byte offset of dst batch batch_idx in t, which broadcasts over the batch dims of dst like ggml_mul_mat
+inline int64_t ggml_batch_offset(const ggml_tensor * t, const ggml_tensor * dst, int64_t batch_idx) {
+    const int64_t i2 = batch_idx % dst->ne[2];
+    const int64_t i3 = batch_idx / dst->ne[2];
+    return (i3 / (dst->ne[3] / t->ne[3])) * t->nb[3] + (i2 / (dst->ne[2] / t->ne[2])) * t->nb[2];
 }
 
 size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst) {
@@ -2371,9 +2372,9 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                     int mb = remaining / NB;
                     int nb = remaining % NB;
 
-                    int64_t src0_offset = ggml_batch_offset(src0, batch_idx, ne2);
-                    int64_t src1_offset = ggml_batch_offset(src1, batch_idx, ne2);
-                    int64_t dst_offset  = ggml_batch_offset(dst,  batch_idx, ne2);
+                    int64_t src0_offset = ggml_batch_offset(src0, dst, batch_idx);
+                    int64_t src1_offset = ggml_batch_offset(src1, dst, batch_idx);
+                    int64_t dst_offset  = ggml_batch_offset(dst, dst, batch_idx);
 
                     int mb_start = mb * BLOCK_M;
                     int mb_size = std::min(BLOCK_M, M - mb_start);
@@ -2421,7 +2422,7 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                 for (int idx = begin; idx < end; ++idx) {
                     int batch_idx = idx / M;
                     int m         = idx % M;
-                    int64_t src1_offset = ggml_batch_offset(src1, batch_idx, ne2);
+                    int64_t src1_offset = ggml_batch_offset(src1, dst, batch_idx);
                     const float * A_data = (const float *)((const char *)src1->data + src1_offset);
                     char * wdata_batch = (char *)wdata + batch_idx * M * row_size_A;
                     from_float<vec_dot_type>(A_data + m * K, wdata_batch + m * row_size_A, K);
@@ -2447,8 +2448,8 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                     int batch_idx = i / NB;
                     int nb = i % NB;
 
-                    int64_t src0_offset = ggml_batch_offset(src0, batch_idx, ne2);
-                    int64_t dst_offset  = ggml_batch_offset(dst,  batch_idx, ne2);
+                    int64_t src0_offset = ggml_batch_offset(src0, dst, batch_idx);
+                    int64_t dst_offset  = ggml_batch_offset(dst, dst, batch_idx);
                     const char * wdata_batch = (const char *)wdata + batch_idx * row_size_A;
 
                     int nb_start = nb * BLOCK_N;
@@ -2489,8 +2490,8 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                 int mb = remaining / NB;
                 int nb = remaining % NB;
 
-                int64_t src0_offset = ggml_batch_offset(src0, batch_idx, ne2);
-                int64_t dst_offset  = ggml_batch_offset(dst,  batch_idx, ne2);
+                int64_t src0_offset = ggml_batch_offset(src0, dst, batch_idx);
+                int64_t dst_offset  = ggml_batch_offset(dst, dst, batch_idx);
                 const char * wdata_batch = (const char *)wdata + batch_idx * M * row_size_A;
 
                 int mb_start = mb * BLOCK_M;
@@ -2502,7 +2503,7 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                     mb_size, nb_size, KB,
                     wdata_batch + mb_start * row_size_A,
                     (const char *)src0->data + src0_offset + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
-                    (float *) dst->data + dst_offset + mb_start * N + nb_start, ldc);
+                    (float *) ((char *) dst->data + dst_offset) + mb_start * N + nb_start, ldc);
             }
         });
     });

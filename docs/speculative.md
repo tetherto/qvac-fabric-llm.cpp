@@ -101,6 +101,23 @@ llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2.gguf \
     --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-vocab 0:98304,248032:248320 -fa on --jinja
 ```
 
+[DSpine](https://github.com/Tencent/DSpine) drafts are DFlash drafts with a code bridge, for example `tencent/Qwen3-8B-DSpine-b16` for `Qwen/Qwen3-8B` and `tencent/Qwen3.8-27B-DSpine-b16` for `Qwen/Qwen3.8-27B`.
+They are detected from the checkpoint and use the same `draft-dflash` type.
+Each draft layer passes a code of the previous block position's token to the next position, and the draft rescores its top-k candidates per position (16 in both checkpoints) with the exact predecessor token.
+
+```bash
+python convert_hf_to_gguf.py tencent/Qwen3-8B-DSpine-b16 \
+    --target-model-dir Qwen/Qwen3-8B --outtype bf16 --outfile Qwen3-8B-DSpine.gguf
+
+llama-server -m Qwen3-8B.gguf -md Qwen3-8B-DSpine.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 15 -fa on --jinja
+```
+
+The draft ubatch (`--spec-draft-n-ubatch`, default `--ubatch-size`) must hold one block per parallel sequence, that is `-np * (--spec-draft-n-max + 1)` tokens.
+`--spec-draft-vocab` is for DFlash2 drafters only and stops the speculative setup with an error for a DSpine draft.
+The draft reads rows of the target output head directly, so a head in a repacked or row-split buffer stops the draft context with an error.
+Load the target with `--no-repack` and without `-sm row` in that case.
+
 See:
 
 - #22105
