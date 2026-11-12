@@ -15,9 +15,9 @@ layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
 // Requires ne20 to be a multiple of QUANT_K (always true for Q4_0).
 void get_dst_indices_lower(uint idx, out uint i0, out uint i1, out uint i2, out uint i3) {
     const uint ne20h = p.ne20 >> 1;
-    i3 = fastdiv(idx, p.ne22 * p.ne21 * ne20h);
+    i3 = fastdiv_small(idx, p.ne22 * p.ne21 * ne20h);
     const uint r3 = idx - i3 * p.ne22 * p.ne21 * ne20h;
-    i2 = fastdiv(r3, p.ne21 * ne20h);
+    i2 = fastdiv_small(r3, p.ne21 * ne20h);
     const uint r2 = r3 - i2 * p.ne21 * ne20h;
     i1 = r2 / ne20h;
     const uint i0h = r2 - i1 * ne20h;

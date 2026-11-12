@@ -43,10 +43,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 10
+#define LLAMA_SESSION_VERSION 11
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 3
+#define LLAMA_STATE_SEQ_VERSION 4
 
 #ifdef __cplusplus
 extern "C" {
@@ -77,6 +77,8 @@ extern "C" {
         LLAMA_VOCAB_TYPE_UGM    = 4, // T5 tokenizer based on Unigram
         LLAMA_VOCAB_TYPE_RWKV   = 5, // RWKV tokenizer based on greedy tokenization
         LLAMA_VOCAB_TYPE_PLAMO2 = 6, // PLaMo-2 tokenizer based on Aho-Corasick with dynamic programming
+        LLAMA_VOCAB_TYPE_TEST   = 7, // Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex
+        LLAMA_VOCAB_TYPE_PLAMO3 = 8, // PLaMo-3 tokenizer with pre-segmentation and dynamic programming
     };
 
     enum llama_rope_type {
@@ -156,6 +158,8 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_PQ2_0         = 141, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_PTQ1_0        = 143, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -214,10 +218,10 @@ extern "C" {
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
 
-    enum llama_tensor_read_lazy {
-        LLAMA_TENSOR_READ_LAZY_OFF  = 0, // always read the whole tensor up front
-        LLAMA_TENSOR_READ_LAZY_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
-        LLAMA_TENSOR_READ_LAZY_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+    enum llama_lazy_mode {
+        LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
+        LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
+        LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
     };
 
     enum llama_context_type {
@@ -292,6 +296,11 @@ extern "C" {
         LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA,
     };
 
+    enum llama_process_type {
+        LLAMA_PROCESS_TYPE_ENCODE,
+        LLAMA_PROCESS_TYPE_DECODE,
+    };
+
     struct llama_model_kv_override {
         enum llama_model_kv_override_type tag;
 
@@ -321,7 +330,7 @@ extern "C" {
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
 
-        enum llama_tensor_read_lazy tensor_read_lazy; // on-demand reading of tensors marked by the arch
+        enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -347,6 +356,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool training;        // load the model for training (keeps the output projection mirrored under tensor split)
     };
 
     struct llama_sampler_seq_config {
@@ -388,7 +398,8 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
-        size_t moe_cache_size; // persistent GPU MoE cache size in bytes, 0 = disabled [EXPERIMENTAL]
+
+        size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -397,7 +408,7 @@ extern "C" {
         void *              abort_callback_data;
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
-        bool embeddings;  // if true, extract embeddings (together with logits)
+        bool embeddings;  // if true, extract embeddings (together with logits, except for a pooling type other than NONE)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device
@@ -424,7 +435,7 @@ extern "C" {
         // The caller must serialize all sharing contexts, including asynchronous work.
         // Synchronize the previous context before decoding, reserving, or changing another context.
         bool ctx_other_share_compute;
-        bool training;    // if true, we're in training mode (affects LoRA K/V gradient flow)
+        bool training;    // if true, the context is built for training (see llama_opt_init)
     };
 
     struct llama_model_tensor_override {
@@ -454,6 +465,7 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
+        size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
@@ -484,14 +496,14 @@ extern "C" {
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 
     // Initialize the llama + ggml backend
-    // If numa is true, use NUMA optimizations
     // Call once at the start of the program
     LLAMA_API void llama_backend_init(void);
 
     // Call once at the end of the program - currently only used for MPI
     LLAMA_API void llama_backend_free(void);
 
-    //optional:
+    // Optional: enable numa optimizations
+    // TODO: deprecate and make part of llama_backend_init()
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 
     // Optional: an auto threadpool gets created in ggml if not passed explicitly
@@ -526,6 +538,8 @@ extern "C" {
               struct llama_model_params   params);
 
     // Load a model from an open FILE pointer
+    // The GGUF is read from the current position, so it can be embedded in a larger file
+    // mmap needs the GGUF data section at a file offset to be aligned to the CPU tensor alignment (32 bytes)
     LLAMA_API struct llama_model * llama_model_load_from_file_ptr(
                                    FILE * file,
               struct llama_model_params   params);
@@ -607,6 +621,9 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
+
+    // Positions every layer attends back from a query when all layers use a standard sliding window, else 0
+    LLAMA_API int32_t llama_model_attn_window(const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
@@ -694,6 +711,11 @@ extern "C" {
             struct llama_model * model,
             const char * path_lora);
 
+    // Load a LoRA adapter from an open FILE pointer, reading from its current position
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_from_file_ptr(
+            struct llama_model * model,
+            FILE * file);
+
     // Functions to access the adapter's GGUF metadata scalar values
     // - The functions return the length of the string on success, or -1 on failure
     // - The output string is always null-terminated and cleared on failure
@@ -755,7 +777,7 @@ extern "C" {
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
-    // seq_id < 0 : match any sequence
+    // seq_id < 0 : match any sequence [TAG_LLAMA_SEQ_ID_NEG]
     // p0 < 0     : [0,  p1]
     // p1 < 0     : [p0, inf)
     LLAMA_API bool llama_memory_seq_rm(
@@ -1013,6 +1035,93 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    //
+    // Extended batch API
+    //
+
+    struct llama_batch_ext;
+
+    struct llama_embd {
+        const float * data;
+        size_t n_rows; // number of embedding rows in data
+        size_t n_embd; // size of one row
+    };
+
+    LLAMA_API struct llama_batch_ext * llama_batch_ext_init (struct llama_context * ctx);
+    LLAMA_API void                     llama_batch_ext_free (struct llama_batch_ext * batch);
+    LLAMA_API void                     llama_batch_ext_clear(struct llama_batch_ext * batch);
+
+    // Add an input token to the batch, with default values:
+    //     id = LLAMA_TOKEN_NULL
+    //     embd = nullptr
+    //     pos = not set, the caller must set it with llama_batch_ext_set_pos()
+    // Returns the batch index (>= 0)
+    // On error:
+    //     -1: batch is full
+    //     -2: token is invalid (id == LLAMA_TOKEN_NULL or invalid embd)
+    //     -3: invalid sequence id
+    LLAMA_API int32_t llama_batch_ext_add      (struct llama_batch_ext * batch, llama_seq_id seq_id);
+
+    // Add an input token to the batch, with a specified token ID or token embedding
+    LLAMA_API int32_t llama_batch_ext_add_token(struct llama_batch_ext * batch, llama_seq_id seq_id, llama_token id);
+    LLAMA_API int32_t llama_batch_ext_add_embd (struct llama_batch_ext * batch, llama_seq_id seq_id, struct llama_embd embd);
+
+    // Add the token at index idx in the batch to another sequence id. The position will stays the same.
+    // Note: this should be called before other _set() functions
+    LLAMA_API bool llama_batch_ext_add_seq(
+                                struct llama_batch_ext * batch,
+                                               int32_t   idx,
+                                          llama_seq_id   seq_id);
+
+    // Set the token embedding for the token at index idx in the batch
+    // use it after llama_batch_ext_add_token() to have an entry with both a token id and an embedding
+    LLAMA_API bool llama_batch_ext_set_embd_token(
+                                struct llama_batch_ext * batch,
+                                               int32_t   idx,
+                                     struct llama_embd   embd);
+
+    // Set the "state" embedding for the token at index idx in the batch
+    // "state" here means extra hidden state carried over from a previous stage, e.g.:
+    //   - MTP: state from N layers of the target model
+    //   - Qwen3 VL (deepstack): state from N layers of the vision encoder
+    //   - LiliCorr: context embeddings for the transformers
+    // Returns false if the context does not take a state embedding (MTP and LiliCorr contexts do)
+    LLAMA_API bool llama_batch_ext_set_embd_state(
+                                struct llama_batch_ext * batch,
+                                               int32_t   idx,
+                                     struct llama_embd   embd);
+
+    // Set if output embeddings should be available for the token at index idx in the batch
+    // Note: for now, this is equivalent to setting the output logits
+    LLAMA_API bool llama_batch_ext_set_output_embd(
+                                struct llama_batch_ext * batch,
+                                               int32_t  idx,
+                                                  bool  value);
+
+    // Set output logits for the token at index idx in the batch
+    // Note: for now, this is equivalent to setting the output embd
+    LLAMA_API bool llama_batch_ext_set_output_logits(
+                                struct llama_batch_ext * batch,
+                                               int32_t  idx,
+                                                  bool  value);
+
+    // Set custom position for the token at index idx in the batch
+    // For M-RoPE models:
+    //     - Embedding tokens must have n_pos_per_embd positions per token, in order [t, y, x, z]; t is also the KV cache position
+    //     - Text token only requires one single position per token
+    LLAMA_API bool llama_batch_ext_set_pos(
+                                struct llama_batch_ext * batch,
+                                               int32_t   idx,
+                                       const llama_pos * pos);
+
+    // TODO: implement get_embeddings() and get_logits() for llama_batch_ext
+
+    // Return values are the same as llama_decode()
+    LLAMA_API int32_t llama_process(
+                                struct llama_context * ctx,
+                             enum llama_process_type   type,
+                              struct llama_batch_ext * batch);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
@@ -1028,9 +1137,20 @@ extern "C" {
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
 
+    // Whether Core ML support was compiled into this library.
+    LLAMA_API bool llama_supports_coreml(void);
+
+    // Configure an optional EmbeddingGemma 2 text embedding sidecar (macOS 15 / iOS 18). NULL disables it.
+    // Requires matching weights, default RoPE, mean pooling, and embedding_raw outputs. Unsupported batches use ggml.
+    // max_inflight is 1..8. Returns false on failure and leaves the current configuration unchanged.
+    LLAMA_API bool llama_set_coreml_model(struct llama_context * ctx, const char * directory, int32_t max_inflight);
+
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+
+    // Returns whether the context is currently using causal attention
+    LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
@@ -1379,7 +1499,7 @@ extern "C" {
     LLAMA_API struct llama_sampler * llama_sampler_chain_get(      struct llama_sampler * chain, int32_t i);
 
     // the total number of samplers in the chain
-    LLAMA_API int                    llama_sampler_chain_n  (const struct llama_sampler * chain);
+    LLAMA_API int32_t                llama_sampler_chain_n  (const struct llama_sampler * chain);
 
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);
@@ -1603,6 +1723,8 @@ extern "C" {
         int32_t n_p_eval;   // number of prompt tokens
         int32_t n_eval;     // number of generated tokens
         int32_t n_reused;   // number of times a ggml compute graph had been reused
+        int32_t n_reallocs_same; // number of graph reallocations during inference with an unchanged graph size
+        int32_t n_reallocs_diff; // number of graph reallocations during inference with a changed graph size
     };
 
     struct llama_perf_sampler_data {
@@ -1646,6 +1768,10 @@ extern "C" {
         bool load_optimizer_state;          // whether to load optimizer state from checkpoint_path
 
         bool assistant_loss_only;
+
+        // keep flash attention enabled during training; every backend in use needs
+        // FLASH_ATTN_EXT_BACK, otherwise the scheduler runs those nodes on the CPU
+        bool flash_attn;
     };
 
     LLAMA_API struct llama_opt_params llama_opt_default_params(void);

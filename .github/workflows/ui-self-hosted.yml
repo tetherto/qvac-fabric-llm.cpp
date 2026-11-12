@@ -29,6 +29,11 @@ on:
       'tools/server/tests/**.*'
     ]
 
+cache-mode: none
+permissions:
+  actions: read
+  contents: read
+
 env:
   LLAMA_ARG_LOG_COLORS: 1
   LLAMA_ARG_LOG_PREFIX: 1
@@ -51,28 +56,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  runner_names:
-    permissions:
-      contents: read
-    uses: ./.github/workflows/reusable-runner-names.yml
-
   authorize:
     permissions: {}
     uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
   ui-build:
     name: Build static output
-    needs: [authorize, runner_names]
+    needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
     uses: ./.github/workflows/ui-build-self-hosted.yml
-    with:
-      runs_on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
+    permissions:
+      actions: write
+      contents: read
 
   ui-checks:
     name: Checks
-    needs: [ui-build, authorize, runner_names]
+    needs: [ui-build, authorize]
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
+    runs-on: qvac-ubuntu2404-x64
     continue-on-error: true
     timeout-minutes: 30
     steps:
@@ -95,7 +96,7 @@ jobs:
       - name: Download built UI artifacts
         uses: actions/download-artifact@v6
         with:
-          name: ui-build
+          name: llama-ui.zip
           path: tools/ui/dist/
 
       - name: Run type checking
@@ -120,9 +121,9 @@ jobs:
 
   e2e-tests:
     name: E2E Tests
-    needs: [ui-build, authorize, runner_names]
+    needs: [ui-build, authorize]
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
+    runs-on: qvac-ubuntu2404-x64
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -144,7 +145,7 @@ jobs:
       - name: Download built UI artifacts
         uses: actions/download-artifact@v6
         with:
-          name: ui-build
+          name: llama-ui.zip
           path: tools/ui/dist/
 
       - name: Build Storybook

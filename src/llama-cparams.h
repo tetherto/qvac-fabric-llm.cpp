@@ -2,7 +2,6 @@
 
 #include "llama.h"
 
-#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -21,6 +20,8 @@ struct llama_cparams {
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
     int32_t  nextn_layer_offset = 0;
+
+    std::vector<int32_t> draft_vocab; // [begin, end) token id pairs a DFlash2 drafter may propose, empty = all
 
     float rope_freq_base;
     float rope_freq_scale;
@@ -49,12 +50,15 @@ struct llama_cparams {
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;
+    bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
+    bool auto_fkvr;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
-    bool training;
+    bool training;           // set by llama_opt_init()
+    bool training_ctx;       // from llama_context_params: the context is built for training
 
     size_t moe_cache_size;
     bool prefetch_weights;
@@ -63,6 +67,7 @@ struct llama_cparams {
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;
+    enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;
@@ -70,3 +75,11 @@ struct llama_cparams {
 
     llama_context * ctx_other;
 };
+
+// true if ranges is empty, or holds non-empty, ascending, disjoint [begin, end) token id pairs within [0, n_vocab)
+// that cover at least n_min_ids ids
+bool llama_draft_vocab_is_valid(const std::vector<int32_t> & ranges, int32_t n_vocab, int32_t n_min_ids);
+// the token ids of the [begin, end) pairs, in draft-logit column order
+std::vector<int32_t> llama_draft_vocab_ids(const std::vector<int32_t> & ranges);
+// graph nodes a draft vocabulary adds per range: a view of the head, its mat-mul and a concat
+static constexpr uint32_t LLAMA_DRAFT_VOCAB_NODES_PER_RANGE = 3;

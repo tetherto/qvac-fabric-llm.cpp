@@ -6,7 +6,7 @@
 
 <p>
 <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-<a href="https://github.com/ggml-org/llama.cpp"><img src="https://img.shields.io/badge/based%20on-llama.cpp%20b10549-orange.svg" alt="Based on llama.cpp"></a>
+<a href="https://github.com/ggml-org/llama.cpp"><img src="https://img.shields.io/badge/based%20on-llama.cpp%20b10796-orange.svg" alt="Based on llama.cpp"></a>
 </p>
 
 </div>
@@ -49,33 +49,78 @@ Split work within each layer across GPUs to accelerate decoding for supported mo
     --device RPC0,RPC1 --split-mode tensor -ngl all
 ```
 
-### MoE Cache for Faster Decoding *(experimental)*
+#### Direct All-Reduce and RDMA Transport
 
-Improve decoding speed on hybrid systems with limited GPU VRAM and ample system RAM by keeping MoE expert weights in system RAM and caching recently used experts on the GPU. Cache hits reuse GPU-resident weights, reducing repeated CPU-to-GPU transfers during token generation. The benefit depends on expert reuse, cache size, and transfer bandwidth.
+Tensor split across a power-of-two number of RPC devices (2, 4, 8, 16) uses a direct recursive-doubling (butterfly) all-reduce between the servers, so partial results no longer pass through the main host. Asynchronous RPC transfers and events (protocol 113) let layer split overlap microbatches across stages. Shared builds load `libibverbs` at runtime, so hosts without RDMA fall back to TCP automatically. All servers and the client must run the same protocol version; the direct communicator is for trusted private networks only. See the [RPC Guide](tools/rpc/README.md).
 
-- **Configurable VRAM budget**: `--moe-cache-mib` defaults to `auto` with `--fit` (on by default). `--moe-cache-mib N` sets an explicit GPU expert cache budget in MiB; `0` disables the cache.
-- **Hybrid placement**: combine GPU layer offload with `--cpu-moe` to keep all expert weights in system RAM, or `--n-cpu-moe N` to keep the first N layers' expert weights there.
-- **On-demand caching**: upload missing experts and evict least-recently-used entries when the cache fills. The cache supports single-GPU inference; OpenCL, tensor parallelism, multi-GPU execution, and training are not supported.
+### LoRA Fine-Tuning
 
-For example, keep expert weights in system RAM and allocate a 1 GiB GPU cache:
+`qvac-fabric-llm.cpp` provides native [LoRA](https://arxiv.org/abs/2106.09685) (Low-Rank Adaptation) fine-tuning across CPU, Vulkan, and Metal backends. The training pipeline runs directly on consumer hardware, including mobile phones and integrated GPUs.
 
-```bash
-./build/bin/llama-cli -m moe-model.gguf \
-    --n-gpu-layers all --cpu-moe --moe-cache-mib 1024 \
-    -p "Explain how mixture-of-experts models work"
-```
+- Multi-backend GPU training on CPU, Vulkan (NVIDIA, AMD, Intel, Mali, Adreno), Metal (Apple) and CUDA
+- Backward kernels for GELU/GEGLU/SIGLU, L2-norm, MoE `mul_mat_id`, flash attention, SSM-conv and gated-delta-net, plus quantized `out_prod` on Vulkan
+- On-device fine-tuning from iOS via the `llama.swiftui` example (`FinetuneBridge`)
+- FP32, FP16, Q8, and Q4 training paths
+- Supervised instruction-tuning via assistant-only masked loss (SFT)
+- Checkpoint saving, optimizer-state save/load, resumable training and stop requests (`llama_opt_*` / `llama_lora_*` C API)
+- Learning rate schedulers (constant, cosine, linear) with warmup support
+- LoRA adapter merging into base models via **llama-export-lora**
+- Verified compatibility with Qwen3, Qwen3.5 and Qwen3.6 (dense and MoE), Gemma3, and Gemma4 (dense and MoE) model architectures
 
-Choose a cache budget that leaves VRAM for other model weights, the KV cache, and compute buffers. It must be large enough to hold the active experts for at least one routed layer.
+For usage details and CLI reference, see the [Finetuning Guide](examples/training/README.md).
 
 ### TurboVec / Local Vector Search
 
 `ggml-vector-index` provides a standalone C API for local vector search, including compressed CPU indexes for applications that need on-device retrieval.
 
-- **Storage**: full-precision f32, generic q8 and packed q4, plus TurboVec 2-bit and 4-bit modes with scalar, NEON, and AVX2 scoring paths.
+- **Storage**: full-precision f32, generic q8 and packed q4, plus TurboVec 2-, 3- and 4-bit modes (a byte-exact port of [turbovec](https://github.com/ryancodrai/turbovec) 1.1.2, dimensions up to 16384) with scalar, NEON, and AVX2 scoring paths.
 - **Search**: exact top-k scans, filtering by caller-provided IDs, reusable prepared filters, and optional IVF search for approximate candidate selection.
-- **Persistence**: index snapshots, with read-only mmap loading and incremental mutation logs for the generic storage modes. TurboVec supports snapshot save/load; mmap and logged mutations are not yet supported for TurboVec.
+- **Persistence**: index snapshots, with read-only mmap loading and incremental mutation logs for the generic storage modes. TurboVec writes turbovec's own v8 files, in memory or on disk, and saves incrementally with crash-safe `sync`.
 
 The library is disabled by default. Enable it with `-DGGML_VECTOR_INDEX=ON` and link `ggml::vector-index` explicitly; it is not integrated into the llama runtime or server. See the [Vector Index Guide](docs/vector-index.md) for supported dimensions, API usage, persistence contracts, and benchmarks.
+
+### Apple Neural Engine via Core ML *(exclusive)*
+
+Opt-in Core ML sidecars run part of the workload on the Apple Neural Engine (ANE) while Metal runs the rest, freeing GPU time on Apple silicon. Build with `-DLLAMA_COREML=ON` (macOS 15 / iOS 18 or later, Metal backend). If a model, build or context is unsupported, the sidecar logs a warning and the model runs on Metal as usual.
+
+- **Qwen3.8-27B prefill** (`--coreml-ffn`): part of each prefill FFN runs on the Neural Engines, and decode stays on Metal. On an M3 Ultra with `Qwen3.8-27B-Q4_0`, prefill of a 4372-token prompt rose from 341.7 to 470.5 tok/s, with KL divergence from Metal's logits of 1e-5 to 7e-5.
+  - Only prompt batches of 256 or more tokens use the Neural Engine.
+  - The split between Metal and Core ML adapts to the chip (two Neural Engines on Ultra parts, one elsewhere) and can be overridden with `--coreml-ffn-split`.
+  - The Core ML programs (4.5-9 GB) compile on first start in about 1-2 minutes into `--coreml-ffn-cache`; later starts load them in about 3 s.
+  - It currently supports the Qwen3.8-27B shape (64 layers, 5120 hidden, 17408 FFN).
+- **EmbeddingGemma 2 embeddings** (`--coreml-model DIR`): ANE acceleration for the embedding API, CLI and server. Short texts are packed into fixed 256-token windows, predictions can be pipelined asynchronously (`--coreml-max-inflight 1..8`), and output order and normalization match the regular path. An exporter, a compute-plan tool and a benchmark are in [examples/embedding-coreml](examples/embedding-coreml/README.md).
+- **Library integration**: `llama_supports_coreml()`, `llama_set_coreml_model()` and `llama_set_coreml_ffn()` configure the sidecars from native apps and addons. Each context owns its Core ML models and worker, and a failed configuration leaves the previous one unchanged. Applications only provide a writable cache directory; no Python exporter is needed at run time. `-DLLAMA_COREML_FFN=ON/OFF` selects only the FFN or only the embedding sidecar.
+
+```bash
+cmake -B build -DLLAMA_COREML=ON
+cmake --build build --target llama-server
+build/bin/llama-server -m Qwen3.8-27B-Q4_0.gguf --coreml-ffn
+```
+
+See [docs/coreml-ffn.md](docs/coreml-ffn.md) for the full guide.
+
+### AMD XDNA (NPU) Backend *(exclusive)*
+
+A ggml backend that runs part of a graph on the AMD XDNA2 NPU (Ryzen AI: Strix Point, Strix Halo, Krackan) through XRT. It is built around Qwen3.5-style models with gated-delta-net layers, where single-token decode runs almost entirely on the NPU array. See [ggml/src/ggml-xdna/README.md](ggml/src/ggml-xdna/README.md) for build, environment variables and troubleshooting.
+
+- **Matrix multiplication**: BF16, F16, Q4_K, Q5_K and Q6_K weights with F32 activations. Decode GEMV keeps weights quantized in memory and applies group parameters on the accumulator. Small batches use a decode GEMM and larger prefill batches use a prefill GEMM, with an int8 path for K-quants.
+- **Fused decode layer**: one design holds the whole recurrent layer of a decode token (conv, norm, gated delta net, gated epilogue, projections and the FFN transition), with the recurrent state kept on the device between tokens.
+- **Prefill ops**: gated-delta-net and flash-attention kernels run on the array above size thresholds. Below them the host is faster and cheaper per token, so the backend leaves them there.
+- **Wider models**: models wider than the fused layer (Qwen3.5 2B, 4B, 9B) run decode on the host cores and use the NPU for prefill. On a Ryzen AI MAX+ 395, Qwen3.5-2B Q4_K_M decode rose from 20.1 to 61.9 t/s at 0.94 instead of 1.69 J per token versus the NPU's per-op decode.
+- **Packaging**: it can be built as a loadable module (`GGML_BACKEND_DL`), with the kernel artifacts installed next to the library.
+
+Requires Linux with an NPU2 device (`/dev/accel/accel0`), XRT 2.25.x under `/opt/xilinx/xrt`, `uuid-dev`, and a Python environment with mlir-aie (IRON) 1.4.3 to compile the kernels at build time. Enable with `-DGGML_XDNA=ON`. All llama contexts in a process share one backend context and take turns on the array.
+
+### BitNet Inference and Fine-Tuning
+
+Native support for [BitNet](https://arxiv.org/abs/2402.17764) ternary quantized models via the TQ2_0 data type, enabling efficient inference and LoRA fine-tuning of models such as [bitnet_b1_58-xl](https://huggingface.co/gianni-cor/bitnet_b1_58-xl-TQ2_0) on resource-constrained devices.
+
+The official [microsoft/BitNet](https://github.com/microsoft/BitNet) inference framework provides optimized CPU kernels and GPU support limited to CUDA. `qvac-fabric-llm.cpp` **extends** BitNet to all major GPU backends -- Vulkan, Metal, and CPU -- bringing cross-platform GPU-accelerated BitNet inference and on-device fine-tuning to hardware not covered by the upstream framework, including Apple Silicon, mobile GPUs (Adreno, Mali), and AMD/Intel discrete GPUs. Compatible with models such as [bitnet_b1_58-3B](https://huggingface.co/1bitLLM/bitnet_b1_58-3B).
+
+- **Backends**: Vulkan, Metal and CPU TQ2_0 quantization support
+- **Training**: LoRA fine-tuning of BitNet models on Vulkan, Metal, and CPU backends
+- **Conversion**: HuggingFace-to-GGUF conversion for BitNet model architectures
+- Cooperative matrix (coopmat) support for Vulkan devices that expose the extension
 
 ### TurboQuant KV Cache Quantization
 
@@ -104,37 +149,9 @@ TurboQuant adds low-bit KV-cache quantization formats for long-context inference
 
 Quality checks on Qwen3.5-4B Q8_0 show `tbq4_0/pq4_0` at -0.03% perplexity delta versus `f16/f16`, with 94.8% RULER main score and 37.04 LongBench average versus 37.52 for `f16/f16`. See the full [TurboQuant benchmark report](docs/turboquant-benchmarks.md) for all measured models, contexts, and quality results.
 
-### LoRA Fine-Tuning
+### Weight Prefetch for Offloaded Models
 
-`qvac-fabric-llm.cpp` provides native [LoRA](https://arxiv.org/abs/2106.09685) (Low-Rank Adaptation) fine-tuning across CPU, Vulkan, and Metal backends. The training pipeline runs directly on consumer hardware, including mobile phones and integrated GPUs.
-
-- Multi-backend GPU training (NVIDIA, AMD, Intel, Apple, Mali, Adreno)
-- FP32, FP16, Q8, and Q4 training paths
-- Supervised instruction-tuning via assistant-only masked loss (SFT)
-- Checkpoint saving and resumable training
-- Learning rate schedulers (constant, cosine, linear) with warmup support
-- LoRA adapter merging into base models via **llama-export-lora**
-- Verified compatibility with Qwen3, Qwen3.5 and Qwen3.6 (dense and MoE), Gemma3, and Gemma4 (dense and MoE) model architectures
-
-For usage details and CLI reference, see the [Finetuning Guide](examples/training/README.md).
-
-### BitNet Inference and Fine-Tuning
-
-Native support for [BitNet](https://arxiv.org/abs/2402.17764) ternary quantized models via the TQ2_0 data type, enabling efficient inference and LoRA fine-tuning of models such as [bitnet_b1_58-xl](https://huggingface.co/gianni-cor/bitnet_b1_58-xl-TQ2_0) on resource-constrained devices.
-
-The official [microsoft/BitNet](https://github.com/microsoft/BitNet) inference framework provides optimized CPU kernels and GPU support limited to CUDA. `qvac-fabric-llm.cpp` **extends** BitNet to all major GPU backends -- Vulkan, Metal, and CPU -- bringing cross-platform GPU-accelerated BitNet inference and on-device fine-tuning to hardware not covered by the upstream framework, including Apple Silicon, mobile GPUs (Adreno, Mali), and AMD/Intel discrete GPUs. Compatible with models such as [bitnet_b1_58-3B](https://huggingface.co/1bitLLM/bitnet_b1_58-3B).
-
-- **Backends**: Vulkan, Metal and CPU TQ2_0 quantization support
-- **Training**: LoRA fine-tuning of BitNet models on Vulkan, Metal, and CPU backends
-- **Conversion**: HuggingFace-to-GGUF conversion for BitNet model architectures
-- Cooperative matrix (coopmat) support for Vulkan devices that expose the extension
-
-### VisionPsy Nano / Flash Support
-
-Run VisionPsy Nano and Flash vision-language models through the multimodal subsystem using compatible GGUF models and projectors.
-
-- **Image sizing**: `--image-no-upscale on` enables the Flash preprocessing rule, rounding image sizes to the slice grid without always stretching smaller images to the maximum size. Use it for Flash projectors that do not declare this rule in GGUF metadata.
-- **Memory-aware vision attention**: automatic flash-attention selection accounts for image size and device memory on backends without efficient cooperative-matrix flash attention.
+`-pw/--prefetch-weights 0|1|auto` overlaps CPU-to-GPU weight transfers with compute when only part of a model fits in VRAM. `auto` (the default) enables it for fitted dense models. The scheduler also exposes prefetch, reserve-size and shared-compute-buffer APIs (`ggml_backend_sched_*`) for embedding applications.
 
 ### Mobile GPU Optimization
 
@@ -144,6 +161,13 @@ Enhanced GPU support with targeted optimizations for Qualcomm Adreno GPUs.
 - **OpenCL on Adreno**: inference support for all other model architectures.
 - Adreno-specific Vulkan shader variants for improved throughput.
 - Vulkan Memory Allocator (VMA) integration for efficient GPU memory management.
+
+### VisionPsy Nano / Flash Support
+
+Run VisionPsy Nano and Flash vision-language models through the multimodal subsystem using compatible GGUF models and projectors.
+
+- **Image sizing**: `--image-no-upscale on` enables the Flash preprocessing rule, rounding image sizes to the slice grid without always stretching smaller images to the maximum size. Use it for Flash projectors that do not declare this rule in GGUF metadata.
+- **Memory-aware vision attention**: automatic flash-attention selection accounts for image size and device memory on backends without efficient cooperative-matrix flash attention.
 
 ---
 
@@ -166,6 +190,15 @@ cmake --build build --config Release
 # With Metal support (macOS, iOS)
 cmake -B build -DGGML_METAL=ON
 cmake --build build --config Release
+
+# With Core ML / Apple Neural Engine sidecars (macOS 15+, requires Metal)
+cmake -B build -DGGML_METAL=ON -DLLAMA_COREML=ON
+cmake --build build --config Release
+
+# With AMD XDNA NPU support (Linux, Strix-class APUs)
+cmake -B build -DGGML_XDNA=ON -DGGML_OPENMP=ON \
+      -DGGML_XDNA_GEMM_PYTHON=$HOME/aie-env/bin/python
+cmake --build build --config Release
 ```
 
 For more detailed build instructions, see [docs/build.md](docs/build.md).
@@ -183,8 +216,9 @@ For more detailed build instructions, see [docs/build.md](docs/build.md).
 
 | Platform | Backend | Status |
 | :-- | :-- | :--: |
-| Linux (x86_64, ARM64) | CPU, Vulkan, CUDA | ✅ Full support |
-| macOS (Intel, Apple Silicon) | CPU, Metal | ✅ Full support |
+| Linux (x86_64, ARM64) | CPU, Vulkan, CUDA, OpenCL | ✅ Full support |
+| Linux (Ryzen AI / Strix) | XDNA NPU (XDNA2) | ✅ Inference backend |
+| macOS (Intel, Apple Silicon) | CPU, Metal, Core ML (Apple silicon) | ✅ Full support |
 | Windows (x86_64) | CPU, Vulkan, CUDA | ✅ Full support |
 | Android (ARM64) | CPU, Vulkan, OpenCL | ✅ Full support |
 | iOS | CPU, Metal | ✅ Full support |
@@ -195,7 +229,7 @@ For more detailed build instructions, see [docs/build.md](docs/build.md).
 
 qvac-fabric-llm.cpp is a maintained fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). The project regularly synchronizes with upstream releases to incorporate improvements, bug fixes, and new model support, while extending the engine with capabilities not present in the upstream project.
 
-**Current upstream baseline:** llama.cpp b10549
+**Current upstream baseline:** llama.cpp b10796
 
 ### Upstream Compatibility
 

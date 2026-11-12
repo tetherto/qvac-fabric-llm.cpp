@@ -56,6 +56,17 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
+#ifdef GGML_METAL_CUSTOM_OPS
+typedef bool (*ggml_metal_custom_execute)(ggml_backend_t backend, struct ggml_tensor * tensor, void * userdata);
+// GGML_OP_CUSTOM nodes (ggml_custom_4d) whose fun is tag run execute instead of a Metal kernel; their graph uses serial
+// Metal encoding. NULL execute removes this tag.
+GGML_BACKEND_API void ggml_backend_metal_set_custom_serial(ggml_custom_op_t tag, ggml_metal_custom_execute execute);
+GGML_BACKEND_API bool ggml_backend_metal_tensor_is_shared(const struct ggml_tensor * tensor);
+// commit a command buffer that signals (or waits for) `value` on an MTLSharedEvent of the backend's device
+GGML_BACKEND_API void ggml_backend_metal_shared_event(ggml_backend_t backend, void * event, uint64_t value, bool wait);
+#endif
+
+
 #ifdef __cplusplus
 }
 #endif

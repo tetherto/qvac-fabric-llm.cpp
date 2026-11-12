@@ -8,14 +8,10 @@
  */
 
 import { browser } from '$app/environment';
-import {
-	CONFIG_LOCALSTORAGE_KEY,
-	SETTING_CONFIG_DEFAULT,
-	SETTINGS_KEYS,
-	USER_OVERRIDES_LOCALSTORAGE_KEY
-} from '$lib/constants';
+import { SETTING_CONFIG_DEFAULT, SETTINGS_KEYS } from '$lib/constants';
 import { ColorMode } from '$lib/enums';
 import { ParameterSyncService } from '$lib/services/parameter-sync.service';
+import { SettingsService } from '$lib/services/settings.service';
 import { deviceStore } from '$lib/stores/device.svelte';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { serverStore } from '$lib/stores/server.svelte';
@@ -205,6 +201,8 @@ class SettingsStore {
 		// Restore user overrides (derived state — may be stale if server defaults differ)
 		this.userOverrides = new Set(data.userOverrides ?? []);
 
+		this.enforceDiscoverCoupling();
+
 		// Persist to localStorage
 		this.saveConfig();
 
@@ -216,7 +214,7 @@ class SettingsStore {
 
 	/**
 	 * Initialize the settings store by loading from localStorage.
-	 * Called by initStores() after migrations have run.
+	 * Called by hydrateStores() after migrations have run.
 	 */
 	initialize() {
 		if (!browser) return;
@@ -224,6 +222,7 @@ class SettingsStore {
 		try {
 			this.loadConfig();
 			this.migrateLegacyTheme();
+			this.enforceDiscoverCoupling();
 			// Apply the persisted theme from config on initial load
 			setMode(this.config[SETTINGS_KEYS.THEME] as ColorMode);
 			this.isInitialized = true;
@@ -247,6 +246,7 @@ class SettingsStore {
 	resetConfig() {
 		this.config = { ...SETTING_CONFIG_DEFAULT };
 
+		this.enforceDiscoverCoupling();
 		this.saveConfig();
 	}
 
@@ -287,10 +287,12 @@ class SettingsStore {
 	 */
 	syncWithServerDefaults(): void {
 		const propsDefaults = this.getServerDefaults();
-
-		if (Object.keys(propsDefaults).length === 0) return;
-
 		const uiSettings = serverStore.uiSettings;
+
+		// a router main instance reports no sampling defaults, but its
+		// ui_settings still need the first visit pass below
+		if (Object.keys(propsDefaults).length === 0 && !(uiSettings && this.isFirstVisit)) return;
+
 		const uiSettingsKeys = new Set(uiSettings ? Object.keys(uiSettings) : []);
 
 		for (const [key, propsValue] of Object.entries(propsDefaults)) {
@@ -365,14 +367,6 @@ class SettingsStore {
 	}
 
 	/**
-	 *
-	 *
-	 * Import / Export
-	 *
-	 *
-	 */
-
-	/**
 	 * Update multiple configuration settings at once
 	 * @param updates - Object containing the configuration updates
 	 */
@@ -402,6 +396,14 @@ class SettingsStore {
 	}
 
 	/**
+	 *
+	 *
+	 * Import / Export
+	 *
+	 *
+	 */
+
+	/**
 	 * Update the theme setting.
 	 * @param newTheme - The new theme value
 	 */
@@ -409,6 +411,20 @@ class SettingsStore {
 		this.updateConfig(SETTINGS_KEYS.THEME, newTheme);
 
 		setMode(newTheme as ColorMode);
+	}
+
+	/**
+	 * Discover needs the hub metadata reads, so a checked Discover Models keeps
+	 * the hub setting on; call wherever stored or reset state may disagree.
+	 */
+	private enforceDiscoverCoupling(): void {
+		if (
+			this.config[SETTINGS_KEYS.ENABLE_DISCOVER_MODELS] &&
+			!this.config[SETTINGS_KEYS.USE_HUGGING_FACE_HUB]
+		) {
+			setConfigValue(this.config, SETTINGS_KEYS.USE_HUGGING_FACE_HUB, true);
+			this.saveConfig();
+		}
 	}
 
 	/**
@@ -428,45 +444,37 @@ class SettingsStore {
 	}
 
 	/**
-	 * Load configuration from localStorage
-	 * Returns default values for missing keys to prevent breaking changes
+	 * Load configuration from localStorage via the persistence service.
+	 * Returns default values for missing keys to prevent breaking changes.
 	 */
 	private loadConfig() {
 		if (!browser) return;
 
-		try {
-			const storedConfigRaw = localStorage.getItem(CONFIG_LOCALSTORAGE_KEY);
+		const {
+			config: savedVal,
+			isFirstVisit,
+			userOverrides: savedOverrides
+		} = SettingsService.loadConfig();
 
-			// First visit: no stored config yet. Server ui_settings apply once in
-			// this state, then the user's config diverges freely.
-			this.isFirstVisit = storedConfigRaw === null;
+		// First visit: no stored config yet. Server ui_settings apply once in
+		// this state, then the user's config diverges freely.
+		this.isFirstVisit = isFirstVisit;
 
-			const savedVal = JSON.parse(storedConfigRaw || '{}');
+		// Merge with defaults to prevent breaking changes
+		this.config = {
+			...SETTING_CONFIG_DEFAULT,
+			...savedVal
+		};
 
-			// Merge with defaults to prevent breaking changes
-			this.config = {
-				...SETTING_CONFIG_DEFAULT,
-				...savedVal
-			};
-
-			// Default sendOnEnter to false on mobile when the user has no saved preference
-			if (!(SETTINGS_KEYS.SEND_ON_ENTER in savedVal)) {
-				if (deviceStore.isMobile) {
-					this.config[SETTINGS_KEYS.SEND_ON_ENTER] = false;
-				}
+		// Default sendOnEnter to false on mobile when the user has no saved preference
+		if (!(SETTINGS_KEYS.SEND_ON_ENTER in savedVal)) {
+			if (deviceStore.isMobile) {
+				this.config[SETTINGS_KEYS.SEND_ON_ENTER] = false;
 			}
-
-			// Load user overrides
-			const savedOverrides = JSON.parse(
-				localStorage.getItem(USER_OVERRIDES_LOCALSTORAGE_KEY) || '[]'
-			);
-
-			this.userOverrides = new Set(savedOverrides);
-		} catch (error) {
-			console.warn('Failed to parse config from localStorage, using defaults:', error);
-			this.config = { ...SETTING_CONFIG_DEFAULT };
-			this.userOverrides = new Set();
 		}
+
+		// Load user overrides
+		this.userOverrides = new Set(savedOverrides);
 	}
 
 	/**
@@ -478,32 +486,22 @@ class SettingsStore {
 	private migrateLegacyTheme() {
 		if (!browser) return;
 
-		const legacyTheme = localStorage.getItem('theme');
+		const legacyTheme = SettingsService.migrateLegacyTheme();
 
 		if (legacyTheme) {
 			this.config[SETTINGS_KEYS.THEME] = legacyTheme;
-			localStorage.removeItem('theme');
 			this.saveConfig();
 			setMode(legacyTheme as ColorMode);
 		}
 	}
 
 	/**
-	 * Save the current configuration to localStorage
+	 * Save the current configuration to localStorage via the persistence service.
 	 */
 	private saveConfig() {
 		if (!browser) return;
 
-		try {
-			localStorage.setItem(CONFIG_LOCALSTORAGE_KEY, JSON.stringify(this.config));
-
-			localStorage.setItem(
-				USER_OVERRIDES_LOCALSTORAGE_KEY,
-				JSON.stringify(Array.from(this.userOverrides))
-			);
-		} catch (error) {
-			console.error('Failed to save config to localStorage:', error);
-		}
+		SettingsService.saveConfig(this.config, Array.from(this.userOverrides));
 	}
 }
 

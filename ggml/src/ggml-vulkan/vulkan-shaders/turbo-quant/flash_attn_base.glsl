@@ -1,4 +1,4 @@
-const bool QJL_FULL_PROJ = (Flags & 16) != 0;
+const bool QJL_FULL_PROJ = (Flags & 32) != 0;
 
 // Output accumulator type. The b9518 generic FA shaders define O_TYPE/O_TYPEV4
 // in the LLAMA_UPSTREAM_FA_MIXED_TYPES branch of flash_attn_base.glsl; the TBQ

@@ -15,6 +15,10 @@ on:
       '**/*.py'
     ]
 
+cache-mode: none
+permissions:
+  contents: read
+
 # QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
 # re-dispatch supersedes the in-flight run. The default branch deliberately
 # keeps upstream's run_id behaviour — master pushes must not cancel each other,
@@ -24,19 +28,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  runner_names:
-    permissions:
-      contents: read
-    uses: ./.github/workflows/reusable-runner-names.yml
-
   authorize:
     permissions: {}
     uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
   flake8-lint:
-    needs: [authorize, runner_names]
+    needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
+    runs-on: qvac-ubuntu2404-x64
     name: Lint
     steps:
       - name: Check out source repository
@@ -45,6 +44,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      - name: Core ML exporter contract tests
+        run: python -m unittest discover -s examples/embedding-coreml -p 'test_export_coreml.py'
       - name: flake8 Lint
         uses: py-actions/flake8@84ec6726560b6d5bd68f2a5bed83d62b52bb50ba # v2
         with:

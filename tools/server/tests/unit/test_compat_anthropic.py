@@ -21,10 +21,6 @@ def create_server():
     global server
     server = ServerPreset.tinyllama2()
     server.model_alias = "tinyllama-2-anthropic"
-    # QVAC-24501: offset from the port ServerProcess resolved, never a literal.
-    # A literal ignores PORT, and fleet hosts run several runner accounts side
-    # by side, so a fixed port can reach another job's llama-server.
-    server.server_port += 2
     server.n_slots = 1
     server.n_ctx = 8192
     server.n_batch = 2048
@@ -37,7 +33,6 @@ def vision_server():
     server = ServerPreset.tinygemma3()
     server.offline = False  # Allow downloading the model
     server.model_alias = "tinygemma3-anthropic"
-    server.server_port += 3  # different port to avoid conflicts; see above
     server.n_slots = 1
     return server
 
@@ -1018,7 +1013,6 @@ def test_anthropic_thinking_with_reasoning_model(stream):
     server.jinja = True
     server.n_ctx = 8192
     server.n_predict = 1024
-    server.server_port += 4  # see create_server
     server.start(timeout_seconds=600)  # large model needs time to download
 
     if stream:

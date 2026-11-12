@@ -12,8 +12,7 @@ public:
     virtual ~llama_io_write_i() = default;
 
     virtual void write(const void * src, size_t size) = 0;
-    // qvac: upstream b9341 made `tensor` const since IO only reads from it.
-    virtual void write_tensor(const ggml_tensor * tensor, size_t offset, size_t size) = 0;
+    virtual void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) = 0;
 
     // bytes written so far
     virtual size_t n_bytes() = 0;
@@ -41,6 +40,9 @@ public:
     // top of read(); the host/device readers (added upstream after b9341)
     // override it to batch the backend copies, so it must stay virtual.
     virtual void read_tensor(ggml_tensor * tensor, size_t offset, size_t size);
+
+    // drop tensor data that has been read but not yet applied (e.g. when a restore fails)
+    virtual void discard() {}
 
     // bytes read so far
     virtual size_t n_bytes() = 0;

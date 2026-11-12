@@ -40,16 +40,26 @@ struct clip_graph_pixtral : clip_graph {
     ggml_cgraph * build() override;
 };
 
+struct clip_graph_deepseek4v : clip_graph {
+    clip_graph_deepseek4v(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+};
+
 struct clip_graph_qwen2vl : clip_graph {
     clip_graph_qwen2vl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
     ggml_tensor * build_inp_with_temporal_merge();
 };
 
-struct clip_graph_qwen3vl : clip_graph {
-    clip_graph_qwen3vl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+struct clip_graph_qwen3vl : clip_graph_qwen2vl {
+    clip_graph_qwen3vl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph_qwen2vl(ctx, img) {}
     ggml_cgraph * build() override;
     bool support_batch() const override { return true; }
+};
+
+struct clip_graph_ling3vl : clip_graph_qwen3vl {
+    clip_graph_ling3vl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph_qwen3vl(ctx, img) {}
+    ggml_cgraph * build() override;
 };
 
 struct clip_graph_minimax_m3 : clip_graph {
@@ -106,6 +116,12 @@ struct clip_graph_nemotron_v2_vl : clip_graph {
     ggml_cgraph * build() override;
 };
 
+struct clip_graph_nemotron_omni : clip_graph {
+    clip_graph_nemotron_omni(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+    ggml_tensor * build_inp_with_temporal_merge();
+};
+
 struct clip_graph_llama4 : clip_graph {
     clip_graph_llama4(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
@@ -126,6 +142,11 @@ struct clip_graph_dotsocr : clip_graph {
     ggml_cgraph * build() override;
 };
 
+struct clip_graph_dots3note_a : clip_graph {
+    clip_graph_dots3note_a(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+};
+
 struct clip_graph_cogvlm : clip_graph {
     clip_graph_cogvlm(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
@@ -138,6 +159,13 @@ struct clip_graph_llava : clip_graph {
 
 struct clip_graph_whisper_enc : clip_graph {
     clip_graph_whisper_enc(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+};
+
+// causal whisper-like encoder with a sliding window KV cache (voxtral realtime)
+struct clip_graph_voxtral_rt : clip_graph {
+    clip_enc_state * state; // nullptr during warmup, the cache is then a graph input
+    clip_graph_voxtral_rt(clip_ctx * ctx, const clip_image_f32 & img, clip_enc_state * state) : clip_graph(ctx, img), state(state) {}
     ggml_cgraph * build() override;
 };
 
@@ -161,6 +189,11 @@ struct clip_graph_conformer : clip_graph {
 
 struct clip_graph_granite_speech : clip_graph {
     clip_graph_granite_speech(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+};
+
+struct clip_graph_muse_spark_audio : clip_graph {
+    clip_graph_muse_spark_audio(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
 };
 

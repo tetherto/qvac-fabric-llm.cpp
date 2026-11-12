@@ -173,6 +173,17 @@ static void helper_free_ctx_data(struct helper_ctx_data ctx_data) {
     ggml_opt_dataset_free(ctx_data.dataset_unsupervised);
 }
 
+// A fresh scheduler with the same backends and options as the one passed in. A shared scheduler
+// remembers the previous test's graph size, and GGML_SCHED_DEBUG_REALLOC aborts when a different
+// graph of the same size needs a reallocation.
+static ggml_backend_sched_t helper_new_sched_like(ggml_backend_sched_t backend_sched) {
+    std::vector<ggml_backend_t> backends;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(backend_sched); ++i) {
+        backends.push_back(ggml_backend_sched_get_backend(backend_sched, i));
+    }
+    return ggml_backend_sched_new(backends.data(), nullptr, backends.size(), GGML_DEFAULT_GRAPH_SIZE, false, true);
+}
+
 static void print_ok(bool subtest_ok) {
     printf(subtest_ok ? "\033[1;32mOK\033[0m\n" : "\033[1;31mFAIL\033[0m\n");
 }
@@ -856,9 +867,11 @@ static ggml_opt_optimizer_params helper_get_opt_pars_wd(void * userdata) {
 }
 
 static std::pair<int, int> test_loss_scale(
-        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched_shared, ggml_backend_t backend) {
     int ntest = 0;
     int npass = 0;
+
+    ggml_backend_sched_t backend_sched = helper_new_sched_like(backend_sched_shared);
 
     const float scales[2] = { 1.0f, 1e-3f };
     float       results[2] = { 0.0f, 0.0f };
@@ -883,6 +896,8 @@ static std::pair<int, int> test_loss_scale(
         helper_free_ctx_data(cd);
     }
 
+    ggml_backend_sched_free(backend_sched);
+
     const bool subtest_ok = almost_equal(results[0], results[1], 1e-4);
     printf("  %s(subtest=weights_after_scaled_backward, optimizer=%s): unscaled=%f scaled=%f ",
            __func__, ggml_opt_optimizer_name(optim), results[0], results[1]);
@@ -896,9 +911,11 @@ static std::pair<int, int> test_loss_scale(
 }
 
 static std::pair<int, int> test_loss_scale_state(
-        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched_shared, ggml_backend_t backend) {
     int ntest = 0;
     int npass = 0;
+
+    ggml_backend_sched_t backend_sched = helper_new_sched_like(backend_sched_shared);
 
     const char * fname = "test-opt-loss-scale-state.gguf";
 
@@ -965,6 +982,7 @@ static std::pair<int, int> test_loss_scale_state(
     }
 
     remove(fname);
+    ggml_backend_sched_free(backend_sched);
 
     // the first half ran unscaled, so only the momenta carried across the scale change are
     // being checked here; they must reproduce the reference trajectory
@@ -976,6 +994,87 @@ static std::pair<int, int> test_loss_scale_state(
         npass++;
     }
     ntest++;
+
+    return std::make_pair(npass, ntest);
+}
+
+static std::pair<int, int> test_non_static_graphs(
+        enum ggml_opt_optimizer_type optim,
+        ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+    int ntest = 0;
+    int npass = 0;
+
+    constexpr int64_t ne = 4;
+
+    struct ggml_context * ctx_static;
+    {
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_static = ggml_init(params);
+    }
+
+    struct ggml_tensor * weights = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, ne);
+    ggml_set_name(weights, "weights");
+    ggml_set_param(weights);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+    const std::vector<float> weights0 = {1.0f, 2.0f, 3.0f, 4.0f};
+    ggml_backend_tensor_set(weights, weights0.data(), 0, ggml_nbytes(weights));
+
+    struct ggml_opt_params opt_params = ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_SUM);
+    opt_params.optimizer    = optim;
+    opt_params.get_opt_pars = helper_get_test_opt_pars;
+    ggml_opt_context_t opt_ctx = ggml_opt_init(opt_params);
+
+    // loss = sum(weights*inputs), so the gradient of weights is inputs
+    const std::vector<std::vector<float>> input_steps = {{2.0f, -2.0f, 2.0f, -2.0f}, {-1.0f, 1.0f, 1.0f, -1.0f}};
+    for (const std::vector<float> & input_data : input_steps) {
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ GGML_DEFAULT_GRAPH_SIZE*ggml_tensor_overhead() + ggml_graph_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        struct ggml_context * ctx_compute = ggml_init(params);
+
+        struct ggml_tensor * inputs = ggml_new_tensor_1d(ctx_compute, GGML_TYPE_F32, ne);
+        ggml_set_name(inputs, "inputs");
+        ggml_set_input(inputs);
+        struct ggml_tensor * outputs = ggml_mul(ctx_compute, weights, inputs);
+        ggml_set_name(outputs, "outputs");
+        ggml_set_output(outputs);
+
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx_compute, GGML_DEFAULT_GRAPH_SIZE, /*grads =*/ true);
+        ggml_build_forward_expand(gf, outputs);
+
+        ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
+        ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+        ggml_backend_tensor_set(inputs, input_data.data(), 0, ggml_nbytes(inputs));
+        ggml_opt_eval(opt_ctx, nullptr);
+
+        ggml_free(ctx_compute);
+    }
+
+    {
+        std::vector<float> weights_fit(ne);
+        ggml_backend_tensor_get(weights, weights_fit.data(), 0, ggml_nbytes(weights));
+
+        bool subtest_ok = true;
+        for (int64_t i = 0; i < ne; ++i) {
+            float weights_expected = weights0[i];
+            for (const std::vector<float> & input_data : input_steps) {
+                weights_expected -= optim == GGML_OPT_OPTIMIZER_TYPE_SGD ? input_data[i] : (input_data[i] > 0.0f ? 1.0f : -1.0f);
+            }
+            subtest_ok = subtest_ok && almost_equal(weights_fit[i], weights_expected, 1e-5);
+        }
+        print_ok(__func__, subtest_ok, npass, ntest, "subtest=weights");
+    }
+
+    ggml_opt_free(opt_ctx);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx_static);
 
     return std::make_pair(npass, ntest);
 }
@@ -1039,6 +1138,11 @@ static std::pair<int, int> test_backend(
     }
     {
         std::pair<int, int> partial = test_regression(optim, backend_sched, backend);
+        npass += partial.first;
+        ntest += partial.second;
+    }
+    {
+        std::pair<int, int> partial = test_non_static_graphs(optim, backend_sched, backend);
         npass += partial.first;
         ntest += partial.second;
     }

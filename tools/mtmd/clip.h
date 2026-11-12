@@ -16,6 +16,7 @@
 #define MTMD_INTERNAL_HEADER
 
 struct clip_ctx;
+struct clip_enc_state;
 
 struct clip_image_size {
     int width;
@@ -85,9 +86,10 @@ struct clip_context_params {
     // or set this field explicitly.
     int image_no_upscale;
     // skip the audio encoder even when the GGUF declares one. The projector still
-    // loads its vision encoder, so clip_init() returns a vision-only context and
-    // mtmd_support_audio() reports false. Lets a caller that never feeds audio
-    // avoid paying for those weights and their warmup compute buffers.
+    // loads its vision and audio-generation encoders, so clip_init() returns no
+    // audio context and mtmd_support_audio() reports false. Lets a caller that
+    // never feeds audio avoid paying for those weights and their warmup compute
+    // buffers.
     bool skip_audio;
 };
 
@@ -98,6 +100,9 @@ struct clip_init_result {
 };
 
 struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params);
+
+// max number of output tokens per image, -1 if not dynamic size
+int clip_get_image_max_tokens(const struct clip_ctx * ctx);
 
 void clip_free(struct clip_ctx * ctx);
 
@@ -147,8 +152,17 @@ struct clip_encode_params {
     std::vector<float> * out_audio = nullptr;         // decoded PCM samples, F32
     const std::vector<uint8_t> * state_in  = nullptr; // state from previous call, null or wrong size means cold start
     std::vector<uint8_t> *       state_out = nullptr; // state for the next call
+
+    // streaming audio input, updated in place by clip_encode()
+    struct clip_enc_state * enc_state = nullptr;
 };
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
+
+// persistent state of a causal audio encoder, for streaming input (one per stream)
+// it holds the sliding window of past keys/values, so each clip_encode() call only takes the new frames
+// n_frames_max is the maximum number of encoder frames per call
+struct clip_enc_state * clip_enc_state_init(struct clip_ctx * ctx, int32_t n_frames_max);
+void                    clip_enc_state_free(struct clip_enc_state * state);
 
 bool clip_is_llava(const struct clip_ctx * ctx);
 // note for contributor: this clip_is_(model) pattern is deprecated

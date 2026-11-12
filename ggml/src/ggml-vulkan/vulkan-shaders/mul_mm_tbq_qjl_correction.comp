@@ -44,7 +44,7 @@ layout (push_constant) uniform parameter {
     uint M; uint N; uint K;
     uint stride_a; uint stride_b; uint stride_d;
     uint batch_stride_a; uint batch_stride_b; uint batch_stride_d;
-    uint k_split;
+    uint batch_stride3_a;
     uint ne02; uint ne12; uint broadcast2; uint broadcast3;
     uint padded_N;
 } p;
@@ -95,11 +95,10 @@ void main() {
         i02 = i12 / p.broadcast2;
     }
 
-    // For src0 (A), the host passes strides in BLOCK units. k_split is unused
-    // by this correction pass, so it carries src0->nb[3] / sizeof(block).
-    // Keeping dim2 and dim3 strides separate is required for permuted TBQ
-    // views, where nb[3] is not necessarily ne[2] * nb[2].
-    const uint a_batch_off_blocks = i02 * p.batch_stride_a + i03 * p.k_split;
+    // For src0 (A), the host passes strides in BLOCK units. Keeping dim2 and
+    // dim3 strides separate is required for permuted TBQ views, where nb[3] is
+    // not necessarily ne[2] * nb[2].
+    const uint a_batch_off_blocks = i02 * p.batch_stride_a + i03 * p.batch_stride3_a;
     const uint b_batch_off        = batch_id    * p.batch_stride_b;
     const uint d_batch_off        = batch_id    * p.batch_stride_d;
 

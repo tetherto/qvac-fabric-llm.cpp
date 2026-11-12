@@ -2,10 +2,23 @@ cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit 
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
+option(LLAMA_COREML "llama: build optional Core ML support (EmbeddingGemma and Qwen3.8-27B FFN sidecars)" OFF)
+# empty follows LLAMA_COREML on every configure; an option() default would stay at its first cached value
+set(LLAMA_COREML_FFN "" CACHE STRING "llama: build optional in-graph Core ML FFN support (ON, OFF, or empty to follow LLAMA_COREML)")
+if (LLAMA_COREML_FFN STREQUAL "")
+    set(LLAMA_COREML_FFN ${LLAMA_COREML})
+endif()
+if (LLAMA_COREML OR LLAMA_COREML_FFN)
+    if (NOT APPLE)
+        message(FATAL_ERROR "Core ML requires macOS 15 or iOS 18")
+    endif()
+    enable_language(OBJC OBJCXX)
+endif()
+
 ### llama.cpp version
 set(LLAMA_VERSION_MAJOR 0)
-set(LLAMA_VERSION_MINOR 1)
-set(LLAMA_VERSION_PATCH 2)
+set(LLAMA_VERSION_MINOR 7)
+set(LLAMA_VERSION_PATCH 0)
 set(LLAMA_VERSION_BASE "${LLAMA_VERSION_MAJOR}.${LLAMA_VERSION_MINOR}.${LLAMA_VERSION_PATCH}")
 
 # whether this is a development/nightly build
@@ -135,8 +148,8 @@ option(LLAMA_BUILD_TOOLS     "llama: build tools"                               
 option(LLAMA_BUILD_EXAMPLES  "llama: build examples"                                                             ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER    "llama: build server example"                                                       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       ON)
-option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available (requires LLAMA_BUILD_UI=ON)" ON)
+option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       OFF)
+option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available" ON)
 
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
@@ -204,6 +217,16 @@ include("cmake/license.cmake")
 license_add_file("llama.cpp" "LICENSE")
 
 #
+# compile options
+#
+
+# clang stores the modification time of the precompiled header sources inside the
+# header and rejects it when they differ, so the timestamp is left out of it
+add_compile_options(
+    "$<$<COMPILE_LANG_AND_ID:C,Clang,IntelLLVM>:SHELL:-Xclang -fno-pch-timestamp>"
+    "$<$<COMPILE_LANG_AND_ID:CXX,Clang,IntelLLVM>:SHELL:-Xclang -fno-pch-timestamp>")
+
+#
 # 3rd-party
 #
 
@@ -228,6 +251,11 @@ if (NOT BUILD_LLAMA)
     message(STATUS "BUILD_LLAMA is OFF: skipping LLAMA targets.")
 else()
 add_subdirectory(src)
+
+if (LLAMA_COREML)
+    enable_testing()
+    add_subdirectory(examples/embedding-coreml)
+endif()
 
 #
 # utils, programs, examples and tests
@@ -312,7 +340,12 @@ set(LLAMA_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location o
 
 set(LLAMA_PUBLIC_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/include/llama.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-cpp.h)
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-cpp.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-coreml-ffn.h)
+
+if (LLAMA_COREML)
+    list(APPEND LLAMA_PUBLIC_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-coreml.h)
+endif()
 
 set_target_properties(llama
     PROPERTIES
@@ -360,6 +393,12 @@ if (LLAMA_MTMD AND TARGET mtmd)
   install(
       TARGETS vendor-hash miniaudio stb
       EXPORT llama-targets)
+
+  # Consumers that inspect images before mtmd decodes them need the same stb
+  # parser, so ship the header the exported stb target points at.
+  install(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/vendor/stb/stb_image.h
+    DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/stb)
 
   if (NOT LLAMA_BUILD_COMMON) # otherwise already exported above
     install(TARGETS sheredom EXPORT llama-targets)
@@ -412,6 +451,14 @@ if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
     set(LLAMA_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
 else()
     set(LLAMA_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
+
+set(LLAMA_PC_LIBS_PRIVATE "")
+if (LLAMA_COREML OR LLAMA_COREML_FFN)
+    set(LLAMA_PC_LIBS_PRIVATE "-framework CoreML -framework Foundation")
+endif()
+if (LLAMA_COREML_FFN)
+    string(APPEND LLAMA_PC_LIBS_PRIVATE " -framework Metal")
 endif()
 
 configure_file(cmake/llama.pc.in

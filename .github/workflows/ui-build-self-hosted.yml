@@ -2,18 +2,15 @@ name: UI Build (self-hosted)
 
 on:
   workflow_call:
-    inputs:
-      # QVAC-24501: taken from the caller rather than declared here. A reusable
-      # workflow's own runner_names job is a second hosted job per run echoing
-      # the same constants, and ui-self-hosted.yml already runs one.
-      runs_on:
-        description: "Runner label for the build job, from the caller's runner_names job"
-        required: true
-        type: string
+
+cache-mode: none
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   build:
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: qvac-ubuntu2404-x64
     timeout-minutes: 20
     env:
       BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
@@ -26,8 +23,9 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: "24"
-          cache: "npm"
-          cache-dependency-path: "tools/ui/package-lock.json"
+          # cache: "npm"
+          # cache-dependency-path: "tools/ui/package-lock.json"
+          package-manager-cache: false
 
       - name: Install dependencies
         run: npm ci
@@ -40,6 +38,6 @@ jobs:
       - name: Upload built UI
         uses: actions/upload-artifact@v6
         with:
-          name: ui-build
+          name: llama-ui.zip
           path: tools/ui/dist/
           retention-days: 1

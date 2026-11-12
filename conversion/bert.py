@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 from pathlib import Path
 from typing import Any, Callable, Iterable, TYPE_CHECKING
@@ -11,7 +12,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import ModelBase, SentencePieceTokenTypes, TextModel, gguf, logger
+from .base import ModelBase, SentencePieceTokenTypes, TextModel, gguf, jinja_str_or_json, logger
 
 
 @ModelBase.register("BertModel", "BertForMaskedLM", "CamembertModel", "BertForSequenceClassification")
@@ -341,7 +342,7 @@ class NomicBertModel(BertModel):
         else:
             raise ValueError(f"unrecognized parameters: n_positions={npos}, max_trained_positions={mtp}")
 
-        assert self.hparams["activation_function"] == "gelu" if self.is_moe else "swiglu"
+        assert self.hparams["activation_function"] == ("gelu" if self.is_moe else "swiglu")
 
         # this doesn't do anything in the HF version
         assert self.hparams["causal"] is False
@@ -606,6 +607,17 @@ class ModernBertModel(BertModel):
         self.gguf_writer.add_add_sep_token(True)
         self._set_vocab_gpt2()
 
+    def get_vocab_base(self) -> tuple[list[str], list[int], str]:
+        tokens, toktypes, tokpre = super().get_vocab_base()
+        if tokpre == "mmbert":
+            # the added tokens for runs of spaces are never matched by the reference tokenizer
+            space = b"\xe2\x96\x81".decode("utf-8")
+            for i, token in enumerate(tokens):
+                if toktypes[i] == gguf.TokenType.USER_DEFINED and token and not token.strip(" "):
+                    tokens[i] = space * len(token)
+                    toktypes[i] = gguf.TokenType.NORMAL
+        return tokens, toktypes, tokpre
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_sliding_window(self.hparams["local_attention"])
@@ -639,3 +651,270 @@ class ModernBertModel(BertModel):
                 name = "classifier.out_proj.bias"
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+
+def _is_laya_checkpoint(dir_model: Path) -> bool:
+    # Laya decision checkpoints keep the encoder config under encoder/ next to
+    # rl_agent_config.json, and have no top-level config.json
+    return not (dir_model / "config.json").is_file() and (dir_model / "rl_agent_config.json").is_file()
+
+
+# registered before _is_decision_checkpoint so it takes rl_agent_config.json checkpoints first
+@ModelBase.register_hparams_loader(_is_laya_checkpoint)
+def _load_laya_hparams(dir_model: Path) -> dict[str, Any]:
+    logger.info("gguf: detected Laya decision checkpoint")
+    with open(dir_model / "encoder" / "config.json", "r", encoding="utf-8") as f:
+        config = json.load(f)
+    config["architectures"] = ["LayaDecisionModel"]
+    return config
+
+
+def _is_decision_checkpoint(dir_model: Path) -> bool:
+    if not (dir_model / "encoder" / "config.json").is_file():
+        return False
+    return (dir_model / "rl_agent_config.json").is_file() or (dir_model / "julia_config.json").is_file()
+
+
+@ModelBase.register_hparams_loader(_is_decision_checkpoint)
+def _load_decision_hparams(dir_model: Path) -> dict[str, Any]:
+    logger.info("gguf: detected ModernBert decision checkpoint")
+    hparams = ModelBase.load_hparams(dir_model / "encoder", False, guess=False)
+    is_julia = (dir_model / "julia_config.json").is_file()
+    with open(dir_model / ("julia_config.json" if is_julia else "rl_agent_config.json"), encoding="utf-8") as f:
+        decision = json.load(f)
+    n_layer = hparams["num_hidden_layers"]
+    n_layer_head = decision["head_layers"]
+    hparams["architectures"] = ["ModernBertDecisionModel"]
+    hparams["decision"] = decision
+    # the head blocks are appended to the encoder blocks, they use a plain 4x MLP
+    hparams["num_hidden_layers"] = n_layer + n_layer_head
+    hparams["intermediate_size"] = [hparams["intermediate_size"]] * n_layer + [4 * hparams["hidden_size"]] * n_layer_head
+    return hparams
+
+
+@ModelBase.register("ModernBertDecisionModel")
+@ModelBase.example("convaiinnovations/laya", "SupersonicLabs/Julia-1")
+class ModernBertDecisionModel(ModernBertModel):
+    model_arch = gguf.MODEL_ARCH.MODERN_BERT
+
+    def set_vocab(self):
+        # vocab loaders read self.dir_model, point it to the tokenizer sub-directory
+        dir_model = self.dir_model
+        self.dir_model = dir_model / "tokenizer"
+        try:
+            super().set_vocab()
+        finally:
+            self.dir_model = dir_model
+        self.gguf_writer.add_token_type_count(3)  # choice, score, noul
+        self.gguf_writer.add_chat_template([{"name": "systemone", "template": self._systemone_template()}])
+
+    def _systemone_template(self) -> str:
+        with open(self.dir_model / "tokenizer" / "tokenizer_config.json", encoding="utf-8") as f:
+            tokenizer_config = json.load(f)
+        tok_cls, tok_sep, tok_mask = (tokenizer_config[k] for k in ("cls_token", "sep_token", "mask_token"))
+        description = jinja_str_or_json("o.description")
+        if self.hparams["decision"].get("architecture") == "JuliaDecisionModel":
+            option = "{% if o.description %}" + description + "{% else %}{{ o.key }}{% endif %}"
+        else:
+            option = (
+                "{% if type == 'choice' %}{{ o.key }}{% if o.description %}: " + description + "{% endif %}"
+                "{% elif type == 'score' %}level {{ o.key }}: " + description
+                + "{% else %}{{ o.key }}: {% if o.description %}" + description
+                + "{% elif o.key == 'true' %}yes, the statement holds"
+                "{% else %}no, the statement does not hold{% endif %}{% endif %}"
+            )
+        return (
+            tok_cls + "{{ type }} question: " + jinja_str_or_json("instructions") + tok_sep
+            + "{% for o in options %}" + tok_mask + " " + option + "{% endfor %}"
+            + tok_sep + jinja_str_or_json("state") + tok_sep
+        )
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        decision = self.hparams["decision"]
+        self.gguf_writer.add_decision_type(gguf.DecisionType.LAYA)
+        self.gguf_writer.add_decision_block_count(decision["head_layers"])
+        self.gguf_writer.add_decision_max_head_tokens(decision.get("head_max_len", 256))
+        for name, value in zip(("choice", "score", "noul"), decision.get("temperature", [])):
+            self.gguf_writer.add_decision_temperature(name, value)
+        # "choice:3-5" -> "choice.3_5", "choice:11+" -> "choice.11"
+        for name, value in decision.get("temperature_by_options", {}).items():
+            self.gguf_writer.add_decision_temperature(name.replace(":", ".").replace("-", "_").rstrip("+"), value)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+
+        # act_head is not used for the answer, the fitted temperatures come from the config
+        if name.startswith("act_head.") or name == "temperature":
+            return None
+
+        if name.startswith("encoder."):
+            name = name[8:]
+
+        return super().filter_tensors((name, gen))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("head.layers.") and bid is not None:
+            # the head blocks come after the encoder blocks
+            suffix = name.split(".", 3)[3].replace("in_proj_", "in_proj.")
+            bid += self.block_count - self.hparams["decision"]["head_layers"]
+            name = f"head.layers.{bid}.{suffix}"
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("LayaDecisionModel")
+class LayaModel(ModernBertModel):
+    # Laya decision checkpoints (https://github.com/NandhaKishorM/laya): a ModernBert encoder
+    # (ModernBERT or mmBERT) followed by the typed decision head of laya/common.py DecisionModel.
+    # The checkpoint directory holds model.safetensors, rl_agent_config.json, encoder/ and tokenizer/.
+    model_arch = gguf.MODEL_ARCH.LAYA
+
+    # option logits exported per sequence, i.e. the most options one question can have
+    max_options = 255
+
+    qtypes = ("choice", "score", "noul")
+
+    decision_tensors = {
+        "type_emb":   gguf.MODEL_TENSOR.DECISION_TYPE_EMBD,
+        "scorer.0":   gguf.MODEL_TENSOR.DECISION_SCORER_NORM,
+        "scorer.1":   gguf.MODEL_TENSOR.DECISION_SCORER,
+        "scorer.3":   gguf.MODEL_TENSOR.DECISION_SCORER_OUT,
+        "act_head.0": gguf.MODEL_TENSOR.DECISION_ACT,
+        "act_head.2": gguf.MODEL_TENSOR.DECISION_ACT_OUT,
+    }
+
+    # nn.TransformerEncoderLayer (norm_first=True) submodules
+    decision_block_tensors = {
+        "self_attn.in_proj":  gguf.MODEL_TENSOR.DECISION_ATTN_QKV,
+        "self_attn.out_proj": gguf.MODEL_TENSOR.DECISION_ATTN_OUT,
+        "norm1":              gguf.MODEL_TENSOR.DECISION_ATTN_NORM,
+        "norm2":              gguf.MODEL_TENSOR.DECISION_FFN_NORM,
+        "linear1":            gguf.MODEL_TENSOR.DECISION_FFN_UP,
+        "linear2":            gguf.MODEL_TENSOR.DECISION_FFN_DOWN,
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        with open(self.dir_model / "rl_agent_config.json", encoding="utf-8") as f:
+            self.agent_config = json.load(f)
+
+    def set_vocab(self):
+        dir_tokenizer = self.dir_model / "tokenizer"
+        with open(dir_tokenizer / "tokenizer.json", encoding="utf-8") as f:
+            tokenizer_json = json.load(f)
+
+        # the vocab helpers read from self.dir_model
+        dir_model, self.dir_model = self.dir_model, dir_tokenizer
+        try:
+            if tokenizer_json["model"]["type"] == "BPE" and tokenizer_json["model"].get("byte_fallback"):
+                self._set_vocab_byte_fallback_bpe(tokenizer_json) # mmBERT
+            else:
+                super().set_vocab() # ModernBERT
+        finally:
+            self.dir_model = dir_model
+
+    def _set_vocab_byte_fallback_bpe(self, tokenizer_json: dict[str, Any]):
+        # mmBERT uses the Gemma 2 vocabulary, shipped only as a byte-fallback BPE tokenizer.json.
+        # llama.cpp's SPM tokenizer merges the adjacent pair whose result has the highest score,
+        # which follows the BPE merge order when a token scores minus the rank of its first merge.
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+
+        merge_rank: dict[str, int] = {}
+        for rank, merge in enumerate(tokenizer_json["model"]["merges"]):
+            left, right = merge.split(" ", 1) if isinstance(merge, str) else merge
+            merge_rank.setdefault(left + right, rank)
+
+        vocab_size = self.hparams["vocab_size"]
+        reverse_vocab = {id_: tok for tok, id_ in tokenizer.get_vocab().items()}  # ty: ignore[unresolved-attribute]
+        added_tokens = {t["id"]: t for t in tokenizer_json["added_tokens"]}
+        unk_token = tokenizer_json["model"].get("unk_token")
+
+        tokens: list[str] = []
+        scores: list[float] = []
+        toktypes: list[int] = []
+        for i in range(vocab_size):
+            token = reverse_vocab.get(i)
+            if token is None:
+                tokens.append(f"[PAD{i}]")
+                scores.append(-1e9)
+                toktypes.append(gguf.TokenType.UNUSED)
+                continue
+            tokens.append(token)
+            if i in added_tokens:
+                scores.append(0.0)
+                toktypes.append(gguf.TokenType.CONTROL if added_tokens[i]["special"] else gguf.TokenType.USER_DEFINED)
+            elif token == unk_token:
+                scores.append(0.0)
+                toktypes.append(gguf.TokenType.UNKNOWN)
+            elif re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", token):
+                scores.append(0.0)
+                toktypes.append(gguf.TokenType.BYTE)
+            else:
+                # a multi-character token that no merge produces must never win a merge
+                scores.append(-float(merge_rank[token]) if token in merge_rank else (0.0 if len(token) == 1 else -1e9))
+                toktypes.append(gguf.TokenType.NORMAL)
+
+        self.gguf_writer.add_tokenizer_model("llama")
+        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores(scores)
+        self.gguf_writer.add_token_types(toktypes)
+        # the Metaspace pre-tokenizer (prepend "always", split on spaces) is applied by the caller,
+        # see tools/laya
+        self.gguf_writer.add_add_space_prefix(False)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        cfg = self.agent_config
+        arch = self.gguf_writer.arch
+
+        # the decision outputs are per sequence: [act logits..., option logits...]
+        self.gguf_writer.add_pooling_type(gguf.PoolingType.RANK)
+        self.gguf_writer.add_uint32(gguf.Keys.Decision.BLOCK_COUNT.format(arch=arch), cfg.get("head_layers", 2))
+        self.gguf_writer.add_uint32(gguf.Keys.Decision.ACT_COUNT.format(arch=arch), len(cfg.get("act_costs", {})) + 1)
+        self.gguf_writer.add_uint32(gguf.Keys.Decision.MAX_OPTIONS.format(arch=arch), self.max_options)
+
+        # every sequence starts with [CLS] "<type> question: ...", so the token after [CLS] selects
+        # the type embedding
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(self.dir_model / "tokenizer")
+        qtype_tokens = [tokenizer("%s question: x" % t, add_special_tokens=False)["input_ids"][0] for t in self.qtypes]  # ty: ignore[call-non-callable]
+        if len(set(qtype_tokens)) != len(qtype_tokens):
+            raise ValueError(f"question types do not start with distinct tokens: {qtype_tokens}")
+        self.gguf_writer.add_array(gguf.Keys.Decision.QTYPE_TOKENS.format(arch=arch), qtype_tokens)
+
+        # sequence budgets and calibration temperatures, applied outside the graph
+        config = {k: v for k, v in cfg.items() if k != "training"}
+        self.gguf_writer.add_string(gguf.Keys.Decision.CONFIG.format(arch=arch), json.dumps(config))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("encoder."):
+            yield from super().modify_tensors(data_torch, name.removeprefix("encoder."), bid)
+            return
+
+        if name == "temperature":
+            # the calibration temperatures are in the decision config
+            return
+
+        if name.startswith("head.layers."):
+            _, _, bid_str, rest = name.split(".", 3)
+            if rest.startswith("self_attn.in_proj_"):
+                module, suffix = "self_attn.in_proj", rest.removeprefix("self_attn.in_proj_")
+            else:
+                module, suffix = rest.rsplit(".", 1)
+            yield (self.format_tensor_name(self.decision_block_tensors[module], int(bid_str), "." + suffix), data_torch)
+            return
+
+        module, suffix = name.rsplit(".", 1)
+        if module in self.decision_tensors:
+            yield (self.format_tensor_name(self.decision_tensors[module], None, "." + suffix), data_torch)
+            return
+
+        raise ValueError(f"Can not map tensor {name!r}")

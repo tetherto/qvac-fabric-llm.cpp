@@ -18,16 +18,22 @@ const V_CHUNKS: u32 = HEAD_DIM_V / 4u;
 const SCORE_REGS_PER_LANE: u32 = (KV_TILE + MIN_SUBGROUP_SIZE - 1u) / MIN_SUBGROUP_SIZE;
 const OUT_REGS_PER_LANE: u32 = (V_CHUNKS + MIN_SUBGROUP_SIZE - 1u) / MIN_SUBGROUP_SIZE;
 
+#ifdef PREC_F32
+#define SHMEM_TYPE f32
+#else
+#define SHMEM_TYPE f16
+#endif
+
 #if !defined(K_DIRECT) || !defined(V_DIRECT)
 #define STAGING_SHMEM kv_shmem
-#define STAGING_OUT_TYPE f16
+#define STAGING_OUT_TYPE SHMEM_TYPE
 #include "flash_attn_staging.tmpl"
 const kv_shmem_size = KV_TILE * max(HEAD_DIM_QK, HEAD_DIM_V);
-var<workgroup> kv_shmem: array<f16, kv_shmem_size>;
+var<workgroup> kv_shmem: array<SHMEM_TYPE, kv_shmem_size>;
 #endif
 
 var<workgroup> q_shmem: array<Q_TYPE, Q_TILE * HEAD_DIM_QK>;
-var<workgroup> p_shmem: array<f16, Q_TILE * KV_TILE>;
+var<workgroup> p_shmem: array<SHMEM_TYPE, Q_TILE * KV_TILE>;
 
 @compute @workgroup_size(WG_SIZE)
 fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
@@ -135,7 +141,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
                         q_shmem[q_off + 2u],
                         q_shmem[q_off + 3u]);
                     let kv_off = kv_local * HEAD_DIM_QK + chunk * 4u;
-                    let kv = vec4<f16>(
+                    let kv = vec4<SHMEM_TYPE>(
                         kv_shmem[kv_off + 0u],
                         kv_shmem[kv_off + 1u],
                         kv_shmem[kv_off + 2u],
@@ -167,7 +173,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
             let kv_local = sg_inv_id + slot * subgroup_size;
             if (row_active && kv_local < kv_count) {
                 let p = exp(local_scores[slot] - new_max);
-                p_shmem[subgroup_p_offset + kv_local] = f16(p);
+                p_shmem[subgroup_p_offset + kv_local] = SHMEM_TYPE(p);
                 local_sum += p;
             }
         }
@@ -197,7 +203,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
                 for (var kv_local = 0u; kv_local < kv_count; kv_local += 1u) {
                     let p = f32(p_shmem[subgroup_p_offset + kv_local]);
                     let kv_off = kv_local * HEAD_DIM_V + chunk * 4u;
-                    let v4 = vec4<f16>(
+                    let v4 = vec4<SHMEM_TYPE>(
                         kv_shmem[kv_off + 0u],
                         kv_shmem[kv_off + 1u],
                         kv_shmem[kv_off + 2u],

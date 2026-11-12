@@ -2,83 +2,41 @@
 
 #include "ggml-backend.h"
 
-#include <cstddef>
-#include <cstdint>
 #include <map>
 #include <memory>
 #include <vector>
 
 struct llama_model;
 
-struct llama_moe_cache_lru_fill {
-    int32_t layer;
-    int32_t expert;
-    int32_t slot;
-};
-
-struct llama_moe_cache_lru_stats {
-    size_t hits = 0;
-    size_t misses = 0;
-    size_t evictions = 0;
-};
-
-class llama_moe_cache_lru {
-public:
-    llama_moe_cache_lru(int32_t n_layers, int32_t n_experts, int32_t n_slots);
-
-    bool plan(
-            int32_t layer,
-            const int32_t * ids,
-            size_t n_ids,
-            int32_t * remapped_ids,
-            std::vector<llama_moe_cache_lru_fill> & fills,
-            llama_moe_cache_lru_stats & stats);
-
-    int32_t capacity() const;
-
-private:
-    struct slot {
-        int32_t layer = -1;
-        int32_t expert = -1;
-        uint64_t last_used = 0;
-    };
-
-    int32_t n_layers;
-    int32_t n_experts;
-    uint64_t clock = 0;
-    std::vector<int32_t> slot_for_expert;
-    std::vector<slot> slots;
-};
-
+// keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
+// each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
 class llama_moe_cache {
 public:
-    llama_moe_cache(
-            const llama_model & model,
-            ggml_backend_t backend,
-            ggml_backend_buffer_type_t buft,
-            size_t size,
-            bool automatic);
+    // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
+    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool automatic);
     ~llama_moe_cache();
 
-    ggml_backend_t backend() const;
-    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
-    void log_stats() const;
+    // the device that caches layer il
+    ggml_backend_t backend(int32_t il) const;
 
-    static bool sched_resolve(
-            void * user_data,
-            const ggml_tensor * weight,
-            ggml_backend_t backend,
-            ggml_tensor ** cached_weight,
-            void ** cache_entry);
-    static void sched_begin(void * user_data);
-    static bool sched_prepare(
-            void * user_data,
-            void * cache_entry,
-            const int32_t * ids,
-            size_t n_ids,
-            int32_t * remapped_ids);
+    // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
+    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+
+    // the experts of w in the cache, nullptr if w is not cached
+    ggml_tensor * get_experts(const ggml_tensor * w) const;
+
+    // ggml_backend_sched copy callback, returns false if src is not a slot map
+    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+
+    // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
+    // returns the number of experts copied, 0 if expert e is not in the cache
+    int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
+
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
+
+using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;

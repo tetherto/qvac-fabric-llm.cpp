@@ -58,7 +58,7 @@ static std::vector<float> run_case(ggml_backend_t backend, const fa_case & c, ui
     ggml_tensor * m = c.mask ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, N_KV, c.n_q, 1, 1) : nullptr;
 
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f / std::sqrt((float) D), 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);

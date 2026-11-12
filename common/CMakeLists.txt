@@ -55,6 +55,8 @@ endif()
 
 set(TARGET llama-common)
 
+include(parsers/sources.cmake)
+
 set(${TARGET}_HEADERS
     arg.h
     base64.hpp
@@ -71,6 +73,9 @@ set(${TARGET}_HEADERS
     http.h
     imatrix-loader.h
     json-schema-to-grammar.h
+    json-schema.h
+    json.h
+    laya.h
     log.h
     ngram-cache.h
     ngram-map.h
@@ -99,6 +104,7 @@ list(TRANSFORM ${TARGET}_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
 list(TRANSFORM ${TARGET}_JINJA_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
 
 add_library(${TARGET} STATIC
+    ${LLAMA_CHAT_PARSERS_SOURCES}
     arg.cpp
     chat-auto-parser-generator.cpp
     chat-auto-parser-helpers.cpp
@@ -114,6 +120,11 @@ add_library(${TARGET} STATIC
     hf-cache.cpp
     imatrix-loader.cpp
     json-schema-to-grammar.cpp
+    json-schema.cpp
+    json-schema.h
+    json.cpp
+    json.h
+    laya.cpp
     llguidance.cpp
     log.cpp
     ngram-cache.cpp

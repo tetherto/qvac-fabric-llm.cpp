@@ -76,13 +76,15 @@ kernel void kernel_get_rows_f32(
         ulong nb12,
         ulong nb1,
         ulong nb2,
-        ulong nb3
+        ulong nb3,
+        int nchunks
 ) {
     src0 = (global void*)((global char*)src0 + offset0);
     src1 = (global int*)((global char*)src1 + offset1);
     dst = (global float*)((global char*)dst + offsetd);
 
-    int nchunks = get_num_groups(0) / ne10;
+    // nchunks comes from the host: deriving it as get_num_groups(0) / ne10 made this copy
+    // ~20x slower on Adreno 740 (E031.41)
     int g       = get_group_id(0);
     int i10     = g / nchunks;
     int chunk   = g - i10 * nchunks;

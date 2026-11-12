@@ -2,72 +2,96 @@
 
 #extension GL_EXT_control_flow_attributes : require
 
-#include "types.glsl"
+// Fan one stream back out to hc streams and add the combination-weighted
+// residuals:
+//
+//   dst[i0, idst, it] = x[i0, it]*post[idst, it]
+//                     + sum_isrc residual[i0, isrc, it]*comb[idst, isrc, it]
+//
+// HAS_COMB == 0: identity mixing, each stream keeps its own residual:
+//
+//   dst[i0, idst, it] = x[i0, it]*post[idst, it] + residual[i0, idst, it]
 
-const uint num_threads = 256;
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint HAS_COMB = 1;
 
-layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform parameter {
-    uint ne;
+layout(push_constant) uniform parameter
+{
     uint n_embd;
-    uint hc;
     uint n_tokens;
-    uint x_nb0;
-    uint x_nb1;
+
+    uint nbx0; uint nbx1;              // x
+    uint nbr0; uint nbr1; uint nbr2;   // residual
+    uint nbp0; uint nbp1;              // post
+    uint nbc0; uint nbc1; uint nbc2;   // comb
+    uint nbd0; uint nbd1; uint nbd2;   // dst
+
     uint x_offset;
-    uint residual_nb0;
-    uint residual_nb1;
-    uint residual_nb2;
-    uint residual_offset;
-    uint post_nb0;
-    uint post_nb1;
-    uint post_offset;
-    uint comb_nb0;
-    uint comb_nb1;
-    uint comb_nb2;
-    uint comb_offset;
-    uint dst_nb0;
-    uint dst_nb1;
-    uint dst_nb2;
-    uint dst_offset;
-} p;
+    uint r_offset;
+    uint p_offset;
+    uint c_offset;
+    uint d_offset;
 
-layout(binding = 0) readonly buffer XBuf { float data_x[]; };
-layout(binding = 1) readonly buffer ResidualBuf { float data_residual[]; };
-layout(binding = 2) readonly buffer PostBuf { float data_post[]; };
-layout(binding = 3) readonly buffer CombBuf { float data_comb[]; };
-layout(binding = 4) writeonly buffer DBuf { float data_d[]; };
+    uint gate;               // post = gate_scale_out*sigmoid(gate_scale_in*p)
+    float gate_scale_in;
+    float gate_scale_out;
+};
 
-uint get_idx() {
-    return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
-}
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) readonly buffer R { float data_r[]; };
+layout(binding = 2, std430) readonly buffer P { float data_p[]; };
+layout(binding = 3, std430) readonly buffer C { float data_c[]; };
+layout(binding = 4, std430) writeonly buffer D { float data_d[]; };
+
+const uint hc = 4;
+
+shared float post_s[hc];
+shared float comb_s[hc * hc];
 
 void main() {
-    uint idx = get_idx();
+    const uint tid = gl_LocalInvocationID.x;
+    const uint it  = gl_WorkGroupID.y;
 
-    const uint num_iter = 2;
-    [[unroll]] for (uint iter = 0; iter < num_iter; ++iter) {
-        if (idx >= p.ne) {
-            continue;
+    if (tid < hc) {
+        const float p = data_p[p_offset + tid * nbp0 + it * nbp1];
+        post_s[tid] = gate != 0 ? (1.0f / (1.0f + exp(-(p * gate_scale_in)))) * gate_scale_out : p;
+    }
+    if (HAS_COMB == 1 && tid < hc * hc) {
+        const uint idst = tid & 3;
+        const uint isrc = tid >> 2;
+        comb_s[tid] = data_c[c_offset + idst * nbc0 + isrc * nbc1 + it * nbc2];
+    }
+    barrier();
+
+    // After the barrier, so every invocation reaches it.
+    const uint i0 = gl_WorkGroupID.x * BLOCK_SIZE + tid;
+    if (i0 >= n_embd) {
+        return;
+    }
+
+    const float xv = data_x[x_offset + i0 * nbx0 + it * nbx1];
+
+    const uint rb = r_offset + i0 * nbr0 + it * nbr2;
+
+    float r[hc];
+    [[unroll]]
+    for (uint isrc = 0; isrc < hc; ++isrc) {
+        r[isrc] = data_r[rb + isrc * nbr1];
+    }
+
+    [[unroll]]
+    for (uint idst = 0; idst < hc; ++idst) {
+        float result = xv * post_s[idst];
+        if (HAS_COMB == 1) {
+            [[unroll]]
+            for (uint isrc = 0; isrc < hc; ++isrc) {
+                result = fma(r[isrc], comb_s[idst + hc * isrc], result);
+            }
+        } else {
+            result += r[idst];
         }
-
-        const uint i = idx % p.n_embd;
-        const uint d = (idx / p.n_embd) % p.hc;
-        const uint t = idx / (p.n_embd * p.hc);
-
-        precise float sum = data_x[p.x_offset + i*p.x_nb0 + t*p.x_nb1] *
-                            data_post[p.post_offset + d*p.post_nb0 + t*p.post_nb1];
-
-        for (uint s = 0; s < p.hc; ++s) {
-            const float rv = data_residual[p.residual_offset + i*p.residual_nb0 + s*p.residual_nb1 + t*p.residual_nb2];
-            const float cw = data_comb[p.comb_offset + d*p.comb_nb0 + s*p.comb_nb1 + t*p.comb_nb2];
-            precise float product = rv * cw;
-            sum = sum + product;
-        }
-
-        data_d[p.dst_offset + i*p.dst_nb0 + d*p.dst_nb1 + t*p.dst_nb2] = sum;
-
-        idx += num_threads;
+        data_d[d_offset + i0 * nbd0 + idst * nbd1 + it * nbd2] = result;
     }
 }
