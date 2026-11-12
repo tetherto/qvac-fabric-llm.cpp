@@ -723,10 +723,11 @@ struct case_short_ubatch_rollback : ctx_test {
         constexpr uint32_t  n_rs_wide = 8;            // n_rs_seq + 1 > n_short
         constexpr uint32_t  n_replay  = 3;
 
+        // reserve for the prefill, the widest ubatch this case decodes
         const auto make_ctx = [&](uint32_t n_rs_seq) {
             ctx_opts opts;
-            opts.n_batch   = 64;
-            opts.n_ubatch  = 64;
+            opts.n_batch   = (uint32_t) n_prefill;
+            opts.n_ubatch  = (uint32_t) n_prefill;
             opts.n_seq_max = 1;
             opts.n_rs_seq  = n_rs_seq;
             return mr.ctx(opts);
