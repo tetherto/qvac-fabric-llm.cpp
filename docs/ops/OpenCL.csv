@@ -9891,6 +9891,7 @@
 "OpenCL","MEAN","type=f32,ne=[32769,1,1,1]","support","1","yes","OpenCL"
 "OpenCL","GROUP_NORM","type=f32,ne=[64,64,320,1],num_groups=32,eps=0.000001","support","1","yes","OpenCL"
 "OpenCL","GROUP_NORM","type=f32,ne=[9,9,1280,1],num_groups=32,eps=0.000001","support","1","yes","OpenCL"
+"OpenCL","GROUP_NORM","type=f32,ne=[64,64,320,2],num_groups=32,eps=0.000001","support","1","yes","OpenCL"
 "OpenCL","ACC","type=f32,ne_a=[256,17,1,1],ne_b=[256,16,1,1]","support","0","no","OpenCL"
 "OpenCL","PAD","type=f32,ne_a=[512,512,1,1],pad_0=1,pad_1=1,circular=0","support","1","yes","OpenCL"
 "OpenCL","PAD","type=f32,ne_a=[33,17,2,1],pad_0=4,pad_1=3,circular=1","support","0","no","OpenCL"
