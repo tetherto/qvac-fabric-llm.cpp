@@ -20356,7 +20356,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             const int n_q_chunk = std::min(chunk_rows, n_q - q_base);
             if (q_base > 0 || n_q_chunk != n_q) {
                 const cl_ulong offset_q_chunk    = offset_q + (cl_ulong)q_base * q_nb1;
-                const cl_ulong offset_o_chunk    = offset_o + (cl_ulong)q_base * o_nb1;
+                const cl_ulong offset_o_chunk    = offset_o + (cl_ulong)q_base * o_nb2;
                 const cl_ulong offset_mask_chunk = mask ? offset_mask + (cl_ulong)q_base * mask_nb1 : offset_mask;
                 CL_CHECK(clSetKernelArg(kernel, 1,  sizeof(cl_ulong), &offset_q_chunk));
                 CL_CHECK(clSetKernelArg(kernel, 7,  sizeof(cl_ulong), &offset_o_chunk));
