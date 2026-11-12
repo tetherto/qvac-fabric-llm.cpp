@@ -20,7 +20,9 @@ static void expect_affinity(const cpu_set_t & expected) {
     GGML_ASSERT(CPU_EQUAL(&actual, &expected));
 }
 
+// worker 0 is the calling thread: it keeps its own mask, the other workers run on the pool's
 struct probe {
+    cpu_set_t caller;
     cpu_set_t expected;
     bool abort;
     int calls;
@@ -29,14 +31,14 @@ struct probe {
 
 static bool check_compute(void * data) {
     auto * p = static_cast<probe *>(data);
-    expect_affinity(p->expected);
+    expect_affinity(p->caller);
     p->calls++;
     return p->abort;
 }
 
 static void check_workers(ggml_tensor * dst, const ggml_tensor * src, int ith, int nth, void * data) {
     auto * p = static_cast<probe *>(data);
-    expect_affinity(p->expected);
+    expect_affinity(ith == 0 ? p->caller : p->expected);
     p->workers.fetch_add(1);
     for (int64_t i = ith; i < ggml_nelements(src); i += nth) {
         ggml_set_f32_1d(dst, i, ggml_get_f32_1d(src, i));
@@ -57,6 +59,7 @@ static void run_case(const cpu_set_t & inherited, int cpu, bool paused, int thre
     auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
     ggml_set_f32(input, 2.0f);
     probe p = {};
+    p.caller = inherited;
     CPU_ZERO(&p.expected);
     CPU_SET(cpu, &p.expected);
     auto * checked = ggml_map_custom1(ctx, input, check_workers, GGML_N_TASKS_MAX, &p);
@@ -99,19 +102,24 @@ int main() {
     }
     if (cpus.size() < 2) {
         std::puts("SKIP: CPU affinity test needs two allowed CPUs");
-        return 0;
+        return 77;
     }
     for (bool paused : {false, true}) {
         for (int threads : {1, 2}) {
             run_case(original, cpus[0], paused, threads);
-            cpu_set_t restricted = original;
-            CPU_CLR(cpus.back(), &restricted);
-            run_case(restricted, cpus[0], paused, threads);
+            // a restricted caller must differ from the pool mask {cpus[0]}
+            if (cpus.size() >= 3) {
+                cpu_set_t restricted = original;
+                CPU_CLR(cpus.back(), &restricted);
+                run_case(restricted, cpus[0], paused, threads);
+            }
         }
     }
     GGML_ASSERT(sched_setaffinity(0, sizeof(original), &original) == 0);
     std::puts("CPU affinity preserved across creation, compute, abort, resume and destruction");
+    return 0;
 #else
     std::puts("SKIP: Linux/Android CPU affinity regression");
+    return 77;
 #endif
 }
