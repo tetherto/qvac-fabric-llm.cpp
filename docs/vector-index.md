@@ -42,7 +42,10 @@ Exact search scans every live slot. Filtered search restricts that scan to a
 caller-provided id set, while prepared filters cache the id-to-slot mapping for
 repeated queries. IVF-flat reduces the number of vectors scored by assigning
 vectors and queries to in-memory centroid lists. It is an optional search
-accelerator and does not change the storage format.
+accelerator and does not change the storage format. On a TurboVec index the
+build reorders the stored rows so each list is contiguous: TurboVec scores
+rows in blocks of 32, and a list spread over many blocks costs as much as a
+full scan.
 
 A `.tvim` file is a complete index snapshot. Normal loading materializes the
 index in memory, while mmap loading keeps supported vector sections mapped
@@ -234,6 +237,10 @@ before search.
   search fewer lists and may return different results from exact search.
   Probing at least the number of built lists searches all lists, so candidate
   coverage matches exact search. IVF state is not persisted in snapshots.
+  On a TurboVec index the build moves the rows into list order. Ids and
+  search results are unchanged, but `ggml_vec_index_ids` reports the new
+  order, prepared filters become stale, and the next `ggml_vec_index_sync`
+  rewrites the whole file.
 
 `ggml_vec_index_prepare` is an optional cache warmup for TurboVec rotation and
 codebook state; other storage modes ignore it. New callers should
@@ -300,7 +307,7 @@ interchangeable with turbovec 1.1 and later in both directions; v7 files and
 v8 files in the bit-planes unit layout load too, and positional `.tv` files
 (no ids) are rejected. Removal is upstream's swap-remove (the last row moves
 into the hole), so a snapshot is byte-identical to the one turbovec writes
-for the same history. Like turbovec, an index that would search in stages at
+for the same history, until an IVF build reorders the rows. Like turbovec, an index that would search in stages at
 its current size stores its block units in the bit-planes layout and every
 other index in the sequential one; both forms load in either
 implementation.

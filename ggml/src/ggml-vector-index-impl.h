@@ -1203,6 +1203,12 @@ bool turbovec_rows_in_blocked(const ggml_vec_index & idx);
 // and drops them again once only the blocked cache is needed.
 void turbovec_materialize_packed_rows(ggml_vec_index & idx);
 void turbovec_settle_rows(ggml_vec_index & idx);
+// Moves the rows of a TurboVec index into IVF list order, list 0 first, and
+// rewrites the IVF lists as ranges of the new slots. A block then holds rows
+// of one list, so an IVF search scores few blocks. Returns false and changes
+// nothing when the index cannot be reordered: not TurboVec, read-only, holds
+// tombstones, or has no current IVF. The caller holds the write lock.
+bool turbovec_group_rows_by_ivf(ggml_vec_index & idx);
 void turbovec_row_seq(const ggml_vec_index & idx, size_t slot, uint8_t * seq);
 void turbovec_row_packed(const ggml_vec_index & idx, size_t slot, uint8_t * packed);
 // The slot's packed row without copying when the index keeps packed rows (a

@@ -1326,6 +1326,16 @@ int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim) {
 }
 #endif
 
+static void group_rows_after_ivf_build(ggml_vec_index & idx) {
+    try {
+        turbovec_group_rows_by_ivf(idx);
+    } catch (...) {
+        // The lists may name slots that have moved.
+        invalidate_ivf(idx);
+        throw;
+    }
+}
+
 static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists, int n_iter) {
     try {
         if (idx == nullptr || n_lists <= 0 || n_iter < 0) {
@@ -1413,6 +1423,7 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
         idx->ivf_lists = std::move(lists);
         idx->ivf_n_lists = actual_lists;
         idx->ivf_generation = idx->generation;
+        group_rows_after_ivf_build(*idx);
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
