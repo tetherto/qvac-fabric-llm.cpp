@@ -66,9 +66,10 @@ its decode runs as for a width they do not take (below). When `ssm_out` is the
 only such weight - a stock `Qwen/Qwen3.5-0.8B Q4_K_M` leaves half of its
 `ssm_out` at `Q8_0` - requantizing it is the way onto the fused path (see
 Build). `GGML_XDNA_FUSED_LAYER=0` is a bisection switch, not a way to run such
-a model on the fused layers. An attention layer's tail reads `attn_output` as
-`Q4_K`, `Q5_K` or `Q6_K`; a layer with another type runs per op, and one
-warning names the first such weight.
+a model on the fused layers. A recurrent layer's in-projection (`attn_qkv`,
+`attn_gate`) and an attention layer's tail (`attn_output`) are read as `Q4_K`,
+`Q5_K` or `Q6_K`; a layer with another type runs per op, and one warning names
+the first such weight.
 
 The layers take the residual width from the model: any multiple of 512 up to
 4096 (`XDNA_RES_MAX_D`, what the residual rows the layers hand each other are
