@@ -571,8 +571,6 @@ target_include_directories(test-backend-buffer-size PRIVATE ${PROJECT_SOURCE_DIR
 
 llama_build_and_test(test-vulkan-buffer-capacity.cpp LINK ggml)
 target_include_directories(test-vulkan-buffer-capacity PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
-set_tests_properties(test-vulkan-buffer-capacity PROPERTIES ENVIRONMENT
-    "GGML_VK_FORCE_MAX_ALLOCATION_SIZE=4194304;GGML_VK_FORCE_MAX_BUFFER_SIZE=8388608;GGML_VK_SUBALLOCATION_BLOCK_SIZE=1048576")
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 
