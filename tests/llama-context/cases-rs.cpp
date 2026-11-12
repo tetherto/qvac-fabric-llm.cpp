@@ -778,11 +778,98 @@ struct case_multi_seq_ragged : ctx_test {
     }
 };
 
+// decodes a prefill, then a short ubatch of n_short tokens, and rolls back to keep only the short ubatch's first token
+static bool decode_short_ubatch_and_roll_back(llama_context * ctx,
+                                              int32_t         n_vocab,
+                                              llama_pos       n_prefill,
+                                              llama_pos       n_short) {
+    return decode_gen(ctx, n_vocab, 0, 0, n_prefill) && decode_gen(ctx, n_vocab, 0, n_prefill, n_prefill + n_short) &&
+           llama_memory_seq_rm(llama_get_memory(ctx), 0, n_prefill + 1, -1);
+}
+
+// replays tokens of another sequence on both contexts from p0 and accumulates their logits difference
+static bool replay_logits_diff(llama_context * ctx_a,
+                               llama_context * ctx_b,
+                               int32_t         n_vocab,
+                               llama_pos       p0,
+                               uint32_t        n_replay,
+                               logits_diff &   diff) {
+    for (uint32_t i = 0; i < n_replay; ++i) {
+        const llama_pos   pos = p0 + (llama_pos) i;
+        const llama_token tok = gen_token(n_vocab, 1, pos);
+        if (!decode_one(ctx_a, tok, pos) || !decode_one(ctx_b, tok, pos)) {
+            return false;
+        }
+        const float * l_a = llama_get_logits_ith(ctx_a, 0);
+        const float * l_b = llama_get_logits_ith(ctx_b, 0);
+        if (l_a == nullptr || l_b == nullptr) {
+            return false;
+        }
+        diff.add(l_a, l_b, n_vocab);
+    }
+    return true;
+}
+
+// the deepest rollback inside a ubatch shorter than n_rs_seq + 1 must restore the same state as in a context whose
+// n_rs_seq + 1 rollback slots that ubatch fills exactly
+struct case_short_ubatch_rollback : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "rollback_short"; }
+
+    const char * description() const override {
+        return "rolling back inside a ubatch shorter than n_rs_seq + 1 replays exactly like a context it fills";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prefill = 16;
+        constexpr llama_pos n_short   = 4;
+        constexpr uint32_t  n_rs_fill = n_short - 1;  // n_rs_seq + 1 = n_short
+        constexpr uint32_t  n_rs_wide = 8;            // n_rs_seq + 1 > n_short
+        constexpr uint32_t  n_replay  = 3;
+
+        const auto make_ctx = [&](uint32_t n_rs_seq) {
+            ctx_opts opts;
+            opts.n_batch   = 64;
+            opts.n_ubatch  = 64;
+            opts.n_seq_max = 1;
+            opts.n_rs_seq  = n_rs_seq;
+            return mr.ctx(opts);
+        };
+
+        llama_context_ptr ctx_fill = make_ctx(n_rs_fill);
+        llama_context_ptr ctx_wide = make_ctx(n_rs_wide);
+        if (!ctx_fill || !ctx_wide) {
+            return case_result::fail();
+        }
+        if (llama_n_rs_seq(ctx_fill.get()) != n_rs_fill || llama_n_rs_seq(ctx_wide.get()) != n_rs_wide) {
+            return case_result::skip("partial rollback is disabled");
+        }
+
+        CTX_REQUIRE(decode_short_ubatch_and_roll_back(ctx_fill.get(), n_vocab, n_prefill, n_short) &&
+                        decode_short_ubatch_and_roll_back(ctx_wide.get(), n_vocab, n_prefill, n_short),
+                    "the prefill, short ubatch or rollback failed");
+
+        logits_diff diff;
+        CTX_REQUIRE(replay_logits_diff(ctx_fill.get(), ctx_wide.get(), n_vocab, n_prefill + 1, n_replay, diff),
+                    "the replay after the rollback failed");
+
+        // both contexts run the same arithmetic on the same tokens
+        CTX_REQUIRE(diff.nmse() == 0.0,
+                    string_format("replay logits differ (max diff %g, nmse %g)", (double) diff.diff_max, diff.nmse()));
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_rollback_bound>());
+    cases.push_back(std::make_unique<case_short_ubatch_rollback>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
     cases.push_back(std::make_unique<case_multi_seq_cell_swap>());
