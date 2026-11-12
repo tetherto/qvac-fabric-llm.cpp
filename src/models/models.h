@@ -1693,6 +1693,13 @@ struct llama_model_dflash : public llama_model_base {
         ggml_tensor * draft_ids    = nullptr;
         ggml_tensor * logits_draft = nullptr;
 
+        // set by build_layers for a DSpine draft on whole blocks (null otherwise): the exact anchor codes and the
+        // last layer's state before its code write, which the lattice in build_logits reuses
+        ggml_tensor * dspine_anchor_codes = nullptr;
+        ggml_tensor * dspine_raw          = nullptr;
+        ggml_tensor * dspine_rms          = nullptr;
+        ggml_tensor * dspine_query        = nullptr;
+
         graph_base(const llm_graph_params & params);
 
         ggml_tensor * build_inject();

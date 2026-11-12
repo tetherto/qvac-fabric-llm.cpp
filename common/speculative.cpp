@@ -10,6 +10,8 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include "../src/llama-ext.h" // staging API: llama_model_is_dspine
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -1093,6 +1095,11 @@ protected:
         }
         this->n_max = this->params.n_max;
 
+        // the DSpine code bridge and lattice need whole blocks, so the blocks of all sequences must fit one draft ubatch
+        if (llama_model_is_dspine(model_dft) && (int64_t) n_seq * (this->params.n_max + 1) > (int64_t) llama_n_ubatch(ctx_dft)) {
+            throw std::runtime_error("DSpine draft needs --spec-draft-n-ubatch >= n_parallel * (--spec-draft-n-max + 1)");
+        }
+
         batch        = common_batch(ctx_dft);
         batch_inject = common_batch(ctx_dft);
 
@@ -1551,6 +1558,7 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
     common_speculative_impl_draft_dflash2(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2)
     {
+        // DSpine also reports its lattice width here and reuses the DFlash2 lattice path
         selector_top_k = llama_model_dflash_selector_top_k(llama_get_model(this->params.ctx_dft));
         dflash2_rng.resize(n_seq);
         dflash2_seed.assign(n_seq, -1);
@@ -3379,7 +3387,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                             common_speculative_type_to_str(config.type).c_str(), common_speculative_type_to_str(type_model).c_str()));
                 }
 
-                switch (type_model) {
+                // a DSpine draft runs the plain DFlash decoder but packs a DFlash2 lattice, which the DFlash2 walk consumes
+                const bool is_dspine = llama_model_is_dspine(llama_get_model(config.params.draft.ctx_dft));
+                switch (is_dspine ? COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 : type_model) {
                     case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                         impls.push_back(std::make_unique<common_speculative_impl_draft_dspark>(config.params, n_seq));
                         break;
