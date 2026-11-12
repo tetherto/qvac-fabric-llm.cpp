@@ -17,6 +17,12 @@ std::vector<enum common_speculative_type> common_speculative_types_from_names(co
 // infer the spec types from the GGUF metadata of a draft model; empty if unknown
 std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
 
+// why the draft model of params cannot draft for the model at path_target, read from both GGUF headers, or empty:
+// a DFlash/DSpark model with another vocabulary (a d2t map does not change it), another n_embd, a target layer past
+// the model's last, or a DSpark Markov head without a positive block size; an external MTP head with another output
+// width or vocabulary. Empty for other speculative types and for unreadable headers, which the load reports itself.
+std::string common_speculative_draft_mismatch(const common_params & params, const std::string & path_target);
+
 // convert string to type
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
 
