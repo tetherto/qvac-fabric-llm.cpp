@@ -8,6 +8,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "mtmd.h"
+#include "mtmd-helper-impl.h"
 
 #include <cstdarg>
 #include <cstdio>
