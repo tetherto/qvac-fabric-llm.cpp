@@ -41,6 +41,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mm-small.cuh"
 #include "ggml-cuda/mmq-cutlass.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmq-few.cuh"
@@ -409,6 +410,11 @@ static bool ggml_cuda_register_host_enabled() {
 
 static bool ggml_cuda_fusion_disabled() {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
+    return disabled;
+}
+
+static bool ggml_cuda_mm_small_disabled() {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_MM_SMALL");
     return disabled;
 }
 
@@ -2816,6 +2822,12 @@ static bool ggml_cuda_repacked_mmvq_supported(
 static void ggml_cuda_mul_mat_canonical(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    // Many small F32 products (windowed attention): ahead of MMVF and cuBLAS, which are both slow on them.
+    if (!ggml_cuda_mm_small_disabled() && ggml_cuda_should_use_mm_small(src0, src1, dst)) {
+        ggml_cuda_mul_mat_small(ctx, src0, src1, dst);
+        return;
+    }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
