@@ -2393,6 +2393,8 @@ static size_t kquant_mc_subgroups(const ggml_backend_opencl_context * backend_ct
 // the GRU kernel keeps one hidden-state row in local memory, one work-item per hidden unit;
 // the same value sizes the kernel's local arrays and gates H in supports_op
 #define GGML_OPENCL_GRU_MAX_H 128
+#define GGML_OPENCL_IM2COL_WG_MIN 64
+#define GGML_OPENCL_IM2COL_WG_MAX 256
 #define GGML_OPENCL_COL2IM_1D_WG 64
 #define GGML_OPENCL_UNARY_F32_WG 64
 #define GGML_OPENCL_UNARY_F32_VEC 4
@@ -38388,9 +38390,14 @@ static void ggml_cl_im2col(ggml_backend_t backend, const ggml_tensor * src0, con
     CL_CHECK(clSetKernelArg(kernel,  19, sizeof(int),      &d0));
     CL_CHECK(clSetKernelArg(kernel,  20, sizeof(int),      &d1));
 
-    const int num_blocks = (pelements + 256 - 1) / 256;
-    size_t global_work_size[] = {(size_t)num_blocks*256, (size_t)OH, (size_t)batch*IC};
-    size_t local_work_size[] = {256, 1, 1};
+    size_t wg = GGML_OPENCL_IM2COL_WG_MIN;
+    while (wg < (size_t) CHW && wg < GGML_OPENCL_IM2COL_WG_MAX) {
+        wg *= 2;
+    }
+    wg = MIN(wg, (size_t) backend_ctx->get_kernel_workgroup_size(kernel));
+
+    size_t global_work_size[] = {(size_t)OW*wg, (size_t)OH, (size_t)batch};
+    size_t local_work_size[] = {wg, 1, 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
