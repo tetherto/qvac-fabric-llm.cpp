@@ -119,7 +119,8 @@ The draft reads rows of the target output head directly, so a head in a repacked
 Load the target with `--no-repack` and without `-sm row` in that case.
 
 The verify cost of a step can jump with the number of drafted tokens, for example on Metal past 8 rows.
-With a lattice drafter such as DFlash2 or DSpine, `--spec-draft-n-short N` keeps only the first N drafts of a step unless the full draft pays for its cost.
+With a lattice drafter (DFlash2, DSpine or LiliCorr), `--spec-draft-n-short N` keeps only the first N drafts of a step unless the full draft pays for its cost.
+Other drafters reject the option, and N must be 0 or at least `--spec-draft-n-min`.
 The expected accepted tokens come from the lattice's own transition probabilities, and `--spec-draft-long-cost R` is the time of a step with `--spec-draft-n-max` drafts relative to a step with N drafts.
 Take R from two runs, one with `--spec-draft-n-max` at each value.
 Every step still decodes the full draft block, so compare the result with `--spec-draft-n-max N` alone.
@@ -307,7 +308,7 @@ Use exactly one of these options:
                                         minimum speculative decoding probability (greedy) (default: 0.00)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
 --spec-draft-n-short                    N
-                                        lattice drafters such as DFlash2 and DSpine: keep only N drafts in a step unless the expected accepted tokens of
+                                        lattice drafters (DFlash2, DSpine, LiliCorr): keep only N drafts in a step unless the expected accepted tokens of
                                         the full draft pay for --spec-draft-long-cost (default: 0, 0 = off)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_SHORT)
 --spec-draft-long-cost                  R
