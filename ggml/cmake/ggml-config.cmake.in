@@ -5,7 +5,7 @@
 # Find all dependencies before creating any target.
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
-if (NOT GGML_SHARED_LIB)
+if (NOT GGML_SHARED_LIB OR GGML_CPU_STATIC)
     set(GGML_BASE_INTERFACE_LINK_LIBRARIES "")
     set(GGML_CPU_INTERFACE_LINK_LIBRARIES "")
     set(GGML_CPU_INTERFACE_LINK_OPTIONS   "")
@@ -41,13 +41,13 @@ if (NOT GGML_SHARED_LIB)
         list(APPEND GGML_CPU_INTERFACE_LINK_LIBRARIES memkind)
     endif()
 
-    if (GGML_BLAS)
+    if (GGML_BLAS AND NOT GGML_BACKEND_DL)
         find_dependency(BLAS)
         list(APPEND GGML_BLAS_INTERFACE_LINK_LIBRARIES ${BLAS_LIBRARIES})
         list(APPEND GGML_BLAS_INTERFACE_LINK_OPTIONS   ${BLAS_LINKER_FLAGS})
     endif()
 
-    if (GGML_CUDA)
+    if (GGML_CUDA AND NOT GGML_BACKEND_DL)
         set(GGML_CUDA_INTERFACE_LINK_LIBRARIES "")
         find_dependency(CUDAToolkit)
         if (GGML_STATIC)
@@ -63,7 +63,7 @@ if (NOT GGML_SHARED_LIB)
         endif()
     endif()
 
-    if (GGML_METAL)
+    if (GGML_METAL AND NOT GGML_BACKEND_DL)
         find_library(FOUNDATION_LIBRARY Foundation)
         find_library(METAL_FRAMEWORK    Metal)
         find_library(METALKIT_FRAMEWORK MetalKit)
@@ -75,31 +75,24 @@ if (NOT GGML_SHARED_LIB)
             ${FOUNDATION_LIBRARY} ${METAL_FRAMEWORK} ${METALKIT_FRAMEWORK})
     endif()
 
-    if (GGML_OPENCL)
+    if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
         find_dependency(OpenCL)
         set(GGML_OPENCL_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:OpenCL::OpenCL>)
     endif()
 
-    # Under GGML_BACKEND_DL the Vulkan backend ships as a standalone module that
-    # is dlopen'd at runtime; the consumer links only ggml/ggml-base and never
-    # references Vulkan::Vulkan (the backend foreach below is skipped entirely
-    # when GGML_BACKEND_DL is set). Hard-requiring the Vulkan SDK at the
-    # consumer's configure time is therefore spurious for DL builds and breaks
-    # CPU-only consumers (e.g. @qvac/classification-ggml) on build hosts without
-    # a Vulkan SDK. Keep the dependency for non-DL builds, which link it directly.
     if (GGML_VULKAN AND NOT GGML_BACKEND_DL)
         find_dependency(Vulkan)
         set(GGML_VULKAN_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:Vulkan::Vulkan>)
     endif()
 
-    if (GGML_HIP)
+    if (GGML_HIP AND NOT GGML_BACKEND_DL)
         find_dependency(hip)
         find_dependency(hipblas)
         find_dependency(rocblas)
         set(GGML_HIP_INTERFACE_LINK_LIBRARIES hip::host roc::rocblas roc::hipblas)
     endif()
 
-    if (GGML_SYCL)
+    if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         set(GGML_SYCL_INTERFACE_LINK_LIBRARIES "")
         find_package(DNNL)
         if (${DNNL_FOUND} AND GGML_SYCL_TARGET STREQUAL "INTEL")
@@ -112,7 +105,7 @@ if (NOT GGML_SHARED_LIB)
         endif()
     endif()
 
-    if (GGML_OPENCL)
+    if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
         # OpenCL::OpenCL, from the find_dependency(OpenCL) above, is the canonical
         # target. pkg-config can contribute extra transitive flags that matter when
         # linking statically, so consult it when it is available - but do not make it
@@ -138,7 +131,7 @@ set_and_check(GGML_INCLUDE_DIR "@PACKAGE_GGML_INCLUDE_INSTALL_DIR@")
 set_and_check(GGML_LIB_DIR "@PACKAGE_GGML_LIB_INSTALL_DIR@")
 #set_and_check(GGML_BIN_DIR "@PACKAGE_GGML_BIN_INSTALL_DIR@")
 
-if (NOT GGML_SHARED_LIB AND GGML_CPU_KLEIDIAI)
+if ((NOT GGML_SHARED_LIB OR GGML_CPU_STATIC) AND GGML_CPU_KLEIDIAI)
     unset(KLEIDIAI_LIBRARY CACHE)
     unset(KLEIDIAI_LIBRARY)
     find_library(KLEIDIAI_LIBRARY kleidiai
@@ -260,6 +253,10 @@ if(NOT TARGET ggml::all)
                 list(APPEND _ggml_all_targets ggml::${_ggml_backend})
             endif()
         endforeach()
+    endif()
+
+    if (GGML_BACKEND_DL AND GGML_CPU_STATIC AND TARGET ggml::ggml-cpu)
+        list(APPEND _ggml_all_targets ggml::ggml-cpu)
     endif()
 
     add_library(ggml::all INTERFACE IMPORTED)

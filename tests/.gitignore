@@ -17,3 +17,6 @@ turbovec-golden-gen/*.tmp.tv
 ggml-common.h
 **/*.swp
 !peg-parser
+!hybrid-package/
+!hybrid-package/CMakeLists.txt
+!hybrid-package/main.cpp

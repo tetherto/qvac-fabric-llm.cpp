@@ -78,3 +78,13 @@ jobs:
           cd examples/simple-cmake-pkg
           cmake -S . -B build -DCMAKE_PREFIX_PATH="$PREFIX"/share
           cmake --build build -j $(nproc)
+
+      - name: Test hybrid GGML package
+        run: cmake -DTEST_BINARY_DIR="${{ github.workspace }}/build-hybrid-package" -P tests/test-hybrid-package.cmake
+
+  windows-hybrid:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test hybrid GGML package
+        run: cmake -DTEST_BINARY_DIR="${{ github.workspace }}/build-hybrid-package" -P tests/test-hybrid-package.cmake
