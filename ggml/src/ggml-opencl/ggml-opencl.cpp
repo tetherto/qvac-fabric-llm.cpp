@@ -9195,6 +9195,10 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         if (!ggml_is_contiguous(gn->src[0]) || !ggml_is_contiguous(w) || !ggml_is_contiguous(b)) {
             return false;
         }
+
+        if (gn->src[0]->ne[3] != 1 || !ggml_are_same_shape(w, gn) || !ggml_are_same_shape(b, gn)) {
+            return false;
+        }
     }
 
     return true;
@@ -16596,6 +16600,18 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
     backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, dst);
 }
 
+static void ggml_cl_group_norm_batches(ggml_backend_opencl_context * backend_ctx, cl_kernel kernel,
+        const ggml_tensor * src, ggml_tensor * dst, cl_ulong offset0, cl_ulong offsetd,
+        size_t * global_work_size, size_t * local_work_size) {
+    for (int64_t i3 = 0; i3 < src->ne[3]; ++i3) {
+        const cl_ulong offset0_i3 = offset0 + i3*src->nb[3];
+        const cl_ulong offsetd_i3 = offsetd + i3*dst->nb[3];
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0_i3));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd_i3));
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    }
+}
+
 static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -16643,7 +16659,7 @@ static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0,
     size_t global_work_size[] = {(size_t)n_groups*sgs, 1, 1};
     size_t local_work_size[] = {(size_t)sgs, 1, 1};
 
-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    ggml_cl_group_norm_batches(backend_ctx, kernel, src0, dst, offset0, offsetd, global_work_size, local_work_size);
 }
 
 static void ggml_cl_l2_norm(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

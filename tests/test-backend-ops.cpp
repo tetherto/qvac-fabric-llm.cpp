@@ -12928,6 +12928,8 @@ struct test_group_norm_mul_add : public test_case {
     const std::array<int64_t, 4> ne;
     int num_groups;
     float eps;
+    const bool broadcast_weight;
+    const bool broadcast_bias;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -12937,19 +12939,19 @@ struct test_group_norm_mul_add : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, num_groups, eps);
+        return VARS_TO_STR6(type, ne, num_groups, eps, broadcast_weight, broadcast_bias);
     }
 
     test_group_norm_mul_add(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {128, 1, 1, 1},
             int num_groups = 4,
-            float eps = 1e-5f)
-        : type(type), ne(ne), num_groups(num_groups), eps(eps) {}
+            float eps = 1e-5f, bool broadcast_weight = false, bool broadcast_bias = false)
+        : type(type), ne(ne), num_groups(num_groups), eps(eps), broadcast_weight(broadcast_weight), broadcast_bias(broadcast_bias) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_tensor * w = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, type, broadcast_weight ? 1 : ne[0], broadcast_weight ? 1 : ne[1], ne[2], broadcast_weight ? 1 : ne[3]);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, type, broadcast_bias ? 1 : ne[0], broadcast_bias ? 1 : ne[1], ne[2], broadcast_bias ? 1 : ne[3]);
         ggml_set_param(a); ggml_set_param(w); ggml_set_param(b);
         ggml_set_name(a, "a"); ggml_set_name(w, "w"); ggml_set_name(b, "b");
         ggml_tensor * n = ggml_group_norm(ctx, a, num_groups, eps);
@@ -17909,6 +17911,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 33, 1, 1, 1 }));
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 33, 1024, 1, 1 }));
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 33, 256, 1, 1 }));
+    for (int64_t batch : {1, 2, 3}) {
+        const std::array<int64_t, 4> shape = {8, 4, 32, batch};
+        test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, shape, 4));
+        for (bool broadcast_weight : {false, true}) {
+            for (bool broadcast_bias : {false, true}) {
+                test_cases.emplace_back(new test_group_norm_mul_add(
+                    GGML_TYPE_F32, shape, 4, 1e-5f, broadcast_weight, broadcast_bias));
+            }
+        }
+    }
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {64, 64, 320, 1}));
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {9, 9, 1280, 1}));
     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {64, 64, 320, 1}));
