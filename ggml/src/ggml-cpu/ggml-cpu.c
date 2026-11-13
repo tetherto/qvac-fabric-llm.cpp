@@ -2966,6 +2966,58 @@ static bool ggml_thread_cpumask_is_valid(const bool * mask) {
     return false;
 }
 
+// qvac-fabric (tetherto/qvac#5537): on Linux and Android, threads inherit their creator's affinity,
+// and a saved mask cannot be restored exactly (sched_getaffinity reports it narrowed by the cpuset
+// and the active CPUs), so the threadpool mask is not applied to a thread ggml does not own there.
+// NUMA mode still pins every compute thread, the caller included, and then resets it to all CPUs.
+static void ggml_thread_apply_caller_affinity(bool * mask) {
+#if defined(__linux__)
+    UNUSED(mask);
+#else
+    if (ggml_thread_cpumask_is_valid(mask)) {
+        ggml_thread_apply_affinity(mask);
+    }
+#endif
+}
+
+#ifdef GGML_USE_OPENMP
+// OpenMP threads are shared across threadpools, so their affinity is scoped to one graph.
+struct ggml_thread_affinity_scope {
+#if defined(__linux__)
+    cpu_set_t saved;
+#endif
+    bool valid;
+};
+
+static struct ggml_thread_affinity_scope ggml_thread_affinity_begin(int ith, bool * mask) {
+    struct ggml_thread_affinity_scope scope;
+    memset(&scope, 0, sizeof(scope));
+    if (ith == 0) {
+        // the calling thread
+        ggml_thread_apply_caller_affinity(mask);
+        return scope;
+    }
+    if (!ggml_thread_cpumask_is_valid(mask)) {
+        return scope;
+    }
+#if defined(__linux__)
+    scope.valid = sched_getaffinity(0, sizeof(scope.saved), &scope.saved) == 0;
+#endif
+    ggml_thread_apply_affinity(mask);
+    return scope;
+}
+
+static void ggml_thread_affinity_end(const struct ggml_thread_affinity_scope * scope) {
+#if defined(__linux__)
+    if (scope->valid && sched_setaffinity(0, sizeof(scope->saved), &scope->saved) != 0) {
+        GGML_LOG_WARN("failed to restore OpenMP thread affinity: %s\n", strerror(errno));
+    }
+#else
+    UNUSED(scope);
+#endif
+}
+#endif // GGML_USE_OPENMP
+
 static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask, bool strict, int32_t* iter) {
     if (!strict) {
         memcpy(local_mask, global_mask, GGML_MAX_N_THREADS);
@@ -3567,10 +3619,9 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
 
     if (threadpool->pause) {
        // Update main thread prio and affinity to match the threadpool settings
+       // (affinity: not on Linux/Android, see ggml_thread_apply_caller_affinity)
        ggml_thread_apply_priority(threadpool->prio);
-       if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
-           ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
-       }
+       ggml_thread_apply_caller_affinity(threadpool->workers[0].cpumask);
 
        // resume does cond broadcast
        ggml_threadpool_resume_locked(threadpool);
@@ -3646,10 +3697,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume
+        // (affinity: not on Linux/Android, see ggml_thread_apply_caller_affinity)
         ggml_thread_apply_priority(threadpool->prio);
-        if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
-            ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
-        }
+        ggml_thread_apply_caller_affinity(threadpool->workers[0].cpumask);
     }
 #endif // GGML_USE_OPENMP
 
@@ -3703,10 +3753,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             int ith = omp_get_thread_num();
 
             ggml_thread_apply_priority(threadpool->prio);
-            if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
-                ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
-            }
+            struct ggml_thread_affinity_scope affinity = ggml_thread_affinity_begin(ith, threadpool->workers[ith].cpumask);
             ggml_graph_compute_thread(&threadpool->workers[ith]);
+            ggml_thread_affinity_end(&affinity);
         }
     } else {
         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
