@@ -1,4 +1,5 @@
 #include "ggml-vulkan-common.h"
+#include "ggml-vulkan-capacity.h"
 
 #ifdef __APPLE__
 #include <pthread.h>
@@ -17252,9 +17253,29 @@ const char * ggml_backend_vk_buffer_type_name(ggml_backend_buffer_type_t buft) {
     return ctx->name.c_str();
 }
 
+static size_t ggml_backend_vk_buffer_type_get_max_capacity(ggml_backend_buffer_type_t buft) {
+    if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
+        return SIZE_MAX;
+    }
+
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+    return ggml_vk_buffer_capacity(
+        ctx->device->max_buffer_size,
+        ctx->device->max_memory_allocation_size,
+        (uint64_t) ctx->device->properties.limits.maxStorageBufferRange,
+        ctx->device->shader_64b_indexing,
+        ctx->device->buffer_device_address);
+}
+
 ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_type_alloc_buffer(" << size << ")");
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+
+    const size_t capacity = ggml_backend_vk_buffer_type_get_max_capacity(buft);
+    if (size > capacity) {
+        GGML_LOG_WARN("%s: requested size %zu exceeds logical buffer capacity %zu\n", __func__, size, capacity);
+        return nullptr;
+    }
 
     vk_buffer dev_buffer = nullptr;
     try {
@@ -20298,8 +20319,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
     const bool uses_bda = (op->op == GGML_OP_IM2COL || op->op == GGML_OP_IM2COL_3D) &&
                           device->shader_int64 && device->buffer_device_address;
 
+    const size_t capacity = ggml_backend_vk_buffer_type_get_max_capacity(&device->buffer_type);
     auto const & tensor_size_supported = [&](size_t tensor_size) {
-        if (tensor_size > device->max_buffer_size) {
+        if (tensor_size > capacity) {
             return false;
         }
         // For im2col shaders using BDA, maxStorageBufferRange limit doesn't apply.
@@ -20311,7 +20333,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         }
         return true;
     };
-    // reject any tensors larger than the max buffer size
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && !tensor_size_supported(ggml_nbytes(op->src[i]))) {
             return false;
@@ -21491,6 +21512,9 @@ static uint64_t ggml_backend_vk_fwht_fusion_count(ggml_backend_t backend) {
 
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_get_buffer_capacity") == 0) {
+        return (void *) ggml_backend_vk_buffer_type_get_max_capacity;
+    }
     if (strcmp(name, "ggml_backend_supports_efficient_fa") == 0) {
         return (void *)ggml_backend_vk_supports_efficient_fa;
     }

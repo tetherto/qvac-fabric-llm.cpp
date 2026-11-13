@@ -572,9 +572,17 @@ llama_build_and_test(test-backend-memory.cpp LINK ggml)
 llama_build_and_test(test-backend-buffer-size.cpp LINK ggml)
 target_include_directories(test-backend-buffer-size PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+llama_build_and_test(test-vulkan-buffer-capacity.cpp LINK ggml)
+target_include_directories(test-vulkan-buffer-capacity PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 
 llama_build_and_test(test-convrot.cpp LINK ggml)
+
+if (GGML_OPENCL)
+    find_package(Threads REQUIRED)
+    llama_build_and_test(test-opencl-concurrent-upload.cpp LINK ggml Threads::Threads)
+endif()
 
 # Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
 # GGML_VK_TBQ_COPY_SG_SIZE values to exercise the shader's cross-subgroup stitch
@@ -736,6 +744,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-rope.cpp LINK ggml)
     llama_build_and_test(test-rope-flux.cpp LINK ggml)
     find_package(Threads REQUIRED)
+    llama_build_and_test(test-cpu-affinity.cpp LINK ggml Threads::Threads)
+    set_tests_properties(test-cpu-affinity PROPERTIES SKIP_RETURN_CODE 77)
     llama_build_and_test(test-tbq-init.cpp LINK ggml Threads::Threads)
     target_include_directories(test-tbq-init PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     llama_test(test-tbq-init NAME test-tbq-init-correction)

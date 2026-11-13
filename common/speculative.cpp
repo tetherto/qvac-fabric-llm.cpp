@@ -981,6 +981,39 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// softmax of a lattice row's transition scores at its argmax, i.e. 1 / sum(exp(s_k - s_max))
+static float lattice_argmax_prob(const float * scores, int32_t n, int32_t i_max) {
+    float sum = 0.0f;
+    for (int32_t k = 0; k < n; ++k) {
+        sum += std::exp(scores[k] - scores[i_max]);
+    }
+    return 1.0f / sum;
+}
+
+// expected accepted drafts among the first n transitions of a lattice path
+static float lattice_expected_accepted(const float * path_p, size_t n) {
+    float p_all = 1.0f;
+    float sum   = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        p_all *= path_p[i];
+        sum   += p_all;
+    }
+    return sum;
+}
+
+size_t common_speculative_lattice_keep(const float * path_p, size_t n, int32_t n_short, float long_cost) {
+    if (n_short <= 0 || n <= (size_t) n_short) {
+        return n;
+    }
+    // every step also yields the target's own next token
+    const float tokens_long  = 1.0f + lattice_expected_accepted(path_p, n);
+    const float tokens_short = 1.0f + lattice_expected_accepted(path_p, (size_t) n_short);
+    return tokens_long >= long_cost * tokens_short ? n : (size_t) n_short;
+}
+
+static constexpr const char * LATTICE_N_SHORT_ERROR =
+        "--spec-draft-n-short needs --spec-type draft-dflash with a lattice draft (DFlash2, DSpine or LiliCorr)";
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1089,8 +1122,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        if (this->params.n_short > 0 && !is_dflash2 && !is_lilicorr) {
+            throw std::runtime_error(LATTICE_N_SHORT_ERROR);
+        }
+
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
-        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_short=%d, long_cost=%.2f\n", __func__, this->params.n_max,
+                this->params.n_min, this->params.p_min, this->params.n_short, this->params.long_cost);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
 
@@ -1388,25 +1426,35 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                const int32_t n_rows = is_dflash2 ? n_block_tokens : params.n_max + 1;
+                const bool    read_p = params.p_min > 0.0f || params.n_short > 0;
+                const bool    keep_p = params.n_short > 0;
+
                 int32_t predecessor = 0;
-                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
+                std::vector<float> path_p;
+                if (keep_p) {
+                    path_p.reserve(n_rows);
+                }
+                for (int32_t i = 1; i < n_rows; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
                     const float * scores = row + top_k + (size_t) predecessor * top_k;
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
-                    if (params.p_min > 0.0f) {
-                        // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
-                        float sum = 0.0f;
-                        for (int32_t k = 0; k < top_k; ++k) {
-                            sum += std::exp(scores[k] - scores[predecessor]);
-                        }
-                        if (1.0f / sum < params.p_min) {
+                    if (read_p) {
+                        const float p = lattice_argmax_prob(scores, top_k, predecessor);
+                        if (p < params.p_min) {
                             break;
+                        }
+                        if (keep_p) {
+                            path_p.push_back(p);
                         }
                     }
                     result.push_back((llama_token) row[predecessor]);
+                }
+                if (keep_p) {
+                    result.resize(common_speculative_lattice_keep(path_p.data(), result.size(), params.n_short, params.long_cost));
                 }
 
                 if (result.size() < (size_t) params.n_min) {
@@ -3065,6 +3113,13 @@ static void common_speculative_apply_draft_vocab(const common_params_speculative
     LOG_INF("%s: draft vocabulary: %zu token id ranges\n", __func__, ranges.size()/2);
 }
 
+// only the DFlash implementation can walk a lattice; its constructor checks that the draft has one
+static bool common_speculative_has_dflash_config(const std::vector<common_speculative_config> & configs) {
+    return std::any_of(configs.begin(), configs.end(), [](const common_speculative_config & config) {
+        return config.type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || config.type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+    });
+}
+
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
@@ -3097,6 +3152,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
+    }
+
+    if (params.draft.n_short > 0 && !configs.empty() && !common_speculative_has_dflash_config(configs)) {
+        throw std::runtime_error(LATTICE_N_SHORT_ERROR);
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};

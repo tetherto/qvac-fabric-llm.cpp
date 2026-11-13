@@ -920,6 +920,8 @@ typedef struct {
     uint64_t nb00;
     uint64_t nb01;
     uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb3;
     int32_t  ngrp;
     float    eps;
 } ggml_metal_kargs_group_norm;
