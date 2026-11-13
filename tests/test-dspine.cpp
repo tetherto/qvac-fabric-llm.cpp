@@ -888,16 +888,24 @@ static bool run_keep_case(const keep_case & c) {
     return kept == c.expected;
 }
 
-// at p = 0.5 the short and full drafts expect 1 - 2^-7 and 1 - 2^-15 accepted tokens: break-even at a cost of ~1.0039
+static constexpr float COST_EPS = 1e-3f;
+
+// tokens of a step whose n drafts each pass with probability 1/2: the target's token plus 2^-1 + ... + 2^-n
+static float tokens_at_half(size_t n) {
+    return 2.0f - std::ldexp(1.0f, -(int) n);
+}
+
+// at p = 1/2 the full path pays for any cost up to tokens_at_half(LATTICE_DRAFTS) / tokens_at_half(KEEP_SHORT), ~1.0039
 static int run_keep_cases() {
-    static const keep_case cases[] = {
-        { "rule off",                        0.99f, 0.1f,  LATTICE_DRAFTS, 0,          1.4f,   LATTICE_DRAFTS },
-        { "path no longer than n_short",     0.99f, 0.99f, 5,              KEEP_SHORT, 1.4f,   5              },
-        { "confident path pays its cost",    0.99f, 0.99f, LATTICE_DRAFTS, KEEP_SHORT, 1.4f,   LATTICE_DRAFTS },
-        { "fading path does not pay",        0.99f, 0.1f,  LATTICE_DRAFTS, KEEP_SHORT, 1.4f,   KEEP_SHORT     },
-        { "no extra cost keeps every draft", 0.99f, 0.1f,  LATTICE_DRAFTS, KEEP_SHORT, 1.0f,   LATTICE_DRAFTS },
-        { "cost just above break-even",      0.5f,  0.5f,  LATTICE_DRAFTS, KEEP_SHORT, 1.005f, KEEP_SHORT     },
-        { "cost just below break-even",      0.5f,  0.5f,  LATTICE_DRAFTS, KEEP_SHORT, 1.003f, LATTICE_DRAFTS },
+    const float break_even = tokens_at_half(LATTICE_DRAFTS) / tokens_at_half(KEEP_SHORT);
+    const keep_case cases[] = {
+        { "rule off",                        0.99f, 0.1f,  LATTICE_DRAFTS, 0,          1.4f,                  LATTICE_DRAFTS },
+        { "path no longer than n_short",     0.99f, 0.99f, 5,              KEEP_SHORT, 1.4f,                  5              },
+        { "confident path pays its cost",    0.99f, 0.99f, LATTICE_DRAFTS, KEEP_SHORT, 1.4f,                  LATTICE_DRAFTS },
+        { "fading path does not pay",        0.99f, 0.1f,  LATTICE_DRAFTS, KEEP_SHORT, 1.4f,                  KEEP_SHORT     },
+        { "no extra cost keeps every draft", 0.99f, 0.1f,  LATTICE_DRAFTS, KEEP_SHORT, 1.0f,                  LATTICE_DRAFTS },
+        { "cost just above break-even",      0.5f,  0.5f,  LATTICE_DRAFTS, KEEP_SHORT, break_even + COST_EPS, KEEP_SHORT     },
+        { "cost just below break-even",      0.5f,  0.5f,  LATTICE_DRAFTS, KEEP_SHORT, break_even - COST_EPS, LATTICE_DRAFTS },
     };
     int failures = 0;
     for (const auto & c : cases) {
