@@ -1413,6 +1413,9 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
         idx->ivf_lists = std::move(lists);
         idx->ivf_n_lists = actual_lists;
         idx->ivf_generation = idx->generation;
+        // False leaves the rows and the IVF as built: either this index does
+        // not reorder, or there was no memory for the reordered copy.
+        turbovec_group_rows_by_ivf(*idx);
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;

@@ -4164,6 +4164,10 @@ void check_turbovec_mutation_cache_regression(int bits) {
         8,
         n_lists,
         replacement_id);
+    // The IVF build moved the rows into list order, so the blocks changed.
+    const uint64_t grouped_blocked_hash = turbovec_blocked_hash_for_test(tv);
+    CHECK(grouped_blocked_hash != 0);
+    CHECK(grouped_blocked_hash != final_blocked_hash);
 
     CHECK(ggml_vec_index_write(tv, final_path.c_str()) == GGML_VEC_INDEX_OK);
     const std::vector<uint8_t> final_bytes = read_file_bytes(final_path);
@@ -4172,7 +4176,7 @@ void check_turbovec_mutation_cache_regression(int bits) {
 
     auto * loaded = ggml_vec_index_load(final_path.c_str());
     CHECK(loaded != nullptr);
-    CHECK(turbovec_blocked_hash_for_test(loaded) == final_blocked_hash);
+    CHECK(turbovec_blocked_hash_for_test(loaded) == grouped_blocked_hash);
     CHECK(turbovec_rotation_hash_for_test(dim) == rotation_hash);
     check_search_contains(
         loaded,
@@ -7324,6 +7328,273 @@ void check_turbovec_1x_vnni_fused_batch() {
     turbovec_force_x86_rules_for_test(0);
 }
 
+// Building an IVF on a TurboVec index moves the rows so one list is stored
+// together. The moved index must answer exactly like a fresh index that got
+// the same rows in the new order: same ids, same score bits, with staged
+// search on (planes caches rebuilt) and off. A bound file must be rewritten,
+// since it holds the rows in the old order.
+void check_turbovec_ivf_groups_rows(int bits, int staged) {
+    constexpr int dim = 64;
+    // 2000 rows over 16 lists is about 125 rows a list, so each list spans
+    // several 32-row blocks and the move has something to group.
+    constexpr int n = 2000;
+    constexpr int nq = 5;
+    constexpr int k = 10;
+    constexpr int n_lists = 16;
+    constexpr int n_iter = 2;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, nq, dim);
+    // Planes from the first vector.
+    turbovec_force_planes_for_test(1, 1);
+    turbovec_force_vector_major_for_test(1);
+
+    auto ids_of = [](ggml_vec_index_t * idx) {
+        size_t count = 0;
+        CHECK(ggml_vec_index_ids(idx, nullptr, 0, &count) == GGML_VEC_INDEX_OK);
+        std::vector<uint64_t> out(count);
+        CHECK(ggml_vec_index_ids(idx, out.data(), out.size(), &count) == GGML_VEC_INDEX_OK);
+        return out;
+    };
+    // A fresh index holding the given ids in the given order, no IVF.
+    auto fresh_in_order = [&](const std::vector<uint64_t> & order) {
+        std::unordered_map<uint64_t, size_t> row_of;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            row_of.emplace(ids[i], i);
+        }
+        std::vector<float> ordered(order.size() * dim);
+        for (size_t i = 0; i < order.size(); ++i) {
+            std::copy_n(rows.data() + row_of.at(order[i]) * dim, dim, ordered.data() + i * dim);
+        }
+        auto * fresh = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(fresh != nullptr);
+        CHECK(ggml_vec_index_turbovec_set_staged(fresh, staged) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_add(fresh, ordered.data(), static_cast<int>(order.size()), order.data()) ==
+              GGML_VEC_INDEX_OK);
+        return fresh;
+    };
+    auto same_search = [&](ggml_vec_index_t * a, ggml_vec_index_t * b) {
+        std::vector<float> a_scores(static_cast<size_t>(nq) * k);
+        std::vector<float> b_scores(a_scores.size());
+        std::vector<uint64_t> a_ids(a_scores.size());
+        std::vector<uint64_t> b_ids(a_scores.size());
+        CHECK(ggml_vec_index_search(a, queries.data(), nq, k, a_scores.data(), a_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(b, queries.data(), nq, k, b_scores.data(), b_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(a_ids == b_ids);
+        CHECK(std::memcmp(a_scores.data(), b_scores.data(), a_scores.size() * sizeof(float)) == 0);
+    };
+    // Probing every list must give the full scan's answer.
+    auto full_probe_matches = [&](ggml_vec_index_t * idx, ggml_vec_index_t * reference) {
+        std::vector<float> ivf_scores(static_cast<size_t>(nq) * k);
+        std::vector<float> ref_scores(ivf_scores.size());
+        std::vector<uint64_t> ivf_ids(ivf_scores.size());
+        std::vector<uint64_t> ref_ids(ivf_scores.size());
+        CHECK(ggml_vec_index_search_ivf(idx, queries.data(), nq, k, n_lists, ivf_scores.data(), ivf_ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(reference, queries.data(), nq, k, ref_scores.data(), ref_ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(ivf_ids == ref_ids);
+        CHECK(std::memcmp(ivf_scores.data(), ref_scores.data(), ivf_scores.size() * sizeof(float)) == 0);
+    };
+
+    temp_file snapshot(".tv");
+    const std::string path = snapshot.path.string();
+    auto * built = ggml_vec_index_create_turbovec(dim, bits);
+    CHECK(built != nullptr);
+    CHECK(ggml_vec_index_turbovec_set_staged(built, staged) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_add(built, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+    // Binds the index to the file with the rows in add order.
+    CHECK(ggml_vec_index_sync(built, path.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ids_of(built) == ids);
+    {
+        // A search before the build, so the staged-search caches exist and
+        // the build has to refresh them.
+        auto * in_add_order = fresh_in_order(ids);
+        same_search(built, in_add_order);
+        ggml_vec_index_free(in_add_order);
+    }
+    // A filter prepared for the old slots is refused after the move.
+    ggml_vec_index_filter_t * filter = ggml_vec_index_filter_create(built, ids.data(), k);
+    CHECK(filter != nullptr);
+
+    CHECK(ggml_vec_index_build_ivf(built, n_lists, n_iter) == GGML_VEC_INDEX_OK);
+    {
+        std::vector<float> scores(static_cast<size_t>(nq) * k);
+        std::vector<uint64_t> out(scores.size());
+        CHECK(ggml_vec_index_search_prepared_filtered(built, filter, queries.data(), nq, k, scores.data(), out.data()) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        ggml_vec_index_filter_free(filter);
+    }
+    const std::vector<uint64_t> grouped = ids_of(built);
+    CHECK(grouped != ids);
+    CHECK(std::is_permutation(grouped.begin(), grouped.end(), ids.begin(), ids.end()));
+    for (const uint64_t id : ids) {
+        CHECK(ggml_vec_index_contains(built, id) == 1);
+    }
+    auto * fresh = fresh_in_order(grouped);
+    same_search(built, fresh);
+    if (staged == 0) {
+        full_probe_matches(built, fresh);
+    }
+
+    // The next sync rewrites the file in the new order, and a load reads it back.
+    CHECK(ggml_vec_index_sync(built, path.c_str()) == GGML_VEC_INDEX_OK);
+    auto * loaded = ggml_vec_index_load(path.c_str());
+    CHECK(loaded != nullptr);
+    CHECK(ggml_vec_index_turbovec_set_staged(loaded, staged) == GGML_VEC_INDEX_OK);
+    CHECK(ids_of(loaded) == grouped);
+    same_search(loaded, fresh);
+    ggml_vec_index_free(loaded);
+    ggml_vec_index_free(fresh);
+
+    // A remove drops the IVF; the rebuild groups the rows again.
+    CHECK(ggml_vec_index_remove(built, ids[0]) == GGML_VEC_INDEX_OK);
+    std::vector<float> scores(static_cast<size_t>(nq) * k);
+    std::vector<uint64_t> out(scores.size());
+    CHECK(ggml_vec_index_search_ivf(built, queries.data(), nq, k, n_lists, scores.data(), out.data()) ==
+          GGML_VEC_INDEX_E_INVALID_ARG);
+    CHECK(ggml_vec_index_build_ivf(built, n_lists, n_iter) == GGML_VEC_INDEX_OK);
+    const std::vector<uint64_t> regrouped = ids_of(built);
+    CHECK(regrouped.size() == ids.size() - 1);
+    fresh = fresh_in_order(regrouped);
+    same_search(built, fresh);
+    if (staged == 0) {
+        full_probe_matches(built, fresh);
+    }
+    ggml_vec_index_free(fresh);
+
+    ggml_vec_index_free(built);
+    turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_vector_major_for_test(-1);
+}
+
+static std::vector<uint64_t> turbovec_ids_in_order(ggml_vec_index_t * idx) {
+    size_t count = 0;
+    CHECK(ggml_vec_index_ids(idx, nullptr, 0, &count) == GGML_VEC_INDEX_OK);
+    std::vector<uint64_t> out(count);
+    CHECK(ggml_vec_index_ids(idx, out.data(), out.size(), &count) == GGML_VEC_INDEX_OK);
+    return out;
+}
+
+// The move keeps every code, so a promoted index that shrank below the
+// promotion size keeps its staged search through an IVF build.
+void check_turbovec_ivf_keeps_staged() {
+    constexpr int dim = 64;
+    // Forced promotion size, small so the test stays quick.
+    constexpr size_t promote_at = 96;
+    constexpr int n = static_cast<int>(promote_at) * 2;
+    constexpr int n_kept = static_cast<int>(promote_at) - 1;
+    constexpr int n_lists = 4;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    turbovec_force_vector_major_for_test(0);
+    turbovec_force_planes_for_test(1, promote_at);
+    auto promoted = [](ggml_vec_index_t * idx) {
+        bool planes = false;
+        bool packed = false;
+        size_t sign = 0;
+        turbovec_staged_caches_for_test(idx, &planes, &packed, &sign);
+        return planes;
+    };
+    for (const int bits : { 2, 4 }) {
+        auto * idx = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(idx != nullptr);
+        CHECK(ggml_vec_index_add(idx, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(promoted(idx));
+        for (int i = n_kept; i < n; ++i) {
+            CHECK(ggml_vec_index_remove(idx, ids[static_cast<size_t>(i)]) == GGML_VEC_INDEX_OK);
+        }
+        CHECK(ggml_vec_index_len(idx) == n_kept);
+        CHECK(promoted(idx));
+        const std::vector<uint64_t> before = turbovec_ids_in_order(idx);
+        CHECK(ggml_vec_index_build_ivf(idx, n_lists, 2) == GGML_VEC_INDEX_OK);
+        CHECK(turbovec_ids_in_order(idx) != before);
+        CHECK(promoted(idx));
+        ggml_vec_index_free(idx);
+    }
+    turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_vector_major_for_test(-1);
+}
+
+// Without memory for the moved copy the build keeps the rows where they are
+// and still returns a working IVF; a failure before the IVF exists leaves
+// the index as it was.
+void check_turbovec_ivf_group_alloc_failure() {
+    constexpr int dim = 64;
+    // Not a multiple of the 32-row block, so the moved copy has a part-full
+    // tail block; small because the loop rebuilds the index once per
+    // allocation.
+    constexpr int n = 140;
+    constexpr int nq = 3;
+    constexpr int k = 10;
+    constexpr int n_lists = 4;
+    // Upper bound on the allocations one build makes, so the loop ends even
+    // if the countdown never fires.
+    constexpr long max_countdown = 20000;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, nq, dim);
+    turbovec_force_vector_major_for_test(0);
+    auto bytes_of = [](ggml_vec_index_t * idx) {
+        uint8_t * data = nullptr;
+        size_t size = 0;
+        CHECK(ggml_vec_index_to_bytes(idx, &data, &size) == GGML_VEC_INDEX_OK);
+        std::vector<uint8_t> out(data, data + size);
+        ggml_vec_index_bytes_free(data);
+        return out;
+    };
+    // Probing every list must give the full scan's answer.
+    auto full_probe_matches = [&](ggml_vec_index_t * idx) {
+        std::vector<float> ivf_scores(static_cast<size_t>(nq) * k);
+        std::vector<float> ref_scores(ivf_scores.size());
+        std::vector<uint64_t> ivf_ids(ivf_scores.size());
+        std::vector<uint64_t> ref_ids(ivf_scores.size());
+        CHECK(ggml_vec_index_search_ivf(idx, queries.data(), nq, k, n_lists, ivf_scores.data(), ivf_ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(idx, queries.data(), nq, k, ref_scores.data(), ref_ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(ivf_ids == ref_ids);
+        CHECK(std::memcmp(ivf_scores.data(), ref_scores.data(), ivf_scores.size() * sizeof(float)) == 0);
+    };
+    for (const int bits : { 2, 4 }) {
+        auto * seed = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(ggml_vec_index_add(seed, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+        const std::vector<uint8_t> before = bytes_of(seed);
+        ggml_vec_index_free(seed);
+        int kept = 0;
+        int moved = 0;
+        int failures = 0;
+        for (long countdown = 1; countdown < max_countdown; ++countdown) {
+            ggml_vec_index_t * idx = nullptr;
+            CHECK(ggml_vec_index_from_bytes(before.data(), before.size(), &idx) == GGML_VEC_INDEX_OK);
+            g_alloc_fail_countdown.store(countdown);
+            const int rc = ggml_vec_index_build_ivf(idx, n_lists, 2);
+            const bool injected = g_alloc_fail_countdown.exchange(0) <= 0;
+            if (rc == GGML_VEC_INDEX_OK) {
+                if (turbovec_ids_in_order(idx) == ids) {
+                    ++kept;
+                    CHECK(bytes_of(idx) == before);
+                } else {
+                    ++moved;
+                }
+                full_probe_matches(idx);
+            } else {
+                CHECK(rc == GGML_VEC_INDEX_E_OOM);
+                ++failures;
+                CHECK(bytes_of(idx) == before);
+            }
+            ggml_vec_index_free(idx);
+            if (!injected) {
+                break;
+            }
+        }
+        CHECK(kept > 0);
+        CHECK(moved > 0);
+        CHECK(failures > 0);
+    }
+    turbovec_force_vector_major_for_test(-1);
+}
+
 // Every search returns the same ids and score bits at any thread count:
 // lone queries (which split their blocks), batches (split across queries),
 // wide and narrow filters, staged and full scans, and k large enough for
@@ -8427,6 +8698,13 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_low_planes_tiny();
             check_turbovec_1x_thread_invariance(0);
             check_turbovec_1x_thread_invariance(1);
+            for (const int bits : { 2, 4 }) {
+                for (const int staged : { 0, 1 }) {
+                    check_turbovec_ivf_groups_rows(bits, staged);
+                }
+            }
+            check_turbovec_ivf_keeps_staged();
+            check_turbovec_ivf_group_alloc_failure();
             check_turbovec_1x_vnni_fused_scan();
             check_turbovec_1x_vnni_fused_batch();
             check_vector_index_pool();
