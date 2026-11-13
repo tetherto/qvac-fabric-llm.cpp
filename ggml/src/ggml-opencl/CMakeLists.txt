@@ -239,6 +239,7 @@ set(GGML_OPENCL_KERNELS
     affine_prelu
     snake
     leaky_relu
+    sin
     tsembd
     upscale
     tanh
