@@ -10,6 +10,7 @@ extern "C" {
 struct llama_coreml_ffn_params {
     // Writable application cache directory; templates are embedded in the library.
     const char * cache_dir;
+    // Qwen3.5-0.8B requires 1024 Metal channels and one Core ML package.
     int32_t metal_channels;
     int32_t n_packages;
     int32_t min_tokens;
@@ -18,7 +19,7 @@ struct llama_coreml_ffn_params {
 LLAMA_API struct llama_coreml_ffn_params llama_coreml_ffn_default_params(void);
 LLAMA_API bool llama_supports_coreml_ffn(void);
 
-// Optional Qwen3.8-27B FFN acceleration, built with LLAMA_COREML=ON (or LLAMA_COREML_FFN=ON).
+// Optional Qwen3.5-0.8B and Qwen3.8-27B prefill FFN acceleration, built with LLAMA_COREML=ON (or LLAMA_COREML_FFN=ON).
 // Requires a model loaded from an unchanged single-file GGUF on disk.
 // Call after context creation, before inference. NULL params disables it.
 // Configuration is context-owned; failure preserves the previous configuration.

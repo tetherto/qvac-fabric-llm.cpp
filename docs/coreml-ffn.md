@@ -1,6 +1,6 @@
-# Qwen3.8-27B Core ML prefill sidecar
+# Qwen Core ML prefill sidecar
 
-Opt-in Core ML sidecar for Qwen3.8-27B prefill on Apple Silicon: part of each prefill FFN runs on the Neural Engines while Metal runs the rest.
+Opt-in Core ML sidecar for Qwen3.5-0.8B and Qwen3.8-27B prefill on Apple Silicon: part of each prefill FFN runs through Core ML while Metal runs the rest. The runtime requests CPU and Neural Engine compute units; Core ML selects operation placement.
 
 ## Command line
 
@@ -12,7 +12,13 @@ cmake --build build --target llama-server -j 8
 build/bin/llama-server -m Qwen3.8-27B-Q4_0.gguf --coreml-ffn
 ```
 
-The first start compiles 4.5-9 GB of Core ML programs into `--coreml-ffn-cache` (default `~/Library/Caches/llama.cpp/coreml-ffn`, or `$LLAMA_CACHE/coreml-ffn`) in about 1-2 minutes; later starts load them in about 3 s. Only prompt batches of 256 or more tokens use the Neural Engine; decode stays on Metal. Other models, other builds and unsupported contexts log a warning and run on Metal. The default split is `8192x2` on chips with two Neural Engines (Ultra) and `11264x1` otherwise; `--coreml-ffn-split` overrides it.
+The first Qwen3.8-27B start compiles 4.5-9 GB of Core ML programs into `--coreml-ffn-cache` (default `~/Library/Caches/llama.cpp/coreml-ffn`, or `$LLAMA_CACHE/coreml-ffn`) in about 1-2 minutes; later starts load them in about 3 s. Only prompt batches of 256 or more tokens use the sidecar; decode stays on Metal. Other models, other builds and unsupported contexts log a warning and run on Metal. The default split is `8192x2` on chips with two Neural Engines (Ultra) and `11264x1` otherwise; `--coreml-ffn-split` overrides it.
+
+Qwen3.5-0.8B requires an explicit `1024x1` split: 1024 intermediate FFN channels stay on Metal and the remaining 2560 run through one Core ML program per layer. The default splits above remain specific to Qwen3.8-27B.
+
+```sh
+build/bin/llama-server -m Qwen3.5-0.8B-Q4_K_M.gguf --coreml-ffn --coreml-ffn-split 1024x1
+```
 
 On an M3 Ultra with `Qwen3.8-27B-Q4_0`, `llama-server` prefill of a 4372-token prompt went from 341.7 tok/s on Metal to 470.5 tok/s with the default split. The KL divergence from Metal's logits was 1e-5 to 7e-5.
 
@@ -20,7 +26,7 @@ On an M3 Ultra with `Qwen3.8-27B-Q4_0`, `llama-server` prefill of a 4372-token p
 
 Build `libllama` with `-DLLAMA_COREML=ON` to use the in-graph FFN sidecar from a native application or addon. That option also builds the EmbeddingGemma sidecar; `-DLLAMA_COREML_FFN=ON` alone builds only the FFN sidecar, and `-DLLAMA_COREML_FFN=OFF` keeps only the embedding one. It works with examples, tools and common utilities disabled. Each context must own its scheduler. The installed header is `llama-coreml-ffn.h`; the ordinary build keeps the API and reports the feature unavailable.
 
-The runtime, exporter and templates live in `src/`, and CMake embeds both templates in the Apple library. Applications provide a writable cache directory, with no Python exporter, template directory or FFN environment variables. `src/llama-coreml-ffn-templates/make_template.py` regenerates the templates with coremltools when the program changes. The disk model source is recorded by `llama_model_load_from_file`; buffer-backed and split-file models are rejected. The source GGUF must remain unchanged and available while configuring the sidecar.
+The runtime, exporter and templates live in `src/`, and CMake embeds the templates in the Apple library. Applications provide a writable cache directory, with no Python exporter, template directory or FFN environment variables. `src/llama-coreml-ffn-templates/make_template.py` regenerates the templates with coremltools when the program changes. The disk model source is recorded by `llama_model_load_from_file`; buffer-backed and split-file models are rejected. The source GGUF must remain unchanged and available while configuring the sidecar.
 
 ```cpp
 #include "llama-coreml-ffn.h"
@@ -37,7 +43,17 @@ if (!llama_set_coreml_ffn(ctx, &params, error, sizeof(error))) {
 llama_set_coreml_ffn(ctx, nullptr, error, sizeof(error));
 ```
 
-The initial implementation supports the 64-layer, 5120-hidden, 17408-FFN Qwen3.8-27B shape with all FFN weights on `MTL0`, no external weight scales, Hadamard transforms or per-weight precision overrides. `llama_coreml_ffn_default_params` picks 8192 Metal channels and two 4608-channel Core ML programs on chips with more than 16 Neural Engine cores, and 11264 Metal channels and one 6144-channel program otherwise, with a minimum of 256 rows. Each package must use one of these two widths. Single-token decode and smaller batches keep the normal FFN. LoRA adapters, training and eval callbacks also keep the normal FFN; configuration rejects training and eval callbacks. This is a model-specific sidecar, not a general ggml Core ML backend.
+For a Qwen3.5-0.8B context, set `params.metal_channels = 1024` and `params.n_packages = 1` before calling `llama_set_coreml_ffn`. Its supported shape is 24 layers, 1024 hidden dimensions and 3584 intermediate FFN channels. The fixed Core ML program takes 512 rows and stores INT8 weights with FP16 computation. Applications must retain the GGUF weights because decode and ineligible batches use Metal. Apple frameworks built with `build-xcframework.sh` expose the configuration API through `llama-coreml-ffn.h`.
+
+Qwen3.8-27B supports the 64-layer, 5120-hidden, 17408-FFN shape. `llama_coreml_ffn_default_params` picks 8192 Metal channels and two 4608-channel Core ML programs on chips with more than 16 Neural Engine cores, and 11264 Metal channels and one 6144-channel program otherwise, with a minimum of 256 rows. Each package must use one of these two widths. Both model paths require all FFN weights on `MTL0`, with no external weight scales, Hadamard transforms or per-weight precision overrides. Single-token decode and smaller batches keep the normal FFN. LoRA adapters, training and eval callbacks also keep the normal FFN; configuration rejects training and eval callbacks. This is a model-specific sidecar, not a general ggml Core ML backend.
+
+To regenerate the weight-free 0.8B template, use coremltools 9.0 and NumPy 1.26.4 in a separate Python environment. The output directory must not exist:
+
+```sh
+python src/llama-coreml-ffn-templates/make_template.py /tmp/int8-h1024-c2560 --hidden 1024 --channels 2560 --chunk 2048
+```
+
+Copy its `Manifest.json`, `model.mlmodel` and `layout.txt` into `src/llama-coreml-ffn-templates/int8-h1024-c2560/`. The runtime supplies weights from the GGUF and compiles each layer on first use; later loads reuse the compiled cache.
 
 Each context owns its models, serial worker, events and pending calls. Two contexts may be used independently; calls on one context must follow the existing caller-side synchronization contract. Configuration waits for outstanding graph work, invalidates graphs containing old runtime pointers, and replaces the old sidecar only after successful setup. Cache entries are shared on disk, and concurrent compilation uses separate staging paths. Compiled weights are keyed by the source path, size and modification time, the template program and layout, and the channel range. Do not modify the GGUF while configuring it.
 
