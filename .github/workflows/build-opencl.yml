@@ -165,7 +165,8 @@ jobs:
           # that requires the manual Firebase Test Lab device run. This job is a
           # regression net for kernel math / indexing / dtype correctness that a
           # compile-only job cannot catch. The speech ops (GRU, ZERO_UPSAMPLE,
-          # CHANNEL_SHUFFLE, AFFINE_PRELU, SNAKE) are portable OpenCL C as well.
+          # CHANNEL_SHUFFLE, AFFINE_PRELU, SNAKE) and the stable-diffusion group
+          # norms (GROUP_NORM, GROUP_NORM_MUL_ADD) are portable OpenCL C as well.
           # The backend only admits Adreno and Intel GPUs by name; a CPU device
           # is let in by the env var below, which exists for test hosts.
           # test-backend-ops counts a backend it never ran as passed, so the
@@ -173,7 +174,7 @@ jobs:
           # visibly when none did instead of going green in silence.
           clinfo -l || true
           export GGML_OPENCL_ALLOW_GENERIC_DEVICE=1
-          ./build/bin/test-backend-ops test -o CONV_2D,CONV_2D_DW,POOL_2D,HARDSWISH,HARDSIGMOID,GRU,ZERO_UPSAMPLE,CHANNEL_SHUFFLE,AFFINE_PRELU,SNAKE | tee tbo.log
+          ./build/bin/test-backend-ops test -o CONV_2D,CONV_2D_DW,POOL_2D,HARDSWISH,HARDSIGMOID,GRU,ZERO_UPSAMPLE,CHANNEL_SHUFFLE,AFFINE_PRELU,SNAKE,GROUP_NORM,GROUP_NORM_MUL_ADD | tee tbo.log
           if grep -q "Backend OpenCL:" tbo.log; then
             grep -q "Backend OpenCL: .*OK" tbo.log
           else

@@ -9328,6 +9328,10 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         if (!ggml_is_contiguous(gn->src[0]) || !ggml_is_contiguous(w) || !ggml_is_contiguous(b)) {
             return false;
         }
+
+        if (gn->src[0]->ne[3] != 1 || !ggml_are_same_shape(w, gn) || !ggml_are_same_shape(b, gn)) {
+            return false;
+        }
     }
 
     return true;
@@ -10710,14 +10714,24 @@ struct ggml_backend_opencl_buffer_context {
     }
 
     ~ggml_backend_opencl_buffer_context() {
-        for (cl_mem buf : buffer) {
-            CL_CHECK(clReleaseMemObject(buf));
-        }
+        release_images();
+        delete_tensor_extras();
+        release_parent_buffers();
+    }
+
+    void release_images() {
         for (cl_mem im : img) {
             CL_CHECK(clReleaseMemObject(im));
         }
+    }
 
-        // Delete all extras to trigger their destructors
+    void release_parent_buffers() {
+        for (cl_mem buf : buffer) {
+            CL_CHECK(clReleaseMemObject(buf));
+        }
+    }
+
+    void delete_tensor_extras() {
         for (ggml_tensor_extra_cl * e : temp_tensor_extras) {
             delete e;
         }
@@ -11248,12 +11262,31 @@ static void ggml_cl_set_pq2_0_layout_args(cl_kernel kernel, const ggml_tensor * 
     CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_int), &nb_row));
 }
 
+static bool ggml_opencl_upload_converts_on_device(const ggml_tensor * tensor) {
+#ifdef GGML_OPENCL_SOA_Q
+    if (ggml_is_quantized(tensor->type)) {
+        return true;
+    }
+#endif
+    return tensor->type == GGML_TYPE_BF16;
+}
+
+static std::unique_lock<std::mutex> ggml_opencl_lock_converting_upload(const ggml_tensor * tensor) {
+    static std::mutex converting_upload_mutex;
+    if (!ggml_opencl_upload_converts_on_device(tensor)) {
+        return {};
+    }
+    return std::unique_lock<std::mutex>(converting_upload_mutex);
+}
+
 static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
     ggml_backend_opencl_context * backend_ctx = dev_ctx->backend_ctx;
 
     cl_context context = backend_ctx->context;
     cl_command_queue queue = backend_ctx->queue;
+
+    const std::unique_lock<std::mutex> converting_upload_lock = ggml_opencl_lock_converting_upload(tensor);
 
 #ifdef GGML_OPENCL_SOA_Q
     if (tensor->type == GGML_TYPE_Q1_0 || tensor->type == GGML_TYPE_PQ2_0) {
@@ -16774,6 +16807,18 @@ static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
 }
 
+static size_t ggml_cl_group_norm_subgroup_size(const ggml_backend_opencl_context * backend_ctx) {
+    constexpr size_t adreno_subgroup_size = 64;
+    constexpr size_t intel_subgroup_size  = 32;
+    if (backend_ctx->gpu_family == ADRENO) {
+        return adreno_subgroup_size;
+    }
+    if (backend_ctx->gpu_family == INTEL) {
+        return intel_subgroup_size;
+    }
+    GGML_ABORT("Unsupported GPU");
+}
+
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor) {
     GGML_ASSERT(gn_tensor && mul_tensor && add_tensor);
 
@@ -16800,11 +16845,10 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
     memcpy(&eps, (char *)gn_tensor->op_params + sizeof(int), sizeof(float));
 
     cl_kernel kernel = backend_ctx->kernel_group_norm_mul_add;
-    int max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
     int ne = ggml_nelements(src0);
     int group_size = ne / groups;
 
-    size_t lws[] = { (size_t)MIN(max_workgroup_size, group_size) };
+    size_t lws[] = { ggml_cl_group_norm_subgroup_size(backend_ctx) };
     size_t gws[] = { (size_t)groups * lws[0] };
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra0->data_device));
@@ -16820,6 +16864,18 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
     CL_CHECK(clSetKernelArg(kernel, 10, sizeof(float), &eps));
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, dst);
+}
+
+static void ggml_cl_group_norm_enqueue_batch(ggml_backend_opencl_context * backend_ctx, cl_kernel kernel,
+        const ggml_tensor * src0, cl_ulong offset0, const ggml_tensor * dst, cl_ulong offsetd,
+        size_t * global_work_size, size_t * local_work_size) {
+    for (int64_t i3 = 0; i3 < src0->ne[3]; ++i3) {
+        const cl_ulong offset0_i3 = offset0 + i3*src0->nb[3];
+        const cl_ulong offsetd_i3 = offsetd + i3*dst->nb[3];
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0_i3));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd_i3));
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    }
 }
 
 static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -16849,19 +16905,10 @@ static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0,
 
     cl_kernel kernel = backend_ctx->kernel_group_norm;
 
-    size_t sgs = 64;
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    size_t sgs = ggml_cl_group_norm_subgroup_size(backend_ctx);
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
-    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
-    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
     CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &ne));
     CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &group_size));
     CL_CHECK(clSetKernelArg(kernel, 6, sizeof(float),    &eps));
@@ -16869,7 +16916,7 @@ static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0,
     size_t global_work_size[] = {(size_t)n_groups*sgs, 1, 1};
     size_t local_work_size[] = {(size_t)sgs, 1, 1};
 
-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    ggml_cl_group_norm_enqueue_batch(backend_ctx, kernel, src0, offset0, dst, offsetd, global_work_size, local_work_size);
 }
 
 static void ggml_cl_l2_norm(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -20674,7 +20721,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             const int n_q_chunk = std::min(chunk_rows, n_q - q_base);
             if (q_base > 0 || n_q_chunk != n_q) {
                 const cl_ulong offset_q_chunk    = offset_q + (cl_ulong)q_base * q_nb1;
-                const cl_ulong offset_o_chunk    = offset_o + (cl_ulong)q_base * o_nb1;
+                const cl_ulong offset_o_chunk    = offset_o + (cl_ulong)q_base * o_nb2;
                 const cl_ulong offset_mask_chunk = mask ? offset_mask + (cl_ulong)q_base * mask_nb1 : offset_mask;
                 CL_CHECK(clSetKernelArg(kernel, 1,  sizeof(cl_ulong), &offset_q_chunk));
                 CL_CHECK(clSetKernelArg(kernel, 7,  sizeof(cl_ulong), &offset_o_chunk));
