@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "common.h"
 
+#include <random>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -39,6 +41,15 @@ int32_t common_speculative_n_max(const common_speculative * spec);
 // pay for long_cost, the cost of any step past n_short drafts relative to one with n_short. path_p[i] is the probability
 // of the path's transition i
 size_t common_speculative_lattice_keep(const float * path_p, size_t n, int32_t n_short, float long_cost);
+
+// walk a DFlash2 or LiliCorr candidate lattice into result. Row i of rows (row_stride floats apart, row 0 unused) holds
+// top_k candidate token ids, then top_k transition scores per predecessor candidate; the walk starts from candidate 0.
+// A greedy walk takes each step's argmax. With rng and result_q, each step samples softmax(scores / temp_sample) and
+// appends its candidates and their probabilities to result_q. params.p_min stops the walk, params.n_short and
+// params.long_cost shorten a greedy draft (common_speculative_lattice_keep), and a draft below params.n_min is dropped.
+void common_speculative_lattice_walk(const float * rows, size_t row_stride, int32_t n_rows, int32_t top_k,
+        const common_params_speculative_draft & params, std::mt19937 * rng, float temp_sample, llama_tokens & result,
+        std::vector<std::vector<llama_token_data>> * result_q);
 
 // validate and resolve the unconditional synthetic acceptance rates
 std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max);
