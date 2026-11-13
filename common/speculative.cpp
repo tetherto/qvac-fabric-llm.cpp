@@ -1015,6 +1015,9 @@ size_t common_speculative_lattice_keep(const float * path_p, size_t n, int32_t n
     return tokens_long >= long_cost * tokens_short ? n : (size_t) n_short;
 }
 
+static constexpr const char * LATTICE_N_SHORT_ERROR =
+        "--spec-draft-n-short needs --spec-type draft-dflash with a lattice draft (DFlash2, DSpine or LiliCorr)";
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1103,6 +1106,11 @@ protected:
         }
 
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+
+        // only the DFlash2 (and DSpine, routed to it) and LiliCorr implementations walk a lattice
+        if (this->params.n_short > 0 && type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 && type != COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR) {
+            throw std::runtime_error(LATTICE_N_SHORT_ERROR);
+        }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_short=%d, long_cost=%.2f\n", __func__, this->params.n_max,
@@ -3543,6 +3551,14 @@ static void common_speculative_apply_draft_vocab(const common_params_speculative
     LOG_INF("%s: draft vocabulary: %zu token id ranges\n", __func__, ranges.size()/2);
 }
 
+// only the DFlash family can walk a lattice; the implementation's constructor checks that the draft has one
+static bool common_speculative_has_dflash_config(const std::vector<common_speculative_config> & configs) {
+    return std::any_of(configs.begin(), configs.end(), [](const common_speculative_config & config) {
+        return config.type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH  || config.type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+               config.type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 || config.type == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
+    });
+}
+
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
@@ -3585,6 +3601,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,   params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2,  params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR, params.draft.ctx_dft != nullptr);
+    }
+
+    if (params.draft.n_short > 0 && !configs.empty() && !common_speculative_has_dflash_config(configs)) {
+        throw std::runtime_error(LATTICE_N_SHORT_ERROR);
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};

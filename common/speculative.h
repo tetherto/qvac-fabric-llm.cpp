@@ -36,7 +36,8 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
 int32_t common_speculative_n_max(const common_speculative * spec);
 
 // how many of the n drafts of a lattice path to keep: n_short when the expected accepted tokens of all n drafts do not
-// pay for long_cost, the relative cost of a step with n drafts. path_p[i] is the probability of the path's transition i
+// pay for long_cost, the cost of any step past n_short drafts relative to one with n_short. path_p[i] is the probability
+// of the path's transition i
 size_t common_speculative_lattice_keep(const float * path_p, size_t n, int32_t n_short, float long_cost);
 
 // validate and resolve the unconditional synthetic acceptance rates

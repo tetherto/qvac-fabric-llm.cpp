@@ -803,6 +803,30 @@ static bool check_spec_ubatch() {
     return rejected_two && !rejected_one;
 }
 
+// --spec-draft-n-short needs a lattice drafter: the DSpine draft takes it, a config without one rejects it
+static bool check_spec_n_short() {
+    dspine_setup s;
+    if (!write_models(N_VOCAB, GGML_TYPE_F32, GGML_TYPE_F32) || !open_setup(s, true, true, BLOCK_SIZE)) {
+        return false;
+    }
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    params.draft.ctx_tgt = s.ctx_tgt;
+    params.draft.ctx_dft = s.ctx_dft;
+    params.draft.n_max   = BLOCK_SIZE - 1;
+    params.draft.n_short = BLOCK_SIZE - 2;
+    const bool rejected_dspine = spec_init_rejects(params, 1);
+
+    params.types = { COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE };
+    const bool rejected_ngram = spec_init_rejects(params, 1);
+    params.draft.n_short = 0;
+    const bool rejected_ngram_off = spec_init_rejects(params, 1);
+
+    printf("%s: DSpine rejected %d, ngram rejected %d, ngram without n_short rejected %d\n", __func__, rejected_dspine,
+           rejected_ngram, rejected_ngram_off);
+    return !rejected_dspine && rejected_ngram && !rejected_ngram_off;
+}
+
 struct load_case {
     draft_kind   kind;
     const char * name;
@@ -902,6 +926,7 @@ int main() {
     failures += expect(check_lattice(MAX_BLOCKS, PARTIAL_ROWS), "DSpine lattice of two blocks shorter than the block size does not match the reference");
     failures += expect(check_head_width_rejected(), "a target head wider than the DSpine codebook did not stop the draft context");
     failures += expect(check_spec_ubatch(), "the speculative setup did not check that the DSpine blocks fit one draft ubatch");
+    failures += expect(check_spec_n_short(), "the speculative setup did not check that --spec-draft-n-short has a lattice drafter");
     failures += expect(check_quantized_head(false) && check_quantized_head(true),
             "a quantized target head gave wrong scores, or a repacked one did not stop the draft context");
     failures += expect(check_quantized_draft(), "a repacked quantized DSpine bridge gave another lattice than the plain one");
