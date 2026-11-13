@@ -19305,7 +19305,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_ragged(16, 128, 3, {1, 70, 2, 1, 15}));
     test_cases.emplace_back(new test_gated_delta_net_ragged(16, 128, 3, {200, 1, 33, 300}));
     test_cases.emplace_back(new test_gated_delta_net_ragged(16, 128, 2, {64, 64}));
-    
+
     // the decode gates activated in the gdn (48 heads of 128 = Qwen3.5 27B)
     for (bool inplace : {false, true}) {
         for (int64_t ns : {1, 2}) {
