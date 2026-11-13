@@ -7337,6 +7337,11 @@ static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_full_f32_matmul_p
     return it == ctx->device->pipeline_matmul.end() || it->second.empty() ? nullptr : &it->second;
 }
 
+static bool ggml_vk_device_has_full_f32_matmul(const vk_device & device) {
+    auto it = device->pipeline_matmul.find(ggml_vk_full_f32_matmul_key());
+    return it != device->pipeline_matmul.end() && !it->second.empty();
+}
+
 static bool ggml_vk_mul_mat_requests_full_f32(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32;
 }
@@ -20497,7 +20502,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 }
-                if (ggml_prec_get_src(op, 1) == GGML_PREC_F32) {
+                // the full-F32 pipelines honor an F32 src1 precision on F32 x F32
+                if (ggml_prec_get_src(op, 1) == GGML_PREC_F32 &&
+                    !(op->op == GGML_OP_MUL_MAT && ggml_vk_mul_mat_requests_full_f32(op->src[0], op->src[1], op) &&
+                      ggml_vk_device_has_full_f32_matmul(device))) {
                     return false;
                 }
                 switch (src0_type) {
