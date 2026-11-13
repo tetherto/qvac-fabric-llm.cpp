@@ -3049,7 +3049,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
                     GGML_LOG_ERROR(
                         "%s: fused layer %d: the in-projection (%s, %s) "
                         "does not split into the core's inputs; "
-                        "GGML_XDNA_FUSED_LAYER=0 runs the layer per op\n",
+                        "GGML_XDNA_FUSED_LAYER=0 decodes without the fused layers\n",
                         "ggml-xdna", p.il, ggml_type_name(p.n_qkv->src[0]->type), ggml_type_name(p.n_z->src[0]->type));
                     return false;
                 }
