@@ -103,6 +103,15 @@ jobs:
   ubuntu-24-opencl:
     runs-on: ubuntu-24.04
 
+    env:
+      POCL_VERSION: '7.2'
+      POCL_SHA256: 7ddc01a7afcd49d4ec7fa9bf94df20852db44fcda629a9763086a8c541e5da1e
+      POCL_LLVM_VERSION: '19'
+      POCL_HOST_CPU: x86-64-v3
+      OPENCL_TEST_OPS: CONV_2D,CONV_2D_DW,POOL_2D,HARDSWISH,HARDSIGMOID,GRU,ZERO_UPSAMPLE,CHANNEL_SHUFFLE,AFFINE_PRELU,SNAKE,GROUP_NORM,GROUP_NORM_MUL_ADD
+      OPENCL_FA_CHUNK_PARAMS: 'kv=256,nb=4100,'
+      OPENCL_FA_CHUNK_CASES: '2'
+
     steps:
       - name: Clone
         id: checkout
@@ -118,15 +127,51 @@ jobs:
         id: depends
         run: |
           sudo apt-get update
-          # pocl-opencl-icd provides a CPU OpenCL device (intel-opencl-icd is
-          # Intel's GPU runtime and gives no device on a hosted runner); the
-          # rest is the ICD loader + CL headers. NOTE: the backend needs
-          # cl_khr_fp16, which POCL exposes only on CPUs with native f16, and
-          # Intel's CPU runtime lacks half-precision math, so on most hosted
-          # runners no device runs the kernels and this job is build coverage.
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake clinfo \
-            ocl-icd-opencl-dev opencl-headers opencl-clhpp-headers pocl-opencl-icd
+            build-essential cmake ninja-build clinfo \
+            ocl-icd-opencl-dev ocl-icd-dev opencl-headers opencl-clhpp-headers \
+            "llvm-${POCL_LLVM_VERSION}-dev" "libclang-${POCL_LLVM_VERSION}-dev" \
+            "libclang-cpp${POCL_LLVM_VERSION}-dev" "clang-${POCL_LLVM_VERSION}"
+
+      - name: Restore PoCL
+        id: pocl_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/pocl
+          key: pocl-${{ env.POCL_VERSION }}-llvm${{ env.POCL_LLVM_VERSION }}-${{ hashFiles('.github/workflows/build-opencl.yml') }}
+
+      - name: Fetch PoCL
+        if: steps.pocl_cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/pocl.tar.gz" "https://github.com/pocl/pocl/archive/refs/tags/v${POCL_VERSION}.tar.gz"
+          echo "${POCL_SHA256}  $RUNNER_TEMP/pocl.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/pocl.tar.gz" -C "$RUNNER_TEMP"
+
+      - name: Build PoCL with cl_khr_fp16 and LLVM builtins (SLEEF fabs lacks half)
+        if: steps.pocl_cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S "$RUNNER_TEMP/pocl-${POCL_VERSION}" -B "$RUNNER_TEMP/pocl-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/pocl" \
+            -DWITH_LLVM_CONFIG="/usr/bin/llvm-config-${POCL_LLVM_VERSION}" \
+            -DENABLE_ICD=ON \
+            -DENABLE_HOST_CPU_VECTORIZE_LIBMVEC=ON \
+            -DLLC_HOST_CPU="$POCL_HOST_CPU" \
+            -DENABLE_HWLOC=OFF \
+            -DENABLE_LOADABLE_DRIVERS=OFF \
+            -DENABLE_SPIRV=OFF \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_EXAMPLES=OFF
+          cmake --build "$RUNNER_TEMP/pocl-build" -j "$(nproc)"
+          cmake --install "$RUNNER_TEMP/pocl-build"
+          OCL_ICD_VENDORS="$RUNNER_TEMP/pocl/etc/OpenCL/vendors" clinfo | grep cl_khr_fp16
+
+      - name: Save PoCL
+        if: steps.pocl_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/pocl
+          key: ${{ steps.pocl_cache.outputs.cache-primary-key }}
 
       - name: Build (GGML_OPENCL, portable kernels)
         id: cmake_build
@@ -155,28 +200,22 @@ jobs:
       - name: Test backend ops (OpenCL)
         id: test_backend_ops
         run: |
-          # Functional coverage for the ggml-opencl ops DocTR uses on Adreno:
-          # CONV_2D (regular direct conv), CONV_2D_DW (depthwise), POOL_2D,
-          # HARDSWISH, HARDSIGMOID. These kernels load unconditionally (no
-          # GGML_OPENCL_USE_ADRENO_KERNELS gate), so they are portable OpenCL C
-          # and run here on the POCL CPU device, compared against the CPU
-          # reference. NOTE: a CPU ICD does NOT reproduce Adreno-compiler bugs
-          # (e.g. the char->float type-punning miscompile this PR works around) —
-          # that requires the manual Firebase Test Lab device run. This job is a
-          # regression net for kernel math / indexing / dtype correctness that a
-          # compile-only job cannot catch. The speech ops (GRU, ZERO_UPSAMPLE,
-          # CHANNEL_SHUFFLE, AFFINE_PRELU, SNAKE) and the stable-diffusion group
-          # norms (GROUP_NORM, GROUP_NORM_MUL_ADD) are portable OpenCL C as well.
-          # The backend only admits Adreno and Intel GPUs by name; a CPU device
-          # is let in by the env var below, which exists for test hosts.
-          # test-backend-ops counts a backend it never ran as passed, so the
-          # step requires a passing OpenCL result when a device ran and warns
-          # visibly when none did instead of going green in silence.
-          clinfo -l || true
+          require_opencl_pass() {
+            if ! grep -q "Backend OpenCL: .*OK" "$1"; then
+              echo "::error::test-backend-ops did not run the OpenCL backend or it failed, see $1"
+              exit 1
+            fi
+          }
+          require_all_cases_pass() {
+            if ! grep -Eq "^ *$2/$2 tests passed$" "$1"; then
+              echo "::error::expected all $2 selected cases to run and pass on OpenCL, see $1"
+              exit 1
+            fi
+          }
+          export OCL_ICD_VENDORS="$RUNNER_TEMP/pocl/etc/OpenCL/vendors"
           export GGML_OPENCL_ALLOW_GENERIC_DEVICE=1
-          ./build/bin/test-backend-ops test -o CONV_2D,CONV_2D_DW,POOL_2D,HARDSWISH,HARDSIGMOID,GRU,ZERO_UPSAMPLE,CHANNEL_SHUFFLE,AFFINE_PRELU,SNAKE,GROUP_NORM,GROUP_NORM_MUL_ADD | tee tbo.log
-          if grep -q "Backend OpenCL:" tbo.log; then
-            grep -q "Backend OpenCL: .*OK" tbo.log
-          else
-            echo "::warning::no usable OpenCL device on this runner; the kernels were built but not executed"
-          fi
+          clinfo -l
+          ./build/bin/test-backend-ops test -o "$OPENCL_TEST_OPS" | tee tbo.log
+          require_opencl_pass tbo.log
+          ./build/bin/test-backend-ops test -o FLASH_ATTN_EXT -p "$OPENCL_FA_CHUNK_PARAMS" | tee tbo-fa.log
+          require_all_cases_pass tbo-fa.log "$OPENCL_FA_CHUNK_CASES"
