@@ -4219,6 +4219,92 @@ struct test_norm_mul_add : public test_case {
         return out;
     }
 };
+
+// Layer norm: GGML_OP_NORM + GGML_OP_MUL + GGML_OP_ADD with a weight and a bias of ne[0] elements
+struct test_layer_norm : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool in_place; // the norm input has no other use, so the allocator runs the chain in place
+    const bool view;     // the norm input is a view with contiguous rows only
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "LAYER_NORM";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, eps, in_place, view);
+    }
+
+    test_layer_norm(std::array<int64_t, 4> ne = {64, 5, 4, 3}, float eps = 1e-5f, bool in_place = true, bool view = false)
+        : ne(ne), eps(eps), in_place(in_place), view(view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(a, "a"); ggml_set_name(w, "w"); ggml_set_name(b, "b");
+
+        // an op in front, so that the norm input is a compute tensor that can be overwritten
+        ggml_tensor * x = ggml_scale(ctx, a, 2.0f);
+        if (view) {
+            // every second row of dim 1
+            x = ggml_view_4d(ctx, x, ne[0], (ne[1] + 1)/2, ne[2], ne[3], 2*x->nb[1], x->nb[2], x->nb[3], 0);
+        }
+
+        ggml_tensor * n   = ggml_norm(ctx, x, eps);
+        ggml_tensor * m   = ggml_mul(ctx, n, w);
+        ggml_tensor * out = ggml_add(ctx, m, b);
+        if (!in_place) {
+            out = ggml_add(ctx, out, x);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// nn.Linear: GGML_OP_MUL_MAT + GGML_OP_ADD of a bias with one value per output row
+struct test_mul_mat_bias : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const std::array<int64_t, 2> bs; // dims 3 and 4 of b
+    const bool bias_4d;              // bias as [m, 1, 1, 1] instead of [m]
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_BIAS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, m, n, k, bs, bias_4d);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4; // as test_mul_mat
+    }
+
+    test_mul_mat_bias(ggml_type type_a = GGML_TYPE_F16, int64_t m = 32, int64_t n = 64, int64_t k = 32,
+            std::array<int64_t, 2> bs = {1, 1}, bool bias_4d = false)
+        : type_a(type_a), m(m), n(n), k(k), bs(bs), bias_4d(bias_4d) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // C^T = A * B^T: (k, m) * (k, n) => (m, n)
+        ggml_tensor * a    = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k, n, bs[0], bs[1]);
+        ggml_tensor * bias = bias_4d ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, m, 1, 1, 1) : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_set_name(a, "a"); ggml_set_name(b, "b"); ggml_set_name(bias, "bias");
+
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a, b), bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
 // GGML_OP_NORM/RMS_NORM + GGML_OP_SCALE
 struct test_norm_scale : public test_case {
     const ggml_type type;
@@ -16936,6 +17022,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
     }
+    for (uint32_t n : { 1, 64, 384, 1025 }) {
+        for (bool in_place : { true, false }) {
+            test_cases.emplace_back(new test_layer_norm({ n, 5, 4, 3 }, 1e-5f, in_place, false));
+            test_cases.emplace_back(new test_layer_norm({ n, 5, 4, 3 }, 1e-5f, in_place, true));
+        }
+    }
+    test_cases.emplace_back(new test_layer_norm({ 128, 1, 90, 62 }, 1e-6f)); // tokens of an image, [C, 1, W, H]
+
+    // 37 output rows take the scalar bias kernel, the other row counts four elements per thread
+    for (ggml_type type_a : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (int64_t m : { 37, 128 }) {
+            test_cases.emplace_back(new test_mul_mat_bias(type_a, m, 300, 64, { 1, 1 }, false));
+            test_cases.emplace_back(new test_mul_mat_bias(type_a, m, 300, 64, { 1, 1 }, true));
+            test_cases.emplace_back(new test_mul_mat_bias(type_a, m,  33, 64, { 5, 3 }, false));
+        }
+        test_cases.emplace_back(new test_mul_mat_bias(type_a, 384, 5581, 1536, { 1, 1 }, false)); // ViT-S MLP down at 90x62 patches
+        test_cases.emplace_back(new test_mul_mat_bias(type_a,  16,    1,   32, { 1, 1 }, false)); // one column: mat-vec, bias same shape
+    }
+
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
         for (bool multi_add : {false, true}) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
