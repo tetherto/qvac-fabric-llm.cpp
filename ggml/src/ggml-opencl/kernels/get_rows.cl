@@ -242,3 +242,44 @@ kernel void kernel_get_rows_q4_0(
         *(((global float16 *) ((global char *) dst + i12*nb3 + i11*nb2 + i10*nb1)) + ind) = temp;
     }
 }
+
+kernel void kernel_get_rows_q8_0_soa(
+        global char * src_q,
+        ulong offset_q,
+        global half * src_d,
+        ulong offset_d,
+        global int * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        ulong nblk01,
+        ulong nblk02,
+        ulong nblk03,
+        int ne10,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src_q = (global char*)((global char*)src_q + offset_q);
+    src_d = (global half*)((global char*)src_d + offset_d);
+    src1  = (global int*) ((global char*)src1  + offset1);
+    dst   = (global float*)((global char*)dst  + offsetd);
+
+    int i10 = get_group_id(0);
+    int i11 = get_group_id(1);
+    int i12 = get_group_id(2);
+
+    int r = ((global int *) ((global char *) src1 + i12*nb12 + i11*nb11 + i10*nb10))[0];
+
+    ulong blk_base = (ulong)r*nblk01 + (ulong)i11*nblk02 + (ulong)i12*nblk03;
+    global float * dst_row = (global float *) ((global char *) dst + i12*nb3 + i11*nb2 + i10*nb1);
+    global char  * q_row   = src_q + blk_base*QK8_0;
+
+    for (int ind = get_local_id(0); ind < ne00; ind += get_local_size(0)) {
+        dst_row[ind] = (float)(q_row[ind]) * (float)(src_d[blk_base + ind/QK8_0]);
+    }
+}
