@@ -1692,8 +1692,16 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
             std::vector<float>   probs;
             std::vector<int32_t> sorted_idx;
 
+            // the keep rule reads transitions past the drafts it keeps, so on a sampled draft it would keep a token
+            // depending on the token's own continuation, and the verifier's q would no longer be its distribution
+            const bool keep_p = params.n_short > 0 && !sample;
+            const bool read_p = params.p_min > 0.0f || keep_p;
+
             int32_t predecessor = 0;
             std::vector<float> path_p;
+            if (keep_p) {
+                path_p.reserve(n_block_tokens);
+            }
             for (int32_t i = 1; i < n_block_tokens; ++i) {
                 const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                 const int32_t top_k = selector_top_k;
@@ -1701,7 +1709,7 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
 
                 predecessor = (int32_t) std::distance(scores,
                         std::max_element(scores, scores + top_k));
-                float p;
+                float p = 0.0f;
                 if (sample) {
                     // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
                     probs.resize(top_k);
@@ -1714,11 +1722,16 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
                     for (int32_t k = 0; k < top_k; ++k) {
                         probs[k] /= sum;
                     }
-                } else {
+                } else if (read_p) {
                     p = lattice_argmax_prob(scores, top_k, predecessor);
                 }
-                if (p < params.p_min) {
-                    break;
+                if (read_p) {
+                    if (p < params.p_min) {
+                        break;
+                    }
+                    if (keep_p) {
+                        path_p.push_back(p);
+                    }
                 }
                 if (sample) {
                     // ggml_top_k leaves candidates unordered, so walk them by token id to keep a seed's draft stable
@@ -1745,11 +1758,8 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
                     }
                 }
                 result.push_back((llama_token) row[predecessor]);
-                path_p.push_back(p);
             }
-            // the keep rule reads transitions past the drafts it keeps, so on a sampled draft it would keep a token
-            // depending on the token's own continuation, and the verifier's q would no longer be its distribution
-            if (!sample) {
+            if (keep_p) {
                 result.resize(common_speculative_lattice_keep(path_p.data(), result.size(), params.n_short, params.long_cost));
             }
 
@@ -1868,8 +1878,14 @@ public:
             const float * lattice = llama_get_embeddings_nextn(ctx_dft);
             GGML_ASSERT(lattice && "LiliCorr scorer produced no lattice");
 
+            const bool keep_p = params.n_short > 0;
+            const bool read_p = params.p_min > 0.0f || keep_p;
+
             int32_t predecessor = 0;
             std::vector<float> path_p;
+            if (keep_p) {
+                path_p.reserve(params.n_max + 1);
+            }
             for (int32_t i = 1; i < params.n_max + 1; ++i) {
                 const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                 const int32_t top_k = lilicorr_top_k;
@@ -1877,14 +1893,20 @@ public:
 
                 predecessor = (int32_t) std::distance(scores,
                         std::max_element(scores, scores + top_k));
-                const float p = lattice_argmax_prob(scores, top_k, predecessor);
-                if (p < params.p_min) {
-                    break;
+                if (read_p) {
+                    const float p = lattice_argmax_prob(scores, top_k, predecessor);
+                    if (p < params.p_min) {
+                        break;
+                    }
+                    if (keep_p) {
+                        path_p.push_back(p);
+                    }
                 }
                 result.push_back((llama_token) row[predecessor]);
-                path_p.push_back(p);
             }
-            result.resize(common_speculative_lattice_keep(path_p.data(), result.size(), params.n_short, params.long_cost));
+            if (keep_p) {
+                result.resize(common_speculative_lattice_keep(path_p.data(), result.size(), params.n_short, params.long_cost));
+            }
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
