@@ -332,6 +332,9 @@ using ParallelTaskFn = void (*)(void * ctx, size_t task, size_t worker);
 // A call from inside a task, or after the pool shut down, runs inline.
 void parallel_run(size_t n_tasks, size_t workers, ParallelTaskFn fn, void * ctx);
 
+// Rows per parallel task: large enough to amortize the hand-off.
+constexpr size_t kTurboVecRowsPerTask = 256;
+
 // Runs fn(task, worker) for every task in [0, n_tasks) on up to n_threads
 // threads, the calling thread included; worker is in [0, workers). Tasks
 // are handed out dynamically, so fn must not depend on which worker runs a
@@ -379,8 +382,9 @@ struct TurboVecSyncBinding {
     // File rows whose redo ops ride the last commit, and rows changed since.
     std::unordered_set<size_t> pending;
     std::unordered_set<size_t> fresh;
-    // `fresh` lost a row, so the next sync must rewrite the file, after the
-    // same generation check as an incremental one.
+    // `fresh` lost a row or an IVF build moved the rows, so the next sync
+    // must rewrite the file, after the same generation check as an
+    // incremental one.
     bool rewrite = false;
     // A failed sync may still have landed its commit. These name it, so the
     // next sync can tell its own commit from another writer's: the nonce of
@@ -1009,6 +1013,10 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot);
 // Frees the sign planes and centre term, which searches read without the
 // planes mutex: the caller must hold `idx.mutex` exclusively.
 void turbovec_planes_reset(ggml_vec_index & idx);
+// The same, but a promoted index stays promoted, for a change that moves
+// every row without changing the codes; the caller then refreshes from
+// slot 0. Same locking rule as turbovec_planes_reset.
+void turbovec_planes_restart(ggml_vec_index & idx);
 void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
 // How a staged search is run, following upstream's batch bookkeeping.
 struct TurboVecStagedOpts {
@@ -1203,11 +1211,13 @@ bool turbovec_rows_in_blocked(const ggml_vec_index & idx);
 // and drops them again once only the blocked cache is needed.
 void turbovec_materialize_packed_rows(ggml_vec_index & idx);
 void turbovec_settle_rows(ggml_vec_index & idx);
-// Moves the rows of a TurboVec index into IVF list order, list 0 first, and
-// rewrites the IVF lists as ranges of the new slots. A block then holds rows
-// of one list, so an IVF search scores few blocks. Returns false and changes
-// nothing when the index cannot be reordered: not TurboVec, read-only, holds
-// tombstones, or has no current IVF. The caller holds the write lock.
+// Moves the rows of a TurboVec index into IVF list order, list 0 first,
+// and rewrites the IVF lists as ranges of the new slots. A block then holds
+// rows of one list, so an IVF search scores few blocks. Returns false and
+// changes nothing when the index cannot be reordered (not TurboVec,
+// read-only, delta-log bound, holds tombstones, or has no current IVF) or
+// when there is no memory for the reordered copy. The caller holds the
+// write lock.
 bool turbovec_group_rows_by_ivf(ggml_vec_index & idx);
 void turbovec_row_seq(const ggml_vec_index & idx, size_t slot, uint8_t * seq);
 void turbovec_row_packed(const ggml_vec_index & idx, size_t slot, uint8_t * packed);

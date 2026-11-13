@@ -4699,8 +4699,6 @@ struct TurboVecCalibrationView {
     }
 };
 
-// Rows per parallel task: large enough to amortize the hand-off.
-constexpr size_t kTurboVecRowsPerTask = 256;
 
 void quantize_turbovec_hadamard_batch(
         const float * src,

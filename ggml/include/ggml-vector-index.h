@@ -243,11 +243,13 @@ GGML_VEC_INDEX_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 // persisted in .tvim files; call again after loading if ANN search is needed.
 // This is allowed on mmap-loaded handles because it only builds heap-owned
 // search state. Successful add/remove calls invalidate the IVF structure.
-// On a TurboVec 1.x index the build also moves the stored rows so the vectors
+// On a TurboVec index the build also moves the stored rows so the vectors
 // of one list sit together, which lets an IVF search score few blocks. That
 // changes the order `ggml_vec_index_ids` reports and the row order of later
 // snapshots, makes prepared filters stale, and makes the next
-// `ggml_vec_index_sync` write the whole file.
+// `ggml_vec_index_sync` write the whole file. The move needs memory for a
+// second copy of the codes; without it the build still succeeds and leaves
+// the rows where they are.
 // `n_lists` is capped to the current index length. `n_iter` controls centroid
 // refinement; 0 uses deterministic initial centroids only.
 GGML_VEC_INDEX_API int ggml_vec_index_build_ivf(
@@ -260,14 +262,13 @@ GGML_VEC_INDEX_API int ggml_vec_index_build_ivf(
 // sorted descending by score (higher = closer / more similar), with equal
 // scores ordered by ascending id; a TurboVec 1.x index orders them by row, as
 // upstream turbovec does (insertion order, as reshuffled by removals and by
-// IVF builds). `k`
-// must be at least 1. If the index holds fewer than k entries, the
-// remaining slots in each row are filled with UINT64_MAX ids; callers must use
-// out_ids[i] == UINT64_MAX to identify padding. Padded score slots are filled
-// with -FLT_MAX for compatibility, but that value can also be a legitimate
-// finite dot product. Read-only against the index (does not mutate state).
-// Exact search scans all live entries; use filtered or IVF search to reduce
-// the candidate set.
+// IVF builds). `k` must be at least 1. If the index holds fewer than k
+// entries, the remaining slots in each row are filled with UINT64_MAX ids;
+// callers must use out_ids[i] == UINT64_MAX to identify padding. Padded score
+// slots are filled with -FLT_MAX for compatibility, but that value can also
+// be a legitimate finite dot product. Read-only against the index (does not
+// mutate state). Exact search scans all live entries; use filtered or IVF
+// search to reduce the candidate set.
 //
 // Score semantics: dot product. For f32 storage this is a full-precision dot
 // product. For q4/q8 storage, the query remains f32 and the dot product is
@@ -414,11 +415,10 @@ GGML_VEC_INDEX_API int ggml_vec_index_from_bytes_with_flags(
 // (upstream turbovec `sync`). The first sync to a path, and any sync after a
 // calibrate or an IVF build, writes the whole file and claims it; later syncs
 // write only the blocks and commit header that changed, durable after one
-// fsync. A crash
-// at any byte leaves the previous commit loadable. Loading a synced file
-// binds the loaded index to it, so syncs continue incrementally. Returns
-// GGML_VEC_INDEX_E_IO when another writer has advanced or replaced the file
-// (load it to adopt its state), and GGML_VEC_INDEX_E_NOT_DURABLE as
+// fsync. A crash at any byte leaves the previous commit loadable. Loading a
+// synced file binds the loaded index to it, so syncs continue incrementally.
+// Returns GGML_VEC_INDEX_E_IO when another writer has advanced or replaced
+// the file (load it to adopt its state), and GGML_VEC_INDEX_E_NOT_DURABLE as
 // `ggml_vec_index_write` does. One writer per path.
 GGML_VEC_INDEX_API int ggml_vec_index_sync(
     ggml_vec_index_t * idx,
@@ -514,7 +514,7 @@ GGML_VEC_INDEX_API int ggml_vec_index_turbovec_is_legacy(const ggml_vec_index_t 
 // Copies the live ids into `out_ids`, up to `capacity` of them, and stores
 // the live count in `out_count`. Pass `capacity` 0 to query the count. Ids
 // come in a stable order that changes only with mutations and, on a TurboVec
-// 1.x index, with IVF builds.
+// index, with IVF builds.
 GGML_VEC_INDEX_API int ggml_vec_index_ids(
     const ggml_vec_index_t * idx,
     uint64_t               * out_ids,

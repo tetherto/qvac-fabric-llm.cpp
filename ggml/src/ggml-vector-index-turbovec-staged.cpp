@@ -889,6 +889,13 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot) {
     idx.turbovec_centre_ready = false;
 }
 
+void turbovec_planes_restart(ggml_vec_index & idx) {
+    const bool planes = idx.turbovec_planes;
+    turbovec_planes_reset(idx);
+    std::lock_guard<std::mutex> lock(idx.turbovec_planes_mutex);
+    idx.turbovec_planes = planes;
+}
+
 void turbovec_planes_reset(ggml_vec_index & idx) {
     std::lock_guard<std::mutex> lock(idx.turbovec_planes_mutex);
     idx.turbovec_planes = false;
