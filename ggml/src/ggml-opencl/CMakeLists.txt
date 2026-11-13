@@ -238,6 +238,7 @@ set(GGML_OPENCL_KERNELS
     channel_shuffle
     affine_prelu
     snake
+    col2im_1d
     leaky_relu
     sin
     cos
