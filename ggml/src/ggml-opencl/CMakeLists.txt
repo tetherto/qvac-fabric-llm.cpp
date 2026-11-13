@@ -317,6 +317,7 @@ set(GGML_OPENCL_KERNELS
     snake
     leaky_relu
     sin
+    cos
     tsembd
     upscale
     tanh
