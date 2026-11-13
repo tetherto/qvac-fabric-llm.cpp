@@ -656,8 +656,9 @@ template [[host_name("kernel_mul_mv_mma_pq2_0_f32_nt1_rt2")]] kernel mul_mv_mma_
 template [[host_name("kernel_mul_mv_mma_pq2_0_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_pq2_0_f32<2, 2>;
 template [[host_name("kernel_mul_mv_mma_pq2_0_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_pq2_0_f32<4, 2>;
 
-// dequantize_q6_K with its 16-bit quant loads issued as packed_ushort4 loads (2-byte aligned, the same bytes)
-void dequantize_q6_K_mv_mma(device const block_q6_K * xb, short il, thread float4x4 & reg) {
+// dequantize_q6_K (dequantize.h) with its 16-bit quant loads issued as packed_ushort4 loads (2-byte aligned, the same
+// bytes); keep the math after the loads in sync with it
+inline void dequantize_q6_K_mv_mma(device const block_q6_K * xb, short il, thread float4x4 & reg) {
     const half d_all = xb->d;
     device const uint16_t * ql = (device const uint16_t *)xb->ql;
     device const uint16_t * qh = (device const uint16_t *)xb->qh;
