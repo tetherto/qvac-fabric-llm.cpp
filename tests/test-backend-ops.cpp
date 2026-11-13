@@ -16748,6 +16748,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_cont(type_dst, ne, false, perm));
             }
         }
+        // permutes that move dim 3: per-head and per-window layouts of windowed attention
+        for (std::array<int64_t, 4> perm : std::initializer_list<std::array<int64_t, 4>>{
+                {0, 2, 3, 1}, {0, 3, 2, 1}, {0, 3, 1, 2}, {3, 1, 2, 0}, {1, 2, 3, 0} }) {
+            test_cases.emplace_back(new test_cont(type_dst, {32, 16, 4, 70}, false, perm));
+            test_cases.emplace_back(new test_cont(type_dst, {5, 7, 3, 11}, false, perm));
+        }
     }
 
     // source strides over 16 MB (24-bit DMA descriptor limit)
@@ -17040,6 +17046,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_bias(type_a, 384, 5581, 1536, { 1, 1 }, false)); // ViT-S MLP down at 90x62 patches
         test_cases.emplace_back(new test_mul_mat_bias(type_a,  16,    1,   32, { 1, 1 }, false)); // one column: mat-vec, bias same shape
     }
+
+    // many small F32 products: a contraction (k) of at most 32, at most 32 columns (n), at least 16 matrices.
+    // k below 4 takes a scalar kernel; the row count (m) picks 4, 2 or 1 rows per thread.
+    for (int64_t k : { 1, 2, 3, 4, 8, 12, 16, 20, 24, 28, 32 }) {
+        for (int64_t m : { 1, 4, 6, 7, 16 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 5, k, { 4, 4 }, { 1, 1 }));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16,  1, k, { 16,  1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 18, 32, k, {  1, 17 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, k, {  4, 70 }, { 1, 1 })); // windowed attention logits
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 700, 16, k, { 16,  1 }, { 1, 1 })); // windows as rows
+        // just outside: one matrix too few, one column too many, broadcast, permuted src1
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, k, {  3,  5 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 33, k, {  4,  4 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, k, {  4,  4 }, { 2, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, k, {  4,  4 }, { 1, 1 }, { 0, 2, 1, 3 }));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, 36, { 4, 4 }, { 1, 1 })); // k too long
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, 30, { 4, 4 }, { 1, 1 })); // k not a multiple of 4
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32,  2,  2, { 4, 5580 }, { 1, 1 })); // attention over 2 tokens per pixel
 
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
         for (bool multi_add : {false, true}) {
@@ -18370,6 +18396,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4,      1, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4,   1023, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {643251, 3, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
+    // many short rows (attention inside small windows): 4096 rows of at most 32 values is where CUDA changes kernel
+    for (int64_t ne0 : { 1, 2, 4, 16, 31, 32, 33 }) {
+        for (bool mask : { false, true }) {
+            for (ggml_type m_prec : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+                if (!mask && m_prec == GGML_TYPE_F16) {
+                    continue;
+                }
+                test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 16, 4, 64}, mask, false, m_prec, {1, 1}, 0.1767767f, 0.0f)); // 4096 rows
+                test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 16, 1, 64}, mask, false, m_prec, {4, 1}, 0.1767767f, 0.0f)); // mask shared by the heads
+                test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 16, 1,  1}, mask, false, m_prec, {4, 70}, 1.0f, 0.0f));      // one mask for every window
+                test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 4095, 1, 1}, mask, false, m_prec, {1, 1}, 1.0f, 0.0f));      // one row too few
+                test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 16, 4, 64}, mask, false, m_prec, {1, 1}, 0.1f, 0.0f, true)); // in place
+            }
+        }
+        test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 16, 4, 64}, true, true, GGML_TYPE_F32, {1, 1}, 0.1f, 0.0f)); // sinks: old kernel
+        test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 16, 4, 64}, true, false, GGML_TYPE_F32, {1, 1}, 0.1f, 8.0f)); // bias: old kernel
+    }
 
     for (float max_bias : {0.0f, 8.0f}) {
         for (float scale : {1.0f, 0.1f}) {
