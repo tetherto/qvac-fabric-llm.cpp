@@ -158,6 +158,7 @@ setup_framework_structure() {
 
     # Copy all required headers (common for all platforms)
     cp include/llama.h             ${header_path}
+    cp include/llama-coreml-ffn.h  ${header_path}
     cp ggml/include/ggml.h         ${header_path}
     cp ggml/include/ggml-opt.h     ${header_path}
     cp ggml/include/ggml-alloc.h   ${header_path}
@@ -181,11 +182,13 @@ setup_framework_structure() {
     cat > ${module_path}module.modulemap << EOF
 framework module llama {
     umbrella "Headers"
+    header "llama-coreml-ffn.h"
 
     link "c++"
     link framework "Accelerate"
     link framework "Metal"
     link framework "Foundation"
+    link framework "CoreML"
 
     export *
 }
