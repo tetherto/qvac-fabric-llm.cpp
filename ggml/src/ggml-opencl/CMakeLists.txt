@@ -238,6 +238,7 @@ set(GGML_OPENCL_KERNELS
     channel_shuffle
     affine_prelu
     snake
+    leaky_relu
     tsembd
     upscale
     tanh
