@@ -4406,7 +4406,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-n-short"}, "N",
         string_format("lattice drafters (DFlash2, DSpine, LiliCorr): keep only N drafts in a step unless the expected accepted tokens of\n"
-                      "the full draft pay for --spec-draft-long-cost (default: %d, 0 = off)", params.speculative.draft.n_short),
+                      "the full draft pay for --spec-draft-long-cost; greedy drafts only, a DFlash2 draft sampled with\n"
+                      "--spec-draft-sampling probabilistic is never shortened (default: %d, 0 = off)", params.speculative.draft.n_short),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

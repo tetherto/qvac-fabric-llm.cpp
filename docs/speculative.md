@@ -121,6 +121,8 @@ Load the target with `--no-repack` and without `-sm row` in that case.
 The verify cost of a step can jump with the number of drafted tokens, for example on Metal past 8 rows.
 With a lattice drafter (DFlash2, DSpine or LiliCorr), `--spec-draft-n-short N` keeps only the first N drafts of a step unless the full draft pays for its cost.
 Other drafters reject the option, and N must be 0 or at least `--spec-draft-n-min`.
+The rule applies to greedy lattice drafts only and does not shorten a DFlash2 draft sampled with `--spec-draft-sampling probabilistic`.
+It decides from transitions past the drafts it keeps, so a sampled draft would no longer follow the distribution that the target's rejection test assumes, and the setup warns when both are set.
 The expected accepted tokens come from the lattice's own transition probabilities, and `--spec-draft-long-cost R` is the time of a step with more than N drafts relative to a step with N drafts.
 The rule uses the same R for every path longer than N, including one that `--spec-draft-p-min` stops before `--spec-draft-n-max`, so set N where the verify cost jumps, for example 7 on Metal.
 Take R from two runs, one with `--spec-draft-n-max` at each value.
@@ -311,7 +313,8 @@ Use exactly one of these options:
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
 --spec-draft-n-short                    N
                                         lattice drafters (DFlash2, DSpine, LiliCorr): keep only N drafts in a step unless the expected accepted tokens of
-                                        the full draft pay for --spec-draft-long-cost (default: 0, 0 = off)
+                                        the full draft pay for --spec-draft-long-cost; greedy drafts only, a DFlash2 draft sampled with
+                                        --spec-draft-sampling probabilistic is never shortened (default: 0, 0 = off)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_SHORT)
 --spec-draft-long-cost                  R
                                         time of a step with more than --spec-draft-n-short drafts relative to one with --spec-draft-n-short drafts
