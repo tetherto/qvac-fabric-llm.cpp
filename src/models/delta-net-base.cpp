@@ -501,7 +501,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        for (int64_t t = 1; t <= K; ++t) {
+        // like the SSM snapshots, keep only the states a rollback inside this ubatch can reach
+        const int64_t n_written = std::min<int64_t>(K, ubatch.n_seq_tokens);
+
+        for (int64_t t = K - n_written + 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
 

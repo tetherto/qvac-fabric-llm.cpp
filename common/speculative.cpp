@@ -981,6 +981,39 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// softmax of a lattice row's transition scores at its argmax, i.e. 1 / sum(exp(s_k - s_max))
+static float lattice_argmax_prob(const float * scores, int32_t n, int32_t i_max) {
+    float sum = 0.0f;
+    for (int32_t k = 0; k < n; ++k) {
+        sum += std::exp(scores[k] - scores[i_max]);
+    }
+    return 1.0f / sum;
+}
+
+// expected accepted drafts among the first n transitions of a lattice path
+static float lattice_expected_accepted(const float * path_p, size_t n) {
+    float p_all = 1.0f;
+    float sum   = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        p_all *= path_p[i];
+        sum   += p_all;
+    }
+    return sum;
+}
+
+size_t common_speculative_lattice_keep(const float * path_p, size_t n, int32_t n_short, float long_cost) {
+    if (n_short <= 0 || n <= (size_t) n_short) {
+        return n;
+    }
+    // every step also yields the target's own next token
+    const float tokens_long  = 1.0f + lattice_expected_accepted(path_p, n);
+    const float tokens_short = 1.0f + lattice_expected_accepted(path_p, (size_t) n_short);
+    return tokens_long >= long_cost * tokens_short ? n : (size_t) n_short;
+}
+
+static constexpr const char * LATTICE_N_SHORT_ERROR =
+        "--spec-draft-n-short needs --spec-type draft-dflash with a lattice draft (DFlash2, DSpine or LiliCorr)";
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1089,8 +1122,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        if (this->params.n_short > 0 && !is_dflash2 && !is_lilicorr) {
+            throw std::runtime_error(LATTICE_N_SHORT_ERROR);
+        }
+
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
-        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_short=%d, long_cost=%.2f\n", __func__, this->params.n_max,
+                this->params.n_min, this->params.p_min, this->params.n_short, this->params.long_cost);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
 
@@ -1398,25 +1436,35 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                const int32_t n_rows = is_dflash2 ? n_block_tokens : params.n_max + 1;
+                const bool    read_p = params.p_min > 0.0f || params.n_short > 0;
+                const bool    keep_p = params.n_short > 0;
+
                 int32_t predecessor = 0;
-                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
+                std::vector<float> path_p;
+                if (keep_p) {
+                    path_p.reserve(n_rows);
+                }
+                for (int32_t i = 1; i < n_rows; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
                     const float * scores = row + top_k + (size_t) predecessor * top_k;
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
-                    if (params.p_min > 0.0f) {
-                        // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
-                        float sum = 0.0f;
-                        for (int32_t k = 0; k < top_k; ++k) {
-                            sum += std::exp(scores[k] - scores[predecessor]);
-                        }
-                        if (1.0f / sum < params.p_min) {
+                    if (read_p) {
+                        const float p = lattice_argmax_prob(scores, top_k, predecessor);
+                        if (p < params.p_min) {
                             break;
+                        }
+                        if (keep_p) {
+                            path_p.push_back(p);
                         }
                     }
                     result.push_back((llama_token) row[predecessor]);
+                }
+                if (keep_p) {
+                    result.resize(common_speculative_lattice_keep(path_p.data(), result.size(), params.n_short, params.long_cost));
                 }
 
                 if (result.size() < (size_t) params.n_min) {
@@ -2538,7 +2586,12 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
 
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
     if (arch != "dflash") {
-        const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
+        const int64_t block_count_id = gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str());
+        if (block_count_id < 0 || gguf_get_kv_type(gguf_ctx.get(), block_count_id) != GGUF_TYPE_UINT32 ||
+                gguf_get_val_u32(gguf_ctx.get(), block_count_id) == 0) {
+            return {};
+        }
+        const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), block_count_id);
 
         if (gguf_find_tensor(gguf_ctx.get(), ("blk." + std::to_string(block_count - 1) + ".nextn.eh_proj.weight").c_str()) >= 0) {
             return { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
@@ -2555,6 +2608,200 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
     SPC_INF("auto-detected speculative type '%s' from the draft model metadata\n", common_speculative_type_to_str(type).c_str());
 
     return { type };
+}
+
+// the header values the draft/model match depends on; 0 or empty when absent
+struct common_speculative_gguf_header {
+    std::string          arch;
+    int64_t              n_embd     = 0; // <arch>.embedding_length
+    int64_t              n_embd_out = 0; // <arch>.embedding_length_out, else n_embd, as llama_hparams::n_embd_out()
+    int64_t              n_layer    = 0; // <arch>.block_count without the nextn layers, as llama_hparams::n_layer()
+    int64_t              n_vocab    = 0; // the tokenizer's tokens, else <arch>.vocab_size, as the vocab loader
+    int64_t              block_size = 0; // <arch>.block_size if a u32 within int32, as the loader and the graph read it
+    bool                 has_markov = false;
+    std::vector<int64_t> target_layers;
+};
+
+// a scalar of any integer type; negative values read as 0
+static int64_t common_speculative_gguf_int(const gguf_context * ctx, const std::string & key) {
+    const int64_t id = gguf_find_key(ctx, key.c_str());
+    if (id < 0) {
+        return 0;
+    }
+    switch (gguf_get_kv_type(ctx, id)) {
+        case GGUF_TYPE_UINT8:  return gguf_get_val_u8 (ctx, id);
+        case GGUF_TYPE_UINT16: return gguf_get_val_u16(ctx, id);
+        case GGUF_TYPE_UINT32: return gguf_get_val_u32(ctx, id);
+        case GGUF_TYPE_UINT64: return (int64_t) std::min<uint64_t>(gguf_get_val_u64(ctx, id), INT64_MAX);
+        case GGUF_TYPE_INT8:   return std::max<int64_t>(0, gguf_get_val_i8 (ctx, id));
+        case GGUF_TYPE_INT16:  return std::max<int64_t>(0, gguf_get_val_i16(ctx, id));
+        case GGUF_TYPE_INT32:  return std::max<int64_t>(0, gguf_get_val_i32(ctx, id));
+        case GGUF_TYPE_INT64:  return std::max<int64_t>(0, gguf_get_val_i64(ctx, id));
+        default:               return 0;
+    }
+}
+
+// an array of any integer type; gguf_get_arr_data asserts on a string array, so other element types read as empty
+static std::vector<int64_t> common_speculative_gguf_int_array(const gguf_context * ctx, const std::string & key) {
+    std::vector<int64_t> values;
+    const int64_t id = gguf_find_key(ctx, key.c_str());
+    if (id < 0 || gguf_get_kv_type(ctx, id) != GGUF_TYPE_ARRAY) {
+        return values;
+    }
+    const size_t n = gguf_get_arr_n(ctx, id);
+    const auto read = [&](auto typed) {
+        using T = decltype(typed);
+        const T * items = static_cast<const T *>(gguf_get_arr_data(ctx, id));
+        for (size_t i = 0; i < n; ++i) {
+            values.push_back((int64_t) items[i]);
+        }
+    };
+    switch (gguf_get_arr_type(ctx, id)) {
+        case GGUF_TYPE_UINT8:  read(uint8_t {}); break;
+        case GGUF_TYPE_INT8:   read(int8_t  {}); break;
+        case GGUF_TYPE_UINT16: read(uint16_t{}); break;
+        case GGUF_TYPE_INT16:  read(int16_t {}); break;
+        case GGUF_TYPE_UINT32: read(uint32_t{}); break;
+        case GGUF_TYPE_INT32:  read(int32_t {}); break;
+        case GGUF_TYPE_UINT64: read(uint64_t{}); break; // past INT64_MAX reads as negative, which is no layer either
+        case GGUF_TYPE_INT64:  read(int64_t {}); break;
+        default: break;
+    }
+    return values;
+}
+
+// whether tensor is in another file of the split model whose file split_no of split_count is path, named as the
+// model loader finds the files
+static bool common_speculative_tensor_in_other_splits(const std::string & path, int64_t split_no, int64_t split_count, const char * tensor) {
+    if (split_no < 0 || split_no >= split_count || split_count > UINT16_MAX) {
+        return false;
+    }
+    std::vector<char> buf(path.size() + 64);
+    if (llama_split_prefix(buf.data(), buf.size(), path.c_str(), (int32_t) split_no, (int32_t) split_count) <= 0) {
+        return false;
+    }
+    const std::string prefix(buf.data());
+    for (int64_t i = 0; i < split_count; ++i) {
+        if (i == split_no || llama_split_path(buf.data(), buf.size(), prefix.c_str(), (int32_t) i, (int32_t) split_count) <= 0) {
+            continue;
+        }
+        const gguf_init_params gguf_params = {
+            /* .no_alloc = */ true,
+            /* .ctx      = */ nullptr,
+        };
+        gguf_context_ptr ctx(gguf_init_from_file(buf.data(), gguf_params));
+        if (ctx && gguf_find_tensor(ctx.get(), tensor) >= 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool common_speculative_read_header(const std::string & path, common_speculative_gguf_header & hdr) {
+    const gguf_init_params gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    gguf_context_ptr ctx(gguf_init_from_file(path.c_str(), gguf_params));
+    if (!ctx) {
+        return false;
+    }
+    const int64_t arch_id = gguf_find_key(ctx.get(), "general.architecture");
+    if (arch_id < 0 || gguf_get_kv_type(ctx.get(), arch_id) != GGUF_TYPE_STRING) {
+        return false;
+    }
+    hdr.arch = gguf_get_val_str(ctx.get(), arch_id);
+    const std::string p = hdr.arch + ".";
+
+    hdr.n_embd     = common_speculative_gguf_int(ctx.get(), p + "embedding_length");
+    hdr.n_embd_out = common_speculative_gguf_int(ctx.get(), p + "embedding_length_out");
+    if (hdr.n_embd_out == 0) {
+        hdr.n_embd_out = hdr.n_embd;
+    }
+    const int64_t n_layer_all   = common_speculative_gguf_int(ctx.get(), p + "block_count");
+    const int64_t n_layer_nextn = common_speculative_gguf_int(ctx.get(), p + "nextn_predict_layers");
+    hdr.n_layer = n_layer_all > n_layer_nextn ? n_layer_all - n_layer_nextn : 0;
+
+    const int64_t tokens_id = gguf_find_key(ctx.get(), "tokenizer.ggml.tokens");
+    if (tokens_id >= 0 && gguf_get_kv_type(ctx.get(), tokens_id) == GGUF_TYPE_ARRAY) {
+        hdr.n_vocab = (int64_t) gguf_get_arr_n(ctx.get(), tokens_id);
+    } else {
+        hdr.n_vocab = common_speculative_gguf_int(ctx.get(), p + "vocab_size");
+    }
+
+    // the loader reads it into a uint32_t, refusing any other type, and the Markov head parses it with std::stoi
+    const int64_t block_size_id = gguf_find_key(ctx.get(), (p + "block_size").c_str());
+    if (block_size_id >= 0 && gguf_get_kv_type(ctx.get(), block_size_id) == GGUF_TYPE_UINT32 &&
+            gguf_get_val_u32(ctx.get(), block_size_id) <= (uint32_t) INT32_MAX) {
+        hdr.block_size = gguf_get_val_u32(ctx.get(), block_size_id);
+    }
+    hdr.has_markov    = gguf_find_tensor(ctx.get(), "markov_w1.weight") >= 0;
+    hdr.target_layers = common_speculative_gguf_int_array(ctx.get(), p + "target_layers");
+
+    // the loader assembles every file's tensors into one model, while the metadata is only in the first
+    const int64_t split_count = common_speculative_gguf_int(ctx.get(), "split.count");
+    if (!hdr.has_markov && split_count > 1) {
+        hdr.has_markov = common_speculative_tensor_in_other_splits(path, common_speculative_gguf_int(ctx.get(), "split.no"), split_count, "markov_w1.weight");
+    }
+    return true;
+}
+
+std::string common_speculative_draft_mismatch(const common_params & params, const std::string & path_target) {
+    const auto & spec = params.speculative;
+    const auto has_type = [&](common_speculative_type type) {
+        return std::find(spec.types.begin(), spec.types.end(), type) != spec.types.end();
+    };
+    const bool is_dflash = has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) || has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+    const bool is_mtp    = has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    if (spec.draft.mparams.path.empty() || (!is_dflash && !is_mtp)) {
+        return "";
+    }
+
+    common_speculative_gguf_header dft;
+    common_speculative_gguf_header tgt;
+    if (!common_speculative_read_header(spec.draft.mparams.path, dft) || !common_speculative_read_header(path_target, tgt)) {
+        return "";
+    }
+
+    std::string reason;
+    const auto add = [&reason](const std::string & part) {
+        reason += reason.empty() ? "" : "; ";
+        reason += part;
+    };
+    // the draft vocabulary sizes the draft model's token embeddings and Markov head, which are indexed with the
+    // model's token ids; a d2t map only shrinks the output head and scatters it back to that vocabulary
+    if (dft.n_vocab > 0 && tgt.n_vocab > 0 && dft.n_vocab != tgt.n_vocab) {
+        add(std::to_string(dft.n_vocab) + " tokens, the model's " + std::to_string(tgt.n_vocab));
+    }
+
+    if (dft.arch == "dflash") {
+        if (!is_dflash) {
+            return reason;
+        }
+        // the input projection takes each target layer's hidden state at the draft model's own width
+        if (dft.n_embd > 0 && tgt.n_embd > 0 && dft.n_embd != tgt.n_embd) {
+            add("hidden width " + std::to_string(dft.n_embd) + ", the model's " + std::to_string(tgt.n_embd));
+        }
+        // the layer inputs 0 through n_layer are extracted, the last being the final hidden state
+        if (tgt.n_layer > 0) {
+            for (const int64_t il : dft.target_layers) {
+                if (il < 0 || il > tgt.n_layer) {
+                    add("it reads target layer " + std::to_string(il) + ", the model has " + std::to_string(tgt.n_layer) + " layers");
+                    break;
+                }
+            }
+        }
+        // the Markov head is built under draft-dspark and draft-dflash alike and asserts a positive block size
+        if (dft.has_markov && dft.block_size <= 0) {
+            add("it has a DSpark Markov head but no positive dflash.block_size");
+        }
+    } else if (is_mtp) {
+        // an external MTP head reads the model's output hidden state
+        if (dft.n_embd_out > 0 && tgt.n_embd_out > 0 && dft.n_embd_out != tgt.n_embd_out) {
+            add("hidden width " + std::to_string(dft.n_embd_out) + ", the model's " + std::to_string(tgt.n_embd_out));
+        }
+    }
+    return reason;
 }
 
 static uint32_t common_get_enabled_speculative_configs(const std::vector<common_speculative_type> & configs) {
@@ -2877,6 +3124,13 @@ static void common_speculative_apply_draft_vocab(const common_params_speculative
     LOG_INF("%s: draft vocabulary: %zu token id ranges\n", __func__, ranges.size()/2);
 }
 
+// only the DFlash implementation can walk a lattice; its constructor checks that the draft has one
+static bool common_speculative_has_dflash_config(const std::vector<common_speculative_config> & configs) {
+    return std::any_of(configs.begin(), configs.end(), [](const common_speculative_config & config) {
+        return config.type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || config.type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+    });
+}
+
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
@@ -2909,6 +3163,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
+    }
+
+    if (params.draft.n_short > 0 && !configs.empty() && !common_speculative_has_dflash_config(configs)) {
+        throw std::runtime_error(LATTICE_N_SHORT_ERROR);
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};

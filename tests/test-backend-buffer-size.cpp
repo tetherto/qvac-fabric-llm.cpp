@@ -186,6 +186,22 @@ void check_capacity_fallback() {
     check(ggml_backend_buft_get_max_capacity(cpu) == ggml_backend_buft_get_max_size(cpu), "CPU limit changed");
 }
 
+void check_device_capacity(ggml_backend_dev_t device) {
+    auto * buft = ggml_backend_dev_buffer_type(device);
+    const size_t capacity = ggml_backend_buft_get_max_capacity(buft);
+    check(ggml_backend_buft_is_size_supported(buft, 0), "device rejected empty buffer");
+    check(ggml_backend_buft_is_size_supported(buft, capacity), "device capacity boundary rejected");
+    if (capacity < SIZE_MAX) {
+        check(!ggml_backend_buft_is_size_supported(buft, capacity + 1), "device capacity overflow accepted");
+    }
+}
+
+void check_device_capacities() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        check_device_capacity(ggml_backend_dev_get(i));
+    }
+}
+
 } // namespace
 
 int main() try {
@@ -196,6 +212,7 @@ int main() try {
     check_capacity_extension();
     check_capacity_boundaries();
     check_capacity_fallback();
+    check_device_capacities();
     std::puts("test-backend-buffer-size: all checks passed");
     return 0;
 } catch (const std::exception & error) {

@@ -427,6 +427,7 @@ llama_build(test-multi-instance-repro.cpp)
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 llama_build_and_test(test-model-load-meta-only.cpp)
+llama_build_and_test(test-speculative-draft-mismatch.cpp)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test-mmap-direct-io test-mmap-direct-io.cpp ../src/llama-mmap.cpp ../src/llama-impl.cpp)
@@ -573,6 +574,9 @@ llama_build_and_test(test-backend-memory.cpp LINK ggml)
 # a synthetic buffer type with a guard; needs the non-public ggml-backend-impl.h
 llama_build_and_test(test-backend-buffer-size.cpp LINK ggml)
 target_include_directories(test-backend-buffer-size PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+llama_build_and_test(test-vulkan-buffer-capacity.cpp LINK ggml)
+target_include_directories(test-vulkan-buffer-capacity PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 

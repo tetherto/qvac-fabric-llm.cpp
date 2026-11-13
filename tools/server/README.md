@@ -270,6 +270,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
 | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
 | `--spec-draft-p-min, --draft-p-min P` | minimum speculative decoding probability (greedy) (default: 0.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_MIN) |
+| `--spec-draft-n-short N` | lattice drafters (DFlash2, DSpine, LiliCorr): keep only N drafts in a step unless the expected accepted tokens of<br/>the full draft pay for --spec-draft-long-cost (default: 0, 0 = off)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_SHORT) |
+| `--spec-draft-long-cost R` | time of a step with more than --spec-draft-n-short drafts relative to one with --spec-draft-n-short drafts<br/>(default: 1.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_LONG_COST) |
 | `--spec-draft-vocab B:E[,B:E...]` | token id ranges [B, E) a DFlash2 drafter may propose; the target still verifies over the full vocabulary<br/>(default: full vocabulary)<br/>(env: LLAMA_ARG_SPEC_DRAFT_VOCAB) |
 | `--spec-draft-n-auto, --no-spec-draft-n-auto` | pick the draft length (up to --spec-draft-n-max) per step from measured step times and acceptance, so that slots draft less when many generate at once (default: disabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_AUTO) |
 | `--spec-draft-backend-sampling, --no-spec-draft-backend-sampling` | offload draft sampling to the backend (default: enabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING) |

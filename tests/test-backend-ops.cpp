@@ -15573,7 +15573,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
 #if 0
-    // >4GB im2col destination. Too slow to run by default.
+    // >4GB im2col tensors. Too slow to run by default.
+    test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {2147483648, 1, 1, 1}, {1, 1, 1, 1}, 1, INT_MAX, 1, 1, 0, 0, 0, 1, 1, 1, false));
     // Test cases taken from Wan2.1 T2V 1.3B.
     test_cases.emplace_back(new test_im2col   (GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {832, 480, 192, 4}, {3, 3, 192, 96}, 1, 1, 1, 1, 1, 1, true));
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {834, 482, 6, 96},  {3, 3,3, 9216}, 96, 1, 1, 1, 0, 0, 0, 1, 1, 1, false));
@@ -15643,6 +15644,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32));
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_F32));
     for (int s0 : {1, 3}) {
         for (int s1 : {1, 3}) {
             for (int s2 : {1, 3}) {
@@ -15987,11 +15990,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     // f32 <-> f16 conversions of a permuted source whose rows are not packed (the speech encoders cast
-    // permuted attention operands this way; the second case also writes a permuted destination)
+    // permuted attention operands this way; the second shape also writes a permuted destination). The
+    // large shapes stay above the Hexagon scheduler threshold for this copy, the small ones below it.
     for (ggml_type type_src : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         const ggml_type type_dst = type_src == GGML_TYPE_F32 ? GGML_TYPE_F16 : GGML_TYPE_F32;
         test_cases.emplace_back(new test_cpy(type_src, type_dst, {16, 138, 256, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}));
         test_cases.emplace_back(new test_cpy(type_src, type_dst, {32, 32, 256, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_cpy(type_src, type_dst, {16, 8, 64, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}));
+        test_cases.emplace_back(new test_cpy(type_src, type_dst, {16, 16, 32, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}, {0, 2, 1, 3}));
     }
     for (ggml_type type_src : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         test_cases.emplace_back(new test_cpy(type_src, GGML_TYPE_F8_E4M3, {32, 2, 3, 4}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {64, 2, 3, 4}));
@@ -16969,6 +16975,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 63,  5, 2304, {3, 2}, {2, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K,  GGML_TYPE_F32, 64, 13, 4608, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 63,  5, 4608, {3, 2}, {2, 2}));
+    // Q6_K at 16 rows: 9-block rows alternate 4- and 2-byte aligned blocks, the view of 11-block rows alternates the row starts
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 1000, 16, 2304, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 1000, 16, 2304, {1, 1}, {1, 1}, {0, 1, 2, 3}, 2816));
     // partial column group, broadcast, padded rows, src1 in [0, 1], src0 in a weights buffer
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 1000,  5, 4608, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   64, 13, 4608, {3, 2}, {2, 2}));

@@ -332,6 +332,11 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    // lattice drafters (DFlash2, DSpine, LiliCorr): keep only n_short drafts unless the longer draft's expected tokens
+    // pay for long_cost, the cost of a step with more than n_short drafts relative to one with n_short (0 = keep all)
+    int32_t n_short   = 0;
+    float   long_cost = 1.0f;
+
     bool n_auto = false; // server: pick the draft length (up to n_max) per step
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)

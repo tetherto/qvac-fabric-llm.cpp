@@ -17,6 +17,12 @@ std::vector<enum common_speculative_type> common_speculative_types_from_names(co
 // infer the spec types from the GGUF metadata of a draft model; empty if unknown
 std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
 
+// why the draft model of params cannot draft for the model at path_target, read from both GGUF headers, or empty:
+// a DFlash/DSpark model with another vocabulary (a d2t map does not change it), another n_embd, a target layer past
+// the model's last, or a DSpark Markov head without a positive block size; an external MTP head with another output
+// width or vocabulary. Empty for other speculative types and for unreadable headers, which the load reports itself.
+std::string common_speculative_draft_mismatch(const common_params & params, const std::string & path_target);
+
 // convert string to type
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
 
@@ -28,6 +34,11 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
 
 // return the max number of draft tokens from the initialized implementations
 int32_t common_speculative_n_max(const common_speculative * spec);
+
+// how many of the n drafts of a lattice path to keep: n_short when the expected accepted tokens of all n drafts do not
+// pay for long_cost, the cost of any step past n_short drafts relative to one with n_short. path_p[i] is the probability
+// of the path's transition i
+size_t common_speculative_lattice_keep(const float * path_p, size_t n, int32_t n_short, float long_cost);
 
 // validate and resolve the unconditional synthetic acceptance rates
 std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max);
