@@ -470,7 +470,9 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            // a sampled draft keeps its prefix: where p_min stops it depends on the tokens it sampled, so dropping a
+            // short one would hand the verifier drafts whose tokens no longer follow their q
+            if (!dp.result_q && dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
         }
@@ -2048,7 +2050,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            // a sampled draft keeps its prefix, as in the draft-model drafter
+            if (!dp.result_q && dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
         }
