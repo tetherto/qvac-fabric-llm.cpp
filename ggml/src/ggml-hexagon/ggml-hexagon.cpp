@@ -3248,6 +3248,13 @@ ggml_tensor * ggml_backend_hexagon_conv_taps_f32(ggml_context * ctx, ggml_backen
     return out;
 }
 
+static constexpr uint32_t HEXAGON_STRIDED_CONVERT_SCHED_MAX_ELEMS = 8192;
+
+static bool ggml_hexagon_cpy_beats_cpu_fallback(const struct htp_copy_kernel_params & kparams) {
+    return kparams.kernel_type != HTP_COPY_KERNEL_STRIDED_CONVERT ||
+           kparams.total_elems <= HEXAGON_STRIDED_CONVERT_SCHED_MAX_ELEMS;
+}
+
 // IMPORTANT: supports_op runs before buffer allocation and before tensor data is populated.
 // Never check buffer usage, buffer properties, or repacking state (is_tiled) here.
 // Support must depend only on static tensor properties (shape, type, strides).
@@ -3270,6 +3277,13 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_TRANSPOSE:
             supp = true;
             break;
+
+        case GGML_OP_CPY:
+        case GGML_OP_CONT: {
+            struct htp_copy_kernel_params kparams;
+            supp = htp_kparams_solve(sess, op, &kparams) && ggml_hexagon_cpy_beats_cpu_fallback(kparams);
+            break;
+        }
 
         default:
             supp = htp_kparams_check(sess, op);
