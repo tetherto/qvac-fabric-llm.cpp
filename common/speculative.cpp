@@ -1426,23 +1426,36 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                const int32_t n_rows = is_dflash2 ? n_block_tokens : params.n_max + 1;
+                const bool    read_p = params.p_min > 0.0f || params.n_short > 0;
+                const bool    keep_p = params.n_short > 0;
+
                 int32_t predecessor = 0;
                 std::vector<float> path_p;
-                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
+                if (keep_p) {
+                    path_p.reserve(n_rows);
+                }
+                for (int32_t i = 1; i < n_rows; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
                     const float * scores = row + top_k + (size_t) predecessor * top_k;
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
-                    const float p = lattice_argmax_prob(scores, top_k, predecessor);
-                    if (p < params.p_min) {
-                        break;
+                    if (read_p) {
+                        const float p = lattice_argmax_prob(scores, top_k, predecessor);
+                        if (p < params.p_min) {
+                            break;
+                        }
+                        if (keep_p) {
+                            path_p.push_back(p);
+                        }
                     }
                     result.push_back((llama_token) row[predecessor]);
-                    path_p.push_back(p);
                 }
-                result.resize(common_speculative_lattice_keep(path_p.data(), result.size(), params.n_short, params.long_cost));
+                if (keep_p) {
+                    result.resize(common_speculative_lattice_keep(path_p.data(), result.size(), params.n_short, params.long_cost));
+                }
 
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
