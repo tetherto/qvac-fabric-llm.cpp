@@ -9566,6 +9566,27 @@ static bool init_mul_mat_id_adreno_repack_tensors(ggml_context * ctx, int n_mats
     return roundtrip_ok;
 }
 
+// GGML_OP_MUL_MAT with f16 operands whose dot products exceed the fp16 range
+struct test_mul_mat_f16_large_sums : public test_mul_mat {
+    static constexpr float operand_min = 8.0f;
+    static constexpr float operand_max = 16.0f;
+    static constexpr const char * float_accumulating_reg = "OpenCL";
+
+    test_mul_mat_f16_large_sums(int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, m, n, k, {1, 1}, {1, 1}) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, operand_min, operand_max);
+        }
+    }
+
+    bool skip_backend(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), float_accumulating_reg) != 0;
+    }
+};
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -17187,6 +17208,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  4096, 128, 896, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  2304, 100, 136, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 20000,  64,  64, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_f16_large_sums(4096, 256, 768));
 
 #if 0
     // > 2^31-element dst (8.9 GB), about 45 GB peak memory. Too large to be enabled by default.

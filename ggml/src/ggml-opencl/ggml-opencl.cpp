@@ -595,6 +595,7 @@ struct ggml_backend_opencl_context;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
 static void ggml_cl_adreno_xmem_attn_release_scratch(ggml_backend_opencl_context * backend_ctx);
+static void ggml_cl_xmem_swapped_release_scratch(ggml_backend_opencl_context * backend_ctx);
 #endif
 
 // backend device context
@@ -796,6 +797,17 @@ static constexpr int Q6K_GEMM_NARROW_COLS = 4;
 #endif
 
 // backend context
+struct ggml_cl_xmem_swapped_scratch {
+    cl_mem weights      = nullptr;
+    size_t weight_bytes = 0;
+    cl_mem src_img      = nullptr;
+    size_t src_w        = 0;
+    size_t src_h        = 0;
+    cl_mem dst_img      = nullptr;
+    size_t dst_w        = 0;
+    size_t dst_h        = 0;
+};
+
 struct ggml_backend_opencl_context {
     int ref_count;
 
@@ -934,6 +946,7 @@ struct ggml_backend_opencl_context {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     ggml_cl_buffer prealloc_adreno_xmem_const;
     bool adreno_xmem_gemm_enabled = false;
+    ggml_cl_xmem_swapped_scratch xmem_swapped;
 #endif
 
     // prealloc buffers for MoE router table preprocess
@@ -1090,6 +1103,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_adreno_xmem_prepack_weight_f16;
     cl_kernel kernel_gemm_xmem_f16_f32_os8;
     cl_kernel kernel_adreno_xmem_store_dst_f32;
+    cl_kernel kernel_adreno_xmem_pack_src_f16;
+    cl_kernel kernel_gemm_xmem_f16_f32_os8_f32acc;
+    cl_kernel kernel_adreno_xmem_store_dst_f32_t;
     cl_kernel kernel_mul_mm_f16_f32_kqv;
     cl_kernel kernel_mul_mm_f16_f32_kq;
     cl_kernel kernel_mul_mat_q4_0_f32, kernel_mul_mat_q4_0_f32_v;
@@ -1708,6 +1724,7 @@ struct ggml_backend_opencl_context {
             dequant_f16_pool.clear();
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
             ggml_cl_adreno_xmem_attn_release_scratch(this);
+            ggml_cl_xmem_swapped_release_scratch(this);
 #endif
         }
     }
@@ -2393,6 +2410,15 @@ static size_t kquant_mc_subgroups(const ggml_backend_opencl_context * backend_ct
 // the GRU kernel keeps one hidden-state row in local memory, one work-item per hidden unit;
 // the same value sizes the kernel's local arrays and gates H in supports_op
 #define GGML_OPENCL_GRU_MAX_H 128
+#define GGML_OPENCL_XMEM_OS 8
+#define GGML_OPENCL_XMEM_CONST_BYTES 6144
+#define GGML_OPENCL_XMEM_MIN_K 64
+#define GGML_OPENCL_XMEM_K_ALIGN 8
+#define GGML_OPENCL_XMEM_SWAPPED_MIN_M 64
+#define GGML_OPENCL_XMEM_SWAPPED_MAX_M 2048
+#define GGML_OPENCL_XMEM_SWAPPED_MIN_N 2048
+#define GGML_OPENCL_XMEM_SWAPPED_MIN_SLICE 64
+#define GGML_OPENCL_XMEM_TEXEL_CHANNELS 4
 #define GGML_OPENCL_IM2COL_WG_MIN 64
 #define GGML_OPENCL_IM2COL_WG_MAX 256
 #define GGML_OPENCL_COL2IM_1D_WG 64
@@ -4078,6 +4104,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             clCreateKernel(prog, "kernel_gemm_xmem_f16_f32_os8", &err), err));
         CL_CHECK((backend_ctx->kernel_adreno_xmem_store_dst_f32 =
             clCreateKernel(prog, "adreno_xmem_store_dst_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_adreno_xmem_pack_src_f16 =
+            clCreateKernel(prog, "adreno_xmem_pack_src_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_xmem_f16_f32_os8_f32acc =
+            clCreateKernel(prog, "kernel_gemm_xmem_f16_f32_os8_f32acc", &err), err));
+        CL_CHECK((backend_ctx->kernel_adreno_xmem_store_dst_f32_t =
+            clCreateKernel(prog, "adreno_xmem_store_dst_f32_t", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -24746,6 +24778,266 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
     CL_CHECK(clReleaseMemObject(dst_img));
     CL_CHECK(clReleaseMemObject(src_img));
 }
+
+static size_t ggml_cl_xmem_swapped_weight_bytes(int K, int M) {
+    const size_t kpack = (size_t) (K / 4);
+    const size_t npack_padded = (size_t) CEIL_DIV(CEIL_DIV(M, 4), GGML_OPENCL_XMEM_OS) * GGML_OPENCL_XMEM_OS;
+    return kpack * npack_padded * 4u * sizeof(cl_half4);
+}
+
+static size_t ggml_cl_xmem_swapped_slice_width(const ggml_backend_opencl_context * backend_ctx, int K, int M, int N) {
+    const size_t src_column_bytes = (size_t) (K / 4) * GGML_OPENCL_XMEM_TEXEL_CHANNELS * sizeof(cl_half);
+    const size_t dst_column_bytes = (size_t) CEIL_DIV(M, 4) * GGML_OPENCL_XMEM_TEXEL_CHANNELS * sizeof(cl_float);
+    size_t width = MIN((size_t) N, backend_ctx->image2d_max_width);
+    width = MIN(width, backend_ctx->max_alloc_size / src_column_bytes);
+    width = MIN(width, backend_ctx->max_alloc_size / dst_column_bytes);
+    return width;
+}
+
+static bool ggml_cl_xmem_swapped_shapes_ok(const ggml_backend_opencl_context * backend_ctx,
+                                           const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        dst->ne[2]  != 1 || dst->ne[3]  != 1) {
+        return false;
+    }
+    const int K = src0->ne[0];
+    const int M = src1->ne[1];
+    const int N = src0->ne[1];
+    if (src1->ne[0] != K || dst->ne[0] != N || dst->ne[1] != M) {
+        return false;
+    }
+    if (K % GGML_OPENCL_XMEM_K_ALIGN != 0 || K < GGML_OPENCL_XMEM_MIN_K) {
+        return false;
+    }
+    if (M < GGML_OPENCL_XMEM_SWAPPED_MIN_M || M > GGML_OPENCL_XMEM_SWAPPED_MAX_M ||
+        N < GGML_OPENCL_XMEM_SWAPPED_MIN_N) {
+        return false;
+    }
+    const int kpack = K / 4;
+    const int npack = CEIL_DIV(M, 4);
+    if (static_cast<size_t>(kpack) > backend_ctx->image2d_max_height ||
+        static_cast<size_t>(npack) > backend_ctx->image2d_max_height) {
+        return false;
+    }
+    return ggml_cl_xmem_swapped_weight_bytes(K, M) <= backend_ctx->max_alloc_size &&
+           ggml_cl_xmem_swapped_slice_width(backend_ctx, K, M, N) >= GGML_OPENCL_XMEM_SWAPPED_MIN_SLICE;
+}
+
+static bool ggml_cl_can_use_adreno_xmem_gemm_swapped(
+        const ggml_backend_opencl_context * backend_ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst) {
+    if (!backend_ctx->adreno_xmem_gemm_enabled || backend_ctx->gpu_family != GPU_FAMILY::ADRENO) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    return ggml_cl_xmem_swapped_shapes_ok(backend_ctx, src0, src1, dst);
+}
+
+static void ggml_cl_xmem_release_mem(cl_mem & mem) {
+    if (mem) {
+        CL_CHECK(clReleaseMemObject(mem));
+        mem = nullptr;
+    }
+}
+
+static void ggml_cl_xmem_swapped_release_scratch(ggml_backend_opencl_context * backend_ctx) {
+    ggml_cl_xmem_release_mem(backend_ctx->xmem_swapped.weights);
+    ggml_cl_xmem_release_mem(backend_ctx->xmem_swapped.src_img);
+    ggml_cl_xmem_release_mem(backend_ctx->xmem_swapped.dst_img);
+    backend_ctx->xmem_swapped = ggml_cl_xmem_swapped_scratch();
+}
+
+static bool ggml_cl_xmem_grow_image(ggml_backend_opencl_context * backend_ctx, cl_mem & img, size_t & img_w, size_t & img_h,
+                                    cl_channel_type channel_type, size_t width, size_t height) {
+    if (img != nullptr && img_w >= width && img_h >= height) {
+        return true;
+    }
+    ggml_cl_xmem_release_mem(img);
+    cl_image_format fmt = {};
+    fmt.image_channel_order = CL_RGBA;
+    fmt.image_channel_data_type = channel_type;
+    cl_image_desc desc = {};
+    desc.image_type = CL_MEM_OBJECT_IMAGE2D;
+    desc.image_width = width;
+    desc.image_height = height;
+    cl_int err = CL_SUCCESS;
+    img = clCreateImage(backend_ctx->context, CL_MEM_READ_WRITE, &fmt, &desc, nullptr, &err);
+    if (err != CL_SUCCESS) {
+        img = nullptr;
+    }
+    img_w = img ? width : 0;
+    img_h = img ? height : 0;
+    return img != nullptr;
+}
+
+static bool ggml_cl_xmem_grow_weights(ggml_backend_opencl_context * backend_ctx, size_t weight_bytes) {
+    ggml_cl_xmem_swapped_scratch & scratch = backend_ctx->xmem_swapped;
+    if (scratch.weights != nullptr && scratch.weight_bytes >= weight_bytes) {
+        return true;
+    }
+    ggml_cl_xmem_release_mem(scratch.weights);
+    cl_int err = CL_SUCCESS;
+    scratch.weights = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, weight_bytes, nullptr, &err);
+    if (err != CL_SUCCESS) {
+        scratch.weights = nullptr;
+    }
+    scratch.weight_bytes = scratch.weights ? weight_bytes : 0;
+    return scratch.weights != nullptr;
+}
+
+static bool ggml_cl_xmem_swapped_ensure_scratch(ggml_backend_opencl_context * backend_ctx, size_t weight_bytes,
+                                                size_t slice_width, size_t kpack, size_t npack) {
+    ggml_cl_xmem_swapped_scratch & scratch = backend_ctx->xmem_swapped;
+    return ggml_cl_xmem_grow_weights(backend_ctx, weight_bytes) &&
+           ggml_cl_xmem_grow_image(backend_ctx, scratch.src_img, scratch.src_w, scratch.src_h, CL_HALF_FLOAT, slice_width, kpack) &&
+           ggml_cl_xmem_grow_image(backend_ctx, scratch.dst_img, scratch.dst_w, scratch.dst_h, CL_FLOAT, slice_width, npack);
+}
+
+static void ggml_cl_xmem_prepack_weights_f16(ggml_backend_opencl_context * backend_ctx, cl_mem weights,
+                                             cl_mem src, cl_ulong offset, int K, int M, int kpack,
+                                             int npack_padded, const ggml_tensor * dst) {
+    const int os = GGML_OPENCL_XMEM_OS;
+    cl_kernel prepack = backend_ctx->kernel_adreno_xmem_prepack_weight_f16;
+    CL_CHECK(clSetKernelArg(prepack, 0, sizeof(cl_mem),   &weights));
+    CL_CHECK(clSetKernelArg(prepack, 1, sizeof(cl_mem),   &src));
+    CL_CHECK(clSetKernelArg(prepack, 2, sizeof(cl_ulong), &offset));
+    CL_CHECK(clSetKernelArg(prepack, 3, sizeof(int),      &K));
+    CL_CHECK(clSetKernelArg(prepack, 4, sizeof(int),      &M));
+    CL_CHECK(clSetKernelArg(prepack, 5, sizeof(int),      &kpack));
+    CL_CHECK(clSetKernelArg(prepack, 6, sizeof(int),      &npack_padded));
+    CL_CHECK(clSetKernelArg(prepack, 7, sizeof(int),      &os));
+    size_t lws = MIN((size_t) 256, (size_t) backend_ctx->get_kernel_workgroup_size(prepack));
+    size_t gws = CEIL_DIV(static_cast<size_t>(kpack) * static_cast<size_t>(npack_padded), lws) * lws;
+    backend_ctx->enqueue_ndrange_kernel(prepack, 1, &gws, &lws, dst);
+}
+
+struct ggml_cl_xmem_swapped_job {
+    cl_mem   weights;
+    cl_mem   src_img;
+    cl_mem   dst_img;
+    cl_mem   stream;
+    cl_ulong offset_stream;
+    cl_mem   out;
+    cl_ulong offset_out;
+    int      K;
+    int      M;
+    int      N_full;
+    int      kpack;
+    int      npack;
+};
+
+static void ggml_cl_xmem_swapped_pack_slice(ggml_backend_opencl_context * backend_ctx,
+                                            const ggml_cl_xmem_swapped_job & job, int n0, int N,
+                                            const ggml_tensor * dst) {
+    const cl_ulong offset = job.offset_stream + (cl_ulong) n0 * (cl_ulong) job.K * sizeof(ggml_fp16_t);
+    cl_kernel pack = backend_ctx->kernel_adreno_xmem_pack_src_f16;
+    CL_CHECK(clSetKernelArg(pack, 0, sizeof(cl_mem),   &job.stream));
+    CL_CHECK(clSetKernelArg(pack, 1, sizeof(cl_ulong), &offset));
+    CL_CHECK(clSetKernelArg(pack, 2, sizeof(cl_mem),   &job.src_img));
+    CL_CHECK(clSetKernelArg(pack, 3, sizeof(int),      &job.K));
+    CL_CHECK(clSetKernelArg(pack, 4, sizeof(int),      &N));
+    size_t lws[2] = { 16, 16 };
+    size_t gws[2] = {
+        CEIL_DIV(static_cast<size_t>(N), lws[0])*lws[0],
+        CEIL_DIV(static_cast<size_t>(job.kpack), lws[1])*lws[1]
+    };
+    backend_ctx->enqueue_ndrange_kernel(pack, 2, gws, lws, dst);
+}
+
+static void ggml_cl_xmem_swapped_gemm_slice(ggml_backend_opencl_context * backend_ctx,
+                                            const ggml_cl_xmem_swapped_job & job, int N, const ggml_tensor * dst) {
+    cl_kernel gemm = backend_ctx->kernel_gemm_xmem_f16_f32_os8_f32acc;
+    CL_CHECK(clSetKernelArg(gemm, 0, sizeof(cl_mem), &job.weights));
+    CL_CHECK(clSetKernelArg(gemm, 1, sizeof(cl_mem), &backend_ctx->prealloc_adreno_xmem_const.buffer));
+    CL_CHECK(clSetKernelArg(gemm, 2, sizeof(cl_mem), &job.src_img));
+    CL_CHECK(clSetKernelArg(gemm, 3, sizeof(cl_mem), &job.dst_img));
+    CL_CHECK(clSetKernelArg(gemm, 4, sizeof(int),    &N));
+    CL_CHECK(clSetKernelArg(gemm, 5, sizeof(int),    &job.npack));
+    CL_CHECK(clSetKernelArg(gemm, 6, sizeof(int),    &job.kpack));
+    const size_t z_values = CEIL_DIV(static_cast<size_t>(job.npack), static_cast<size_t>(GGML_OPENCL_XMEM_OS));
+    size_t lws[3] = { 64, 1, 1 };
+    size_t gws[3] = { z_values*lws[0], CEIL_DIV(static_cast<size_t>(N), lws[0]), 1 };
+    backend_ctx->enqueue_ndrange_kernel(gemm, 3, gws, lws, dst);
+}
+
+static void ggml_cl_xmem_swapped_store_slice(ggml_backend_opencl_context * backend_ctx,
+                                             const ggml_cl_xmem_swapped_job & job, int n0, int N,
+                                             const ggml_tensor * dst) {
+    cl_kernel store = backend_ctx->kernel_adreno_xmem_store_dst_f32_t;
+    CL_CHECK(clSetKernelArg(store, 0, sizeof(cl_mem),   &job.dst_img));
+    CL_CHECK(clSetKernelArg(store, 1, sizeof(cl_mem),   &job.out));
+    CL_CHECK(clSetKernelArg(store, 2, sizeof(cl_ulong), &job.offset_out));
+    CL_CHECK(clSetKernelArg(store, 3, sizeof(int),      &job.M));
+    CL_CHECK(clSetKernelArg(store, 4, sizeof(int),      &N));
+    CL_CHECK(clSetKernelArg(store, 5, sizeof(int),      &job.N_full));
+    CL_CHECK(clSetKernelArg(store, 6, sizeof(int),      &n0));
+    size_t lws[2] = { 64, 4 };
+    size_t gws[2] = {
+        CEIL_DIV(static_cast<size_t>(N), lws[0])*lws[0],
+        CEIL_DIV(static_cast<size_t>(job.npack), lws[1])*lws[1]
+    };
+    backend_ctx->enqueue_ndrange_kernel(store, 2, gws, lws, dst);
+}
+
+static void ggml_cl_xmem_swapped_run_slices(ggml_backend_opencl_context * backend_ctx,
+                                            const ggml_cl_xmem_swapped_job & job, int N_step, const ggml_tensor * dst) {
+    for (int n0 = 0; n0 < job.N_full; n0 += N_step) {
+        const int N = std::min(N_step, job.N_full - n0);
+        ggml_cl_xmem_swapped_pack_slice(backend_ctx, job, n0, N, dst);
+        ggml_cl_xmem_swapped_gemm_slice(backend_ctx, job, N, dst);
+        ggml_cl_xmem_swapped_store_slice(backend_ctx, job, n0, N, dst);
+    }
+}
+
+static bool ggml_cl_mul_mat_f16_f16_adreno_xmem_swapped(
+        ggml_backend_t backend,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    ggml_cl_xmem_swapped_job job;
+    job.stream        = extra0->data_device;
+    job.offset_stream = extra0->offset + src0->view_offs;
+    job.out           = extrad->data_device;
+    job.offset_out    = extrad->offset + dst->view_offs;
+    job.K             = src0->ne[0];
+    job.M             = src1->ne[1];
+    job.N_full        = src0->ne[1];
+    job.kpack         = job.K / 4;
+    job.npack         = CEIL_DIV(job.M, 4);
+
+    const int npack_padded = CEIL_DIV(job.npack, GGML_OPENCL_XMEM_OS)*GGML_OPENCL_XMEM_OS;
+    const size_t slice_width = ggml_cl_xmem_swapped_slice_width(backend_ctx, job.K, job.M, job.N_full);
+    const size_t weight_bytes = ggml_cl_xmem_swapped_weight_bytes(job.K, job.M);
+
+    if (!ggml_cl_xmem_swapped_ensure_scratch(backend_ctx, weight_bytes, slice_width, (size_t) job.kpack, (size_t) job.npack)) {
+        ggml_cl_xmem_swapped_release_scratch(backend_ctx);
+        return false;
+    }
+    job.weights = backend_ctx->xmem_swapped.weights;
+    job.src_img = backend_ctx->xmem_swapped.src_img;
+    job.dst_img = backend_ctx->xmem_swapped.dst_img;
+
+    backend_ctx->prealloc_adreno_xmem_const.allocate(backend_ctx->context, GGML_OPENCL_XMEM_CONST_BYTES);
+
+    ggml_cl_xmem_prepack_weights_f16(backend_ctx, job.weights, extra1->data_device, extra1->offset + src1->view_offs,
+                                     job.K, job.M, job.kpack, npack_padded, dst);
+    ggml_cl_xmem_swapped_run_slices(backend_ctx, job, (int) slice_width, dst);
+    return true;
+}
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
 static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -31464,6 +31756,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         ggml_cl_fwht(backend, src1, dst);
         return;
     }
+
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    if (ggml_cl_can_use_adreno_xmem_gemm_swapped(backend_ctx, src0, src1, dst) &&
+        ggml_cl_mul_mat_f16_f16_adreno_xmem_swapped(backend, src0, src1, dst)) {
+        return;
+    }
+#endif
 
     // quant kv without FA
     // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
