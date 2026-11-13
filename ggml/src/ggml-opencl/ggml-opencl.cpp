@@ -9829,13 +9829,24 @@ static void ggml_cl_free(ggml_backend_t backend) {
 }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+#define GGML_OPENCL_TRANSPOSE_TILE 32
+#define GGML_OPENCL_TRANSPOSE_TILE_ROWS 8
+
+static void transpose_launch_dims(cl_int ldi, cl_int ldo, size_t global[3], size_t local[3]) {
+    local[0]  = GGML_OPENCL_TRANSPOSE_TILE;
+    local[1]  = GGML_OPENCL_TRANSPOSE_TILE_ROWS;
+    local[2]  = 1;
+    global[0] = (size_t) CEIL_DIV(ldi, GGML_OPENCL_TRANSPOSE_TILE) * GGML_OPENCL_TRANSPOSE_TILE;
+    global[1] = (size_t) CEIL_DIV(ldo, GGML_OPENCL_TRANSPOSE_TILE) * GGML_OPENCL_TRANSPOSE_TILE_ROWS;
+    global[2] = 1;
+}
+
 static void transpose_2d(
     ggml_backend_opencl_context * backend_ctx,
     cl_kernel kernel,
     cl_mem src, cl_mem dst, size_t size,
     cl_int stride, cl_int rows,
-    bool blocking = true,
-    bool auto_local = false // let driver pick local size for non-uniform workgroups
+    bool blocking = true
 ) {
     static ggml_cl_buffer buf;
 
@@ -9858,10 +9869,10 @@ static void transpose_2d(
     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_int), &stride));
     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_int), &rows));
 
-    size_t local_size[3] = {64, 1, 1};
-    size_t global_size[3] = {(size_t)stride, (size_t)rows, 1};;
+    size_t local_size[3], global_size[3];
+    transpose_launch_dims(stride, rows, global_size, local_size);
     CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL,
-        global_size, auto_local ? NULL : local_size, 0, NULL, NULL));
+        global_size, local_size, 0, NULL, NULL));
 
     if (blocking) {
         CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, trans, dst, 0, 0, size, 0, NULL, &evt));
@@ -9878,33 +9889,30 @@ static void transpose_2d_as_8b(
     ggml_backend_opencl_context * backend_ctx,
     cl_mem src, cl_mem dst, size_t size,
     cl_int stride, cl_int rows,
-    bool blocking = true,
-    bool auto_local = false
+    bool blocking = true
 ) {
     transpose_2d(backend_ctx, backend_ctx->kernel_transpose_8_buf,
-        src, dst, size, stride, rows, blocking, auto_local);
+        src, dst, size, stride, rows, blocking);
 }
 
 static void transpose_2d_as_16b(
     ggml_backend_opencl_context * backend_ctx,
     cl_mem src, cl_mem dst, size_t size,
     cl_int stride, cl_int rows,
-    bool blocking = true,
-    bool auto_local = false
+    bool blocking = true
 ) {
     transpose_2d(backend_ctx, backend_ctx->kernel_transpose_16_buf,
-        src, dst, size, stride, rows, blocking, auto_local);
+        src, dst, size, stride, rows, blocking);
 }
 
 static void transpose_2d_as_32b(
     ggml_backend_opencl_context * backend_ctx,
     cl_mem src, cl_mem dst, size_t size,
     cl_int stride, cl_int rows,
-    bool blocking = true,
-    bool auto_local = false
+    bool blocking = true
 ) {
     transpose_2d(backend_ctx, backend_ctx->kernel_transpose_32_buf,
-        src, dst, size, stride, rows, blocking, auto_local);
+        src, dst, size, stride, rows, blocking);
 }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
@@ -13919,9 +13927,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         if (extra->noshuffle) {
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/4, m, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->sc, extra->sc, size_sc, k/16, m, true, true);
-            transpose_2d_as_32b(backend_ctx, extra->dm, extra->dm, size_dm, k/(int)blck, m, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/4, m, true);
+            transpose_2d_as_8b(backend_ctx, extra->sc, extra->sc, size_sc, k/16, m, true);
+            transpose_2d_as_32b(backend_ctx, extra->dm, extra->dm, size_dm, k/(int)blck, m, true);
         }
 #endif
 
@@ -14002,10 +14010,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         if (extra->noshuffle) {
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/4, m, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->hm, extra->hm, size_hm, k/8, m, true, true);
-            transpose_2d_as_32b(backend_ctx, extra->sc, extra->sc, size_sc, 3*k/(int)blck, m, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/(int)blck, m, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/4, m, true);
+            transpose_2d_as_8b(backend_ctx, extra->hm, extra->hm, size_hm, k/8, m, true);
+            transpose_2d_as_32b(backend_ctx, extra->sc, extra->sc, size_sc, 3*k/(int)blck, m, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/(int)blck, m, true);
         }
 #endif
 
@@ -14089,11 +14097,11 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         if (extra->noshuffle) {
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/4, m, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->sg, extra->sg, size_sg, k/8, m, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->qh, extra->qh, size_qh, k/32, m, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->sc, extra->sc, size_sc, k/64, m, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/256, m, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/4, m, true);
+            transpose_2d_as_8b(backend_ctx, extra->sg, extra->sg, size_sg, k/8, m, true);
+            transpose_2d_as_8b(backend_ctx, extra->qh, extra->qh, size_qh, k/32, m, true);
+            transpose_2d_as_8b(backend_ctx, extra->sc, extra->sc, size_sc, k/64, m, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/256, m, true);
         }
 #endif
 
@@ -14166,9 +14174,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         if (extra->noshuffle) {
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/4, m, true, true);
-            transpose_2d_as_32b(backend_ctx, extra->sas, extra->sas, size_sas, k/32, m, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/256, m, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/4, m, true);
+            transpose_2d_as_32b(backend_ctx, extra->sas, extra->sas, size_sas, k/32, m, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/256, m, true);
         }
 #endif
 
@@ -14239,9 +14247,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         if (extra->noshuffle) {
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/8, m, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->qh, extra->qh, size_qh, k/16, m, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->sc, extra->sc, size_sc, k/64, m, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/8, m, true);
+            transpose_2d_as_8b(backend_ctx, extra->qh, extra->qh, size_qh, k/16, m, true);
+            transpose_2d_as_16b(backend_ctx, extra->sc, extra->sc, size_sc, k/64, m, true);
         }
 #endif
 
@@ -14312,9 +14320,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         if (extra->noshuffle) {
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/8, m, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->qh, extra->qh, size_qh, k/32, m, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/(int)blck, m, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/8, m, true);
+            transpose_2d_as_16b(backend_ctx, extra->qh, extra->qh, size_qh, k/32, m, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/(int)blck, m, true);
         }
 #endif
 
@@ -14397,11 +14405,11 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         if (extra->noshuffle) {
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/8, m, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->sg, extra->sg, size_sg, k/8, m, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->qh, extra->qh, size_qh, k/32, m, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->sc, extra->sc, size_sc, k/32, m, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/(int)blck, m, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/8, m, true);
+            transpose_2d_as_8b(backend_ctx, extra->sg, extra->sg, size_sg, k/8, m, true);
+            transpose_2d_as_8b(backend_ctx, extra->qh, extra->qh, size_qh, k/32, m, true);
+            transpose_2d_as_8b(backend_ctx, extra->sc, extra->sc, size_sc, k/32, m, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/(int)blck, m, true);
         }
 #endif
 
@@ -14474,9 +14482,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         if (extra->noshuffle) {
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_16b(backend_ctx, extra->qs, extra->qs, size_qs, k/8, m, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->sc, extra->sc, size_sc, k/32, m, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/(int)blck, m, true, true);
+            transpose_2d_as_16b(backend_ctx, extra->qs, extra->qs, size_qs, k/8, m, true);
+            transpose_2d_as_8b(backend_ctx, extra->sc, extra->sc, size_sc, k/32, m, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/(int)blck, m, true);
         }
 #endif
 
@@ -14547,9 +14555,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         if (extra->noshuffle) {
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/8, m, true, true);
-            transpose_2d_as_32b(backend_ctx, extra->sas, extra->sas, size_sas, k/32, m, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/(int)blck, m, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/8, m, true);
+            transpose_2d_as_32b(backend_ctx, extra->sas, extra->sas, size_sas, k/32, m, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/(int)blck, m, true);
         }
 #endif
 
@@ -14695,8 +14703,8 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         if (extra->noshuffle) {
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/4, m, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/64, m, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/4, m, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, k/64, m, true);
         }
 #endif
 
@@ -15821,7 +15829,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             transpose_2d_as_16b(backend_ctx, extra->dm, extra->dm, size_dm, K/256, M);
 
             // Transpose s as uchar
-            transpose_2d_as_8b(backend_ctx, extra->s, extra->s, size_s, K/256*12, M, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->s, extra->s, size_s, K/256*12, M, true);
         }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
         return;
@@ -16023,7 +16031,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 CL_CHECK((extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &wimg_fmt, &wimg_desc, NULL, &err), err));
 
                 // Transpose s as uchar
-                transpose_2d_as_8b(backend_ctx, extra->s, extra->s, size_s, K/256*12, M, true, true);
+                transpose_2d_as_8b(backend_ctx, extra->s, extra->s, size_s, K/256*12, M, true);
             } else {
                 // Transpose q as ushort
                 transpose_2d_as_16b(backend_ctx, extra->q, extra->q, size_q, K/4, M);
@@ -16356,9 +16364,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             dm = buf_dm.buffer;
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/4, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->sc, sc, extra->size_sc, m, k/16, true, true);
-            transpose_2d_as_32b(backend_ctx, extra->dm, dm, extra->size_dm, m, k/(int)blck, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/4, true);
+            transpose_2d_as_8b(backend_ctx, extra->sc, sc, extra->size_sc, m, k/16, true);
+            transpose_2d_as_32b(backend_ctx, extra->dm, dm, extra->size_dm, m, k/(int)blck, true);
         }
 #endif
         cl_kernel kernel = extra->noshuffle ? backend_ctx->kernel_restore_block_q2_k_noshuffle
@@ -16404,10 +16412,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             d = buf_d.buffer;
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/4, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->hm, hm, extra->size_hm, m, k/8, true, true);
-            transpose_2d_as_32b(backend_ctx, extra->sc, sc, extra->size_sc, m, 3*k/(int)blck, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/(int)blck, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/4, true);
+            transpose_2d_as_8b(backend_ctx, extra->hm, hm, extra->size_hm, m, k/8, true);
+            transpose_2d_as_32b(backend_ctx, extra->sc, sc, extra->size_sc, m, 3*k/(int)blck, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/(int)blck, true);
         }
 #endif
         cl_kernel kernel = extra->noshuffle ? backend_ctx->kernel_restore_block_q3_k_noshuffle
@@ -16462,11 +16470,11 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
 
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/4, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->sg, sg, extra->size_sg, m, k/8, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->qh, qh, extra->size_qh, m, k/32, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->sc, sc, extra->size_sc, m, k/64, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/256, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/4, true);
+            transpose_2d_as_8b(backend_ctx, extra->sg, sg, extra->size_sg, m, k/8, true);
+            transpose_2d_as_8b(backend_ctx, extra->qh, qh, extra->size_qh, m, k/32, true);
+            transpose_2d_as_8b(backend_ctx, extra->sc, sc, extra->size_sc, m, k/64, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/256, true);
         }
 #endif
 
@@ -16518,9 +16526,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
 
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/4, true, true);
-            transpose_2d_as_32b(backend_ctx, extra->sas, sas, extra->size_sas, m, k/32, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/256, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/4, true);
+            transpose_2d_as_32b(backend_ctx, extra->sas, sas, extra->size_sas, m, k/32, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/256, true);
         }
 #endif
 
@@ -16568,9 +16576,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             sc = buf_sc.buffer;
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/8, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->qh, qh, extra->size_qh, m, k/16, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->sc, sc, extra->size_sc, m, k/64, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/8, true);
+            transpose_2d_as_8b(backend_ctx, extra->qh, qh, extra->size_qh, m, k/16, true);
+            transpose_2d_as_16b(backend_ctx, extra->sc, sc, extra->size_sc, m, k/64, true);
         }
 #endif
         cl_kernel kernel = backend_ctx->kernel_restore_block_iq1_m;
@@ -16617,9 +16625,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             d = buf_d.buffer;
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/8, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->qh, qh, extra->size_qh, m, k/32, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/(int)blck, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/8, true);
+            transpose_2d_as_16b(backend_ctx, extra->qh, qh, extra->size_qh, m, k/32, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/(int)blck, true);
         }
 #endif
         cl_kernel kernel = backend_ctx->kernel_restore_block_iq1_s;
@@ -16670,11 +16678,11 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             d = buf_d.buffer;
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/8, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->sg, sg, extra->size_sg, m, k/8, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->qh, qh, extra->size_qh, m, k/32, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->sc, sc, extra->size_sc, m, k/32, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/(int)blck, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/8, true);
+            transpose_2d_as_8b(backend_ctx, extra->sg, sg, extra->size_sg, m, k/8, true);
+            transpose_2d_as_8b(backend_ctx, extra->qh, qh, extra->size_qh, m, k/32, true);
+            transpose_2d_as_8b(backend_ctx, extra->sc, sc, extra->size_sc, m, k/32, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/(int)blck, true);
         }
 #endif
         cl_kernel kernel = backend_ctx->kernel_restore_block_iq2_s;
@@ -16723,9 +16731,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             d = buf_d.buffer;
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_16b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/8, true, true);
-            transpose_2d_as_8b(backend_ctx, extra->sc, sc, extra->size_sc, m, k/32, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/(int)blck, true, true);
+            transpose_2d_as_16b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/8, true);
+            transpose_2d_as_8b(backend_ctx, extra->sc, sc, extra->size_sc, m, k/32, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/(int)blck, true);
         }
 #endif
         cl_kernel kernel = backend_ctx->kernel_restore_block_iq2_xs;
@@ -16772,9 +16780,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             d = buf_d.buffer;
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/8, true, true);
-            transpose_2d_as_32b(backend_ctx, extra->sas, sas, extra->size_sas, m, k/32, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/(int)blck, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/8, true);
+            transpose_2d_as_32b(backend_ctx, extra->sas, sas, extra->size_sas, m, k/32, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/(int)blck, true);
         }
 #endif
         cl_kernel kernel = backend_ctx->kernel_restore_block_iq2_xxs;
@@ -16883,8 +16891,8 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             d = buf_d.buffer;
             const int m = tensor->ne[1];
             const int k = tensor->ne[0];
-            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/4, true, true);
-            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/64, true, true);
+            transpose_2d_as_8b(backend_ctx, extra->qs, qs, extra->size_qs, m, k/4, true);
+            transpose_2d_as_16b(backend_ctx, extra->d, d, extra->size_d, m, k/64, true);
         }
 #endif
 
@@ -17645,7 +17653,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             }
             transpose_2d_as_16b(backend_ctx, extra->d,  buf_trans_d.buffer,  size_d,  M, K/256);
             transpose_2d_as_16b(backend_ctx, extra->dm, buf_trans_dm.buffer, size_dm, M, K/256);
-            transpose_2d_as_8b (backend_ctx, extra->s,  buf_trans_s.buffer,  size_s,  M, K/256*12, true, true);
+            transpose_2d_as_8b (backend_ctx, extra->s,  buf_trans_s.buffer,  size_s,  M, K/256*12, true);
 
             cl_kernel kernel = backend_ctx->kernel_restore_block_q4_K_noshuffle;
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &buf_trans_q.buffer));
@@ -17759,7 +17767,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
 
             if (use_q5_k_bin_kernels(backend_ctx, tensor)) {
                 transpose_2d_as_32b(backend_ctx, extra->q, buf_trans_q.buffer, size_q, M, K/8);
-                transpose_2d_as_8b (backend_ctx, extra->s,  buf_trans_s.buffer,  size_s,  M, K/256*12, true, true);
+                transpose_2d_as_8b (backend_ctx, extra->s,  buf_trans_s.buffer,  size_s,  M, K/256*12, true);
                 buf_s = buf_trans_s.buffer;
             } else {
                 transpose_2d_as_16b(backend_ctx, extra->q, buf_trans_q.buffer, size_q, M, K/4);
