@@ -241,6 +241,7 @@ set(GGML_OPENCL_KERNELS
     leaky_relu
     sin
     cos
+    argmax
     tsembd
     upscale
     tanh
