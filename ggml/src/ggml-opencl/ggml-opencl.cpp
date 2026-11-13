@@ -1312,6 +1312,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_affine_prelu_f32;
     cl_kernel kernel_snake_f32;
     cl_kernel kernel_leaky_relu_f32, kernel_leaky_relu_f32_4;
+    cl_kernel kernel_sin_f32, kernel_sin_f32_4;
     cl_kernel kernel_timestep_embedding;
     cl_kernel kernel_gemv_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns_bin;
     cl_kernel kernel_gemm_moe_q8_0_f32_ns;
@@ -5077,6 +5078,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_leaky_relu_f32 = clCreateKernel(prog, "kernel_leaky_relu_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_leaky_relu_f32_4 = clCreateKernel(prog, "kernel_leaky_relu_f32_4", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "sin.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("sin.cl");
+#endif
+        cl_program prog =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_sin_f32 = clCreateKernel(prog, "kernel_sin_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_sin_f32_4 = clCreateKernel(prog, "kernel_sin_f32_4", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -12520,6 +12537,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                    op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
         case GGML_OP_LEAKY_RELU:
+        case GGML_OP_SIN:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]);
         case GGML_OP_SNAKE:
@@ -21862,6 +21880,14 @@ static void ggml_cl_leaky_relu(ggml_backend_t backend, const ggml_tensor * src0,
 
     ggml_cl_unary_f32(backend, src0, dst, backend_ctx->kernel_leaky_relu_f32, backend_ctx->kernel_leaky_relu_f32_4,
                       &negative_slope);
+}
+
+static void ggml_cl_sin(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_UNUSED(src1);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_cl_unary_f32(backend, src0, dst, backend_ctx->kernel_sin_f32, backend_ctx->kernel_sin_f32_4, nullptr);
 }
 
 static void ggml_cl_channel_shuffle(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -39378,6 +39404,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_leaky_relu;
+            break;
+        case GGML_OP_SIN:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_sin;
             break;
         case GGML_OP_TIMESTEP_EMBEDDING:
             if (!any_on_device) {
