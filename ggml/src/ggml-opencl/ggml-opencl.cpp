@@ -1048,7 +1048,7 @@ struct ggml_backend_opencl_context {
 #endif
     cl_kernel kernel_top_k_f32, kernel_top_k_merge_f32;
     cl_kernel kernel_lightning_indexer;
-    cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_i32, kernel_get_rows_q4_0;
+    cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_i32, kernel_get_rows_q4_0, kernel_get_rows_q8_0_soa;
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
     cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
     cl_kernel kernel_set_rows_q8_0_soa_i64, kernel_set_rows_q8_0_soa_i32;
@@ -2816,6 +2816,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_get_rows_i32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_i32", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_f16  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_q4_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q4_0", &err), err));
+        CL_CHECK((backend_ctx->kernel_get_rows_q8_0_soa = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q8_0_soa", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -12334,7 +12335,21 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     return op->type == GGML_TYPE_I32;
                 case GGML_TYPE_F32:
                 case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:
                     return true;
+                case GGML_TYPE_Q8_0:
+#ifdef GGML_OPENCL_SOA_Q
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+                    if (enable_adreno_trans_weight(backend_ctx, op->src[0]->view_src ? op->src[0]->view_src : op->src[0])) {
+                        return false;
+                    }
+#endif // GGML_OPENCL_USE_ADRENO_KERNELS
+                    // a tensor without a buffer has no layout yet; once allocated, only the SOA layout is readable
+                    return op->src[0]->view_offs % ggml_type_size(GGML_TYPE_Q8_0) == 0 &&
+                           (op->src[0]->buffer == nullptr || ggml_cl_is_q8_0_soa(op->src[0]));
+#else // GGML_OPENCL_SOA_Q
+                    return false;
+#endif // GGML_OPENCL_SOA_Q
                 case GGML_TYPE_Q4_0:
 #ifdef GGML_OPENCL_SOA_Q
                     // We do not support flattened Q4_0 (and possibly other Q's)
@@ -18581,6 +18596,68 @@ static void ggml_cl_nop(ggml_backend_t backend, const ggml_tensor * src0, const 
     UNUSED(dst);
 }
 
+static void ggml_cl_get_rows_q8_0_soa(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_TENSOR_LOCALS(int,      ne0, src0, ne);
+    GGML_TENSOR_LOCALS(int,      ne1, src1, ne);
+    GGML_TENSOR_LOCALS(cl_ulong, nb1, src1, nb);
+    GGML_TENSOR_LOCALS(cl_ulong, nb,  dst,  nb);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    GGML_ASSERT(ggml_cl_is_q8_0_soa(src0) && "Q8_0 get_rows reads the SOA layout only");
+    const ggml_tensor * soa0_src = src0->view_src != nullptr ? src0->view_src : src0;
+    ggml_tensor_extra_cl_q8_0 * extra0_q8_0 = (ggml_tensor_extra_cl_q8_0 *)soa0_src->extra;
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    const cl_ulong block_bytes = ggml_type_size(GGML_TYPE_Q8_0);
+    const cl_ulong block_elems = ggml_blck_size(GGML_TYPE_Q8_0);
+    GGML_ASSERT(src0->view_offs % block_bytes == 0);
+    const cl_ulong view_blocks = src0->view_offs / block_bytes;
+
+    cl_ulong offset_q = view_blocks * block_elems;
+    cl_ulong offset_d = view_blocks * sizeof(ggml_fp16_t);
+    cl_ulong offset1  = extra1->offset + src1->view_offs;
+    cl_ulong offsetd  = extrad->offset + dst->view_offs;
+
+    GGML_ASSERT(src0->nb[1] % block_bytes == 0 && src0->nb[2] % block_bytes == 0 && src0->nb[3] % block_bytes == 0);
+    cl_ulong nblk01 = src0->nb[1] / block_bytes;
+    cl_ulong nblk02 = src0->nb[2] / block_bytes;
+    cl_ulong nblk03 = src0->nb[3] / block_bytes;
+
+    cl_kernel kernel = backend_ctx->kernel_get_rows_q8_0_soa;
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q8_0->q));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset_q));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra0_q8_0->d));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset_d));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nblk01));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nblk02));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nblk03));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne10));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb10));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb11));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb12));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb3));
+
+    int max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
+    int nth = 1;
+    while (nth < ne00 && 2*nth <= max_workgroup_size) {
+        nth *= 2;
+    }
+
+    size_t global_work_size[] = {(size_t)ne10*nth, (size_t)ne11, (size_t)ne12};
+    size_t local_work_size[] = {(size_t)nth, 1, 1};
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -18608,6 +18685,11 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
 
     cl_kernel kernel;
 
+    if (src0->type == GGML_TYPE_Q8_0) {
+        ggml_cl_get_rows_q8_0_soa(backend, src0, src1, dst);
+        return;
+    }
+
     switch (src0->type) {
         case GGML_TYPE_F32:
             kernel = backend_ctx->kernel_get_rows_f32;
@@ -18616,6 +18698,7 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
             kernel = backend_ctx->kernel_get_rows_i32;
             break;
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
             kernel = backend_ctx->kernel_get_rows_f16;
             break;
         case GGML_TYPE_Q4_0:
