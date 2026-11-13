@@ -142,6 +142,53 @@ static __global__ void soft_max_f32(
     }
 }
 
+// rows of at most this many values take soft_max_f32_short_rows when there are enough of them
+#define CUDA_SOFT_MAX_SHORT_ROW 32
+// fewest rows for that kernel: below this the call is too small to matter and the block-per-row kernels are kept
+#define CUDA_SOFT_MAX_SHORT_ROW_MIN_ROWS 4096
+#define CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE 128
+
+// One thread per row. The other kernels use one block per row, which for hundreds of thousands of rows of a few
+// values (attention inside small windows) is mostly launch and reduction overhead. No sinks, no ALiBi bias.
+template <typename T>
+static __global__ void soft_max_f32_short_rows(
+        const float * __restrict__ x, const T * __restrict__ mask, float * __restrict__ dst, const soft_max_params p) {
+    const int64_t row = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (row >= p.nrows_x) {
+        return;
+    }
+    const int ncols = p.ncols;
+
+    x   += row*ncols;
+    dst += row*ncols;
+    if (mask != nullptr) {
+        const int64_t i01 = row % p.ne01;
+        const int64_t i02 = (row / p.ne01) % p.ne02;
+        const int64_t i03 = row / (p.ne01*p.ne02);
+        mask += (i01*p.nb11 + (i02 % p.ne12)*p.nb12 + (i03 % p.ne13)*p.nb13) / sizeof(T);
+    }
+
+    float vals[CUDA_SOFT_MAX_SHORT_ROW];
+    float max_val = -INFINITY;
+    for (int col = 0; col < ncols; ++col) {
+        const float val = x[col]*p.scale + (mask ? t2f32(mask[col]) : 0.0f);
+        vals[col] = val;
+        max_val   = max(max_val, val);
+    }
+
+    float sum = 0.0f;
+    for (int col = 0; col < ncols; ++col) {
+        const float val = expf(vals[col] - max_val);
+        vals[col] = val;
+        sum += val;
+    }
+
+    const float inv_sum = 1.0f / sum;
+    for (int col = 0; col < ncols; ++col) {
+        dst[col] = vals[col] * inv_sum;
+    }
+}
+
 template <int n_elem_per_thread = 0>
 static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __restrict__ x,
                                                                 float * __restrict__ dst,
@@ -397,6 +444,14 @@ static void soft_max_f32_cuda(const float *                                x,
                               [[maybe_unused]] ggml_backend_cuda_context & ctx) {
     int nth = WARP_SIZE;
     const int64_t ncols_x = params.ncols;
+
+    if (ncols_x <= CUDA_SOFT_MAX_SHORT_ROW && params.nrows_x >= CUDA_SOFT_MAX_SHORT_ROW_MIN_ROWS &&
+            sinks == nullptr && params.max_bias == 0.0f) {
+        const int64_t n_blocks = (params.nrows_x + CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE - 1) / CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE;
+        GGML_ASSERT(n_blocks <= INT32_MAX);
+        soft_max_f32_short_rows<T><<<(unsigned int) n_blocks, CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE, 0, stream>>>(x, mask, dst, params);
+        return;
+    }
 
     while (nth < ncols_x && nth < CUDA_SOFT_MAX_BLOCK_SIZE) nth *= 2;
     const dim3 block_dims(nth,     1, 1);
