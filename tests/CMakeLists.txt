@@ -879,3 +879,9 @@ if (LLAMA_COREML_FFN)
     target_link_libraries(test-coreml-ffn-export PRIVATE ggml)
     llama_test(test-coreml-ffn-export)
 endif()
+
+if (GGML_CPU_STATIC AND GGML_BACKEND_DL AND NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME test-hybrid-package COMMAND ${CMAKE_COMMAND}
+        -DTEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/hybrid-package
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-hybrid-package.cmake)
+endif()
