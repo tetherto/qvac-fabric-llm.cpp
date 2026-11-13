@@ -46,7 +46,8 @@ size_t common_speculative_lattice_keep(const float * path_p, size_t n, int32_t n
 // top_k candidate token ids, then top_k transition scores per predecessor candidate; the walk starts from candidate 0.
 // A greedy walk takes each step's argmax. With rng and result_q, each step samples softmax(scores / temp_sample) and
 // appends its candidates and their probabilities to result_q. params.p_min stops the walk, params.n_short and
-// params.long_cost shorten a greedy draft (common_speculative_lattice_keep), and a draft below params.n_min is dropped.
+// params.long_cost shorten a greedy draft (common_speculative_lattice_keep), and a greedy draft below params.n_min is
+// dropped. A sampled draft is never shortened or dropped after it is drawn.
 void common_speculative_lattice_walk(const float * rows, size_t row_stride, int32_t n_rows, int32_t top_k,
         const common_params_speculative_draft & params, std::mt19937 * rng, float temp_sample, llama_tokens & result,
         std::vector<std::vector<llama_token_data>> * result_q);

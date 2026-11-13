@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -914,6 +915,122 @@ static int run_keep_cases() {
     return failures;
 }
 
+// a lattice of two draft steps with two candidates each. The first step is A at 70% or B at 30%. After A the second
+// step is confident (95%), after B it is a coin flip that p_min 0.6 stops, so a draft starting with B has one token
+static constexpr int32_t     WALK_TOP_K  = 2;
+static constexpr int32_t     WALK_ROWS   = 3; // the unused anchor row and the two draft steps
+static constexpr size_t      WALK_STRIDE = WALK_TOP_K + WALK_TOP_K * WALK_TOP_K;
+static constexpr float       WALK_P_A    = 0.7f;
+static constexpr float       WALK_P_MIN  = 0.6f;
+static constexpr llama_token WALK_A      = 10;
+static constexpr llama_token WALK_B      = 11;
+static constexpr llama_token WALK_A2     = 20;
+static constexpr llama_token WALK_B2     = 21;
+static constexpr int         WALK_DRAWS  = 20000;
+static constexpr double      WALK_TOL    = 0.02; // about 7 standard errors of the 70% estimate over WALK_DRAWS drafts
+
+static std::vector<float> walk_lattice() {
+    std::vector<float> rows(WALK_ROWS * WALK_STRIDE, 0.0f);
+    float * step1 = rows.data() + WALK_STRIDE;
+    step1[0] = WALK_A;
+    step1[1] = WALK_B;
+    // the walk starts from candidate 0, so step 1 reads only the first score row
+    step1[WALK_TOP_K + 0] = std::log(WALK_P_A);
+    step1[WALK_TOP_K + 1] = std::log(1.0f - WALK_P_A);
+    float * step2 = rows.data() + 2 * WALK_STRIDE;
+    step2[0] = WALK_A2;
+    step2[1] = WALK_B2;
+    step2[WALK_TOP_K + 0] = std::log(0.95f); // after A
+    step2[WALK_TOP_K + 1] = std::log(0.05f);
+    step2[2 * WALK_TOP_K + 0] = 0.0f;        // after B, 50/50
+    step2[2 * WALK_TOP_K + 1] = 0.0f;
+    return rows;
+}
+
+static common_params_speculative_draft walk_params(int32_t n_min, int32_t n_short) {
+    common_params_speculative_draft params;
+    params.p_min     = WALK_P_MIN;
+    params.n_min     = n_min;
+    params.n_short   = n_short;
+    params.long_cost = 100.0f; // no draft pays it, so n_short always shortens a greedy draft
+    return params;
+}
+
+static bool expect_greedy_walk(const char * name, int32_t n_min, int32_t n_short, const llama_tokens & expected) {
+    const std::vector<float> rows = walk_lattice();
+    llama_tokens result;
+    common_speculative_lattice_walk(rows.data(), WALK_STRIDE, WALK_ROWS, WALK_TOP_K, walk_params(n_min, n_short), nullptr,
+            1.0f, result, nullptr);
+    if (result != expected) {
+        fprintf(stderr, "FAIL: greedy walk, %s: drafted %zu tokens, expected %zu\n", name, result.size(), expected.size());
+        return false;
+    }
+    return true;
+}
+
+// a sampled draft goes to the target's rejection test, which assumes its first token is A with q = 70%. So among the
+// drafts the walk hands over, A must start 70% of them. A rule that drops or shortens a draft after reading past its
+// sampled tokens, as n_min did by discarding the one-token B drafts, makes A start more of them
+static bool expect_sampled_walk(const char * name, int32_t n_min, int32_t n_short) {
+    const std::vector<float> rows = walk_lattice();
+    const common_params_speculative_draft params = walk_params(n_min, n_short);
+    std::mt19937 rng(42);
+
+    int n_handed = 0;
+    int n_a      = 0;
+    int n_b      = 0;
+    bool ok      = true;
+    for (int d = 0; d < WALK_DRAWS && ok; ++d) {
+        llama_tokens result;
+        std::vector<std::vector<llama_token_data>> result_q;
+        common_speculative_lattice_walk(rows.data(), WALK_STRIDE, WALK_ROWS, WALK_TOP_K, params, &rng, 1.0f, result,
+                &result_q);
+        if (result.size() != result_q.size()) {
+            fprintf(stderr, "FAIL: sampled walk, %s: %zu tokens with %zu distributions\n", name, result.size(), result_q.size());
+            ok = false;
+            break;
+        }
+        if (result.empty()) {
+            continue;
+        }
+        ++n_handed;
+        const auto & q0 = result_q[0];
+        const auto   qa = std::find_if(q0.begin(), q0.end(), [](const llama_token_data & c) { return c.id == WALK_A; });
+        if (qa == q0.end() || std::fabs(qa->p - WALK_P_A) > 1e-5f) {
+            fprintf(stderr, "FAIL: sampled walk, %s: q of the first token does not give A %.2f\n", name, (double) WALK_P_A);
+            ok = false;
+            break;
+        }
+        const bool a_first = result[0] == WALK_A;
+        n_a += a_first ? 1 : 0;
+        n_b += a_first ? 0 : 1;
+        // n_short never shortens a sampled draft after A, and p_min stops after B before drawing from the coin flip
+        if (result.size() != (a_first ? 2u : 1u)) {
+            fprintf(stderr, "FAIL: sampled walk, %s: a draft starting with %d has %zu tokens\n", name, result[0], result.size());
+            ok = false;
+        }
+    }
+    const double f_a = n_handed > 0 ? (double) n_a / n_handed : 0.0;
+    printf("%s: sampled walk, %s: %d of %d drafts handed over, A starts %.4f, B starts %d\n", __func__, name, n_handed,
+            WALK_DRAWS, f_a, n_b);
+    if (ok && (n_handed != WALK_DRAWS || n_b == 0 || std::fabs(f_a - WALK_P_A) > WALK_TOL)) {
+        fprintf(stderr, "FAIL: sampled walk, %s: %d of %d drafts handed over and A starts %.4f of them, expected all and %.2f\n",
+                name, n_handed, WALK_DRAWS, f_a, (double) WALK_P_A);
+        ok = false;
+    }
+    return ok;
+}
+
+static int run_walk_cases() {
+    int failures = 0;
+    failures += expect_greedy_walk("full path",               2, 0, { WALK_A, WALK_A2 }) ? 0 : 1;
+    failures += expect_greedy_walk("n_min drops a short one", 3, 0, {})                  ? 0 : 1;
+    failures += expect_greedy_walk("n_short shortens it",     1, 1, { WALK_A })          ? 0 : 1;
+    failures += expect_sampled_walk("n_min 2", 2, 0)   ? 0 : 1;
+    failures += expect_sampled_walk("n_short 1", 0, 1) ? 0 : 1;
+    return failures;
+}
+
 static int expect(bool ok, const char * failure) {
     if (!ok) {
         fprintf(stderr, "FAIL: %s\n", failure);
@@ -928,6 +1045,7 @@ int main() {
 
     int failures = run_load_cases();
     failures += run_keep_cases();
+    failures += run_walk_cases();
     failures += expect(check_dspine_detected(), "a DSpine draft is not reported by llama_model_is_dspine");
     failures += expect(check_lattice(1, BLOCK_SIZE), "DSpine lattice of one block does not match the reference");
     failures += expect(check_lattice(MAX_BLOCKS, BLOCK_SIZE), "DSpine lattice of two blocks in one ubatch does not match the reference");

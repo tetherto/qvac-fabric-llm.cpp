@@ -1094,11 +1094,10 @@ void common_speculative_lattice_walk(const float * rows, size_t row_stride, int3
         result.resize(common_speculative_lattice_keep(path_p.data(), result.size(), params.n_short, params.long_cost));
     }
 
-    if (result.size() < (size_t) params.n_min) {
+    // where p_min stops a sampled walk depends on the tokens it sampled, so dropping a short sampled draft would hand
+    // the verifier drafts whose tokens no longer follow their q; it keeps the sampled prefix instead
+    if (!sample && result.size() < (size_t) params.n_min) {
         result.clear();
-        if (sample) {
-            result_q->clear();
-        }
     }
 }
 
