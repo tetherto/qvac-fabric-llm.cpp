@@ -4442,7 +4442,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_SHORT"));
     add_opt(common_arg(
         {"--spec-draft-long-cost"}, "R",
-        string_format("time of a step with --spec-draft-n-max drafts relative to one with --spec-draft-n-short drafts\n"
+        string_format("time of a step with more than --spec-draft-n-short drafts relative to one with --spec-draft-n-short drafts\n"
                       "(default: %.2f)", (double) params.speculative.draft.long_cost),
         [](common_params & params, const std::string & value) {
             const float cost = std::stof(value);
