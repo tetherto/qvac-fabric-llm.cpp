@@ -1455,16 +1455,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 std::vector<float>   probs;
                 std::vector<int32_t> sorted_idx;
 
+                const int32_t n_rows = is_dflash2 ? n_block_tokens : params.n_max + 1;
+                // the keep rule reads transitions past the drafts it keeps, so on a sampled draft it would keep a token
+                // depending on the token's own continuation, and the verifier's q would no longer be its distribution
+                const bool    keep_p = params.n_short > 0 && !sample;
+                const bool    read_p = params.p_min > 0.0f || keep_p;
+
                 int32_t predecessor = 0;
                 std::vector<float> path_p;
-                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
+                if (keep_p) {
+                    path_p.reserve(n_rows);
+                }
+                for (int32_t i = 1; i < n_rows; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
                     const float * scores = row + top_k + (size_t) predecessor * top_k;
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
-                    float p;
+                    float p = 0.0f;
                     if (sample) {
                         // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
                         probs.resize(top_k);
@@ -1477,11 +1486,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         for (int32_t k = 0; k < top_k; ++k) {
                             probs[k] /= sum;
                         }
-                    } else {
+                    } else if (read_p) {
                         p = lattice_argmax_prob(scores, top_k, predecessor);
                     }
-                    if (p < params.p_min) {
-                        break;
+                    if (read_p) {
+                        if (p < params.p_min) {
+                            break;
+                        }
+                        if (keep_p) {
+                            path_p.push_back(p);
+                        }
                     }
                     if (sample) {
                         // ggml_top_k leaves candidates unordered, so walk them by token id to keep a seed's draft stable
@@ -1508,11 +1522,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                     }
                     result.push_back((llama_token) row[predecessor]);
-                    path_p.push_back(p);
                 }
-                // the keep rule reads transitions past the drafts it keeps, so on a sampled draft it would keep a token
-                // depending on the token's own continuation, and the verifier's q would no longer be its distribution
-                if (!sample) {
+                if (keep_p) {
                     result.resize(common_speculative_lattice_keep(path_p.data(), result.size(), params.n_short, params.long_cost));
                 }
 
