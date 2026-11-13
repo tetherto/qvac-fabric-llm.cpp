@@ -128,10 +128,13 @@ static bool any_op_offered(ggml_backend_dev_t device, const std::vector<ggml_ten
     return false;
 }
 
-static bool check_convrot_ops_not_offered(ggml_backend_dev_t device) {
+static bool check_partial_backend_ops_not_offered(ggml_backend_dev_t device) {
     constexpr int64_t group_size = 256;
     constexpr int64_t rows       = 4;
     constexpr int64_t columns    = 2;
+    constexpr int64_t d_head     = 8;
+    constexpr int64_t n_head     = 2;
+    constexpr int64_t length     = 4;
 
     ggml_init_params params = {
         /* .mem_size   = */ 1024 * 1024,
@@ -145,9 +148,12 @@ static bool check_convrot_ops_not_offered(ggml_backend_dev_t device) {
     ggml_tensor * activations = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, group_size, columns);
     ggml_tensor * weights     = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I8, group_size, rows);
     ggml_tensor * scales      = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, rows, 1);
+    ggml_tensor * rope_input  = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d_head, n_head, length, 1);
+    ggml_tensor * rope_pe     = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 2, 2, d_head/2, length);
     const std::vector<ggml_tensor *> ops = {
         ggml_mul_mat_convrot(ctx.get(), activations, weights, scales, group_size),
         ggml_convrot(ctx.get(), activations, group_size),
+        ggml_rope_flux(ctx.get(), rope_input, rope_pe),
     };
     return !any_op_offered(device, ops);
 }
@@ -215,7 +221,7 @@ int main() {
         return 1;
     }
 
-    if (!check_convrot_ops_not_offered(device_a)) {
+    if (!check_partial_backend_ops_not_offered(device_a)) {
         return 1;
     }
 
