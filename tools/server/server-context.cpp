@@ -6,6 +6,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
+#include "server-spec-n-auto.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -1010,6 +1011,10 @@ private:
 
     common_speculative_ptr spec;
 
+    // --spec-draft-n-auto; planned rows of the current step (0 = not timed)
+    server_spec_n_auto spec_n_auto;
+    int32_t spec_n_auto_rows = 0;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1857,6 +1862,10 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (spec_n_auto.ready()) {
+            spec_n_auto.reset_seq(slot.id);
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -3303,6 +3312,8 @@ private:
             }
         }
 
+        const int64_t t_step_start = ggml_time_us();
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -3315,6 +3326,10 @@ private:
         }
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+
+        // a step is timed only when it ran the planned rows (no short drafts, no skipped slots)
+        const int32_t n_step_rows = spec_n_auto_rows > 0 && (int32_t) batch.size() == spec_n_auto_rows ? spec_n_auto_rows : 0;
+        bool          step_failed = false;
 
         if (batch.slot_batched) {
             auto & slot_batched      = batch.slot_batched;
@@ -3362,6 +3377,7 @@ private:
             } catch (const std::exception & e) {
                 SRV_ERR("decode() failed: %s\n", e.what());
                 abort_all_slots("decode() failed: " + std::string(e.what()));
+                step_failed = true;
                 break; // stop any further processing
             }
 
@@ -3371,8 +3387,14 @@ private:
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
+                step_failed = true;
                 break; // stop any further processing
             }
+        }
+
+        // the whole step (draft, verify, sampling) is the cost of its rows
+        if (n_step_rows > 0 && !step_failed) {
+            spec_n_auto.observe_step(n_step_rows, 1e-6 * (double) (ggml_time_us() - t_step_start));
         }
     }
 
@@ -3450,6 +3472,29 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // --spec-draft-n-auto: one draft length for all generating slots
+        int32_t n_draft_cap = -1;
+        spec_n_auto_rows = 0;
+        if (spec && params_base.speculative.draft.n_auto) {
+            if (!spec_n_auto.ready()) {
+                spec_n_auto.init((int32_t) slots.size(), common_speculative_n_max(spec.get()), params_base.speculative.draft.n_min);
+            }
+
+            std::vector<int32_t> seqs;
+            bool timed = true; // no prompt tokens in the step
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    seqs.push_back(slot.id);
+                }
+                timed = timed && (!slot.is_processing() || slot.state == SLOT_STATE_GENERATING);
+            }
+
+            if (!seqs.empty()) {
+                n_draft_cap      = spec_n_auto.pick(seqs);
+                spec_n_auto_rows = timed ? (int32_t) seqs.size() * (n_draft_cap + 1) : 0;
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3471,7 +3516,10 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+                if (n_draft_cap >= 0) {
+                    n_draft_max = std::min(n_draft_max, n_draft_cap);
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -4617,6 +4665,11 @@ private:
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                // a replay is not a new draft
+                if (params_base.speculative.draft.n_auto && spec_n_auto.ready() && !slot.spec_is_replay) {
+                    spec_n_auto.observe_verify(slot.id, (int32_t) n_draft, (int32_t) accepted.size() - 1);
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
