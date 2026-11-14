@@ -2228,7 +2228,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
-        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS || hparams.expert_router_f32) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
         cb(logits, "ffn_moe_logits", il);
@@ -2350,6 +2350,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (arch == LLM_ARCH_DEEPSEEK41) {
             // model.py Gate.forward: weights / (sum + 1e-20); the sum can fall below the F16 clamp below
             weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, 1e-20f);
+        } else if (hparams.expert_weights_norm_eps > 0.0f) {
+            weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, hparams.expert_weights_norm_eps);
         } else if (cparams.training_ctx) {
             ggml_tensor * shifted = ggml_scale_bias(ctx0, weights_sum, -1.0f, weights_sum_eps);
             ggml_tensor * relu_shifted = ggml_relu(ctx0, shifted);
@@ -2999,7 +3001,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && (!sinks || ggml_is_vector(sinks));
     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
@@ -3084,8 +3086,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cb(kq, "kq_plus_kq_b", il);
         }
 
-        kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
-        ggml_soft_max_add_sinks(kq, sinks);
+        if (sinks && !ggml_is_vector(sinks)) {
+            // Per-query sinks are extra logits with zero values.
+            const int64_t n_kv = kq->ne[0];
+            kq = ggml_add(ctx0, ggml_scale(ctx0, kq, kq_scale), ggml_cast(ctx0, kq_mask, GGML_TYPE_F32));
+            kq = ggml_soft_max(ctx0, ggml_concat(ctx0, kq, sinks, 0));
+            kq = ggml_cont(ctx0, ggml_view_4d(ctx0, kq, n_kv, kq->ne[1], kq->ne[2], kq->ne[3], kq->nb[1], kq->nb[2], kq->nb[3], 0));
+        } else {
+            kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+            ggml_soft_max_add_sinks(kq, sinks);
+        }
         cb(kq, "kq_soft_max", il);
 
         if (!v_trans) {
@@ -3597,7 +3607,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * kq_mask) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * k_rot = is_swa ? inp->self_k_rot_swa[il] : inp->self_k_rot[il];
@@ -3653,7 +3664,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    ggml_tensor * kq_mask = is_swa ? inp->self_attn_mask_swa.cnv  : inp->self_attn_mask.cnv;
+    if (!kq_mask) {
+        kq_mask = is_swa ? inp->self_attn_mask_swa.cnv  : inp->self_attn_mask.cnv;
+    }
     ggml_tensor * kv_rows = is_swa ? inp->self_attn_mask_swa.rows : inp->self_attn_mask.rows;
 
     ggml_tensor * q = q_cur;
