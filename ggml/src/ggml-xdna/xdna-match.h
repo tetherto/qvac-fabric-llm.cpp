@@ -4,6 +4,7 @@
 // test-xdna-match checks them against the shapes llama's graph code makes.
 
 #include "ggml.h"
+#include "xdna-quant.h"
 
 #include <cstring>
 #include <string>
@@ -67,6 +68,30 @@ static inline const ggml_tensor * xdna_fused_uncovered(const ggml_tensor * const
     for (int i = 0; i < n_nodes; i++) {
         if (const ggml_tensor * w = xdna_fused_uncovered_src(nodes[i], gated_fmt)) {
             return w;
+        }
+    }
+    return nullptr;
+}
+
+// Whether the fused decode's GEMV reads weight `w`: a recurrent layer's in-projection (attn_qkv, attn_gate) and, with
+// the attention tails on (`tail`), an attention layer's attn_output, in a type it packs (Q4_K, Q5_K or Q6_K). Every
+// other tensor passes.
+static inline bool xdna_fused_gemv_ok(const ggml_tensor * w, bool tail) {
+    const char * name = ggml_get_name(w);
+    const bool   read = xdna_name_ends(name, ".attn_qkv.weight") || xdna_name_ends(name, ".attn_gate.weight") ||
+                        (tail && xdna_name_ends(name, ".attn_output.weight"));
+    return !read || xdna_wfmt_gemv_for(xdna_gemv_type_of(w)) != XDNA_WFMT_NONE;
+}
+
+// The first weight of these nodes the fused decode's GEMV does not read (xdna_fused_gemv_ok), or null.
+static inline const ggml_tensor * xdna_fused_gemv_uncovered(const ggml_tensor * const * nodes, int n_nodes, bool tail) {
+    for (int i = 0; i < n_nodes; i++) {
+        const ggml_tensor * n = nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC && n->src[s]; s++) {
+            const ggml_tensor * w = n->src[s];
+            if (w->op == GGML_OP_NONE && !xdna_fused_gemv_ok(w, tail)) {
+                return w;
+            }
         }
     }
     return nullptr;

@@ -2175,10 +2175,13 @@ static bool xdna_width_fits(int64_t d) {
     return false;
 }
 
-// The fused layers read only their own weight formats (xdna_fused_weight_ok); a chunk with any other is
-// left to the same route as a width they do not take, and one warning names the first such weight.
+// The fused layers read only their own weight formats (xdna_fused_weight_ok, xdna_fused_gemv_ok); a chunk with any
+// other is left to the same route as a width they do not take, and one warning names the first such weight.
 static bool xdna_weights_fit(const ggml_cgraph * cgraph) {
     const ggml_tensor * w = xdna_fused_uncovered(cgraph->nodes, cgraph->n_nodes, xdna_rec_pack::GATED_FMT);
+    if (!w) {
+        w = xdna_fused_gemv_uncovered(cgraph->nodes, cgraph->n_nodes, xdna_tail_on());
+    }
     if (!w) {
         return true;
     }
@@ -2186,8 +2189,8 @@ static bool xdna_weights_fit(const ggml_cgraph * cgraph) {
     if (!said) {
         said = true;
         GGML_LOG_WARN(
-            "%s: the fused decode layers read ssm_out as %s, the FFN's gate and up as Q4_K and its down as "
-            "Q4_K or Q6_K; this model's %s is %s: %s\n",
+            "%s: the fused decode layers read ssm_out as %s, the FFN's gate and up as Q4_K, its down as Q4_K or "
+            "Q6_K, and attn_qkv, attn_gate and attn_output as Q4_K, Q5_K or Q6_K; this model's %s is %s: %s\n",
             "ggml-xdna", xdna_rec_pack::GATED_FMT == 0 ? "Q4_K" : "Q5_K or Q6_K", ggml_get_name(w),
             ggml_type_name(w->type), xdna_misfit_route());
     }
@@ -3046,7 +3049,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
                     GGML_LOG_ERROR(
                         "%s: fused layer %d: the in-projection (%s, %s) "
                         "does not split into the core's inputs; "
-                        "GGML_XDNA_FUSED_LAYER=0 runs the layer per op\n",
+                        "GGML_XDNA_FUSED_LAYER=0 decodes without the fused layers\n",
                         "ggml-xdna", p.il, ggml_type_name(p.n_qkv->src[0]->type), ggml_type_name(p.n_z->src[0]->type));
                     return false;
                 }
