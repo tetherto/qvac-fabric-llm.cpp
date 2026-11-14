@@ -42,7 +42,10 @@ Exact search scans every live slot. Filtered search restricts that scan to a
 caller-provided id set, while prepared filters cache the id-to-slot mapping for
 repeated queries. IVF-flat reduces the number of vectors scored by assigning
 vectors and queries to in-memory centroid lists. It is an optional search
-accelerator and does not change the storage format.
+accelerator and does not change the storage format. On a TurboVec index the
+build reorders the stored rows so each list is contiguous: TurboVec scores
+rows in blocks of 32, and a list spread over many blocks costs as much as a
+full scan.
 
 A `.tvim` file is a complete index snapshot. Normal loading materializes the
 index in memory, while mmap loading keeps supported vector sections mapped
@@ -234,6 +237,13 @@ before search.
   search fewer lists and may return different results from exact search.
   Probing at least the number of built lists searches all lists, so candidate
   coverage matches exact search. IVF state is not persisted in snapshots.
+  On a TurboVec index the build moves the rows into list order. Search
+  returns the same ids and scores, except that a TurboVec 1.x index orders
+  equal scores by row, so tied rows from different lists can swap. `ggml_vec_index_ids` reports
+  the new order, prepared filters become stale, and the next
+  `ggml_vec_index_sync` rewrites the whole file. The move needs memory for a
+  second copy of the codes; without it, or on a read-only mmap, delta-log
+  bound or tombstoned index, the build keeps the rows where they are.
 
 `ggml_vec_index_prepare` is an optional cache warmup for TurboVec rotation and
 codebook state; other storage modes ignore it. New callers should
@@ -300,10 +310,10 @@ interchangeable with turbovec 1.1 and later in both directions; v7 files and
 v8 files in the bit-planes unit layout load too, and positional `.tv` files
 (no ids) are rejected. Removal is upstream's swap-remove (the last row moves
 into the hole), so a snapshot is byte-identical to the one turbovec writes
-for the same history. Like turbovec, an index that would search in stages at
-its current size stores its block units in the bit-planes layout and every
-other index in the sequential one; both forms load in either
-implementation.
+for the same history, until an IVF build reorders the rows. Like turbovec,
+an index that would search in stages at its current size stores its block
+units in the bit-planes layout and every other index in the sequential one;
+both forms load in either implementation.
 Each header slot reserves room for 1024 pending removals, so even a small file
 carries a few hundred KiB of zero padding; the writer leaves it as a file hole
 where the filesystem supports one. v8 carries no checksum over the block
@@ -320,8 +330,8 @@ codes.
 through memory, and `ggml_vec_index_serialized_size` reports its size.
 
 `ggml_vec_index_sync` saves a TurboVec index incrementally, as turbovec's
-`sync` does. The first sync to a path, and the first after a calibrate, writes
-the whole file and claims it with a random nonce. Later syncs write only the
+`sync` does. The first sync to a path, and the first after a calibrate or an
+IVF build, writes the whole file and claims it with a random nonce. Later syncs write only the
 appended or changed block units plus one commit header and make them durable
 with a single fsync; removals inside committed blocks ride the header as redo
 ops. Each header names the units its sync wrote and their digest, so a commit

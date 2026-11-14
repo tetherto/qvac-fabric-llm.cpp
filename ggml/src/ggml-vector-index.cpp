@@ -978,6 +978,87 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
     }
 }
 
+bool turbovec_group_rows_by_ivf(ggml_vec_index & idx) {
+    const size_t n_slots = idx.slot_to_id.size();
+    if (!is_turbovec(idx) || idx.read_only_mmap || idx.delta_log_bound || n_slots == 0 ||
+        idx.ivf_generation != idx.generation || active_count(idx) != n_slots ||
+        !turbovec_supported_dim(idx.dim, idx.turbovec_legacy)) {
+        return false;
+    }
+
+    // Everything is built on the side first. Without memory for it the index
+    // and its IVF stay as they are, rows in the old order.
+    const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim));
+    std::vector<uint8_t> new_data;
+    std::vector<float> new_scales;
+    std::vector<uint64_t> new_slot_to_id;
+    std::vector<uint8_t> new_blocked;
+    size_t new_n_blocks = 0;
+    try {
+        std::vector<size_t> order;
+        order.reserve(n_slots);
+        for (const std::vector<size_t> & list : idx.ivf_lists) {
+            order.insert(order.end(), list.begin(), list.end());
+        }
+        if (order.size() != n_slots) {
+            return false;
+        }
+        new_data.resize(n_slots * row_bytes);
+        new_scales.resize(n_slots);
+        new_slot_to_id.resize(n_slots);
+        const size_t n_tasks = (n_slots + kTurboVecRowsPerTask - 1) / kTurboVecRowsPerTask;
+        parallel_for(n_tasks, idx.n_threads, [&](size_t task, size_t) {
+            const size_t end = std::min(n_slots, (task + 1) * kTurboVecRowsPerTask);
+            for (size_t out_slot = task * kTurboVecRowsPerTask; out_slot < end; ++out_slot) {
+                const size_t slot = order[out_slot];
+                turbovec_row_packed(idx, slot, new_data.data() + out_slot * row_bytes);
+                new_scales[out_slot] = idx.turbovec_scale[slot];
+                new_slot_to_id[out_slot] = idx.slot_to_id[slot];
+            }
+        });
+        repack_turbovec_codes(
+            new_data.data(), n_slots, idx.turbovec_bits, idx.dim, new_blocked, new_n_blocks, turbovec_layout(idx),
+            idx.n_threads);
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+
+    idx.turbovec_data.swap(new_data);
+    idx.turbovec_packed_rows = true;
+    idx.turbovec_scale.swap(new_scales);
+    idx.turbovec_blocked_data.swap(new_blocked);
+    idx.turbovec_blocked_n_blocks = new_n_blocks;
+    idx.slot_to_id.swap(new_slot_to_id);
+    // The ids stay the same, so every key is already in the map and only its
+    // slot changes; nothing is allocated.
+    for (size_t slot = 0; slot < n_slots; ++slot) {
+        idx.id_to_slot.find(idx.slot_to_id[slot])->second = slot;
+    }
+    // Bumped before anything else can throw, so a prepared filter or an IVF
+    // made for the old slots is never accepted again.
+    ++idx.generation;
+    idx.delta_log_start_allowed = false;
+    // A bound file holds the rows in the old order, and an incremental sync
+    // writes only the rows marked dirty, so the next sync rewrites the file.
+    if (idx.turbovec_sync.bound) {
+        idx.turbovec_sync.rewrite = true;
+    }
+    // Every row moved, so the sign planes are rebuilt from slot 0. A promoted
+    // index stays promoted, even below the size that promotes one.
+    turbovec_planes_restart(idx);
+    turbovec_planes_refresh(idx, 0);
+    turbovec_settle_rows(idx);
+
+    size_t next = 0;
+    for (std::vector<size_t> & list : idx.ivf_lists) {
+        for (size_t & slot : list) {
+            slot = next++;
+        }
+    }
+    idx.ivf_generation = idx.generation;
+    return true;
+}
+
 int ggml_vec_index_compact(ggml_vec_index_t * idx) {
     if (idx == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
