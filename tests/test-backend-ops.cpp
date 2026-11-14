@@ -12457,8 +12457,11 @@ struct test_rms_norm_mul_mv_glu : public test_case {
 
     bool run_whole_graph() override { return true; }
 
+    // the CPU reference quantizes the activations to q8_0, so a backend that keeps them in f32 (the WebGPU mat-vec on
+    // Apple) differs by that rounding; with few outputs (m = 33) it does not average out, so those shapes get the bound
+    // of test_mul_mat_vec_fusion (f32 activations on RADV, m = 33: 9 of 2600 runs above 5e-4, max 8.9e-4)
     double max_nmse_err() override {
-        return 5e-4;
+        return m * n < 256 ? 5e-3 : 5e-4;
     }
 
     uint64_t fusion_count(ggml_backend_t backend) override {
