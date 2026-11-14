@@ -547,11 +547,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
             iw = ggml_view_4d(ctx0, iw, iw->ne[0], nt/n_stream, 1, n_stream, iw->nb[1], iw->nb[1]*(nt/n_stream), iw->nb[1]*(nt/n_stream), 0);
 
-            // chunk queries so the [n_ih, tokens, n_comp] scores stay near 2^26 elements (at most 64 chunks); the fused indexer runs as one chunk
+            // chunk queries so the scores stay near 2^26 elements (at most 64 chunks): [tokens, n_comp] from the fused indexer, [n_ih, tokens, n_comp] without it
             const int64_t n_tok = nt/n_stream;
             GGML_ASSERT(ci.kq_mask->ne[1] == n_tok);
-            const int64_t chunk = fused_idx ? n_tok :
-                std::max({ (n_tok + 63)/64, (INT64_C(1) << 26)/(n_idx_head*n_comp*n_stream), INT64_C(1) });
+            const int64_t n_score = (fused_idx ? 1 : n_idx_head)*n_comp*n_stream;
+            const int64_t chunk   = std::max({ (n_tok + 63)/64, (INT64_C(1) << 26)/n_score, INT64_C(1) });
 
             const int32_t cand_src = hparams.dsv41_cand_src;
             const bool    pick_blk = cand_src == il && cand_pin;              // level one: pick the candidate blocks
@@ -569,13 +569,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 const auto rows = [&](ggml_tensor * t) {
                     return ggml_view_4d(ctx0, t, t->ne[0], nc, 1, n_stream, t->nb[1], t->nb[2], t->nb[3], t0*t->nb[1]);
                 };
+                ggml_tensor * iqc = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nc, n_stream, iq->nb[1], iq->nb[2], iq->nb[3], t0*iq->nb[2]);
                 ggml_tensor * score = nullptr;
                 if (fused_idx) {
-                    score = ggml_lightning_indexer(ctx0, iq, ik, iw, ci.kq_mask);
+                    // the fused indexer broadcasts the mask over the streams, so keep its own ne[3]
+                    ggml_tensor * m = ci.kq_mask;
+                    ggml_tensor * mask = ggml_view_4d(ctx0, m, m->ne[0], nc, 1, m->ne[3], m->nb[1], m->nb[2], m->nb[3], t0*m->nb[1]);
+                    score = ggml_lightning_indexer(ctx0, iqc, ik, rows(iw), mask);
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
                 } else {
-                    ggml_tensor * iqc = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nc, n_stream, iq->nb[1], iq->nb[2], iq->nb[3], t0*iq->nb[2]);
-
                     ggml_tensor * kq = ggml_mul_mat(ctx0, ik_p, ggml_permute(ctx0, iqc, 0, 2, 1, 3));
                     kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
                     score = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_relu(ctx0, kq), rows(iw)));
@@ -642,7 +644,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
 
         ggml_tensor * raw_k    = inp_attn->mctx->get_k(ctx0, il);
-        ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+        ggml_tensor * raw_mask = inp_attn->self_attn_mask.cnv;
 
         const int32_t topk_src = hparams.dsv41_topk_src[il];
         const int64_t k_sel    = top_k->ne[0];
@@ -713,7 +715,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 cb(kq_mask, "comp_kq_mask_sel", il);
             }
 
-            out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, 0, kq_scale, il);
+            out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, 0, kq_scale, il);
         } else {
             // dense attention over [window | all compressed rows], selection applied as a mask
             ggml_tensor * comp_k = ggml_view_4d(ctx0, comp_all, n_embd_head, 1, n_comp, n_stream,
@@ -740,7 +742,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
             // at most window + top-k visible columns per query: lets CUDA FA gather only those
             const int64_t n_kv_max = sparse ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + k_sel : 0;
-            out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
+            out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
         }
         if (k_rot) {
             out = llama_mul_mat_hadamard(ctx0, out, k_rot);
@@ -781,7 +783,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     ggml_tensor * inp_pos = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
-    ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_kq_mask);
+    ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_attn_mask.raw);
 
     auto inp41 = std::make_unique<llm_graph_input_dsv41>(model, inp_dsv4->mctx);
     // embedding input has no token ids: it skips Engram, like the reference's masked (image) positions
@@ -930,4 +932,6 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     cur = ggml_mul_mat(ctx0, model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
 }

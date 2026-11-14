@@ -1,0 +1,19 @@
+Third-party notices for ggml-xdna
+
+mlir-aie
+  Source:    https://github.com/Xilinx/mlir-aie
+  Version:   1.4.3
+  Used in:   kernels/gemm.py, adapted from
+             programming_examples/basic/matrix_multiplication/whole_array/whole_array.py
+             programming_examples/basic/matrix_multiplication/cascade/cascade.py
+             programming_examples/ml/block_datatypes/matrix_multiplication/whole_array_shuffle/whole_array.py
+             programming_examples/ml/block_datatypes/matrix_multiplication/whole_array_mixed/whole_array.py
+  Copyright: Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+  License:   Apache-2.0 WITH LLVM-exception,
+             see LICENSES/Apache-2.0-WITH-LLVM-exception.txt
+  NOTICE:    NO NOTICE
+
+Build dependency, not copied into this tree:
+    kernels/attn-mm.cc includes aie_kernels/aie2p/mm.cc from mlir-aie
+    at build time. That code is compiled into the .xclbin / .insts.bin
+    artifacts, which are covered by the LLVM exception.

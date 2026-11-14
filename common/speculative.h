@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "common.h"
 
+#include <random>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -17,6 +19,12 @@ std::vector<enum common_speculative_type> common_speculative_types_from_names(co
 // infer the spec types from the GGUF metadata of a draft model; empty if unknown
 std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
 
+// why the draft model of params cannot draft for the model at path_target, read from both GGUF headers, or empty:
+// a DFlash/DSpark model with another vocabulary (a d2t map does not change it), another n_embd, a target layer past
+// the model's last, or a DSpark Markov head without a positive block size; an external MTP head with another output
+// width or vocabulary. Empty for other speculative types and for unreadable headers, which the load reports itself.
+std::string common_speculative_draft_mismatch(const common_params & params, const std::string & path_target);
+
 // convert string to type
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
 
@@ -28,6 +36,21 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
 
 // return the max number of draft tokens from the initialized implementations
 int32_t common_speculative_n_max(const common_speculative * spec);
+
+// how many of the n drafts of a lattice path to keep: n_short when the expected accepted tokens of all n drafts do not
+// pay for long_cost, the cost of any step past n_short drafts relative to one with n_short. path_p[i] is the probability
+// of the path's transition i
+size_t common_speculative_lattice_keep(const float * path_p, size_t n, int32_t n_short, float long_cost);
+
+// walk a DFlash2 or LiliCorr candidate lattice into result. Row i of rows (row_stride floats apart, row 0 unused) holds
+// top_k candidate token ids, then top_k transition scores per predecessor candidate; the walk starts from candidate 0.
+// A greedy walk takes each step's argmax. With rng and result_q, each step samples softmax(scores / temp_sample) and
+// appends its candidates and their probabilities to result_q. params.p_min stops the walk, params.n_short and
+// params.long_cost shorten a greedy draft (common_speculative_lattice_keep), and a greedy draft below params.n_min is
+// dropped. A sampled draft is never shortened or dropped after it is drawn.
+void common_speculative_lattice_walk(const float * rows, size_t row_stride, int32_t n_rows, int32_t top_k,
+        const common_params_speculative_draft & params, std::mt19937 * rng, float temp_sample, llama_tokens & result,
+        std::vector<std::vector<llama_token_data>> * result_q);
 
 // validate and resolve the unconditional synthetic acceptance rates
 std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max);
@@ -85,6 +108,10 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
+
+// optionally call before a prompt is processed: pos_end is the position right after the prompt, the first draft's
+// anchor. Implementations may skip prompt rows no draft can attend.
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_end);
 
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);

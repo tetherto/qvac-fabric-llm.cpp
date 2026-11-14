@@ -74,6 +74,60 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
+DFlash2 drafts add grouped convolution and a candidate selector. The selector is detected from the checkpoint; use the same `draft-dflash` type.
+For example, convert `incoai/Qwen3.8-27B-DFlash2` against its target tokenizer, then start the server:
+
+```bash
+python convert_hf_to_gguf.py incoai/Qwen3.8-27B-DFlash2 \
+    --target-model-dir Qwen/Qwen3.8-27B --outtype bf16 --outfile Qwen3.8-27B-DFlash2.gguf
+
+llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 7 -fa on --jinja
+```
+
+The target GGUF must use the same tokenizer as the draft.
+Reconvert older DFlash2 GGUFs for image or video inputs; the draft needs the target's M-RoPE metadata.
+
+A DFlash2 drafter can propose tokens from part of the vocabulary only.
+`--spec-draft-vocab` takes ascending, disjoint `[begin, end)` token id ranges. The drafter computes its output head over those rows only, and the target still verifies over the full vocabulary, so the output is unchanged.
+Tokens outside the ranges are never drafted, which can lower acceptance for text that uses them.
+Each range adds a mat-mul and a concat to the draft graph, so a few wide ranges cost less than many narrow ones.
+The ranges have no effect when the draft output head has a LoRA adapter or a Hadamard rotation, or when the loader stores it in a repacked or split buffer type, such as `CPU_REPACK` for a quantized head on the CPU. The drafter then uses the full vocabulary.
+Invalid ranges, ranges that cover fewer tokens than the drafter's selector top-k, a speculative type other than `draft-dflash`, or a drafter that is not DFlash2 or has a reduced (d2t) vocabulary stop the speculative setup with an error.
+For the Qwen3.8 DFlash2 drafter, `0:98304,248032:248320` keeps the first 98304 tokens and the special tokens at the end of the vocabulary:
+
+```bash
+llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-vocab 0:98304,248032:248320 -fa on --jinja
+```
+
+[DSpine](https://github.com/Tencent/DSpine) drafts are DFlash drafts with a code bridge, for example `tencent/Qwen3-8B-DSpine-b16` for `Qwen/Qwen3-8B` and `tencent/Qwen3.8-27B-DSpine-b16` for `Qwen/Qwen3.8-27B`.
+They are detected from the checkpoint and use the same `draft-dflash` type.
+Each draft layer passes a code of the previous block position's token to the next position, and the draft rescores its top-k candidates per position (16 in both checkpoints) with the exact predecessor token.
+
+```bash
+python convert_hf_to_gguf.py tencent/Qwen3-8B-DSpine-b16 \
+    --target-model-dir Qwen/Qwen3-8B --outtype bf16 --outfile Qwen3-8B-DSpine.gguf
+
+llama-server -m Qwen3-8B.gguf -md Qwen3-8B-DSpine.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 15 -fa on --jinja
+```
+
+The draft ubatch (`--spec-draft-n-ubatch`, default `--ubatch-size`) must hold one block per parallel sequence, that is `-np * (--spec-draft-n-max + 1)` tokens.
+`--spec-draft-vocab` is for DFlash2 drafters only and stops the speculative setup with an error for a DSpine draft.
+The draft reads rows of the target output head directly, so a head in a repacked or row-split buffer stops the draft context with an error.
+Load the target with `--no-repack` and without `-sm row` in that case.
+
+The verify cost of a step can jump with the number of drafted tokens, for example on Metal past 8 rows.
+With a lattice drafter (DFlash2, DSpine or LiliCorr), `--spec-draft-n-short N` keeps only the first N drafts of a step unless the full draft pays for its cost.
+Other drafters reject the option, and N must be 0 or at least `--spec-draft-n-min`.
+The rule applies to greedy lattice drafts only and does not shorten a DFlash2 draft sampled with `--spec-draft-sampling probabilistic`.
+It decides from transitions past the drafts it keeps, so a sampled draft would no longer follow the distribution that the target's rejection test assumes, and the setup warns when both are set.
+The expected accepted tokens come from the lattice's own transition probabilities, and `--spec-draft-long-cost R` is the time of a step with more than N drafts relative to a step with N drafts.
+The rule uses the same R for every path longer than N, including one that `--spec-draft-p-min` stops before `--spec-draft-n-max`, so set N where the verify cost jumps, for example 7 on Metal.
+Take R from two runs, one with `--spec-draft-n-max` at each value.
+Every step still decodes the full draft block, so compare the result with `--spec-draft-n-max N` alone.
+
 See:
 
 - #22105
@@ -246,7 +300,8 @@ Use exactly one of these options:
                                         number of tokens to draft for speculative decoding (default: 3)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MAX)
 --spec-draft-n-min                      N
-                                        minimum number of draft tokens to use for speculative decoding (default: 0)
+                                        minimum number of draft tokens to use for speculative decoding; greedy drafts only, a draft sampled with
+                                        --spec-draft-sampling probabilistic is kept at any length (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
 --spec-draft-n-ubatch                   N
                                         physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)
@@ -257,6 +312,19 @@ Use exactly one of these options:
 --spec-draft-p-min, --draft-p-min       P
                                         minimum speculative decoding probability (greedy) (default: 0.00)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
+--spec-draft-n-short                    N
+                                        lattice drafters (DFlash2, DSpine, LiliCorr): keep only N drafts in a step unless the expected accepted tokens of
+                                        the full draft pay for --spec-draft-long-cost; greedy drafts only, a DFlash2 draft sampled with
+                                        --spec-draft-sampling probabilistic is never shortened (default: 0, 0 = off)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_SHORT)
+--spec-draft-long-cost                  R
+                                        time of a step with more than --spec-draft-n-short drafts relative to one with --spec-draft-n-short drafts
+                                        (default: 1.00)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_LONG_COST)
+--spec-draft-vocab                      B:E[,B:E...]
+                                        token id ranges [B, E) a DFlash2 drafter may propose; the target still verifies over the full vocabulary
+                                        (default: full vocabulary)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_VOCAB)
 --spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft  N
                                         max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)
                                         (env: LLAMA_ARG_N_GPU_LAYERS_DRAFT)

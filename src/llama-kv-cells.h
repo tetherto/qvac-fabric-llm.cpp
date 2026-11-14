@@ -3,12 +3,38 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
+#include <array>
 #include <bitset>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <set>
+#include <type_traits>
 #include <vector>
+
+#if defined(__GNUC__)
+#    define LLAMA_ATTRIBUTE_NOINLINE __attribute__((noinline))
+#else
+#    define LLAMA_ATTRIBUTE_NOINLINE
+#endif
+
+#if defined(_MSC_VER)
+#    include <intrin.h>
+#endif
+
+// index of the lowest set bit, x != 0
+static inline int ctz64(uint64_t x) {
+#if defined(_MSC_VER)
+    unsigned long i;
+    _BitScanForward64(&i, x);
+    return (int) i;
+#else
+    return __builtin_ctzll(x);
+#endif
+}
 
 struct llama_kv_cell_ext {
     // 2D spatial positions, typically used for M-RoPE
@@ -31,6 +57,41 @@ struct llama_kv_cell_ext {
     }
 };
 
+struct llama_kv_cell_shift {
+    std::array<llama_pos, 4> v = {}; // [t, y, x, other]
+
+    llama_pos & t()     { return v[0]; }
+    llama_pos & y()     { return v[1]; }
+    llama_pos & x()     { return v[2]; }
+    llama_pos & other() { return v[3]; }
+
+    llama_pos t()     const { return v[0]; }
+    llama_pos y()     const { return v[1]; }
+    llama_pos x()     const { return v[2]; }
+    llama_pos other() const { return v[3]; }
+
+    llama_pos axis(uint32_t dim) const {
+        assert(dim < v.size());
+        return v[dim];
+    }
+
+    bool is_zero() const {
+        return v == std::array<llama_pos, 4>{};
+    }
+
+    void reset() {
+        v = {};
+    }
+};
+
+// the data of one slice of a ubatch, used to build the cell rows of the kv_rows attention (see ggml_flash_attn_ext_rows)
+struct llama_kv_rows_slice {
+    std::vector<llama_seq_id> seq_ids; // the sequences whose cells form the list of the slice
+
+    // min position of the cells that are not masked by the SWA (-1 if all cells are kept)
+    llama_pos p_min = -1;
+};
+
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
@@ -41,7 +102,7 @@ public:
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
-            shift[i] =  0;
+            shift[i].reset();
             seq[i].reset();
         }
 
@@ -51,6 +112,7 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            std::fill(seq_bits[s].begin(), seq_bits[s].end(), 0);
         }
     }
 
@@ -58,7 +120,7 @@ public:
         has_shift = false;
 
         for (uint32_t i = 0; i < shift.size(); ++i) {
-            shift[i] = 0;
+            shift[i].reset();
         }
     }
 
@@ -71,6 +133,10 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
+
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            seq_bits[s].clear();
+        }
 
         reset();
     }
@@ -137,7 +203,7 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
 
         return res;
@@ -156,7 +222,7 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
 
         return res;
@@ -189,7 +255,7 @@ public:
                 seq_pos_add(i + j);
             }
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
     }
 
@@ -220,7 +286,7 @@ public:
                 seq_pos_add(idx);
             }
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
     }
 
@@ -234,7 +300,7 @@ public:
 
         pos[i] = -1;
         ext[i].reset();
-        shift[i] = 0;
+        shift[i].reset();
 
         used.erase(i);
     }
@@ -253,7 +319,7 @@ public:
         if (seq[i].none()) {
             pos[i] = -1;
             ext[i].reset();
-            shift[i] = 0;
+            shift[i].reset();
 
             used.erase(i);
 
@@ -283,7 +349,7 @@ public:
 
             pos[i] = -1;
             ext[i].reset();
-            shift[i] = 0;
+            shift[i].reset();
 
             used.erase(i);
 
@@ -344,6 +410,22 @@ public:
         return ext[(--it)->second].tok;
     }
 
+    // number of cache cells that contain seq_id.
+    // seq_id < 0 counts all non-empty cells.
+    uint32_t seq_token_count(llama_seq_id seq_id) const {
+        if (seq_id < 0) {
+            return get_used();
+        }
+
+        uint32_t result = 0;
+        for (const uint32_t i : used) {
+            if (seq[i].test(seq_id)) {
+                ++result;
+            }
+        }
+        return result;
+    }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
@@ -366,6 +448,75 @@ public:
         }
 
         return -1;
+    }
+
+    // number of cells that contain seq_id
+    uint32_t seq_n_cells(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_pos[seq_id].size();
+    }
+
+    // number of cells that contain seq_id at a position >= p_min
+    uint32_t seq_n_cells(llama_seq_id seq_id, llama_pos p_min) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+
+        return std::distance(sp.lower_bound({ p_min, 0 }), sp.end());
+    }
+
+    // get the lists of the cells that contain any of the sequences of each slice, in cell order
+    // one list of max `n_per_seq` for each slice, padded with the cells that follow its last cell, below `n_kv`, then with -1
+    // `n_kv` is the number of rows of the K/V views the lists index
+    // the cells of slice s at a position below slices[s].p_min are skipped
+    LLAMA_ATTRIBUTE_NOINLINE
+    void get_seq_cells(const std::vector<llama_kv_rows_slice> & slices, int32_t * data, int64_t n_per_seq, uint32_t n_kv) const {
+        assert(slices.size() >= 1);
+
+        // the listed cells are below used_max_p1()
+        GGML_ASSERT(used_max_p1() <= n_kv && n_kv <= size());
+
+        const int64_t n_slices = (int64_t) slices.size();
+
+        const uint32_t n_words = (used_max_p1() + 63)/64;
+
+        for (int64_t s = 0; s < n_slices; ++s) {
+            const llama_pos pm = slices[s].p_min;
+
+            int32_t * dst = data + s*n_per_seq;
+            int32_t * end = dst + n_per_seq;
+
+            for (uint32_t w = 0; w < n_words; ++w) {
+                uint64_t word = 0;
+                for (const llama_seq_id seq_id : slices[s].seq_ids) {
+                    const auto & bits = seq_bits[seq_id];
+                    if (w < bits.size()) {
+                        word |= bits[w];
+                    }
+                }
+
+                for (uint64_t b = word; b != 0; b &= b - 1) {
+                    const int32_t i = 64*w + ctz64(b);
+                    if (pos[i] >= pm) {
+                        GGML_ASSERT(dst < end);
+                        *dst++ = i;
+                    }
+                }
+            }
+
+            // pad with the cells after the last one: the mask hides them (the list holds every cell the slice attends to, in
+            // cell order), and the end of the list stays consecutive, which backends read like the dense cache; -1 from
+            // n_kv on, as some backends copy only the n_kv rows of the K/V views
+            int32_t next = dst > data + s*n_per_seq ? dst[-1] + 1 : 0;
+            for (; dst < end && next < (int32_t) n_kv; ++dst, ++next) {
+                *dst = next;
+            }
+
+            std::fill(dst, end, -1);
+        }
     }
 
     // the minimum position of sequence seq_id currently present in any of the cells
@@ -414,6 +565,20 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        return shift[i].t();
+    }
+
+    llama_pos get_shift(uint32_t i, uint32_t dim) const {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
+        return shift[i].axis(dim);
+    }
+
+    const llama_kv_cell_shift & get_shift_ext(uint32_t i) const {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
         return shift[i];
     }
 
@@ -443,23 +608,44 @@ public:
     }
 
     // pos[i] = pos[i] + d
+    // for decoder M-RoPE/iM-RoPE, ext holds the active spatial axes and the 4th axis is unused
     // sets "has_shift" to true
     // note: call only if the cell is not empty
-    bool pos_add(uint32_t i, llama_pos d) {
+    bool pos_add(uint32_t i, llama_pos d, bool shift_ext = false) {
+        llama_kv_cell_shift delta;
+        delta.t() = d;
+
+        if (shift_ext) {
+            // Move the shared M-RoPE origin while preserving relative image-grid offsets.
+            delta.y() = d;
+            delta.x() = d;
+        }
+
+        return pos_shift(i, delta);
+    }
+
+    bool pos_shift(uint32_t i, const llama_kv_cell_shift & d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
 
         seq_pos_rm(i);
 
-        pos[i]   += d;
-        shift[i] += d;
+        pos[i]     += d.t();
+        ext[i].y   += d.y();
+        ext[i].x   += d.x();
+
+        shift[i].t()     += d.t();
+        shift[i].y()     += d.y();
+        shift[i].x()     += d.x();
+        shift[i].other() += d.other();
 
         has_shift = true;
 
         if (pos[i] < 0) {
             seq[i].reset();
             pos[i] = -1;
-            shift[i] = 0;
+            ext[i].reset();
+            shift[i].reset();
 
             used.erase(i);
 
@@ -474,16 +660,17 @@ public:
     // pos[i] = pos[i] / d
     // sets "has_shift" to true
     // note: call only if the cell is not empty
-    void pos_div(uint32_t i, int d) {
+    void pos_div(uint32_t i, int d, bool shift_ext = false) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+        GGML_ASSERT(!shift_ext && "pos_div() is not supported for multi-axis M-RoPE shifts");
 
         const llama_pos p_old = pos[i];
 
         seq_pos_rm(i);
 
         pos[i]   /= d;
-        shift[i] += p_old - pos[i];
+        shift[i].t() += p_old - pos[i];
 
         seq_pos_add(i);
 
@@ -516,7 +703,7 @@ private:
     //      cells.reset_shift();
     //   }
     //
-    std::vector<llama_pos> shift;
+    std::vector<llama_kv_cell_shift> shift;
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
@@ -531,16 +718,28 @@ private:
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
-    // helper functions for updating `seq_pos`, once cell at a time:
+    // bit i of seq_bits[s] is set if cell i carries sequence s (the transpose of `seq`), used to build the cell lists
+    // allocated on the first cell of the sequence, so the copies made by cp() never allocate it
+    std::vector<uint64_t> seq_bits[LLAMA_MAX_SEQ];
+
+    // helper functions for updating `seq_pos` and `seq_bits`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, uint32_t i) {
         const auto n = seq_pos[s].erase({ pos[i], i });
         assert(n == 1);
         GGML_UNUSED(n);
+
+        seq_bits[s][i/64] &= ~(1ull << (i%64));
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
         seq_pos[s].insert({ pos[i], i });
+
+        if (seq_bits[s].empty()) {
+            seq_bits[s].assign((pos.size() + 63)/64, 0);
+        }
+
+        seq_bits[s][i/64] |= 1ull << (i%64);
     }
 
     // remove cell i

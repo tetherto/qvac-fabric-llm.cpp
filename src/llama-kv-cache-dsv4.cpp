@@ -168,6 +168,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
         /*.output       =*/ data->output.data(),
         /*.type         =*/ nullptr,
         /*.decision_order =*/ nullptr,
+        /*.seq_off      =*/ nullptr,
         /*.data         =*/ data,
     };
 
@@ -1706,6 +1707,14 @@ llama_pos llama_kv_cache_dsv4::seq_pos_max(llama_seq_id seq_id) const {
     return kv_raw->seq_pos_max(seq_id);
 }
 
+uint32_t llama_kv_cache_dsv4::seq_token_count(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+        return 0;
+    }
+
+    return kv_raw->seq_token_count(seq_id);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = kv_raw->memory_breakdown();
     for (const auto & buft_size : kv_csa->memory_breakdown()) {
@@ -2082,8 +2091,8 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_idxs(ggml_tensor * dst) const 
     kv_swa->set_input_k_idxs(dst, &ubatches_write[i_next], sinfos_write[i_next]);
 }
 
-void llama_kv_cache_dsv4_raw_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv_swa->set_input_kq_mask(dst, ubatch, causal_attn);
+void llama_kv_cache_dsv4_raw_context::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
+    kv_swa->set_input_attn_mask(attn_mask, ubatch, causal_attn);
 }
 
 void llama_kv_cache_dsv4_raw_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

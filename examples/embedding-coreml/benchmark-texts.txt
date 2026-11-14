@@ -1,0 +1,12 @@
+title: none | text: The spacecraft landed safely on Mars.
+title: none | text: Neural networks can run locally without sending private documents to a server.
+title: none | text: This recipe uses fresh tomatoes, basil, olive oil and pasta.
+title: none | text: A database transaction should either commit completely or roll back.
+title: none | text: The train leaves the central station at eight in the morning.
+title: none | text: Les embeddings permettent de rechercher des documents par leur sens.
+title: none | text: Die Daten bleiben auf dem lokalen Computer.
+title: none | text: El motor neuronal acelera los modelos de inteligencia artificial.
+title: none | text: def binary_search(items, target): return bisect_left(items, target)
+title: none | text: A short message about music and concerts.
+title: none | text: The quarterly revenue increased compared with the previous year.
+task: search result | query: How do I keep inference entirely on my device?

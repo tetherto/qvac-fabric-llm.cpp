@@ -31,6 +31,7 @@
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <thread>
 #include <utility>
 #include <fstream>
 
@@ -340,6 +341,9 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // storage of the checkpoints discarded by the current task
+    server_checkpoint_pool ckpt_pool;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -437,6 +441,7 @@ struct server_slot {
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
+        ckpt_pool.clear();
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -1251,6 +1256,10 @@ private:
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
+            mparams.image_tile_mode  = (int) params_base.image_tile_mode;
+            mparams.image_max_tiles  = params_base.image_max_tiles;
+            mparams.image_no_upscale = params_base.image_no_upscale;
+            mparams.skip_audio       = params_base.mmproj_no_audio;
             mparams.media_marker     = get_media_marker();
             // progress callback
             mparams.progress_callback           = load_progress_callback;
@@ -2735,7 +2744,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
-                it = slot.prompt.checkpoints.erase(it);
+                it = slot.ckpt_pool.discard(slot.prompt.checkpoints, it);
                 continue;
             }
 
@@ -2750,7 +2759,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.ckpt_pool.discard(slot.prompt.checkpoints, slot.prompt.checkpoints.begin());
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2759,14 +2768,14 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
-                    it = slot.prompt.checkpoints.erase(it);
+                    it = slot.ckpt_pool.discard(slot.prompt.checkpoints, it);
                 } else {
                     ++it;
                 }
             }
         }
 
-        auto & cur = slot.prompt.checkpoints.emplace_back();
+        auto & cur = slot.ckpt_pool.add(slot.prompt.checkpoints);
 
         cur.id_task = id_task;
 
@@ -4304,7 +4313,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
-                                        it = slot.prompt.checkpoints.erase(it);
+                                        it = slot.ckpt_pool.discard(slot.prompt.checkpoints, it);
                                     } else {
                                         ++it;
                                     }
@@ -4325,6 +4334,8 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        common_speculative_set_prompt_end(spec.get(), slot.id, input_tokens.pos_next());
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -4794,6 +4805,48 @@ private:
         return true;
     }
 
+    // sample one token for each slot, on up to 8 threads with at least 4 slots each: every slot has its own sampler and
+    // only reads the logits. a slot that fails keeps LLAMA_TOKEN_NULL and is sampled again by the caller
+    void sample_parallel(const std::vector<server_slot *> & to_sample, int32_t off, std::vector<llama_token> & out) {
+        const int n = (int) to_sample.size();
+        const int n_threads = std::min(n / 4, 8);
+        if (n_threads < 2) {
+            return;
+        }
+
+        // the first synchronization and logits access update the context, later calls only read it
+        llama_synchronize(ctx_tgt);
+        llama_get_logits(ctx_tgt);
+
+        // the debug sampling timings count the whole parallel section, once per slot sampled in it
+        const int64_t t_start = ggml_time_us();
+
+        auto work = [&](int t) {
+            for (int i = t; i < n; i += n_threads) {
+                server_slot & slot = *to_sample[i];
+                try {
+                    out[slot.id] = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, slot.i_batch - off);
+                } catch (const std::exception &) {
+                    out[slot.id] = LLAMA_TOKEN_NULL;
+                }
+            }
+        };
+
+        std::vector<std::thread> workers;
+        for (int t = 1; t < n_threads; ++t) {
+            workers.emplace_back(work, t);
+        }
+        work(0);
+        for (auto & w : workers) {
+            w.join();
+        }
+
+        t_sampl += ggml_time_us() - t_start;
+        for (const server_slot * slot : to_sample) {
+            n_sampl += out[slot->id] != LLAMA_TOKEN_NULL;
+        }
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -4814,6 +4867,22 @@ private:
             return params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
+
+        // the slots that sample one token from this sub-batch below, sampled first and in parallel
+        std::vector<llama_token> pre_sampled(slots.size(), LLAMA_TOKEN_NULL);
+        {
+            std::vector<server_slot *> to_sample;
+            for (auto & slot : slots) {
+                if (!is_inside_view(slot.i_batch) || (slot.can_speculate() && !slot.spec_draft.empty())) {
+                    continue;
+                }
+                const bool done_prompt = slot.state == SLOT_STATE_DONE_PROMPT && slot.task->need_sampling();
+                if (done_prompt || slot.state == SLOT_STATE_GENERATING) {
+                    to_sample.push_back(&slot);
+                }
+            }
+            sample_parallel(to_sample, off, pre_sampled);
+        }
 
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
@@ -4870,8 +4939,8 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
-            llama_token id;
-            {
+            llama_token id = pre_sampled[slot.id];
+            if (id == LLAMA_TOKEN_NULL) {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }

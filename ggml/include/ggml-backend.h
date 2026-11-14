@@ -39,8 +39,14 @@ extern "C" {
     GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_n  (ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
     GGML_API size_t                ggml_backend_buft_get_alignment   (ggml_backend_buffer_type_t buft);
     GGML_API size_t                ggml_backend_buft_get_max_size    (ggml_backend_buffer_type_t buft);
+    GGML_API size_t                ggml_backend_buft_get_max_capacity(ggml_backend_buffer_type_t buft);
+    GGML_API bool                  ggml_backend_buft_is_size_supported(ggml_backend_buffer_type_t buft, size_t size);
     GGML_API size_t                ggml_backend_buft_get_alloc_size  (ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
     GGML_API size_t                ggml_backend_buft_get_alloc_size_n(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+    // Reported size of a physical buffer allocated for this payload request,
+    // including backend padding/guards. Does not allocate. Zero stays zero;
+    // SIZE_MAX denotes an unrepresentable request. Defaults to the payload size.
+    GGML_API size_t                ggml_backend_buft_get_buffer_alloc_size(ggml_backend_buffer_type_t buft, size_t size);
     GGML_API bool                  ggml_backend_buft_is_host         (ggml_backend_buffer_type_t buft);
     GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device      (ggml_backend_buffer_type_t buft);
 
@@ -85,6 +91,8 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_alloc_buffer(ggml_backend_t backend, size_t size);
     GGML_API size_t                     ggml_backend_get_alignment(ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_get_max_size(ggml_backend_t backend);
+    GGML_API size_t                     ggml_backend_get_max_buffer_capacity(ggml_backend_t backend);
+    GGML_API bool                       ggml_backend_is_buffer_size_supported(ggml_backend_t backend, size_t size);
 
     GGML_API void ggml_backend_tensor_set_async   (ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
     GGML_API void ggml_backend_tensor_get_async   (ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
@@ -108,6 +116,10 @@ extern "C" {
     GGML_API enum ggml_status ggml_backend_graph_plan_compute (ggml_backend_t backend, ggml_backend_graph_plan_t plan);
     GGML_API enum ggml_status ggml_backend_graph_compute      (ggml_backend_t backend, struct ggml_cgraph * cgraph);
     GGML_API enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph);
+
+    // backend execution workspace, separate from tensor buffers; backends without one report zero
+    GGML_API size_t ggml_backend_get_work_size      (ggml_backend_t backend);
+    GGML_API size_t ggml_backend_graph_get_work_size(ggml_backend_t backend, const struct ggml_cgraph * cgraph);
 
     // NOTE: will be removed, use device version instead
     GGML_API bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op);
@@ -161,6 +173,8 @@ extern "C" {
         bool events;
         // mmap is supported for loading
         bool mmap_support;
+        // dedicated copy stream for compute/transfer overlap
+        bool copy_stream;
     };
 
     // all the device properties
@@ -175,6 +189,10 @@ extern "C" {
         size_t memory_total;
         // device type
         enum ggml_backend_dev_type type;
+        // whether device memory is the same physical pool as host memory
+        // (e.g. Apple silicon unified memory); such devices must be budgeted
+        // together with the host rather than as an independent pool
+        bool memory_unified;
         // device id
         //   for PCI devices, this should be the lower-case PCI bus id formatted as "domain:bus:device.function" (e.g. "0000:c1:00.0")
         //   if the id is unknown, this should be NULL
@@ -220,6 +238,21 @@ extern "C" {
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
+    typedef size_t                       (*ggml_backend_get_buffer_capacity_t)(ggml_backend_buffer_type_t buft);
+    // Optional "ggml_backend_buft_get_buffer_alloc_size" registry procedure.
+    // Return the same size that alloc_buffer reports for a single physical
+    // payload allocation, or SIZE_MAX on overflow. Must not allocate or mutate.
+    typedef size_t (*ggml_backend_buft_get_buffer_alloc_size_t)(ggml_backend_buffer_type_t buft, size_t size);
+    // Get buffer types preferred over the default for model weight placement.
+    // The result is ordered, NULL-terminated, and must be copied before the next call.
+    typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_preferred_bufts_t)(ggml_backend_dev_t device);
+    // Check whether set_tensor_async supports host uploads to this buffer type.
+    typedef bool (*ggml_backend_dev_supports_async_upload_t)(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
+    // Optional bulk upload: begin, contiguous set_tensor_async calls covering the tensor, then end.
+    // Only one upload may be active per backend stream. Do not access the tensor before end succeeds.
+    // The caller keeps host data alive until the stream completes. Freeing the backend cancels an unfinished upload.
+    typedef bool (*ggml_backend_begin_async_upload_t)(ggml_backend_t backend, struct ggml_tensor * tensor);
+    typedef bool (*ggml_backend_end_async_upload_t)  (ggml_backend_t backend, struct ggml_tensor * tensor);
     // Set the abort callback for the backend
     typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
@@ -341,8 +374,14 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // Share physical compute buffers while keeping scheduler and graph allocation state independent.
+    // The caller must ensure the schedulers do not execute concurrently while the buffers are shared.
+    // Returns false for incompatible or unsupported scheduler layouts, or if dst is already allocated.
+    // Buffers with reset callbacks are unsupported because reset can invalidate another graph's tensor extras.
+    GGML_API bool ggml_backend_sched_share_compute_buffers(ggml_backend_sched_t dst, ggml_backend_sched_t src);
+
     // Initialize backend buffers from a measure graph
-    GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
+    GGML_API bool                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
@@ -354,12 +393,16 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // scheduler-owned host allocations including allocator metadata, excluding tensor buffers and backend workspace
+    GGML_API size_t                     ggml_backend_sched_get_host_size(ggml_backend_sched_t sched);
+    // peak execution workspace over the last graph's splits assigned to this backend, at its configured threads
+    GGML_API size_t                     ggml_backend_sched_get_work_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
     // Split graph without allocating it
-    GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API bool                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
@@ -380,6 +423,10 @@ extern "C" {
 
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
+
+    // Enable async weight prefetching to overlap CPU->GPU transfers with compute
+    GGML_API void                 ggml_backend_sched_set_prefetch_weights(ggml_backend_sched_t sched, bool enabled);
+    GGML_API void                 ggml_backend_sched_set_prefetch_weights_active(ggml_backend_sched_t sched, bool active);
 
     //
     // Meta backend

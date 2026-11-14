@@ -7,6 +7,7 @@
 #include "htp/argsort-ops.h"
 #include "htp/binary-ops.h"
 #include "htp/concat-ops.h"
+#include "htp/conv-taps-ops.h"
 #include "htp/conv2d-ops.h"
 #include "htp/cpy-ops.h"
 #include "htp/cumsum-ops.h"
@@ -24,6 +25,7 @@
 #include "htp/roll-ops.h"
 #include "htp/rope-ops.h"
 #include "htp/set-rows-ops.h"
+#include "htp/snake-ops.h"
 #include "htp/softmax-ops.h"
 #include "htp/solve-tri-ops.h"
 #include "htp/ssm-conv.h"
@@ -49,6 +51,9 @@ static inline bool htp_kparams_check(Args &&... args) {
 }
 
 struct htp_opnode;
+
+// CPU fallback for the F32 conv-taps custom op; also identifies the op in the HTP solver.
+void htp_conv_taps_cpu(struct ggml_tensor * dst, int ith, int nth, void * userdata);
 
 bool htp_kparams_solve(
     const struct ggml_hexagon_session * sess,
