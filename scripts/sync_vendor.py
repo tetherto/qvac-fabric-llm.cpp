@@ -13,11 +13,15 @@ SHA1_COMMIT        = "e1e2536fcf6a8f9703be8c85d58724b408552287"
 SHA256_COMMIT      = "5e637272c13f200872d55ff579f7e2ab6c3f252f"
 ROTATE_BITS_COMMIT = "27e784942f67db44abf2115c6638e735b579acd1"
 
+# stb_image.h v2.30; the QVAC-26299 patches below are written against this file, and
+# stb master moved to v2.32 in Nov 2026 (the is_iphone anchor no longer matches)
+STB_COMMIT         = "013ac3beddff3dbffafd5177e7972067cd2b5083"
+
 vendor = {
     "https://github.com/nlohmann/json/releases/latest/download/json.hpp":     "vendor/nlohmann/json.hpp",
     "https://github.com/nlohmann/json/releases/latest/download/json_fwd.hpp": "vendor/nlohmann/json_fwd.hpp",
 
-    "https://raw.githubusercontent.com/nothings/stb/refs/heads/master/stb_image.h": "vendor/stb/stb_image.h",
+    f"https://raw.githubusercontent.com/nothings/stb/{STB_COMMIT}/stb_image.h": "vendor/stb/stb_image.h",
 
     # not using latest tag to avoid this issue: https://github.com/ggml-org/llama.cpp/pull/17179#discussion_r2515877926
     # "https://github.com/mackron/miniaudio/raw/refs/tags/0.11.24/miniaudio.h": "vendor/miniaudio/miniaudio.h",
