@@ -41,6 +41,11 @@ std::string common_chat_template_generation_prompt_impl(
 
 bool is_lfm2_template(const std::string & src);
 
+bool is_inkling2_template(const std::string & src);
+
+// give each media marker of a text block its own message block
+void common_chat_inkling2_split_media(common_chat_prompt & prompt);
+
 namespace workaround {
 
 void convert_tool_responses_gemma4(json & messages);

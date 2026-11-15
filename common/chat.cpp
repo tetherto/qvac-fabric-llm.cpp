@@ -1647,6 +1647,9 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
             thinking_forced_open_from_gen_prompt(auto_params.generation_prompt,
                                                  auto_params.thinking_start_tag,
                                                  auto_params.thinking_end_tags);
+        if (is_inkling2_template(src)) {
+            common_chat_inkling2_split_media(auto_params.prompt);
+        }
         const auto & arena = auto_params.parser;
         LOG_DBG("%s: generated parser:\n%s\n\nparser generation prompt: %s\n", __func__, arena.dump(arena.root()).c_str(), auto_params.generation_prompt.c_str());
         return auto_params;
