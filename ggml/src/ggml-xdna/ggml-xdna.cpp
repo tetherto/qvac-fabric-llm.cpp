@@ -1147,7 +1147,8 @@ struct xdna_rec_plan {
     ggml_tensor * n_resid    = nullptr;  // ADD attn_residual-N (h_attn dst)
     ggml_tensor * n_lout     = nullptr;  // ADD l_out-N (h_out dst)
     ggml_tensor * n_convst   = nullptr;  // GET_ROWS behind conv_states-N (conv seed)
-    ggml_tensor * n_sstate   = nullptr;  // GET_ROWS cache_s read (ssm seed)
+    ggml_tensor * n_sstate   = nullptr;  // ssm seed: n_sview, or the GET_ROWS of a moved state
+    ggml_tensor * n_sview    = nullptr;  // in-place cache_s read behind state_predelta-N
     ggml_tensor * n_hres     = nullptr;  // residual input (attn_residual src[1])
     // weight leaves
     ggml_tensor * w_conv     = nullptr;
@@ -2469,8 +2470,14 @@ static bool xdna_rec_scan(ggml_backend_xdna_context *  ctx,
             const int il  = xdna_atoi(nn + 14);
             m[il].il      = il;
             m[il].n_resid = const_cast<ggml_tensor *>(n);
+        } else if (strncmp(nn, "state_predelta-", 15) == 0 && xdna_rec_state_view(n->src[0]) &&
+                   strncmp(ggml_get_name(n->src[0]->view_src), "cache_s_l", 9) == 0) {
+            // the ssm state read in place: its cache row
+            const int il  = xdna_atoi(nn + 15);
+            m[il].il      = il;
+            m[il].n_sview = const_cast<ggml_tensor *>(n->src[0]);
         }
-        // cache_s read (GET_ROWS over the state cell), the ssm seed.
+        // a one-row GET_ROWS over cache_s: the ubatch's state, moved into its cell before the in-place read
         if (n->op == GGML_OP_GET_ROWS && xdna_rec_state_heads(n->ne[0]) > 0 && n->ne[1] == 1) {
             const ggml_tensor * r = n->src[0];
             if (r && ggml_get_name(r)) {
@@ -2488,6 +2495,13 @@ static bool xdna_rec_scan(ggml_backend_xdna_context *  ctx,
     // or miss a needed data node in this chunk.
     for (auto & kv : m) {
         xdna_rec_plan & p = kv.second;
+        // only with one state in the graph (n_rs == 1): the seed is the moved state's gather (the fire skips its copy into the cell), else the cell
+        if (!p.n_convst || p.n_convst->ne[1] != 1) {
+            continue;
+        }
+        if (!p.n_sstate) {
+            p.n_sstate = p.n_sview;
+        }
         if (!p.w_conv || !p.w_so || !p.w_gamma || !p.w_post || !p.w_gate || !p.w_up || !p.w_down || !p.n_qkv ||
             !p.n_z || !p.n_gate || !p.n_beta || !p.n_resid || !p.n_lout || !p.n_convst || !p.n_sstate || p.i_conv < 0 ||
             p.i_lout < 0) {
@@ -2559,7 +2573,11 @@ static bool xdna_rec_scan(ggml_backend_xdna_context *  ctx,
 
 // The recurrent-memory row the layer's state read points at: the sequence's
 // cell slot, which is what tells two sequences sharing one context apart.
+// An in-place read gives it by its offset, a gather by its first row id.
 static int64_t xdna_rec_seq_row(const xdna_rec_plan & p) {
+    if (p.n_sstate && p.n_sstate == p.n_sview) {
+        return xdna_rec_state_view_row(p.n_sview);
+    }
     const ggml_tensor * idx = p.n_sstate ? p.n_sstate->src[1] : nullptr;
     if (idx && idx->data && idx->type == GGML_TYPE_I32 && idx->ne[0] >= 1) {
         return ((const int32_t *) idx->data)[0];
@@ -4994,13 +5012,15 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
         // Fused-layer input snapshot: right when a producer node runs, copy its
         // output into the layer session before llama recycles the buffer. A
         // consumed node was already produced (e.g. the fused write of a
-        // previous layer) and is only copied. Views need no snapshot.
+        // previous layer) and is only copied. Views need no snapshot, except the
+        // ssm seed read in place, whose cache row is copied.
         for (auto & c : rec_caps) {
-            if (c.i != i || ggml_xdna_is_view_op(node->op)) {
+            const bool view = ggml_xdna_is_view_op(node->op);
+            if (c.i != i || (view && !(c.kind == 2 && node == c.p->n_sview))) {
                 continue;
             }
             xdna_rec_session * s = xdna_rec_session_get(ctx, c.p->il);
-            if (s && consumed.count(node) == 0) {
+            if (s && !view && consumed.count(node) == 0) {
                 if (!xdna_res_touch(ctx, node)) {
                     return GGML_STATUS_FAILED;
                 }
