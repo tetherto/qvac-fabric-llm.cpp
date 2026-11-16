@@ -1,14 +1,20 @@
+#pragma once
+
 #include "common.cuh"
 
 // Batched F32 products with a short contraction and few columns, one direct kernel instead of cuBLAS:
 // windowed attention over many small windows gives tens of thousands of 16x16 products per call.
 
-// longest contraction (src0->ne[0]): the rows of src0 a thread holds must fit in registers
-#define MM_SMALL_MAX_K 32
+// longest contraction (src0->ne[0]): the rows of src0 a thread holds must fit in registers.
+// mm_small_launch has one switch case per multiple of 4 up to this value: change both together.
+#define CUDA_MM_SMALL_MAX_K 32
 // most src1 columns: above this the strided batched cuBLAS GEMM is as fast or faster
-#define MM_SMALL_MAX_COLS 32
-// fewest matrices per call: below this the call is too small to matter and the other paths are kept
-#define MM_SMALL_MIN_BATCH 16
+#define CUDA_MM_SMALL_MAX_COLS 32
+// fewest threads per launch, one per 1, 2 or 4 rows of src0 (see mm_small_rows_per_thread). Each thread loops over
+// every src1 column, so a small launch is bound by that loop. Measured on a T4 against MMVF and cuBLAS for K 2 to 32,
+// 2 to 32 columns and 16 to 64 rows: from 1024 threads on mm-small was 1.6x to 20x faster in every shape, at 512
+// one shape was 1.6x slower.
+#define CUDA_MM_SMALL_MIN_THREADS 1024
 
 bool ggml_cuda_should_use_mm_small(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 
