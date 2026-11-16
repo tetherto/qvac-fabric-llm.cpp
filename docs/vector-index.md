@@ -242,9 +242,10 @@ before search.
   equal scores by row, so tied rows from different lists can swap.
   `ggml_vec_index_ids` reports the new order, prepared filters become stale,
   and the next `ggml_vec_index_sync` rewrites the whole file. The move needs
-  memory for a second copy of the codes; without it, or on a read-only mmap,
-  delta-log bound or tombstoned index, the build keeps the rows where they
-  are. Initial centroids are picked in id order, so rebuilding an unchanged
+  memory for one extra copy of the codes, or two when the index also keeps
+  packed rows, as staged search does. Without that memory, or on a read-only
+  mmap, delta-log bound or tombstoned index, the build keeps the rows where
+  they are. Initial centroids are picked in id order, so rebuilding an unchanged
   index gives the same lists and moves nothing.
 
 `ggml_vec_index_prepare` is an optional cache warmup for TurboVec rotation and

@@ -247,9 +247,10 @@ GGML_VEC_INDEX_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 // of one list sit together, which lets an IVF search score few blocks. That
 // changes the order `ggml_vec_index_ids` reports and the row order of later
 // snapshots, makes prepared filters stale, and makes the next
-// `ggml_vec_index_sync` write the whole file. The move needs memory for a
-// second copy of the codes; without it the build still succeeds and leaves
-// the rows where they are. Rows already in list order are not moved, so
+// `ggml_vec_index_sync` write the whole file. The move needs memory for one
+// extra copy of the codes, or two when the index also keeps packed rows, as
+// staged search does; without it the build still succeeds and leaves the
+// rows where they are. Rows already in list order are not moved, so
 // rebuilding an unchanged index changes nothing.
 // `n_lists` is capped to the current index length. `n_iter` controls centroid
 // refinement; 0 uses the initial centroids only. Those are rows picked at
