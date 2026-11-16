@@ -2236,6 +2236,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix(ggml
     return res;
 }
 
+// the chunk pass or the merge pass of the chunked top-k
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_chunked(ggml_metal_library_t lib, const ggml_tensor * op, bool merge) {
+    assert(op->op == GGML_OP_TOP_K);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_top_k_%s_%s_%s", merge ? "merge_chunks" : "chunk", ggml_type_name(op->src[0]->type), ggml_type_name(op->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_merge(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_TOP_K);
 

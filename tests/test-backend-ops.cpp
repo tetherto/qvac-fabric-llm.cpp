@@ -18952,6 +18952,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k, true));
         }
     }
+    // the chunked top-k at the largest k it serves and just above it, over a ragged last chunk and batch dims
+    for (int k : {16, 64, 65}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 8, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4*4096 + 123, 3, 2, 2}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4*4096 + 123, 3, 2, 2}, k, true));
+    }
 
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));
@@ -20919,6 +20925,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 16));
         }
     }
+    // DSpine draft head: the top 16 of each of the 16 block rows over the Qwen3.8 vocabulary
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 16, 1, 1}, 16));
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
     for (auto k : {20, 40}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {151936, 1, 1, 1}, k));
