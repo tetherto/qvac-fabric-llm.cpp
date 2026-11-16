@@ -7592,9 +7592,10 @@ void check_turbovec_ivf_rebuild_stable() {
     }
 }
 
-// Staged search fits its statistics from the first 64 blocks. After the
-// move those hold one IVF list, so the build fits them first, from the mixed
-// rows, and staged search keeps returning what it returned before the build.
+// Staged search fits its statistics from the codes. Upstream counts the
+// first 64 blocks, which after an IVF build hold one list; counted over every
+// row they do not depend on the order, so staged search returns what it did
+// before the build, in memory and after a save and load.
 void check_turbovec_ivf_keeps_staged_results() {
     constexpr int dim = 64;
     // Rows from many clusters interleaved, so the head of the index is a mix
@@ -7672,6 +7673,27 @@ void check_turbovec_ivf_keeps_staged_results() {
             const auto got = staged_results(idx);
             CHECK(got.first == expected.first);
             CHECK(got.second == expected.second);
+
+            // The grouped rows saved and loaded back, through bytes and
+            // through a synced file, give the same staged results too.
+            uint8_t * data = nullptr;
+            size_t size = 0;
+            CHECK(ggml_vec_index_to_bytes(idx, &data, &size) == GGML_VEC_INDEX_OK);
+            ggml_vec_index_t * from_bytes = nullptr;
+            CHECK(ggml_vec_index_from_bytes(data, size, &from_bytes) == GGML_VEC_INDEX_OK);
+            ggml_vec_index_bytes_free(data);
+            CHECK(turbovec_ids_in_order(from_bytes) == turbovec_ids_in_order(idx));
+            CHECK(staged_results(from_bytes) == expected);
+            ggml_vec_index_free(from_bytes);
+
+            temp_file snapshot(".tv");
+            const std::string path = snapshot.path.string();
+            CHECK(ggml_vec_index_sync(idx, path.c_str()) == GGML_VEC_INDEX_OK);
+            auto * loaded = ggml_vec_index_load(path.c_str());
+            CHECK(loaded != nullptr);
+            CHECK(turbovec_ids_in_order(loaded) == turbovec_ids_in_order(idx));
+            CHECK(staged_results(loaded) == expected);
+            ggml_vec_index_free(loaded);
             ggml_vec_index_free(idx);
         }
     }

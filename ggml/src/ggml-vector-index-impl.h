@@ -1014,15 +1014,11 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot);
 // planes mutex: the caller must hold `idx.mutex` exclusively.
 void turbovec_planes_reset(ggml_vec_index & idx);
 // The same, but a promoted index stays promoted and keeps its fitted
-// statistics, for a change that moves every row without changing the codes;
+// statistics (counted over every row, so a move does not change them), for
+// a change that moves every row without changing the codes;
 // the caller then refreshes from slot 0. Same locking rule as
 // turbovec_planes_reset.
 void turbovec_planes_restart(ggml_vec_index & idx);
-// Fits the staged-search statistics now if the index is promoted and has
-// none yet. They come from the first 64 blocks (upstream pack.rs
-// `planes_stats`), so a row move fits them first, while the head still holds
-// a mix of rows rather than one IVF list.
-void turbovec_planes_fit_stats(ggml_vec_index & idx);
 void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
 // How a staged search is run, following upstream's batch bookkeeping.
 struct TurboVecStagedOpts {

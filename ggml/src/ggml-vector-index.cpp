@@ -1035,9 +1035,6 @@ bool turbovec_group_rows_by_ivf(ggml_vec_index & idx) {
             }
         });
         turbovec_blocked_gather(idx, order, new_blocked, new_n_blocks);
-        // Staged search would refit its statistics from the head of the
-        // moved rows, which is one list, and return different results.
-        turbovec_planes_fit_stats(idx);
     } catch (const std::bad_alloc &) {
         return false;
     }
@@ -1065,7 +1062,7 @@ bool turbovec_group_rows_by_ivf(ggml_vec_index & idx) {
     }
     // Every row moved, so the sign planes are rebuilt from slot 0. A promoted
     // index stays promoted, even below the size that promotes one, and keeps
-    // the statistics fitted above.
+    // its fitted statistics, which do not depend on the row order.
     turbovec_planes_restart(idx);
     turbovec_planes_refresh(idx, 0);
     turbovec_settle_rows(idx);

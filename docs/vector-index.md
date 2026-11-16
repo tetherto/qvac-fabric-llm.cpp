@@ -177,7 +177,15 @@ full scan's, the same as upstream, and real embeddings fare better (see
 upstream's measurements). The results match upstream's single-threaded
 staged search bit for bit, ties included, down to the batch query whose
 sampled seed comes up short and is rescanned unseeded (with single-query
-tables under the aarch64 rules, with the batch's own under the x86 rules).
+tables under the aarch64 rules, with the batch's own under the x86 rules),
+with one exception. The statistics that weigh the lower planes in the
+shortlist ranking are counted over every row, where upstream counts the
+first 2,048. Counted that way they do not depend on the row order, so an IVF
+build, which moves the rows into list order, does not change staged
+results, in memory or after a save and load. On an index of more than 2,048
+rows the ids can therefore differ from upstream's; the returned scores are
+still exactly the full scan's. The count is one pass over the codes, paid
+on the first staged search after a load or promotion.
 A batch over an index with no filter and no removed rows scans the sign
 planes for several queries at once (four on aarch64, six on x86).
 Upstream's thread-pool variant refines inside its scan and can return
