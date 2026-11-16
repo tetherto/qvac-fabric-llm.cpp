@@ -17986,7 +17986,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t k : {128, 384}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 100, n, k, {1, 1}, {1, 1}));
         }
-        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q5_K, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_F16, GGML_TYPE_BF16}) {
             for (mul_mat_add_mode mode : {MUL_MAT_ADD_MM_RES, MUL_MAT_ADD_RES_MM, MUL_MAT_ADD_ROW, MUL_MAT_ADD_RES_INPLACE, MUL_MAT_ADD_MM_MM}) {
                 test_cases.emplace_back(new test_mul_mat_add(type_a, 1000, n, 1024, mode));
             }
@@ -18000,7 +18000,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // a src1 with a nonzero mean, for the zero points and mins of quantized src0 types
         for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q2_K,
-                                 GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+                                 GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
             test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
         }
     }
@@ -20312,6 +20312,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int n : {2, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
         }
+    }
+    // Qwen3.8 27B q6_K output head: single token, and the speculative draft and verify
+    for (int n : {1, 8, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
     }
     // Bonsai-2 27B output head, single token and speculative verify
     for (int n : {1, 8}) {
