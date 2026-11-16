@@ -17967,6 +17967,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
         }
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 64, n, 256, {3, 2}, {2, 1}));
+        // a single iq4_nl block: one simdgroup, whose reduction needs less shmem than the iq4 table
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 40, n, 32, {1, 1}, {1, 1}));
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
                                  GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
                                  GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_TQ2_0,
@@ -17986,7 +17988,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t k : {128, 384}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 100, n, k, {1, 1}, {1, 1}));
         }
-        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL,
+                                 GGML_TYPE_IQ4_XS, GGML_TYPE_F16, GGML_TYPE_BF16}) {
             for (mul_mat_add_mode mode : {MUL_MAT_ADD_MM_RES, MUL_MAT_ADD_RES_MM, MUL_MAT_ADD_ROW, MUL_MAT_ADD_RES_INPLACE, MUL_MAT_ADD_MM_MM}) {
                 test_cases.emplace_back(new test_mul_mat_add(type_a, 1000, n, 1024, mode));
             }
@@ -17994,7 +17997,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // the widest tiles with two src1 tiles, and src1 rows padded in memory
         for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_K,
-                                 GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+                                 GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, n, 512,  {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
         }
