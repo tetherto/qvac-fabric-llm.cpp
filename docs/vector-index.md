@@ -245,7 +245,8 @@ before search.
   memory for one extra copy of the codes, or two when the index also keeps
   packed rows, as staged search does. Without that memory, or on a read-only
   mmap, delta-log bound or tombstoned index, the build keeps the rows where
-  they are. Initial centroids are picked in id order, so rebuilding an unchanged
+  they are. Initial centroids are picked in id order and `n_iter` e-means
+  passes refine them, with a fixed shuffle seed, so rebuilding an unchanged
   index gives the same lists and moves nothing.
 
 `ggml_vec_index_prepare` is an optional cache warmup for TurboVec rotation and
@@ -254,7 +255,9 @@ use `ggml_vec_index_build_ivf` when approximate-search preparation is needed.
 
 Higher `nprobe` values search more lists and generally improve recall at higher
 cost. IVF uses the same dot-product score as exact search, assigning vectors and
-queries to arithmetic centroids with dot-product scoring. Low `nprobe` values
+queries to centroids with dot-product scoring. The centroids are trained with
+spherical e-means, mini-batch k-means with moving-average centroids, so they
+are unit length after at least one pass. Low `nprobe` values
 are a recall/latency heuristic; probing all built lists gives exact-search
 candidate coverage. For cosine-like IVF behavior, normalize vectors before
 insertion and normalize queries before search.

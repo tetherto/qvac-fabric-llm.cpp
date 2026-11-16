@@ -7,6 +7,7 @@
 #include "ggml-vector-index.h"
 
 #include <algorithm>
+#include <random>
 #include <array>
 #include <cassert>
 #include <cerrno>
@@ -9793,7 +9794,12 @@ int main(int argc, char ** argv) {
             empty_list_vecs.data(),
             static_cast<int>(empty_list_ids.size()),
             empty_list_ids.data()) == GGML_VEC_INDEX_OK);
-        CHECK(ggml_vec_index_build_ivf(empty_list_ann, /*n_lists=*/3, /*n_iter=*/1)
+        // With the seeds only (n_iter 0), the rows are the three centroids and
+        // the third row scores higher on the first one, so list 2 is empty.
+        // E-means passes would revive it. The query scores best on that empty
+        // list, so search must skip it and probe list 1, which holds the
+        // second row.
+        CHECK(ggml_vec_index_build_ivf(empty_list_ann, /*n_lists=*/3, /*n_iter=*/0)
               == GGML_VEC_INDEX_OK);
         CHECK(ggml_vec_index_search_ivf(
             empty_list_ann,
@@ -9803,9 +9809,78 @@ int main(int argc, char ** argv) {
             /*nprobe=*/1,
             ann_scores.data(),
             ann_ids.data()) == GGML_VEC_INDEX_OK);
-        CHECK(ann_ids[0] == empty_list_ids[2]);
-        CHECK(std::fabs(ann_scores[0] + 3.0f) < 1e-5f);
+        CHECK(ann_ids[0] == empty_list_ids[1]);
+        // The second row scores 1 * -2 + -3 * 1 = -5 against the query.
+        CHECK(std::fabs(ann_scores[0] + 5.0f) < 1e-5f);
         ggml_vec_index_free(empty_list_ann);
+    }
+
+    // E-means IVF on well separated clusters: one probe finds a query's own
+    // cluster, and an index with the same rows added in another order gives
+    // the same results, since the build works in id order.
+    {
+        constexpr int dim = 32;
+        constexpr int n_clusters = 8;
+        constexpr int per_cluster = 64;
+        constexpr int n = n_clusters * per_cluster;
+        constexpr int n_iter = 2;
+        constexpr int k = 5;
+        // Cluster centers are far apart next to the noise, so a correct
+        // build puts each cluster in its own list.
+        constexpr float center_scale = 10.0f;
+        constexpr float noise_scale = 0.1f;
+        constexpr uint32_t seed = 4242;
+        std::mt19937 rng(seed);
+        std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+        std::vector<float> centers(static_cast<size_t>(n_clusters) * dim);
+        for (float & v : centers) {
+            v = center_scale * unit(rng);
+        }
+        std::vector<float> rows(static_cast<size_t>(n) * dim);
+        std::vector<uint64_t> row_ids(n);
+        for (int i = 0; i < n; ++i) {
+            const int c = i % n_clusters;
+            for (int d = 0; d < dim; ++d) {
+                rows[static_cast<size_t>(i) * dim + d] = centers[static_cast<size_t>(c) * dim + d] + noise_scale * unit(rng);
+            }
+            row_ids[static_cast<size_t>(i)] = static_cast<uint64_t>(i);
+        }
+        auto cluster_of = [](uint64_t id) { return static_cast<int>(id % n_clusters); };
+
+        auto * forward = ggml_vec_index_create(dim, /*bit_width=*/32);
+        CHECK(forward != nullptr);
+        CHECK(ggml_vec_index_add(forward, rows.data(), n, row_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_build_ivf(forward, n_clusters, n_iter) == GGML_VEC_INDEX_OK);
+
+        // The same rows added back to front.
+        std::vector<float> reversed_rows(rows.size());
+        std::vector<uint64_t> reversed_ids(row_ids.rbegin(), row_ids.rend());
+        for (int i = 0; i < n; ++i) {
+            std::copy_n(rows.data() + static_cast<size_t>(n - 1 - i) * dim, dim,
+                        reversed_rows.data() + static_cast<size_t>(i) * dim);
+        }
+        auto * backward = ggml_vec_index_create(dim, /*bit_width=*/32);
+        CHECK(backward != nullptr);
+        CHECK(ggml_vec_index_add(backward, reversed_rows.data(), n, reversed_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_build_ivf(backward, n_clusters, n_iter) == GGML_VEC_INDEX_OK);
+
+        std::vector<float> scores(k);
+        std::vector<uint64_t> found(k);
+        std::vector<float> back_scores(k);
+        std::vector<uint64_t> back_found(k);
+        for (int c = 0; c < n_clusters; ++c) {
+            const float * query = centers.data() + static_cast<size_t>(c) * dim;
+            CHECK(ggml_vec_index_search_ivf(forward, query, 1, k, /*nprobe=*/1, scores.data(), found.data()) ==
+                  GGML_VEC_INDEX_OK);
+            for (uint64_t id : found) {
+                CHECK(id != UINT64_MAX && cluster_of(id) == c);
+            }
+            CHECK(ggml_vec_index_search_ivf(backward, query, 1, k, /*nprobe=*/1, back_scores.data(),
+                                            back_found.data()) == GGML_VEC_INDEX_OK);
+            CHECK(back_found == found);
+        }
+        ggml_vec_index_free(backward);
+        ggml_vec_index_free(forward);
     }
 
     // Read-only APIs on one handle can run concurrently.
