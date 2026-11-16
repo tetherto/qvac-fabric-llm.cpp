@@ -2710,13 +2710,15 @@ struct test_get_rows : public test_case {
     const bool v; // view src1
     const bool vs0; // view src0
     const int offset_cols; // // column offset of the view src0
+    const float amp; // range of the source values
 
     std::string vars() override {
-        return VARS_TO_STR9(type, n, m, r, be1, be2, v, vs0, offset_cols);
+        const std::string s = VARS_TO_STR9(type, n, m, r, be1, be2, v, vs0, offset_cols);
+        return amp == 1.0f ? s : s + "," + VAR_TO_STR(amp);
     }
 
-    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false, int offset_cols = 0)
-        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), vs0(vs0), offset_cols(offset_cols) {}
+    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false, int offset_cols = 0, float amp = 1.0f)
+        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), vs0(vs0), offset_cols(offset_cols), amp(amp) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * in;
@@ -2767,7 +2769,7 @@ struct test_get_rows : public test_case {
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
             } else {
-                init_tensor_uniform(t);
+                init_tensor_uniform(t, -amp, amp);
             }
         }
     }
@@ -16312,6 +16314,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
         test_cases.emplace_back(new test_get_rows(type,     256,   5,         4, 700, 100, false));
     }
+    // weights of the size of real LLM weights, where the q4_K super-block scale d/16 is a half subnormal
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q4_K, 4096, 5, 4, 1, 1, false, false, 0, 0.03f));
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,

@@ -582,7 +582,7 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
     q = q + (il/4) * 32 + 16 * (il&1);
     il = il & 3;
     const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float d   = il < 2 ? xb->d : xb->d / 16.f;
     const float min = xb->dmin;
     const float dl = d * sc[0];
     const float ml = min * sc[1];
