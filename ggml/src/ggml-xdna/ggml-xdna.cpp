@@ -94,6 +94,10 @@ static bool xdna_glue_claims(const struct ggml_tensor * op) {
     if (op->op == GGML_OP_NONE || ggml_xdna_is_view_op(op->op)) {
         return false;
     }
+    // llama builds ragged ubatches only for a device that takes these ops; on the host they make a multi-sequence prefill slower than the equal split
+    if (op->op == GGML_OP_SSM_CONV_RAGGED || op->op == GGML_OP_GATED_DELTA_NET_RAGGED) {
+        return false;
+    }
     // The KV append writes llama's f16 cache, which this backend's buffers
     // hold. Left to the CPU backend it split the graph at every attention
     // layer - seven graph_compute calls a token - and an attention layer
