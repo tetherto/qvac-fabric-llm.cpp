@@ -1123,8 +1123,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma(ggml_
         ggml_metal_cv_free(cv);
     }
 
+    // the iq4 kernel keeps its 256-entry half2 table in shmem before the reduction
+    constexpr size_t iq4_lut_bytes = 256*2*sizeof(uint16_t);
+    const size_t smem = ggml_metal_mul_mv_mma_smem(nsg, nt, rt);
+
     res.nsg  = nsg;
-    res.smem = ggml_metal_mul_mv_mma_smem(nsg, nt, rt);
+    res.smem = ggml_metal_mul_mv_mma_kind(tsrc0, rt) == GGML_METAL_MMA_KIND_IQ4 ? std::max(smem, iq4_lut_bytes) : smem;
 
     res.nr0 = GGML_METAL_MMA_TILE*nt;
     res.nr1 = GGML_METAL_MMA_TILE*rt;

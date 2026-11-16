@@ -651,6 +651,156 @@ template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt1_rt2")]] kernel mul_mv_mma_t
 template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q6_K_f32<2, 2>;
 template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q6_K_f32<4, 2>;
 
+// iq4_nl and iq4_xs over 32-weight sub-blocks, laid out as in mul_mv_mma_q4_0: A lane (m, j) holds qs bytes 2*j .. 2*j + 3
+// (j even), B lane k = fm holds src1 values 2*k, 2*k + 1 (low nibbles) and 2*k + 16, 2*k + 17 (high nibbles)
+struct mul_mv_mma_iq4_nl {
+    typedef block_iq4_nl block;
+    enum { n_sub = 1 };
+
+    static ushort2 load(device const block * xb, short sb, short fn) {
+        device const ushort * qs = (device const ushort *) xb->qs + fn;
+        return ushort2(qs[0], qs[1]);
+    }
+    static float scale(device const block * xb, short sb) {
+        return xb->d;
+    }
+};
+
+struct mul_mv_mma_iq4_xs {
+    typedef block_iq4_xs block;
+    enum { n_sub = QK_K/32 };
+
+    static ushort2 load(device const block * xb, short sb, short fn) {
+        device const ushort * qs = (device const ushort *) (xb->qs + 16*sb) + fn;
+        return ushort2(qs[0], qs[1]);
+    }
+    static float scale(device const block * xb, short sb) {
+        const int ls = ((xb->scales_l[sb/2] >> 4*(sb%2)) & 0xf) | (((xb->scales_h >> 2*sb) & 3) << 4);
+        return (float) xb->d*(ls - 32);
+    }
+};
+
+// few-row mat-mat for iq4_nl/iq4_xs: the MMAs take the exact LUT values of a threadgroup table indexed by quant byte,
+// and the sub-block scale goes into the accumulation. the table shares shmem with the K-slice reduction
+template<short NT, short RT, typename Q>
+kernel void kernel_mul_mv_mma_iq4_f32(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * src2,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_mma_nsg;
+
+    constexpr short n_lut = 256;
+
+    threadgroup half2 * lut = (threadgroup half2 *) shmem;
+    for (short i = sgitg*32 + tiisg; i < n_lut; i += NSG*32) {
+        lut[i] = half2((half) kvalues_iq4nl_f[i & 0xF], (half) kvalues_iq4nl_f[i >> 4]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const mul_mv_mma_tile tile = mul_mv_mma_tile_init<NT, RT>(args, tgpig, tiisg);
+
+    device const typename Q::block * x[NT];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        x[t] = (device const typename Q::block *) mul_mv_mma_src0_row(tile, args, src0, t);
+    }
+
+    device const float2 * y[RT][2];
+    FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+        FOR_UNROLL (short e = 0; e < 2; ++e) {
+            y[rt][e] = (device const float2 *) mul_mv_mma_src1_row(tile, args, src1, rt, e) + tile.fm;
+        }
+    }
+
+    float acc[RT][NT][2] = {};
+
+    const int n_sb = FC_mul_mv_mma_ne00/32;
+
+    for (int isb = sgitg; isb < n_sb; isb += NSG) {
+        const int   ib = isb/Q::n_sub;
+        const short sb = isb%Q::n_sub;
+
+        ushort2 q[NT];
+        float   d[NT];
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            q[t] = Q::load(x[t] + ib, sb, tile.fn);
+            d[t] = Q::scale(x[t] + ib, sb);
+        }
+
+        float2 b0[RT][2];
+        float2 b1[RT][2];
+        FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+            FOR_UNROLL (short e = 0; e < 2; ++e) {
+                b0[rt][e] = y[rt][e][16*isb];
+                b1[rt][e] = y[rt][e][16*isb + 8];
+            }
+        }
+
+        simdgroup_float8x8 mp[RT][NT];
+        FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+            FOR_UNROLL (short t = 0; t < NT; ++t) {
+                mp[rt][t] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+        }
+
+        // step (hb, hi) takes byte hb of each ushort and its low (hi = 0) or high nibble: weight 2*k + hb + 16*hi
+        FOR_UNROLL (short hb = 0; hb < 2; ++hb) {
+            half2 lx[NT];
+            half2 ly[NT];
+            FOR_UNROLL (short t = 0; t < NT; ++t) {
+                lx[t] = lut[(q[t].x >> 8*hb) & 0xFF];
+                ly[t] = lut[(q[t].y >> 8*hb) & 0xFF];
+            }
+            FOR_UNROLL (short hi = 0; hi < 2; ++hi) {
+                simdgroup_float8x8 mb[RT];
+                FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+                    const float2 v0 = hi ? b1[rt][0] : b0[rt][0];
+                    const float2 v1 = hi ? b1[rt][1] : b0[rt][1];
+                    mb[rt].thread_elements()[0] = hb ? v0.y : v0.x;
+                    mb[rt].thread_elements()[1] = hb ? v1.y : v1.x;
+                }
+                FOR_UNROLL (short t = 0; t < NT; ++t) {
+                    simdgroup_half8x8 ma;
+                    ma.thread_elements()[0] = hi ? lx[t].y : lx[t].x;
+                    ma.thread_elements()[1] = hi ? ly[t].y : ly[t].x;
+                    FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+                        simdgroup_multiply_accumulate(mp[rt][t], ma, mb[rt], mp[rt][t]);
+                    }
+                }
+            }
+        }
+
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+                acc[rt][t][0] = fma(d[t], mp[rt][t].thread_elements()[0], acc[rt][t][0]);
+                acc[rt][t][1] = fma(d[t], mp[rt][t].thread_elements()[1], acc[rt][t][1]);
+            }
+        }
+    }
+
+    // the reduction overwrites the table
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    mul_mv_mma_store<NT, RT>(acc, args, src2, dst, shmem, tile, tiisg, sgitg);
+}
+
+template [[host_name("kernel_mul_mv_mma_iq4_nl_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_iq4_f32<1, 1, mul_mv_mma_iq4_nl>;
+template [[host_name("kernel_mul_mv_mma_iq4_nl_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_iq4_f32<2, 1, mul_mv_mma_iq4_nl>;
+template [[host_name("kernel_mul_mv_mma_iq4_nl_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_iq4_f32<4, 1, mul_mv_mma_iq4_nl>;
+template [[host_name("kernel_mul_mv_mma_iq4_nl_f32_nt1_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_iq4_f32<1, 2, mul_mv_mma_iq4_nl>;
+template [[host_name("kernel_mul_mv_mma_iq4_nl_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_iq4_f32<2, 2, mul_mv_mma_iq4_nl>;
+template [[host_name("kernel_mul_mv_mma_iq4_nl_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_iq4_f32<4, 2, mul_mv_mma_iq4_nl>;
+
+// iq4_xs with one src1 tile keeps the generic kernel: on an M3 Ultra this one is up to 2% slower there at 6144 rows or fewer
+template [[host_name("kernel_mul_mv_mma_iq4_xs_f32_nt1_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_iq4_f32<1, 2, mul_mv_mma_iq4_xs>;
+template [[host_name("kernel_mul_mv_mma_iq4_xs_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_iq4_f32<2, 2, mul_mv_mma_iq4_xs>;
+template [[host_name("kernel_mul_mv_mma_iq4_xs_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_iq4_f32<4, 2, mul_mv_mma_iq4_xs>;
+
 // pq2_0 runs over 64-weight halves h of a block. A lane (m, j) holds qs bytes 16*h + 2*j .. 16*h + 2*j + 3 (j even) as a ushort2,
 // and MMA step s takes field s%4 of the low (s < 4) or high byte of each ushort: the exact half q - 1.
 inline half2 mul_mv_mma_pq2_0_frag(ushort2 q, short s) {
@@ -924,8 +1074,9 @@ MUL_MV_MMA_GEN("iq3_xxs", block_iq3_xxs, QK_NL, dequantize_iq3_xxs)
 MUL_MV_MMA_GEN("iq3_s",   block_iq3_s,   QK_NL, dequantize_iq3_s)
 MUL_MV_MMA_GEN("iq1_s",   block_iq1_s,   QK_NL, dequantize_iq1_s)
 MUL_MV_MMA_GEN("iq1_m",   block_iq1_m,   QK_NL, dequantize_iq1_m)
-MUL_MV_MMA_GEN("iq4_nl",  block_iq4_nl,  2,     dequantize_iq4_nl)
-MUL_MV_MMA_GEN("iq4_xs",  block_iq4_xs,  QK_NL, dequantize_iq4_xs)
+template [[host_name("kernel_mul_mv_mma_iq4_xs_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 1, block_iq4_xs, QK_NL, dequantize_iq4_xs>;
+template [[host_name("kernel_mul_mv_mma_iq4_xs_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 1, block_iq4_xs, QK_NL, dequantize_iq4_xs>;
+template [[host_name("kernel_mul_mv_mma_iq4_xs_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 1, block_iq4_xs, QK_NL, dequantize_iq4_xs>;
 MUL_MV_MMA_GEN("tq2_0",   block_tq2_0,   QK_NL, dequantize_tq2_0)
 
 #undef MUL_MV_MMA_GEN
