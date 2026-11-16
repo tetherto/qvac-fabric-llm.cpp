@@ -273,8 +273,17 @@ bool xdna_gemm_seq_supported(const xdna_gemm_tiles * tiles, int M, int K, int N)
 // `tiles`. Buffer layout (row-major): arg 0 = A [M x K] bf16, arg 1 = B
 // [K x N] bf16, arg 2 = C [M x N] f32. M must equal the baked block.
 // `b_offset` (bytes) shifts the B base address, so a K-block can point into a
-// persistent full-weight buffer.
-bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * tiles, int M, int K, int N, uint32_t b_offset = 0);
+// persistent full-weight buffer; `c_offset` does the same for C. `sweep_window`
+// sweeps of the block are issued before the first one's tokens are waited (1:
+// each sweep is waited before the next is issued; at most 4, the widest measured).
+bool xdna_gemm_seq_build(xdna_seq *             seq,
+                         const xdna_gemm_tiles * tiles,
+                         int                     M,
+                         int                     K,
+                         int                     N,
+                         uint32_t                b_offset = 0,
+                         uint32_t                c_offset = 0,
+                         int                     sweep_window = 1);
 
 // Geometry of the merged conv+norm+gdn decode kernel (fused_layer.xclbin,
 // kernels/fused_layer.py). The worker layout is the rec_full design: conv on
@@ -312,8 +321,20 @@ struct xdna_attn_gdn_geom {
     int conv_cols         = 2;   // conv columns (cols 0-1)
     int norm_cols         = 2;   // norm columns (cols 2-3)
     int gdn_cols          = 4;   // gdn columns (cols 4-7)
-    int n_vh              = 16;  // value heads
+    int n_vh              = 16;  // value heads a pass
     int n_obj             = 8;   // pkv chunks per head
+    // The conv stage covers every group of the layer once: n_kg q groups,
+    // n_kg k groups, then one a value head (n_block in all), each into its
+    // head's x slot. A layer with more value heads than n_vh runs the other
+    // stages once per n_vh of them (a pass) over its own x slots, state and
+    // azg heads, from head0.
+    int n_kg              = 16;
+    int head0             = 0;
+    // Where a pass's heads find their q and k when not in their own x slots:
+    // head head0 + i reads them from slot qk_head0 + i (-1: its own slot).
+    int qk_head0          = -1;
+    int conv_stage        = 1;
+    int core_stage        = 1;  // norm, gdn and gated
     // Shim streams the gdn state is split across, in each direction. The
     // block's cost is that stream: 512 KB in and 512 KB out a layer, which one
     // channel moves in 119 us with the arithmetic hidden underneath.

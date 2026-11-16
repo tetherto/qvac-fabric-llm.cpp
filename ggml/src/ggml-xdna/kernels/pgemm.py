@@ -62,7 +62,7 @@ import kernelsrc
 import aie.iron as iron
 import aie.iron.kernels as akernels
 from aie.iron import Buffer, CompileTime, In, Lock, ObjectFifo, Out, Program, Runtime, Worker
-from aie.iron.dataflow import Flow, PacketFlow, TileDma
+from aie.iron.dataflow import Flow, PacketDest, PacketFlow, TileDma
 from aie.iron.dataflow.tile_dma import Acquire, Bd, DmaChannel, Release
 from aie.dialects._aie_enum_gen import DMAChannelDir, WireBundle
 from aie.iron.controlflow import range_
@@ -83,6 +83,8 @@ W_SHIM_CH  = 1                         # shim MM2S channel of W
 W_MT_S2MM  = 5                         # MemTile S2MM channel W arrives on
 W_MT_MM2S  = 4                         # MemTile MM2S channels: GEMV tile r on 4 + r
 W_CORE_CH  = 1                         # core S2MM channel W lands on
+W_PKT_PAIR = (0, 1)                    # packet-switched W: a pair's shared tiles, by r
+W_PKT_CORE = (2, 3, 4, 5)              # packet-switched W: one core's own data, by row - 2
 WS_ADDR    = 0x24000                   # the MemTile slot buffer: past the A objects of
 WS_BYTES   = 33 * 10752                # columns 6 and 7, to the end of the 512 KB
 CHUNK = COLS * 2 * NC                  # a GEMV chunk: 1024 output columns
@@ -127,7 +129,55 @@ def core_of(i: int):
     return i // 2, i % 2
 
 
-def build(dev_name: str = "npu2"):
+def w_packet_flows(mt, cts: list) -> list:
+    """A column's W routes as packet flows from MemTile `mt` to its cores `cts`
+    (rows 2-5, the tiles their DMAs use, so each core is one placement): id
+    W_PKT_PAIR[r] reaches both cores of pair r, id W_PKT_CORE[i] only core i."""
+    flows = []
+    for r in range(2):
+        flows.append(PacketFlow(W_PKT_PAIR[r], mt, cts[2 * r], src_channel=W_MT_MM2S + r, dst_channel=W_CORE_CH,
+                                extra_dsts=[PacketDest(cts[2 * r + 1], channel=W_CORE_CH)]))
+    for i, ct in enumerate(cts):
+        flows.append(PacketFlow(W_PKT_CORE[i], mt, ct, src_channel=W_MT_MM2S + core_of(i)[0],
+                                dst_channel=W_CORE_CH))
+    return flows
+
+
+def w_path_column(col: int, w_packet: bool = False):
+    """W: shim -> the MemTile's slot buffer -> the cores, the MemTile's side
+    programmed by the host per call (xdna-pgemm.cpp), so a chunk's tiles are
+    read from DDR once and replayed for every M block. Column `col`'s flows,
+    locks and DMAs, and its four cores' (tile buffer, empty lock, full lock).
+    `w_packet` routes MemTile -> cores by packet id instead of circuits."""
+    flows, locks, dmas, per = [], [], [], []
+    mt, sh = Tile(col, 1), Tile(col, 0)
+    wsb = Buffer(ws_ty, name=f"ws{col}", tile=mt, address=WS_ADDR)
+    dmas.append(_Hold(mt, [wsb]))
+    for k in range(4):
+        locks.append(Lock(mt, lock_id=WLOCK0 + k, init=0, name=f"wl{col}_{k}"))
+    flows.append(Flow(sh, mt, src_channel=W_SHIM_CH, dst_channel=W_MT_S2MM))
+    # the MemTile's task tokens, which the host waits on to keep its
+    # channels' queues short (the compiler gives MemTiles packet id 26)
+    flows.append(PacketFlow(MT_CTRL_PKT, mt, sh, src_port=WireBundle.TileControl, src_channel=0,
+                            dst_port=WireBundle.South, dst_channel=0, keep_pkt_header=True))
+    cts = [Tile(col, 2 + i) for i in range(4)]
+    if w_packet:
+        flows += w_packet_flows(mt, cts)
+    for i, ct in enumerate(cts):
+        r, mb = core_of(i)
+        if not w_packet:
+            flows.append(Flow(mt, ct, src_channel=W_MT_MM2S + r, dst_channel=W_CORE_CH))
+        wb = Buffer(t_ty, name=f"wb{col}_{i}", tile=ct)
+        wp = Lock(ct, init=1, name=f"wp{col}_{i}")
+        wc = Lock(ct, init=0, name=f"wc{col}_{i}")
+        locks += [wp, wc]
+        dmas.append(TileDma(ct, [DmaChannel(DMAChannelDir.S2MM, W_CORE_CH,
+                                            [Bd(wb, acquires=[Acquire(wp)], releases=[Release(wc)])])]))
+        per.append((wb, wp, wc))
+    return flows, locks, dmas, per
+
+
+def build(dev_name: str = "npu2", w_packet: bool = False):
     """The workers and the object fifos' endpoints; the runtime sequence is the
     caller's. Endpoints: w (a column each), a (mb 0, 1), c (a column each)."""
     mm = akernels.mm(MB, KS, NC, input_dtype=bf16, output_dtype=np.float32, vectorized=True,
@@ -139,34 +189,13 @@ def build(dev_name: str = "npu2"):
     k_exp = mk("ggml_xdna_expand_pair", [t_ty, b_ty, n_ty])
     k_out = mk("ggml_xdna_pg_out", [acc_ty, c_ty, n_ty])
 
-    # W: shim -> the MemTile's slot buffer -> the cores, the MemTile's side
-    # programmed by the host per call (xdna-pgemm.cpp), so a chunk's tiles
-    # are read from DDR once and replayed for every M block
     flows, locks, dmas = [], [], []
     w_core = []
     for col in range(COLS):
-        mt, sh = Tile(col, 1), Tile(col, 0)
-        wsb = Buffer(ws_ty, name=f"ws{col}", tile=mt, address=WS_ADDR)
-        dmas.append(_Hold(mt, [wsb]))
-        for k in range(4):
-            locks.append(Lock(mt, lock_id=WLOCK0 + k, init=0, name=f"wl{col}_{k}"))
-        flows.append(Flow(sh, mt, src_channel=W_SHIM_CH, dst_channel=W_MT_S2MM))
-        # the MemTile's task tokens, which the host waits on to keep its
-        # channels' queues short (the compiler gives MemTiles packet id 26)
-        flows.append(PacketFlow(MT_CTRL_PKT, mt, sh, src_port=WireBundle.TileControl, src_channel=0,
-                                dst_port=WireBundle.South, dst_channel=0, keep_pkt_header=True))
-        per = []
-        for i in range(4):
-            r, mb = core_of(i)
-            ct = Tile(col, 2 + i)
-            flows.append(Flow(mt, ct, src_channel=W_MT_MM2S + r, dst_channel=W_CORE_CH))
-            wb = Buffer(t_ty, name=f"wb{col}_{i}", tile=ct)
-            wp = Lock(ct, init=1, name=f"wp{col}_{i}")
-            wc = Lock(ct, init=0, name=f"wc{col}_{i}")
-            locks += [wp, wc]
-            dmas.append(TileDma(ct, [DmaChannel(DMAChannelDir.S2MM, W_CORE_CH,
-                                                [Bd(wb, acquires=[Acquire(wp)], releases=[Release(wc)])])]))
-            per.append((wb, wp, wc))
+        f, lk, d, per = w_path_column(col, w_packet)
+        flows += f
+        locks += lk
+        dmas += d
         w_core.append(per)
     # A: the host's row-major (64 x 64) K steps, tiled into the mmul's (8, 8)
     # sub-tiles by the MemTile on the way to the cores
@@ -269,6 +298,12 @@ def sizes(M: int, K: int, N: int, q8: bool, glu: bool = False):
 def pgemm(w: In, a: In, c: Out, *, M: CompileTime[int] = 512, K: CompileTime[int] = 1024,
           N: CompileTime[int] = 2048, Q8: CompileTime[int] = 0, GLU: CompileTime[int] = 0,
           dev_name: CompileTime[str] = "npu2"):
+    return program_of(build(dev_name), M=M, K=K, N=N, Q8=Q8, GLU=GLU, dev_name=dev_name)
+
+
+def program_of(built, *, M: int, K: int, N: int, Q8: int, GLU: int, dev_name: str):
+    """The program of `built` (build's workers, endpoints and explicit resources)
+    with the sample stream of this shape."""
     z = sizes(M, K, N, bool(Q8), bool(GLU))
     NT, NSTEP, NCH, NMB = z["NT"], z["NSTEP"], z["NCH"], z["NMB"]
     W_BYTES = COLS * NCH * NT * 2 * TB
@@ -276,7 +311,7 @@ def pgemm(w: In, a: In, c: Out, *, M: CompileTime[int] = 512, K: CompileTime[int
     N_OUT = N // 2 if GLU else N
     C_ELEMS = M * N_OUT
     OBJS = z["OBJS"]
-    workers, eps, extra = build(dev_name)
+    workers, eps, extra = built
 
     def seq(w_h, a_h, c_h, *e):
         # (the sample leaves W out: the host programs the MemTile side)

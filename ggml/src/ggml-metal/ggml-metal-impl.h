@@ -42,6 +42,7 @@
 #define N_SG_Q4_0 2
 // glu holds 2 accs per row, so use fewer rows per simdgroup
 #define N_R0_Q4_0_GLU 1
+#define N_R0_Q4_0_GLU_NORM 2 // the norm variant also reads the norm weight: more rows per simdgroup share both reads
 
 #define N_R0_Q4_1 4
 #define N_SG_Q4_1 2
@@ -412,6 +413,21 @@ typedef struct {
     float    sin_sign;
 } ggml_metal_kargs_rope;
 
+typedef struct {
+    int32_t  d_head;
+    int32_t  n_head;
+    int32_t  L;
+    int32_t  N;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t pe_nb0;
+    uint64_t pe_nb1;
+    uint64_t pe_nb2;
+    uint64_t pe_nb3;
+} ggml_metal_kargs_rope_flux;
+
 // fused RMS_NORM + MUL + ROPE (+ SET_ROWS): the rows are normalized, weighted and rotated over their full width
 typedef struct {
     int32_t  ne00;     // row width: the norm width and the RoPE dims
@@ -615,6 +631,44 @@ typedef struct {
     int16_t  r3;
     float    eps; // fused RMS_NORM (FC_mul_mv_norm)
 } ggml_metal_kargs_mul_mv;
+
+// native mode rotates the activations once before a tiled FP32 I8 matmul;
+// the F16 compatibility mode reconstructs F16 weight tiles
+typedef struct {
+    int32_t  k;
+    int32_t  out_features;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    int32_t  f16_compat;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb20;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_mul_mat_convrot;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    int32_t  group_size;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_convrot;
 
 typedef struct {
     int32_t  ne00;
@@ -866,6 +920,8 @@ typedef struct {
     uint64_t nb00;
     uint64_t nb01;
     uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb3;
     int32_t  ngrp;
     float    eps;
 } ggml_metal_kargs_group_norm;
@@ -984,6 +1040,35 @@ typedef struct {
     int32_t  KW;
     int32_t  KHW; // KH * KW, pre-computed on CPU to save GPU resources
 } ggml_metal_kargs_im2col;
+
+typedef struct {
+    int32_t  s0;
+    int32_t  s1;
+    int32_t  s2;
+    int32_t  p0;
+    int32_t  p1;
+    int32_t  p2;
+    int32_t  d0;
+    int32_t  d1;
+    int32_t  d2;
+    int32_t  IC;
+    int64_t  ID;
+    int64_t  IH;
+    int64_t  IW;
+    int64_t  KD;
+    int64_t  KH;
+    int64_t  KW;
+    int64_t  OD;
+    int64_t  OH;
+    int64_t  ne0;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_im2col_3d;
 
 typedef struct {
     int32_t  IW;
@@ -1151,6 +1236,35 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
 } ggml_metal_kargs_ssm_conv;
+
+typedef struct {
+    int32_t  C;     // channels
+    uint64_t nb01;  // conv state [3, C, n_seqs] strides
+    uint64_t nb02;
+    uint64_t nb11;  // new input [1, C, n_seqs] strides
+    uint64_t nb12;
+    uint64_t nb2;   // dst [C, 1, n_seqs] seq stride
+    uint64_t nbs1;  // new conv state [3*C, n_seqs] row stride
+} ggml_metal_kargs_ssm_conv_state;
+
+typedef struct {
+    int32_t  hd;    // head size (channels per simdgroup), at most 128
+    int32_t  n_q;   // leading heads L2-normalized into dst_q
+    int32_t  n_k;   // next heads L2-normalized into dst_k
+    float    eps;   // of the RMS_NORM
+    float    scale; // of the SCALE
+    float    bias;
+    uint64_t nb01;  // conv state [3, C, n_seqs] strides
+    uint64_t nb02;
+    uint64_t nb11;  // new input [1, C, n_seqs] strides
+    uint64_t nb12;
+    uint64_t nb2;   // dst [C, 1, n_seqs] seq stride
+    uint64_t nbs1;  // new conv state [3*C, n_seqs] row stride
+    uint64_t nbq1;  // dst_q [hd, n_q, 1, n_seqs] strides
+    uint64_t nbq3;
+    uint64_t nbk1;  // dst_k [hd, n_k, 1, n_seqs] strides
+    uint64_t nbk3;
+} ggml_metal_kargs_ssm_conv_state_norm;
 
 typedef struct {
     int64_t  d_state;

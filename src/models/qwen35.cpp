@@ -249,8 +249,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
-    const int64_t n_seqs       = ubatch.n_seqs;
-    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+    // a ragged ubatch keeps all its tokens in one sequence dimension
+    const int64_t n_seqs       = ubatch.is_ragged() ? 1 : ubatch.n_seqs;
+    const int64_t n_seq_tokens = ubatch.is_ragged() ? ubatch.n_tokens : ubatch.n_seq_tokens;
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
@@ -360,16 +361,18 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         int                  il) {
     const auto * mctx_cur = inp->mctx;
 
+    // a ragged ubatch keeps all its tokens in one sequence dimension (see build_recurrent_ragged)
+    const bool    ragged       = ubatch.is_ragged();
     const int64_t d_inner      = hparams.ssm_d_inner;
-    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t n_seqs       = ragged ? 1 : ubatch.n_seqs;
     const int64_t head_k_dim   = hparams.ssm_d_state;
     const int64_t num_k_heads  = hparams.ssm_n_group;
     const int64_t num_v_heads  = hparams.ssm_dt_rank;
     const int64_t head_v_dim   = d_inner / num_v_heads;
-    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+    const int64_t n_seq_tokens = ragged ? ubatch.n_tokens : ubatch.n_seq_tokens;
 
-    GGML_ASSERT(n_seqs != 0);
-    GGML_ASSERT(ubatch.equal_seqs());
+    GGML_ASSERT(ubatch.n_seqs != 0);
+    GGML_ASSERT(ubatch.equal_seqs() || ragged);
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
     // Input projections
@@ -384,6 +387,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
+
+    // the norm feeds the four input projections: keep them together, so backends can fold the norm into them
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_build_forward_expand(gf, z);
+    ggml_build_forward_expand(gf, beta);
+    ggml_build_forward_expand(gf, alpha);
 
     // with the deferred commit the gdn op activates the gates itself
     const bool raw_gates = inp->rec_idx != nullptr;
@@ -416,6 +425,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // applies the q/k l2 norms
     const bool deferred = inp->rec_idx != nullptr;
 
+    if (ragged) {
+        GGML_ASSERT(!deferred);
+        ggml_tensor * output = build_recurrent_ragged(inp, qkv_mixed, conv_kernel, gate, beta,
+                head_k_dim, num_k_heads, head_v_dim, num_v_heads, il);
+
+        ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+        ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+        ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
+        cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+        cb(cur, "linear_attn_out", il);
+        return cur;
+    }
+
     ggml_tensor * conv_qkv_mix;
 
     if (deferred) {
@@ -429,11 +451,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
         conv_qkv_mix = ggml_silu(ctx0, conv_output_proper);
         cb(conv_qkv_mix, "conv_output_silu", il);
-    }
 
-    ggml_tensor * state = build_rs_ssm(inp, ssm_states_all, n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
+        // right after the conv state copy, so backends can fuse the conv step with it
+        ggml_build_forward_expand(gf, conv_qkv_mix);
+    }
 
     // Calculate the total conv dimension
     int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
@@ -468,7 +489,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     if (!deferred) {
         q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
         k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+
+        // right after the conv step, so backends can fuse the norms with it
+        ggml_build_forward_expand(gf, q_conv);
+        ggml_build_forward_expand(gf, k_conv);
     }
+
+    ggml_tensor * state = build_rs_ssm(inp, ssm_states_all, n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    cb(state, "state_predelta", il);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);

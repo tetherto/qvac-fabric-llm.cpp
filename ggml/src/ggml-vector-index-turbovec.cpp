@@ -3250,6 +3250,31 @@ void turbovec_blocked_set_blocks_packed(
     }
 }
 
+void turbovec_blocked_gather(
+    const ggml_vec_index & idx, const std::vector<size_t> & order, std::vector<uint8_t> & blocked, size_t & n_blocks) {
+    const size_t n = order.size();
+    const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / idx.turbovec_bits);
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    const size_t block_bytes = n_byte_groups * lane_size;
+    const TurboVecLayout layout = turbovec_layout(idx);
+    const size_t new_blocks = (n + lane_size - 1) / lane_size;
+    blocked.assign(new_blocks * block_bytes, 0);
+    parallel_for((new_blocks + kTurboVecBlocksPerTask - 1) / kTurboVecBlocksPerTask, idx.n_threads, [&](size_t task, size_t) {
+        const size_t begin = task * kTurboVecBlocksPerTask;
+        const size_t end = std::min(new_blocks, begin + kTurboVecBlocksPerTask);
+        std::vector<uint8_t> seq(block_bytes);
+        for (size_t block = begin; block < end; ++block) {
+            // Lanes past the last row stay zero, as in a fresh repack.
+            std::fill(seq.begin(), seq.end(), 0);
+            for (size_t lane = 0; lane < lane_size && block * lane_size + lane < n; ++lane) {
+                turbovec_row_seq(idx, order[block * lane_size + lane], seq.data() + lane * n_byte_groups);
+            }
+            write_blocked_block(seq.data(), n_byte_groups, blocked.data() + block * block_bytes, layout);
+        }
+    });
+    n_blocks = new_blocks;
+}
+
 void turbovec_blocked_set_block_seq(ggml_vec_index & idx, size_t block, const uint8_t * seq_blocked) {
     const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / idx.turbovec_bits);
     const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
@@ -4699,8 +4724,6 @@ struct TurboVecCalibrationView {
     }
 };
 
-// Rows per parallel task: large enough to amortize the hand-off.
-constexpr size_t kTurboVecRowsPerTask = 256;
 
 void quantize_turbovec_hadamard_batch(
         const float * src,

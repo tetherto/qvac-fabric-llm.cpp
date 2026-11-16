@@ -1,0 +1,50 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "convrot_f16.glsl"
+
+// Reconstruct each H256 weight block once, independent of activation columns.
+// Packed F16 stores avoid requiring 16-bit storage support.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform parameter {
+    uint k;
+    uint w_offset;
+    uint s_offset;
+};
+layout(binding = 0, std430) readonly buffer W { uint data_w[]; };
+layout(binding = 1, std430) readonly buffer S { float data_s[]; };
+layout(binding = 2, std430) writeonly buffer D { uint data_d[]; };
+shared precise float values[256];
+shared precise float transformed[256];
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.x;
+    const uint offset = row * k + gl_WorkGroupID.y * 256;
+    const uint wi = w_offset + offset + tid;
+    const uint packed = data_w[wi / 4];
+    const int value = bitfieldExtract(int(packed), int((wi & 3) * 8), 8);
+    values[tid] = float(value) * data_s[s_offset + row];
+    barrier();
+    for (uint stride = 1; stride < 256; stride *= 4) {
+        const uint block = (tid / (4 * stride)) * (4 * stride);
+        const uint lane = (tid / stride) % 4;
+        const uint index = tid % stride;
+        const float a = values[block + index];
+        const float b = values[block + stride + index];
+        const float c = values[block + 2 * stride + index];
+        const float d = values[block + 3 * stride + index];
+        transformed[tid] = lane == 0 ? ( a + b + c - d) * 0.5 :
+                           lane == 1 ? ( a + b - c + d) * 0.5 :
+                           lane == 2 ? ( a - b + c + d) * 0.5 :
+                                       (-a + b + c + d) * 0.5;
+        barrier();
+        values[tid] = transformed[tid];
+        barrier();
+    }
+#ifdef DST_F16
+    if (tid < 128) {
+        data_d[offset / 2 + tid] = convrot_pack_f16_rne(vec2(values[2 * tid], values[2 * tid + 1]));
+    }
+#else
+    data_d[offset + tid] = floatBitsToUint(values[tid]);
+#endif
+}

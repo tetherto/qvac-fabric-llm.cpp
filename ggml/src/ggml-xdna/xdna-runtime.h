@@ -11,12 +11,17 @@
 
 // --- device ----------------------------------------------------------------
 
+// The NPU's device name. One NPU per system, named like the other backends'
+// devices (CUDA0, Vulkan0), so --device takes it unquoted.
+constexpr const char * XDNA_DEVICE_NAME = "XDNA0";
+
 // Open the first NPU. Returns nullptr when no device is available.
 xdna_device * xdna_device_open(void);
 
 // --- kernel ----------------------------------------------------------------
 
-// Kernel search dirs (the backend dir, the executable dir, cwd).
+// Kernel search dirs, in priority order (GGML_XDNA_KERNEL_DIR, the module dir,
+// the backend install dir, the executable dir). Never the working directory.
 std::vector<std::filesystem::path> xdna_kernel_search_dirs(void);
 
 // Load an xclbin into a kernel handle without an instruction stream; bind one
@@ -49,6 +54,10 @@ bool xdna_insts_stream_ok(const char * name, const uint32_t * insts, size_t n_wo
 // size, instead of a garbage dispatch. Prefer this over reading the artifact
 // directly; every stream is checked again by xdna_kernel_bind_insts.
 bool xdna_insts_read_file(const char * path, std::vector<uint32_t> & words);
+
+// A kernel of the same xclbin as `proto` with no stream bound yet, to keep one
+// more stream ready without loading the xclbin again. Returns nullptr on failure.
+xdna_kernel * xdna_kernel_clone(const xdna_kernel * proto);
 
 // Bind an in-memory instruction stream (TXN words) to a loaded kernel. `dev`
 // must be the same handle used for the data buffers.
@@ -109,6 +118,10 @@ static constexpr uint32_t XDNA_POISON_F32 = 0x7FC0DEADu;
 // write the pattern through the CPU caches: left dirty, our own lines could
 // land on top of the device's output. Mark before the dispatch that writes it.
 void xdna_buffer_mark(xdna_buffer * buf, size_t bytes, size_t offset = 0);
+
+// xdna_buffer_mark for a large range the host does not read before the dispatch: the pattern goes out in
+// non-temporal stores, so a line the range does not hold in cache is never fetched to be overwritten.
+void xdna_buffer_mark_bulk(xdna_buffer * buf, size_t bytes, size_t offset = 0);
 
 // Wait until the device has written every word of [offset, offset+bytes) and
 // return the buffer's map at that offset, so the caller reads it in place; or
@@ -202,3 +215,30 @@ xdna_buffer * xdna_kernel_pool_acquire_buffer(xdna_kernel_pool * pool, size_t by
 
 // Return a buffer to the pool, freeing the LRU entry past the limit.
 void xdna_kernel_pool_release_buffer(xdna_kernel_pool * pool, xdna_buffer * buf);
+
+// --- test hook -------------------------------------------------------------
+
+// The outputs the array writes, by the site that hands them to it: the host reads them back, except a fused GEMM's
+// layout ("pgemm-fused"), which the array's next projection reads.
+enum xdna_out_site {
+    XDNA_OUT_PGEMM,
+    XDNA_OUT_ATTN_MM,
+    XDNA_OUT_GDN_MM,
+    XDNA_OUT_ATT,
+    XDNA_OUT_HEAD,
+    XDNA_OUT_PFX_ATTN,
+    XDNA_OUT_PGEMM_FUSED,
+    XDNA_OUT_SITES
+};
+
+// Test hook (ggml_backend_xdna_test_dirty_output): with `arm`, the next output of `site` ("pgemm", "attn-mm", "gdn-mm",
+// "att", "head", "pfx-attn", "pgemm-fused") is filled with NaN by plain stores, its lines left dirty, before the site
+// flushes it. Returns the outputs of the site filled so far, -1 for a site it does not know.
+int xdna_test_dirty_output(const char * site, int arm);
+
+// [offset, offset + bytes) of `buf`, the output `site` hands the array, filled as above when the site is armed.
+void xdna_test_dirty_if_armed(xdna_out_site site, xdna_buffer * buf, size_t bytes, size_t offset);
+
+// After the array wrote that output: what is still dirty of the site's fill is written back now, as an eviction would,
+// for a site whose output the host never reads back.
+void xdna_test_land_dirty(xdna_out_site site, xdna_buffer * buf, size_t bytes, size_t offset);

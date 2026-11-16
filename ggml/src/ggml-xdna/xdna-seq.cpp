@@ -2,6 +2,8 @@
 
 #include "ggml-impl.h"
 
+#include <algorithm>
+
 // TXN instruction encodings (NPU2 / XDNA2). Each op is a fixed-size word
 // group; the last word of each group holds op_size * 4 (the total op size in
 // bytes), which the firmware uses to advance the instruction pointer.
@@ -184,6 +186,19 @@ static void emit_bd(xdna_seq * seq, int col, int bd_id, const xdna_bd & bd, uint
     xdna_seq_ddr_patch(seq, (uint32_t) col, 0, (uint32_t) bd_id, arg, off);
 }
 
+// BD ids a sweep takes on a shim: C, B and, on the shims that feed A, A. A shim has 16 ids, so this many sweeps fit.
+static constexpr int BDS_PER_SWEEP   = 3;
+static constexpr int BD_IDS_PER_SHIM = 16;
+// The widest sweep window measured on the device (window 4 at 912 tokens); the ids alone would allow 5.
+static constexpr int MAX_SWEEP_WINDOW = 4;
+
+// Wait for the C output token of every column: a sweep has been written.
+static void wait_sweep_tokens(xdna_seq * seq, int n_cols) {
+    for (int col = 0; col < n_cols; col++) {
+        xdna_seq_wait_token(seq, (uint32_t) col, 0, xdna_dma_dir::S2MM, 0);
+    }
+}
+
 // Emits the same instruction stream IRON's seq_fn produces for the GEMM
 // kernel. The BD field semantics follow mlir-aie's AIEDmaToNpu.cpp:
 //   - d0_size / d1_size in 4-byte address-gen words (elements*elem_bytes/4)
@@ -191,7 +206,14 @@ static void emit_bd(xdna_seq * seq, int col, int bd_id, const xdna_bd & bd, uint
 //   - buffer_length is in 4-byte words
 //   - the outer tap dim folds into the queue push repeat_count (stride 0)
 //     or the BD iteration field (stride > 0)
-bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K, int N, uint32_t b_offset) {
+bool xdna_gemm_seq_build(xdna_seq *             seq,
+                         const xdna_gemm_tiles * t,
+                         int                     M,
+                         int                     K,
+                         int                     N,
+                         uint32_t                b_offset,
+                         uint32_t                c_offset,
+                         int                     sweep_window) {
     if (!seq || !xdna_gemm_seq_supported(t, M, K, N)) {
         GGML_LOG_ERROR(
             "%s: gemm: unsupported geometry M%d K%d N%d "
@@ -233,13 +255,22 @@ bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K
 
     // DMA: per shim column, C output then A/B inputs. BD ids are allocated per
     // shim (in write order), matching IRON: even shims 0,2,4,6 carry the A of
-    // logical col/2 plus their own C and B, odd shims only C and B. Multi-sweep
-    // blocks reuse the per-sweep BD ids after the previous sweep's C tokens are
-    // waited (the C completion implies A/B were consumed).
+    // logical col/2 plus their own C and B, odd shims only C and B. A sweep's BD
+    // ids are free again once its C tokens are waited (the C completion implies
+    // A/B were consumed). `window` sweeps are issued before the first wait, each
+    // on its own ids, so issuing one overlaps the previous one's compute.
+    const int window =
+        std::max(1, std::min({ sweep_window, n_sweeps, BD_IDS_PER_SHIM / BDS_PER_SWEEP, MAX_SWEEP_WINDOW }));
     for (int sweep = 0; sweep < n_sweeps; sweep++) {
+        if (sweep >= window) {
+            wait_sweep_tokens(seq, n_cols);
+        }
         const size_t c_row_off                  = (size_t) sweep * mem_tile_m_C;  // rows into C
         const size_t c_byte                     = c_row_off * N * 4;              // C is f32/int32
         uint32_t     shim_bd[XDNA_SEQ_MAX_COLS] = {};
+        for (int col = 0; col < n_cols; col++) {
+            shim_bd[col] = (uint32_t) ((sweep % window) * BDS_PER_SWEEP);
+        }
         for (int col = 0; col < n_cols; col++) {
             // C output [M x N] f32/int32. Column c covers tile_n output columns
             // laid out every mem_tile_n elements (interleaved by the tiler).
@@ -247,7 +278,7 @@ bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K
             {
                 xdna_bd bd;
                 bd.buf_len           = (uint32_t) (mem_tile_m_C * tile_n * n_col_tiles);  // words
-                bd.buf_off           = (uint32_t) ((size_t) col * tile_n * 4 + c_byte);   // bytes into C
+                bd.buf_off           = (uint32_t) ((size_t) col * tile_n * 4 + c_byte + c_offset);  // bytes into C
                 bd.d0_size           = (uint32_t) tile_n;                                 // words
                 bd.d0_stride         = 1;
                 bd.d1_size           = (uint32_t) mem_tile_m_C;                           // elements (rows)
@@ -255,7 +286,7 @@ bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K
                 bd.d2_stride         = n_col_tiles > 1 ? to_words((uint32_t) mem_tile_n, 4) : 1;
                 bd.ax_cache          = 2;
                 const uint32_t bd_id = shim_bd[col]++;
-                emit_bd(seq, col, (int) bd_id, bd, 2, (uint32_t) ((size_t) col * tile_n * 4 + c_byte));
+                emit_bd(seq, col, (int) bd_id, bd, 2, (uint32_t) ((size_t) col * tile_n * 4 + c_byte + c_offset));
                 xdna_seq_issue_token(seq, (uint32_t) col, 0, xdna_dma_dir::S2MM, 0, 0xF);
                 xdna_seq_push_queue(seq, (uint32_t) col, 0, bd_id, xdna_dma_dir::S2MM, 0, true, 0);
             }
@@ -306,11 +337,9 @@ bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K
                                     n_col_tiles > 1 ? (uint32_t) (n_col_tiles - 1) : 0);
             }
         }
-
-        // Wait for all 8 C output tokens so the next sweep can reuse the BDs.
-        for (int col = 0; col < n_cols; col++) {
-            xdna_seq_wait_token(seq, (uint32_t) col, 0, xdna_dma_dir::S2MM, 0);
-        }
+    }
+    for (int i = 0; i < window; i++) {
+        wait_sweep_tokens(seq, n_cols);
     }
 
     return true;

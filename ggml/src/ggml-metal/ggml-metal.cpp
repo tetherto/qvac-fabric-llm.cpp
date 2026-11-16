@@ -222,6 +222,12 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
 
     // some operations require additional memory for fleeting data:
     switch (tensor->op) {
+        case GGML_OP_MUL_MAT_CONVROT:
+            {
+                if (!ggml_get_op_params_i32(tensor, 1)) {
+                    res = GGML_PAD(res, 256) + sizeof(float)*ggml_nelements(tensor->src[0]);
+                }
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);

@@ -87,6 +87,9 @@ float ggml_table_f32_e8m0_half[1 << 8];
 // precomputed f32 table for ue4m3 (1 KB) (simd-mappings.h)
 float ggml_table_f32_ue4m3[1 << 8];
 
+// Signed FP8 needs its own table: UE4M3 ignores the sign, halves values for NVFP4, and maps NaN to zero.
+float ggml_table_f32_f8_e4m3[1 << 8];
+
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
     int sve_cnt;
@@ -308,6 +311,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_nvfp4,
         .vec_dot                  = ggml_vec_dot_nvfp4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_F8_E4M3] = {
+        .from_float               = quantize_row_f8_e4m3,
+        .vec_dot                  = ggml_vec_dot_f8_e4m3_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_K] = {
@@ -1977,6 +1986,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat(params, tensor);
             } break;
+        case GGML_OP_MUL_MAT_CONVROT:
+            {
+                ggml_compute_forward_mul_mat_convrot(params, tensor);
+            } break;
+        case GGML_OP_CONVROT:
+            {
+                ggml_compute_forward_convrot(params, tensor);
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
@@ -2048,6 +2065,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_ROPE_BACK:
             {
                 ggml_compute_forward_rope_back(params, tensor);
+            } break;
+        case GGML_OP_ROPE_FLUX:
+            {
+                ggml_compute_forward_rope_flux(params, tensor);
             } break;
         case GGML_OP_CLAMP:
             {
@@ -2273,6 +2294,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gdn_conv_deferred(params, tensor);
             } break;
+        case GGML_OP_SSM_CONV_RAGGED:
+            {
+                ggml_compute_forward_ssm_conv_ragged(params, tensor);
+            } break;
+        case GGML_OP_GATED_DELTA_NET_RAGGED:
+            {
+                ggml_compute_forward_gated_delta_net_ragged(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2482,6 +2511,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GATED_DELTA_NET_BACK:
         case GGML_OP_GATED_DELTA_NET_DEFERRED:
         case GGML_OP_GDN_CONV_DEFERRED:
+        case GGML_OP_SSM_CONV_RAGGED:
+        case GGML_OP_GATED_DELTA_NET_RAGGED:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -2561,6 +2592,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GROUP_NORM:
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_CONVROT:
+        case GGML_OP_CONVROT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_MUL_MAT_ID_BACK_A:
         case GGML_OP_MUL_MAT_ID_BACK_B:
@@ -2592,6 +2625,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOFT_MAX_BACK:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
+        case GGML_OP_ROPE_FLUX:
         case GGML_OP_ADD_REL_POS:
             {
                 n_tasks = n_threads;
@@ -2937,6 +2971,58 @@ static bool ggml_thread_cpumask_is_valid(const bool * mask) {
     return false;
 }
 
+// qvac-fabric (tetherto/qvac#5537): on Linux and Android, threads inherit their creator's affinity,
+// and a saved mask cannot be restored exactly (sched_getaffinity reports it narrowed by the cpuset
+// and the active CPUs), so the threadpool mask is not applied to a thread ggml does not own there.
+// NUMA mode still pins every compute thread, the caller included, and then resets it to all CPUs.
+static void ggml_thread_apply_caller_affinity(bool * mask) {
+#if defined(__linux__)
+    UNUSED(mask);
+#else
+    if (ggml_thread_cpumask_is_valid(mask)) {
+        ggml_thread_apply_affinity(mask);
+    }
+#endif
+}
+
+#ifdef GGML_USE_OPENMP
+// OpenMP threads are shared across threadpools, so their affinity is scoped to one graph.
+struct ggml_thread_affinity_scope {
+#if defined(__linux__)
+    cpu_set_t saved;
+#endif
+    bool valid;
+};
+
+static struct ggml_thread_affinity_scope ggml_thread_affinity_begin(int ith, bool * mask) {
+    struct ggml_thread_affinity_scope scope;
+    memset(&scope, 0, sizeof(scope));
+    if (ith == 0) {
+        // the calling thread
+        ggml_thread_apply_caller_affinity(mask);
+        return scope;
+    }
+    if (!ggml_thread_cpumask_is_valid(mask)) {
+        return scope;
+    }
+#if defined(__linux__)
+    scope.valid = sched_getaffinity(0, sizeof(scope.saved), &scope.saved) == 0;
+#endif
+    ggml_thread_apply_affinity(mask);
+    return scope;
+}
+
+static void ggml_thread_affinity_end(const struct ggml_thread_affinity_scope * scope) {
+#if defined(__linux__)
+    if (scope->valid && sched_setaffinity(0, sizeof(scope->saved), &scope->saved) != 0) {
+        GGML_LOG_WARN("failed to restore OpenMP thread affinity: %s\n", strerror(errno));
+    }
+#else
+    UNUSED(scope);
+#endif
+}
+#endif // GGML_USE_OPENMP
+
 static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask, bool strict, int32_t* iter) {
     if (!strict) {
         memcpy(local_mask, global_mask, GGML_MAX_N_THREADS);
@@ -3087,7 +3173,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_ADD_ID:
                 case GGML_OP_ADD1:
                     {
-                        if (ggml_is_quantized(node->src[0]->type)) {
+                        if (ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_F8_E4M3) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
                     } break;
@@ -3136,9 +3222,13 @@ struct ggml_cplan ggml_graph_plan(
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
+                case GGML_OP_MUL_MAT_CONVROT:
+                    {
+                        cur = sizeof(float)*(node->src[1]->ne[0] + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
                 case GGML_OP_OUT_PROD:
                     {
-                        if (ggml_is_quantized(node->src[0]->type) ||
+                        if (ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_F8_E4M3 ||
                             node->src[0]->type == GGML_TYPE_F16) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
@@ -3249,6 +3339,11 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const int64_t S_v = node->src[2]->ne[0];
                         cur = (S_v + S_v * S_v) * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_GATED_DELTA_NET_RAGGED:
+                    {
+                        const int64_t S_v = node->src[2]->ne[0];
+                        cur = (S_v + CACHE_LINE_SIZE_F32) * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_GATED_DELTA_NET_BACK:
                     {
@@ -3529,10 +3624,9 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
 
     if (threadpool->pause) {
        // Update main thread prio and affinity to match the threadpool settings
+       // (affinity: not on Linux/Android, see ggml_thread_apply_caller_affinity)
        ggml_thread_apply_priority(threadpool->prio);
-       if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
-           ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
-       }
+       ggml_thread_apply_caller_affinity(threadpool->workers[0].cpumask);
 
        // resume does cond broadcast
        ggml_threadpool_resume_locked(threadpool);
@@ -3608,10 +3702,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume
+        // (affinity: not on Linux/Android, see ggml_thread_apply_caller_affinity)
         ggml_thread_apply_priority(threadpool->prio);
-        if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
-            ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
-        }
+        ggml_thread_apply_caller_affinity(threadpool->workers[0].cpumask);
     }
 #endif // GGML_USE_OPENMP
 
@@ -3665,10 +3758,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             int ith = omp_get_thread_num();
 
             ggml_thread_apply_priority(threadpool->prio);
-            if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
-                ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
-            }
+            struct ggml_thread_affinity_scope affinity = ggml_thread_affinity_begin(ith, threadpool->workers[ith].cpumask);
             ggml_graph_compute_thread(&threadpool->workers[ith]);
+            ggml_thread_affinity_end(&affinity);
         }
     } else {
         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
@@ -4132,6 +4224,7 @@ void ggml_cpu_init(void) {
             // initialize UE4M3 table (256 entries)
             for (int i = 0; i < (1 << 8); ++i) {
                 ggml_table_f32_ue4m3[i] = ggml_ue4m3_to_fp32(i);
+                ggml_table_f32_f8_e4m3[i] = ggml_f8_e4m3_to_fp32(i);
             }
 
             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);

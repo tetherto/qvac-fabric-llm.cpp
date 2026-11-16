@@ -264,33 +264,44 @@ xdna_wfmt xdna_wfmt_gemv_for(enum ggml_type type) {
     }
 }
 
-enum ggml_type xdna_gemv_type_of(const struct ggml_tensor * w) {
-    static const std::vector<std::string> sel = [] {
-        std::vector<std::string> v;
-        // Every attn_qkv and attn_v by default: measured one tensor at a time
-        // the KLD adds up, and these are the best tok/s per unit of it -
-        // 47.5 -> 52.4 tok/s at 1k for decode KLD 0.0051 -> 0.0122. ffn_down
-        // pays about half as much speed for the same accuracy.
-        const char *             e = getenv("GGML_XDNA_W4");
-        if (!e) {
-            e = "attn_qkv,attn_v";
-        }
-        std::string cur;
-        for (const char * p = e ? e : "";; p++) {
-            if (*p == ',' || *p == '\0') {
-                if (!cur.empty()) {
-                    v.push_back(cur);
-                }
-                cur.clear();
-                if (*p == '\0') {
-                    break;
-                }
-            } else if (*p != ' ') {
-                cur += *p;
+namespace {
+
+// attn_qkv buys the most tok/s per unit of KLD. 9B fused decode KLD against the CPU: 0.0033 exact, 0.0061 with it
+// (7.17 -> 7.42 tok/s); attn_v as well gives 0.0091 for 1.5% more tok/s and no less J above idle.
+const char * const W4_DEFAULT = "attn_qkv";
+
+// A GGML_XDNA_W4 value's comma-separated entries, spaces dropped.
+std::vector<std::string> w4_entries(const char * e) {
+    std::vector<std::string> v;
+    std::string              cur;
+    for (const char * p = e;; p++) {
+        if (*p == ',' || *p == '\0') {
+            if (!cur.empty()) {
+                v.push_back(cur);
             }
+            cur.clear();
+            if (*p == '\0') {
+                break;
+            }
+        } else if (*p != ' ') {
+            cur += *p;
         }
-        return v;
-    }();
+    }
+    return v;
+}
+
+// An entry is a whole name or a role, which matches after a '.'.
+bool w4_listed(const std::string & name, const std::vector<std::string> & sel) {
+    for (const std::string & e : sel) {
+        if (name == e || (name.size() > e.size() && name.compare(name.size() - e.size(), e.size(), e) == 0 &&
+                          name[name.size() - e.size() - 1] == '.')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+enum ggml_type gemv_type_in(const struct ggml_tensor * w, const std::vector<std::string> & sel) {
     if (!w || (w->type != GGML_TYPE_Q5_K && w->type != GGML_TYPE_Q6_K) || sel.empty()) {
         return w ? w->type : GGML_TYPE_COUNT;
     }
@@ -302,13 +313,19 @@ enum ggml_type xdna_gemv_type_of(const struct ggml_tensor * w) {
     if (name.find("ssm_out") != std::string::npos) {
         return w->type;
     }
-    for (const std::string & e : sel) {
-        if (name == e || (name.size() > e.size() && name.compare(name.size() - e.size(), e.size(), e) == 0 &&
-                          name[name.size() - e.size() - 1] == '.')) {
-            return GGML_TYPE_Q4_K;
-        }
-    }
-    return w->type;
+    return w4_listed(name, sel) ? GGML_TYPE_Q4_K : w->type;
+}
+
+}  // namespace
+
+enum ggml_type xdna_gemv_type_w4(const struct ggml_tensor * w, const char * w4) {
+    return gemv_type_in(w, w4_entries(w4 ? w4 : W4_DEFAULT));
+}
+
+enum ggml_type xdna_gemv_type_of(const struct ggml_tensor * w) {
+    static const char * const             w4  = getenv("GGML_XDNA_W4");
+    static const std::vector<std::string> sel = w4_entries(w4 ? w4 : W4_DEFAULT);
+    return gemv_type_in(w, sel);
 }
 
 bool xdna_wfmt_repack_row_as(enum ggml_type type, xdna_wfmt fmt, const void * src, int64_t k, void * dst) {

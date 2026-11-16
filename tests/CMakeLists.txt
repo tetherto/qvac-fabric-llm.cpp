@@ -247,6 +247,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-dflash-draft-vocab PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-dflash-loader.cpp)
     target_include_directories(test-dflash-loader PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-dspine.cpp)
+    target_include_directories(test-dspine PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -256,6 +258,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-server-checkpoint-pool.cpp)
     target_include_directories(test-server-checkpoint-pool PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-checkpoint-pool PRIVATE server-context)
+    llama_build_and_test(test-server-spec-n-auto.cpp)
+    target_include_directories(test-server-spec-n-auto PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-spec-n-auto PRIVATE server-context)
     llama_build_and_test(test-json-schema-to-grammar.cpp)
 
     if (NOT GGML_BACKEND_DL)
@@ -422,6 +427,7 @@ llama_build(test-multi-instance-repro.cpp)
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 llama_build_and_test(test-model-load-meta-only.cpp)
+llama_build_and_test(test-speculative-draft-mismatch.cpp)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test-mmap-direct-io test-mmap-direct-io.cpp ../src/llama-mmap.cpp ../src/llama-impl.cpp)
@@ -565,8 +571,21 @@ llama_test(test-hexagon-dma-reader)
 llama_build(test-backend-ops.cpp LINK ggml)
 
 llama_build_and_test(test-backend-memory.cpp LINK ggml)
+# a synthetic buffer type with a guard; needs the non-public ggml-backend-impl.h
+llama_build_and_test(test-backend-buffer-size.cpp LINK ggml)
+target_include_directories(test-backend-buffer-size PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+llama_build_and_test(test-vulkan-buffer-capacity.cpp LINK ggml)
+target_include_directories(test-vulkan-buffer-capacity PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
+
+llama_build_and_test(test-convrot.cpp LINK ggml)
+
+if (GGML_OPENCL)
+    find_package(Threads REQUIRED)
+    llama_build_and_test(test-opencl-concurrent-upload.cpp LINK ggml Threads::Threads)
+endif()
 
 # Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
 # GGML_VK_TBQ_COPY_SG_SIZE values to exercise the shader's cross-subgroup stitch
@@ -660,7 +679,7 @@ llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-laya.cpp)
 
-# XDNA NPU. Self-skipping when no XDNA device is registered.
+# XDNA NPU. Self-skipping when no XDNA device is registered; failing when one is listed but does not open.
 if (GGML_XDNA)
     # Load, run and free a model several times in one process (#293).
     llama_build_and_test(test-xdna-reload.cpp       LABEL "model")
@@ -669,15 +688,44 @@ if (GGML_XDNA)
     llama_build_and_test(test-xdna-graph.cpp)
     # Two llama contexts computing at once (-m model.gguf).
     llama_build_and_test(test-xdna-contexts.cpp     LABEL "model")
-    # A sequence's state saved and restored around other tokens (-m model.gguf).
+    # A sequence's state saved and restored around other tokens, and two
+    # sequences in one unified cache (-m model.gguf).
     llama_build_and_test(test-xdna-state.cpp        LABEL "model")
     # Every thread's CPU mask unchanged by the pinned host decode (-m model.gguf).
     llama_build_and_test(test-xdna-affinity.cpp     LABEL "model")
+    # An embedding model's layer outputs and pooled embeddings against the CPU (-m model.gguf).
+    llama_build_and_test(test-xdna-embedding.cpp    LABEL "model")
+    # A model's recurrent layers, prefill and decode, against the CPU backend
+    # (-m model.gguf; probes/gdn_widen_model.py makes one of 32 value heads).
+    llama_build_and_test(test-xdna-gdn.cpp          LABEL "model")
+    # A fused decode watched through an eval callback against the unwatched
+    # one (-m model.gguf).
+    llama_build_and_test(test-xdna-observe.cpp      LABEL "model")
+    # A context made after another was freed, while a third stays alive, against
+    # the third's tokens (-m model.gguf [-c n_ctx]).
+    llama_build_and_test(test-xdna-kv-reuse.cpp     LABEL "model")
     # The host-only backend tests are built with the backend
     # (ggml/src/ggml-xdna/CMakeLists.txt); they need no model and no device.
-    foreach(t test-xdna-repack test-xdna-head-rows test-xdna-match)
+    foreach(t test-xdna-repack test-xdna-head-rows test-xdna-match test-xdna-mark test-xdna-seq test-xdna-seg-reach
+              test-xdna-pfx-row)
         if (TARGET ${t})
             add_test(NAME ${t} COMMAND ${t} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+        endif()
+    endforeach()
+    # The committed design tag header against the kernel sources at the default gated layout: Python, no IRON, no device.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME test-xdna-design-tag
+                 COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna/tests/test-xdna-design-tag.py
+                         ${GGML_XDNA_GATED_FMT_DEFAULT})
+    else()
+        message(STATUS "test-xdna-design-tag: no Python 3 interpreter, test not registered")
+    endif()
+    # The FFN pair and the fused attention layer on the device against the
+    # CPU, self-skipping; no model.
+    foreach(t test-xdna-pair test-xdna-att-layer)
+        if (TARGET ${t})
+            add_test(NAME ${t} COMMAND ${t})
         endif()
     endforeach()
 endif()
@@ -697,13 +745,17 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     target_include_directories(test-quantize-fns PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     llama_build_and_test(test-quantize-perf.cpp LINK ggml)
     llama_build_and_test(test-rope.cpp LINK ggml)
+    llama_build_and_test(test-rope-flux.cpp LINK ggml)
     find_package(Threads REQUIRED)
+    llama_build_and_test(test-cpu-affinity.cpp LINK ggml Threads::Threads)
+    set_tests_properties(test-cpu-affinity PROPERTIES SKIP_RETURN_CODE 77)
     llama_build_and_test(test-tbq-init.cpp LINK ggml Threads::Threads)
     target_include_directories(test-tbq-init PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     llama_test(test-tbq-init NAME test-tbq-init-correction)
     set_tests_properties(test-tbq-init PROPERTIES ENVIRONMENT "GGML_TQ_NORM_CORRECTION=0")
     set_tests_properties(test-tbq-init-correction PROPERTIES ENVIRONMENT "GGML_TQ_NORM_CORRECTION=1")
     llama_build_and_test(test-gdn-deferred.cpp LINK ggml)
+    llama_build_and_test(test-graph-leaves.cpp LINK ggml)
     llama_build_and_test(test-col2im-1d.cpp LINK ggml)
     llama_build_and_test(test-conv-1d.cpp LINK ggml)
 endif()

@@ -1,35 +1,38 @@
 #!/usr/bin/env python3
 # attn_mm.py -*- Python -*-
 #
-# Prefill attention on the mmul for Qwen3.5's
-# full-attention layers: 8 query heads, 2 KV heads, D = 256, causal. Every
-# core runs kernels/attn-mm.cc.
+# Prefill attention on the mmul: Qwen3.5's full-attention layers (8 query
+# heads, 2 KV heads, D = 256, causal) and any attention of 2 KV heads and
+# D = 256 whose rows see a run of keys each (a bidirectional or a banded
+# mask, packed sequences). Every core runs kernels/attn-mm.cc.
 #
 #   KV head group g (0, 1) owns columns 4g .. 4g + 3. A column's rows 2, 3
 #   are a pair and rows 4, 5 another; a pair's two cores hold the two halves
 #   of D and trade their halves of the scores through shared memory. The
 #   pair pidx = (column - 4g) * 2 + (row - 2) // 2 of a group owns 32 rows:
-#   the group's 4 query heads at 8 positions, pidx * 8 .. + 7 of each pass.
-#   A pass is 64 positions of both groups.
+#   the group's query heads at their positions of the pass, however the host
+#   lays the rows out (4 heads x 8 positions, or 2 heads x 16). A pass is 8
+#   pairs of rows of both groups.
 #   Each D half of a group's K/V is one stream, broadcast by the MemTile to
 #   the 8 cores that hold that half: all 8 pairs take the same key tiles in
-#   lockstep, keys 0 to the pass's last position.
+#   lockstep, the tiles that hold any key a row of the pass sees.
 #
 # A call is data-driven: the first object of each core's Q stream is a header
-# (fa_hdr: the passes, the ubatch's first position), and a core works out
-# its positions and a pass's key tiles itself, so one artifact serves every
-# length. The host builds the instruction stream; the one compiled here is a
-# sample of the same shape.
+# (fa_hdr: the passes), and every pass's Q object ends in a trailer (fa_pass:
+# the first key of the pass's first tile, its tile count, and each row's first
+# and last visible key), so one artifact serves every length and mask. The host
+# builds the instruction stream; the one compiled here is a sample of the same
+# shape.
 #
 #   python3 attn_mm.py -d npu2 --xclbin-path build/bin/attn_mm_c8.xclbin \
 #       --insts-path build/bin/attn_mm_c8.insts.bin
 #
 # Per-call layouts (the host's, probes/fa_design_check.py checks them):
 #   Q   per column: the header object, then per pass the column's four
-#       cores' Q half^T, (d/8, row/8, 8, 8) bf16, Q scaled by log2(e) / 16
+#       cores' Q half^T, (d/8, row/8, 8, 8) bf16, Q scaled by log2(e) * the
+#       attention scale, each followed by its trailer (TR bf16)
 #   KV  per group and D half, per 32-key tile: K half (key/8, d/8, 8, 8) then
-#       V half^T (d/8, key/8, 8, 8), bf16; each pass streams tiles 0 .. its
-#       last
+#       V half^T (d/8, key/8, 8, 8), bf16; each pass streams its tiles
 #   O   per column, per pass, the four cores' O half as rows (32 x 128) f32
 
 from __future__ import annotations
@@ -54,16 +57,17 @@ from aie.utils.hostruntime.argparse import add_compile_args
 from aie.utils.hostruntime.cli import run_design_cli
 
 COLS, R, D, DH, NK = 8, 32, 256, 128, 32
-PASS = 64                                # positions a pass
+TR = 256                                 # bf16 a Q object's trailer
 bf16 = ml_dtypes.bfloat16
 
 _here = Path(__file__).resolve().parent
 _src = kernelsrc.load(_here / "attn-mm.cc")
-_flags = [f"-DFA_R={R}", f"-DFA_DH={DH}", f"-DFA_NK={NK}"]
+_flags = [f"-DFA_R={R}", f"-DFA_DH={DH}", f"-DFA_NK={NK}", f"-DFA_TR={TR}"]
 _obj = "attmm_" + hashlib.md5((_src + str(_flags)).encode()).hexdigest()[:8] + ".o"
 
-q_ty = np.ndarray[(R * DH,), np.dtype[bf16]]
-q4_ty = np.ndarray[(4 * R * DH,), np.dtype[bf16]]
+Q_OBJ = R * DH + TR                      # bf16 a core's Q object
+q_ty = np.ndarray[(Q_OBJ,), np.dtype[bf16]]
+q4_ty = np.ndarray[(4 * Q_OBJ,), np.dtype[bf16]]
 kv_ty = np.ndarray[(NK * DH,), np.dtype[bf16]]      # half a tile: K or V^T
 s_ty = np.ndarray[(R * NK,), np.dtype[np.float32]]
 p_ty = np.ndarray[(R * NK,), np.dtype[bf16]]
@@ -91,7 +95,7 @@ def build(dev_name: str = "npu2"):
                                               arg_types=types, include_dirs=_include_dirs(),
                                               compile_flags=_flags)
     k_hdr = mk("fa_hdr", [q_ty, n_ty])
-    k_pass = mk("fa_pass", [o_ty, ml_ty, n_ty, np.int32])
+    k_pass = mk("fa_pass", [o_ty, ml_ty, n_ty, q_ty])
     k_scores = mk("fa_scores", [q_ty, kv_ty, s_ty])
     k_update = mk("fa_update_p", [s_ty, s_ty, o_ty, p_ty, ml_ty])
     k_pv = mk("fa_pv", [p_ty, kv_ty, o_ty])
@@ -101,7 +105,7 @@ def build(dev_name: str = "npu2"):
     for col in range(COLS):
         f = ObjectFifo(q4_ty, name=f"q{col}", depth=2)
         q_col.append(f)
-        q_core.append(f.cons().split(offsets=[i * R * DH for i in range(4)],
+        q_core.append(f.cons().split(offsets=[i * Q_OBJ for i in range(4)],
                                      obj_types=[q_ty] * 4, depths=[1] * 4,
                                      names=[f"q{col}_{i}" for i in range(4)],
                                      tile=Tile(col, 1)))
@@ -123,14 +127,14 @@ def build(dev_name: str = "npu2"):
                                     names=[f"o{col}_{i}" for i in range(4)], tile=Tile(col, 1),
                                     dims_from_stream=[[(DH // 8, 8), (R // 8, 8 * DH), (8, 1), (8, DH)]] * 4))
 
-    def core(q_in, kv, o_out, x_own, x_nb, hdr, pas, scores, update, pv, end, pb, ml, cnt, pidx):
+    def core(q_in, kv, o_out, x_own, x_nb, hdr, pas, scores, update, pv, end, pb, ml, cnt):
         hq = q_in.acquire(1)
         hdr(hq, cnt)
         q_in.release(1)
         for _ in range_(cnt[0]):
             qq = q_in.acquire(1)
             oo = o_out.acquire(1)
-            pas(oo, ml, cnt, pidx)
+            pas(oo, ml, cnt, qq)
             for _ in range_(cnt[1]):
                 # the tile's K, then its V^T: each object is released as
                 # soon as it is used, so the stream brings the next one in
@@ -154,13 +158,13 @@ def build(dev_name: str = "npu2"):
         x = [[ObjectFifo(s_ty, name=f"x{col}_{pr}_{h}", depth=1) for h in range(2)]
              for pr in range(2)]
         for i in range(4):
-            g, pidx, h = core_of(col, i)
+            g, _, h = core_of(col, i)
             pr = i // 2
             workers.append(Worker(core, fn_args=[
                 q_core[col][i].cons(), kv_b[g][h].cons(), o_core[col][i].prod(),
                 x[pr][h].prod(), x[pr][1 - h].cons(), k_hdr, k_pass, k_scores, k_update,
                 k_pv, k_end, Buffer(p_ty, name=f"p{col}_{i}"),
-                Buffer(ml_ty, name=f"ml{col}_{i}"), Buffer(n_ty, name=f"n{col}_{i}"), pidx],
+                Buffer(ml_ty, name=f"ml{col}_{i}"), Buffer(n_ty, name=f"n{col}_{i}")],
                 tile=Tile(col, 2 + i), stack_size=0xE00))
     eps = ([f.prod(tile=Tile(col, 0)) for col, f in enumerate(q_col)]
            + [kv_in[g][h].prod(tile=Tile(kv_col(g, h), 0)) for g in range(2) for h in range(2)]
@@ -168,16 +172,16 @@ def build(dev_name: str = "npu2"):
     return workers, eps
 
 
-def tiles_of(p0: int, p: int) -> int:
-    """Key tiles pass p streams."""
-    return (p0 + p * PASS + PASS + NK - 1) // NK
+def tiles_of(p: int) -> int:
+    """Key tiles pass p streams in the sample: the keys up to its last position
+    of a causal run with 64-position passes."""
+    return (p * 64 + 64 + NK - 1) // NK
 
 
 @iron.jit
-def attn(q: In, kv: In, o: Out, *, NPASS: CompileTime[int] = 2, P0: CompileTime[int] = 0,
-         dev_name: CompileTime[str] = "npu2"):
-    Q_ELEMS = COLS * (1 + NPASS) * 4 * R * DH
-    T_MAX = tiles_of(P0, NPASS - 1)
+def attn(q: In, kv: In, o: Out, *, NPASS: CompileTime[int] = 2, dev_name: CompileTime[str] = "npu2"):
+    Q_ELEMS = COLS * (1 + NPASS) * 4 * Q_OBJ
+    T_MAX = tiles_of(NPASS - 1)
     KV_OBJ = 2 * NK * DH                 # a tile: two stream objects
     KV_ELEMS = 4 * T_MAX * KV_OBJ
     O_ELEMS = COLS * NPASS * 4 * R * DH
@@ -185,12 +189,12 @@ def attn(q: In, kv: In, o: Out, *, NPASS: CompileTime[int] = 2, P0: CompileTime[
 
     def seq(q_h, kv_h, o_h, *e):
         qi, ki, oo = e[:COLS], e[COLS:COLS + 4], e[COLS + 4:]
-        per_q = (1 + NPASS) * 4 * R * DH
+        per_q = (1 + NPASS) * 4 * Q_OBJ
         for col in range(COLS):
             qi[col].fill(q_h, tap=TensorAccessPattern([1, Q_ELEMS], col * per_q,
                                                       [1, per_q], [0, 1]))
         for p in range(NPASS):
-            n = tiles_of(P0, p) * KV_OBJ
+            n = tiles_of(p) * KV_OBJ
             for s in range(4):
                 ki[s].fill(kv_h, tap=TensorAccessPattern([1, KV_ELEMS], s * T_MAX * KV_OBJ,
                                                          [n // 1024, 1024], [1024, 1]))

@@ -3,15 +3,20 @@
 #include <stddef.h>
 
 // The prefill gated delta rule on the mmul (kernels/gdn_mm.py):
-// GGML_OP_GATED_DELTA_NET of Qwen3.5's recurrent layers - 16 heads, S = 128, a
-// scalar gate, one sequence, one state snapshot. The state stays on the array
-// for the whole ubatch.
+// GGML_OP_GATED_DELTA_NET of Qwen3.5's recurrent layers - 16 q/k groups and 16
+// or 32 value heads, S = 128, a scalar gate, one sequence, one state snapshot.
+// The state stays on the array for the whole ubatch.
 // GGML_XDNA_GDN_MM=0 leaves it to the host.
 
 struct ggml_tensor;
 struct xdna_kernel_pool;
 
 bool xdna_gdn_mm_supported(const struct ggml_tensor * node);
+
+// A node of more value heads takes several runs of 16. Only a node of one
+// run takes the input laid out ahead (xdna_gdn_mm_prepare) or leaves its
+// output on the array (xdna_gdn_mm_keep).
+bool xdna_gdn_mm_one_run(const struct ggml_tensor * node);
 
 // Run it to completion and write the output and the new state.
 bool xdna_gdn_mm_run(struct xdna_kernel_pool * pool, struct ggml_tensor * node);

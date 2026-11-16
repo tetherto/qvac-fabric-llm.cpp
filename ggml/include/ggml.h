@@ -383,6 +383,8 @@ extern "C" {
     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
 
+    typedef struct { uint8_t bits; } ggml_fp8_e4m3_t;
+
     struct ggml_object;
     struct ggml_context;
     struct ggml_cgraph;
@@ -432,14 +434,16 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_TBQ3_0    = 43, // TurboQuant 3-bit + QJL Stage 2, block=128 (4.25 bpw)
-        GGML_TYPE_TBQ4_0    = 44, // TurboQuant 4-bit + QJL Stage 2, block=128 (5.25 bpw)
-        GGML_TYPE_TBQ3_0_64 = 45, // TurboQuant 3-bit + QJL Stage 2, block=64  (4.5 bpw)
-        GGML_TYPE_TBQ4_0_64 = 46, // TurboQuant 4-bit + QJL Stage 2, block=64  (5.5 bpw)
-        GGML_TYPE_PQ3_0     = 47, // PolarQuant 3-bit (Stage 1 only), block=128 (3.125 bpw)
-        GGML_TYPE_PQ3_0_64  = 48, // PolarQuant 3-bit (Stage 1 only), block=64  (3.25 bpw)
-        GGML_TYPE_PQ4_0     = 49, // PolarQuant 4-bit (Stage 1 only), block=128 (4.125 bpw)
-        GGML_TYPE_PQ4_0_64  = 50, // PolarQuant 4-bit (Stage 1 only), block=64  (4.25 bpw)
+        GGML_TYPE_F8_E4M3   = 43,
+        // fabric KV-cache-only types, moved out of the upstream range (not stored in GGUF files)
+        GGML_TYPE_TBQ3_0    = 52, // TurboQuant 3-bit + QJL Stage 2, block=128 (4.25 bpw)
+        GGML_TYPE_TBQ4_0    = 53, // TurboQuant 4-bit + QJL Stage 2, block=128 (5.25 bpw)
+        GGML_TYPE_TBQ3_0_64 = 54, // TurboQuant 3-bit + QJL Stage 2, block=64  (4.5 bpw)
+        GGML_TYPE_TBQ4_0_64 = 55, // TurboQuant 4-bit + QJL Stage 2, block=64  (5.5 bpw)
+        GGML_TYPE_PQ3_0     = 56, // PolarQuant 3-bit (Stage 1 only), block=128 (3.125 bpw)
+        GGML_TYPE_PQ3_0_64  = 57, // PolarQuant 3-bit (Stage 1 only), block=64  (3.25 bpw)
+        GGML_TYPE_PQ4_0     = 58, // PolarQuant 4-bit (Stage 1 only), block=128 (4.125 bpw)
+        GGML_TYPE_PQ4_0_64  = 59, // PolarQuant 4-bit (Stage 1 only), block=64  (4.25 bpw)
         GGML_TYPE_PQ2_0     = 142,
         GGML_TYPE_PTQ1_0    = 143,
         GGML_TYPE_COUNT     = 144,
@@ -464,8 +468,11 @@ extern "C" {
 
     // op hint
     enum ggml_op_hint {
-        GGML_HINT_NONE             = 0,
-        GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_NONE                 = 0,
+        GGML_HINT_SRC0_IS_HADAMARD     = 1,
+        // src0 is the dense normalized ConvRot H256 matrix (ggml_convrot with
+        // group_size 256); backends without a native transform run the plain matmul
+        GGML_HINT_SRC0_IS_CONVROT_H256 = 2,
     };
 
     // model file types
@@ -498,6 +505,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_F8_E4M3 = 29, // except 1d tensors
         GGML_FTYPE_MOSTLY_PQ2_0  = 141, // except 1d tensors
         GGML_FTYPE_MOSTLY_PTQ1_0 = 143, // except 1d tensors
     };
@@ -669,6 +677,19 @@ extern "C" {
         // snapshot per draft token. See ggml_gated_delta_net_deferred.
         GGML_OP_GATED_DELTA_NET_DEFERRED,
         GGML_OP_GDN_CONV_DEFERRED,
+
+        // ConvRot (ComfyUI TensorWise I8 diffusion weights): the I8 linear layer
+        // that rotates each 256-wide scaled weight block, and the activation-side
+        // rotation that lets the same layer run on the standard matmul kernels.
+        GGML_OP_MUL_MAT_CONVROT,
+        GGML_OP_CONVROT,
+        // conv and gated delta net over sequences of different lengths in one batch
+        GGML_OP_SSM_CONV_RAGGED,
+        GGML_OP_GATED_DELTA_NET_RAGGED,
+
+        // Flux RoPE: rotates each even/odd pair by a precomputed 2x2 matrix and
+        // permutes [d_head, n_head, L, N] into the flash-attention layout.
+        GGML_OP_ROPE_FLUX,
 
         GGML_OP_COUNT,
     };
@@ -1643,6 +1664,72 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
 
+    // ConvRot linear layer on ComfyUI TensorWise I8 weights.
+    //
+    // Each group_size-wide block of a scaled weight row is rotated by the
+    // normalized regular radix-4 Hadamard before the dot product. Only
+    // group_size 256 is accepted.
+    //
+    // activations : F32 or F16 [in_features, batch, ...]
+    // weights     : I8  [in_features, out_features]
+    // scales      : F32 [out_features, 1], one scale per weight row
+    // result      : F32 [out_features, batch, ...]
+    GGML_API struct ggml_tensor * ggml_mul_mat_convrot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * activations,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * scales,
+            int32_t               group_size);
+
+    // ask the backend for its F16 compatibility arithmetic (F16 operands and
+    // output, as the F16 loaders produce); the weights stay I8 at rest
+    GGML_API void ggml_mul_mat_convrot_set_f16_compat(
+            struct ggml_tensor * a,
+            bool                 enabled);
+
+    // ConvRot rotation of every group_size-wide block along dimension 0.
+    //
+    // a is F32 and a->ne[0] a multiple of group_size. The rotation is
+    // symmetric and orthogonal, so (H*w) . x == w . (H*x): rotating the
+    // activations lets a ConvRot layer run on ggml_mul_mat with weights
+    // repacked by ggml_convrot_repack_q8_0().
+    GGML_API struct ggml_tensor * ggml_convrot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int32_t               group_size);
+
+    GGML_API struct ggml_tensor * ggml_convrot_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int32_t               group_size);
+
+    // true for a power of four in [4, 1024]
+    GGML_API bool ggml_convrot_group_size_is_valid(int32_t group_size);
+
+    // ggml_mul_mat(weights, ggml_convrot(activations, group_size))
+    //
+    // weights     : [in_features, out_features], any ggml_mul_mat type,
+    //               typically Q8_0 from ggml_convrot_repack_q8_0()
+    // activations : F32 [in_features, batch, ...]
+    GGML_API struct ggml_tensor * ggml_convrot_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * activations,
+            int32_t               group_size);
+
+    // Repack I8 ConvRot weights [in_features, out_features] with one F32 scale
+    // per row into Q8_0 rows. The int8 values are copied verbatim; the only
+    // rounding is the row scale becoming the F16 scale of each block, which
+    // loses relative precision below 2^-14 and cannot represent scales above
+    // the F16 range. in_features must be a multiple of 32. Returns the packed
+    // size in bytes; pass dst == NULL to query it.
+    GGML_API size_t ggml_convrot_repack_q8_0(
+            const int8_t * weights,
+            const float  * scales,
+            int64_t        in_features,
+            int64_t        out_features,
+            void         * dst);
+
     // indirect matrix multiplication
     //
     // [TAG_MUL_MAT_ID_DUPLICATE_ID]
@@ -2179,6 +2266,17 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow),
         "use ggml_rope_ext_inplace instead");
+
+    // Fused Flux RoPE: rotates every (even, odd) pair of a by the precomputed
+    // matrix b and permutes the result for flash attention.
+    // a: [d_head, n_head, L, N] F32, may be non-contiguous
+    // b: [2, 2, d_head/2, L] F32 with b[i, j] multiplying input component i into
+    //    output component j, or NULL to permute only
+    // result: [d_head, L, N*n_head] F32, contiguous
+    GGML_API struct ggml_tensor * ggml_rope_flux(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
 
     // compute correction dims for YaRN RoPE scaling
     GGML_API void ggml_rope_yarn_corr_dims(
@@ -3153,6 +3251,40 @@ extern "C" {
             struct ggml_tensor  * a,
             int64_t               K);
 
+    // ragged variants of ggml_ssm_conv and ggml_gated_delta_net: the sequences of a batch may have
+    // different lengths. The tokens of seq s are rows [seq_off[s], seq_off[s + 1]) of the inputs.
+    //
+    // causal depthwise conv, preceded per seq by its conv state:
+    //   x       : [C, n_tokens]
+    //   state   : [d_conv - 1, C, n_seqs] (time-major per channel, as ggml_ssm_conv's conv_x)
+    //   w       : [d_conv, C]
+    //   seq_off : I32 [n_seqs + 1]
+    // result 1D: y [C, n_tokens] (SiLU applied if silu) | new states [d_conv - 1, C, n_seqs]
+    GGML_API struct ggml_tensor * ggml_ssm_conv_ragged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * seq_off,
+            bool                  silu);
+
+    // gated delta net with K == 1, scalar gate:
+    //   q, k    : [S_k, H_k, n_tokens]
+    //   v       : [S_v, H_v, n_tokens]
+    //   g, beta : [1, H_v, n_tokens]
+    //   state   : [S_v, S_v, H_v, n_seqs]
+    //   seq_off : I32 [n_seqs + 1]
+    // result 1D: attn [S_v, H_v, n_tokens] | new states [S_v, S_v, H_v, n_seqs]
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ragged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * seq_off);
+
     GGML_API int64_t ggml_gated_delta_net_rec_size(int64_t S_k, int64_t H_k, int64_t S_v, int64_t H_v, int64_t G, int64_t K);
 
     // causal depthwise conv + SiLU of a gated delta net layer with a deferred conv-state commit, the
@@ -3429,6 +3561,12 @@ extern "C" {
     GGML_API int                   ggml_graph_n_nodes(struct ggml_cgraph * cgraph);
 
     GGML_API void   ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
+
+    GGML_API struct ggml_tensor *  ggml_graph_leaf   (struct ggml_cgraph * cgraph, int i);
+    GGML_API struct ggml_tensor ** ggml_graph_leafs  (struct ggml_cgraph * cgraph);
+    GGML_API int                   ggml_graph_n_leafs(struct ggml_cgraph * cgraph);
+
+    GGML_API void   ggml_graph_add_leaf(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
 
     GGML_API size_t ggml_graph_overhead(void);
     GGML_API size_t ggml_graph_overhead_custom(size_t size, bool grads);

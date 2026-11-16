@@ -97,6 +97,22 @@ struct llm_build_delta_net_base : public llm_graph_context {
             float                eps,
             int                  il);
 
+    // conv + silu + q/k l2 norms + delta net of a ragged ubatch (per-sequence token ranges, see ggml_ssm_conv_ragged
+    // and ggml_gated_delta_net_ragged); writes the new conv and ssm states back to the cache
+    // qkv_mixed: (conv_channels, n_tokens, 1), g and b: (1, num_v_heads, n_tokens, 1) activated gates
+    // returns output: (head_v_dim, num_v_heads, n_tokens, 1)
+    ggml_tensor * build_recurrent_ragged(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        qkv_mixed,
+            ggml_tensor *        conv_kernel,
+            ggml_tensor *        g,
+            ggml_tensor *        b,
+            int64_t              head_k_dim,
+            int64_t              num_k_heads,
+            int64_t              head_v_dim,
+            int64_t              num_v_heads,
+            int                  il);
+
     // gather the ubatch's ssm states from the cache (the base states with the deferred gdn commit)
     ggml_tensor * build_rs_ssm(
             llm_graph_input_rs * inp,

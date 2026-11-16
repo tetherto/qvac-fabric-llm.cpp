@@ -239,6 +239,44 @@ DEFINE_CPY_CONVERT_SAMESHAPE(f32_f16, hvx_copy_f32_f16_aa)
 DEFINE_CPY_CONVERT_SAMESHAPE(i32_f32, hvx_copy_i32_f32_aa)
 DEFINE_CPY_CONVERT_SAMESHAPE(f32_i32, hvx_copy_f32_i32_aa)
 
+// Element-wise conversion over an arbitrary stride quadruple on both sides, for
+// same-extent sources whose rows are not packed (permuted or transposed views):
+// the row-based conversion kernels above need packed inner rows. Scalar on
+// purpose; the speech encoders emit a handful of these per layer.
+#define DEFINE_CPY_CONVERT_STRIDED(NAME, SRC_TYPE, DST_TYPE)                                          \
+static void cpy_thread_##NAME##_strided(unsigned int nth, unsigned int ith, void * data) {          \
+    struct htp_copy_context * ct = (struct htp_copy_context *) data;                                \
+    struct htp_ops_context * octx = ct->octx;                                                       \
+    cpy_preamble;                                                                                   \
+                                                                                                    \
+    const uint32_t dr  = ct->src0_nrows_per_thread;                                                 \
+    const uint32_t ir0 = ct->row_start + dr * ith;                                                  \
+    const uint32_t ir1 = MIN(ir0 + dr, ct->row_start + ct->nrows);                                  \
+    if (ir0 >= ir1) return;                                                                         \
+                                                                                                    \
+    const struct htp_copy_strided_params * sp = &ct->kparams->u.strided;                            \
+    const uint8_t * src_base = (const uint8_t *) (uintptr_t) src0->data;                            \
+    uint8_t *       dst_base = (uint8_t *) (uintptr_t) dst->data;                                   \
+                                                                                                    \
+    for (uint32_t r = ir0; r < ir1; r++) {                                                          \
+        const uint32_t i03 = fastdiv(r, &sp->div_ne02_ne01);                                        \
+        const uint32_t rem = r - i03 * ne02 * ne01;                                                 \
+        const uint32_t i02 = fastdiv(rem, &sp->div_ne01);                                           \
+        const uint32_t i01 = rem - i02 * ne01;                                                      \
+        const uint8_t * src_row = src_base + i01 * nb01 + i02 * nb02 + i03 * nb03;                  \
+        uint8_t *       dst_row = dst_base + i01 * nb1  + i02 * nb2  + i03 * nb3;                   \
+        for (uint32_t i00 = 0; i00 < ne00; i00++) {                                                 \
+            SRC_TYPE x;                                                                             \
+            memcpy(&x, src_row + i00 * nb00, sizeof(x));                                            \
+            const DST_TYPE y = (DST_TYPE) x;                                                        \
+            memcpy(dst_row + i00 * nb0, &y, sizeof(y));                                             \
+        }                                                                                           \
+    }                                                                                               \
+}
+
+DEFINE_CPY_CONVERT_STRIDED(f32_f16, float, __fp16)
+DEFINE_CPY_CONVERT_STRIDED(f16_f32, __fp16, float)
+
 static int cpy_scalar(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
     if (octx->ctx->mdev.count > 1 && octx->ctx->mdev.idx > 0) {
         return HTP_STATUS_OK;
@@ -393,6 +431,50 @@ static int cpy_sameshape_convert(struct htp_ops_context * octx, const struct htp
     return HTP_STATUS_OK;
 }
 
+static int cpy_strided_convert(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+
+    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    uint32_t row_start = 0;
+    uint32_t nrows     = kparams->total_rows;
+
+    if (octx->ctx->mdev.count > 1) {
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
+            kparams->total_rows, 1, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        row_start = range.start;
+        nrows     = range.count;
+    }
+
+    if (nrows == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads = octx->n_threads;
+
+    struct htp_copy_context ct;
+    ct.octx                  = octx;
+    ct.kparams               = kparams;
+    ct.row_start             = row_start;
+    ct.nrows                 = nrows;
+    ct.src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
+
+    work_queue_func_t copy_fun = NULL;
+    if (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F16) {
+        copy_fun = cpy_thread_f32_f16_strided;
+    } else if (src0->type == HTP_TYPE_F16 && dst->type == HTP_TYPE_F32) {
+        copy_fun = cpy_thread_f16_f32_strided;
+    } else {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
+    return HTP_STATUS_OK;
+}
+
 static int cpy_reshape(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * dst  = octx->dst;
@@ -455,6 +537,9 @@ int op_cpy(struct htp_ops_context * octx) {
             break;
         case HTP_COPY_KERNEL_RESHAPE:
             status = cpy_reshape(octx, kparams);
+            break;
+        case HTP_COPY_KERNEL_STRIDED_CONVERT:
+            status = cpy_strided_convert(octx, kparams);
             break;
         case HTP_COPY_KERNEL_GATHER_ROWS:
             status = htp_gather_rows(octx, octx->src[0], NULL, &kparams->u.gather, kparams->n_threads);

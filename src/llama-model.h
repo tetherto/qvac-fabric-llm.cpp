@@ -291,6 +291,8 @@ struct llama_layer {
     struct ggml_tensor * wq        = nullptr;
     struct ggml_tensor * wk        = nullptr;
     struct ggml_tensor * wv        = nullptr;
+    struct ggml_tensor * k_cache_scale = nullptr;
+    struct ggml_tensor * v_cache_scale = nullptr;
     struct ggml_tensor * wo        = nullptr;
     struct ggml_tensor * wqkv      = nullptr;
     struct ggml_tensor * wg        = nullptr;
@@ -424,6 +426,9 @@ struct llama_layer {
     struct ggml_tensor * lilicorr_mlp_2           = nullptr;
     struct ggml_tensor * lilicorr_mlp_2_b         = nullptr;
     struct ggml_tensor * lilicorr_mlp_2_s         = nullptr;
+
+    struct ggml_tensor * dspine_read  = nullptr;
+    struct ggml_tensor * dspine_write = nullptr;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -851,6 +856,12 @@ struct llama_model {
     struct ggml_tensor * lilicorr_anchor_out_head     = nullptr;
     struct ggml_tensor * lilicorr_anchor_out_head_b   = nullptr;
 
+    struct ggml_tensor * dspine_codebook  = nullptr;
+    struct ggml_tensor * dspine_gate      = nullptr;
+    struct ggml_tensor * dspine_gate_b    = nullptr;
+    struct ggml_tensor * dspine_pred_gate = nullptr;
+    struct ggml_tensor * dspine_prev      = nullptr;
+
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
@@ -1024,6 +1035,9 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+
+    // helper: give FP8 weights their checkpoint's static input scale (op_params, read by the CUDA backend)
+    void load_fp8_input_scales();
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

@@ -1386,7 +1386,10 @@ int turbovec_sync_plan_for_test(
         std::vector<TurboVecWriteBatch> & batches) {
     std::unique_lock<std::shared_mutex> lock(idx->mutex);
     TurboVecSyncBinding & b = idx->turbovec_sync;
-    if (!b.bound || !filesystem_paths_equal(b.path.c_str(), path) || b.calib_gen != idx->turbovec_calib_gen) {
+    // A sync after a calibrate or a row move writes the whole file, so
+    // there is no incremental plan.
+    if (!b.bound || !filesystem_paths_equal(b.path.c_str(), path) || b.calib_gen != idx->turbovec_calib_gen ||
+        b.rewrite) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     CursorState state = CursorState::replaced;

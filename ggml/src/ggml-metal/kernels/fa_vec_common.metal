@@ -15,6 +15,39 @@ constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EX
 constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
 constant bool    FC_flash_attn_ext_vec_has_rows   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
 constant int32_t FC_flash_attn_ext_vec_nhptg [[function_constant(FC_FLASH_ATTN_EXT_VEC + 24)]];
+
+// reduce the partial Q*K dot products of a simdgroup (NE cache elements, NL lanes each) and broadcast them
+template<short NE, short NL, typename T>
+static inline T fa_vec_reduce_qk(T s, short ty) {
+    if (NE == 1) {
+        return simd_sum(s);
+    }
+
+    // simdgroup reduce (NE = 4)
+    // [ 0 ..  7] -> [ 0]
+    // [ 8 .. 15] -> [ 8]
+    // [16 .. 23] -> [16]
+    // [24 .. 31] -> [24]
+    if (NE <= 1) {
+        s += simd_shuffle_down(s, 16);
+    }
+    if (NE <= 2) {
+        s += simd_shuffle_down(s,  8);
+    }
+    if (NE <= 4) {
+        s += simd_shuffle_down(s,  4);
+    }
+    if (NE <= 8) {
+        s += simd_shuffle_down(s,  2);
+    }
+    if (NE <= 16) {
+        s += simd_shuffle_down(s,  1);
+    }
+
+    // broadcast
+    return simd_shuffle(s, NL*ty);
+}
+
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -91,8 +124,10 @@ kernel void kernel_flash_attn_ext_vec(
     static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
     static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
 
-    // the host groups heads only without sparse indices, so a head's shared memory is SMEM
-    shmem_f16 += ihg*SMEM;
+    // each head has SMEM, then NSG*C ints of K/V row indices with kv_rows (the host groups heads only without sparse indices)
+    const int SMEM_IDX = FC_flash_attn_ext_vec_has_rows ? 2*NSG*C : 0;
+
+    shmem_f16 += ihg*(SMEM + SMEM_IDX);
 
     threadgroup q4_t  * sq4 = (threadgroup q4_t  *) shmem_f16; // holds the query data
     threadgroup s_t   * ss  = (threadgroup s_t   *) (shmem_f16 + SMEM_Q + sgitg*SH); // scratch buffer for attention
@@ -243,13 +278,26 @@ kernel void kernel_flash_attn_ext_vec(
             }
 
             // load the KV row indices for the current block into shared memory
+            // with kv_rows, a block of consecutive cache rows is read like the dense cache, from row ic_kv
+            bool rows_dense = false;
+            int  ic_kv      = ic;
             if (FC_flash_attn_ext_vec_has_sparse || FC_flash_attn_ext_vec_has_rows) {
+                const int r0 = FC_flash_attn_ext_vec_has_rows ? rows_list[ic] : 0;
+
+                bool seq = r0 >= 0;
                 FOR_UNROLL (short ii = 0; ii < C/NW; ++ii) {
                     const short i = ii*NW + tiisg;
 
-                    spidx[i] = FC_flash_attn_ext_vec_has_rows ? rows_list[ic + i] : pidx[ic + i];
+                    const int r = FC_flash_attn_ext_vec_has_rows ? rows_list[ic + i] : pidx[ic + i];
+                    spidx[i] = r;
+                    seq = seq && r == r0 + i;
                 }
                 simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (FC_flash_attn_ext_vec_has_rows) {
+                    rows_dense = simd_all(seq);
+                    ic_kv = r0;
+                }
             }
 
             if (FC_flash_attn_ext_vec_has_mask) {
@@ -305,8 +353,8 @@ kernel void kernel_flash_attn_ext_vec(
             {
                 device      const k4_t * pk4 = nullptr;
 
-                if (!FC_flash_attn_ext_vec_has_sparse && !FC_flash_attn_ext_vec_has_rows) {
-                    pk4 = (device const k4_t *) (k + ic*args.nb11);
+                if (!FC_flash_attn_ext_vec_has_sparse && (!FC_flash_attn_ext_vec_has_rows || rows_dense)) {
+                    pk4 = (device const k4_t *) (k + ic_kv*args.nb11);
 
                     pk4 += ty*NS10/4 + tx;
                 }
@@ -319,8 +367,9 @@ kernel void kernel_flash_attn_ext_vec(
                 }
 
                 // each simdgroup processes Q queries and NE (NW/NL) cache elements
-                FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                    if (FC_flash_attn_ext_vec_has_sparse || FC_flash_attn_ext_vec_has_rows) {
+                // the path is chosen once per block, outside the unrolled loop, so that the dense reads compile as without kv_rows
+                if ((FC_flash_attn_ext_vec_has_sparse || FC_flash_attn_ext_vec_has_rows) && !rows_dense) {
+                    FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                         // the KV rows are gathered from the index list; -1 entries are padding
                         const int i11 = spidx[NE*cc + ty];
                         if (i11 >= 0) {
@@ -348,56 +397,36 @@ kernel void kernel_flash_attn_ext_vec(
                                 }
                             }
                         }
-                    } else if (is_same<kd4_t, k4_t>::value) {
-                        FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
-                            const k4_t k_elem = pk4[cc*NE*NS10/4 + ii*NL];
-                            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
-                                mqk[qq][cc] += dot((float4) k_elem, (float4) sq4[qq*PK4 + ii*NL + tx]);
-                            }
-                        }
-                    } else {
-                        device const kd4_t * pk = (device const kd4_t *) (k + ((ic + NE*cc + ty)*args.nb11));
-
-                        k4_t mk;
-
-                        FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
-                            const short i = ii*NL + tx;
-
-                            deq_k_t4(pk + i/nl_k, i%nl_k, mk);
-
-                            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
-                                mqk[qq][cc] += dot((float4) mk, (float4) sq4[qq*PK4 + i]);
-                            }
+                        FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                            mqk[qq][cc] = fa_vec_reduce_qk<NE, NL>(mqk[qq][cc], ty);
                         }
                     }
-
-                    FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
-                        if (NE == 1) {
-                            mqk[qq][cc] = simd_sum(mqk[qq][cc]);
+                } else {
+                    FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                        if (is_same<kd4_t, k4_t>::value) {
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                const k4_t k_elem = pk4[cc*NE*NS10/4 + ii*NL];
+                                FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                                    mqk[qq][cc] += dot((float4) k_elem, (float4) sq4[qq*PK4 + ii*NL + tx]);
+                                }
+                            }
                         } else {
-                            // simdgroup reduce (NE = 4)
-                            // [ 0 ..  7] -> [ 0]
-                            // [ 8 .. 15] -> [ 8]
-                            // [16 .. 23] -> [16]
-                            // [24 .. 31] -> [24]
-                            if (NE <= 1) {
-                                mqk[qq][cc] += simd_shuffle_down(mqk[qq][cc], 16);
-                            }
-                            if (NE <= 2) {
-                                mqk[qq][cc] += simd_shuffle_down(mqk[qq][cc],  8);
-                            }
-                            if (NE <= 4) {
-                                mqk[qq][cc] += simd_shuffle_down(mqk[qq][cc],  4);
-                            }
-                            if (NE <= 8) {
-                                mqk[qq][cc] += simd_shuffle_down(mqk[qq][cc],  2);
-                            }
-                            if (NE <= 16) {
-                                mqk[qq][cc] += simd_shuffle_down(mqk[qq][cc],  1);
-                            }
+                            device const kd4_t * pk = (device const kd4_t *) (k + ((ic_kv + NE*cc + ty)*args.nb11));
 
-                            // broadcast
-                            mqk[qq][cc] = simd_shuffle(mqk[qq][cc], NL*ty);
+                            k4_t mk;
+
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+
+                                deq_k_t4(pk + i/nl_k, i%nl_k, mk);
+
+                                FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                                    mqk[qq][cc] += dot((float4) mk, (float4) sq4[qq*PK4 + i]);
+                                }
+                            }
+                        }
+                        FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                            mqk[qq][cc] = fa_vec_reduce_qk<NE, NL>(mqk[qq][cc], ty);
                         }
                     }
                 }
@@ -463,7 +492,7 @@ kernel void kernel_flash_attn_ext_vec(
                     }
                 }
 
-                if (FC_flash_attn_ext_vec_has_sparse || FC_flash_attn_ext_vec_has_rows) {
+                if ((FC_flash_attn_ext_vec_has_sparse || FC_flash_attn_ext_vec_has_rows) && !rows_dense) {
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                         // the KV rows are gathered from the index list; -1 entries are padding
                         const int i11 = spidx[NE*cc + ty];
@@ -497,7 +526,7 @@ kernel void kernel_flash_attn_ext_vec(
                         }
                     }
                 } else if (is_same<vd4_t, v4_t>::value) {
-                    device const v4_t * pv4 = (device const v4_t *) (v + ic*args.nb21);
+                    device const v4_t * pv4 = (device const v4_t *) (v + ic_kv*args.nb21);
 
                     pv4 += ty*NS20/4 + tx;
 
@@ -511,7 +540,7 @@ kernel void kernel_flash_attn_ext_vec(
                     }
                 } else {
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                        device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic + NE*cc + ty)*args.nb21));
+                        device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic_kv + NE*cc + ty)*args.nb21));
 
                         FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
                             const short i = ii*NL + tx;

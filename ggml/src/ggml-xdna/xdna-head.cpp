@@ -204,21 +204,21 @@ xdna_head * xdna_head_create(xdna_kernel_pool *  pool,
     // The same from the rows: each part's first tile takes F, A and gamma and
     // the prologue quantizes rms_norm(F + A) * gamma; its tiles are every
     // chunk's, in DDR (a replayed first tile would take the rows again).
-    if (res && gamma && K == XDNA_RES_D) {
+    if (res && gamma && xdna_res_width_ok(K)) {
         size_t rb = 0;
         for (int i = 0; i < h->n_parts; i++) {
             h->p[i].ra_off = rb;
             rb             = xdna_align_up(rb + h->p[i].geom.act_bytes());
         }
         const size_t g_off = rb;
-        rb += (size_t) XDNA_RES_D * sizeof(float);
+        rb += (size_t) K * sizeof(float);
         h->ra = xdna_buffer_alloc(dev, rb);
         xdna_seq sr;
         bool     ok_r = h->ra != nullptr;
         for (int i = 0; ok_r && i < h->n_parts; i++) {
             const part & p = h->p[i];
             ok_r           = xdna_gemv_row_act(p.geom, (uint8_t *) h->ra->data + p.ra_off, eps, true, 0);
-            xdna_seq_row_io(&sr, 3, XDNA_RES_F, XDNA_RES_A, 1, (uint32_t) g_off, XDNA_RES_H);
+            xdna_seq_row_io(&sr, (int) K, 3, XDNA_RES_F, XDNA_RES_A, 1, (uint32_t) g_off, XDNA_RES_H);
             xdna_gemv_seq_opts o;
             o.bd_base = 0;
             o.w_off   = (uint32_t) p.w_off;
@@ -228,7 +228,7 @@ xdna_head * xdna_head_create(xdna_kernel_pool *  pool,
             xdna_seq_row_wait(&sr);
         }
         if (ok_r) {
-            std::memcpy((uint8_t *) h->ra->data + g_off, gamma, (size_t) XDNA_RES_D * sizeof(float));
+            std::memcpy((uint8_t *) h->ra->data + g_off, gamma, (size_t) K * sizeof(float));
             if (!xdna_buffer_sync_to_device(h->ra)) {
                 xdna_head_free(h);
                 return nullptr;
@@ -265,6 +265,16 @@ void xdna_head_free(xdna_head * h) {
     delete h;
 }
 
+namespace {
+
+// no dirty line of the logits may land over what the array writes
+bool flush_logits(xdna_head * h) {
+    xdna_test_dirty_if_armed(XDNA_OUT_HEAD, h->o, h->o->bytes, 0);
+    return xdna_buffer_sync_to_device(h->o);
+}
+
+}  // namespace
+
 bool xdna_head_run(xdna_head * h, const float * x, float * logits) {
     if (!h || !x || !logits || !h->a->data) {
         GGML_LOG_ERROR("%s: bad call or the head's activation has no host mapping (x=%p logits=%p)\n", "xdna-head",
@@ -283,6 +293,9 @@ bool xdna_head_run(xdna_head * h, const float * x, float * logits) {
             return false;
         }
     }
+    if (!flush_logits(h)) {
+        return false;
+    }
     {
         xdna_prof::section_timer st("head: dispatch (restart+wait)");
         if (!xdna_run_restart(h->run) || !xdna_run_wait(h->run)) {
@@ -300,7 +313,7 @@ xrt::run * xdna_head_start_rows(xdna_head * h) {
     if (!xdna_head_rows(h)) {
         return nullptr;
     }
-    if (!xdna_run_submit(h->kern_r, h->run_r, h->args_r.data(), h->args_r.size())) {
+    if (!flush_logits(h) || !xdna_run_submit(h->kern_r, h->run_r, h->args_r.data(), h->args_r.size())) {
         return nullptr;
     }
     return &h->run_r;

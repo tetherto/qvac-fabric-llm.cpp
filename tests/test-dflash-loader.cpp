@@ -507,6 +507,20 @@ static bool check_attn_window(case_type kind, int32_t expected) {
     return ok;
 }
 
+// DSpine reuses the DFlash2 lattice width accessor, so a DFlash2 selector draft must not be reported as DSpine
+static bool check_not_dspine(case_type kind) {
+    if (!write_model(kind)) {
+        return false;
+    }
+    llama_model_params params = llama_model_default_params();
+    params.no_alloc = true;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    llama_model * model = llama_model_load_from_file(PATH, params);
+    const bool ok = model && !llama_model_is_dspine(model);
+    llama_model_free(model);
+    return ok;
+}
+
 static bool check_rejected_draft_vocab() {
     if (!write_model(case_type::legacy, true)) {
         return false;
@@ -598,6 +612,10 @@ int main() {
         !check_attn_window(case_type::full_attention_window, 0) ||
         !check_attn_window(case_type::valid_selector, 0)) {
         fprintf(stderr, "FAIL: the attention window must equal the sliding window only when every layer uses it\n");
+        ++failures;
+    }
+    if (!check_not_dspine(case_type::valid_selector)) {
+        fprintf(stderr, "FAIL: a DFlash2 selector draft is reported as DSpine\n");
         ++failures;
     }
     if (!check_fused_encoder()) {
