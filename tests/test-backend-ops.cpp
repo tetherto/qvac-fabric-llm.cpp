@@ -4360,6 +4360,7 @@ struct test_mul_mat_bias : public test_case {
     const int64_t k;
     const std::array<int64_t, 2> bs; // dims 3 and 4 of b
     const bool bias_4d;              // bias as [m, 1, 1, 1] instead of [m]
+    const int64_t bias_view_off;     // >= 0: bias as a view of a larger tensor at this offset in floats, < 0: a leaf
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4369,7 +4370,7 @@ struct test_mul_mat_bias : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR6(type_a, m, n, k, bs, bias_4d);
+        return VARS_TO_STR7(type_a, m, n, k, bs, bias_4d, bias_view_off);
     }
 
     double max_nmse_err() override {
@@ -4377,14 +4378,23 @@ struct test_mul_mat_bias : public test_case {
     }
 
     test_mul_mat_bias(ggml_type type_a = GGML_TYPE_F16, int64_t m = 32, int64_t n = 64, int64_t k = 32,
-            std::array<int64_t, 2> bs = {1, 1}, bool bias_4d = false)
-        : type_a(type_a), m(m), n(n), k(k), bs(bs), bias_4d(bias_4d) {}
+            std::array<int64_t, 2> bs = {1, 1}, bool bias_4d = false, int64_t bias_view_off = -1)
+        : type_a(type_a), m(m), n(n), k(k), bs(bs), bias_4d(bias_4d), bias_view_off(bias_view_off) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
         ggml_tensor * a    = ggml_new_tensor_2d(ctx, type_a, k, m);
         ggml_tensor * b    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k, n, bs[0], bs[1]);
-        ggml_tensor * bias = bias_4d ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, m, 1, 1, 1) : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_tensor * bias;
+        if (bias_view_off >= 0) {
+            // one packed tensor of several biases, as a model that stores them together: the graph is then
+            // MUL_MAT, VIEW, ADD and the view's offset decides the alignment of the bias data
+            ggml_tensor * packed = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, bias_view_off + 2*m);
+            ggml_set_name(packed, "packed");
+            bias = ggml_view_1d(ctx, packed, m, bias_view_off*ggml_element_size(packed));
+        } else {
+            bias = bias_4d ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, m, 1, 1, 1) : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        }
         ggml_set_name(a, "a"); ggml_set_name(b, "b"); ggml_set_name(bias, "bias");
 
         ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a, b), bias);
@@ -4392,6 +4402,7 @@ struct test_mul_mat_bias : public test_case {
         return out;
     }
 };
+
 // GGML_OP_NORM/RMS_NORM + GGML_OP_SCALE
 struct test_norm_scale : public test_case {
     const ggml_type type;
@@ -17435,29 +17446,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_bias(type_a, m, 300, 64, { 1, 1 }, false));
             test_cases.emplace_back(new test_mul_mat_bias(type_a, m, 300, 64, { 1, 1 }, true));
             test_cases.emplace_back(new test_mul_mat_bias(type_a, m,  33, 64, { 5, 3 }, false));
+            // bias as a view: an offset of whole float4s keeps the four-element kernel, one float off takes the scalar one
+            for (int64_t off : { int64_t(0), int64_t(4), int64_t(1) }) {
+                test_cases.emplace_back(new test_mul_mat_bias(type_a, m, 300, 64, { 1, 1 }, false, off));
+            }
         }
         test_cases.emplace_back(new test_mul_mat_bias(type_a, 384, 5581, 1536, { 1, 1 }, false)); // ViT-S MLP down at 90x62 patches
         test_cases.emplace_back(new test_mul_mat_bias(type_a,  16,    1,   32, { 1, 1 }, false)); // one column: mat-vec, bias same shape
     }
 
-    // many small F32 products: a contraction (k) of at most 32, at most 32 columns (n), at least 16 matrices.
-    // k below 4 takes a scalar kernel; the row count (m) picks 4, 2 or 1 rows per thread.
+    // many small F32 products: a contraction (k) of at most 32, at most 32 columns (n), and at least 1024 CUDA threads,
+    // one per 1, 2 or 4 rows (m) of all matrices. k below 4 takes a scalar kernel; m picks 4, 2 or 1 rows per thread.
     for (int64_t k : { 1, 2, 3, 4, 8, 12, 16, 20, 24, 28, 32 }) {
         for (int64_t m : { 1, 4, 6, 7, 16 }) {
-            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 5, k, { 4, 4 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 5, k, { 32, 32 }, { 1, 1 }));
         }
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16,  1, k, { 16,  1 }, { 1, 1 }));
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 18, 32, k, {  1, 17 }, { 1, 1 }));
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, k, {  4, 70 }, { 1, 1 })); // windowed attention logits
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 700, 16, k, { 16,  1 }, { 1, 1 })); // windows as rows
-        // just outside: one matrix too few, one column too many, broadcast, permuted src1
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, k, {  3,  5 }, { 1, 1 }));
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 33, k, {  4,  4 }, { 1, 1 }));
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, k, {  4,  4 }, { 2, 1 }));
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, k, {  4,  4 }, { 1, 1 }, { 0, 2, 1, 3 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16,  1, k, { 256,   1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 18, 32, k, {   1, 120 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, k, {   4,  70 }, { 1, 1 })); // windowed attention logits
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 700, 16, k, { 16,   1 }, { 1, 1 })); // windows as rows
+        // just outside: one thread too few, one column too many, broadcast, permuted src1
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  1, 16, k, { 1023, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 33, k, {   4,  70 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, k, {   4,  70 }, { 2, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, k, {   4,  70 }, { 1, 1 }, { 0, 2, 1, 3 }));
     }
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, 36, { 4, 4 }, { 1, 1 })); // k too long
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, 30, { 4, 4 }, { 1, 1 })); // k not a multiple of 4
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, 36, { 4, 70 }, { 1, 1 })); // k too long
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, 30, { 4, 70 }, { 1, 1 })); // k not a multiple of 4
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32,  2,  2, { 4, 5580 }, { 1, 1 })); // attention over 2 tokens per pixel
 
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
@@ -18876,15 +18891,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4,      1, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4,   1023, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {643251, 3, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
-    // many short rows (attention inside small windows): 4096 rows of at most 32 values is where CUDA changes kernel
-    for (int64_t ne0 : { 1, 2, 4, 16, 31, 32, 33 }) {
+    // many short rows (attention inside small windows): 4096 rows of at most 16 values is where CUDA changes kernel
+    const float scale_head_dim_32 = 1.0f/sqrtf(32.0f); // attention scale 1/sqrt(head dim) for heads of 32
+    for (int64_t ne0 : { 1, 2, 4, 5, 8, 9, 15, 16, 17 }) {
         for (bool mask : { false, true }) {
             for (ggml_type m_prec : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
                 if (!mask && m_prec == GGML_TYPE_F16) {
                     continue;
                 }
-                test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 16, 4, 64}, mask, false, m_prec, {1, 1}, 0.1767767f, 0.0f)); // 4096 rows
-                test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 16, 1, 64}, mask, false, m_prec, {4, 1}, 0.1767767f, 0.0f)); // mask shared by the heads
+                test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 16, 4, 64}, mask, false, m_prec, {1, 1}, scale_head_dim_32, 0.0f)); // 4096 rows
+                test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 16, 1, 64}, mask, false, m_prec, {4, 1}, scale_head_dim_32, 0.0f)); // mask shared by the heads
                 test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 16, 1,  1}, mask, false, m_prec, {4, 70}, 1.0f, 0.0f));      // one mask for every window
                 test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 4095, 1, 1}, mask, false, m_prec, {1, 1}, 1.0f, 0.0f));      // one row too few
                 test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 16, 4, 64}, mask, false, m_prec, {1, 1}, 0.1f, 0.0f, true)); // in place
