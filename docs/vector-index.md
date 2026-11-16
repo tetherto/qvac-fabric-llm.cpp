@@ -239,11 +239,13 @@ before search.
   coverage matches exact search. IVF state is not persisted in snapshots.
   On a TurboVec index the build moves the rows into list order. Search
   returns the same ids and scores, except that a TurboVec 1.x index orders
-  equal scores by row, so tied rows from different lists can swap. `ggml_vec_index_ids` reports
-  the new order, prepared filters become stale, and the next
-  `ggml_vec_index_sync` rewrites the whole file. The move needs memory for a
-  second copy of the codes; without it, or on a read-only mmap, delta-log
-  bound or tombstoned index, the build keeps the rows where they are.
+  equal scores by row, so tied rows from different lists can swap.
+  `ggml_vec_index_ids` reports the new order, prepared filters become stale,
+  and the next `ggml_vec_index_sync` rewrites the whole file. The move needs
+  memory for a second copy of the codes; without it, or on a read-only mmap,
+  delta-log bound or tombstoned index, the build keeps the rows where they
+  are. Initial centroids are picked in id order, so rebuilding an unchanged
+  index gives the same lists and moves nothing.
 
 `ggml_vec_index_prepare` is an optional cache warmup for TurboVec rotation and
 codebook state; other storage modes ignore it. New callers should

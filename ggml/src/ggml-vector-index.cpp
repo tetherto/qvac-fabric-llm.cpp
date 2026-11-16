@@ -994,6 +994,7 @@ bool turbovec_group_rows_by_ivf(ggml_vec_index & idx) {
     std::vector<uint64_t> new_slot_to_id;
     std::vector<uint8_t> new_blocked;
     size_t new_n_blocks = 0;
+    bool keep_packed = false;
     try {
         std::vector<size_t> order;
         order.reserve(n_slots);
@@ -1003,7 +1004,22 @@ bool turbovec_group_rows_by_ivf(ggml_vec_index & idx) {
         if (order.size() != n_slots) {
             return false;
         }
-        new_data.resize(n_slots * row_bytes);
+        // Rows already in list order (one list, or a rebuild of an index
+        // grouped before) stay put: no move, no stale filters, no full sync.
+        bool moved = false;
+        for (size_t i = 0; i < n_slots && !moved; ++i) {
+            moved = order[i] != i;
+        }
+        if (!moved) {
+            return false;
+        }
+        // Packed rows are reordered only when the index keeps them; a settled
+        // 1.x index holds its codes in the blocked cache alone, so the move
+        // costs one extra copy of the codes either way.
+        keep_packed = idx.turbovec_packed_rows;
+        if (keep_packed) {
+            new_data.resize(n_slots * row_bytes);
+        }
         new_scales.resize(n_slots);
         new_slot_to_id.resize(n_slots);
         const size_t n_tasks = (n_slots + kTurboVecRowsPerTask - 1) / kTurboVecRowsPerTask;
@@ -1011,20 +1027,21 @@ bool turbovec_group_rows_by_ivf(ggml_vec_index & idx) {
             const size_t end = std::min(n_slots, (task + 1) * kTurboVecRowsPerTask);
             for (size_t out_slot = task * kTurboVecRowsPerTask; out_slot < end; ++out_slot) {
                 const size_t slot = order[out_slot];
-                turbovec_row_packed(idx, slot, new_data.data() + out_slot * row_bytes);
+                if (keep_packed) {
+                    turbovec_row_packed(idx, slot, new_data.data() + out_slot * row_bytes);
+                }
                 new_scales[out_slot] = idx.turbovec_scale[slot];
                 new_slot_to_id[out_slot] = idx.slot_to_id[slot];
             }
         });
-        repack_turbovec_codes(
-            new_data.data(), n_slots, idx.turbovec_bits, idx.dim, new_blocked, new_n_blocks, turbovec_layout(idx),
-            idx.n_threads);
+        turbovec_blocked_gather(idx, order, new_blocked, new_n_blocks);
     } catch (const std::bad_alloc &) {
         return false;
     }
 
-    idx.turbovec_data.swap(new_data);
-    idx.turbovec_packed_rows = true;
+    if (keep_packed) {
+        idx.turbovec_data.swap(new_data);
+    }
     idx.turbovec_scale.swap(new_scales);
     idx.turbovec_blocked_data.swap(new_blocked);
     idx.turbovec_blocked_n_blocks = new_n_blocks;

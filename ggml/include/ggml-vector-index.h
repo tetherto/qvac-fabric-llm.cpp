@@ -249,9 +249,11 @@ GGML_VEC_INDEX_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 // snapshots, makes prepared filters stale, and makes the next
 // `ggml_vec_index_sync` write the whole file. The move needs memory for a
 // second copy of the codes; without it the build still succeeds and leaves
-// the rows where they are.
+// the rows where they are. Rows already in list order are not moved, so
+// rebuilding an unchanged index changes nothing.
 // `n_lists` is capped to the current index length. `n_iter` controls centroid
-// refinement; 0 uses deterministic initial centroids only.
+// refinement; 0 uses the initial centroids only. Those are rows picked at
+// even steps in id order, so the same vectors and ids give the same lists.
 GGML_VEC_INDEX_API int ggml_vec_index_build_ivf(
     ggml_vec_index_t * idx,
     int                n_lists,
