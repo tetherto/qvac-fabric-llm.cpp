@@ -1215,9 +1215,9 @@ void turbovec_settle_rows(ggml_vec_index & idx);
 // and rewrites the IVF lists as ranges of the new slots. A block then holds
 // rows of one list, so an IVF search scores few blocks. Returns false and
 // changes nothing when the index cannot be reordered (not TurboVec,
-// read-only, delta-log bound, holds tombstones, or has no current IVF) or
-// when there is no memory for the reordered copy. The caller holds the
-// write lock.
+// read-only, delta-log bound, holds tombstones, or has no current IVF), when
+// the rows are already in list order, or when there is no memory for the
+// reordered copy. The caller holds the write lock.
 bool turbovec_group_rows_by_ivf(ggml_vec_index & idx);
 void turbovec_row_seq(const ggml_vec_index & idx, size_t slot, uint8_t * seq);
 void turbovec_row_packed(const ggml_vec_index & idx, size_t slot, uint8_t * packed);
@@ -1243,6 +1243,10 @@ void turbovec_blocked_set_block_seq(ggml_vec_index & idx, size_t block, const ui
 // `repack_turbovec_codes` uses. The blocks must lie inside the cache.
 void turbovec_blocked_set_blocks_packed(
     ggml_vec_index & idx, size_t first_block, size_t n_blocks, const uint8_t * packed_rows);
+// A new blocked cache whose slot i holds the codes of `order[i]`, read
+// straight from the current rows, so no packed copy is needed.
+void turbovec_blocked_gather(
+    const ggml_vec_index & idx, const std::vector<size_t> & order, std::vector<uint8_t> & blocked, size_t & n_blocks);
 // Writes n_new packed rows into the blocked cache from first_slot on.
 void turbovec_blocked_append(ggml_vec_index & idx, const uint8_t * packed, size_t first_slot, size_t n_new);
 // The sign planes of rows [first_slot, n_vectors) into the sign blocked

@@ -7516,6 +7516,81 @@ void check_turbovec_ivf_keeps_staged() {
     turbovec_force_vector_major_for_test(-1);
 }
 
+// A build that would leave every row where it is (one list, or a rebuild of
+// an index already grouped by an earlier build) moves nothing: the ids and
+// lists stay the same, prepared filters stay valid and the next sync stays
+// incremental.
+void check_turbovec_ivf_rebuild_stable() {
+    constexpr int dim = 64;
+    // Several 32-row blocks per list, so the first build has rows to move.
+    constexpr int n = 600;
+    constexpr int nq = 5;
+    constexpr int k = 10;
+    constexpr int n_lists = 8;
+    constexpr int n_iter = 2;
+    constexpr int nprobe = 1;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, nq, dim);
+    auto ivf_search = [&](ggml_vec_index_t * idx, std::vector<float> & scores, std::vector<uint64_t> & out) {
+        scores.assign(static_cast<size_t>(nq) * k, 0.0f);
+        out.assign(scores.size(), 0);
+        CHECK(ggml_vec_index_search_ivf(idx, queries.data(), nq, k, nprobe, scores.data(), out.data()) ==
+              GGML_VEC_INDEX_OK);
+    };
+    auto filter_still_valid = [&](ggml_vec_index_t * idx, ggml_vec_index_filter_t * filter) {
+        std::vector<float> scores(static_cast<size_t>(nq) * k);
+        std::vector<uint64_t> out(scores.size());
+        CHECK(ggml_vec_index_search_prepared_filtered(idx, filter, queries.data(), nq, k, scores.data(), out.data()) ==
+              GGML_VEC_INDEX_OK);
+    };
+    auto sync_is_incremental = [](ggml_vec_index_t * idx, const std::string & path) {
+        std::vector<std::vector<std::pair<uint64_t, std::vector<uint8_t>>>> batches;
+        return turbovec_sync_plan_for_test(idx, path.c_str(), batches) == GGML_VEC_INDEX_OK;
+    };
+    for (const int bits : { 2, 4 }) {
+        temp_file snapshot(".tv");
+        const std::string path = snapshot.path.string();
+        auto * idx = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(idx != nullptr);
+        CHECK(ggml_vec_index_add(idx, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(idx, path.c_str()) == GGML_VEC_INDEX_OK);
+
+        // One list holds every row in slot order already.
+        ggml_vec_index_filter_t * filter = ggml_vec_index_filter_create(idx, ids.data(), k);
+        CHECK(filter != nullptr);
+        CHECK(ggml_vec_index_build_ivf(idx, 1, 0) == GGML_VEC_INDEX_OK);
+        CHECK(turbovec_ids_in_order(idx) == ids);
+        filter_still_valid(idx, filter);
+        CHECK(sync_is_incremental(idx, path));
+        ggml_vec_index_filter_free(filter);
+
+        // The first real build moves the rows; a second one on the same data
+        // starts from the same seeds, gives the same lists and moves nothing.
+        CHECK(ggml_vec_index_build_ivf(idx, n_lists, n_iter) == GGML_VEC_INDEX_OK);
+        const std::vector<uint64_t> grouped = turbovec_ids_in_order(idx);
+        CHECK(grouped != ids);
+        std::vector<float> first_scores;
+        std::vector<uint64_t> first_ids;
+        ivf_search(idx, first_scores, first_ids);
+        CHECK(ggml_vec_index_sync(idx, path.c_str()) == GGML_VEC_INDEX_OK);
+        filter = ggml_vec_index_filter_create(idx, ids.data(), k);
+        CHECK(filter != nullptr);
+
+        CHECK(ggml_vec_index_build_ivf(idx, n_lists, n_iter) == GGML_VEC_INDEX_OK);
+        CHECK(turbovec_ids_in_order(idx) == grouped);
+        std::vector<float> second_scores;
+        std::vector<uint64_t> second_ids;
+        ivf_search(idx, second_scores, second_ids);
+        CHECK(second_ids == first_ids);
+        CHECK(std::memcmp(second_scores.data(), first_scores.data(), first_scores.size() * sizeof(float)) == 0);
+        filter_still_valid(idx, filter);
+        CHECK(sync_is_incremental(idx, path));
+        ggml_vec_index_filter_free(filter);
+        ggml_vec_index_free(idx);
+    }
+}
+
 // Without memory for the moved copy the build keeps the rows where they are
 // and still returns a working IVF; a failure before the IVF exists leaves
 // the index as it was.
@@ -8704,6 +8779,7 @@ int main(int argc, char ** argv) {
                 }
             }
             check_turbovec_ivf_keeps_staged();
+            check_turbovec_ivf_rebuild_stable();
             check_turbovec_ivf_group_alloc_failure();
             check_turbovec_1x_vnni_fused_scan();
             check_turbovec_1x_vnni_fused_batch();
