@@ -5515,6 +5515,10 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                 !is_row_vector(w) || !is_row_vector(b)) {
             return false;
         }
+        // norm_f32 computes the dst row offset in int: fuse only what that offset can index
+        if (ggml_nelements(add) > INT32_MAX) {
+            return false;
+        }
 
         const auto overlaps_dst = [add](const ggml_tensor * t) {
             const char * dst_begin = (const char *) add->data;
@@ -5539,6 +5543,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // Returns the index of the ADD that can be fused into the cuBLAS F16 MUL_MAT at mm_idx, or -1.
 // The ADD is the next node, or the one after it when the bias is a view or a reshape made for
 // the ADD: that node computes nothing and is skipped with the ADD.
+// This does not go through ggml_cuda_can_fuse on purpose: that takes a run of consecutive ops, and
+// the node skipped here sits between the two that are fused. The same checks are made directly,
+// ggml_can_fuse_ext on the two node indices and ggml_cuda_check_fusion_memory_ranges on the span.
 static int ggml_cuda_find_mul_mat_cublas_bias(const ggml_cgraph * cgraph, const int mm_idx) {
     if (cgraph->nodes[mm_idx]->op != GGML_OP_MUL_MAT || mm_idx + 1 >= cgraph->n_nodes) {
         return -1;
