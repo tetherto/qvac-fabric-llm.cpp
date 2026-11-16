@@ -342,16 +342,20 @@ struct mul_mv_mma_q5_K_a {
     uint  dm;
 };
 
-template<short NT>
-inline void load_q5_K_mma_a(device const block_q5_K * const x[NT], int ip, short fn, thread mul_mv_mma_q5_K_a * a) {
+// the qh bits of a pair: q4_K has none, so its quants are the low 4 bits of the q5_K fragments
+inline uint2 mul_mv_mma_q5_K_qh(device const block_q5_K * xb, short fn) { return *((device const uint2 *) xb->qh + fn/2); }
+inline uint2 mul_mv_mma_q5_K_qh(device const block_q4_K * xb, short fn) { return uint2(0); }
+
+template<short NT, typename B>
+inline void load_q5_K_mma_a(device const B * const x[NT], int ip, short fn, thread mul_mv_mma_q5_K_a * a) {
     constexpr short pairs = QK_K/64;
 
     FOR_UNROLL (short t = 0; t < NT; ++t) {
-        device const block_q5_K * xb = x[t] + ip/pairs;
+        device const B * xb = x[t] + ip/pairs;
         device const uint * sp = (device const uint *) xb->scales;
 
         a[t].q     = *((device const uint2 *) (xb->qs + 32*(ip%pairs)) + fn/2);
-        a[t].h     = *((device const uint2 *) xb->qh + fn/2);
+        a[t].h     = mul_mv_mma_q5_K_qh(xb, fn);
         a[t].sc[0] = sp[0];
         a[t].sc[1] = sp[1];
         a[t].sc[2] = sp[2];
@@ -372,9 +376,9 @@ inline void load_q5_K_mma_b(device const float2 * const y[RT][2], int ip, thread
     }
 }
 
-// few-row mat-mat for q5_K over pairs of 32-weight sub-blocks, laid out like mul_mv_mma_q4_0: A lane (m, j) holds qs and qh bytes 4*j .. 4*j + 7 of a pair (j even).
+// few-row mat-mat for q5_K and q4_K over pairs of 32-weight sub-blocks, laid out like mul_mv_mma_q4_0: A lane (m, j) holds qs and qh bytes 4*j .. 4*j + 7 of a pair (j even).
 // the 1/16 of the in-place high nibbles and the sub-block scales go into the accumulation; the mins are removed with the src1 sums.
-template<short NT, short RT>
+template<short NT, short RT, typename B>
 kernel void kernel_mul_mv_mma_q5_K_f32(
         constant ggml_metal_kargs_mul_mv_ext & args,
         device const char * src0,
@@ -392,9 +396,9 @@ kernel void kernel_mul_mv_mma_q5_K_f32(
 
     const mul_mv_mma_tile tile = mul_mv_mma_tile_init<NT, RT>(args, tgpig, tiisg);
 
-    device const block_q5_K * x[NT];
+    device const B * x[NT];
     FOR_UNROLL (short t = 0; t < NT; ++t) {
-        x[t] = (device const block_q5_K *) mul_mv_mma_src0_row(tile, args, src0, t);
+        x[t] = (device const B *) mul_mv_mma_src0_row(tile, args, src0, t);
     }
 
     // B lane k = fm holds src1 values b, b + 1, b + 4, b + 5 of each sub-block, b = 8*(k/2) + 2*(k%2)
@@ -413,7 +417,7 @@ kernel void kernel_mul_mv_mma_q5_K_f32(
     float2 xn[RT][2][2][2];
 
     const int ip0 = min((int) sgitg, np - 1);
-    load_q5_K_mma_a<NT>(x, ip0, tile.fn, an);
+    load_q5_K_mma_a<NT, B>(x, ip0, tile.fn, an);
     load_q5_K_mma_b<RT>(y, ip0, xn);
 
     for (int ip = sgitg; ip < np; ip += NSG) {
@@ -434,7 +438,7 @@ kernel void kernel_mul_mv_mma_q5_K_f32(
         }
 
         const int ipn = min(ip + NSG, np - 1);
-        load_q5_K_mma_a<NT>(x, ipn, tile.fn, an);
+        load_q5_K_mma_a<NT, B>(x, ipn, tile.fn, an);
         load_q5_K_mma_b<RT>(y, ipn, xn);
 
         float c[RT][2][2];
@@ -494,12 +498,17 @@ kernel void kernel_mul_mv_mma_q5_K_f32(
     mul_mv_mma_store<NT, RT>(acc, args, src2, dst, shmem, tile, tiisg, sgitg);
 }
 
-template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<1, 1>;
-template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<2, 1>;
-template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<4, 1>;
-template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt1_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<1, 2>;
-template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<2, 2>;
-template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<4, 2>;
+template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<1, 1, block_q5_K>;
+template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<2, 1, block_q5_K>;
+template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<4, 1, block_q5_K>;
+template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt1_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<1, 2, block_q5_K>;
+template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<2, 2, block_q5_K>;
+template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<4, 2, block_q5_K>;
+
+// q4_K with two src1 tiles keeps the generic kernel: on an M3 Ultra this one is up to 16% slower there
+template [[host_name("kernel_mul_mv_mma_q4_K_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<1, 1, block_q4_K>;
+template [[host_name("kernel_mul_mv_mma_q4_K_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<2, 1, block_q4_K>;
+template [[host_name("kernel_mul_mv_mma_q4_K_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<4, 1, block_q4_K>;
 
 // a 64-weight q6_K group: the 16-weight sub-blocks at l .. l + 15 of the 4 planes of a 128-weight half. a lane holds
 // ql bytes l .. l + 3 of planes 0/2 (ql) and 1/3 (qm), the qh bytes l .. l + 3 and the 8 scales of the half
@@ -1057,7 +1066,12 @@ MUL_MV_MMA_GEN("f16",  half4x4,    1,     dequantize_f16)
 MUL_MV_MMA_GEN("q4_1", block_q4_1, 2,     dequantize_q4_1)
 MUL_MV_MMA_GEN("q5_0", block_q5_0, 2,     dequantize_q5_0)
 MUL_MV_MMA_GEN("q5_1", block_q5_1, 2,     dequantize_q5_1)
-MUL_MV_MMA_GEN("q4_K", block_q4_K, QK_NL, dequantize_q4_K)
+template [[host_name("kernel_mul_mv_mma_q4_K_gen_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 1, block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_mul_mv_mma_q4_K_gen_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 1, block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_mul_mv_mma_q4_K_gen_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 1, block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_mul_mv_mma_q4_K_f32_nt1_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 2, block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_mul_mv_mma_q4_K_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 2, block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_mul_mv_mma_q4_K_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 2, block_q4_K, QK_NL, dequantize_q4_K>;
 
 #if defined(GGML_METAL_HAS_BF16)
 MUL_MV_MMA_GEN("bf16",    bfloat4x4,     1,     dequantize_bf16)
