@@ -69,6 +69,9 @@ enum ggml_metal_mma_kind ggml_metal_mul_mv_mma_kind(enum ggml_type type, int rt)
     if (type == GGML_TYPE_Q4_0 || (type == GGML_TYPE_Q8_0 && rt == 1)) {
         return GGML_METAL_MMA_KIND_BLK;
     }
+    if (type == GGML_TYPE_Q4_K && rt == 1) {
+        return GGML_METAL_MMA_KIND_Q4_K;
+    }
     if (type == GGML_TYPE_IQ4_NL || (type == GGML_TYPE_IQ4_XS && rt == 2)) {
         return GGML_METAL_MMA_KIND_IQ4;
     }
