@@ -501,6 +501,156 @@ template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt1_rt2")]] kernel mul_mv_mma_t
 template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<2, 2>;
 template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<4, 2>;
 
+// a 64-weight q6_K group: the 16-weight sub-blocks at l .. l + 15 of the 4 planes of a 128-weight half. a lane holds
+// ql bytes l .. l + 3 of planes 0/2 (ql) and 1/3 (qm), the qh bytes l .. l + 3 and the 8 scales of the half
+struct mul_mv_mma_q6_K_a {
+    uint   ql;
+    uint   qm;
+    uint   qh;
+    ushort sc[4];
+    half   d;
+};
+
+template<short NT>
+inline void load_q6_K_mma_a(device const block_q6_K * const x[NT], int ig, short fn, thread mul_mv_mma_q6_K_a * a) {
+    const short n = (ig/2) % 2;
+    const short l = 16*(ig % 2) + 2*fn;
+
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        device const block_q6_K * xb = x[t] + ig/4;
+
+        // blocks are only 2-byte aligned
+        device const ushort * ql = (device const ushort *) (xb->ql + 64*n + l);
+        device const ushort * qm = (device const ushort *) (xb->ql + 64*n + 32 + l);
+        device const ushort * qh = (device const ushort *) (xb->qh + 32*n + l);
+        device const ushort * sc = (device const ushort *) (xb->scales + 8*n);
+
+        a[t].ql = ql[0] | (uint) ql[1] << 16;
+        a[t].qm = qm[0] | (uint) qm[1] << 16;
+        a[t].qh = qh[0] | (uint) qh[1] << 16;
+        FOR_UNROLL (short p = 0; p < 4; ++p) {
+            a[t].sc[p] = sc[p];
+        }
+        a[t].d = xb->d;
+    }
+}
+
+// xs[rt][e][p]: src1 values 2*fm, 2*fm + 1 of the group in plane p, for the steps h = 0 and 1
+template<short RT>
+inline void load_q6_K_mma_b(device const float2 * const y[RT][2], int ig, thread float2 (*xs)[2][4]) {
+    const int off = (ig/4)*(QK_K/2) + ((ig/2) % 2)*(QK_K/4) + (ig % 2)*8;
+
+    FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+        FOR_UNROLL (short e = 0; e < 2; ++e) {
+            FOR_UNROLL (short p = 0; p < 4; ++p) {
+                xs[rt][e][p] = y[rt][e][off + 16*p];
+            }
+        }
+    }
+}
+
+// the A fragment of plane p at step h (bytes h and 2 + h of the words): the exact q - 32 for planes 0 and 1, and
+// 16*(q - 32) for planes 2 and 3, whose high nibbles stay in place
+inline half2 mul_mv_mma_q6_K_frag(thread const mul_mv_mma_q6_K_a & a, short p, short h) {
+    const uint ql = (p % 2 == 0 ? a.ql : a.qm) >> 8*h;
+    const uint qh = (a.qh >> 8*h) << (p % 2 == 0 ? 4 : 2);
+    const uint q  = p < 2 ? (ql & 0x000F000F) | (qh & 0x00300030) : (ql & 0x00F000F0) | (qh & 0x03000300);
+
+    constexpr half lo_zero = 32.0h;
+    constexpr half hi_zero = 16*lo_zero;
+
+    return mul_mv_mma_1024_plus(as_type<ushort2>(q)) - (mma_f16_1024 + (p < 2 ? lo_zero : hi_zero));
+}
+
+// few-row mat-mat for q6_K over 64-weight groups: each 16-weight sub-block runs its two MMA steps alone and its scale
+// (1/16 for planes 2 and 3) goes into the accumulation
+template<short NT, short RT>
+kernel void kernel_mul_mv_mma_q6_K_f32(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * src2,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_mma_nsg;
+
+    constexpr float hi_scale = 1.0f/16;
+
+    const mul_mv_mma_tile tile = mul_mv_mma_tile_init<NT, RT>(args, tgpig, tiisg);
+
+    device const block_q6_K * x[NT];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        x[t] = (device const block_q6_K *) mul_mv_mma_src0_row(tile, args, src0, t);
+    }
+
+    // B lane k = fm holds src1 values 2*k, 2*k + 1 of each sub-block
+    device const float2 * y[RT][2];
+    FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+        FOR_UNROLL (short e = 0; e < 2; ++e) {
+            y[rt][e] = (device const float2 *) mul_mv_mma_src1_row(tile, args, src1, rt, e) + tile.fm;
+        }
+    }
+
+    float acc[RT][NT][2] = {};
+
+    const int ng = FC_mul_mv_mma_ne00/64;
+
+    for (int ig = sgitg; ig < ng; ig += NSG) {
+        const short g = ig % 2;
+
+        mul_mv_mma_q6_K_a ac[NT];
+        float2 xs[RT][2][4];
+        load_q6_K_mma_a<NT>(x, ig, tile.fn, ac);
+        load_q6_K_mma_b<RT>(y, ig, xs);
+
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            const float d = ac[t].d;
+
+            FOR_UNROLL (short p = 0; p < 4; ++p) {
+                const float dsc = d*(char) (ac[t].sc[p] >> 8*g)*(p < 2 ? 1.0f : hi_scale);
+
+                simdgroup_float8x8 mp[RT];
+                FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+                    mp[rt] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                }
+
+                FOR_UNROLL (short h = 0; h < 2; ++h) {
+                    const half2 a = mul_mv_mma_q6_K_frag(ac[t], p, h);
+
+                    simdgroup_half8x8 ma;
+                    ma.thread_elements()[0] = a.x;
+                    ma.thread_elements()[1] = a.y;
+
+                    FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+                        simdgroup_float8x8 mb;
+                        mb.thread_elements()[0] = h == 0 ? xs[rt][0][p].x : xs[rt][0][p].y;
+                        mb.thread_elements()[1] = h == 0 ? xs[rt][1][p].x : xs[rt][1][p].y;
+
+                        simdgroup_multiply_accumulate(mp[rt], ma, mb, mp[rt]);
+                    }
+                }
+
+                FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+                    acc[rt][t][0] = fma(dsc, mp[rt].thread_elements()[0], acc[rt][t][0]);
+                    acc[rt][t][1] = fma(dsc, mp[rt].thread_elements()[1], acc[rt][t][1]);
+                }
+            }
+        }
+    }
+
+    mul_mv_mma_store<NT, RT>(acc, args, src2, dst, shmem, tile, tiisg, sgitg);
+}
+
+template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q6_K_f32<1, 1>;
+template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q6_K_f32<2, 1>;
+template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q6_K_f32<4, 1>;
+template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt1_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q6_K_f32<1, 2>;
+template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q6_K_f32<2, 2>;
+template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q6_K_f32<4, 2>;
+
 // pq2_0 runs over 64-weight halves h of a block. A lane (m, j) holds qs bytes 16*h + 2*j .. 16*h + 2*j + 3 (j even) as a ushort2,
 // and MMA step s takes field s%4 of the low (s < 4) or high byte of each ushort: the exact half q - 1.
 inline half2 mul_mv_mma_pq2_0_frag(ushort2 q, short s) {
@@ -656,51 +806,6 @@ template [[host_name("kernel_mul_mv_mma_pq2_0_f32_nt1_rt2")]] kernel mul_mv_mma_
 template [[host_name("kernel_mul_mv_mma_pq2_0_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_pq2_0_f32<2, 2>;
 template [[host_name("kernel_mul_mv_mma_pq2_0_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_pq2_0_f32<4, 2>;
 
-// dequantize_q6_K (dequantize.h) with its 16-bit quant loads issued as packed_ushort4 loads (2-byte aligned, the same
-// bytes); keep the math after the loads in sync with it
-inline void dequantize_q6_K_mv_mma(device const block_q6_K * xb, short il, thread float4x4 & reg) {
-    const half d_all = xb->d;
-    device const uint16_t * ql = (device const uint16_t *)xb->ql;
-    device const uint16_t * qh = (device const uint16_t *)xb->qh;
-    device const int8_t * scales = (device const int8_t *)xb->scales;
-
-    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
-    qh = qh + 16*(il/8) + 8*(il&1);
-    float sc = scales[(il%2) + 2 * ((il/2))];
-    il = (il/2) & 3;
-
-    uint32_t wl[4];
-    uint32_t wh[4];
-    FOR_UNROLL (short j = 0; j < 2; ++j) {
-        const ushort4 l = ((device const packed_ushort4 *) ql)[j];
-        const ushort4 h = ((device const packed_ushort4 *) qh)[j];
-        wl[2*j + 0] = l[0] | (uint32_t)(l[1] << 16);
-        wl[2*j + 1] = l[2] | (uint32_t)(l[3] << 16);
-        wh[2*j + 0] = h[0] | (uint32_t)(h[1] << 16);
-        wh[2*j + 1] = h[2] | (uint32_t)(h[3] << 16);
-    }
-
-    const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0 : 0x30303030) : (il>0 ? 0x0C0C0C0C : 0x03030303);
-    const uint32_t kmask2 = il>1 ? 0xF0F0F0F0                       : 0x0F0F0F0F;
-    const float ml = d_all * sc * 32.f;
-    const float dl0 = d_all * sc;
-    const float dl1 = dl0 / 256.f;
-    const float dl2 = dl0 / (256.f * 256.f);
-    const float dl3 = dl0 / (256.f * 256.f * 256.f);
-    const uint8_t shr_h = il>2 ? 2 : 0;
-    const uint8_t shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
-    const uint8_t shr_l = il>1 ? 4 : 0;
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t  low = wl[i] & kmask2;
-        const uint32_t high = wh[i] & kmask1;
-        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
-        reg[i][0] = dl0 *  ((half)(q & 0xFF))       - ml;
-        reg[i][1] = dl1 * ((float)(q & 0xFF00))     - ml;
-        reg[i][2] = dl2 * ((float)(q & 0xFF0000))   - ml;
-        reg[i][3] = dl3 * ((float)(q & 0xFF000000)) - ml;
-    }
-}
-
 // few-row mat-mat for any type with a 16-weight dequantizer: a lane dequantizes 16 consecutive weights of a 64-weight chunk once for all src1 rows.
 // MMA step s at MMA-k index j reads chunk weight 16*(j/2) + 8*(j%2) + s.
 template<short NT, short RT, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
@@ -791,14 +896,6 @@ template [[host_name("kernel_mul_mv_mma_" tname "_f32_nt4_rt1")]] kernel mul_mv_
 template [[host_name("kernel_mul_mv_mma_" tname "_f32_nt1_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 2, bq, nl, deq>; \
 template [[host_name("kernel_mul_mv_mma_" tname "_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 2, bq, nl, deq>; \
 template [[host_name("kernel_mul_mv_mma_" tname "_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 2, bq, nl, deq>;
-
-// q6_K: the packed loads are faster with 9..16 src1 rows (rt2); the rt1 kernels keep dequantize_q6_K
-template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 1, block_q6_K, QK_NL, dequantize_q6_K>;
-template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 1, block_q6_K, QK_NL, dequantize_q6_K>;
-template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 1, block_q6_K, QK_NL, dequantize_q6_K>;
-template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt1_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 2, block_q6_K, QK_NL, dequantize_q6_K_mv_mma>;
-template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 2, block_q6_K, QK_NL, dequantize_q6_K_mv_mma>;
-template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 2, block_q6_K, QK_NL, dequantize_q6_K_mv_mma>;
 
 // q8_0 with 9..16 src1 rows: the per-block scaling above is slower than dequantizing to f32
 template [[host_name("kernel_mul_mv_mma_q8_0_f32_nt1_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 2, block_q8_0, 2, dequantize_q8_0>;
