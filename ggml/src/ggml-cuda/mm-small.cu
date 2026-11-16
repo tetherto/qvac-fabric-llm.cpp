@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-#define MM_SMALL_BLOCK_SIZE 128
+#define CUDA_MM_SMALL_BLOCK_SIZE 128
 
 // dst[m, n, b] = sum over k of src0[k, m, b] * src1[k, n, b], all three contiguous.
 //
@@ -126,21 +126,23 @@ bool ggml_cuda_should_use_mm_small(const ggml_tensor * src0, const ggml_tensor *
     if (src0->ne[2] != src1->ne[2] || src0->ne[3] != src1->ne[3]) {
         return false;
     }
-    if (src1->ne[2]*src1->ne[3] < MM_SMALL_MIN_BATCH) {
-        return false;
-    }
     const int64_t ne00 = src0->ne[0];
-    if (ne00 > MM_SMALL_MAX_K || src1->ne[1] > MM_SMALL_MAX_COLS || src0->ne[1] > INT32_MAX/MM_SMALL_MAX_K) {
+    if (ne00 > CUDA_MM_SMALL_MAX_K || src1->ne[1] > CUDA_MM_SMALL_MAX_COLS || src0->ne[1] > INT32_MAX/CUDA_MM_SMALL_MAX_K) {
         return false;
     }
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
         return false;
     }
+    const int64_t n_mats = src1->ne[2]*src1->ne[3];
     if (ne00 < 4) {
-        return true;
+        // k_mul_mat_small_scalar: one thread per src0 row
+        return src0->ne[1]*n_mats >= CUDA_MM_SMALL_MIN_THREADS;
     }
     // the 16-byte loads need whole float4 rows
-    return ne00 % 4 == 0 && mm_small_is_aligned(src0->data) && mm_small_is_aligned(src1->data);
+    if (ne00 % 4 != 0 || !mm_small_is_aligned(src0->data) || !mm_small_is_aligned(src1->data)) {
+        return false;
+    }
+    return src0->ne[1]/mm_small_rows_per_thread(src0, dst)*n_mats >= CUDA_MM_SMALL_MIN_THREADS;
 }
 
 template <int R>
@@ -148,10 +150,10 @@ static void mm_small_launch(
         const float * src0_d, const float * src1_d, float * dst_d,
         const int ne00, const int ne01, const int ne11, const int64_t n_mats, cudaStream_t stream) {
     const int64_t n_groups = (ne01 / R)*n_mats;
-    const int64_t n_blocks = (n_groups + MM_SMALL_BLOCK_SIZE - 1) / MM_SMALL_BLOCK_SIZE;
+    const int64_t n_blocks = (n_groups + CUDA_MM_SMALL_BLOCK_SIZE - 1) / CUDA_MM_SMALL_BLOCK_SIZE;
     GGML_ASSERT(n_blocks <= INT32_MAX);
     const dim3 grid((unsigned int) n_blocks);
-    const dim3 block(MM_SMALL_BLOCK_SIZE);
+    const dim3 block(CUDA_MM_SMALL_BLOCK_SIZE);
     switch (ne00) {
         case  4: k_mul_mat_small< 4, R><<<grid, block, 0, stream>>>(src0_d, src1_d, dst_d, ne01, ne11, n_groups); break;
         case  8: k_mul_mat_small< 8, R><<<grid, block, 0, stream>>>(src0_d, src1_d, dst_d, ne01, ne11, n_groups); break;
@@ -180,10 +182,10 @@ void ggml_cuda_mul_mat_small(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (ne00 < 4) {
         const int64_t n_rows   = ne01*n_mats;
-        const int64_t n_blocks = (n_rows + MM_SMALL_BLOCK_SIZE - 1) / MM_SMALL_BLOCK_SIZE;
+        const int64_t n_blocks = (n_rows + CUDA_MM_SMALL_BLOCK_SIZE - 1) / CUDA_MM_SMALL_BLOCK_SIZE;
         GGML_ASSERT(n_blocks <= INT32_MAX);
         const dim3 grid((unsigned int) n_blocks);
-        const dim3 block(MM_SMALL_BLOCK_SIZE);
+        const dim3 block(CUDA_MM_SMALL_BLOCK_SIZE);
         k_mul_mat_small_scalar<<<grid, block, 0, stream>>>(src0_d, src1_d, dst_d, ne00, ne01, ne11, n_rows);
         return;
     }
