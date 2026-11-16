@@ -142,15 +142,29 @@ static __global__ void soft_max_f32(
     }
 }
 
-// rows of at most this many values take soft_max_f32_short_rows when there are enough of them
-#define CUDA_SOFT_MAX_SHORT_ROW 32
+// GGML_CUDA_DISABLE_SHORT_ROW_SOFTMAX=1 keeps every softmax on the block-per-row kernels, to A/B soft_max_f32_short_rows
+static bool ggml_cuda_short_row_softmax_disabled() {
+    static const bool disabled = [] {
+        const char * env = getenv("GGML_CUDA_DISABLE_SHORT_ROW_SOFTMAX");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return disabled;
+}
+
+// rows of at most this many values take soft_max_f32_short_rows when there are enough of them.
+// Measured on a T4 against the block-per-row kernels at 4096 to 357120 rows: 1.5x to 59x faster up to 16 values,
+// even at 20, and slower from 24 values with a mask, 1.3x there and 4x at 32 (one thread reads a whole row).
+// soft_max_f32_cuda has one instantiation per power of 2 up to this value: change both together.
+#define CUDA_SOFT_MAX_SHORT_ROW 16
 // fewest rows for that kernel: below this the call is too small to matter and the block-per-row kernels are kept
 #define CUDA_SOFT_MAX_SHORT_ROW_MIN_ROWS 4096
 #define CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE 128
 
 // One thread per row. The other kernels use one block per row, which for hundreds of thousands of rows of a few
 // values (attention inside small windows) is mostly launch and reduction overhead. No sinks, no ALiBi bias.
-template <typename T>
+// max_cols is a power of 2 at or above the row length: with the loops unrolled to it, vals is indexed by constants
+// and stays in registers instead of local memory.
+template <typename T, int max_cols>
 static __global__ void soft_max_f32_short_rows(
         const float * __restrict__ x, const T * __restrict__ mask, float * __restrict__ dst, const soft_max_params p) {
     const int64_t row = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
@@ -168,24 +182,33 @@ static __global__ void soft_max_f32_short_rows(
         mask += (i01*p.nb11 + (i02 % p.ne12)*p.nb12 + (i03 % p.ne13)*p.nb13) / sizeof(T);
     }
 
-    float vals[CUDA_SOFT_MAX_SHORT_ROW];
+    float vals[max_cols];
     float max_val = -INFINITY;
-    for (int col = 0; col < ncols; ++col) {
-        const float val = x[col]*p.scale + (mask ? t2f32(mask[col]) : 0.0f);
-        vals[col] = val;
-        max_val   = max(max_val, val);
+#pragma unroll
+    for (int col = 0; col < max_cols; ++col) {
+        if (col < ncols) {
+            const float val = x[col]*p.scale + (mask ? t2f32(mask[col]) : 0.0f);
+            vals[col] = val;
+            max_val   = max(max_val, val);
+        }
     }
 
     float sum = 0.0f;
-    for (int col = 0; col < ncols; ++col) {
-        const float val = expf(vals[col] - max_val);
-        vals[col] = val;
-        sum += val;
+#pragma unroll
+    for (int col = 0; col < max_cols; ++col) {
+        if (col < ncols) {
+            const float val = expf(vals[col] - max_val);
+            vals[col] = val;
+            sum += val;
+        }
     }
 
     const float inv_sum = 1.0f / sum;
-    for (int col = 0; col < ncols; ++col) {
-        dst[col] = vals[col] * inv_sum;
+#pragma unroll
+    for (int col = 0; col < max_cols; ++col) {
+        if (col < ncols) {
+            dst[col] = vals[col] * inv_sum;
+        }
     }
 }
 
@@ -383,10 +406,19 @@ static void soft_max_f32_cuda(const float *                                x,
     const int64_t ncols_x = params.ncols;
 
     if (ncols_x <= CUDA_SOFT_MAX_SHORT_ROW && params.nrows_x >= CUDA_SOFT_MAX_SHORT_ROW_MIN_ROWS &&
-            sinks == nullptr && params.max_bias == 0.0f) {
+            sinks == nullptr && params.max_bias == 0.0f && !ggml_cuda_short_row_softmax_disabled()) {
         const int64_t n_blocks = (params.nrows_x + CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE - 1) / CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE;
         GGML_ASSERT(n_blocks <= INT32_MAX);
-        soft_max_f32_short_rows<T><<<(unsigned int) n_blocks, CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE, 0, stream>>>(x, mask, dst, params);
+        const dim3 grid((unsigned int) n_blocks);
+        const dim3 block(CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE);
+        // one case per power of 2 up to CUDA_SOFT_MAX_SHORT_ROW: change both together
+        if (ncols_x <= 4) {
+            soft_max_f32_short_rows<T,  4><<<grid, block, 0, stream>>>(x, mask, dst, params);
+        } else if (ncols_x <= 8) {
+            soft_max_f32_short_rows<T,  8><<<grid, block, 0, stream>>>(x, mask, dst, params);
+        } else {
+            soft_max_f32_short_rows<T, 16><<<grid, block, 0, stream>>>(x, mask, dst, params);
+        }
         return;
     }
 
