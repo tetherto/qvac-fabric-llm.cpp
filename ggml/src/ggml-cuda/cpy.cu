@@ -41,6 +41,15 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
+// GGML_CUDA_DISABLE_SAME_SHAPE_CPY=1 keeps every strided copy on cpy_scalar, to A/B cpy_scalar_same_shape
+static bool ggml_cuda_same_shape_cpy_disabled() {
+    static const bool disabled = [] {
+        const char * env = getenv("GGML_CUDA_DISABLE_SAME_SHAPE_CPY");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return disabled;
+}
+
 // cpy_scalar for src and dst of the same shape and fewer than 2^32 elements: the flat index is split once for both
 // sides and with 32-bit divisions. The 64-bit divisions of cpy_scalar cost more than the copy itself.
 template <cpy_kernel_t cpy_1>
@@ -241,7 +250,7 @@ static void ggml_cpy_scalar_cuda(
         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         GGML_ASSERT(num_blocks <= INT_MAX);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
-        if (ne00 == ne10 && ne01 == ne11 && ne02 == ne12 && ne <= UINT32_MAX) {
+        if (ne00 == ne10 && ne01 == ne11 && ne02 == ne12 && ne <= UINT32_MAX && !ggml_cuda_same_shape_cpy_disabled()) {
             ggml_cuda_kernel_launch(cpy_scalar_same_shape<cpy_1_scalar<src_t, dst_t>>, launch_params,
                 cx, cdst, ne, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne02, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13);
             return;
