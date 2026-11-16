@@ -16,6 +16,13 @@
 // one shape was 1.6x slower.
 #define CUDA_MM_SMALL_MIN_THREADS 1024
 
+// GPUs where mm-small was measured faster than MMVF / cuBLAS at the shapes above: a T4 (Turing) and a Radeon 8060S
+// (RDNA 3.5, gfx1151). On an RTX 5090 (Blackwell) cuBLAS was 1.5x to 6x faster for K 16 and 32 with 8 or more columns,
+// so Ampere and newer NVIDIA GPUs keep cuBLAS. Other targets are untested and keep the existing paths.
+static inline bool ggml_cuda_mm_small_supported_cc(const int cc) {
+    return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_AMPERE) || GGML_CUDA_CC_IS_RDNA(cc);
+}
+
 bool ggml_cuda_should_use_mm_small(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 
 void ggml_cuda_mul_mat_small(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

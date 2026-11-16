@@ -3316,7 +3316,8 @@ static void ggml_cuda_mul_mat_canonical(
     GGML_TENSOR_BINARY_OP_LOCALS
 
     // Many small F32 products (windowed attention): ahead of MMVF and cuBLAS, which are both slow on them.
-    if (!ggml_cuda_mm_small_disabled() && ggml_cuda_should_use_mm_small(src0, src1, dst)) {
+    if (!ggml_cuda_mm_small_disabled() && ggml_cuda_mm_small_supported_cc(ggml_cuda_info().devices[ctx.device].cc) &&
+        ggml_cuda_should_use_mm_small(src0, src1, dst)) {
         ggml_cuda_mul_mat_small(ctx, src0, src1, dst);
         return;
     }

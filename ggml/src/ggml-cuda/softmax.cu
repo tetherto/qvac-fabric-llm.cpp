@@ -156,6 +156,9 @@ static bool ggml_cuda_short_row_softmax_disabled() {
 // even at 20, and slower from 24 values with a mask, 1.3x there and 4x at 32 (one thread reads a whole row).
 // soft_max_f32_cuda has one instantiation per power of 2 up to this value: change both together.
 #define CUDA_SOFT_MAX_SHORT_ROW 16
+// limit on AMD: on a Radeon 8060S (RDNA 3.5) the kernel was 1.9x to 25x faster up to 8 values and up to 2.7x slower
+// at 12 and 16. An RTX 5090 matched the T4 numbers above.
+#define CUDA_SOFT_MAX_SHORT_ROW_AMD        8
 // fewest rows for that kernel: below this the call is too small to matter and the block-per-row kernels are kept
 #define CUDA_SOFT_MAX_SHORT_ROW_MIN_ROWS 4096
 #define CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE 128
@@ -468,8 +471,10 @@ static void soft_max_f32_cuda(const float *                                x,
     int nth = WARP_SIZE;
     const int64_t ncols_x = params.ncols;
 
-    if (ncols_x <= CUDA_SOFT_MAX_SHORT_ROW && params.nrows_x >= CUDA_SOFT_MAX_SHORT_ROW_MIN_ROWS &&
-            sinks == nullptr && params.max_bias == 0.0f && !ggml_cuda_short_row_softmax_disabled()) {
+    const int cc              = ggml_cuda_info().devices[ctx.device].cc;
+    const int short_row_limit = GGML_CUDA_CC_IS_AMD(cc) ? CUDA_SOFT_MAX_SHORT_ROW_AMD : CUDA_SOFT_MAX_SHORT_ROW;
+    if (ncols_x <= short_row_limit && params.nrows_x >= CUDA_SOFT_MAX_SHORT_ROW_MIN_ROWS && sinks == nullptr &&
+        params.max_bias == 0.0f && !ggml_cuda_short_row_softmax_disabled()) {
         const int64_t n_blocks = (params.nrows_x + CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE - 1) / CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE;
         GGML_ASSERT(n_blocks <= INT32_MAX);
         const dim3 grid((unsigned int) n_blocks);
