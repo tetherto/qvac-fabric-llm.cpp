@@ -1366,9 +1366,19 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
             }
         }
 
+        // Seeds are picked in id order, not slot order: a TurboVec build moves
+        // the rows, and a rebuild of unchanged data must start from the same
+        // seeds to give the same lists.
+        std::vector<uint64_t> active_ids;
+        active_ids.reserve(active_slots.size());
+        for (size_t slot : active_slots) {
+            active_ids.push_back(idx->slot_to_id[slot]);
+        }
+        std::sort(active_ids.begin(), active_ids.end());
         for (int list = 0; list < actual_lists; ++list) {
-            const size_t slot = active_slots[static_cast<size_t>(list) * active_slots.size() /
+            const uint64_t id = active_ids[static_cast<size_t>(list) * active_ids.size() /
                 static_cast<size_t>(actual_lists)];
+            const size_t slot = idx->id_to_slot.at(id);
             float * centroid = centroids.data() + static_cast<size_t>(list) * dim_sz;
             decode_slot_to_f32(*idx, slot, centroid);
         }
