@@ -4461,6 +4461,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB"));
     add_opt(common_arg(
+        {"--spec-draft-n-auto"},
+        {"--no-spec-draft-n-auto"},
+        string_format("pick the draft length (up to --spec-draft-n-max) per step from measured step times and acceptance, "
+                      "so that slots draft less when many generate at once (default: %s)",
+                      params.speculative.draft.n_auto ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.n_auto = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_AUTO"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",

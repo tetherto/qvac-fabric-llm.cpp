@@ -1372,6 +1372,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        // n_auto: shrink the noise blocks to the longest draft of the step (the dflash2 graph needs equal blocks)
+        int32_t n_draft = params.n_max;
+        if (params.n_auto) {
+            n_draft = 0;
+            for (const auto & dp : dparams) {
+                if (dp.drafting) {
+                    n_draft = std::max(n_draft, dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max);
+                }
+            }
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1382,7 +1393,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
             const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
@@ -1921,7 +1931,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                // n_auto: stop at the step's draft length
+                if (params.n_max <= (int) result.size() || (params.n_auto && dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
