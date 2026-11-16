@@ -7592,6 +7592,93 @@ void check_turbovec_ivf_rebuild_stable() {
     }
 }
 
+// Staged search fits its statistics from the first 64 blocks. After the
+// move those hold one IVF list, so the build fits them first, from the mixed
+// rows, and staged search keeps returning what it returned before the build.
+void check_turbovec_ivf_keeps_staged_results() {
+    constexpr int dim = 64;
+    // Rows from many clusters interleaved, so the head of the index is a mix
+    // before the build and one cluster after it.
+    constexpr int n_clusters = 32;
+    // Well past the 64 blocks of 32 rows the statistics are fitted from,
+    // and past the 1024 blocks from which staged search seeds its shortlist.
+    constexpr int n = 40000;
+    constexpr int nq = 100;
+    constexpr int k = 10;
+    constexpr int n_iter = 2;
+    // Tight clusters: the codes of one cluster are close, so statistics
+    // fitted from one cluster differ from the mixed ones. With noise of 0.2
+    // or more the two fits agree and the test would not see the bug.
+    constexpr float noise_scale = 0.05f;
+    constexpr uint32_t seed = 7;
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    std::vector<float> centers(static_cast<size_t>(n_clusters) * dim);
+    for (float & v : centers) {
+        v = gauss(rng);
+    }
+    std::vector<float> rows(static_cast<size_t>(n) * dim);
+    for (int i = 0; i < n; ++i) {
+        const float * c = centers.data() + static_cast<size_t>(i % n_clusters) * dim;
+        for (int d = 0; d < dim; ++d) {
+            rows[static_cast<size_t>(i) * dim + d] = c[d] + noise_scale * gauss(rng);
+        }
+    }
+    // Queries hit the clusters in a scrambled order; 7 is coprime with
+    // n_clusters, so every cluster is hit.
+    constexpr int query_step = 7;
+    std::vector<float> queries(static_cast<size_t>(nq) * dim);
+    for (int q = 0; q < nq; ++q) {
+        const float * c = centers.data() + static_cast<size_t>((q * query_step) % n_clusters) * dim;
+        for (int d = 0; d < dim; ++d) {
+            queries[static_cast<size_t>(q) * dim + d] = c[d] + noise_scale * gauss(rng);
+        }
+    }
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    turbovec_force_vector_major_for_test(0);
+    // Planes from the first vector.
+    turbovec_force_planes_for_test(1, 1);
+
+    // Scores in rank order and the ids of each query sorted, so rows with
+    // equal scores may swap places (a 1.x index orders ties by row).
+    auto staged_results = [&](ggml_vec_index_t * idx) {
+        std::vector<float> scores(static_cast<size_t>(nq) * k);
+        std::vector<uint64_t> out(scores.size());
+        CHECK(ggml_vec_index_search(idx, queries.data(), nq, k, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
+        for (int q = 0; q < nq; ++q) {
+            std::sort(out.begin() + q * k, out.begin() + (q + 1) * k);
+        }
+        return std::make_pair(scores, out);
+    };
+    for (const int bits : { 2, 4 }) {
+        auto * reference = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(reference != nullptr);
+        CHECK(ggml_vec_index_add(reference, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+        const auto expected = staged_results(reference);
+        ggml_vec_index_free(reference);
+
+        // With a search before the build, and without one, so the
+        // statistics are either kept or fitted by the build.
+        for (const bool searched_first : { true, false }) {
+            auto * idx = ggml_vec_index_create_turbovec(dim, bits);
+            CHECK(idx != nullptr);
+            CHECK(ggml_vec_index_add(idx, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+            if (searched_first) {
+                CHECK(staged_results(idx) == expected);
+            }
+            const std::vector<uint64_t> before = turbovec_ids_in_order(idx);
+            CHECK(ggml_vec_index_build_ivf(idx, n_clusters, n_iter) == GGML_VEC_INDEX_OK);
+            CHECK(turbovec_ids_in_order(idx) != before);
+            const auto got = staged_results(idx);
+            CHECK(got.first == expected.first);
+            CHECK(got.second == expected.second);
+            ggml_vec_index_free(idx);
+        }
+    }
+    turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_vector_major_for_test(-1);
+}
+
 // Without memory for the moved copy the build keeps the rows where they are
 // and still returns a working IVF; a failure before the IVF exists leaves
 // the index as it was.
@@ -8780,6 +8867,7 @@ int main(int argc, char ** argv) {
                 }
             }
             check_turbovec_ivf_keeps_staged();
+            check_turbovec_ivf_keeps_staged_results();
             check_turbovec_ivf_rebuild_stable();
             check_turbovec_ivf_group_alloc_failure();
             check_turbovec_1x_vnni_fused_scan();

@@ -891,9 +891,13 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot) {
 
 void turbovec_planes_restart(ggml_vec_index & idx) {
     const bool planes = idx.turbovec_planes;
+    const bool stats_ready = idx.turbovec_stats_ready;
+    const TurboVecPlanesStats stats = idx.turbovec_stats;
     turbovec_planes_reset(idx);
     std::lock_guard<std::mutex> lock(idx.turbovec_planes_mutex);
     idx.turbovec_planes = planes;
+    idx.turbovec_stats = stats;
+    idx.turbovec_stats_ready = planes && stats_ready;
 }
 
 void turbovec_planes_reset(ggml_vec_index & idx) {
@@ -1182,6 +1186,14 @@ void keep_best(std::vector<Candidate> & cands, size_t keep, std::vector<float> *
 }
 
 }  // namespace
+
+void turbovec_planes_fit_stats(ggml_vec_index & idx) {
+    std::lock_guard<std::mutex> lock(idx.turbovec_planes_mutex);
+    if (idx.turbovec_planes && !idx.turbovec_stats_ready) {
+        idx.turbovec_stats = compute_stats(idx);
+        idx.turbovec_stats_ready = true;
+    }
+}
 
 namespace {
 
