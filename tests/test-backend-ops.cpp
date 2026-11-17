@@ -18010,6 +18010,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                  GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
             test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
         }
+        // before Apple10, q4_K at 3..8 rows runs the q5_K kernel from 2048 src0 rows: 2 tiles there, 4 at 4096 rows
+        for (int64_t m : {2048, 4096}) {
+            test_cases.emplace_back(new test_mul_mat_pos(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, n, 1024, {1, 1}, {1, 1}));
+        }
     }
 
     // the column counts the list above skips, for every type of the shared integer-dot mat-vec shader
