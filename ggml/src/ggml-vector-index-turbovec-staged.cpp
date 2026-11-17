@@ -997,50 +997,60 @@ constexpr uint64_t kByteValid = 0xff;
 // so the level counts come from the planes directly: the (bit 1, bit 0) and,
 // for 4 bits, (bit 3, bit 2) masks of a word are ANDed pairwise and counted,
 // 64 codes at a time.
-void count_levels_serial(
-        const uint8_t * data, int bits, size_t nsg, size_t first, size_t last, uint64_t * level) {
-    // Staged search runs only at 2 and 4 bits (turbovec_planes_for); the
-    // masks below cover exactly those, so any other width counts nothing
-    // rather than reading past the row.
-    assert(bits == 2 || bits == 4);
-    if (bits != 2 && bits != 4) {
-        return;
-    }
-    const size_t row_bytes = static_cast<size_t>(bits) * nsg;
+template <int kBits>
+void count_levels_rows(const uint8_t * data, size_t nsg, size_t first, size_t last, uint64_t * level) {
+    const size_t row_bytes = static_cast<size_t>(kBits) * nsg;
     const size_t n_words = nsg / sizeof(uint64_t);
+    // Local counters, so the compiler keeps them in registers.
+    uint64_t local[size_t{ 1 } << kBits] = {};
     auto count_word = [&](const uint64_t * p, uint64_t valid) {
         const uint64_t lo[4] = { ~p[1] & ~p[0] & valid, ~p[1] & p[0], p[1] & ~p[0], p[1] & p[0] };
-        if (bits == 2) {
+        if constexpr (kBits == 2) {
             for (size_t l = 0; l < 4; ++l) {
-                level[l] += static_cast<uint64_t>(popcount64(lo[l]));
+                local[l] += static_cast<uint64_t>(popcount64(lo[l]));
             }
-            return;
-        }
-        const uint64_t hi[4] = { ~p[3] & ~p[2], ~p[3] & p[2], p[3] & ~p[2], p[3] & p[2] };
-        for (size_t h = 0; h < 4; ++h) {
-            for (size_t l = 0; l < 4; ++l) {
-                level[h * 4 + l] += static_cast<uint64_t>(popcount64(hi[h] & lo[l]));
+        } else {
+            const uint64_t hi[4] = { ~p[3] & ~p[2], ~p[3] & p[2], p[3] & ~p[2], p[3] & p[2] };
+            for (size_t h = 0; h < 4; ++h) {
+                for (size_t l = 0; l < 4; ++l) {
+                    local[h * 4 + l] += static_cast<uint64_t>(popcount64(hi[h] & lo[l]));
+                }
             }
         }
     };
-    const size_t n_planes = static_cast<size_t>(bits);
     for (size_t v = first; v < last; ++v) {
         const uint8_t * row = data + v * row_bytes;
-        uint64_t p[4] = {};
+        uint64_t p[kBits];
         for (size_t w = 0; w < n_words; ++w) {
-            for (size_t plane = 0; plane < n_planes; ++plane) {
-                std::memcpy(&p[plane], row + plane * nsg + w * sizeof(uint64_t), sizeof(uint64_t));
+            for (int plane = 0; plane < kBits; ++plane) {
+                std::memcpy(&p[plane], row + static_cast<size_t>(plane) * nsg + w * sizeof(uint64_t), sizeof(uint64_t));
             }
             count_word(p, ~uint64_t{ 0 });
         }
         // A dimension that is not a multiple of 64 leaves a tail of whole
         // bytes, counted one byte at a time.
         for (size_t g = n_words * sizeof(uint64_t); g < nsg; ++g) {
-            for (size_t plane = 0; plane < n_planes; ++plane) {
-                p[plane] = row[plane * nsg + g];
+            for (int plane = 0; plane < kBits; ++plane) {
+                p[plane] = row[static_cast<size_t>(plane) * nsg + g];
             }
             count_word(p, kByteValid);
         }
+    }
+    for (size_t code = 0; code < (size_t{ 1 } << kBits); ++code) {
+        level[code] += local[code];
+    }
+}
+
+void count_levels_serial(
+        const uint8_t * data, int bits, size_t nsg, size_t first, size_t last, uint64_t * level) {
+    // Staged search runs only at 2 and 4 bits (turbovec_planes_for); the
+    // masks cover exactly those, so any other width counts nothing rather
+    // than reading past the row.
+    assert(bits == 2 || bits == 4);
+    if (bits == 2) {
+        count_levels_rows<2>(data, nsg, first, last, level);
+    } else if (bits == 4) {
+        count_levels_rows<4>(data, nsg, first, last, level);
     }
 }
 
