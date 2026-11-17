@@ -153,6 +153,9 @@ static bool ggml_cuda_short_row_softmax_disabled() {
 // even at 20, and slower from 24 values with a mask, 1.3x there and 4x at 32 (one thread reads a whole row).
 // soft_max_f32_cuda has one instantiation per power of 2 up to this value: change both together.
 #define CUDA_SOFT_MAX_SHORT_ROW 16
+// limit on NVIDIA GPUs other than Turing and cc 12.0: on a DGX Spark (GB10, cc 12.1) the kernel was 1.3x slower at 16
+// values with a mask, the attention shape of 16-token windows, and 1.3x to 100x faster up to 12 values
+#define CUDA_SOFT_MAX_SHORT_ROW_NVIDIA_OTHER 12
 // limit on RDNA 3.5: on a Radeon 8060S (gfx1151) the kernel was 1.9x to 25x faster up to 8 values and up to 2.7x
 // slower at 12 and 16
 #define CUDA_SOFT_MAX_SHORT_ROW_RDNA3_5    8
@@ -161,12 +164,13 @@ static bool ggml_cuda_short_row_softmax_disabled() {
 // not tuned
 #define CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE 128
 
-// Longest row for soft_max_f32_short_rows on this GPU, 0 where it is not used. Measured on a T4 (Turing) and an RTX
-// 5090 (Blackwell), both faster up to 16 values, so NVIDIA from Turing on takes it; on AMD only RDNA 3.5 was
-// measured. Every other GPU keeps the block-per-row kernels.
+// Longest row for soft_max_f32_short_rows on this GPU, 0 where it is not used. A T4 (Turing) and an RTX 5090 (cc 12.0)
+// were faster up to 16 values. Other NVIDIA GPUs from Turing on, measured only on a GB10 (cc 12.1), stop at 12, where
+// all three were faster. On AMD only RDNA 3.5 was measured. Every other GPU keeps the block-per-row kernels.
 static int ggml_cuda_short_row_softmax_limit(const int cc) {
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
-        return CUDA_SOFT_MAX_SHORT_ROW;
+        const bool turing = cc < GGML_CUDA_CC_AMPERE;
+        return turing || cc == GGML_CUDA_CC_BLACKWELL ? CUDA_SOFT_MAX_SHORT_ROW : CUDA_SOFT_MAX_SHORT_ROW_NVIDIA_OTHER;
     }
     if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
         return CUDA_SOFT_MAX_SHORT_ROW_RDNA3_5;
