@@ -7803,6 +7803,83 @@ void check_turbovec_stat_counts() {
     }
 }
 
+// An add whose code count runs out of memory still commits its rows: the
+// index drops its kept counts, and the next staged search counts every row.
+// Every allocation of the add fails in turn; whatever fails, the kept counts
+// are either current or dropped, never stale.
+void check_turbovec_stats_note_add_alloc_failure() {
+    constexpr int dim = 64;
+    constexpr int nq = 3;
+    constexpr int k = 10;
+    // Small, because the loop rebuilds the index once per allocation.
+    constexpr int n_head = 300;
+    // More than one counting task (kTurboVecRowsPerTask rows each), so the
+    // count allocates its per-task histograms.
+    constexpr int n_more = 600;
+    constexpr int n = n_head + n_more;
+    // Upper bound on the allocations one add makes, so the loop ends even if
+    // the countdown never fires.
+    constexpr long max_countdown = 20000;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, nq, dim);
+    turbovec_force_vector_major_for_test(0);
+    // Planes from the first vector.
+    turbovec_force_planes_for_test(1, 1);
+    for (const int bits : { 2, 4 }) {
+        int counts_dropped = 0;
+        int counts_kept = 0;
+        int failures = 0;
+        for (long countdown = 1; countdown < max_countdown; ++countdown) {
+            auto * idx = ggml_vec_index_create_turbovec(dim, bits);
+            CHECK(idx != nullptr);
+            CHECK(ggml_vec_index_add(idx, rows.data(), n_head, ids.data()) == GGML_VEC_INDEX_OK);
+            (void) staged_results(idx, queries, dim, k);
+            CHECK(turbovec_stat_counts_current_for_test(idx) == 1);
+            g_alloc_fail_countdown.store(countdown);
+            const int rc = ggml_vec_index_add(
+                idx, rows.data() + static_cast<size_t>(n_head) * dim, n_more, ids.data() + n_head);
+            const bool injected = g_alloc_fail_countdown.exchange(0) <= 0;
+            bool planes = false;
+            bool packed_rows = false;
+            size_t sign_capacity = 0;
+            turbovec_staged_caches_for_test(idx, &planes, &packed_rows, &sign_capacity);
+            const int counts = turbovec_stat_counts_current_for_test(idx);
+            if (rc == GGML_VEC_INDEX_OK) {
+                CHECK(ggml_vec_index_len(idx) == n);
+                CHECK(counts == 1 || counts == -1);
+                if (planes && counts == -1) {
+                    // Only the count failed: the planes stayed, the counts
+                    // were dropped.
+                    ++counts_dropped;
+                } else if (counts == 1) {
+                    ++counts_kept;
+                }
+            } else {
+                CHECK(rc == GGML_VEC_INDEX_E_OOM);
+                ++failures;
+                CHECK(ggml_vec_index_len(idx) == n_head);
+                CHECK(counts == 1 || counts == -1);
+            }
+            if (planes) {
+                // Whatever the add left behind, staged search gives what the
+                // same rows counted afresh give.
+                CHECK(staged_results(idx, queries, dim, k) == staged_results_reloaded(idx, queries, dim, k));
+                CHECK(turbovec_stat_counts_current_for_test(idx) == 1);
+            }
+            ggml_vec_index_free(idx);
+            if (!injected) {
+                break;
+            }
+        }
+        CHECK(counts_dropped > 0);
+        CHECK(counts_kept > 0);
+        CHECK(failures > 0);
+    }
+    turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_vector_major_for_test(-1);
+}
+
 // Without memory for the moved copy the build keeps the rows where they are
 // and still returns a working IVF; a failure before the IVF exists leaves
 // the index as it was.
@@ -8994,6 +9071,7 @@ int main(int argc, char ** argv) {
             check_turbovec_ivf_keeps_staged_results();
             check_turbovec_staged_stats_follow_mutations();
             check_turbovec_stat_counts();
+            check_turbovec_stats_note_add_alloc_failure();
             check_turbovec_ivf_rebuild_stable();
             check_turbovec_ivf_group_alloc_failure();
             check_turbovec_1x_vnni_fused_scan();
