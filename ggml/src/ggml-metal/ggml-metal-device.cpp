@@ -1084,6 +1084,11 @@ static ggml_metal_mma_kind ggml_metal_mul_mv_mma_kind_on(int gpu_family, const g
     return kind == GGML_METAL_MMA_KIND_Q4_K && q4_K_gen ? GGML_METAL_MMA_KIND_GEN : kind;
 }
 
+static bool ggml_metal_mul_mv_mma_has_kind(ggml_type type) {
+    return ggml_metal_mul_mv_mma_kind(type, 1) != GGML_METAL_MMA_KIND_GEN ||
+           ggml_metal_mul_mv_mma_kind(type, 2) != GGML_METAL_MMA_KIND_GEN;
+}
+
 static int ggml_metal_mul_mv_mma_nt_max(int gpu_family, ggml_metal_mma_kind kind) {
     const bool cap_q5_K = kind == GGML_METAL_MMA_KIND_Q5_K && gpu_family < GGML_METAL_MMA_FAMILY_APPLE10;
 
@@ -1154,8 +1159,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma(ggml_
     GGML_ASSERT(ne12 <= INT16_MAX && r2 <= INT16_MAX && r3 <= INT16_MAX);
 
     const ggml_metal_mma_kind kind = ggml_metal_mul_mv_mma_kind_on(ggml_metal_library_gpu_family(lib), op, rt);
-    // a type that runs the generic kernel only on some GPU families names it with _gen
-    const char * gen = kind != ggml_metal_mul_mv_mma_kind(tsrc0, rt) ? "_gen" : "";
+    // the generic kernel of a type that also has its own kernel is named with _gen
+    const char * gen = kind == GGML_METAL_MMA_KIND_GEN && ggml_metal_mul_mv_mma_has_kind(tsrc0) ? "_gen" : "";
 
     // the specialized kernels unroll over a compile-time row length
     const int ne00 = kind != GGML_METAL_MMA_KIND_GEN ? op->src[0]->ne[0] : 0;
