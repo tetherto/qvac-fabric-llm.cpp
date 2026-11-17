@@ -66,8 +66,12 @@ foreach(_f IN LISTS _qvac_sc_files)
     list(APPEND _qvac_sc_sources "${_qvac_sc_dir}/${_f}")
 endforeach()
 
-add_library(server-context STATIC ${_qvac_sc_sources})
+# Before the target: llama_add_compile_flags() sets directory-scope options
+# (warnings, LLAMA_FATAL_WARNINGS, LLAMA_SANITIZE_*), which only seed targets
+# created after it, as upstream calls it in tools/CMakeLists.txt before
+# add_subdirectory(server). No target is created after this file is included.
 llama_add_compile_flags()
+add_library(server-context STATIC ${_qvac_sc_sources})
 target_compile_features(server-context PRIVATE cxx_std_17)
 # Linked into a shared addon module, so position-independent regardless of
 # BUILD_SHARED_LIBS (upstream only sets it for shared builds).
