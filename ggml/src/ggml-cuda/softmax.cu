@@ -144,10 +144,7 @@ static __global__ void soft_max_f32(
 
 // GGML_CUDA_DISABLE_SHORT_ROW_SOFTMAX=1 keeps every softmax on the block-per-row kernels, to A/B soft_max_f32_short_rows
 static bool ggml_cuda_short_row_softmax_disabled() {
-    static const bool disabled = [] {
-        const char * env = getenv("GGML_CUDA_DISABLE_SHORT_ROW_SOFTMAX");
-        return env != nullptr && atoi(env) != 0;
-    }();
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SHORT_ROW_SOFTMAX");
     return disabled;
 }
 
@@ -156,12 +153,26 @@ static bool ggml_cuda_short_row_softmax_disabled() {
 // even at 20, and slower from 24 values with a mask, 1.3x there and 4x at 32 (one thread reads a whole row).
 // soft_max_f32_cuda has one instantiation per power of 2 up to this value: change both together.
 #define CUDA_SOFT_MAX_SHORT_ROW 16
-// limit on AMD: on a Radeon 8060S (RDNA 3.5) the kernel was 1.9x to 25x faster up to 8 values and up to 2.7x slower
-// at 12 and 16. An RTX 5090 matched the T4 numbers above.
-#define CUDA_SOFT_MAX_SHORT_ROW_AMD        8
-// fewest rows for that kernel: below this the call is too small to matter and the block-per-row kernels are kept
-#define CUDA_SOFT_MAX_SHORT_ROW_MIN_ROWS 4096
+// limit on RDNA 3.5: on a Radeon 8060S (gfx1151) the kernel was 1.9x to 25x faster up to 8 values and up to 2.7x
+// slower at 12 and 16
+#define CUDA_SOFT_MAX_SHORT_ROW_RDNA3_5    8
+// fewest rows for that kernel, the lowest row count of the T4 sweep: smaller calls keep the block-per-row kernels
+#define CUDA_SOFT_MAX_SHORT_ROW_MIN_ROWS   4096
+// not tuned
 #define CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE 128
+
+// Longest row for soft_max_f32_short_rows on this GPU, 0 where it is not used. Measured on a T4 (Turing) and an RTX
+// 5090 (Blackwell), both faster up to 16 values, so NVIDIA from Turing on takes it; on AMD only RDNA 3.5 was
+// measured. Every other GPU keeps the block-per-row kernels.
+static int ggml_cuda_short_row_softmax_limit(const int cc) {
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
+        return CUDA_SOFT_MAX_SHORT_ROW;
+    }
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+        return CUDA_SOFT_MAX_SHORT_ROW_RDNA3_5;
+    }
+    return 0;
+}
 
 // One thread per row. The other kernels use one block per row, which for hundreds of thousands of rows of a few
 // values (attention inside small windows) is mostly launch and reduction overhead. No sinks, no ALiBi bias.
@@ -471,8 +482,7 @@ static void soft_max_f32_cuda(const float *                                x,
     int nth = WARP_SIZE;
     const int64_t ncols_x = params.ncols;
 
-    const int cc              = ggml_cuda_info().devices[ctx.device].cc;
-    const int short_row_limit = GGML_CUDA_CC_IS_AMD(cc) ? CUDA_SOFT_MAX_SHORT_ROW_AMD : CUDA_SOFT_MAX_SHORT_ROW;
+    const int short_row_limit = ggml_cuda_short_row_softmax_limit(ggml_cuda_info().devices[ctx.device].cc);
     if (ncols_x <= short_row_limit && params.nrows_x >= CUDA_SOFT_MAX_SHORT_ROW_MIN_ROWS && sinks == nullptr &&
         params.max_bias == 0.0f && !ggml_cuda_short_row_softmax_disabled()) {
         const int64_t n_blocks = (params.nrows_x + CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE - 1) / CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE;

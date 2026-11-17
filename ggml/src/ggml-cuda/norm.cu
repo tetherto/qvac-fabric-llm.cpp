@@ -2,7 +2,8 @@
 #include "convert.cuh"
 #include <cstdint>
 
-// a*b + c as two rounded operations, never one FMA: the same bits as separate MUL and ADD nodes
+// a*b + c as two rounded operations, never one FMA: on CUDA the same bits as separate MUL and ADD nodes. HIP and
+// MUSA may contract the plain expression to an FMA, so there the last bit can differ.
 static __device__ __forceinline__ float norm_mul_add(const float a, const float b, const float c) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     return a * b + c;

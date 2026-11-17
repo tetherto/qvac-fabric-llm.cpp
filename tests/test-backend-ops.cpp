@@ -18891,7 +18891,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4,      1, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4,   1023, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {643251, 3, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
-    // many short rows (attention inside small windows): 4096 rows of at most 16 values is where CUDA changes kernel
+    // many short rows (attention inside small windows): 4096 rows of at most 16 values (8 on RDNA 3.5) is where CUDA changes kernel
     const float scale_head_dim_32 = 1.0f/sqrtf(32.0f); // attention scale 1/sqrt(head dim) for heads of 32
     for (int64_t ne0 : { 1, 2, 4, 5, 8, 9, 15, 16, 17 }) {
         for (bool mask : { false, true }) {
