@@ -7,7 +7,6 @@
 #include "ggml-vector-index.h"
 
 #include <algorithm>
-#include <random>
 #include <array>
 #include <cassert>
 #include <cerrno>
@@ -26,6 +25,7 @@
 #include <fstream>
 #include <limits>
 #include <new>
+#include <random>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -215,6 +215,7 @@ void turbovec_force_batches_for_test(int enabled);
 int turbovec_layout_for_test(const ggml_vec_index_t * idx);
 bool turbovec_planes_for(int bits, int dim);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
+int turbovec_stat_counts_match_for_test(int bits, int dim, int n_rows, uint32_t seed);
 void turbovec_staged_caches_for_test(
     const ggml_vec_index_t * idx, bool * planes, bool * packed_rows, size_t * sign_capacity);
 int64_t turbovec_seed_short_count_for_test(void);
@@ -7592,6 +7593,79 @@ void check_turbovec_ivf_rebuild_stable() {
     }
 }
 
+// Rows in tight clusters around normal centres, and queries near the
+// centres. Tight, because the codes of one cluster are then close, so
+// statistics fitted from a few clusters differ from those of all of them;
+// with noise of 0.2 or more the two fits agree and a test of the staged
+// statistics would not see a stale or one-list fit.
+struct TightClusters {
+    std::vector<float> rows;
+    std::vector<float> queries;
+};
+
+// Row i belongs to cluster i % n_clusters when interleaved, else to cluster
+// i * n_clusters / n, so the clusters come one after another.
+static TightClusters tight_clusters(int n, int nq, int dim, int n_clusters, bool interleaved) {
+    constexpr float noise_scale = 0.05f;
+    constexpr uint32_t seed = 7;
+    // Queries hit the clusters in a scrambled order; 7 is coprime with the
+    // power-of-two cluster counts the tests use, so every cluster is hit.
+    constexpr int query_step = 7;
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    std::vector<float> centers(static_cast<size_t>(n_clusters) * dim);
+    for (float & v : centers) {
+        v = gauss(rng);
+    }
+    TightClusters out;
+    out.rows.resize(static_cast<size_t>(n) * dim);
+    for (int i = 0; i < n; ++i) {
+        const int cluster = interleaved ? i % n_clusters
+                                        : static_cast<int>(static_cast<int64_t>(i) * n_clusters / n);
+        const float * c = centers.data() + static_cast<size_t>(cluster) * dim;
+        for (int d = 0; d < dim; ++d) {
+            out.rows[static_cast<size_t>(i) * dim + d] = c[d] + noise_scale * gauss(rng);
+        }
+    }
+    out.queries.resize(static_cast<size_t>(nq) * dim);
+    for (int q = 0; q < nq; ++q) {
+        const float * c = centers.data() + static_cast<size_t>((q * query_step) % n_clusters) * dim;
+        for (int d = 0; d < dim; ++d) {
+            out.queries[static_cast<size_t>(q) * dim + d] = c[d] + noise_scale * gauss(rng);
+        }
+    }
+    return out;
+}
+
+// Staged search scores and ids of every query, ids sorted per query so rows
+// with equal scores may swap places (a 1.x index orders ties by row).
+static std::pair<std::vector<float>, std::vector<uint64_t>> staged_results(
+        ggml_vec_index_t * idx, const std::vector<float> & queries, int dim, int k) {
+    const int nq = static_cast<int>(queries.size() / static_cast<size_t>(dim));
+    std::vector<float> scores(static_cast<size_t>(nq) * k);
+    std::vector<uint64_t> out(scores.size());
+    CHECK(ggml_vec_index_search(idx, queries.data(), nq, k, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
+    for (int q = 0; q < nq; ++q) {
+        std::sort(out.begin() + q * k, out.begin() + (q + 1) * k);
+    }
+    return std::make_pair(scores, out);
+}
+
+// The same index through to_bytes and from_bytes, which counts the codes
+// afresh.
+static std::pair<std::vector<float>, std::vector<uint64_t>> staged_results_reloaded(
+        ggml_vec_index_t * idx, const std::vector<float> & queries, int dim, int k) {
+    uint8_t * data = nullptr;
+    size_t size = 0;
+    CHECK(ggml_vec_index_to_bytes(idx, &data, &size) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_t * copy = nullptr;
+    CHECK(ggml_vec_index_from_bytes(data, size, &copy) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_bytes_free(data);
+    auto results = staged_results(copy, queries, dim, k);
+    ggml_vec_index_free(copy);
+    return results;
+}
+
 // Staged search fits its statistics from the codes. Upstream counts the
 // first 64 blocks, which after an IVF build hold one list; counted over every
 // row they do not depend on the order, so staged search returns what it did
@@ -7601,61 +7675,23 @@ void check_turbovec_ivf_keeps_staged_results() {
     // Rows from many clusters interleaved, so the head of the index is a mix
     // before the build and one cluster after it.
     constexpr int n_clusters = 32;
-    // Well past the 64 blocks of 32 rows the statistics are fitted from,
+    // Well past the 64 blocks of 32 rows upstream fits the statistics from,
     // and past the 1024 blocks from which staged search seeds its shortlist.
     constexpr int n = 40000;
     constexpr int nq = 100;
     constexpr int k = 10;
     constexpr int n_iter = 2;
-    // Tight clusters: the codes of one cluster are close, so statistics
-    // fitted from one cluster differ from the mixed ones. With noise of 0.2
-    // or more the two fits agree and the test would not see the bug.
-    constexpr float noise_scale = 0.05f;
-    constexpr uint32_t seed = 7;
-    std::mt19937 rng(seed);
-    std::normal_distribution<float> gauss(0.0f, 1.0f);
-    std::vector<float> centers(static_cast<size_t>(n_clusters) * dim);
-    for (float & v : centers) {
-        v = gauss(rng);
-    }
-    std::vector<float> rows(static_cast<size_t>(n) * dim);
-    for (int i = 0; i < n; ++i) {
-        const float * c = centers.data() + static_cast<size_t>(i % n_clusters) * dim;
-        for (int d = 0; d < dim; ++d) {
-            rows[static_cast<size_t>(i) * dim + d] = c[d] + noise_scale * gauss(rng);
-        }
-    }
-    // Queries hit the clusters in a scrambled order; 7 is coprime with
-    // n_clusters, so every cluster is hit.
-    constexpr int query_step = 7;
-    std::vector<float> queries(static_cast<size_t>(nq) * dim);
-    for (int q = 0; q < nq; ++q) {
-        const float * c = centers.data() + static_cast<size_t>((q * query_step) % n_clusters) * dim;
-        for (int d = 0; d < dim; ++d) {
-            queries[static_cast<size_t>(q) * dim + d] = c[d] + noise_scale * gauss(rng);
-        }
-    }
+    const TightClusters data = tight_clusters(n, nq, dim, n_clusters, true);
     const std::vector<uint64_t> ids = tv1x_ids(n);
     turbovec_force_vector_major_for_test(0);
     // Planes from the first vector.
     turbovec_force_planes_for_test(1, 1);
 
-    // Scores in rank order and the ids of each query sorted, so rows with
-    // equal scores may swap places (a 1.x index orders ties by row).
-    auto staged_results = [&](ggml_vec_index_t * idx) {
-        std::vector<float> scores(static_cast<size_t>(nq) * k);
-        std::vector<uint64_t> out(scores.size());
-        CHECK(ggml_vec_index_search(idx, queries.data(), nq, k, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
-        for (int q = 0; q < nq; ++q) {
-            std::sort(out.begin() + q * k, out.begin() + (q + 1) * k);
-        }
-        return std::make_pair(scores, out);
-    };
     for (const int bits : { 2, 4 }) {
         auto * reference = ggml_vec_index_create_turbovec(dim, bits);
         CHECK(reference != nullptr);
-        CHECK(ggml_vec_index_add(reference, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
-        const auto expected = staged_results(reference);
+        CHECK(ggml_vec_index_add(reference, data.rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+        const auto expected = staged_results(reference, data.queries, dim, k);
         ggml_vec_index_free(reference);
 
         // With a search before the build, and without one, so the
@@ -7663,28 +7699,20 @@ void check_turbovec_ivf_keeps_staged_results() {
         for (const bool searched_first : { true, false }) {
             auto * idx = ggml_vec_index_create_turbovec(dim, bits);
             CHECK(idx != nullptr);
-            CHECK(ggml_vec_index_add(idx, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_add(idx, data.rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
             if (searched_first) {
-                CHECK(staged_results(idx) == expected);
+                CHECK(staged_results(idx, data.queries, dim, k) == expected);
             }
             const std::vector<uint64_t> before = turbovec_ids_in_order(idx);
             CHECK(ggml_vec_index_build_ivf(idx, n_clusters, n_iter) == GGML_VEC_INDEX_OK);
             CHECK(turbovec_ids_in_order(idx) != before);
-            const auto got = staged_results(idx);
+            const auto got = staged_results(idx, data.queries, dim, k);
             CHECK(got.first == expected.first);
             CHECK(got.second == expected.second);
 
             // The grouped rows saved and loaded back, through bytes and
             // through a synced file, give the same staged results too.
-            uint8_t * data = nullptr;
-            size_t size = 0;
-            CHECK(ggml_vec_index_to_bytes(idx, &data, &size) == GGML_VEC_INDEX_OK);
-            ggml_vec_index_t * from_bytes = nullptr;
-            CHECK(ggml_vec_index_from_bytes(data, size, &from_bytes) == GGML_VEC_INDEX_OK);
-            ggml_vec_index_bytes_free(data);
-            CHECK(turbovec_ids_in_order(from_bytes) == turbovec_ids_in_order(idx));
-            CHECK(staged_results(from_bytes) == expected);
-            ggml_vec_index_free(from_bytes);
+            CHECK(staged_results_reloaded(idx, data.queries, dim, k) == expected);
 
             temp_file snapshot(".tv");
             const std::string path = snapshot.path.string();
@@ -7692,13 +7720,79 @@ void check_turbovec_ivf_keeps_staged_results() {
             auto * loaded = ggml_vec_index_load(path.c_str());
             CHECK(loaded != nullptr);
             CHECK(turbovec_ids_in_order(loaded) == turbovec_ids_in_order(idx));
-            CHECK(staged_results(loaded) == expected);
+            CHECK(staged_results(loaded, data.queries, dim, k) == expected);
             ggml_vec_index_free(loaded);
             ggml_vec_index_free(idx);
         }
     }
     turbovec_force_planes_for_test(-1, 0);
     turbovec_force_vector_major_for_test(-1);
+}
+
+// Adds and removes after a staged search keep the code counts current, so
+// the statistics in memory are the ones a reload counts afresh: staged
+// results do not depend on when the index was last searched.
+void check_turbovec_staged_stats_follow_mutations() {
+    constexpr int dim = 64;
+    // Clusters one after another, so the first rows added, and the rows
+    // left after the removes, are a few clusters whose statistics differ
+    // from those of all of them.
+    constexpr int n_clusters = 32;
+    // Past the 64 blocks of 32 rows upstream fits the statistics from, as
+    // in check_turbovec_ivf_keeps_staged_results.
+    constexpr int n = 40000;
+    constexpr int nq = 100;
+    constexpr int k = 10;
+    constexpr int head_clusters = 4;
+    constexpr int n_head = n / n_clusters * head_clusters;
+    const TightClusters data = tight_clusters(n, nq, dim, n_clusters, false);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    turbovec_force_vector_major_for_test(0);
+    // Planes from the first vector.
+    turbovec_force_planes_for_test(1, 1);
+
+    for (const int bits : { 2, 4 }) {
+        auto * reference = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(reference != nullptr);
+        CHECK(ggml_vec_index_add(reference, data.rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+        const auto expected = staged_results(reference, data.queries, dim, k);
+        ggml_vec_index_free(reference);
+
+        // Searched with the head clusters only, then the rest added.
+        auto * idx = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(idx != nullptr);
+        CHECK(ggml_vec_index_add(idx, data.rows.data(), n_head, ids.data()) == GGML_VEC_INDEX_OK);
+        (void) staged_results(idx, data.queries, dim, k);
+        CHECK(ggml_vec_index_add(
+                  idx, data.rows.data() + static_cast<size_t>(n_head) * dim, n - n_head, ids.data() + n_head) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(staged_results(idx, data.queries, dim, k) == expected);
+        CHECK(staged_results_reloaded(idx, data.queries, dim, k) == expected);
+
+        // All but the head clusters removed after a search.
+        for (int i = n_head; i < n; ++i) {
+            CHECK(ggml_vec_index_remove(idx, ids[static_cast<size_t>(i)]) == GGML_VEC_INDEX_OK);
+        }
+        CHECK(staged_results(idx, data.queries, dim, k) == staged_results_reloaded(idx, data.queries, dim, k));
+        ggml_vec_index_free(idx);
+    }
+    turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_vector_major_for_test(-1);
+}
+
+// The plane popcounts that count the code levels for the staged statistics
+// match a count of every decoded code, at dims that fill whole 64-bit words
+// and at dims that leave a byte tail.
+void check_turbovec_stat_counts() {
+    constexpr int n_rows = 50;
+    constexpr uint32_t seed = 11;
+    // 32 is all tail (4 bytes a plane), 64 one whole word, 96 a word and a
+    // tail, 2080 many words and a tail.
+    for (const int bits : { 2, 4 }) {
+        for (const int dim : { 32, 64, 96, 2080 }) {
+            CHECK(turbovec_stat_counts_match_for_test(bits, dim, n_rows, seed) == 1);
+        }
+    }
 }
 
 // Without memory for the moved copy the build keeps the rows where they are
@@ -8890,6 +8984,8 @@ int main(int argc, char ** argv) {
             }
             check_turbovec_ivf_keeps_staged();
             check_turbovec_ivf_keeps_staged_results();
+            check_turbovec_staged_stats_follow_mutations();
+            check_turbovec_stat_counts();
             check_turbovec_ivf_rebuild_stable();
             check_turbovec_ivf_group_alloc_failure();
             check_turbovec_1x_vnni_fused_scan();

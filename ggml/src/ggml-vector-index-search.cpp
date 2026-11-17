@@ -1384,7 +1384,9 @@ static size_t batch_size_for(size_t n, int k, int n_epochs, int dim) {
         std::pow(static_cast<double>(k), law.k_exp) *
         std::pow(static_cast<double>(n), law.n_exp) *
         std::pow(static_cast<double>(n_epochs), law.epoch_exp);
-    size_t batch = round_power_of_two(raw);
+    // Capped at n before rounding: the caps below are at most n anyway, and
+    // a huge n_iter would otherwise overflow the size_t cast.
+    size_t batch = round_power_of_two(std::min(raw, static_cast<double>(n)));
     // The two caps differ on purpose: they reproduce the two fitted recipes.
     const size_t cap = quality ? n / 2 : round_power_of_two(static_cast<double>(n) / 2.0);
     batch = std::min(batch, cap);
@@ -1409,8 +1411,9 @@ static double scheduled_step(double alpha0, size_t step, size_t total_steps) {
 }
 
 // Fisher-Yates with raw mt19937_64 output. std::shuffle and the standard
-// distributions are implementation-defined, which would make the IVF differ
-// between standard libraries.
+// distributions are implementation-defined; this keeps the shuffle the same
+// everywhere. The lists themselves are reproducible on one build: the math
+// functions and the SIMD dot product can round differently elsewhere.
 static void shuffle_slots(std::vector<size_t> & slots, std::mt19937_64 & rng) {
     for (size_t i = slots.size(); i > 1; --i) {
         const size_t j = static_cast<size_t>(rng() % static_cast<uint64_t>(i));
@@ -1419,9 +1422,11 @@ static void shuffle_slots(std::vector<size_t> & slots, std::mt19937_64 & rng) {
 }
 
 static double uniform_open01(std::mt19937_64 & rng) {
-    // 53 random bits, shifted off zero so log() below stays finite.
+    // The top 53 of 64 random bits (a double's mantissa), shifted off zero
+    // so log() below stays finite.
+    constexpr int kMantissaBits = 53;
     constexpr double kTwoPow53 = 9007199254740992.0;
-    return (static_cast<double>(rng() >> 11) + 0.5) / kTwoPow53;
+    return (static_cast<double>(rng() >> (64 - kMantissaBits)) + 0.5) / kTwoPow53;
 }
 
 // Replaces under-used centroids by splitting well-used ones. Donors are drawn

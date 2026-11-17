@@ -367,6 +367,13 @@ struct TurboVecPlanesStats {
     float beta1 = 0.0f;
 };
 
+// Code counts per level behind TurboVecPlanesStats, over every row. 2-bit
+// codes use the first 4 entries, 4-bit codes all 16.
+inline constexpr size_t kTurboVecMaxLevels = 16;
+struct TurboVecStatCounts {
+    uint64_t level[kTurboVecMaxLevels] = {};
+};
+
 // A TurboVec index's binding to the v8 file it syncs to (upstream
 // `SyncCursor` plus its dirty sets). A 1.x index removes by swap-remove,
 // as upstream does, so its slot order is the file's row order.
@@ -476,9 +483,12 @@ struct ggml_vec_index {
     bool turbovec_planes = false;
     std::vector<uint8_t> turbovec_sign_blocked;
     // Derived lazily by the first staged search, as upstream does: the
-    // planes statistics (from the cache head, reset only on promotion) and
-    // the per-vector centre term (reset by every mutation).
+    // code counts over every row (counted afresh after a load or promotion,
+    // then kept current by adds and removes), the planes statistics fitted
+    // from them, and the per-vector centre term (reset by every mutation).
     mutable std::mutex turbovec_planes_mutex;
+    mutable bool turbovec_counts_ready = false;
+    mutable TurboVecStatCounts turbovec_stat_counts;
     mutable bool turbovec_stats_ready = false;
     mutable TurboVecPlanesStats turbovec_stats;
     mutable bool turbovec_centre_ready = false;
@@ -752,6 +762,9 @@ void turbovec_force_vm8_2bit_for_test(int mode);
 // small indexes included, so a test reaches the batch kernels.
 void turbovec_force_batches_for_test(int enabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
+// 1 when the plane popcounts behind the staged statistics count the same
+// levels as decoding every code, over n_rows random rows.
+int turbovec_stat_counts_match_for_test(int bits, int dim, int n_rows, uint32_t seed);
 // Whether the staged-search caches exist, and the bytes the sign planes still
 // hold allocated.
 void turbovec_staged_caches_for_test(
@@ -1013,13 +1026,19 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot);
 // Frees the sign planes and centre term, which searches read without the
 // planes mutex: the caller must hold `idx.mutex` exclusively.
 void turbovec_planes_reset(ggml_vec_index & idx);
-// The same, but a promoted index stays promoted and keeps its fitted
-// statistics (counted over every row, so a move does not change them), for
+// The same, but a promoted index stays promoted and keeps its code counts
+// and statistics (counted over every row, so a move does not change them), for
 // a change that moves every row without changing the codes;
 // the caller then refreshes from slot 0. Same locking rule as
 // turbovec_planes_reset.
 void turbovec_planes_restart(ggml_vec_index & idx);
 void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
+// Keep the code counts of a promoted index current: after an add has
+// written rows [first_slot, n) and refreshed the planes, and before a
+// remove overwrites the row in `slot`. The remove side allocates nothing.
+// Same locking rule as turbovec_planes_reset.
+void turbovec_stats_note_add(ggml_vec_index & idx, size_t first_slot);
+void turbovec_stats_note_remove(ggml_vec_index & idx, size_t slot);
 // How a staged search is run, following upstream's batch bookkeeping.
 struct TurboVecStagedOpts {
     // The call searches one query: on aarch64 its sign tables cap at 31.

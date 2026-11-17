@@ -699,6 +699,7 @@ int ggml_vec_index_add_unlocked(
                 turbovec_blocked_append(*idx, turbovec_batch.data(), base_slot, n_sz);
             }
             turbovec_planes_refresh(*idx, base_slot);
+            turbovec_stats_note_add(*idx, base_slot);
             turbovec_settle_rows(*idx);
         }
         add_state_hash_range(*idx, base_slot, new_slots, turbovec_batch.empty() ? nullptr : turbovec_batch.data());
@@ -741,6 +742,7 @@ int ggml_vec_index_add(
 // tombstones and its slot order is upstream's row order. Allocation-free.
 static void turbovec_swap_remove(ggml_vec_index & idx, size_t slot) {
     turbovec_sync_note_remove(idx, slot);
+    turbovec_stats_note_remove(idx, slot);
     const size_t last = idx.slot_to_id.size() - 1;
     const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim));
     if (slot != last) {

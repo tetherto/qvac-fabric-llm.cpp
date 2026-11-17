@@ -258,8 +258,8 @@ GGML_VEC_INDEX_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 // mini-batch k-means with moving-average centroids that revives empty lists,
 // so a pass costs about one k-means iteration but needs far fewer passes. The
 // refined centroids are unit length. 0 keeps the initial centroids. The
-// e-means shuffle uses a fixed seed and id order, so the same vectors and ids
-// give the same lists.
+// e-means shuffle uses a fixed seed and id order, so on the same build the
+// same vectors and ids give the same lists.
 GGML_VEC_INDEX_API int ggml_vec_index_build_ivf(
     ggml_vec_index_t * idx,
     int                n_lists,
