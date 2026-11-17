@@ -765,6 +765,9 @@ void turbovec_force_planes_for_test(int mode, size_t min_vectors);
 // 1 when the plane popcounts behind the staged statistics count the same
 // levels as decoding every code, over n_rows random rows.
 int turbovec_stat_counts_match_for_test(int bits, int dim, int n_rows, uint32_t seed);
+// 1 when the code counts kept on a promoted index equal a fresh count over
+// its rows, 0 when they differ, -1 when no counts are kept yet.
+int turbovec_stat_counts_current_for_test(const ggml_vec_index_t * idx);
 // Whether the staged-search caches exist, and the bytes the sign planes still
 // hold allocated.
 void turbovec_staged_caches_for_test(

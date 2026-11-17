@@ -216,6 +216,7 @@ int turbovec_layout_for_test(const ggml_vec_index_t * idx);
 bool turbovec_planes_for(int bits, int dim);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
 int turbovec_stat_counts_match_for_test(int bits, int dim, int n_rows, uint32_t seed);
+int turbovec_stat_counts_current_for_test(const ggml_vec_index_t * idx);
 void turbovec_staged_caches_for_test(
     const ggml_vec_index_t * idx, bool * planes, bool * packed_rows, size_t * sign_capacity);
 int64_t turbovec_seed_short_count_for_test(void);
@@ -7694,8 +7695,9 @@ void check_turbovec_ivf_keeps_staged_results() {
         const auto expected = staged_results(reference, data.queries, dim, k);
         ggml_vec_index_free(reference);
 
-        // With a search before the build, and without one, so the
-        // statistics are either kept or fitted by the build.
+        // With a search before the build, and without one, so the code
+        // counts are either kept by the build or taken by the first search
+        // after it.
         for (const bool searched_first : { true, false }) {
             auto * idx = ggml_vec_index_create_turbovec(dim, bits);
             CHECK(idx != nullptr);
@@ -7706,6 +7708,7 @@ void check_turbovec_ivf_keeps_staged_results() {
             const std::vector<uint64_t> before = turbovec_ids_in_order(idx);
             CHECK(ggml_vec_index_build_ivf(idx, n_clusters, n_iter) == GGML_VEC_INDEX_OK);
             CHECK(turbovec_ids_in_order(idx) != before);
+            CHECK(turbovec_stat_counts_current_for_test(idx) == (searched_first ? 1 : -1));
             const auto got = staged_results(idx, data.queries, dim, k);
             CHECK(got.first == expected.first);
             CHECK(got.second == expected.second);
@@ -7743,6 +7746,7 @@ void check_turbovec_staged_stats_follow_mutations() {
     constexpr int n = 40000;
     constexpr int nq = 100;
     constexpr int k = 10;
+    // A small share of the clusters, so their statistics differ from all.
     constexpr int head_clusters = 4;
     constexpr int n_head = n / n_clusters * head_clusters;
     const TightClusters data = tight_clusters(n, nq, dim, n_clusters, false);
@@ -7763,9 +7767,11 @@ void check_turbovec_staged_stats_follow_mutations() {
         CHECK(idx != nullptr);
         CHECK(ggml_vec_index_add(idx, data.rows.data(), n_head, ids.data()) == GGML_VEC_INDEX_OK);
         (void) staged_results(idx, data.queries, dim, k);
+        CHECK(turbovec_stat_counts_current_for_test(idx) == 1);
         CHECK(ggml_vec_index_add(
                   idx, data.rows.data() + static_cast<size_t>(n_head) * dim, n - n_head, ids.data() + n_head) ==
               GGML_VEC_INDEX_OK);
+        CHECK(turbovec_stat_counts_current_for_test(idx) == 1);
         CHECK(staged_results(idx, data.queries, dim, k) == expected);
         CHECK(staged_results_reloaded(idx, data.queries, dim, k) == expected);
 
@@ -7773,6 +7779,7 @@ void check_turbovec_staged_stats_follow_mutations() {
         for (int i = n_head; i < n; ++i) {
             CHECK(ggml_vec_index_remove(idx, ids[static_cast<size_t>(i)]) == GGML_VEC_INDEX_OK);
         }
+        CHECK(turbovec_stat_counts_current_for_test(idx) == 1);
         CHECK(staged_results(idx, data.queries, dim, k) == staged_results_reloaded(idx, data.queries, dim, k));
         ggml_vec_index_free(idx);
     }
@@ -7784,6 +7791,7 @@ void check_turbovec_staged_stats_follow_mutations() {
 // match a count of every decoded code, at dims that fill whole 64-bit words
 // and at dims that leave a byte tail.
 void check_turbovec_stat_counts() {
+    // Enough random rows that every level occurs; the seed is arbitrary.
     constexpr int n_rows = 50;
     constexpr uint32_t seed = 11;
     // 32 is all tail (4 bytes a plane), 64 one whole word, 96 a word and a

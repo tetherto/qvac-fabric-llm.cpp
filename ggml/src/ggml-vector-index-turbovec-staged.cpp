@@ -861,8 +861,8 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot) {
         if (!idx.turbovec_staged_enabled || !turbovec_planes_wanted(idx.turbovec_bits, idx.dim, n)) {
             return;
         }
-        // Promotion: the statistics are fitted afresh from the new cache,
-        // and the staged search reads the bit planes from packed rows.
+        // Promotion: the code counts are taken afresh over every row on the
+        // next staged search, which reads the bit planes from packed rows.
         try {
             turbovec_materialize_packed_rows(idx);
         } catch (const std::bad_alloc &) {
@@ -1062,6 +1062,11 @@ void count_levels(const ggml_vec_index & idx, size_t first, size_t last, uint64_
     const size_t nsg = static_cast<size_t>(idx.dim) / 8;
     const size_t n_rows = last - first;
     const size_t n_tasks = (n_rows + kTurboVecRowsPerTask - 1) / kTurboVecRowsPerTask;
+    if (n_tasks <= 1) {
+        // A small add: no task split, and nothing to allocate.
+        count_levels_serial(idx.turbovec_data.data(), bits, nsg, first, last, level);
+        return;
+    }
     std::vector<uint64_t> task_level(n_tasks * kTurboVecMaxLevels, 0);
     parallel_for(n_tasks, idx.n_threads, [&](size_t task, size_t) {
         const size_t begin = first + task * kTurboVecRowsPerTask;
@@ -1077,6 +1082,9 @@ void count_levels(const ggml_vec_index & idx, size_t first, size_t last, uint64_
 }
 
 TurboVecPlanesStats stats_from_counts(int bits, int dim, const TurboVecStatCounts & counts) {
+    // Reached only on a promoted index (turbovec_planes_for: 2 or 4 bits),
+    // so 1 << bits levels fit counts.level.
+    assert(bits == 2 || bits == 4);
     std::vector<float> boundaries;
     std::vector<float> centroids;
     turbovec_codebook_values(bits, dim, false, boundaries, centroids);
@@ -2647,6 +2655,18 @@ int turbovec_stat_counts_match_for_test(int bits, int dim, int n_rows, uint32_t 
         }
     }
     return std::equal(std::begin(got.level), std::end(got.level), std::begin(want.level)) ? 1 : 0;
+}
+
+int turbovec_stat_counts_current_for_test(const ggml_vec_index_t * idx) {
+    std::lock_guard<std::mutex> lock(idx->turbovec_planes_mutex);
+    if (!idx->turbovec_planes || !idx->turbovec_counts_ready) {
+        return -1;
+    }
+    TurboVecStatCounts fresh;
+    count_levels(*idx, 0, idx->slot_to_id.size(), fresh.level);
+    return std::equal(std::begin(fresh.level), std::end(fresh.level), std::begin(idx->turbovec_stat_counts.level))
+               ? 1
+               : 0;
 }
 
 int64_t turbovec_seed_short_count_for_test() {
