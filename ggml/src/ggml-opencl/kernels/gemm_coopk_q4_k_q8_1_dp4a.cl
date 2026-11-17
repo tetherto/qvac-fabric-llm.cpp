@@ -89,16 +89,20 @@ typedef int2   coopk_dotv;
     }
 #endif
 
-inline void get_scale_min_k4_c(int j, global const uchar * q, int stride,
-                               uchar * d, uchar * m,
-                               uchar mask_d6, uchar mask_d4, uchar mask_hi2) {
+// Returns the 6-bit scale in bits 0-7 and the min in bits 8-15. Kept pointer-free and uint-only like the
+// MoE kernels' get_scale_min_k4_packed: the Adreno E031.47 compiler miscompiles the uchar out-parameter
+// form, which turned every 2-4 column q4_K product into garbage on the S25 Ultra. The mask_* kernel
+// arguments are no longer read.
+inline uint get_scale_min_k4_c(int j, global const uchar * q, int stride) {
+    uint d, m;
     if (j < 4) {
-        *d = q[j*stride] & mask_d6;
-        *m = q[(j + 4)*stride] & mask_d6;
+        d = q[j*stride]       & 63u;
+        m = q[(j + 4)*stride] & 63u;
     } else {
-        *d = (q[(j + 4)*stride] & mask_d4) | ((q[(j - 4)*stride] >> 6) << 4);
-        *m = (q[(j + 4)*stride] >>   4)    | ((q[(j    )*stride] >> 6) << 4);
+        d = (q[(j + 4)*stride] & 0x0Fu)        | ((q[(j - 4)*stride] & 0xC0u) >> 2);
+        m = ((q[(j + 4)*stride] >> 4) & 0x0Fu) | ((q[j*stride]       & 0xC0u) >> 2);
     }
+    return d | (m << 8);
 }
 
 // Weights use the untiled Adreno noshuffle SoA layout; COOPK_Q_BIN selects uint-transposed q instead of ushort-transposed q.
@@ -156,23 +160,21 @@ kernel void kernel_gemm_coopk_q4_k_q8_1_dp4a(
         const int sub_idx = blk & 7;
 
         global const uchar * sc = src0_s + sb_idx * K_SCALE_SIZE * m + row0;
-        uchar sv0, mn0, sv1, mn1;
-        get_scale_min_k4_c(sub_idx, sc + 0, m, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
-        get_scale_min_k4_c(sub_idx, sc + 1, m, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        const uint sm0 = get_scale_min_k4_c(sub_idx, sc + 0, m);
+        const uint sm1 = get_scale_min_k4_c(sub_idx, sc + 1, m);
 #if COOPK_ROWS == 4
         half4 dd  = vload4(0, src0_d  + row0 + sb_idx * m);
         half4 dmm = vload4(0, src0_dm + row0 + sb_idx * m);
-        uchar sv2, mn2, sv3, mn3;
-        get_scale_min_k4_c(sub_idx, sc + 2, m, &sv2, &mn2, mask_d6, mask_d4, mask_hi2);
-        get_scale_min_k4_c(sub_idx, sc + 3, m, &sv3, &mn3, mask_d6, mask_d4, mask_hi2);
-        const float sc2 = (float)dd.s2 * (float)sv2, mv2 = (float)dmm.s2 * (float)mn2;
-        const float sc3 = (float)dd.s3 * (float)sv3, mv3 = (float)dmm.s3 * (float)mn3;
+        const uint sm2 = get_scale_min_k4_c(sub_idx, sc + 2, m);
+        const uint sm3 = get_scale_min_k4_c(sub_idx, sc + 3, m);
+        const float sc2 = (float)dd.s2 * (float)(sm2 & 0xFFu), mv2 = (float)dmm.s2 * (float)(sm2 >> 8);
+        const float sc3 = (float)dd.s3 * (float)(sm3 & 0xFFu), mv3 = (float)dmm.s3 * (float)(sm3 >> 8);
 #else
         half2 dd  = vload2(0, src0_d  + row0 + sb_idx * m);
         half2 dmm = vload2(0, src0_dm + row0 + sb_idx * m);
 #endif
-        const float sc0 = (float)dd.s0 * (float)sv0, mv0 = (float)dmm.s0 * (float)mn0;
-        const float sc1 = (float)dd.s1 * (float)sv1, mv1 = (float)dmm.s1 * (float)mn1;
+        const float sc0 = (float)dd.s0 * (float)(sm0 & 0xFFu), mv0 = (float)dmm.s0 * (float)(sm0 >> 8);
+        const float sc1 = (float)dd.s1 * (float)(sm1 & 0xFFu), mv1 = (float)dmm.s1 * (float)(sm1 >> 8);
 
         // Q4_K scale and min values change every 32 K values.
         coopk_dotv s0 = (coopk_dotv)(0), s1 = (coopk_dotv)(0);
