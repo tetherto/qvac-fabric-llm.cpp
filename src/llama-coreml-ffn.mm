@@ -14,8 +14,6 @@
 #include "llama-coreml-ffn-templates.inc"
 
 namespace {
-constexpr int hidden = 5120;
-constexpr int channels = 17408;
 constexpr int rows = 512;
 std::mutex registry_mutex;
 size_t registered_contexts = 0;
@@ -46,14 +44,14 @@ void coreml_op_cpu(ggml_tensor *, int, int, void *) {
     GGML_ABORT("Core ML FFN custom operations require Metal");
 }
 
-MLMultiArray * bind_array(float * data, NSError ** failure) {
+MLMultiArray * bind_array(float * data, int hidden, NSError ** failure) {
     return [[MLMultiArray alloc] initWithDataPointer:data shape:@[@(rows), @(hidden)]
         dataType:MLMultiArrayDataTypeFloat32 strides:@[@(hidden), @1] deallocator:nil error:failure];
 }
 
-void predict(MLModel * model, MLDictionaryFeatureProvider * features, float * output) {
+void predict(MLModel * model, MLDictionaryFeatureProvider * features, float * output, int hidden) {
     NSError * failure = nil;
-    MLMultiArray * backing = bind_array(output, &failure);
+    MLMultiArray * backing = bind_array(output, hidden, &failure);
     require(backing, failure_message(failure, "Core ML output binding failed"));
     MLPredictionOptions * options = [[MLPredictionOptions alloc] init];
     options.outputBackings = @{@"y": backing};
@@ -76,6 +74,8 @@ bool execute(ggml_backend_t backend, ggml_tensor * dst, void * userdata);
 } // namespace
 
 struct llama_coreml_ffn {
+    int hidden;
+    int channels;
     int metal_channels;
     int packages;
     int min_tokens;
@@ -110,6 +110,7 @@ bool execute(ggml_backend_t backend, ggml_tensor * dst, void * userdata) {
     auto & call = *static_cast<ffn_call *>(userdata);
     auto & layer = *call.layer;
     auto & state = *layer.owner;
+    const int hidden = state.hidden;
     @autoreleasepool {
         try {
             if (call.finish) {
@@ -122,7 +123,7 @@ bool execute(ggml_backend_t backend, ggml_tensor * dst, void * userdata) {
             require(ggml_backend_metal_tensor_is_shared(x) && ggml_backend_metal_tensor_is_shared(dst),
                 "Core ML FFN requires shared Metal tensors");
             NSError * failure = nil;
-            MLMultiArray * array = bind_array(static_cast<float *>(x->data), &failure);
+            MLMultiArray * array = bind_array(static_cast<float *>(x->data), hidden, &failure);
             require(array, failure_message(failure, "Core ML input binding failed"));
             MLDictionaryFeatureProvider * features = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": array} error:&failure];
             require(features, failure_message(failure, "Core ML input provider failed"));
@@ -141,18 +142,18 @@ bool execute(ggml_backend_t backend, ggml_tensor * dst, void * userdata) {
                             dispatch_group_t group = dispatch_group_create();
                             dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
                                 @autoreleasepool {
-                                    try { predict(worker->model[1], features, output + rows * hidden); }
+                                    try { predict(worker->model[1], features, output + rows * hidden, hidden); }
                                     catch (const std::exception & e) { second_error = e.what(); }
                                 }
                             });
                             std::string first_error;
-                            try { predict(worker->model[0], features, output); }
+                            try { predict(worker->model[0], features, output, hidden); }
                             catch (const std::exception & e) { first_error = e.what(); }
                             dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
                             require(first_error.empty(), first_error);
                             require(second_error.empty(), second_error);
                         } else {
-                            predict(worker->model[0], features, output);
+                            predict(worker->model[0], features, output, hidden);
                         }
                     } catch (const std::exception & e) { owner->fail(e.what()); }
                     owner->done.signaledValue = value;
@@ -166,9 +167,9 @@ bool execute(ggml_backend_t backend, ggml_tensor * dst, void * userdata) {
     }
 }
 
-otf_template builtin_template(int count) {
+otf_template builtin_template(int hidden, int count) {
     otf_template result;
-    result.dir = "int8-c" + std::to_string(count);
+    result.dir = (hidden == 1024 ? "int8-h1024-c" : "int8-c") + std::to_string(count);
     const unsigned char * program;
     const unsigned char * manifest;
     const unsigned char * layout;
@@ -177,8 +178,15 @@ otf_template builtin_template(int count) {
     program = ffn_##C##_model_mlmodel; program_size = sizeof(ffn_##C##_model_mlmodel); \
     manifest = ffn_##C##_Manifest_json; manifest_size = sizeof(ffn_##C##_Manifest_json); \
     layout = ffn_##C##_layout_txt; layout_size = sizeof(ffn_##C##_layout_txt)
-    if (count == 4608) { FFN_TEMPLATE(4608); }
-    else { require(count == 6144, "unsupported Core ML FFN partition"); FFN_TEMPLATE(6144); }
+    if (hidden == 1024) {
+        require(count == 2560, "unsupported Core ML FFN partition");
+        FFN_TEMPLATE(h1024_c2560);
+    } else if (hidden == 5120 && count == 4608) {
+        FFN_TEMPLATE(4608);
+    } else {
+        require(hidden == 5120 && count == 6144, "unsupported Core ML FFN partition");
+        FFN_TEMPLATE(6144);
+    }
 #undef FFN_TEMPLATE
     result.program.assign(program, program + program_size);
     result.manifest.assign(reinterpret_cast<const char *>(manifest), manifest_size);
@@ -198,13 +206,19 @@ llama_coreml_ffn * llama_coreml_ffn_load(const llama_model & model, const llama_
         require(std::filesystem::file_size(model_path) == model.source_size &&
             std::filesystem::last_write_time(model_path).time_since_epoch().count() == model.source_mtime,
             "GGUF changed since model loading");
+        const int hidden = model.hparams.n_embd;
+        const int channels = model.hparams.n_ff(0);
+        const int n_layer = model.hparams.n_layer();
+        const bool small = hidden == 1024 && channels == 3584 && n_layer == 24;
+        const bool large = hidden == 5120 && channels == 17408 && n_layer == 64;
         require(params.n_packages >= 1 && params.n_packages <= 2 && params.metal_channels > 0 &&
             params.metal_channels < channels && params.metal_channels % 256 == 0 &&
             (channels - params.metal_channels) % params.n_packages == 0 && params.min_tokens >= 2 && params.min_tokens <= rows,
             "invalid Core ML FFN configuration");
-        require(model.arch == LLM_ARCH_QWEN35 && model.hparams.n_embd == hidden && model.hparams.n_layer() == 64 &&
-            !model.hparams.no_alloc && model.hdmd.rot.empty() && model.hdmd.inv.empty(), "Core ML FFN requires an unrotated Qwen3.8-27B model");
-        for (int i = 0; i < 64; ++i) {
+        require(model.arch == LLM_ARCH_QWEN35 && (small || large) &&
+            (!small || (params.metal_channels == 1024 && params.n_packages == 1)) &&
+            !model.hparams.no_alloc && model.hdmd.rot.empty() && model.hdmd.inv.empty(), "Core ML FFN requires an unrotated Qwen3.5-0.8B or Qwen3.8-27B model");
+        for (int i = 0; i < n_layer; ++i) {
             const auto & layer = model.layers[i];
             require(model.dev_layer(i) && std::string(ggml_backend_dev_name(model.dev_layer(i))) == "MTL0",
                 "Core ML FFN requires the default Metal device for every layer");
@@ -217,9 +231,11 @@ llama_coreml_ffn * llama_coreml_ffn_load(const llama_model & model, const llama_
                 ggml_backend_metal_tensor_is_shared(layer.ffn_gate) && ggml_backend_metal_tensor_is_shared(layer.ffn_up) &&
                 ggml_backend_metal_tensor_is_shared(layer.ffn_down), "all FFN weights must use shared Metal storage without external scales");
         }
-        const auto tmpl = builtin_template((channels - params.metal_channels) / params.n_packages);
+        const auto tmpl = builtin_template(hidden, (channels - params.metal_channels) / params.n_packages);
         const auto cache = otf_cache_dir(params.cache_dir, model_path, tmpl);
         auto state = std::make_unique<llama_coreml_ffn>();
+        state->hidden = hidden;
+        state->channels = channels;
         state->metal_channels = params.metal_channels;
         state->packages = params.n_packages;
         state->min_tokens = params.min_tokens;
@@ -231,7 +247,7 @@ llama_coreml_ffn * llama_coreml_ffn_load(const llama_model & model, const llama_
         require(state->ready && state->done && state->queue, "could not create Core ML FFN synchronization objects");
         MLModelConfiguration * configuration = [[MLModelConfiguration alloc] init];
         configuration.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i < n_layer; ++i) {
             @autoreleasepool {
                 auto layer = std::make_unique<ffn_layer>();
                 layer->owner = state.get();
@@ -305,8 +321,10 @@ bool llama_coreml_ffn_check(llama_coreml_ffn * runtime) {
 
 ggml_tensor * llama_coreml_ffn_build(llama_coreml_ffn * runtime, ggml_context * ctx, ggml_cgraph * graph,
         ggml_tensor * input, ggml_tensor * residual, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * down, int il) {
-    if (!runtime || il < 0 || size_t(il) >= runtime->layers.size() || input->type != GGML_TYPE_F32 || input->ne[0] != hidden ||
+    if (!runtime || il < 0 || size_t(il) >= runtime->layers.size() || input->type != GGML_TYPE_F32 || input->ne[0] != runtime->hidden ||
         input->ne[1] < runtime->min_tokens || input->ne[2] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input)) { return nullptr; }
+    const int64_t hidden = runtime->hidden;
+    const int64_t channels = runtime->channels;
     const int64_t m = runtime->metal_channels;
     const int64_t n = input->ne[1];
     const int64_t chunks = n / rows + (n % rows >= runtime->min_tokens ? 1 : 0);

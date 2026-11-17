@@ -9,6 +9,9 @@ the program in file order: offset of its metadata, MILBlob data type, role, kind
 The bundled templates were made with coremltools 9.0 and numpy 2.0.2:
     make_template.py int8-c4608 --channels 4608
     make_template.py int8-c6144 --channels 6144
+
+The Qwen3.5-0.8B template uses coremltools 9.0 and numpy 1.26.4:
+    make_template.py int8-h1024-c2560 --hidden 1024 --channels 2560 --chunk 2048
 """
 
 import argparse
