@@ -380,11 +380,6 @@ int ggml_cuda_get_device() {
     return id;
 }
 
-static bool ggml_cuda_env_flag(const char * name) {
-    const char * env = getenv(name);
-    return env != nullptr && std::atoi(env) != 0;
-}
-
 static int ggml_cuda_env_int(const char * name, int default_value) {
     const char * env = getenv(name);
     return env != nullptr ? std::atoi(env) : default_value;
@@ -2989,8 +2984,8 @@ static void ggml_cuda_mul_mat_canonical(
     GGML_TENSOR_BINARY_OP_LOCALS
 
     // Many small F32 products (windowed attention): ahead of MMVF and cuBLAS, which are both slow on them.
-    if (!ggml_cuda_mm_small_disabled() && ggml_cuda_mm_small_supported_cc(ggml_cuda_info().devices[ctx.device].cc) &&
-        ggml_cuda_should_use_mm_small(src0, src1, dst)) {
+    if (!ggml_cuda_mm_small_disabled() &&
+        ggml_cuda_should_use_mm_small(src0, src1, dst, ggml_cuda_info().devices[ctx.device].cc)) {
         ggml_cuda_mul_mat_small(ctx, src0, src1, dst);
         return;
     }
@@ -5176,7 +5171,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // the node skipped here sits between the two that are fused. The same checks are made directly,
 // ggml_can_fuse_ext on the two node indices and ggml_cuda_check_fusion_memory_ranges on the span.
 static int ggml_cuda_find_mul_mat_cublas_bias(const ggml_cgraph * cgraph, const int mm_idx) {
-    if (cgraph->nodes[mm_idx]->op != GGML_OP_MUL_MAT || mm_idx + 1 >= cgraph->n_nodes) {
+    // only F16 weights take this fusion: reject the rest before the graph checks
+    if (cgraph->nodes[mm_idx]->op != GGML_OP_MUL_MAT || cgraph->nodes[mm_idx]->src[0]->type != GGML_TYPE_F16 ||
+        mm_idx + 1 >= cgraph->n_nodes) {
         return -1;
     }
 
