@@ -1422,11 +1422,13 @@ static void shuffle_slots(std::vector<size_t> & slots, std::mt19937_64 & rng) {
 }
 
 static double uniform_open01(std::mt19937_64 & rng) {
-    // The top 53 of 64 random bits (a double's mantissa), shifted off zero
-    // so log() below stays finite.
+    // The top 53 of 64 random bits (a double's mantissa) give [0, 1), raised
+    // off zero so log() below stays finite, as the faiss reference does.
+    // Adding 0.5 instead would round 2^53 - 0.5 up to exactly 1.0.
     constexpr int kMantissaBits = 53;
-    constexpr double kTwoPow53 = 9007199254740992.0;
-    return (static_cast<double>(rng() >> (64 - kMantissaBits)) + 0.5) / kTwoPow53;
+    constexpr double kTwoPowMinus53 = 0x1p-53;
+    return std::max(static_cast<double>(rng() >> (64 - kMantissaBits)) * kTwoPowMinus53,
+                    std::numeric_limits<double>::min());
 }
 
 // Replaces under-used centroids by splitting well-used ones. Donors are drawn
