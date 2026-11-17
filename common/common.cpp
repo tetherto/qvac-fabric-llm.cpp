@@ -1485,8 +1485,17 @@ common_init_result_ptr common_init_from_model_and_params(llama_model* model, com
             if (params.coreml_ffn_packages > 0) {
                 ffn_params.metal_channels = params.coreml_ffn_metal;
                 ffn_params.n_packages     = params.coreml_ffn_packages;
+            } else {
+                char architecture[32] = {};
+                const int32_t hidden = llama_model_n_embd(model);
+                if (llama_model_n_layer(model) == 24 && (hidden == 1024 || hidden == 2048) &&
+                        llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) > 0 &&
+                        std::strcmp(architecture, "qwen35") == 0) {
+                    ffn_params.metal_channels = hidden;
+                    ffn_params.n_packages     = 1;
+                }
             }
-            COM_INF("Core ML FFN: trying split %dx%d with cache %s (the first run compiles the programs, about 1-2 minutes)\n",
+            COM_INF("Core ML FFN: trying split %dx%d with cache %s (the first run exports and compiles the programs)\n",
                 ffn_params.metal_channels, ffn_params.n_packages, cache.c_str());
             char error[512];
             if (!llama_set_coreml_ffn(lctx, &ffn_params, error, sizeof(error))) {
