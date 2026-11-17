@@ -1089,6 +1089,8 @@ static bool ggml_metal_mul_mv_mma_has_kind(ggml_type type) {
            ggml_metal_mul_mv_mma_kind(type, 2) != GGML_METAL_MMA_KIND_GEN;
 }
 
+// q4_K on the q5_K kernel keeps 4 tiles: on an M3 Ultra 2 tiles run 0.88-0.95x at 4096, 6144 and 6272 src0 rows but
+// 1.01-1.09x at 5120 rows and from 10240 rows, a net loss over the q4_K layers of a 27B UD-Q4_K_M model
 static int ggml_metal_mul_mv_mma_nt_max(int gpu_family, ggml_metal_mma_kind kind) {
     const bool cap_q5_K = kind == GGML_METAL_MMA_KIND_Q5_K && gpu_family < GGML_METAL_MMA_FAMILY_APPLE10;
 
