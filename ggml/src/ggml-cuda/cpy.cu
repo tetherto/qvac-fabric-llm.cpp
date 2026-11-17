@@ -43,10 +43,7 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
 
 // GGML_CUDA_DISABLE_SAME_SHAPE_CPY=1 keeps every strided copy on cpy_scalar, to A/B cpy_scalar_same_shape
 static bool ggml_cuda_same_shape_cpy_disabled() {
-    static const bool disabled = [] {
-        const char * env = getenv("GGML_CUDA_DISABLE_SAME_SHAPE_CPY");
-        return env != nullptr && atoi(env) != 0;
-    }();
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SAME_SHAPE_CPY");
     return disabled;
 }
 

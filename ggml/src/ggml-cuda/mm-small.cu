@@ -2,7 +2,10 @@
 
 #include <cstdint>
 
+// not tuned
 #define CUDA_MM_SMALL_BLOCK_SIZE 128
+// floats in one 16-byte load or store
+static constexpr int MM_SMALL_VEC = sizeof(float4) / sizeof(float);
 
 // dst[m, n, b] = sum over k of src0[k, m, b] * src1[k, n, b], all three contiguous.
 //
@@ -109,16 +112,27 @@ static bool mm_small_is_aligned(const void * ptr) {
 // rows per thread: 4 where the dst rows can be written with one 16-byte store, single rows for very short matrices
 static int mm_small_rows_per_thread(const ggml_tensor * src0, const ggml_tensor * dst) {
     const int64_t ne01 = src0->ne[1];
-    if (ne01 <= 4) {
+    if (ne01 <= MM_SMALL_VEC) {
         return 1;
     }
-    if (ne01 % 4 == 0 && mm_small_is_aligned(dst->data)) {
-        return 4;
+    if (ne01 % MM_SMALL_VEC == 0 && mm_small_is_aligned(dst->data)) {
+        return MM_SMALL_VEC;
     }
     return ne01 % 2 == 0 ? 2 : 1;
 }
 
-bool ggml_cuda_should_use_mm_small(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+static bool ggml_cuda_mm_small_forced() {
+    static const bool forced = ggml_cuda_env_flag("GGML_CUDA_FORCE_MM_SMALL");
+    return forced;
+}
+
+bool ggml_cuda_should_use_mm_small(const ggml_tensor * src0,
+                                   const ggml_tensor * src1,
+                                   const ggml_tensor * dst,
+                                   const int           cc) {
+    if (!ggml_cuda_mm_small_forced() && !ggml_cuda_mm_small_measured_cc(cc)) {
+        return false;
+    }
     if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
@@ -134,12 +148,12 @@ bool ggml_cuda_should_use_mm_small(const ggml_tensor * src0, const ggml_tensor *
         return false;
     }
     const int64_t n_mats = src1->ne[2]*src1->ne[3];
-    if (ne00 < 4) {
+    if (ne00 < MM_SMALL_VEC) {
         // k_mul_mat_small_scalar: one thread per src0 row
         return src0->ne[1]*n_mats >= CUDA_MM_SMALL_MIN_THREADS;
     }
     // the 16-byte loads need whole float4 rows
-    if (ne00 % 4 != 0 || !mm_small_is_aligned(src0->data) || !mm_small_is_aligned(src1->data)) {
+    if (ne00 % MM_SMALL_VEC != 0 || !mm_small_is_aligned(src0->data) || !mm_small_is_aligned(src1->data)) {
         return false;
     }
     return src0->ne[1]/mm_small_rows_per_thread(src0, dst)*n_mats >= CUDA_MM_SMALL_MIN_THREADS;
@@ -168,7 +182,7 @@ static void mm_small_launch(
 }
 
 void ggml_cuda_mul_mat_small(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(ggml_cuda_should_use_mm_small(src0, src1, dst));
+    GGML_ASSERT(ggml_cuda_should_use_mm_small(src0, src1, dst, ggml_cuda_info().devices[ctx.device].cc));
 
     const float * src0_d = (const float *) src0->data;
     const float * src1_d = (const float *) src1->data;
@@ -180,7 +194,7 @@ void ggml_cuda_mul_mat_small(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t n_mats = src1->ne[2]*src1->ne[3];
     cudaStream_t  stream = ctx.stream();
 
-    if (ne00 < 4) {
+    if (ne00 < MM_SMALL_VEC) {
         const int64_t n_rows   = ne01*n_mats;
         const int64_t n_blocks = (n_rows + CUDA_MM_SMALL_BLOCK_SIZE - 1) / CUDA_MM_SMALL_BLOCK_SIZE;
         GGML_ASSERT(n_blocks <= INT32_MAX);
