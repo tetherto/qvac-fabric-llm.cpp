@@ -66,6 +66,32 @@ static int check_state_gather(ggml_context * ctx) {
     return count_failures(cases);
 }
 
+// build_rs in place hands out the ubatch's rows of the cache itself, at the cell of its first sequence.
+static int check_state_view(ggml_context * ctx) {
+    static constexpr int64_t HEAD = 2;
+
+    ggml_tensor * cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, STATE_FLOATS, N_CELLS);
+    ggml_tensor * states = ggml_reshape_2d(ctx, cache, STATE_FLOATS, cache->ne[1]);
+    ggml_tensor * own    = ggml_view_2d(ctx, states, STATE_FLOATS, 1, states->nb[1], HEAD * states->nb[1]);
+    ggml_tensor * ids    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N_RS);
+    ggml_tensor * all    = ggml_get_rows(ctx, states, ids);
+    ggml_tensor * rows   = ggml_view_2d(ctx, all, STATE_FLOATS, 1, all->nb[1], 0);
+    ggml_tensor * half   = ggml_view_2d(ctx, states, STATE_FLOATS / 2, 1, states->nb[1], HEAD * states->nb[1]);
+    ggml_tensor * skew   = ggml_view_2d(ctx, states, STATE_FLOATS, 1, states->nb[1], ggml_row_size(GGML_TYPE_F32, 1));
+
+    const match_case cases[] = {
+        { "the in-place read is a view of the cache", xdna_rec_state_view(own), own },
+        { "a view of a gather is not an in-place read", xdna_rec_state_view(rows), nullptr },
+        { "a gather is not an in-place read", xdna_rec_state_view(all), nullptr },
+        { "half a row is not a state", xdna_rec_state_view(half), nullptr },
+        { "a view off the row boundary is not a state", xdna_rec_state_view(skew), nullptr },
+    };
+    int        failures = count_failures(cases);
+    const bool row_ok   = xdna_rec_state_view_row(own) == HEAD;
+    std::printf("%s: %s\n", row_ok ? "ok  " : "FAIL", "the in-place read names the cell of its first sequence");
+    return failures + (row_ok ? 0 : 1);
+}
+
 // The last layer crops the attention output and its residual to the output rows before they are added.
 static int check_row_crop(ggml_context * ctx) {
     ggml_tensor * w_o    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D_ATTN, D_MODEL);
@@ -121,6 +147,34 @@ static int check_fused_weights(ggml_context * ctx) {
         { "a Q8_0 FFN is the first weight not read",    xdna_fused_uncovered(stock,     4, 1), gate8->src[0] },
         { "a Q8_0 FFN down is not read",                xdna_fused_uncovered(&stock[2], 2, 1), down8->src[0] },
         { "a Q8_0 attn_qkv is not a fused-set weight",  xdna_fused_uncovered(stock,     1, 1), nullptr       },
+    };
+    return count_failures(cases);
+}
+
+// The in-projection and attn_output the fused decode's GEMV reads, and the first it does not.
+static int check_fused_gemv_weights(ggml_context * ctx) {
+    ggml_tensor *       x         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, QK_ROW, 1);
+    ggml_tensor *       qkv4      = read_weight(ctx, GGML_TYPE_Q4_K, "blk.0.attn_qkv.weight", x);
+    ggml_tensor *       qkv5      = read_weight(ctx, GGML_TYPE_Q5_K, "blk.1.attn_qkv.weight", x);
+    ggml_tensor *       z6        = read_weight(ctx, GGML_TYPE_Q6_K, "blk.0.attn_gate.weight", x);
+    ggml_tensor *       o4        = read_weight(ctx, GGML_TYPE_Q4_K, "blk.3.attn_output.weight", x);
+    ggml_tensor *       qkv8      = read_weight(ctx, GGML_TYPE_Q8_0, "blk.2.attn_qkv.weight", x);
+    ggml_tensor *       qkv16     = read_weight(ctx, GGML_TYPE_F16, "blk.4.attn_qkv.weight", x);
+    ggml_tensor *       z8        = read_weight(ctx, GGML_TYPE_Q8_0, "blk.2.attn_gate.weight", x);
+    ggml_tensor *       o8        = read_weight(ctx, GGML_TYPE_Q8_0, "blk.7.attn_output.weight", x);
+    ggml_tensor *       gate8     = read_weight(ctx, GGML_TYPE_Q8_0, "blk.2.ffn_gate.weight", x);
+    const ggml_tensor * k_quant[] = { qkv4, qkv5, z6, o4 };
+    const ggml_tensor * gate_q8[] = { qkv5, z8 };
+
+    const match_case cases[] = {
+        { "a K-quant in-projection and attn_output read", xdna_fused_gemv_uncovered(k_quant, 4, true),  nullptr       },
+        { "a Q8_0 attn_qkv is not read",                  xdna_fused_gemv_uncovered(&qkv8,   1, true),  qkv8->src[0]  },
+        { "an F16 attn_qkv is not read",                  xdna_fused_gemv_uncovered(&qkv16,  1, true),  qkv16->src[0] },
+        { "a Q8_0 attn_gate is not read",                 xdna_fused_gemv_uncovered(gate_q8, 2, true),  z8->src[0]    },
+        { "a Q8_0 attn_output is not read",               xdna_fused_gemv_uncovered(&o8,     1, true),  o8->src[0]    },
+        { "with the tails off attn_output is not read",   xdna_fused_gemv_uncovered(&o8,     1, false), nullptr       },
+        { "with the tails off attn_qkv still is",         xdna_fused_gemv_uncovered(&qkv8,   1, false), qkv8->src[0]  },
+        { "an FFN weight is the fused set's to check",    xdna_fused_gemv_uncovered(&gate8,  1, true),  nullptr       },
     };
     return count_failures(cases);
 }
@@ -253,7 +307,8 @@ static int check_route_fused(void) {
 int main(void) {
     const ggml_init_params params = { ggml_tensor_overhead() * MAX_TENSORS, nullptr, true };
     ggml_context *         ctx    = ggml_init(params);
-    const int              failures = check_state_gather(ctx) + check_row_crop(ctx) + check_fused_weights(ctx) +
+    const int              failures = check_state_gather(ctx) + check_state_view(ctx) + check_row_crop(ctx) +
+                                      check_fused_weights(ctx) + check_fused_gemv_weights(ctx) +
                                       check_layer_census(ctx) + check_census_keeps_name() + check_route_fused();
     ggml_free(ctx);
     if (failures) {

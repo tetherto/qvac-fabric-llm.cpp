@@ -803,6 +803,30 @@ static bool check_spec_ubatch() {
     return rejected_two && !rejected_one;
 }
 
+// --spec-draft-n-short needs a lattice drafter: the DSpine draft takes it, a config without one rejects it
+static bool check_spec_n_short() {
+    dspine_setup s;
+    if (!write_models(N_VOCAB, GGML_TYPE_F32, GGML_TYPE_F32) || !open_setup(s, true, true, BLOCK_SIZE)) {
+        return false;
+    }
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    params.draft.ctx_tgt = s.ctx_tgt;
+    params.draft.ctx_dft = s.ctx_dft;
+    params.draft.n_max   = BLOCK_SIZE - 1;
+    params.draft.n_short = BLOCK_SIZE - 2;
+    const bool rejected_dspine = spec_init_rejects(params, 1);
+
+    params.types = { COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE };
+    const bool rejected_ngram = spec_init_rejects(params, 1);
+    params.draft.n_short = 0;
+    const bool rejected_ngram_off = spec_init_rejects(params, 1);
+
+    printf("%s: DSpine rejected %d, ngram rejected %d, ngram without n_short rejected %d\n", __func__, rejected_dspine,
+           rejected_ngram, rejected_ngram_off);
+    return !rejected_dspine && rejected_ngram && !rejected_ngram_off;
+}
+
 struct load_case {
     draft_kind   kind;
     const char * name;
@@ -840,6 +864,56 @@ static int run_load_cases() {
     return failures;
 }
 
+static constexpr size_t  LATTICE_DRAFTS = 15;
+static constexpr int32_t KEEP_SHORT     = 7;
+
+// a lattice path whose first KEEP_SHORT transitions have probability p_head and the rest p_tail
+struct keep_case {
+    const char * name;
+    float        p_head;
+    float        p_tail;
+    size_t       n;
+    int32_t      n_short;
+    float        long_cost;
+    size_t       expected;
+};
+
+static bool run_keep_case(const keep_case & c) {
+    std::vector<float> path_p(c.n, c.p_tail);
+    std::fill(path_p.begin(), path_p.begin() + std::min(c.n, (size_t) KEEP_SHORT), c.p_head);
+    const size_t kept = common_speculative_lattice_keep(path_p.data(), c.n, c.n_short, c.long_cost);
+    if (kept != c.expected) {
+        fprintf(stderr, "FAIL: %s: kept %zu drafts, expected %zu\n", c.name, kept, c.expected);
+    }
+    return kept == c.expected;
+}
+
+static constexpr float COST_EPS = 1e-3f;
+
+// tokens of a step whose n drafts each pass with probability 1/2: the target's token plus 2^-1 + ... + 2^-n
+static float tokens_at_half(size_t n) {
+    return 2.0f - std::ldexp(1.0f, -(int) n);
+}
+
+// at p = 1/2 the full path pays for any cost up to tokens_at_half(LATTICE_DRAFTS) / tokens_at_half(KEEP_SHORT), ~1.0039
+static int run_keep_cases() {
+    const float break_even = tokens_at_half(LATTICE_DRAFTS) / tokens_at_half(KEEP_SHORT);
+    const keep_case cases[] = {
+        { "rule off",                        0.99f, 0.1f,  LATTICE_DRAFTS, 0,          1.4f,                  LATTICE_DRAFTS },
+        { "path no longer than n_short",     0.99f, 0.99f, 5,              KEEP_SHORT, 1.4f,                  5              },
+        { "confident path pays its cost",    0.99f, 0.99f, LATTICE_DRAFTS, KEEP_SHORT, 1.4f,                  LATTICE_DRAFTS },
+        { "fading path does not pay",        0.99f, 0.1f,  LATTICE_DRAFTS, KEEP_SHORT, 1.4f,                  KEEP_SHORT     },
+        { "no extra cost keeps every draft", 0.99f, 0.1f,  LATTICE_DRAFTS, KEEP_SHORT, 1.0f,                  LATTICE_DRAFTS },
+        { "cost just above break-even",      0.5f,  0.5f,  LATTICE_DRAFTS, KEEP_SHORT, break_even + COST_EPS, KEEP_SHORT     },
+        { "cost just below break-even",      0.5f,  0.5f,  LATTICE_DRAFTS, KEEP_SHORT, break_even - COST_EPS, LATTICE_DRAFTS },
+    };
+    int failures = 0;
+    for (const auto & c : cases) {
+        failures += run_keep_case(c) ? 0 : 1;
+    }
+    return failures;
+}
+
 static int expect(bool ok, const char * failure) {
     if (!ok) {
         fprintf(stderr, "FAIL: %s\n", failure);
@@ -853,12 +927,14 @@ int main() {
     printf("%s: CPU repacks Q4_0 %d (features: %s)\n", __func__, cpu_repacks_q4_0(), joined(cpu_features()).c_str());
 
     int failures = run_load_cases();
+    failures += run_keep_cases();
     failures += expect(check_dspine_detected(), "a DSpine draft is not reported by llama_model_is_dspine");
     failures += expect(check_lattice(1, BLOCK_SIZE), "DSpine lattice of one block does not match the reference");
     failures += expect(check_lattice(MAX_BLOCKS, BLOCK_SIZE), "DSpine lattice of two blocks in one ubatch does not match the reference");
     failures += expect(check_lattice(MAX_BLOCKS, PARTIAL_ROWS), "DSpine lattice of two blocks shorter than the block size does not match the reference");
     failures += expect(check_head_width_rejected(), "a target head wider than the DSpine codebook did not stop the draft context");
     failures += expect(check_spec_ubatch(), "the speculative setup did not check that the DSpine blocks fit one draft ubatch");
+    failures += expect(check_spec_n_short(), "the speculative setup did not check that --spec-draft-n-short has a lattice drafter");
     failures += expect(check_quantized_head(false) && check_quantized_head(true),
             "a quantized target head gave wrong scores, or a repacked one did not stop the draft context");
     failures += expect(check_quantized_draft(), "a repacked quantized DSpine bridge gave another lattice than the plain one");

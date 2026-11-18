@@ -236,3 +236,174 @@ __kernel void adreno_xmem_store_dst_f32(
     if (m + 2 < M) dst[x*M + m + 2] = (float)hv.s2;
     if (m + 3 < M) dst[x*M + m + 3] = (float)hv.s3;
 }
+
+__kernel void adreno_xmem_pack_src_f16(
+    __global const void * src_void,
+    ulong offset,
+    __write_only image2d_t src_img,
+    int K,
+    int N) {
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    const int kpack = K / 4;
+
+    if (x >= N || y >= kpack) {
+        return;
+    }
+
+    __global const half * src = (__global const half *)((__global const char *)src_void + offset);
+    const int base = x*K + y*4;
+    const half4 v = (half4)(src[base + 0], src[base + 1], src[base + 2], src[base + 3]);
+    write_imageh(src_img, (int2)(x, y), v);
+}
+
+__attribute__((qcom_max_concurrent_subgroups(12)))
+__kernel void kernel_gemm_xmem_f16_f32_os8_f32acc(
+    __constant half8 * weights_buffer __attribute__((sub_group_uniform)),
+    __constant half8 * xmem_buffer __attribute__((max_constant_size((6144)))),
+    __read_only image2d_t src_img,
+    __write_only image2d_t dst_img,
+    int N,
+    int npack,
+    int kpack) {
+    const int X = get_group_id(1)*get_local_size(0) + get_local_id(0);
+    const int Z = get_group_id(0)*get_local_size(2) + get_local_id(2);
+
+    if (Z*8 >= npack) {
+        return;
+    }
+
+    float4 r0 = (float4)(0.0f);
+    float4 r1 = (float4)(0.0f);
+    float4 r2 = (float4)(0.0f);
+    float4 r3 = (float4)(0.0f);
+    float4 r4 = (float4)(0.0f);
+    float4 r5 = (float4)(0.0f);
+    float4 r6 = (float4)(0.0f);
+    float4 r7 = (float4)(0.0f);
+
+    int f_offset = Z*kpack*32;
+    int subgroup_id = (int)(0x1F & qcom_get_physical_sub_group_id());
+    subgroup_id = subgroup_id % 12;
+    const int c_offset = subgroup_id*32;
+    __constant half16 * weights_cache = (__constant half16 *)&xmem_buffer[c_offset];
+
+    int coord_s = 0;
+    do {
+        const half4 src0 = read_imageh(src_img, smp_zero, (int2)(X, coord_s));
+        coord_s++;
+        const half4 src1 = read_imageh(src_img, smp_zero, (int2)(X, coord_s));
+        coord_s++;
+
+        qcom_sub_group_constant_load8(xmem_buffer, weights_buffer, c_offset, f_offset >> 1, 32);
+        f_offset += 64;
+        qcom_sub_group_sync(QCOM_CLK_CONST_LOAD_SYNC);
+
+        r0 += (float)src0.x * convert_float4(weights_cache[0].s0123);
+        r0 += (float)src0.y * convert_float4(weights_cache[0].s4567);
+        r0 += (float)src0.z * convert_float4(weights_cache[0].s89ab);
+        r0 += (float)src0.w * convert_float4(weights_cache[0].scdef);
+        r1 += (float)src0.x * convert_float4(weights_cache[1].s0123);
+        r1 += (float)src0.y * convert_float4(weights_cache[1].s4567);
+        r1 += (float)src0.z * convert_float4(weights_cache[1].s89ab);
+        r1 += (float)src0.w * convert_float4(weights_cache[1].scdef);
+        r2 += (float)src0.x * convert_float4(weights_cache[2].s0123);
+        r2 += (float)src0.y * convert_float4(weights_cache[2].s4567);
+        r2 += (float)src0.z * convert_float4(weights_cache[2].s89ab);
+        r2 += (float)src0.w * convert_float4(weights_cache[2].scdef);
+        r3 += (float)src0.x * convert_float4(weights_cache[3].s0123);
+        r3 += (float)src0.y * convert_float4(weights_cache[3].s4567);
+        r3 += (float)src0.z * convert_float4(weights_cache[3].s89ab);
+        r3 += (float)src0.w * convert_float4(weights_cache[3].scdef);
+        r4 += (float)src0.x * convert_float4(weights_cache[4].s0123);
+        r4 += (float)src0.y * convert_float4(weights_cache[4].s4567);
+        r4 += (float)src0.z * convert_float4(weights_cache[4].s89ab);
+        r4 += (float)src0.w * convert_float4(weights_cache[4].scdef);
+        r5 += (float)src0.x * convert_float4(weights_cache[5].s0123);
+        r5 += (float)src0.y * convert_float4(weights_cache[5].s4567);
+        r5 += (float)src0.z * convert_float4(weights_cache[5].s89ab);
+        r5 += (float)src0.w * convert_float4(weights_cache[5].scdef);
+        r6 += (float)src0.x * convert_float4(weights_cache[6].s0123);
+        r6 += (float)src0.y * convert_float4(weights_cache[6].s4567);
+        r6 += (float)src0.z * convert_float4(weights_cache[6].s89ab);
+        r6 += (float)src0.w * convert_float4(weights_cache[6].scdef);
+        r7 += (float)src0.x * convert_float4(weights_cache[7].s0123);
+        r7 += (float)src0.y * convert_float4(weights_cache[7].s4567);
+        r7 += (float)src0.z * convert_float4(weights_cache[7].s89ab);
+        r7 += (float)src0.w * convert_float4(weights_cache[7].scdef);
+
+        r0 += (float)src1.x * convert_float4(weights_cache[8].s0123);
+        r0 += (float)src1.y * convert_float4(weights_cache[8].s4567);
+        r0 += (float)src1.z * convert_float4(weights_cache[8].s89ab);
+        r0 += (float)src1.w * convert_float4(weights_cache[8].scdef);
+        r1 += (float)src1.x * convert_float4(weights_cache[9].s0123);
+        r1 += (float)src1.y * convert_float4(weights_cache[9].s4567);
+        r1 += (float)src1.z * convert_float4(weights_cache[9].s89ab);
+        r1 += (float)src1.w * convert_float4(weights_cache[9].scdef);
+        r2 += (float)src1.x * convert_float4(weights_cache[10].s0123);
+        r2 += (float)src1.y * convert_float4(weights_cache[10].s4567);
+        r2 += (float)src1.z * convert_float4(weights_cache[10].s89ab);
+        r2 += (float)src1.w * convert_float4(weights_cache[10].scdef);
+        r3 += (float)src1.x * convert_float4(weights_cache[11].s0123);
+        r3 += (float)src1.y * convert_float4(weights_cache[11].s4567);
+        r3 += (float)src1.z * convert_float4(weights_cache[11].s89ab);
+        r3 += (float)src1.w * convert_float4(weights_cache[11].scdef);
+        r4 += (float)src1.x * convert_float4(weights_cache[12].s0123);
+        r4 += (float)src1.y * convert_float4(weights_cache[12].s4567);
+        r4 += (float)src1.z * convert_float4(weights_cache[12].s89ab);
+        r4 += (float)src1.w * convert_float4(weights_cache[12].scdef);
+        r5 += (float)src1.x * convert_float4(weights_cache[13].s0123);
+        r5 += (float)src1.y * convert_float4(weights_cache[13].s4567);
+        r5 += (float)src1.z * convert_float4(weights_cache[13].s89ab);
+        r5 += (float)src1.w * convert_float4(weights_cache[13].scdef);
+        r6 += (float)src1.x * convert_float4(weights_cache[14].s0123);
+        r6 += (float)src1.y * convert_float4(weights_cache[14].s4567);
+        r6 += (float)src1.z * convert_float4(weights_cache[14].s89ab);
+        r6 += (float)src1.w * convert_float4(weights_cache[14].scdef);
+        r7 += (float)src1.x * convert_float4(weights_cache[15].s0123);
+        r7 += (float)src1.y * convert_float4(weights_cache[15].s4567);
+        r7 += (float)src1.z * convert_float4(weights_cache[15].s89ab);
+        r7 += (float)src1.w * convert_float4(weights_cache[15].scdef);
+    } while (coord_s < kpack);
+
+    // Keep all lanes active until the subgroup loads and syncs are done.
+    if (X >= N) {
+        return;
+    }
+
+    int coord_s_out = Z*8;
+    if (coord_s_out < npack) { write_imagef(dst_img, (int2)(X, coord_s_out), r0); coord_s_out++; }
+    if (coord_s_out < npack) { write_imagef(dst_img, (int2)(X, coord_s_out), r1); coord_s_out++; }
+    if (coord_s_out < npack) { write_imagef(dst_img, (int2)(X, coord_s_out), r2); coord_s_out++; }
+    if (coord_s_out < npack) { write_imagef(dst_img, (int2)(X, coord_s_out), r3); coord_s_out++; }
+    if (coord_s_out < npack) { write_imagef(dst_img, (int2)(X, coord_s_out), r4); coord_s_out++; }
+    if (coord_s_out < npack) { write_imagef(dst_img, (int2)(X, coord_s_out), r5); coord_s_out++; }
+    if (coord_s_out < npack) { write_imagef(dst_img, (int2)(X, coord_s_out), r6); coord_s_out++; }
+    if (coord_s_out < npack) { write_imagef(dst_img, (int2)(X, coord_s_out), r7); }
+}
+
+__kernel void adreno_xmem_store_dst_f32_t(
+    __read_only image2d_t dst_img,
+    __global void * dst_void,
+    ulong offset,
+    int M,
+    int N,
+    int N_full,
+    int n0) {
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    const int npack = (M + 3) / 4;
+
+    if (x >= N || y >= npack) {
+        return;
+    }
+
+    __global float * dst = (__global float *)((__global char *)dst_void + offset);
+    const float4 hv = read_imagef(dst_img, smp_zero, (int2)(x, y));
+    const int  m   = y*4;
+    const long col = (long)n0 + (long)x;
+    if (m + 0 < M) dst[(long)(m + 0)*N_full + col] = hv.s0;
+    if (m + 1 < M) dst[(long)(m + 1)*N_full + col] = hv.s1;
+    if (m + 2 < M) dst[(long)(m + 2)*N_full + col] = hv.s2;
+    if (m + 3 < M) dst[(long)(m + 3)*N_full + col] = hv.s3;
+}

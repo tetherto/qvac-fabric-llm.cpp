@@ -9379,6 +9379,27 @@ static bool init_mul_mat_id_adreno_repack_tensors(ggml_context * ctx, int n_mats
     return roundtrip_ok;
 }
 
+// GGML_OP_MUL_MAT with f16 operands whose dot products exceed the fp16 range
+struct test_mul_mat_f16_large_sums : public test_mul_mat {
+    static constexpr float operand_min = 8.0f;
+    static constexpr float operand_max = 16.0f;
+    static constexpr const char * float_accumulating_reg = "OpenCL";
+
+    test_mul_mat_f16_large_sums(int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, m, n, k, {1, 1}, {1, 1}) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, operand_min, operand_max);
+        }
+    }
+
+    bool skip_backend(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), float_accumulating_reg) != 0;
+    }
+};
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -12928,6 +12949,7 @@ struct test_group_norm_mul_add : public test_case {
     const std::array<int64_t, 4> ne;
     int num_groups;
     float eps;
+    bool channel_affine;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -12937,21 +12959,24 @@ struct test_group_norm_mul_add : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, num_groups, eps);
+        return VARS_TO_STR4(type, ne, num_groups, eps) + (channel_affine ? "," + VARS_TO_STR1(channel_affine) : "");
     }
 
     test_group_norm_mul_add(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {128, 1, 1, 1},
             int num_groups = 4,
-            float eps = 1e-5f)
-        : type(type), ne(ne), num_groups(num_groups), eps(eps) {}
+            float eps = 1e-5f,
+            bool channel_affine = false)
+        : type(type), ne(ne), num_groups(num_groups), eps(eps), channel_affine(channel_affine) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        const std::array<int64_t, 4> ne_affine = channel_affine ? std::array<int64_t, 4>{1, 1, ne[2], 1} : ne;
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_tensor * w = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor(ctx, type, 4, ne_affine.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_affine.data());
         ggml_set_param(a); ggml_set_param(w); ggml_set_param(b);
         ggml_set_name(a, "a"); ggml_set_name(w, "w"); ggml_set_name(b, "b");
+        a = ggml_add(ctx, ggml_add(ctx, a, w), b);
         ggml_tensor * n = ggml_group_norm(ctx, a, num_groups, eps);
         ggml_tensor * m = ggml_mul(ctx, n, w);
         ggml_tensor * out = ggml_add(ctx, m, b);
@@ -16697,6 +16722,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  4096, 128, 896, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  2304, 100, 136, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 20000,  64,  64, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_f16_large_sums(4096, 256, 768));
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
@@ -16975,6 +17005,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 63,  5, 2304, {3, 2}, {2, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K,  GGML_TYPE_F32, 64, 13, 4608, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 63,  5, 4608, {3, 2}, {2, 2}));
+    // Q6_K at 16 rows: 9-block rows alternate 4- and 2-byte aligned blocks, the view of 11-block rows alternates the row starts
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 1000, 16, 2304, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 1000, 16, 2304, {1, 1}, {1, 1}, {0, 1, 2, 3}, 2816));
     // partial column group, broadcast, padded rows, src1 in [0, 1], src0 in a weights buffer
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 1000,  5, 4608, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   64, 13, 4608, {3, 2}, {2, 2}));
@@ -17908,8 +17941,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 33, 256, 1, 1 }));
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {64, 64, 320, 1}));
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {9, 9, 1280, 1}));
+    test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {64, 64, 320, 2}));
     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {64, 64, 320, 1}));
     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {9, 9, 1280, 1}));
+    test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {64, 64, 320, 2}));
+    test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {64, 64, 320, 1}, 32, 1e-6f, true));
+    test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {64, 64, 320, 2}, 32, 1e-6f, true));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, -1));
@@ -18104,6 +18141,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : {247, 256}) {
             test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {1, 1}, n, n, false, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
             test_cases.emplace_back(new test_flash_attn_ext(80, 80, 8, {1, 1}, n, n, false, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+        for (bool mask : {false, true}) {
+            test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {1, 1}, 256, 4100, mask, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
         // n_q not a multiple of the query tile and n_kv leaving a partial final
         // KV tile for any pow2 tile size (513 = 16*32 + 1): out-of-range query

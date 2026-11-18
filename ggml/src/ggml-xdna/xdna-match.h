@@ -4,6 +4,7 @@
 // test-xdna-match checks them against the shapes llama's graph code makes.
 
 #include "ggml.h"
+#include "xdna-quant.h"
 
 #include <cstring>
 #include <string>
@@ -16,6 +17,22 @@ static inline const ggml_tensor * xdna_rec_state_gather(const ggml_tensor * n) {
     }
     const ggml_tensor * g = n->src[0];
     return n->op == GGML_OP_VIEW && n->view_offs == 0 && g && g->op == GGML_OP_GET_ROWS ? g : nullptr;
+}
+
+// The in-place read of a recurrent state (build_rs with in_place): a view of whole rows of the cache itself, else null.
+// A CPY's destination view has the same shape: the caller tells them apart by the reader.
+static inline const ggml_tensor * xdna_rec_state_view(const ggml_tensor * n) {
+    const ggml_tensor * c = n ? n->view_src : nullptr;
+    if (!n || n->op != GGML_OP_VIEW || !c || c->op != GGML_OP_NONE || c->type != n->type || n->ne[0] != c->ne[0] ||
+        n->nb[1] != c->nb[1] || !ggml_is_contiguous(n) || n->view_offs % c->nb[1] != 0) {
+        return nullptr;
+    }
+    return n;
+}
+
+// The cache row an in-place state read (xdna_rec_state_view) starts at: the cell of its first sequence.
+static inline int64_t xdna_rec_state_view_row(const ggml_tensor * n) {
+    return (int64_t) (n->view_offs / n->nb[1]);
 }
 
 // A GET_ROWS of the one row of a one-row tensor is that tensor: llama crops the
@@ -67,6 +84,30 @@ static inline const ggml_tensor * xdna_fused_uncovered(const ggml_tensor * const
     for (int i = 0; i < n_nodes; i++) {
         if (const ggml_tensor * w = xdna_fused_uncovered_src(nodes[i], gated_fmt)) {
             return w;
+        }
+    }
+    return nullptr;
+}
+
+// Whether the fused decode's GEMV reads weight `w`: a recurrent layer's in-projection (attn_qkv, attn_gate) and, with
+// the attention tails on (`tail`), an attention layer's attn_output, in a type it packs (Q4_K, Q5_K or Q6_K). Every
+// other tensor passes.
+static inline bool xdna_fused_gemv_ok(const ggml_tensor * w, bool tail) {
+    const char * name = ggml_get_name(w);
+    const bool   read = xdna_name_ends(name, ".attn_qkv.weight") || xdna_name_ends(name, ".attn_gate.weight") ||
+                        (tail && xdna_name_ends(name, ".attn_output.weight"));
+    return !read || xdna_wfmt_gemv_for(xdna_gemv_type_of(w)) != XDNA_WFMT_NONE;
+}
+
+// The first weight of these nodes the fused decode's GEMV does not read (xdna_fused_gemv_ok), or null.
+static inline const ggml_tensor * xdna_fused_gemv_uncovered(const ggml_tensor * const * nodes, int n_nodes, bool tail) {
+    for (int i = 0; i < n_nodes; i++) {
+        const ggml_tensor * n = nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC && n->src[s]; s++) {
+            const ggml_tensor * w = n->src[s];
+            if (w->op == GGML_OP_NONE && !xdna_fused_gemv_ok(w, tail)) {
+                return w;
+            }
         }
     }
     return nullptr;

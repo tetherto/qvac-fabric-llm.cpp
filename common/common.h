@@ -332,6 +332,13 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    // lattice drafters (DFlash2, DSpine, LiliCorr): keep only n_short drafts unless the longer draft's expected tokens
+    // pay for long_cost, the cost of a step with more than n_short drafts relative to one with n_short (0 = keep all)
+    int32_t n_short   = 0;
+    float   long_cost = 1.0f;
+
+    bool n_auto = false; // server: pick the draft length (up to n_max) per step
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
@@ -594,10 +601,10 @@ struct common_params {
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
-    bool coreml_ffn        = false; // run part of each Qwen3.8-27B FFN on the Neural Engine
+    bool coreml_ffn        = false; // run part of each supported Qwen prefill FFN through Core ML
     std::string coreml_ffn_cache;   // compiled Core ML FFN programs, empty = <cache dir>/coreml-ffn
-    int32_t coreml_ffn_metal    = 0; // Metal channels per FFN, 0 = library default
-    int32_t coreml_ffn_packages = 0; // Core ML programs per FFN, 0 = library default
+    int32_t coreml_ffn_metal    = 0; // Metal channels per FFN, 0 = automatic selection
+    int32_t coreml_ffn_packages = 0; // Core ML programs per FFN, 0 = automatic selection
     bool training          = false; // build the context for training (see llama_opt_init)
     bool prefetch_weights      = false; // prefetch weight transfers to overlap CPU->GPU copies with compute
     bool prefetch_weights_auto = true;  // enable weight prefetch when fitting a dense model
