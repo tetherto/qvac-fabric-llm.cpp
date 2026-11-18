@@ -3449,6 +3449,10 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context &          ctx,
     }
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if ((activation == nullptr || activation->src1_written) && ggml_cuda_should_use_mmq_few_repacked(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_q_few_repacked(ctx, src0, src1, dst);
+        return true;
+    }
     if (ggml_cuda_repacked_mmvq_supported(src0, src1, dst, cc) &&
         ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1])) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
@@ -5697,6 +5701,11 @@ static bool ggml_cuda_match_mlp_bf16(const ggml_cgraph * cgraph, int i, ggml_cud
                                                                                   ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         return false;
     }
+    // the few-row MMQ takes these column counts
+    if (ggml_cuda_should_use_mmq_few_repacked(cgraph->nodes[i]->src[0], cgraph->nodes[i]->src[1], cgraph->nodes[i],
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        return false;
+    }
 
     const ggml_op ops[] = {
         GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_GLU, GGML_OP_MUL_MAT,
@@ -6477,11 +6486,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
                 break;
             }
 
-            // cuBLASLt only above the mat-vec range: an unfused MMVF + scale is faster there
+            // cuBLASLt only above the mat-vec and few-row MMQ ranges: an unfused MMVF or few-row MMQ + scale is faster there
             if (op == GGML_OP_MUL_MAT && !with_bias && src0->type == GGML_TYPE_F8_E4M3 &&
                     ggml_get_op_params_i32(mm_node, 3) != GGML_PREC_F32 &&
                     !ggml_cuda_should_use_mmvf(src0, ggml_cuda_info().devices[cuda_ctx->device].cc,
-                        ggml_cuda_info().devices[cuda_ctx->device].warp_size, src1->ne[1])) {
+                        ggml_cuda_info().devices[cuda_ctx->device].warp_size, src1->ne[1]) &&
+                    !ggml_cuda_should_use_mmq_few(src0, src1, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
                 const ggml_cuda_cutlass_activation * activation =
                     activation_plan != nullptr ? ggml_cuda_activation_plan_prepare(*activation_plan, *cuda_ctx, mm_node) : nullptr;
                 const bool prequantized = activation != nullptr && activation->type == GGML_TYPE_F8_E4M3;
@@ -7051,6 +7061,12 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
         if (node->op != GGML_OP_MUL_MAT || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || node->src[0] == nullptr ||
             node->src[1] == nullptr || (node->src[0]->type != GGML_TYPE_NVFP4 && node->src[0]->type != GGML_TYPE_F8_E4M3) ||
             ggml_nrows(node->src[1]) <= ggml_cuda_repacked_mmvq_max_batch(node->src[0]->type, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            continue;
+        }
+        // the few-row MMQ quantizes its own src1
+        if (node->src[0]->type == GGML_TYPE_F8_E4M3 ?
+                ggml_cuda_should_use_mmq_few(node->src[0], node->src[1], ggml_cuda_info().devices[cuda_ctx->device].cc) :
+                ggml_cuda_should_use_mmq_few_repacked(node->src[0], node->src[1], node, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
             continue;
         }
 

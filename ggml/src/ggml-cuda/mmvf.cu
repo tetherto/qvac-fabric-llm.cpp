@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "mmvf.cuh"
 #include "mmf.cuh"
+#include "mmq-few.cuh"
 #include "convert.cuh"
 
 static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t * x, const int col2) {
@@ -979,6 +980,13 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
             }
             return ne11 <= MMVF_MAX_BATCH_SIZE;
         case GGML_TYPE_F8_E4M3:
+            // the few-row MMQ, where it takes F8_E4M3, multiplies all columns with one e4m3 MMA per weight value
+            {
+                const int few_min = ggml_cuda_mmq_few_min_ncols(type, cc, src0_ne[0]);
+                if (few_min > 0 && ne11 >= few_min) {
+                    return false;
+                }
+            }
             // MMVF reads the src1 columns once per weight row; with fast memory the cuBLASLt FP8 GEMM, which reads
             // each weight once for all columns, is faster from 3 columns on (H100) or 5 (RTX 5090)
             if (cc == GGML_CUDA_CC_HOPPER) {

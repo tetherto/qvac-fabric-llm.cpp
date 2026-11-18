@@ -18304,6 +18304,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 4608, {1, 1}, {1, 1}));
         }
     }
+    // few-row MMQ for F8_E4M3 and CUTLASS repacked NVFP4, where enabled: 1-3 column groups, 32-row tiles (6170 rows);
+    // canonical NVFP4 must stay on its other paths
+    for (int64_t n : {2, 3, 4, 7, 8, 13, 16, 17, 24}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8_E4M3, GGML_TYPE_F32, 1000, n, 4608, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_repacked_mul_mat(GGML_TYPE_NVFP4, 1000, n, 4608));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_NVFP4, GGML_TYPE_F32, 1000, n, 4608, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8_E4M3, GGML_TYPE_F32, 6170, 13, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_repacked_mul_mat(GGML_TYPE_NVFP4, 6170, 13, 2048));
+    test_cases.emplace_back(new test_repacked_mul_mat(GGML_TYPE_NVFP4, 6170, 21, 4608));
     // K not a multiple of 256 in 16 byte aligned rows: the few-row MMQ must decline these views
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 8, 2080, {1, 1}, {1, 1}, {0, 1, 2, 3}, 2304));
