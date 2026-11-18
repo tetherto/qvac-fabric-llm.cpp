@@ -27,10 +27,14 @@ extern "C" {
 //     temp-11018: 111).
 // 115 adds GATED_DELTA_NET_DEFERRED and GDN_CONV_DEFERRED to the ggml_op enum
 //     (b12032 fork: 113, temp-11259: 112).
+// 116 is the b12032 fork's 114, which renumbers ops and types for upstream
+//     b12032. b12429 already has those ids, so no id moves on this line; the
+//     number is taken so majors stay two up from the b12032 fork.
+// 117 moves the TBQ/PQ types from 44-51 to 52-59 (b12032 fork: 115).
 // A minor bump is additive: the client still accepts a server with an older
 // minor and must gate every command introduced by a later minor on the minor
 // the server announces at HELLO.
-#define RPC_PROTO_MAJOR_VERSION    115
+#define RPC_PROTO_MAJOR_VERSION    117
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
@@ -39,7 +43,7 @@ extern "C" {
 // below it; the TBQ/PQ family can move without changing the count, so check
 // its first id instead.
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 125, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 125, "GGML_OP_COUNT has changed - update RPC_PROTO_MAJOR_VERSION");
 static_assert(GGML_TYPE_TBQ3_0 == 52, "GGML_TYPE_TBQ3_0 has moved - update RPC_PROTO_MAJOR_VERSION");
 #endif
 
