@@ -414,6 +414,13 @@ static bool ggml_cuda_mm_small_disabled() {
     return disabled;
 }
 
+// GGML_CUDA_DISABLE_MM_BIAS_GELU=1 keeps a GELU_ERF after the fused cuBLAS F16 MUL_MAT + ADD as its own
+// node, to A/B the GELU part alone. The MUL_MAT + ADD fusion stays on.
+static bool ggml_cuda_mm_bias_gelu_disabled() {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_MM_BIAS_GELU");
+    return disabled;
+}
+
 #ifdef GGML_CUDA_NVRTC_FUSION
 // GGML_CUDA_DISABLE_FUSION turns the generated kernels off as well
 static bool ggml_cuda_nvrtc_active() {
@@ -2158,10 +2165,27 @@ static __global__ void k_compute_batched_ptrs(
     ptrs_dst[0*ne23 + i12 + i13*ne12] = (      char *)         dst + i12*nbd2 + i13*nbd3;
 }
 
+// a + b as one rounded F32 add that the compiler cannot merge with the arithmetic around it: the value
+// an ADD node stores before a separate GELU_ERF kernel reads it. Same guard as norm_mul_add in norm.cu.
+static __device__ __forceinline__ float row_bias_add_exact(const float a, const float b) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#    pragma clang fp contract(off)
+    return a + b;
+#else
+    return __fadd_rn(a, b);
+#endif
+}
+
 // The cuBLAS F16 path leaves its result in a half temporary and converts it to the F32 dst.
 // These kernels do that conversion and add bias[row] in the same pass, for a following ADD of
 // a per-row bias that is fused into the matmul. The sum is the F32 add the unfused ADD does,
 // so the result has the same bits.
+// gelu_erf: a GELU_ERF node after the ADD is fused too and its result is what gets stored. For the same
+// bits as the GELU_ERF op, the sum goes through row_bias_add_exact and the GELU is the device function
+// of unary.cu. That call has no contraction pragma around it on purpose: unary.cu compiles the
+// expression with the compiler default, which lets nvcc and hipcc contract, and here it must be compiled
+// the same way. The clang pragma is lexical, so the one in row_bias_add_exact does not reach it.
+template <bool gelu_erf = false>
 static __global__ void k_half_to_float_add_row_bias(
         const half * __restrict__ x, const float * __restrict__ bias, float * __restrict__ dst,
         const uint32_t n, const uint3 nrows) {
@@ -2171,12 +2195,18 @@ static __global__ void k_half_to_float_add_row_bias(
         return;
     }
 
-    dst[i] = ggml_cuda_cast<float>(x[i]) + bias[fastmodulo(i, nrows)];
+    if constexpr (gelu_erf) {
+        dst[i] =
+            ggml_cuda_op_gelu_erf_single(row_bias_add_exact(ggml_cuda_cast<float>(x[i]), bias[fastmodulo(i, nrows)]));
+    } else {
+        dst[i] = ggml_cuda_cast<float>(x[i]) + bias[fastmodulo(i, nrows)];
+    }
 }
 
 template <typename T> struct alignas(sizeof(T)*4) row_bias_vec4 { T v[4]; };
 
 // four elements per thread, as convert_unary_cont_vec4
+template <bool gelu_erf = false>
 static __global__ void k_half_to_float_add_row_bias_vec4(
         const half * __restrict__ x, const float * __restrict__ bias, float * __restrict__ dst,
         const uint32_t n4, const uint3 nrows4) {
@@ -2192,7 +2222,11 @@ static __global__ void k_half_to_float_add_row_bias_vec4(
     row_bias_vec4<float> yv;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        yv.v[j] = ggml_cuda_cast<float>(xv.v[j]) + bv.v[j];
+        if constexpr (gelu_erf) {
+            yv.v[j] = ggml_cuda_op_gelu_erf_single(row_bias_add_exact(ggml_cuda_cast<float>(xv.v[j]), bv.v[j]));
+        } else {
+            yv.v[j] = ggml_cuda_cast<float>(xv.v[j]) + bv.v[j];
+        }
     }
 
     ((row_bias_vec4<float> *) dst)[i] = yv;
@@ -2200,6 +2234,7 @@ static __global__ void k_half_to_float_add_row_bias_vec4(
 
 // x and dst hold n elements in columns of nrows, bias holds nrows.
 // The kernels index with uint32_t: the caller keeps n below INT32_MAX.
+template <bool gelu_erf>
 static void ggml_cuda_half_to_float_add_row_bias(
         const half * x, const float * bias, float * dst, const int64_t n, const int64_t nrows, cudaStream_t stream) {
     GGML_ASSERT(n <= INT32_MAX);
@@ -2210,13 +2245,13 @@ static void ggml_cuda_half_to_float_add_row_bias(
         (uintptr_t) dst  % alignof(row_bias_vec4<float>) == 0) {
         const int64_t n4 = n/4;
         const int64_t num_blocks = (n4 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
-        k_half_to_float_add_row_bias_vec4<<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+        k_half_to_float_add_row_bias_vec4<gelu_erf><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
             x, bias, dst, (uint32_t) n4, init_fastdiv_values(nrows/4));
         return;
     }
 
     const int64_t num_blocks = (n + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
-    k_half_to_float_add_row_bias<<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+    k_half_to_float_add_row_bias<gelu_erf><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
         x, bias, dst, (uint32_t) n, init_fastdiv_values(nrows));
 }
 
@@ -2273,13 +2308,17 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
 
 // bias: optional F32 tensor of dst->ne[0] elements added to every dst column. Only for the F16 path
 // that converts a half temporary to dst, see ggml_cuda_should_fuse_mul_mat_cublas_bias.
+// gelu_erf: optional, with a bias only. A contiguous F32 tensor of as many elements as dst that takes
+// GELU_ERF of the biased result. dst then only gives the shape and is not written,
+// see ggml_cuda_find_mul_mat_cublas_bias_gelu_erf.
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-                                          const ggml_tensor * bias = nullptr) {
+                                          const ggml_tensor * bias = nullptr, const ggml_tensor * gelu_erf = nullptr) {
     using traits = batched_mul_mat_traits<compute_type>;
     using cuda_t = typename traits::cuda_type;
 
     GGML_ASSERT(bias == nullptr || compute_type == GGML_TYPE_F16);
+    GGML_ASSERT(gelu_erf == nullptr || bias != nullptr);
 
     // F32 chunks can have padding between rows to preserve the original destination stride.
     GGML_ASSERT(ggml_is_contiguous(dst) ||
@@ -2485,15 +2524,20 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     // Convert output back to F32 if needed
     if (cu_data_type != CUDA_R_32F) {
-        if (bias != nullptr) {
-            ggml_cuda_half_to_float_add_row_bias(
+        if (gelu_erf != nullptr) {
+            GGML_ASSERT(gelu_erf->type == GGML_TYPE_F32 && ggml_is_contiguous(gelu_erf) &&
+                        ggml_nelements(gelu_erf) == ne_dst);
+            ggml_cuda_half_to_float_add_row_bias<true>((const half *) dst_temp.get(), (const float *) bias->data,
+                                                       (float *) gelu_erf->data, ne_dst, ne0, main_stream);
+        } else if (bias != nullptr) {
+            ggml_cuda_half_to_float_add_row_bias<false>(
                 (const half *) dst_temp.get(), (const float *) bias->data, dst_ddf, ne_dst, ne0, main_stream);
         } else {
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
             to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
         }
     } else {
-        GGML_ASSERT(bias == nullptr);
+        GGML_ASSERT(bias == nullptr && gelu_erf == nullptr);
     }
 }
 
@@ -5199,6 +5243,59 @@ static int ggml_cuda_find_mul_mat_cublas_bias(const ggml_cgraph * cgraph, const 
     return add_idx;
 }
 
+// Returns the index of a GELU_ERF that can be fused after the MUL_MAT at mm_idx and its fused ADD at
+// add_idx (see ggml_cuda_find_mul_mat_cublas_bias), or -1 to fuse only those two.
+// The GELU is the node after the ADD, or the one after a RESHAPE of the ADD. The fused kernel stores
+// the GELU result only, so the ADD result must have no other reader: not a second node, not a graph
+// output, not another view of it.
+static int ggml_cuda_find_mul_mat_cublas_bias_gelu_erf(const ggml_cgraph * cgraph,
+                                                       const int           mm_idx,
+                                                       const int           add_idx) {
+    if (ggml_cuda_mm_bias_gelu_disabled() || add_idx + 1 >= cgraph->n_nodes) {
+        return -1;
+    }
+
+    const ggml_tensor * add = cgraph->nodes[add_idx];
+    if (!ggml_node_has_n_uses(cgraph, add_idx, 1)) {
+        return -1;
+    }
+
+    int                 gelu_idx = add_idx + 1;
+    const ggml_tensor * gelu_src = add;
+    const ggml_tensor * next     = cgraph->nodes[gelu_idx];
+    if (next->op == GGML_OP_RESHAPE && next->src[0] == add) {
+        // The reshape is the one reader of the ADD and computes nothing. It is a view, which
+        // ggml_node_has_n_uses rejects, so the same conditions are checked here one by one. Any other
+        // view of the ADD has the ADD or this reshape as a src and shows up in a use count.
+        if (next->view_src != add || (next->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+            (next->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_node_get_use_count(cgraph, gelu_idx) != 1 ||
+            add_idx + 2 >= cgraph->n_nodes) {
+            return -1;
+        }
+        gelu_src = next;
+        gelu_idx = add_idx + 2;
+    }
+
+    const ggml_tensor * gelu = cgraph->nodes[gelu_idx];
+    if (gelu->op != GGML_OP_UNARY || ggml_get_unary_op(gelu) != GGML_UNARY_OP_GELU_ERF || gelu->src[0] != gelu_src ||
+        (gelu->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return -1;
+    }
+    // A reshape keeps the element order of the contiguous ADD result, so a contiguous GELU dst of
+    // the same size takes the elements in the order the kernel writes them, whatever its shape.
+    if (gelu->type != GGML_TYPE_F32 || !ggml_is_contiguous(gelu) || ggml_nelements(gelu) != ggml_nelements(add)) {
+        return -1;
+    }
+
+    // the GELU dst may be the ADD's own memory (in place), but must not cover any input of the chain
+    const int out_nodes[] = { gelu_idx };
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, mm_idx, gelu_idx - mm_idx + 1, out_nodes, 1)) {
+        return -1;
+    }
+
+    return gelu_idx;
+}
+
 static const ggml_tensor * ggml_cuda_get_mul_mat_scale(const ggml_tensor * scale_node, const ggml_tensor * mm_node) {
     const bool scale_lhs_mm = scale_node->src[0] == mm_node;
     const bool scale_rhs_mm = scale_node->src[1] == mm_node;
@@ -6115,11 +6212,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
         return fused_node_count - 1;
     }
 
-    // mul_mat (cuBLAS F16) + add of a per-row bias
+    // mul_mat (cuBLAS F16) + add of a per-row bias, and a GELU_ERF of the sum when one follows
     if (const int add_idx = ggml_cuda_find_mul_mat_cublas_bias(cgraph, i); add_idx >= 0) {
-        ggml_tensor * add = cgraph->nodes[add_idx];
-        ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(*cuda_ctx, node->src[0], node->src[1], add, add->src[1]);
-        return add_idx - i;
+        ggml_tensor *       add      = cgraph->nodes[add_idx];
+        const int           gelu_idx = ggml_cuda_find_mul_mat_cublas_bias_gelu_erf(cgraph, i, add_idx);
+        const ggml_tensor * gelu     = gelu_idx >= 0 ? cgraph->nodes[gelu_idx] : nullptr;
+        ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(*cuda_ctx, node->src[0], node->src[1], add, add->src[1], gelu);
+        return (gelu_idx >= 0 ? gelu_idx : add_idx) - i;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {

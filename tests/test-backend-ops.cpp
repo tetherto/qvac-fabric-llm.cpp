@@ -4316,6 +4316,57 @@ struct test_mul_mat_bias : public test_case {
     }
 };
 
+// nn.Linear + GELU: GGML_OP_MUL_MAT + GGML_OP_ADD of a per-row bias + GGML_UNARY_OP_GELU_ERF
+struct test_mul_mat_bias_gelu_erf : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const std::array<int64_t, 2> bs; // dims 3 and 4 of b
+    const bool reshape;              // a RESHAPE between the ADD and the GELU
+    const bool add_reused;           // the ADD result has a second reader, so it has to be stored
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_BIAS_GELU_ERF";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, m, n, k, bs, reshape, add_reused);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4; // as test_mul_mat
+    }
+
+    test_mul_mat_bias_gelu_erf(ggml_type type_a = GGML_TYPE_F16, int64_t m = 32, int64_t n = 64, int64_t k = 32,
+            std::array<int64_t, 2> bs = {1, 1}, bool reshape = false, bool add_reused = false)
+        : type_a(type_a), m(m), n(n), k(k), bs(bs), reshape(reshape), add_reused(add_reused) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // C^T = A * B^T: (k, m) * (k, n) => (m, n)
+        ggml_tensor * a    = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k, n, bs[0], bs[1]);
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_set_name(a, "a"); ggml_set_name(b, "b"); ggml_set_name(bias, "bias");
+
+        ggml_tensor * lin = ggml_add(ctx, ggml_mul_mat(ctx, a, b), bias);
+        ggml_tensor * x   = lin;
+        if (reshape) {
+            // every column of every matrix as one token, [m, 1, tokens]: never the shape of lin
+            x = ggml_reshape_3d(ctx, lin, m, 1, n*bs[0]*bs[1]);
+        }
+        ggml_tensor * out = ggml_gelu_erf(ctx, x);
+        if (add_reused) {
+            out = ggml_add(ctx, out, x);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_NORM/RMS_NORM + GGML_OP_SCALE
 struct test_norm_scale : public test_case {
     const ggml_type type;
@@ -17060,6 +17111,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat_bias(type_a, 384, 5581, 1536, { 1, 1 }, false)); // ViT-S MLP down at 90x62 patches
         test_cases.emplace_back(new test_mul_mat_bias(type_a,  16,    1,   32, { 1, 1 }, false)); // one column: mat-vec, bias same shape
+    }
+
+    // the same with a GELU_ERF after the ADD: 37 rows for the scalar kernel, 128 for four elements per thread
+    for (ggml_type type_a : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (int64_t m : { 37, 128 }) {
+            for (bool reshape : { false, true }) {
+                test_cases.emplace_back(new test_mul_mat_bias_gelu_erf(type_a, m, 300, 64, { 1, 1 }, reshape));
+                test_cases.emplace_back(new test_mul_mat_bias_gelu_erf(type_a, m,  33, 64, { 5, 3 }, reshape));
+                // the sum is read a second time, past the reshape too: the GELU must stay its own node
+                test_cases.emplace_back(new test_mul_mat_bias_gelu_erf(type_a, m, 300, 64, { 1, 1 }, reshape, true));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_bias_gelu_erf(type_a, 1536, 5581, 384, { 1, 1 }, true)); // ViT-S MLP up at 90x62 patches
     }
 
     // many small F32 products: a contraction (k) of at most 32, at most 32 columns (n), and at least 1024 CUDA threads,
