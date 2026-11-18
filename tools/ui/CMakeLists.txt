@@ -17,6 +17,8 @@ if(DEFINED LLAMA_WEBUI_HF_BUCKET)
     message(DEPRECATION "LLAMA_WEBUI_HF_BUCKET is deprecated, use LLAMA_UI_HF_BUCKET instead")
 endif()
 
+set(LLAMA_UI_BASE_VERSION "b11739" CACHE STRING "UI asset version of the upstream release this branch is based on, the fallback before latest")
+
 # Resolve HF asset version: explicit env var > upstream base tag > LLAMA_UI_BASE_VERSION
 if(DEFINED ENV{HF_WEBUI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_WEBUI_VERSION}")
@@ -29,9 +31,9 @@ else()
     # then 404s and falls back to 'latest', whose newer-era dist is missing assets this
     # tree's llama-ui-embed requires (loading.html) and the build fails. Pin to the
     # nearest reachable upstream release tag instead. Shallow CI clones and tarballs reach no
-    # tag, and 'latest' moved to a dist layout this tree cannot embed, so they take the
-    # upstream release this branch is based on (bump it with each upstream sync).
-    set(LLAMA_UI_BASE_VERSION "b11739" CACHE STRING "UI asset version when no upstream b<N> tag is reachable")
+    # tag, and the fork's own tags can name an unpublished version, while 'latest' moved to a
+    # dist layout this tree cannot embed, so both fall back to the upstream release this branch
+    # is based on, LLAMA_UI_BASE_VERSION (bump it with each upstream sync).
     execute_process(
         COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" describe --tags --abbrev=0 --match "b[0-9]*"
         OUTPUT_VARIABLE UPSTREAM_BASE_TAG
@@ -66,6 +68,7 @@ add_custom_target(llama-ui-assets ALL
         "-DLLAMA_BUILD_NUMBER=${LLAMA_BUILD_NUMBER}"
         "-DHF_BUCKET=${LLAMA_UI_HF_BUCKET}"
         "-DHF_VERSION=${HF_UI_VERSION}"
+        "-DHF_FALLBACK_VERSION=${LLAMA_UI_BASE_VERSION}"
         "-DHF_ENABLED=${LLAMA_USE_PREBUILT_UI}"
         "-DBUILD_UI=${LLAMA_BUILD_UI}"
         "-DLLAMA_UI_GZIP=${LLAMA_UI_GZIP}"
