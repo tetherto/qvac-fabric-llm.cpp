@@ -23,6 +23,12 @@ GGML_BLAS_DEFAULT=ON
 GGML_OPENMP=OFF
 LLAMA_COREML_FFN=${LLAMA_COREML_FFN:-OFF}
 
+# normalize once so CMake and the framework link see the same value
+case "$(echo "$LLAMA_COREML_FFN" | tr '[:lower:]' '[:upper:]')" in
+    ON|1|TRUE|YES|Y) LLAMA_COREML_FFN=ON ;;
+    *)               LLAMA_COREML_FFN=OFF ;;
+esac
+
 # Max number of concurrent platform builds
 MAX_PARALLEL_BUILDS=1
 
