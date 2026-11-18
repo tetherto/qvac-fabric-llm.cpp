@@ -2645,8 +2645,8 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
 
 // MUL_MAT with F16 weights on the cuBLAS F16 path, then an ADD of a bias with one value per dst row
 // (nn.Linear over many tokens). That path ends with a half to F32 conversion of the whole result,
-// which can add the bias for free. The checks mirror ggml_cuda_mul_mat so that the fused node runs
-// the same GEMM as the unfused one.
+// which can add the bias for free. The checks mirror ggml_cuda_mul_mat and its canonical path so that the
+// fused node runs the same GEMM as the unfused one; ggml_cuda_mul_mat_canonical points back here.
 static bool ggml_cuda_should_fuse_mul_mat_cublas_bias(const ggml_tensor * mm, const ggml_tensor * add) {
     const ggml_tensor * src0 = mm->src[0];
     const ggml_tensor * src1 = mm->src[1];
@@ -3047,6 +3047,8 @@ static void ggml_cuda_mul_mat_canonical(
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // F16 weights that pass the MMVF and MMF checks below reach cuBLAS. ggml_cuda_should_fuse_mul_mat_cublas_bias
+    // repeats these checks to fuse a bias into that call: a new F16 path here must be ruled out there too.
     if (ggml_cuda_should_use_mmvf(src0, cc, warp_size, ne11)) {
         // The custom vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
