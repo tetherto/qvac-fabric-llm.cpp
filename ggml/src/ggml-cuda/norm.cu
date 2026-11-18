@@ -2,10 +2,11 @@
 #include "convert.cuh"
 #include <cstdint>
 
-// a*b + c as two rounded operations, never one FMA: on CUDA the same bits as separate MUL and ADD nodes. HIP and
-// MUSA may contract the plain expression to an FMA, so there the last bit can differ.
+// a*b + c as two rounded operations, never one FMA, so the fused layer norm gives the same bits as separate MUL
+// and ADD nodes. hipcc and the MUSA compiler contract a plain a*b + c to an FMA by default.
 static __device__ __forceinline__ float norm_mul_add(const float a, const float b, const float c) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#    pragma clang fp contract(off)
     return a * b + c;
 #else
     return __fadd_rn(__fmul_rn(a, b), c);
