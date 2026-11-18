@@ -28,6 +28,13 @@ static constexpr int64_t GGML_METAL_FA_KV_SPLIT_MIN_KV       = 256;
 static constexpr int64_t GGML_METAL_FA_KV_SPLIT_MIN_Q_ELEMS  = 512;
 static constexpr int64_t GGML_METAL_FA_KV_SPLIT_MIN_QK_ELEMS = 1024*1024;
 
+// chunked top-k: columns per chunk (one threadgroup each), threads per threadgroup of both passes, and the shapes it
+// serves (from 16K columns it beats the one-threadgroup-per-row radix on an M3 Ultra; k must stay below a chunk)
+static constexpr int GGML_METAL_TOP_K_CHUNK            = 4096;
+static constexpr int GGML_METAL_TOP_K_CHUNK_THREADS    = 256;
+static constexpr int GGML_METAL_TOP_K_CHUNKED_MIN_COLS = 4*GGML_METAL_TOP_K_CHUNK;
+static constexpr int GGML_METAL_TOP_K_CHUNKED_MAX_K    = 64;
+
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
         return { nullptr, 0 };
@@ -7417,6 +7424,17 @@ static void ggml_metal_op_top_k_bitonic(ggml_metal_op_t ctx, int idx) {
     }
 }
 
+// threadgroup memory of the radix-select kernels: 256-entry histogram + bucket/above scalars + output counter
+static void ggml_metal_op_top_k_radix_smem(ggml_metal_encoder_t enc) {
+    const size_t smem_histo  = GGML_PAD(256*sizeof(uint32_t), 16);
+    const size_t smem_scalar = GGML_PAD(    sizeof(uint32_t), 16);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_histo,  0);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_scalar, 1);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_scalar, 2);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_scalar, 3);
+}
+
 // radix-select: one workgroup per row. Maps each float to an order-preserving unsigned
 // key, finds the k-th largest via 4 radix-8 histogram passes, then compacts the top-k
 // indices. Fast for large k and/or many rows.
@@ -7445,25 +7463,75 @@ static void ggml_metal_op_top_k_radix(ggml_metal_op_t ctx, int idx) {
         /*.nb02  =*/ nb02,
         /*.nb03  =*/ nb03,
         /*.top_k =*/ (int32_t) op->ne[0],
+        /*.chunk    =*/ 0,
+        /*.n_chunks =*/ 0,
     };
-
-    // shared memory: 256-entry histogram + bucket/above scalars + output counter
-    const size_t smem_histo  = GGML_PAD(256*sizeof(uint32_t), 16);
-    const size_t smem_bucket = GGML_PAD(    sizeof(uint32_t), 16);
-    const size_t smem_above  = GGML_PAD(    sizeof(uint32_t), 16);
-    const size_t smem_out    = GGML_PAD(    sizeof(uint32_t), 16);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
 
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_histo,  0);
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_bucket, 1);
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_above,  2);
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_out,    3);
+    ggml_metal_op_top_k_radix_smem(enc);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+}
+
+// chunked radix-select for long rows and a small k: one threadgroup per chunk of a row keeps its top-k columns,
+// then one threadgroup per row selects the top-k among the chunks' candidates (placed after the output in dst)
+static void ggml_metal_op_top_k_chunked(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_ASSERT(ggml_is_contiguous_rows(op->src[0]));
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+
+    auto pipeline_chunk = ggml_metal_library_get_pipeline_top_k_chunked(lib, op, false);
+    auto pipeline_merge = ggml_metal_library_get_pipeline_top_k_chunked(lib, op, true);
+
+    const int n_chunks = ne00/GGML_METAL_TOP_K_CHUNK;
+
+    ggml_metal_kargs_top_k args = {
+        /*.ne00     =*/ ne00,
+        /*.ne01     =*/ ne01,
+        /*.ne02     =*/ ne02,
+        /*.ne03     =*/ ne03,
+        /*.nb01     =*/ nb01,
+        /*.nb02     =*/ nb02,
+        /*.nb03     =*/ nb03,
+        /*.top_k    =*/ (int32_t) op->ne[0],
+        /*.chunk    =*/ GGML_METAL_TOP_K_CHUNK,
+        /*.n_chunks =*/ n_chunks,
+    };
+
+    ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+    ggml_metal_buffer_id bid_cand = bid_dst;
+    bid_cand.offs += sizeof(int32_t)*ggml_nelements(op->src[0]);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline_chunk);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, bid_cand, 2);
+    ggml_metal_op_top_k_radix_smem(enc);
+
+    const int nth_chunk = std::min(GGML_METAL_TOP_K_CHUNK_THREADS, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_chunk));
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_chunks*ne01, ne02, ne03, nth_chunk, 1, 1);
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline_merge);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst,  2);
+    ggml_metal_encoder_set_buffer  (enc, bid_cand, 3);
+    ggml_metal_op_top_k_radix_smem(enc);
+
+    const int nth_merge = std::min(GGML_METAL_TOP_K_CHUNK_THREADS, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_merge));
+    ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth_merge, 1, 1);
 }
 
 int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
@@ -7573,8 +7641,8 @@ int ggml_metal_op_moe_reduce(ggml_metal_op_t ctx, int idx) {
 int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
-    // radix-select has a fixed single-workgroup-per-row cost (~50-60us) that is only
-    // amortized for long rows, many rows, or a large k; otherwise the bitonic path wins
+    // long rows with a small k split into chunks; otherwise radix-select has a fixed single-workgroup-per-row cost
+    // that is only amortized for long rows, many rows, or a large k, and the bitonic path wins
     const int ncols = op->src[0]->ne[0];
     const int k     = op->ne[0];
     const int nrows = ggml_nrows(op->src[0]);
@@ -7582,7 +7650,9 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
     const bool use_radix =
         ncols > 2048 && (k > 64 || (nrows > 4 && ncols >= 8192));
 
-    if (use_radix) {
+    if (ncols >= GGML_METAL_TOP_K_CHUNKED_MIN_COLS && k <= GGML_METAL_TOP_K_CHUNKED_MAX_K) {
+        ggml_metal_op_top_k_chunked(ctx, idx);
+    } else if (use_radix) {
         ggml_metal_op_top_k_radix(ctx, idx);
     } else {
         ggml_metal_op_top_k_bitonic(ctx, idx);
