@@ -345,7 +345,7 @@ struct llm_attn_mask {
     uint32_t      n_kv = 0;
 
     // false if the mask is never built over kv_rows, so it is reused like a dense mask
-    // (masks built with build_attn_inp_kq_mask, or the whole-cache mask that fabric's qwen4exp QSA selection reads)
+    // (masks built with build_attn_inp_kq_mask)
     bool allow_rows = false;
 };
 

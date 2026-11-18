@@ -413,13 +413,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     return cur;
 }
 
-// the QSA layers attend through the k-pool selection, see build_attn_qsa
-static bool qwen4exp_has_qsa(const llama_hparams & hparams, const llama_memory_context_i * mctx) {
-    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
-
-    return mctx_hyb->get_idx() != nullptr && hparams.indexer_kpool > 0;
-}
-
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t hc = hparams.dsv4_hc_mult;
@@ -429,9 +422,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    // the QSA selection is built from the whole-cache kq_mask, so the QSA path keeps the dense mask (no kv_rows)
-    // TODO: drop once the selection is built without the kq_mask (upstream #31243)
-    auto * inp = build_inp_mem_hybrid(!qwen4exp_has_qsa(hparams, mctx));
+    // the QSA layers build their own selection without the kq_mask, see build_qsa_sel
+    auto * inp = build_inp_mem_hybrid();
 
     // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
     // the indexer cache inside it is absent when the GGUF has no indexer tensors
@@ -592,7 +584,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     res->add_input(std::move(inp));
 
-    auto * inp_hyb = build_inp_mem_hybrid(!qwen4exp_has_qsa(hparams, mctx));
+    auto * inp_hyb = build_inp_mem_hybrid();
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
 
     // the draft memory has no recurrent layer, but its input still has to be allocated
@@ -702,8 +694,29 @@ public:
         // the scatter mask shape follows n_kv
         res &= n_kv              == idx->get_n_kv();
         res &= n_new             == mctx->get_n_kpool_new();
+        res &= n_group           == sel_group(params.cparams, params.ubatch);
 
         return res;
+    }
+
+    // length of the cell lists in whole flash attention tiles: n_group times one token's selection, which bounds the
+    // union of the group's picked blocks plus each token's own tail. a list then takes the same bytes at every group
+    // size, so the prompt-size reserve graph covers them all
+    static uint32_t n_sel_rows(uint32_t n_sel, uint32_t n_group) {
+        return n_group*GGML_PAD(n_sel, 256);
+    }
+
+    // tokens per cell list, 0 for the n_kv-wide mask: flash attention reads only the listed rows, so the other
+    // sequences of a unified cache cost nothing
+    // with few tokens per sequence (decode, drafts) each token has its own list, a prompt shares one list per 8 tokens,
+    // the query tile of the flash attention kernels
+    // every graph takes the lists, at any cache size: a graph of another shape replaces the reserved allocation, and
+    // the growing graphs of a prompt then re-plan it at every ubatch
+    static uint32_t sel_group(const llama_cparams & cparams, const llama_ubatch & ubatch) {
+        if (!cparams.flash_attn || !cparams.fused_kv_rows || !cparams.fused_top_k_mask) {
+            return 0;
+        }
+        return ubatch.n_tokens <= 8*ubatch.n_seqs_unq && ubatch.n_tokens <= 64 ? 1 : 8;
     }
 
     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
@@ -721,6 +734,7 @@ public:
     uint32_t n_new = 0; // padded to a stable bound, never below 1
     uint32_t n_sel = 0;
     uint32_t n_kv  = 0;
+    uint32_t n_group = 0; // see sel_group
 };
 
 llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb) {
@@ -752,6 +766,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->n_new = mctx_hyb->get_n_kpool_new();
     // the top blocks plus the tail
     inp->n_sel = kpool*std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool) + kpool - 1;
+    inp->n_group = llm_graph_input_kpool::sel_group(cparams, ubatch);
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
@@ -774,6 +789,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         ggml_tensor *                           cur,
         ggml_tensor *                           inp_pos,
         int *                                   sections,
+        ggml_tensor **                          sel_rows,
         int                                     il) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
@@ -847,6 +863,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     // keep the cells of the live picked pools and the tail, -inf elsewhere
     // all retained cells are in the token's sequence, so the kq_mask is not needed
+    if (inp_kpool->n_group > 0) {
+        GGML_ASSERT(kpool*n_top_pool + inp_kpool->tail_idxs->ne[0] == inp_kpool->n_sel);
+
+        const int64_t n_group = inp_kpool->n_group;
+        const int64_t n_res   = llm_graph_input_kpool::n_sel_rows(inp_kpool->n_sel, n_group);
+
+        *sel_rows = ggml_top_k_rows(ctx0, top_k, score, inp_kpool->pool_idxs, inp_kpool->tail_idxs,
+                inp_kpool->n_kv, n_res, n_group, GGML_TYPE_I32); // [n_res, n_groups]
+        cb(*sel_rows, "indexer_sel_rows", il);
+
+        ggml_tensor * sel = ggml_top_k_rows(ctx0, top_k, score, inp_kpool->pool_idxs, inp_kpool->tail_idxs,
+                inp_kpool->n_kv, n_res, n_group, type_mask); // [n_res, n_groups*n_group]
+        cb(sel, "indexer_sel", il);
+
+        // probed with the row-list attention: a backend without the op keeps the mask path
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN_KV_ROWS, *sel_rows, il});
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN_KV_ROWS, sel,       il});
+
+        return sel;
+    }
+
     if (cparams.fused_top_k_mask) {
         GGML_ASSERT(kpool*n_top_pool + inp_kpool->tail_idxs->ne[0] == inp_kpool->n_sel);
 
@@ -918,6 +955,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor *             k_cur,
         ggml_tensor *             v_cur,
         ggml_tensor *             sel,
+        ggml_tensor *             sel_rows,
         int64_t                   n_sel,
         float                     kq_scale,
         int                       il) {
@@ -954,13 +992,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // the selection replaces the kq_mask: split it into the streams of the K view
-    const int64_t n_stream = k->ne[3];
-    GGML_ASSERT(sel->ne[0] == k->ne[2] && sel->ne[1] % n_stream == 0);
-    sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], sel->ne[1]/n_stream, 1, n_stream);
-    cb(sel, "kq_mask_qsa", il);
+    ggml_tensor * cur = nullptr;
+    if (sel_rows) {
+        // one slice per group of tokens over the group's list of cells, K/V are shared by the slices
+        const int64_t n_group  = sel->ne[1]/sel_rows->ne[1];
+        const int64_t n_tokens = q->ne[2];
+        GGML_ASSERT(k->ne[3] == 1 && sel->ne[1] == n_group*sel_rows->ne[1]);
+        sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], n_group, 1, sel_rows->ne[1]);
+        cb(sel, "kq_mask_qsa", il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, nullptr, n_sel, kq_scale, il);
+        // pad the queries to whole groups, the padding rows see no cells and are dropped
+        // decode pads by 0 rows: every graph then has the nodes of the reserved prompt graph and reuses its allocation,
+        // where a view of q in place of the pad would let q's memory be reused before the attention reads it
+        q = ggml_pad(ctx0, q, 0, 0, n_group*sel_rows->ne[1] - n_tokens, 0);
+        cb(q, "q_qsa", il);
+
+        cur = build_attn_mha(q, k, v, nullptr, sel, sel_rows, nullptr, nullptr, 0, kq_scale, il);
+        cur = ggml_view_2d(ctx0, cur, cur->ne[0], n_tokens, cur->nb[1], 0);
+    } else {
+        // the selection replaces the kq_mask: split it into the streams of the K view
+        const int64_t n_stream = k->ne[3];
+        GGML_ASSERT(sel->ne[0] == k->ne[2] && sel->ne[1] % n_stream == 0);
+        sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], sel->ne[1]/n_stream, 1, n_stream);
+        cb(sel, "kq_mask_qsa", il);
+
+        cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, nullptr, n_sel, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
@@ -985,7 +1042,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
-    ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, sections, il) : nullptr;
+    ggml_tensor * sel_rows = nullptr;
+    ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, sections, &sel_rows, il) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
@@ -1038,7 +1096,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
     if (sel) {
-        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, sel, inp_kpool->n_sel, kq_scale, il);
+        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, sel, sel_rows, inp_kpool->n_sel, kq_scale, il);
     } else {
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
