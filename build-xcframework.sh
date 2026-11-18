@@ -21,6 +21,7 @@ GGML_METAL=ON
 GGML_METAL_EMBED_LIBRARY=${GGML_METAL_EMBED_LIBRARY:-ON}
 GGML_BLAS_DEFAULT=ON
 GGML_OPENMP=OFF
+LLAMA_COREML_FFN=${LLAMA_COREML_FFN:-OFF}
 
 # Max number of concurrent platform builds
 MAX_PARALLEL_BUILDS=1
@@ -80,6 +81,7 @@ COMMON_CMAKE_ARGS=(
     -DLLAMA_BUILD_TESTS=${LLAMA_BUILD_TESTS}
     -DLLAMA_BUILD_SERVER=${LLAMA_BUILD_SERVER}
     -DLLAMA_BUILD_MTMD=${LLAMA_BUILD_MTMD}
+    -DLLAMA_COREML_FFN=${LLAMA_COREML_FFN}
     -DGGML_METAL_EMBED_LIBRARY=${GGML_METAL_EMBED_LIBRARY}
     -DGGML_BLAS_DEFAULT=${GGML_BLAS_DEFAULT}
     -DGGML_METAL=${GGML_METAL}
@@ -377,7 +379,7 @@ combine_static_libraries() {
         $arch_flags \
         $min_version_flag \
         -Wl,-force_load,"${temp_dir}/combined.a" \
-        -framework Foundation -framework Metal -framework Accelerate \
+        -framework Foundation -framework Metal -framework Accelerate $( [[ "$LLAMA_COREML_FFN" == "ON" ]] && echo "-framework CoreML" ) \
         -install_name "$install_name" \
         -o "${base_dir}/${output_lib}"
 
