@@ -620,14 +620,19 @@ static void ggml_cuda_flash_attn_ext_vec_case_rows(ggml_backend_cuda_context & c
 
 template <int D, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-#ifdef GGML_USE_HIP
-    // kv_rows uses this kernel only on AMD
     if (dst->src[5]) {
+#ifdef GGML_USE_HIP
+        // on AMD every vec variant reads K/V through kv_rows
         ggml_cuda_flash_attn_ext_vec_case_rows<D, type_K, type_V, true>(ctx, dst);
+#else
+        // on NVIDIA the kv_rows vec kernel serves one query per sequence without softcap (quantized K/V decode)
+        float logit_softcap;
+        memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+        GGML_ASSERT(dst->src[0]->ne[1] == 1 && logit_softcap == 0.0f);
+        ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, type_K, type_V, false, true>(ctx, dst);
+#endif // GGML_USE_HIP
         return;
     }
-#endif // GGML_USE_HIP
-    GGML_ASSERT(!dst->src[5]);
     ggml_cuda_flash_attn_ext_vec_case_rows<D, type_K, type_V, false>(ctx, dst);
 }
 
