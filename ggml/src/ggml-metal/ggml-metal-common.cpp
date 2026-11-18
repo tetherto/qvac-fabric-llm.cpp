@@ -61,15 +61,23 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
 // src1 rows per 8x8 simdgroup matrix tile of the few-row MMA kernels
 static constexpr int64_t GGML_METAL_MMA_TILE_ROWS = 8;
 
-// weights per K step of the q5_K, pq2_0 and generic few-row MMA kernels
+// weights per K step of the q5_K, q6_K, pq2_0 and generic few-row MMA kernels, and of the iq4 kernel
 static constexpr int64_t GGML_METAL_MMA_K_CHUNK = 64;
+static constexpr int64_t GGML_METAL_MMA_K_IQ4   = 32;
 
 enum ggml_metal_mma_kind ggml_metal_mul_mv_mma_kind(enum ggml_type type, int rt) {
     if (type == GGML_TYPE_Q4_0 || (type == GGML_TYPE_Q8_0 && rt == 1)) {
         return GGML_METAL_MMA_KIND_BLK;
     }
+    if (type == GGML_TYPE_Q4_K && rt == 1) {
+        return GGML_METAL_MMA_KIND_Q4_K;
+    }
+    if (type == GGML_TYPE_IQ4_NL || (type == GGML_TYPE_IQ4_XS && rt == 2)) {
+        return GGML_METAL_MMA_KIND_IQ4;
+    }
     switch (type) {
         case GGML_TYPE_Q5_K:  return GGML_METAL_MMA_KIND_Q5_K;
+        case GGML_TYPE_Q6_K:  return GGML_METAL_MMA_KIND_Q6_K;
         case GGML_TYPE_PQ2_0: return GGML_METAL_MMA_KIND_PQ2_0;
         default:              return GGML_METAL_MMA_KIND_GEN;
     }
@@ -118,7 +126,11 @@ int64_t ggml_metal_mul_mv_mma_k_step(enum ggml_type type, int rt) {
     if (!ggml_metal_mul_mv_mma_type_supported(type)) {
         return 0;
     }
-    return ggml_metal_mul_mv_mma_kind(type, rt) == GGML_METAL_MMA_KIND_BLK ? ggml_blck_size(type) : GGML_METAL_MMA_K_CHUNK;
+    switch (ggml_metal_mul_mv_mma_kind(type, rt)) {
+        case GGML_METAL_MMA_KIND_BLK: return ggml_blck_size(type);
+        case GGML_METAL_MMA_KIND_IQ4: return GGML_METAL_MMA_K_IQ4;
+        default:                      return GGML_METAL_MMA_K_CHUNK;
+    }
 }
 
 static bool ggml_metal_mul_mat_mma_type_ok(const struct ggml_tensor * op) {
