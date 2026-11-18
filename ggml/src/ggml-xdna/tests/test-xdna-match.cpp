@@ -66,6 +66,32 @@ static int check_state_gather(ggml_context * ctx) {
     return count_failures(cases);
 }
 
+// build_rs in place hands out the ubatch's rows of the cache itself, at the cell of its first sequence.
+static int check_state_view(ggml_context * ctx) {
+    static constexpr int64_t HEAD = 2;
+
+    ggml_tensor * cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, STATE_FLOATS, N_CELLS);
+    ggml_tensor * states = ggml_reshape_2d(ctx, cache, STATE_FLOATS, cache->ne[1]);
+    ggml_tensor * own    = ggml_view_2d(ctx, states, STATE_FLOATS, 1, states->nb[1], HEAD * states->nb[1]);
+    ggml_tensor * ids    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N_RS);
+    ggml_tensor * all    = ggml_get_rows(ctx, states, ids);
+    ggml_tensor * rows   = ggml_view_2d(ctx, all, STATE_FLOATS, 1, all->nb[1], 0);
+    ggml_tensor * half   = ggml_view_2d(ctx, states, STATE_FLOATS / 2, 1, states->nb[1], HEAD * states->nb[1]);
+    ggml_tensor * skew   = ggml_view_2d(ctx, states, STATE_FLOATS, 1, states->nb[1], ggml_row_size(GGML_TYPE_F32, 1));
+
+    const match_case cases[] = {
+        { "the in-place read is a view of the cache", xdna_rec_state_view(own), own },
+        { "a view of a gather is not an in-place read", xdna_rec_state_view(rows), nullptr },
+        { "a gather is not an in-place read", xdna_rec_state_view(all), nullptr },
+        { "half a row is not a state", xdna_rec_state_view(half), nullptr },
+        { "a view off the row boundary is not a state", xdna_rec_state_view(skew), nullptr },
+    };
+    int        failures = count_failures(cases);
+    const bool row_ok   = xdna_rec_state_view_row(own) == HEAD;
+    std::printf("%s: %s\n", row_ok ? "ok  " : "FAIL", "the in-place read names the cell of its first sequence");
+    return failures + (row_ok ? 0 : 1);
+}
+
 // The last layer crops the attention output and its residual to the output rows before they are added.
 static int check_row_crop(ggml_context * ctx) {
     ggml_tensor * w_o    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D_ATTN, D_MODEL);
@@ -281,9 +307,9 @@ static int check_route_fused(void) {
 int main(void) {
     const ggml_init_params params = { ggml_tensor_overhead() * MAX_TENSORS, nullptr, true };
     ggml_context *         ctx    = ggml_init(params);
-    const int              failures = check_state_gather(ctx) + check_row_crop(ctx) + check_fused_weights(ctx) +
-                                      check_fused_gemv_weights(ctx) + check_layer_census(ctx) +
-                                      check_census_keeps_name() + check_route_fused();
+    const int              failures = check_state_gather(ctx) + check_state_view(ctx) + check_row_crop(ctx) +
+                                      check_fused_weights(ctx) + check_fused_gemv_weights(ctx) +
+                                      check_layer_census(ctx) + check_census_keeps_name() + check_route_fused();
     ggml_free(ctx);
     if (failures) {
         std::printf("test-xdna-match: %d failures\n", failures);

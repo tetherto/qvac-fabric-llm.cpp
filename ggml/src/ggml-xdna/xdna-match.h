@@ -19,6 +19,22 @@ static inline const ggml_tensor * xdna_rec_state_gather(const ggml_tensor * n) {
     return n->op == GGML_OP_VIEW && n->view_offs == 0 && g && g->op == GGML_OP_GET_ROWS ? g : nullptr;
 }
 
+// The in-place read of a recurrent state (build_rs with in_place): a view of whole rows of the cache itself, else null.
+// A CPY's destination view has the same shape: the caller tells them apart by the reader.
+static inline const ggml_tensor * xdna_rec_state_view(const ggml_tensor * n) {
+    const ggml_tensor * c = n ? n->view_src : nullptr;
+    if (!n || n->op != GGML_OP_VIEW || !c || c->op != GGML_OP_NONE || c->type != n->type || n->ne[0] != c->ne[0] ||
+        n->nb[1] != c->nb[1] || !ggml_is_contiguous(n) || n->view_offs % c->nb[1] != 0) {
+        return nullptr;
+    }
+    return n;
+}
+
+// The cache row an in-place state read (xdna_rec_state_view) starts at: the cell of its first sequence.
+static inline int64_t xdna_rec_state_view_row(const ggml_tensor * n) {
+    return (int64_t) (n->view_offs / n->nb[1]);
+}
+
 // A GET_ROWS of the one row of a one-row tensor is that tensor: llama crops the
 // last layer to its output rows, which in a single-token decode is all of it.
 static inline ggml_tensor * xdna_skip_row_crop(ggml_tensor * t) {

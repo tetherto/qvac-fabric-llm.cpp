@@ -3106,26 +3106,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--coreml-ffn"},
-        "run part of each FFN on the Apple Neural Engine for prompts of 256+ tokens (Qwen3.8-27B, -DLLAMA_COREML=ON builds; default: off)",
+        "run part of each FFN through Core ML for prompts of 256+ tokens (Qwen3.5-0.8B/2B and Qwen3.8-27B, -DLLAMA_COREML=ON builds; default: off)",
         [](common_params & params) {
             params.coreml_ffn = true;
         }
     ).set_env("LLAMA_COREML"));
     add_opt(common_arg(
         {"--coreml-ffn-cache"}, "DIR",
-        "directory for the compiled Core ML FFN programs, 4.5-9 GB per model (default: <cache dir>/coreml-ffn)",
+        "directory for the compiled Core ML FFN programs; size depends on model and split (default: <cache dir>/coreml-ffn)",
         [](common_params & params, const std::string & value) {
             params.coreml_ffn_cache = value;
         }
     ).set_env("LLAMA_ARG_COREML_FFN_CACHE"));
     add_opt(common_arg(
         {"--coreml-ffn-split"}, "METALxN",
-        "Metal channels and Core ML programs per FFN, e.g. 8192x2 or 11264x1 (default: 8192x2 with two Neural Engines, else 11264x1)",
+        "override the automatic Metal-channel / Core ML-program split (defaults: 0.8B 1024x1, 2B 2048x1, 27B 8192x2 with two Neural Engines, else 11264x1)",
         [](common_params & params, const std::string & value) {
             int metal = 0, packages = 0;
             char tail = 0;
             if (sscanf(value.c_str(), "%dx%d%c", &metal, &packages, &tail) != 2 || metal <= 0 || packages < 1 || packages > 2) {
-                throw std::invalid_argument("--coreml-ffn-split must look like 8192x2 or 11264x1");
+                throw std::invalid_argument("--coreml-ffn-split requires METALxN with positive Metal channels and 1 or 2 programs, e.g. 1024x1, 2048x1 or 8192x2");
             }
             params.coreml_ffn_metal    = metal;
             params.coreml_ffn_packages = packages;

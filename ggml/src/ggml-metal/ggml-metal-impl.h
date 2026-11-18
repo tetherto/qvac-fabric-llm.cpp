@@ -1633,6 +1633,8 @@ typedef struct {
     uint64_t nb02;
     uint64_t nb03;
     int32_t  top_k;  // k
+    int32_t  chunk;    // columns per chunk of the chunked top-k
+    int32_t  n_chunks; // chunks per row of the chunked top-k
 } ggml_metal_kargs_top_k;
 
 // widths at or above this use the threadgroup FWHT kernel, one row per threadgroup

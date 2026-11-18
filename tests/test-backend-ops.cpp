@@ -2594,13 +2594,15 @@ struct test_get_rows : public test_case {
     const bool v; // view src1
     const bool vs0; // view src0
     const int offset_cols; // // column offset of the view src0
+    const float amp; // range of the source values
 
     std::string vars() override {
-        return VARS_TO_STR9(type, n, m, r, be1, be2, v, vs0, offset_cols);
+        const std::string s = VARS_TO_STR9(type, n, m, r, be1, be2, v, vs0, offset_cols);
+        return amp == 1.0f ? s : s + "," + VAR_TO_STR(amp);
     }
 
-    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false, int offset_cols = 0)
-        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), vs0(vs0), offset_cols(offset_cols) {}
+    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false, int offset_cols = 0, float amp = 1.0f)
+        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), vs0(vs0), offset_cols(offset_cols), amp(amp) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * in;
@@ -2651,7 +2653,7 @@ struct test_get_rows : public test_case {
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
             } else {
-                init_tensor_uniform(t);
+                init_tensor_uniform(t, -amp, amp);
             }
         }
     }
@@ -15616,6 +15618,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
         test_cases.emplace_back(new test_get_rows(type,     256,   5,         4, 700, 100, false));
     }
+    // weights of the size of real LLM weights, where the q4_K super-block scale d/16 is a half subnormal
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q4_K, 4096, 5, 4, 1, 1, false, false, 0, 0.03f));
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
     for (int n : {1, 3, 257}) {
@@ -17140,6 +17144,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
         }
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 64, n, 256, {3, 2}, {2, 1}));
+        // a single iq4_nl block: one simdgroup, whose reduction needs less shmem than the iq4 table
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 40, n, 32, {1, 1}, {1, 1}));
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
                                  GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
                                  GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_TQ2_0,
@@ -17159,7 +17165,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t k : {128, 384}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 100, n, k, {1, 1}, {1, 1}));
         }
-        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q5_K, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL,
+                                 GGML_TYPE_IQ4_XS, GGML_TYPE_F16, GGML_TYPE_BF16}) {
             for (mul_mat_add_mode mode : {MUL_MAT_ADD_MM_RES, MUL_MAT_ADD_RES_MM, MUL_MAT_ADD_ROW, MUL_MAT_ADD_RES_INPLACE, MUL_MAT_ADD_MM_MM}) {
                 test_cases.emplace_back(new test_mul_mat_add(type_a, 1000, n, 1024, mode));
             }
@@ -17167,14 +17174,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // the widest tiles with two src1 tiles, and src1 rows padded in memory
         for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_K,
-                                 GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+                                 GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, n, 512,  {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
         }
         // a src1 with a nonzero mean, for the zero points and mins of quantized src0 types
         for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q2_K,
-                                 GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+                                 GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
             test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
+        }
+        // before Apple10, q4_K at 3..8 rows runs the q5_K kernel from 2048 src0 rows: 2 tiles there, 4 at 4096 rows
+        for (int64_t m : {2048, 4096}) {
+            test_cases.emplace_back(new test_mul_mat_pos(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, n, 1024, {1, 1}, {1, 1}));
         }
     }
 
@@ -18084,6 +18095,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192,   nrows, 1, 1}, k, true));
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k, true));
         }
+    }
+    // the chunked top-k at the largest k it serves and just above it, over a ragged last chunk and batch dims
+    for (int k : {16, 64, 65}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 8, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4*4096 + 123, 3, 2, 2}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4*4096 + 123, 3, 2, 2}, k, true));
     }
 
     for (int k : {1, 2, 3, 7, 15}) {
@@ -19311,6 +19328,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
         }
     }
+    // Qwen3.8 27B q6_K output head: single token, and the speculative draft and verify
+    for (int n : {1, 8, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
+    }
     // Bonsai-2 27B output head, single token and speculative verify
     for (int n : {1, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
@@ -19809,6 +19830,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 16));
         }
     }
+    // DSpine draft head: the top 16 of each of the 16 block rows over the Qwen3.8 vocabulary
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 16, 1, 1}, 16));
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
     for (auto k : {20, 40}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {151936, 1, 1, 1}, k));
