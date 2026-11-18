@@ -714,8 +714,8 @@ static __global__ void quantize_mmq_few_q8_1(
     float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
     amax = warp_reduce_max<8>(amax);
 
-    char4 q;
-    float d;
+    char4 q = make_char4(0, 0, 0, 0);
+    float d = 1.0f;
     if constexpr (fp8) {
 #if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         d = amax > 0.0f ? amax*(1.0f/448.0f) : 1.0f;
