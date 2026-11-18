@@ -2192,7 +2192,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    ggml_is_contiguous(op->src[5]) &&
                    (!op->src[6] || ggml_is_contiguous(op->src[6]));
         case GGML_OP_LIGHTNING_INDEXER:
-            if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK) {
+            // no K row list (ggml_lightning_indexer_rows)
+            if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK || op->src[4] != NULL) {
                 return false;
             }
             if (!has_simdgroup_mm ||

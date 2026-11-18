@@ -22318,6 +22318,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 64;
         case GGML_OP_LIGHTNING_INDEXER:
             {
+                // no K row list (ggml_lightning_indexer_rows)
+                if (op->src[4] != nullptr) {
+                    return false;
+                }
                 const ggml_tensor * q = op->src[0];
                 const ggml_tensor * k = op->src[1];
                 const ggml_tensor * w = op->src[2];

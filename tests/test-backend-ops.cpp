@@ -15367,6 +15367,74 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_LIGHTNING_INDEXER over a row list of a larger K storage (ggml_lightning_indexer_rows)
+struct test_lightning_indexer_rows : public test_case {
+    const int64_t hsk;     // indexer K head size
+    const int64_t nh;      // num indexer heads
+    const int64_t kv;      // listed rows
+    const int64_t n_store; // rows of the storage
+    const int64_t nb;      // batch size
+    const int64_t ns;      // q slices sharing the rows
+    const ggml_type type_K;
+
+    std::string vars() override {
+        return VARS_TO_STR7(hsk, nh, kv, n_store, nb, ns, type_K);
+    }
+
+    double max_nmse_err() override {
+        return kv * nb * ns < 128 ? 1e-4 : 1e-6;
+    }
+
+    test_lightning_indexer_rows(int64_t hsk = 128, int64_t nh = 4, int64_t kv = 256, int64_t n_store = 1024,
+            int64_t nb = 1, int64_t ns = 1, ggml_type type_K = GGML_TYPE_F16)
+        : hsk(hsk), nh(nh), kv(kv), n_store(n_store), nb(nb), ns(ns), type_K(type_K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
+        ggml_set_param(q);
+        ggml_set_name(q, "q");
+
+        // the keys are the second half of each storage row, like the pooled keys of the QSA indexer cache
+        ggml_tensor * store = ggml_new_tensor_2d(ctx, type_K, 2*hsk, n_store);
+        ggml_set_name(store, "store");
+        ggml_tensor * k = ggml_view_4d(ctx, store, hsk, 1, n_store, 1, store->nb[1], store->nb[1], store->nb[1]*n_store,
+                ggml_row_size(type_K, hsk));
+        ggml_set_name(k, "k");
+
+        ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
+        ggml_set_name(rows, "rows");
+
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
+        ggml_set_param(w);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_lightning_indexer_rows(ctx, q, k, w, m, rows);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "rows") == 0) {
+                // distinct rows in random order, as the pool cells of a cache
+                std::vector<int32_t> all(n_store);
+                std::iota(all.begin(), all.end(), 0);
+                std::shuffle(all.begin(), all.end(), rng);
+                ggml_backend_tensor_set(t, all.data(), 0, kv*sizeof(int32_t));
+            } else if (t->view_src == nullptr) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_TOP_K_MASK
 struct test_top_k_mask : public test_case {
     const ggml_type type;
@@ -20806,6 +20874,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 65, 7, 4, 4, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 65, 7, 4, 1, GGML_TYPE_F32));
+
+    // the QSA indexer reads the pooled keys of its cache rows in place: decode (vec kernel) and prompts (tile kernel)
+    for (int64_t nb : { 1, 3, 8, 512 }) {
+        for (int64_t kv : { 64, 1000 }) {
+            for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+                test_cases.emplace_back(new test_lightning_indexer_rows(128, 4, kv, 4*kv + 3, nb, 1, type_K));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_lightning_indexer_rows(128, 4, 100, 1000, 9, 3, GGML_TYPE_F16));
 
     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {

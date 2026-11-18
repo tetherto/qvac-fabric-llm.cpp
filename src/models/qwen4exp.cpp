@@ -874,12 +874,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     pooled_new = ggml_reshape_2d(ctx0, pooled_new, idx_dim, n_new);
     cb(pooled_new, "indexer_pool_k_new", il);
 
-    // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
-    // the older pools come from the rows earlier ubatches wrote
-    ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
-    ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
-    cb(pooled, "indexer_k", il);
+    // scatter the fresh pooled keys into their rep rows, the older pools are in the rows earlier ubatches wrote
+    ggml_tensor * pooled_all = kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep); // [idx_dim, n_rows]
+    ggml_build_forward_expand(gf, pooled_all);
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
@@ -890,7 +887,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
     // which is the lightning indexer with every head weight set to that scale
     ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
-    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
+
+    ggml_tensor * score = nullptr;
+    if (inp_kpool->n_group > 0) {
+        // score the pooled keys in place through their rows: a gathered F32 copy of them costs a write and a read
+        // of n_pool rows per layer, which grows with the context. the view of the scatter orders the read after it
+        ggml_tensor * pooled = ggml_view_4d(ctx0, pooled_all, idx_dim, 1, pooled_all->ne[1], 1,
+                pooled_all->nb[1], pooled_all->nb[1], pooled_all->nb[1]*pooled_all->ne[1], 0);
+        score = ggml_lightning_indexer_rows(ctx0, q, pooled, weights, inp_kpool->pool_mask, inp_kpool->pool_cells); // [n_pool, n_tokens]
+
+        // probed with the row-list attention, like the row lists below
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN_KV_ROWS, score, il});
+    } else {
+        // gather all n_pool pooled keys by cell
+        ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
+        cb(pooled, "indexer_k", il);
+
+        score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
+    }
     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
     cb(score, "indexer_score", il);
 

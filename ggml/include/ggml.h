@@ -3073,6 +3073,23 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
+    // ggml_lightning_indexer over the K rows that k_rows lists, instead of a gathered copy of them
+    //
+    // k:       [n_embd_idx, 1,          n_k,     1   ] rows of a larger storage, read in place
+    // k_rows:  [n_kv] i32, the K row of each score, in [0, n_k)
+    // mask:    [n_kv,       n_batch,    1,       ne33]
+    // res:     [n_kv,       n_batch,    1,       ne3 ]
+    //
+    // the rows are shared by the ne3 slices of q
+    //
+    GGML_API struct ggml_tensor * ggml_lightning_indexer_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * k_rows);
+
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.
