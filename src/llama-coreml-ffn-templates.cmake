@@ -1,6 +1,6 @@
 set(_ffn_header "${CMAKE_CURRENT_BINARY_DIR}/llama-coreml-ffn-templates.inc")
 file(WRITE "${_ffn_header}" "// Generated from the bundled Core ML FFN templates.\n")
-foreach(_channels 4608 6144 h1024-c2560 h2048-c2048 h2048-c3072 h2048-c4096)
+foreach(_channels 4608 6144 h1024-c2560 h2048-c2048 h2048-c3072 h2048-c4096 h2560-c6144 h2560-c6656 h4096-c8192)
     foreach(_file model.mlmodel Manifest.json layout.txt)
         if (_channels MATCHES "^h")
             set(_template "int8-${_channels}")

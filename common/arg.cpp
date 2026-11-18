@@ -3053,7 +3053,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--coreml-ffn"},
-        "run part of each FFN through Core ML for prompts of 256+ tokens (Qwen3.5-0.8B/2B and Qwen3.8-27B, -DLLAMA_COREML=ON builds; default: off)",
+        "run part of each FFN through Core ML for prompts of 256+ tokens (Qwen3.5-0.8B/2B/4B/9B and Qwen3.8-27B, -DLLAMA_COREML=ON builds; default: off)",
         [](common_params & params) {
             params.coreml_ffn = true;
         }
@@ -3067,7 +3067,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_COREML_FFN_CACHE"));
     add_opt(common_arg(
         {"--coreml-ffn-split"}, "METALxN",
-        "override the automatic Metal-channel / Core ML-program split (defaults: 0.8B 1024x1, 2B 2048x1, 27B 8192x2 with two Neural Engines, else 11264x1)",
+        "override the automatic Metal-channel / Core ML-program split (defaults: 0.8B 1024x1, 2B 2048x1, 4B 2560x1, 9B 4096x1, 27B 8192x2 with two Neural Engines, else 11264x1)",
         [](common_params & params, const std::string & value) {
             int metal = 0, packages = 0;
             char tail = 0;

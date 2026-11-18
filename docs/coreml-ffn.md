@@ -1,6 +1,6 @@
 # Qwen Core ML prefill sidecar
 
-Opt-in Core ML sidecar for Qwen3.5-0.8B, Qwen3.5-2B and Qwen3.8-27B prefill on Apple Silicon: part of each prefill FFN runs through Core ML while Metal runs the rest. The runtime requests CPU and Neural Engine compute units; Core ML selects operation placement.
+Opt-in Core ML sidecar for Qwen3.5-0.8B, 2B, 4B and 9B and Qwen3.8-27B prefill on Apple Silicon: part of each prefill FFN runs through Core ML while Metal runs the rest. The runtime requests CPU and Neural Engine compute units; Core ML selects operation placement.
 
 ## Command line
 
@@ -12,12 +12,14 @@ cmake --build build --target llama-server -j 8
 build/bin/llama-server -m Qwen3.8-27B-Q4_0.gguf --coreml-ffn
 ```
 
-The same `--coreml-ffn` flag enables all three models and selects the split automatically. For the supported 24-layer Qwen3.5-0.8B and 2B shapes, the Metal FFN channel count equals the model's hidden dimension, with one Core ML program per layer. Qwen3.8-27B keeps its existing hardware-dependent defaults:
+The same `--coreml-ffn` flag enables all these models and selects the split automatically. For the supported Qwen3.5 shapes (0.8B and 2B with 24 layers, 4B and 9B with 32 layers), the Metal FFN channel count equals the model's hidden dimension, with one Core ML program per layer. Qwen3.8-27B keeps its existing hardware-dependent defaults:
 
 | Model | Automatic split |
 | --- | --- |
 | Qwen3.5-0.8B | `1024x1` |
 | Qwen3.5-2B | `2048x1` |
+| Qwen3.5-4B | `2560x1` |
+| Qwen3.5-9B | `4096x1` |
 | Qwen3.8-27B | `8192x2` on chips with two Neural Engines (Ultra), or `11264x1` otherwise |
 
 `--coreml-ffn-split METALxN` is an optional override: `METAL` is the number of intermediate FFN channels kept on Metal and `N` is the number of Core ML programs per layer. An explicit split takes precedence over automatic selection. The equivalent environment variables are `LLAMA_COREML=1` and the optional `LLAMA_ARG_COREML_FFN_SPLIT`. Unsupported models and splits log a configuration warning and keep inference on Metal.
@@ -36,7 +38,11 @@ For Qwen3.5-2B, 2048 FFN channels stay on Metal and the remaining 4096 run throu
 build/bin/llama-server -m Qwen3.5-2B-Q4_K_M.gguf --coreml-ffn
 ```
 
-For 2B, `--coreml-ffn-split 3072x1` and `--coreml-ffn-split 4096x1` remain supported overrides with smaller Core ML partitions. The hidden-dimension rule is specific to the supported smaller models, not a general split formula for other model sizes.
+For 2B, `--coreml-ffn-split 3072x1` and `--coreml-ffn-split 4096x1` remain supported overrides with smaller Core ML partitions. The hidden-dimension rule is specific to the supported Qwen3.5 models, not a general split formula for other model sizes.
+
+For Qwen3.5-4B, 2560 FFN channels stay on Metal and the remaining 6656 run through one Core ML program per layer. `--coreml-ffn-split 3072x1` is a supported override with 6144 Core ML channels. For Qwen3.5-9B, 4096 FFN channels stay on Metal and the remaining 8192 run through one Core ML program per layer. The compiled cache is about 1.6 GB for 4B and 3.2 GB for 9B, and the same amount of memory is resident in addition to the GGUF. 9B is intended for macOS.
+
+On a MacBook Air M2 (16 GB) with Q4_K_M models, `llama-perplexity` prefill over four 2048-token passes (mean of three alternating runs) went from 208.3 to 315.5 tok/s for 4B with `2560x1` (307.6 tok/s with `3072x1`), and from 114.7 to 180.4 tok/s for 9B. The mean KL divergence from Metal's logits was 4e-4 for 4B and 3e-4 for 9B.
 
 On an M3 Ultra with `Qwen3.8-27B-Q4_0`, `llama-server` prefill of a 4372-token prompt went from 341.7 tok/s on Metal to 470.5 tok/s with the default split. The KL divergence from Metal's logits was 1e-5 to 7e-5.
 
@@ -63,7 +69,7 @@ llama_set_coreml_ffn(ctx, nullptr, error, sizeof(error));
 
 For a Qwen3.5-0.8B context, set `params.metal_channels = 1024` and `params.n_packages = 1` before calling `llama_set_coreml_ffn`. Its supported shape is 24 layers, 1024 hidden dimensions and 3584 intermediate FFN channels. The fixed Core ML program takes 512 rows and stores INT8 weights with FP16 computation. Applications must retain the GGUF weights because decode and ineligible batches use Metal. Apple frameworks built with `build-xcframework.sh` expose the configuration API through `llama-coreml-ffn.h`.
 
-For a Qwen3.5-2B context, set `params.metal_channels = 2048` and `params.n_packages = 1`. Its supported shape is 24 layers, 2048 hidden dimensions and 6144 intermediate FFN channels. Metal partitions of 3072 or 4096 channels also use one package. These templates take 512 rows and store INT8 weights with FP16 computation. Automatic model-based selection is performed by the shared CLI initialization code; applications calling this API directly must set these smaller-model parameters explicitly because `llama_coreml_ffn_default_params` retains the 27B hardware defaults.
+For a Qwen3.5-2B context, set `params.metal_channels = 2048` and `params.n_packages = 1`. Its supported shape is 24 layers, 2048 hidden dimensions and 6144 intermediate FFN channels. Metal partitions of 3072 or 4096 channels also use one package. These templates take 512 rows and store INT8 weights with FP16 computation. For a Qwen3.5-4B context (32 layers, 2560 hidden dimensions, 9216 FFN channels), set `params.metal_channels = 2560` or `3072`; for Qwen3.5-9B (32 layers, 4096 hidden dimensions, 12288 FFN channels), set `params.metal_channels = 4096`. Both use `params.n_packages = 1`. Automatic model-based selection is performed by the shared CLI initialization code; applications calling this API directly must set these smaller-model parameters explicitly because `llama_coreml_ffn_default_params` retains the 27B hardware defaults.
 
 Keep Metal available if sidecar setup fails or its extra memory does not fit the application's budget. Check the configuration API's return value; a failed setup leaves the context's previous configuration intact. Resident sidecar models add memory alongside the GGUF and Metal buffers. An operating-system memory termination cannot be recovered through this API. A prediction error fails the request; callers must discard that request's KV state before retrying.
 
@@ -77,7 +83,7 @@ python src/llama-coreml-ffn-templates/make_template.py /tmp/int8-h1024-c2560 --h
 
 Copy its `Manifest.json`, `model.mlmodel` and `layout.txt` into `src/llama-coreml-ffn-templates/int8-h1024-c2560/`. The runtime supplies weights from the GGUF and compiles each layer on first use; later loads reuse the compiled cache.
 
-For the 2B `2048x1` split, generate the `int8-h2048-c4096` template with `--hidden 2048 --channels 4096 --chunk 2048`. The `3072x1` and `4096x1` splits use `int8-h2048-c3072` and `int8-h2048-c2048`, respectively, with the matching `--channels` value.
+For the 2B `2048x1` split, generate the `int8-h2048-c4096` template with `--hidden 2048 --channels 4096 --chunk 2048`. The `3072x1` and `4096x1` splits use `int8-h2048-c3072` and `int8-h2048-c2048`, respectively, with the matching `--channels` value. The 4B `2560x1` and `3072x1` splits use `int8-h2560-c6656` and `int8-h2560-c6144` (`--hidden 2560`), and the 9B `4096x1` split uses `int8-h4096-c8192` (`--hidden 4096 --channels 8192`).
 
 Each context owns its models, serial worker, events and pending calls. Two contexts may be used independently; calls on one context must follow the existing caller-side synchronization contract. Configuration waits for outstanding graph work, invalidates graphs containing old runtime pointers, and replaces the old sidecar only after successful setup. Cache entries are shared on disk, and concurrent compilation uses separate staging paths. Compiled weights are keyed by the source path, size and modification time, the template program and layout, and the channel range. Do not modify the GGUF while configuring it.
 
