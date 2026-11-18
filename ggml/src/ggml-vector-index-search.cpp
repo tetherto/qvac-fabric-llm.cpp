@@ -2,6 +2,9 @@
 
 #include "ggml-vector-index-impl.h"
 
+#include <random>
+#include <utility>
+
 #if GGML_VEC_INDEX_USE_NEON
 #include <arm_neon.h>
 #endif
@@ -1326,6 +1329,281 @@ int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim) {
 }
 #endif
 
+// E-means (Bessa et al., arXiv:2611.09501): mini-batch k-means whose
+// centroids are exponential moving averages of the batch means, with
+// under-used centroids revived by splitting well-used ones. Constants and
+// names follow the reference, faiss/contrib/e_means/base.py (MIT). One pass
+// costs about one Lloyd iteration but converges in far fewer passes.
+namespace emeans {
+// Batch law B = C * k^b_k * n^b_n * T^b_T (Section 4, Equation 7).
+struct BatchLaw {
+    double coefficient;
+    double k_exp;
+    double n_exp;
+    double epoch_exp;
+};
+constexpr BatchLaw kThroughputLaw = { 0.035134, 0.134749, 0.876473, 0.813344 };
+// The quality law uses one eighth of the throughput coefficient.
+constexpr BatchLaw kQualityLaw = { 0.00439175, 0.134749, 0.876473, 0.813344 };
+// The reference picks the quality law at or below this dimension.
+constexpr int kQualityLawMaxDim = 16;
+// Step law alpha0 = C * k^a_k * B^a_B * n^a_n * T^a_T (Equation 6).
+constexpr double kStepCoefficient = 0.8244;
+constexpr double kStepKExp        = -0.4617;
+constexpr double kStepBatchExp    = 0.9003;
+constexpr double kStepNExp        = -0.4498;
+constexpr double kStepEpochExp    = -0.1057;
+constexpr double kStepMin         = 1e-4;
+constexpr double kStepMax         = 1.0;
+// Cosine schedule floor: the last step is this fraction of alpha0 (Equation 5).
+constexpr double kAlphaMinFactor = 0.1;
+// Initial EMA mass per centroid, 2^-16 in the reference.
+constexpr double kInitUsage = 1.0 / 65536.0;
+// Revive centroids whose mass is below this fraction of the mean mass.
+constexpr double kUnusedThreshold = 0.1;
+// Batch updates between revival checks (Algorithm 1, line 9).
+constexpr int kCheckUnusedEvery = 5;
+// Relative per-coordinate perturbation when a donor is split (Appendix J).
+constexpr float kSplitEpsilon = 1e-4f;
+// Fixed seed so a build is reproducible for a given index state.
+constexpr uint64_t kSeed = 1234;
+
+static size_t round_power_of_two(double value) {
+    if (value <= 1.0) {
+        return 1;
+    }
+    const double low  = std::pow(2.0, std::floor(std::log2(value)));
+    const double high = 2.0 * low;
+    return static_cast<size_t>(value / low < high / value ? low : high);
+}
+
+static size_t batch_size_for(size_t n, int k, int n_epochs, int dim) {
+    const bool quality = dim <= kQualityLawMaxDim;
+    const BatchLaw & law = quality ? kQualityLaw : kThroughputLaw;
+    const double raw = law.coefficient *
+        std::pow(static_cast<double>(k), law.k_exp) *
+        std::pow(static_cast<double>(n), law.n_exp) *
+        std::pow(static_cast<double>(n_epochs), law.epoch_exp);
+    // Capped at n before rounding: the caps below are at most n anyway, and
+    // a huge n_iter would otherwise overflow the size_t cast.
+    size_t batch = round_power_of_two(std::min(raw, static_cast<double>(n)));
+    // The two caps differ on purpose: they reproduce the two fitted recipes.
+    const size_t cap = quality ? n / 2 : round_power_of_two(static_cast<double>(n) / 2.0);
+    batch = std::min(batch, cap);
+    return std::max<size_t>(1, std::min(batch, n));
+}
+
+static double initial_step_for(size_t n, int k, int n_epochs, size_t batch) {
+    const double alpha0 = kStepCoefficient *
+        std::pow(static_cast<double>(k), kStepKExp) *
+        std::pow(static_cast<double>(batch), kStepBatchExp) *
+        std::pow(static_cast<double>(n), kStepNExp) *
+        std::pow(static_cast<double>(n_epochs), kStepEpochExp);
+    return std::min(std::max(alpha0, kStepMin), kStepMax);
+}
+
+static double scheduled_step(double alpha0, size_t step, size_t total_steps) {
+    const double pi = std::acos(-1.0);
+    const double fraction = static_cast<double>(std::min(step, total_steps)) /
+        static_cast<double>(std::max<size_t>(1, total_steps));
+    const double cosine = 0.5 * (1.0 + std::cos(pi * fraction));
+    return alpha0 * (kAlphaMinFactor + (1.0 - kAlphaMinFactor) * cosine);
+}
+
+// Fisher-Yates with raw mt19937_64 output. std::shuffle and the standard
+// distributions are implementation-defined; this keeps the shuffle the same
+// everywhere. The lists themselves are reproducible on one build: the math
+// functions and the SIMD dot product can round differently elsewhere.
+static void shuffle_slots(std::vector<size_t> & slots, std::mt19937_64 & rng) {
+    for (size_t i = slots.size(); i > 1; --i) {
+        const size_t j = static_cast<size_t>(rng() % static_cast<uint64_t>(i));
+        std::swap(slots[i - 1], slots[j]);
+    }
+}
+
+static double uniform_open01(std::mt19937_64 & rng) {
+    // The top 53 of 64 random bits (a double's mantissa) give [0, 1), raised
+    // off zero so log() below stays finite, as the faiss reference does.
+    // Adding 0.5 instead would round 2^53 - 0.5 up to exactly 1.0.
+    constexpr int kMantissaBits = 53;
+    constexpr double kTwoPowMinus53 = 0x1p-53;
+    return std::max(static_cast<double>(rng() >> (64 - kMantissaBits)) * kTwoPowMinus53,
+                    std::numeric_limits<double>::min());
+}
+
+// Replaces under-used centroids by splitting well-used ones. Donors are drawn
+// without replacement in proportion to their mass (Gumbel top-k), and each
+// donor and its child share the donor's mass.
+static void revive_unused(
+        std::vector<float> & centroids,
+        std::vector<double> & usage,
+        int k,
+        int dim,
+        std::mt19937_64 & rng) {
+    double total = 0.0;
+    for (double u : usage) {
+        total += u;
+    }
+    const double threshold = total * kUnusedThreshold / static_cast<double>(k);
+    std::vector<int> unused;
+    std::vector<std::pair<double, int>> donor_keys;
+    for (int j = 0; j < k; ++j) {
+        const double u = usage[static_cast<size_t>(j)];
+        if (u < threshold) {
+            unused.push_back(j);
+        } else if (u > 0.0) {
+            const double gumbel = -std::log(-std::log(uniform_open01(rng)));
+            donor_keys.push_back({ std::log(u) + gumbel, j });
+        }
+    }
+    const size_t n_split = std::min(unused.size(), donor_keys.size());
+    if (n_split == 0) {
+        return;
+    }
+    std::sort(donor_keys.begin(), donor_keys.end(), [](const auto & a, const auto & b) {
+        return a.first != b.first ? a.first > b.first : a.second < b.second;
+    });
+    const size_t dim_sz = static_cast<size_t>(dim);
+    for (size_t s = 0; s < n_split; ++s) {
+        const size_t donor = static_cast<size_t>(donor_keys[s].second);
+        const size_t child = static_cast<size_t>(unused[s]);
+        float * donor_row = centroids.data() + donor * dim_sz;
+        float * child_row = centroids.data() + child * dim_sz;
+        bool collapsed = true;
+        for (int i = 0; i < dim; ++i) {
+            const float offset = (i % 2 == 0) ? kSplitEpsilon : -kSplitEpsilon;
+            const float value = donor_row[i];
+            donor_row[i] = value * (1.0f - offset);
+            child_row[i] = value * (1.0f + offset);
+            collapsed = collapsed && donor_row[i] == child_row[i];
+        }
+        if (collapsed) {
+            // An all-zero donor cannot be separated by scaling.
+            child_row[0] = std::nextafter(child_row[0], std::numeric_limits<float>::infinity());
+        }
+        usage[donor] *= 0.5;
+        usage[child] = usage[donor];
+    }
+}
+
+static void normalize_rows_into(const std::vector<float> & src, std::vector<float> & dst, int dim) {
+    dst.resize(src.size());
+    const size_t dim_sz = static_cast<size_t>(dim);
+    for (size_t begin = 0; begin < src.size(); begin += dim_sz) {
+        double norm = 0.0;
+        for (size_t i = 0; i < dim_sz; ++i) {
+            norm += static_cast<double>(src[begin + i]) * static_cast<double>(src[begin + i]);
+        }
+        // A zero row stays zero, as in the reference.
+        const double inv = norm > 0.0 ? 1.0 / std::sqrt(norm) : 0.0;
+        for (size_t i = 0; i < dim_sz; ++i) {
+            dst[begin + i] = static_cast<float>(static_cast<double>(src[begin + i]) * inv);
+        }
+    }
+}
+
+// Refines `centroids` (k rows, seeded by the caller) with n_epochs passes of
+// spherical e-means over `slots`: rows are assigned to the unit-length
+// centroid with the best dot product, which is how IVF search scores them,
+// and the result is unit length. The closing centroids are the plain means
+// of the last pass. Every step depends only on the order of `slots`, so the
+// same order gives the same centroids.
+static void train(
+        const ggml_vec_index & idx,
+        const std::vector<size_t> & slots,
+        int n_epochs,
+        int k,
+        std::vector<float> & centroids) {
+    const int dim = idx.dim;
+    const size_t dim_sz = static_cast<size_t>(dim);
+    const size_t k_sz = static_cast<size_t>(k);
+    const size_t n = slots.size();
+    std::vector<double> batch_sums(centroids.size());
+    std::vector<double> pass_sums(centroids.size());
+    std::vector<size_t> batch_counts(k_sz);
+    std::vector<size_t> pass_counts(k_sz);
+    std::vector<double> usage(k_sz, kInitUsage);
+    std::vector<float> unit_centroids;
+    std::vector<float> row(dim_sz);
+    std::vector<size_t> order = slots;
+
+    const size_t batch = batch_size_for(n, k, n_epochs, dim);
+    const double alpha0 = initial_step_for(n, k, n_epochs, batch);
+    const size_t steps_per_epoch = (n + batch - 1) / batch;
+    const size_t total_steps = steps_per_epoch * static_cast<size_t>(n_epochs);
+    std::mt19937_64 rng(kSeed);
+    size_t step = 0;
+    for (int epoch = 0; epoch < n_epochs; ++epoch) {
+        const bool last_epoch = epoch == n_epochs - 1;
+        shuffle_slots(order, rng);
+        for (size_t begin = 0; begin < n; begin += batch) {
+            const size_t end = std::min(begin + batch, n);
+            std::fill(batch_sums.begin(), batch_sums.end(), 0.0);
+            std::fill(batch_counts.begin(), batch_counts.end(), 0);
+            normalize_rows_into(centroids, unit_centroids, dim);
+            for (size_t pos = begin; pos < end; ++pos) {
+                decode_slot_to_f32(idx, order[pos], row.data());
+                const size_t list = best_centroid(row.data(), unit_centroids, k, dim);
+                double * dst = batch_sums.data() + list * dim_sz;
+                for (int i = 0; i < dim; ++i) {
+                    dst[i] += static_cast<double>(row[static_cast<size_t>(i)]);
+                }
+                ++batch_counts[list];
+            }
+
+            const double alpha = scheduled_step(alpha0, step, total_steps);
+            for (size_t list = 0; list < k_sz; ++list) {
+                const double retained = alpha >= 1.0 ? 0.0 : usage[list] * (1.0 - alpha);
+                const size_t count = batch_counts[list];
+                if (count == 0) {
+                    usage[list] = alpha >= 1.0 ? usage[list] : retained;
+                    continue;
+                }
+                const double * sums = batch_sums.data() + list * dim_sz;
+                if (last_epoch) {
+                    double * total = pass_sums.data() + list * dim_sz;
+                    for (int i = 0; i < dim; ++i) {
+                        total[i] += sums[i];
+                    }
+                    pass_counts[list] += count;
+                }
+                // N_new = (1 - alpha) * N + alpha * n_j
+                // c_new = c + (alpha * n_j / N_new) * (s_j / n_j - c)
+                const double mass = retained + alpha * static_cast<double>(count);
+                const double weight = alpha * static_cast<double>(count) / mass;
+                const double inv_count = 1.0 / static_cast<double>(count);
+                float * centroid = centroids.data() + list * dim_sz;
+                for (int i = 0; i < dim; ++i) {
+                    const double mean = sums[i] * inv_count;
+                    const double current = static_cast<double>(centroid[i]);
+                    centroid[i] = static_cast<float>(current + weight * (mean - current));
+                }
+                usage[list] = mass;
+            }
+
+            ++step;
+            if (step % static_cast<size_t>(kCheckUnusedEvery) == 0) {
+                revive_unused(centroids, usage, k, dim, rng);
+            }
+        }
+    }
+
+    for (size_t list = 0; list < k_sz; ++list) {
+        if (pass_counts[list] == 0) {
+            continue;
+        }
+        const double inv_count = 1.0 / static_cast<double>(pass_counts[list]);
+        const double * total = pass_sums.data() + list * dim_sz;
+        float * centroid = centroids.data() + list * dim_sz;
+        for (int i = 0; i < dim; ++i) {
+            centroid[i] = static_cast<float>(total[i] * inv_count);
+        }
+    }
+    normalize_rows_into(centroids, unit_centroids, dim);
+    centroids.swap(unit_centroids);
+}
+} // namespace emeans
+
 static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists, int n_iter) {
     try {
         if (idx == nullptr || n_lists <= 0 || n_iter < 0) {
@@ -1353,11 +1631,10 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
         }
         test_maybe_throw_bad_alloc();
 
-        std::vector<float> centroids(static_cast<size_t>(actual_lists) * dim_sz);
-        std::vector<double> next_centroids(centroids.size());
-        std::vector<int> counts(static_cast<size_t>(actual_lists));
+        const size_t k_sz = static_cast<size_t>(actual_lists);
+        std::vector<float> centroids(k_sz * dim_sz);
         std::vector<float> row(dim_sz);
-        std::vector<std::vector<size_t>> lists(static_cast<size_t>(actual_lists));
+        std::vector<std::vector<size_t>> lists(k_sz);
         std::vector<size_t> active_slots;
         active_slots.reserve(n_live);
         for (size_t slot = 0; slot < n_slots; ++slot) {
@@ -1366,51 +1643,28 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
             }
         }
 
-        // Seeds are picked in id order, not slot order: a TurboVec build moves
-        // the rows, and a rebuild of unchanged data must start from the same
-        // seeds to give the same lists.
+        // The live slots in id order. Seeds and the e-means shuffle both work
+        // from it, not from slot order: a TurboVec build moves the rows, and a
+        // rebuild of unchanged data must give the same lists.
         std::vector<uint64_t> active_ids;
         active_ids.reserve(active_slots.size());
         for (size_t slot : active_slots) {
             active_ids.push_back(idx->slot_to_id[slot]);
         }
         std::sort(active_ids.begin(), active_ids.end());
-        for (int list = 0; list < actual_lists; ++list) {
-            const uint64_t id = active_ids[static_cast<size_t>(list) * active_ids.size() /
-                static_cast<size_t>(actual_lists)];
-            const size_t slot = idx->id_to_slot.at(id);
-            float * centroid = centroids.data() + static_cast<size_t>(list) * dim_sz;
-            decode_slot_to_f32(*idx, slot, centroid);
+        std::vector<size_t> by_id;
+        by_id.reserve(active_ids.size());
+        for (uint64_t id : active_ids) {
+            by_id.push_back(idx->id_to_slot.at(id));
         }
+        std::vector<uint64_t>().swap(active_ids);
 
-        for (int iter = 0; iter < n_iter; ++iter) {
-            std::fill(next_centroids.begin(), next_centroids.end(), 0.0);
-            std::fill(counts.begin(), counts.end(), 0);
-
-            for (size_t slot : active_slots) {
-                decode_slot_to_f32(*idx, slot, row.data());
-                const size_t list = best_centroid(row.data(), centroids, actual_lists, dim);
-                double * dst = next_centroids.data() + list * dim_sz;
-                for (int i = 0; i < dim; ++i) {
-                    dst[i] += static_cast<double>(row[static_cast<size_t>(i)]);
-                }
-                ++counts[list];
-            }
-
-            for (int list = 0; list < actual_lists; ++list) {
-                float * centroid = centroids.data() + static_cast<size_t>(list) * dim_sz;
-                if (counts[static_cast<size_t>(list)] == 0) {
-                    continue;
-                }
-                const double inv_count = 1.0 /
-                    static_cast<double>(counts[static_cast<size_t>(list)]);
-                const double * src =
-                    next_centroids.data() + static_cast<size_t>(list) * dim_sz;
-                for (int i = 0; i < dim; ++i) {
-                    centroid[i] = static_cast<float>(
-                        src[static_cast<size_t>(i)] * inv_count);
-                }
-            }
+        for (int list = 0; list < actual_lists; ++list) {
+            const size_t slot = by_id[static_cast<size_t>(list) * by_id.size() / k_sz];
+            decode_slot_to_f32(*idx, slot, centroids.data() + static_cast<size_t>(list) * dim_sz);
+        }
+        if (n_iter > 0) {
+            emeans::train(*idx, by_id, n_iter, actual_lists, centroids);
         }
 
         for (size_t slot : active_slots) {

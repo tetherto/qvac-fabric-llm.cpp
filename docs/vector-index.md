@@ -177,7 +177,17 @@ full scan's, the same as upstream, and real embeddings fare better (see
 upstream's measurements). The results match upstream's single-threaded
 staged search bit for bit, ties included, down to the batch query whose
 sampled seed comes up short and is rescanned unseeded (with single-query
-tables under the aarch64 rules, with the batch's own under the x86 rules).
+tables under the aarch64 rules, with the batch's own under the x86 rules),
+with one exception. The statistics that weigh the lower planes in the
+shortlist ranking are counted over every row, where upstream counts the
+first 2,048. Counted that way they do not depend on the row order, so an IVF
+build, which moves the rows into list order, does not change staged
+results, in memory or after a save and load. On an index of more than 2,048
+rows the ids can therefore differ from upstream's; the returned scores are
+still exactly the full scan's. The full count is one pass over the codes,
+paid on the first staged search after a load or promotion; adds and removes
+then update the counts, so results never depend on when the index was
+last searched or saved.
 A batch over an index with no filter and no removed rows scans the sign
 planes for several queries at once (four on aarch64, six on x86).
 Upstream's thread-pool variant refines inside its scan and can return
@@ -245,8 +255,9 @@ before search.
   memory for one extra copy of the codes, or two when the index also keeps
   packed rows, as staged search does. Without that memory, or on a read-only
   mmap, delta-log bound or tombstoned index, the build keeps the rows where
-  they are. Initial centroids are picked in id order, so rebuilding an unchanged
-  index gives the same lists and moves nothing.
+  they are. Initial centroids are picked in id order and `n_iter` e-means
+  passes refine them, with a fixed shuffle seed, so on the same build
+  rebuilding an unchanged index gives the same lists and moves nothing.
 
 `ggml_vec_index_prepare` is an optional cache warmup for TurboVec rotation and
 codebook state; other storage modes ignore it. New callers should
@@ -254,7 +265,9 @@ use `ggml_vec_index_build_ivf` when approximate-search preparation is needed.
 
 Higher `nprobe` values search more lists and generally improve recall at higher
 cost. IVF uses the same dot-product score as exact search, assigning vectors and
-queries to arithmetic centroids with dot-product scoring. Low `nprobe` values
+queries to centroids with dot-product scoring. The centroids are trained with
+spherical e-means, mini-batch k-means with moving-average centroids, so they
+are unit length after at least one pass. Low `nprobe` values
 are a recall/latency heuristic; probing all built lists gives exact-search
 candidate coverage. For cosine-like IVF behavior, normalize vectors before
 insertion and normalize queries before search.

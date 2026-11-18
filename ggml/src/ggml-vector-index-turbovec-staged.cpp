@@ -17,6 +17,8 @@
 #include "ggml-vector-index-impl.h"
 
 #include <bitset>
+#include <iterator>
+#include <random>
 
 #if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL) || defined(GGML_VEC_INDEX_HAVE_VPOPCNT_KERNEL) || \
     defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
@@ -859,8 +861,8 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot) {
         if (!idx.turbovec_staged_enabled || !turbovec_planes_wanted(idx.turbovec_bits, idx.dim, n)) {
             return;
         }
-        // Promotion: the statistics are fitted afresh from the new cache,
-        // and the staged search reads the bit planes from packed rows.
+        // Promotion: the code counts are taken afresh over every row on the
+        // next staged search, which reads the bit planes from packed rows.
         try {
             turbovec_materialize_packed_rows(idx);
         } catch (const std::bad_alloc &) {
@@ -869,6 +871,7 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot) {
         }
         idx.turbovec_planes = true;
         idx.turbovec_stats_ready = false;
+        idx.turbovec_counts_ready = false;
         idx.turbovec_sign_blocked.clear();
         first_slot = 0;
     }
@@ -882,6 +885,7 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot) {
         // the next add promotes it again.
         idx.turbovec_planes = false;
         idx.turbovec_stats_ready = false;
+        idx.turbovec_counts_ready = false;
         std::vector<uint8_t>().swap(idx.turbovec_sign_blocked);
         std::vector<float>().swap(idx.turbovec_centre);
         turbovec_settle_rows(idx);
@@ -891,15 +895,24 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot) {
 
 void turbovec_planes_restart(ggml_vec_index & idx) {
     const bool planes = idx.turbovec_planes;
+    const bool counts_ready = idx.turbovec_counts_ready;
+    const bool stats_ready = idx.turbovec_stats_ready;
+    const TurboVecStatCounts counts = idx.turbovec_stat_counts;
+    const TurboVecPlanesStats stats = idx.turbovec_stats;
     turbovec_planes_reset(idx);
     std::lock_guard<std::mutex> lock(idx.turbovec_planes_mutex);
     idx.turbovec_planes = planes;
+    idx.turbovec_stat_counts = counts;
+    idx.turbovec_stats = stats;
+    idx.turbovec_counts_ready = planes && counts_ready;
+    idx.turbovec_stats_ready = planes && counts_ready && stats_ready;
 }
 
 void turbovec_planes_reset(ggml_vec_index & idx) {
     std::lock_guard<std::mutex> lock(idx.turbovec_planes_mutex);
     idx.turbovec_planes = false;
     idx.turbovec_stats_ready = false;
+    idx.turbovec_counts_ready = false;
     idx.turbovec_centre_ready = false;
     // Swapped out rather than cleared: clear() keeps the capacity, and the
     // sign planes alone are dim / 8 bytes per vector.
@@ -967,29 +980,124 @@ float sample_seed(const ggml_vec_index & idx, const SignLut & lut, size_t s_len,
     return kth_best(scores.data(), n_s, r, [](float a, float b) { return static_cast<int>(a > b); }, scratch);
 }
 
-// Upstream pack.rs `planes_stats`, from the first 64 blocks of the cache.
-TurboVecPlanesStats compute_stats(const ggml_vec_index & idx) {
+// Upstream pack.rs `planes_stats`, but from code counts over every row where
+// upstream counts the first 64 blocks of the cache. Over every row the
+// counts do not depend on the row order: an IVF build moves the rows into
+// list order, and a fit from the first blocks would then see one list,
+// before or after a save and load, and change staged results. Adds and
+// removes update the counts (turbovec_stats_note_add/remove), so the
+// statistics in memory are always the ones a fresh count gives. On an index
+// of at most 64 blocks this is upstream's fit.
+
+// One byte of a plane carries 8 codes; a whole byte is valid.
+constexpr uint64_t kByteValid = 0xff;
+
+// Adds the codes of rows [first, last) to level[code]. A row holds its
+// codes as `bits` planes of nsg bytes, plane p carrying bit p of every code,
+// so the level counts come from the planes directly: the (bit 1, bit 0) and,
+// for 4 bits, (bit 3, bit 2) masks of a word are ANDed pairwise and counted,
+// 64 codes at a time.
+template <int kBits>
+void count_levels_rows(const uint8_t * data, size_t nsg, size_t first, size_t last, uint64_t * level) {
+    const size_t row_bytes = static_cast<size_t>(kBits) * nsg;
+    const size_t n_words = nsg / sizeof(uint64_t);
+    // Local counters, so the compiler keeps them in registers.
+    uint64_t local[size_t{ 1 } << kBits] = {};
+    auto count_word = [&](const uint64_t * p, uint64_t valid) {
+        const uint64_t lo[4] = { ~p[1] & ~p[0] & valid, ~p[1] & p[0], p[1] & ~p[0], p[1] & p[0] };
+        if constexpr (kBits == 2) {
+            for (size_t l = 0; l < 4; ++l) {
+                local[l] += static_cast<uint64_t>(popcount64(lo[l]));
+            }
+        } else {
+            const uint64_t hi[4] = { ~p[3] & ~p[2], ~p[3] & p[2], p[3] & ~p[2], p[3] & p[2] };
+            for (size_t h = 0; h < 4; ++h) {
+                for (size_t l = 0; l < 4; ++l) {
+                    local[h * 4 + l] += static_cast<uint64_t>(popcount64(hi[h] & lo[l]));
+                }
+            }
+        }
+    };
+    for (size_t v = first; v < last; ++v) {
+        const uint8_t * row = data + v * row_bytes;
+        uint64_t p[kBits];
+        for (size_t w = 0; w < n_words; ++w) {
+            for (int plane = 0; plane < kBits; ++plane) {
+                std::memcpy(&p[plane], row + static_cast<size_t>(plane) * nsg + w * sizeof(uint64_t), sizeof(uint64_t));
+            }
+            count_word(p, ~uint64_t{ 0 });
+        }
+        // A dimension that is not a multiple of 64 leaves a tail of whole
+        // bytes, counted one byte at a time.
+        for (size_t g = n_words * sizeof(uint64_t); g < nsg; ++g) {
+            for (int plane = 0; plane < kBits; ++plane) {
+                p[plane] = row[static_cast<size_t>(plane) * nsg + g];
+            }
+            count_word(p, kByteValid);
+        }
+    }
+    for (size_t code = 0; code < (size_t{ 1 } << kBits); ++code) {
+        level[code] += local[code];
+    }
+}
+
+void count_levels_serial(
+        const uint8_t * data, int bits, size_t nsg, size_t first, size_t last, uint64_t * level) {
+    // Staged search runs only at 2 and 4 bits (turbovec_planes_for); the
+    // masks cover exactly those, so any other width counts nothing rather
+    // than reading past the row.
+    assert(bits == 2 || bits == 4);
+    if (bits == 2) {
+        count_levels_rows<2>(data, nsg, first, last, level);
+    } else if (bits == 4) {
+        count_levels_rows<4>(data, nsg, first, last, level);
+    }
+}
+
+// The same over rows [first, last) in parallel. One histogram per task,
+// summed after: integer counts, so the sum does not depend on how the tasks
+// were split or run.
+void count_levels(const ggml_vec_index & idx, size_t first, size_t last, uint64_t * level) {
     const int bits = idx.turbovec_bits;
-    const int dim = idx.dim;
-    const size_t n = std::min(idx.slot_to_id.size(), static_cast<size_t>(64 * kBlock));
-    const size_t row_bytes = turbovec_row_bytes(bits, static_cast<size_t>(dim));
-    const size_t nsg = static_cast<size_t>(dim) / 8;
+    const size_t nsg = static_cast<size_t>(idx.dim) / 8;
+    const size_t n_rows = last - first;
+    const size_t n_tasks = (n_rows + kTurboVecRowsPerTask - 1) / kTurboVecRowsPerTask;
+    if (n_tasks <= 1) {
+        // A small add: no task split, and nothing to allocate.
+        count_levels_serial(idx.turbovec_data.data(), bits, nsg, first, last, level);
+        return;
+    }
+    std::vector<uint64_t> task_level(n_tasks * kTurboVecMaxLevels, 0);
+    parallel_for(n_tasks, idx.n_threads, [&](size_t task, size_t) {
+        const size_t begin = first + task * kTurboVecRowsPerTask;
+        const size_t end = std::min(last, begin + kTurboVecRowsPerTask);
+        count_levels_serial(
+            idx.turbovec_data.data(), bits, nsg, begin, end, task_level.data() + task * kTurboVecMaxLevels);
+    });
+    for (size_t task = 0; task < n_tasks; ++task) {
+        for (size_t code = 0; code < kTurboVecMaxLevels; ++code) {
+            level[code] += task_level[task * kTurboVecMaxLevels + code];
+        }
+    }
+}
+
+TurboVecPlanesStats stats_from_counts(int bits, int dim, const TurboVecStatCounts & counts) {
+    // Reached only on a promoted index (turbovec_planes_for: 2 or 4 bits),
+    // so 1 << bits levels fit counts.level.
+    assert(bits == 2 || bits == 4);
     std::vector<float> boundaries;
     std::vector<float> centroids;
     turbovec_codebook_values(bits, dim, false, boundaries, centroids);
+    const size_t levels = size_t{ 1 } << bits;
+    uint64_t total_count = 0;
+    for (size_t code = 0; code < levels; ++code) {
+        total_count += counts.level[code];
+    }
     TurboVecPlanesStats stats;
     if (bits == 2) {
         // Fraction of codes on an outer level (sign bit == low bit).
-        uint64_t outer = 0;
-        uint64_t total = 0;
-        for (size_t v = 0; v < n; ++v) {
-            const uint8_t * row = idx.turbovec_data.data() + v * row_bytes;
-            for (size_t g = 0; g < nsg; ++g) {
-                outer += static_cast<uint64_t>(popcount64(static_cast<uint8_t>(~(row[nsg + g] ^ row[g]))));
-                total += 8;
-            }
-        }
-        const float f = total == 0 ? 0.5f : static_cast<float>(outer) / static_cast<float>(total);
+        const uint64_t outer = counts.level[0] + counts.level[3];
+        const float f = total_count == 0 ? 0.5f : static_cast<float>(outer) / static_cast<float>(total_count);
         stats.m = centroids[2] * (1.0f - f) + centroids[3] * f;
         stats.alpha = (centroids[3] + centroids[2]) * 0.5f;
         stats.beta[0] = (centroids[3] - centroids[2]) * 0.5f;
@@ -998,23 +1106,8 @@ TurboVecPlanesStats compute_stats(const ggml_vec_index & idx) {
         return stats;
     }
     // 4 bits: a least-squares fit of the levels on the bit signs, weighted
-    // by how often each level occurs in the sample.
-    const size_t levels = size_t{ 1 } << bits;
-    std::vector<uint64_t> hist(levels, 0);
-    const size_t n_byte_groups = static_cast<size_t>(dim) / static_cast<size_t>(8 / bits);
-    std::vector<uint8_t> seq(n_byte_groups);
-    for (size_t v = 0; v < n; ++v) {
-        turbovec_packed_row_to_seq(idx.turbovec_data.data() + v * row_bytes, bits, dim, seq.data());
-        for (uint8_t byte : seq) {
-            for (int c = 0; c < 8 / bits; ++c) {
-                ++hist[(byte >> (c * bits)) & (levels - 1)];
-            }
-        }
-    }
-    uint64_t total_count = 0;
-    for (uint64_t h : hist) {
-        total_count += h;
-    }
+    // by how often each level occurs in the index.
+    const uint64_t * hist = counts.level;
     const double total = static_cast<double>(std::max<uint64_t>(total_count, 1));
     const int nf = bits;
     double ata[4][4] = {};
@@ -1183,6 +1276,37 @@ void keep_best(std::vector<Candidate> & cands, size_t keep, std::vector<float> *
 
 }  // namespace
 
+void turbovec_stats_note_add(ggml_vec_index & idx, size_t first_slot) {
+    std::lock_guard<std::mutex> lock(idx.turbovec_planes_mutex);
+    if (!idx.turbovec_planes || !idx.turbovec_counts_ready) {
+        return;
+    }
+    try {
+        TurboVecStatCounts counts = idx.turbovec_stat_counts;
+        count_levels(idx, first_slot, idx.slot_to_id.size(), counts.level);
+        idx.turbovec_stat_counts = counts;
+    } catch (const std::bad_alloc &) {
+        // The add has committed its rows; the next staged search counts
+        // every row instead.
+        idx.turbovec_counts_ready = false;
+    }
+    idx.turbovec_stats_ready = false;
+}
+
+void turbovec_stats_note_remove(ggml_vec_index & idx, size_t slot) {
+    std::lock_guard<std::mutex> lock(idx.turbovec_planes_mutex);
+    if (!idx.turbovec_planes || !idx.turbovec_counts_ready) {
+        return;
+    }
+    TurboVecStatCounts row;
+    count_levels_serial(
+        idx.turbovec_data.data(), idx.turbovec_bits, static_cast<size_t>(idx.dim) / 8, slot, slot + 1, row.level);
+    for (size_t code = 0; code < kTurboVecMaxLevels; ++code) {
+        idx.turbovec_stat_counts.level[code] -= row.level[code];
+    }
+    idx.turbovec_stats_ready = false;
+}
+
 namespace {
 
 // The planes cache's statistics and centre, computed on first use. False
@@ -1200,8 +1324,15 @@ bool planes_ready(const ggml_vec_index & idx, TurboVecPlanesStats & stats, const
         idx.turbovec_blocked_data.size() != n_blocks * n_byte_groups * kBlock) {
         return false;
     }
+    if (!idx.turbovec_counts_ready) {
+        TurboVecStatCounts counts;
+        count_levels(idx, 0, n, counts.level);
+        idx.turbovec_stat_counts = counts;
+        idx.turbovec_counts_ready = true;
+        idx.turbovec_stats_ready = false;
+    }
     if (!idx.turbovec_stats_ready) {
-        idx.turbovec_stats = compute_stats(idx);
+        idx.turbovec_stats = stats_from_counts(bits, idx.dim, idx.turbovec_stat_counts);
         idx.turbovec_stats_ready = true;
     }
     stats = idx.turbovec_stats;
@@ -2497,6 +2628,45 @@ void turbovec_staged_caches_for_test(
 void turbovec_force_planes_for_test(int mode, size_t min_vectors) {
     g_planes_override.store(mode, std::memory_order_relaxed);
     g_planes_min_vectors.store(min_vectors == 0 ? kTurboVecPlanesMinVectors : min_vectors, std::memory_order_relaxed);
+}
+
+int turbovec_stat_counts_match_for_test(int bits, int dim, int n_rows, uint32_t seed) {
+    const size_t nsg = static_cast<size_t>(dim) / 8;
+    const size_t row_bytes = static_cast<size_t>(bits) * nsg;
+    std::vector<uint8_t> rows(static_cast<size_t>(n_rows) * row_bytes);
+    std::mt19937 rng(seed);
+    for (uint8_t & b : rows) {
+        b = static_cast<uint8_t>(rng());
+    }
+    TurboVecStatCounts got;
+    count_levels_serial(rows.data(), bits, nsg, 0, static_cast<size_t>(n_rows), got.level);
+    // The per-code count the plane popcounts replace: each sequential byte
+    // holds 8 / bits codes.
+    TurboVecStatCounts want;
+    const int codes_per_byte = 8 / bits;
+    const unsigned code_mask = (1u << bits) - 1u;
+    std::vector<uint8_t> seq(static_cast<size_t>(dim / codes_per_byte));
+    for (int v = 0; v < n_rows; ++v) {
+        turbovec_packed_row_to_seq(rows.data() + static_cast<size_t>(v) * row_bytes, bits, dim, seq.data());
+        for (uint8_t byte : seq) {
+            for (int c = 0; c < codes_per_byte; ++c) {
+                ++want.level[(byte >> (c * bits)) & code_mask];
+            }
+        }
+    }
+    return std::equal(std::begin(got.level), std::end(got.level), std::begin(want.level)) ? 1 : 0;
+}
+
+int turbovec_stat_counts_current_for_test(const ggml_vec_index_t * idx) {
+    std::lock_guard<std::mutex> lock(idx->turbovec_planes_mutex);
+    if (!idx->turbovec_planes || !idx->turbovec_counts_ready) {
+        return -1;
+    }
+    TurboVecStatCounts fresh;
+    count_levels(*idx, 0, idx->slot_to_id.size(), fresh.level);
+    return std::equal(std::begin(fresh.level), std::end(fresh.level), std::begin(idx->turbovec_stat_counts.level))
+               ? 1
+               : 0;
 }
 
 int64_t turbovec_seed_short_count_for_test() {
