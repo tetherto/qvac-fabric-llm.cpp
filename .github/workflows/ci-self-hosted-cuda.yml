@@ -92,6 +92,13 @@ jobs:
           nvidia-smi
           GG_BUILD_CUDA=1 CUDACXX=/usr/local/cuda/bin/nvcc bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
+      # The small batched matmul is on by default only on the GPUs it was measured on, which this runner's
+      # GPU is not, so the run above tests the MUL_MAT cases on the other paths. Run them once more with it forced on.
+      - name: Test small batched matmul
+        id: mm-small
+        run: |
+          GGML_CUDA_FORCE_MM_SMALL=1 ./build-ci-release/bin/test-backend-ops test -b CUDA0 -o MUL_MAT
+
       - name: ccache-buckets-save
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
         uses: ./.github/actions/ccache-buckets
