@@ -19,6 +19,15 @@
 #include <utility>
 #include <vector>
 
+// LLAMA_GDN_DEFERRED is set for an arch that implements it; init can still turn it off
+static bool gdn_deferred_requested(const llama_model * model) {
+    char arch_name[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch_name, sizeof(arch_name));
+    const llm_arch arch = llama_arch_from_string(arch_name);
+    const char * env = getenv("LLAMA_GDN_DEFERRED");
+    return (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) && env && atoi(env) != 0;
+}
+
 // roll back multiple sequences, then replay them in a single batch whose per-seq token count exceeds n_ubatch: each
 // seq's replay spans several ubatches while its rollback restore is still pending. Compared against a reference context
 // that never advanced past the rollback point and decodes the identical replay batch. Only the first replayed token of
@@ -260,8 +269,10 @@ struct case_rollback : ctx_test {
         ckpt.update_tgt(ctx_src.get(), 0, 0);
         ckpt.load_tgt(ctx_dst.get(), 0, 0);
 
-        // exact match - the same context configuration replaying the same tokens
-        constexpr float nmse_eps = 0.0;
+        // exact match - the same context configuration replaying the same tokens.
+        // the deferred gdn commit saves the state through a host replay that sums in another order
+        // than the op, so the restored state matches the source only to rounding
+        const float nmse_eps = gdn_deferred_requested(mr.model) ? 1e-10f : 0.0f;
 
         std::vector<std::vector<float>> logits_src_replay(n_rollback);
         for (uint32_t i = 0; i < n_rollback; ++i) {
@@ -372,8 +383,7 @@ struct case_rollback_bound : ctx_test {
         // the DSV4 cache rebuilds snapshot d from the state before the ubatch, so d <= n is exact;
         // the recurrent memory gets snapshots 0..n-1 from ggml_gated_delta_net, only for n <= n_rs_seq + 1
         // the deferred gated delta net commit (LLAMA_GDN_DEFERRED) keeps the state before the ubatch too
-        const char * gdn_env = getenv("LLAMA_GDN_DEFERRED");
-        const bool gdn_deferred = (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) && gdn_env && atoi(gdn_env) != 0;
+        const bool gdn_deferred = gdn_deferred_requested(mr.model);
         const bool from_ubatch_start = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || gdn_deferred;
 
         const auto make_ctx = [&]() {
