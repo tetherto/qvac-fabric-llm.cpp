@@ -238,7 +238,7 @@ GGML_VEC_INDEX_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 
 // Builds an in-memory IVF-flat approximate nearest-neighbor structure for the
 // same dot-product score used by exact search. IVF assigns vectors and queries
-// to arithmetic centroids with dot-product scoring; low nprobe values are a
+// to centroids with dot-product scoring; low nprobe values are a
 // recall/latency heuristic, not a metric-correct guarantee. This is not
 // persisted in .tvim files; call again after loading if ANN search is needed.
 // This is allowed on mmap-loaded handles because it only builds heap-owned
@@ -252,9 +252,14 @@ GGML_VEC_INDEX_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 // staged search does; without it the build still succeeds and leaves the
 // rows where they are. Rows already in list order are not moved, so
 // rebuilding an unchanged index changes nothing.
-// `n_lists` is capped to the current index length. `n_iter` controls centroid
-// refinement; 0 uses the initial centroids only. Those are rows picked at
-// even steps in id order, so the same vectors and ids give the same lists.
+// `n_lists` is capped to the current index length. The initial centroids are
+// rows picked at even steps in id order. `n_iter` is the number of spherical
+// e-means passes over the live vectors (Bessa et al., arXiv:2611.09501):
+// mini-batch k-means with moving-average centroids that revives empty lists,
+// so a pass costs about one k-means iteration but needs far fewer passes. The
+// refined centroids are unit length. 0 keeps the initial centroids. The
+// e-means shuffle uses a fixed seed and id order, so on the same build the
+// same vectors and ids give the same lists.
 GGML_VEC_INDEX_API int ggml_vec_index_build_ivf(
     ggml_vec_index_t * idx,
     int                n_lists,
