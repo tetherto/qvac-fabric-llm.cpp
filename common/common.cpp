@@ -1475,7 +1475,8 @@ common_init_result_ptr common_init_from_model_and_params(llama_model* model, com
             } else {
                 char architecture[32] = {};
                 const int32_t hidden = llama_model_n_embd(model);
-                if (llama_model_n_layer(model) == 24 && (hidden == 1024 || hidden == 2048) &&
+                const int32_t n_layer = llama_model_n_layer(model);
+                if (((n_layer == 24 && (hidden == 1024 || hidden == 2048)) || (n_layer == 32 && (hidden == 2560 || hidden == 4096))) &&
                         llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) > 0 &&
                         std::strcmp(architecture, "qwen35") == 0) {
                     ffn_params.metal_channels = hidden;

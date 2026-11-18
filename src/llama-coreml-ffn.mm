@@ -187,6 +187,12 @@ otf_template builtin_template(int hidden, int count) {
         FFN_TEMPLATE(h2048_c3072);
     } else if (hidden == 2048 && count == 4096) {
         FFN_TEMPLATE(h2048_c4096);
+    } else if (hidden == 2560 && count == 6144) {
+        FFN_TEMPLATE(h2560_c6144);
+    } else if (hidden == 2560 && count == 6656) {
+        FFN_TEMPLATE(h2560_c6656);
+    } else if (hidden == 4096 && count == 8192) {
+        FFN_TEMPLATE(h4096_c8192);
     } else if (hidden == 5120 && count == 4608) {
         FFN_TEMPLATE(4608);
     } else {
@@ -217,15 +223,19 @@ llama_coreml_ffn * llama_coreml_ffn_load(const llama_model & model, const llama_
         const int n_layer = model.hparams.n_layer();
         const bool small = hidden == 1024 && channels == 3584 && n_layer == 24;
         const bool medium = hidden == 2048 && channels == 6144 && n_layer == 24;
+        const bool q4b = hidden == 2560 && channels == 9216 && n_layer == 32;
+        const bool q9b = hidden == 4096 && channels == 12288 && n_layer == 32;
         const bool large = hidden == 5120 && channels == 17408 && n_layer == 64;
         require(params.n_packages >= 1 && params.n_packages <= 2 && params.metal_channels > 0 &&
             params.metal_channels < channels && params.metal_channels % 256 == 0 &&
             (channels - params.metal_channels) % params.n_packages == 0 && params.min_tokens >= 2 && params.min_tokens <= rows,
             "invalid Core ML FFN configuration");
-        require(model.arch == LLM_ARCH_QWEN35 && (small || medium || large) &&
+        require(model.arch == LLM_ARCH_QWEN35 && (small || medium || q4b || q9b || large) &&
             (!small || (params.metal_channels == 1024 && params.n_packages == 1)) &&
             (!medium || ((params.metal_channels == 2048 || params.metal_channels == 3072 || params.metal_channels == 4096) && params.n_packages == 1)) &&
-            !model.hparams.no_alloc && model.hdmd.rot.empty() && model.hdmd.inv.empty(), "Core ML FFN requires an unrotated Qwen3.5-0.8B, Qwen3.5-2B or Qwen3.8-27B model");
+            (!q4b || ((params.metal_channels == 2560 || params.metal_channels == 3072) && params.n_packages == 1)) &&
+            (!q9b || (params.metal_channels == 4096 && params.n_packages == 1)) &&
+            !model.hparams.no_alloc && model.hdmd.rot.empty() && model.hdmd.inv.empty(), "Core ML FFN requires an unrotated Qwen3.5-0.8B, 2B, 4B, 9B or Qwen3.8-27B model");
         for (int i = 0; i < n_layer; ++i) {
             const auto & layer = model.layers[i];
             require(model.dev_layer(i) && std::string(ggml_backend_dev_name(model.dev_layer(i))) == "MTL0",

@@ -12,6 +12,11 @@ The bundled templates were made with coremltools 9.0 and numpy 2.0.2:
 
 The Qwen3.5-0.8B template uses coremltools 9.0 and numpy 1.26.4:
     make_template.py int8-h1024-c2560 --hidden 1024 --channels 2560 --chunk 2048
+
+The Qwen3.5-4B and 9B templates use the same versions:
+    make_template.py int8-h2560-c6656 --hidden 2560 --channels 6656 --chunk 2048
+    make_template.py int8-h2560-c6144 --hidden 2560 --channels 6144 --chunk 2048
+    make_template.py int8-h4096-c8192 --hidden 4096 --channels 8192 --chunk 2048
 """
 
 import argparse
