@@ -1041,29 +1041,35 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
 // A unified cache has one cell-to-block map for every sequence. Image patches can share a
 // temporal position, so until QSA has sequence-local ranks this configuration must stay dense.
 static int test_qsa_unified_multiseq(size_t seed, float stdev) {
-    // visible (finite) cells of the selection masks and of the causal masks they are built on
+    // visible (finite) cells of the selection masks, and of the causal masks of the same model without QSA
     struct observed_nodes {
         bool   top_k    = false;
         size_t n_sparse = 0;
         size_t n_dense  = 0;
     } observed;
 
-    auto observe = [](ggml_tensor * tensor, bool ask, void * data) {
+    // the selection is built without the kq_mask: a mask over the cache cells, or over each group's list of cells
+    auto observe_sparse = [](ggml_tensor * tensor, bool ask, void * data) {
         auto & nodes = *static_cast<observed_nodes *>(data);
-        auto count_finite = [](const std::vector<float> & mask) {
-            return (size_t) std::count_if(mask.begin(), mask.end(), [](float v) { return std::isfinite(v); });
-        };
         if (ask) {
             nodes.top_k |= std::strncmp(tensor->name, "indexer_top_k-", 14) == 0;
-            if (std::strncmp(tensor->name, "kq_mask_qsa-", 12) != 0) {
-                return false;
-            }
-            // sel = set_rows(-inf, 0) + kq_mask may be computed in place over the mask input, so read it first
-            GGML_ASSERT(std::strcmp(tensor->src[1]->name, "attn_inp_kq_mask") == 0);
-            nodes.n_dense += count_finite(get_tensor_f32(tensor->src[1]));
-            return true;
+            return std::strncmp(tensor->name, "kq_mask_qsa-", 12) == 0;
         }
-        nodes.n_sparse += count_finite(get_tensor_f32(tensor));
+        const std::vector<float> values = get_tensor_f32(tensor);
+        nodes.n_sparse += (size_t) std::count_if(values.begin(), values.end(), [](float v) { return std::isfinite(v); });
+        return true;
+    };
+
+    // the causal mask each dense attention layer reads
+    auto observe_dense = [](ggml_tensor * tensor, bool ask, void * data) {
+        auto & nodes = *static_cast<observed_nodes *>(data);
+        const ggml_tensor * mask = tensor->op == GGML_OP_FLASH_ATTN_EXT ? tensor->src[3] :
+                                   tensor->op == GGML_OP_SOFT_MAX       ? tensor->src[1] : nullptr;
+        if (ask) {
+            return mask != nullptr;
+        }
+        const std::vector<float> values = get_tensor_f32(mask);
+        nodes.n_dense += (size_t) std::count_if(values.begin(), values.end(), [](float v) { return std::isfinite(v); });
         return true;
     };
 
@@ -1077,11 +1083,11 @@ static int test_qsa_unified_multiseq(size_t seed, float stdev) {
             GGUF_TYPE_UINT32, dense_ratios, 2);
 
     auto unified = get_model_and_ctx(gguf_sparse.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER,
-            false, nullptr, 0, 2, true, observe, &observed);
+            false, nullptr, 0, 2, true, observe_sparse, &observed);
     auto streams = get_model_and_ctx(gguf_sparse.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER,
             false, nullptr, 0, 2, false);
     auto dense = get_model_and_ctx(gguf_dense.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER,
-            false, nullptr, 0, 2, false);
+            false, nullptr, 0, 2, false, observe_dense, &observed);
 
     const uint32_t n_embd  = llama_model_n_embd(unified.first.get());
     const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(unified.first.get()));
