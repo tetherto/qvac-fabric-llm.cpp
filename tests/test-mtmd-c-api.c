@@ -8,8 +8,8 @@
 #include "mtmd-helper.h"
 
 // Image chunk of mtmd_test_create_input_chunks(), saved by a build using serialization version 4.
-// Version 5 added grid_x/grid_y to the image payload, so this must fail the version check instead of
-// being parsed with the version 5 field order.
+// Version 6 has grid_x/grid_y in the image payload, so this must fail the version check instead of
+// being parsed with the version 6 field order.
 static const unsigned char mtmd_v4_image_chunk[610] = {
     0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
@@ -149,8 +149,9 @@ int main(void) {
 
         uint64_t version;
         memcpy(&version, buf, sizeof(version));
-        assert(version == 5);
-        for (uint64_t old_version = 2; old_version <= 4; ++old_version) {
+        assert(version == 6);
+        // every 5 is rejected: upstream's, the b12032 fork's and the pre-bump layout all used it
+        for (uint64_t old_version = 2; old_version <= 5; ++old_version) {
             memcpy(buf, &old_version, sizeof(old_version));
             assert(mtmd_input_chunk_load(buf, expected_len) == NULL);
         }

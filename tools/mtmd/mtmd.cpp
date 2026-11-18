@@ -61,10 +61,13 @@ std::string mtmd_format(const char * fmt, ...) {
 }
 
 // remember to bump this if the serialization format changes
-#define MTMD_SERIALIZATION_VERSION 5
+// 5 names three layouts: upstream b12429's (audio_n_ctx), the b12032 fork's
+// (grid_x/grid_y in the image tokens) and this line's before the bump (both).
+// 6 is this line's layout; no 5 can be told apart, so none is loaded.
+#define MTMD_SERIALIZATION_VERSION 6
 
 // oldest compat version that can be loaded
-#define MTMD_SERIALIZATION_VERSION_MIN 5
+#define MTMD_SERIALIZATION_VERSION_MIN 6
 
 struct mtmd_serialization {
     // note: using 64-bit here for future-proofing
