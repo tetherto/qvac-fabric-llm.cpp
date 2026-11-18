@@ -1005,7 +1005,15 @@ static constexpr int64_t GGML_METAL_MIN_THREADGROUPS = 128;
 // few-row MMA mat-mul: 8x8 simdgroup matrices for the src1 rows of ggml_metal_mul_mat_use_mma
 static constexpr int     GGML_METAL_MMA_TILE          = 8;
 static constexpr int     GGML_METAL_MMA_NT_MAX        = 4;
+// the q5_K and q6_K kernels hold more state per tile: on an M3 Ultra 2 tiles beat 4 by up to 18%
+static constexpr int     GGML_METAL_MMA_NT_MAX_K      = 2;
 static constexpr int     GGML_METAL_MMA_SMEM_MAX      = 16384;
+// from this Apple GPU family on (M5, A19) q4_K with one src1 tile runs faster on the generic kernel, and q5_K without the
+// tile cap (both measured on an M5)
+static constexpr int     GGML_METAL_MMA_FAMILY_APPLE10 = 10;
+// q4_K with one src1 tile runs the q5_K kernel from two tiles of src0 rows per minimum threadgroup count on; with fewer
+// rows the generic kernel is faster (M3 Ultra: 1024 rows 1.06x, 2048 rows 0.90-1.00x)
+static constexpr int64_t GGML_METAL_MMA_Q4_K_MIN_ROWS = 2*GGML_METAL_MIN_THREADGROUPS*GGML_METAL_MMA_TILE;
 
 // simdgroups per threadgroup for at most FEW_ROWS, at most MANY_ROWS, and more src0 rows
 static constexpr int64_t GGML_METAL_MMA_FEW_ROWS      = 64;
@@ -1028,6 +1036,30 @@ static int ggml_metal_halve_to_limit(int n, int64_t limit) {
     return n;
 }
 
+static ggml_metal_mma_kind ggml_metal_mul_mv_mma_kind_on(int gpu_family, const ggml_tensor * op, int rt) {
+    const ggml_metal_mma_kind kind = ggml_metal_mul_mv_mma_kind(op->src[0]->type, rt);
+    const bool q4_K_gen = gpu_family >= GGML_METAL_MMA_FAMILY_APPLE10 || op->src[0]->ne[1] < GGML_METAL_MMA_Q4_K_MIN_ROWS;
+
+    return kind == GGML_METAL_MMA_KIND_Q4_K && q4_K_gen ? GGML_METAL_MMA_KIND_GEN : kind;
+}
+
+static bool ggml_metal_mul_mv_mma_has_kind(ggml_type type) {
+    return ggml_metal_mul_mv_mma_kind(type, 1) != GGML_METAL_MMA_KIND_GEN ||
+           ggml_metal_mul_mv_mma_kind(type, 2) != GGML_METAL_MMA_KIND_GEN;
+}
+
+// q4_K on the q5_K kernel keeps 4 tiles: on an M3 Ultra 2 tiles run 0.88-0.95x at 4096, 6144 and 6272 src0 rows but
+// 1.01-1.09x at 5120 rows and from 10240 rows, a net loss over the q4_K layers of a 27B UD-Q4_K_M model
+static int ggml_metal_mul_mv_mma_nt_max(int gpu_family, ggml_metal_mma_kind kind) {
+    const bool cap_q5_K = kind == GGML_METAL_MMA_KIND_Q5_K && gpu_family < GGML_METAL_MMA_FAMILY_APPLE10;
+
+    return cap_q5_K || kind == GGML_METAL_MMA_KIND_Q6_K ? GGML_METAL_MMA_NT_MAX_K : GGML_METAL_MMA_NT_MAX;
+}
+
+static int ggml_metal_library_gpu_family(ggml_metal_library_t lib) {
+    return ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->gpu_family;
+}
+
 static size_t ggml_metal_mul_mv_mma_smem(int nsg, int nt, int rt) {
     // one 8x8 float simdgroup matrix per output tile
     constexpr size_t tile_bytes = 8*8*sizeof(float);
@@ -1036,7 +1068,7 @@ static size_t ggml_metal_mul_mv_mma_smem(int nsg, int nt, int rt) {
 
 // fewer src0 rows need more simdgroups per threadgroup (a finer K split) to fill the GPU.
 // the tiles become narrower when the K-slice reduction buffer is too large or when too few threadgroups fill the GPU.
-static ggml_metal_mma_tiling ggml_metal_op_mul_mat_mma_tiling(const ggml_tensor * op) {
+static ggml_metal_mma_tiling ggml_metal_op_mul_mat_mma_tiling(const ggml_tensor * op, int gpu_family) {
     const ggml_type type = op->src[0]->type;
     const int64_t   ne00 = op->src[0]->ne[0];
     const int64_t   ne01 = op->src[0]->ne[1];
@@ -1056,14 +1088,15 @@ static ggml_metal_mma_tiling ggml_metal_op_mul_mat_mma_tiling(const ggml_tensor 
 
     const int64_t nt_smem   = GGML_METAL_MMA_SMEM_MAX/(int64_t) ggml_metal_mul_mv_mma_smem(res.nsg, 1, res.rt);
     const int64_t nt_rows   = ne01/(GGML_METAL_MIN_THREADGROUPS*GGML_METAL_MMA_TILE);
-    res.nt = ggml_metal_halve_to_limit(GGML_METAL_MMA_NT_MAX, std::min(nt_smem, nt_rows));
+    const int nt_max = ggml_metal_mul_mv_mma_nt_max(gpu_family, ggml_metal_mul_mv_mma_kind_on(gpu_family, op, res.rt));
+    res.nt = ggml_metal_halve_to_limit(nt_max, std::min(nt_smem, nt_rows));
 
     return res;
 }
 
 // the pipeline for the tiling, with fewer simdgroups when the device cannot run that many threads
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma_auto(ggml_metal_library_t lib, const ggml_tensor * op, bool add) {
-    ggml_metal_mma_tiling tiling = ggml_metal_op_mul_mat_mma_tiling(op);
+    ggml_metal_mma_tiling tiling = ggml_metal_op_mul_mat_mma_tiling(op, ggml_metal_library_gpu_family(lib));
 
     auto pipeline = ggml_metal_library_get_pipeline_mul_mv_mma(lib, op, tiling.nsg, tiling.nt, tiling.rt, add);
     while (tiling.nsg > 1 && ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < tiling.nsg*32) {
@@ -1086,10 +1119,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma(ggml_
 
     GGML_ASSERT(ne12 <= INT16_MAX && r2 <= INT16_MAX && r3 <= INT16_MAX);
 
-    // the specialized kernels unroll over a compile-time row length
-    const int ne00 = ggml_metal_mul_mv_mma_kind(tsrc0, rt) != GGML_METAL_MMA_KIND_GEN ? op->src[0]->ne[0] : 0;
+    const ggml_metal_mma_kind kind = ggml_metal_mul_mv_mma_kind_on(ggml_metal_library_gpu_family(lib), op, rt);
+    // the generic kernel of a type that also has its own kernel is named with _gen
+    const char * gen = kind == GGML_METAL_MMA_KIND_GEN && ggml_metal_mul_mv_mma_has_kind(tsrc0) ? "_gen" : "";
 
-    snprintf(base, 256, "kernel_mul_mv_mma_%s_%s_nt%d_rt%d", ggml_type_name(tsrc0), ggml_type_name(tsrc1), nt, rt);
+    // the specialized kernels unroll over a compile-time row length
+    const int ne00 = kind != GGML_METAL_MMA_KIND_GEN ? op->src[0]->ne[0] : 0;
+
+    snprintf(base, 256, "kernel_mul_mv_mma_%s%s_%s_nt%d_rt%d", ggml_type_name(tsrc0), gen, ggml_type_name(tsrc1), nt, rt);
     snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_ne00=%d_add=%d", base, nsg, ne12, r2, r3, ne00, add);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1108,8 +1145,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma(ggml_
         ggml_metal_cv_free(cv);
     }
 
+    // the iq4 kernel keeps its 256-entry half2 table in shmem before the reduction
+    constexpr size_t iq4_lut_bytes = 256*2*sizeof(uint16_t);
+    const size_t smem = ggml_metal_mul_mv_mma_smem(nsg, nt, rt);
+
     res.nsg  = nsg;
-    res.smem = ggml_metal_mul_mv_mma_smem(nsg, nt, rt);
+    res.smem = kind == GGML_METAL_MMA_KIND_IQ4 ? std::max(smem, iq4_lut_bytes) : smem;
 
     res.nr0 = GGML_METAL_MMA_TILE*nt;
     res.nr1 = GGML_METAL_MMA_TILE*rt;
@@ -2160,6 +2201,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix(ggml
     char name[256];
 
     snprintf(base, 256, "kernel_top_k_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+// the chunk pass or the merge pass of the chunked top-k
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_chunked(ggml_metal_library_t lib, const ggml_tensor * op, bool merge) {
+    assert(op->op == GGML_OP_TOP_K);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_top_k_%s_%s_%s", merge ? "merge_chunks" : "chunk", ggml_type_name(op->src[0]->type), ggml_type_name(op->type));
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
