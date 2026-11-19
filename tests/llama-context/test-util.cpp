@@ -411,6 +411,11 @@ bool arch_reserves_single_seq(const llama_model * model) {
     return strcmp(arch_str, "kimi-linear") == 0 || strcmp(arch_str, "minimax-01") == 0;
 }
 
+bool has_metal_backend() {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("MTL");
+    return reg != nullptr && ggml_backend_reg_dev_count(reg) > 0;
+}
+
 //
 // model_run
 //
