@@ -158,6 +158,7 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 }
 
 #ifdef __CUDA_ARCH_LIST__
+// Functions that expand __CUDA_ARCH_LIST__ must be static: mmq-cutlass.cu has its own arch list, and the linker keeps only one copy of a non-static inline function.
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;
 }
@@ -167,7 +168,7 @@ constexpr bool ggml_cuda_has_arch_impl(const int arch, const int first, Archs...
     return arch == first || ggml_cuda_has_arch_impl(arch, rest...);
 }
 
-constexpr bool ggml_cuda_has_arch(const int arch) {
+static constexpr bool ggml_cuda_has_arch(const int arch) {
     return ggml_cuda_has_arch_impl(arch, __CUDA_ARCH_LIST__);
 }
 
@@ -187,7 +188,7 @@ constexpr int ggml_cuda_highest_compiled_arch_impl(const int arch, const int cur
     }
 }
 
-constexpr int ggml_cuda_highest_compiled_arch(const int arch) {
+static constexpr int ggml_cuda_highest_compiled_arch(const int arch) {
     return ggml_cuda_highest_compiled_arch_impl(arch, 0, __CUDA_ARCH_LIST__);
 }
 
