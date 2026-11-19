@@ -1,8 +1,10 @@
 name: Convert PR to draft
 
 on:
-  pull_request_target:
-    types: [labeled]
+  # PR events also runs on labeled, so applying `draft` starts the default branch's copy, whose token can convert forks.
+  workflow_run:
+    workflows: [PR events]
+    types: [requested]
 
 cache-mode: none
 permissions:
@@ -12,13 +14,31 @@ permissions:
 
 jobs:
   convert-to-draft:
-    if: github.event.label.name == 'draft' && github.event.pull_request.draft == false
     runs-on: ubuntu-slim
     steps:
+      # The open, non-draft PR labelled `draft` whose head is the triggering commit, from the API.
+      - name: Find the pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          number=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f per_page=100 \
+            -f head="${HEAD_REPO%%/*}:$HEAD_BRANCH" --jq '
+              [.[] | select(.head.sha == env.HEAD_SHA
+                and (.head.repo.full_name | ascii_downcase) == (env.HEAD_REPO | ascii_downcase)
+                and (.draft | not) and any(.labels[]; .name == "draft"))]
+              | if length == 1 then .[0].number else "" end')
+          [ -z "$number" ] || echo "PR #$number at $HEAD_SHA"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
       - name: Convert PR to draft
+        if: steps.pr.outputs.number != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
-          gh pr ready --undo "$PR_URL"
-          gh pr edit "$PR_URL" --remove-label draft
+          gh pr ready --undo "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"
+          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label draft

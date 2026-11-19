@@ -1,6 +1,9 @@
 name: "Pull Request Labeler"
 on:
-- pull_request_target
+  # Each PR events run starts the default branch's copy, whose token can label fork PRs; it checks out only the config.
+  workflow_run:
+    workflows: [PR events]
+    types: [requested]
 
 cache-mode: none
 permissions:
@@ -13,9 +16,30 @@ jobs:
       pull-requests: write
     runs-on: ubuntu-slim
     steps:
+    # The open PR whose head is the triggering commit, from the API; the trigger gives only its head.
+    - name: Find the pull request
+      id: pr
+      env:
+        GH_TOKEN: ${{ github.token }}
+        HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+        HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      run: |
+        number=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f per_page=100 \
+          -f head="${HEAD_REPO%%/*}:$HEAD_BRANCH" --jq '
+            [.[] | select(.head.sha == env.HEAD_SHA
+              and (.head.repo.full_name | ascii_downcase) == (env.HEAD_REPO | ascii_downcase))]
+            | if length == 1 then .[0].number else "" end')
+        [ -n "$number" ] || echo "::notice::No open PR at $HEAD_SHA to label"
+        [ -z "$number" ] || echo "PR #$number at $HEAD_SHA"
+        echo "number=$number" >> "$GITHUB_OUTPUT"
     - uses: actions/checkout@v6
+      if: steps.pr.outputs.number != ''
       with:
         repository: "ggml-org/llama.cpp"
+        persist-credentials: false
     - uses: actions/labeler@v6
+      if: steps.pr.outputs.number != ''
       with:
         configuration-path: '.github/labeler.yml'
+        pr-number: ${{ steps.pr.outputs.number }}
