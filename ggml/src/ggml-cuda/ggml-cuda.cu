@@ -1100,19 +1100,6 @@ static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_cuda_buffer_free_buffer;
 }
 
-#ifdef GGML_CUDA_CUTLASS
-static const char * ggml_backend_cuda_repacked_buffer_type_get_name(ggml_backend_buffer_type_t buft);
-#endif
-
-bool ggml_backend_buft_is_cuda_repacked(ggml_backend_buffer_type_t buft) {
-#ifdef GGML_CUDA_CUTLASS
-    return buft != nullptr && buft->iface.get_name == ggml_backend_cuda_repacked_buffer_type_get_name;
-#else
-    GGML_UNUSED(buft);
-    return false;
-#endif
-}
-
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     return ctx->dev_ptr;
@@ -1239,6 +1226,8 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
 struct ggml_backend_cuda_buffer_type_context {
     int device;
     std::string name;
+    // Marks CUTLASS repack types; get_name is shared because MSVC /OPT:ICF merges identical functions.
+    bool repacked = false;
 };
 
 static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -1248,9 +1237,16 @@ static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_t
 }
 
 static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
-    return buft != nullptr &&
-        (buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name ||
-         ggml_backend_buft_is_cuda_repacked(buft));
+    return buft != nullptr && buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
+}
+
+bool ggml_backend_buft_is_cuda_repacked(ggml_backend_buffer_type_t buft) {
+#ifdef GGML_CUDA_CUTLASS
+    return ggml_backend_buft_is_cuda(buft) && ((ggml_backend_cuda_buffer_type_context *) buft->context)->repacked;
+#else
+    GGML_UNUSED(buft);
+    return false;
+#endif
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -1340,6 +1336,8 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
                 /* .device   = */ dev,
                 /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i)},
             };
+            // A plain buffer type must never classify as repacked.
+            GGML_ASSERT(!ggml_backend_buft_is_cuda_repacked(&ggml_backend_cuda_buffer_types[i]));
         }
         ggml_backend_cuda_buffer_type_initialized = true;
     }
@@ -1367,11 +1365,6 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 static ggml_cuda_repack_metadata ggml_cuda_cutlass_blockscaled_metadata = {
     GGML_CUDA_REPACK_TYPE_CUTLASS_BLOCKSCALED,
 };
-
-static const char * ggml_backend_cuda_repacked_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
-    ggml_backend_cuda_buffer_type_context * ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
-    return ctx->name.c_str();
-}
 
 static ggml_status ggml_backend_cuda_repacked_buffer_init_tensor(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
@@ -1598,7 +1591,7 @@ static size_t ggml_backend_cuda_repacked_buffer_type_get_alloc_size(
 }
 
 static const ggml_backend_buffer_type_i ggml_backend_cuda_repacked_buffer_type_interface = {
-    /* .get_name         = */ ggml_backend_cuda_repacked_buffer_type_get_name,
+    /* .get_name         = */ ggml_backend_cuda_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_cuda_repacked_buffer_type_alloc_buffer,
     /* .alloc_buffer_n   = */ nullptr,
     /* .get_alignment    = */ ggml_backend_cuda_buffer_type_get_alignment,
@@ -1628,8 +1621,13 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_repacked_buffer_type(int dev
                 /* .iface    = */ ggml_backend_cuda_repacked_buffer_type_interface,
                 /* .device   = */ dev,
                 /* .context  = */
-                new ggml_backend_cuda_buffer_type_context{ i, GGML_CUDA_NAME + std::to_string(i) + "_REPACK" },
+                new ggml_backend_cuda_buffer_type_context{
+                    /* .device   = */ i,
+                    /* .name     = */ GGML_CUDA_NAME + std::to_string(i) + "_REPACK",
+                    /* .repacked = */ true,
+                },
             };
+            GGML_ASSERT(ggml_backend_buft_is_cuda_repacked(&buffer_types[i]));
         }
         initialized = true;
     }
