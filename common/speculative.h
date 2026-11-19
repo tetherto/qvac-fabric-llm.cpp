@@ -37,6 +37,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
 // return the max number of draft tokens from the initialized implementations
 int32_t common_speculative_n_max(const common_speculative * spec);
 
+// draft-dflash drafts n_max_dflash tokens unless n_max is explicit; call once the spec types are final
+void common_speculative_set_default_n_max(common_params_speculative & spec);
+
 // how many of the n drafts of a lattice path to keep: n_short when the expected accepted tokens of all n drafts do not
 // pay for long_cost, the cost of any step past n_short drafts relative to one with n_short. path_p[i] is the probability
 // of the path's transition i

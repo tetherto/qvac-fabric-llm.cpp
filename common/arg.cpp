@@ -731,6 +731,9 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             task.on_done();
         }
     }
+
+    // the spec types are final here, including the ones inferred from the draft repo or GGUF above
+    common_speculative_set_default_n_max(params.speculative);
 }
 
 //
@@ -4331,12 +4334,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
-        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
+        string_format("number of tokens to draft for speculative decoding (default: %d, %d with --spec-type draft-dflash)",
+                      params.speculative.draft.n_max, common_params_speculative_draft::n_max_dflash),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.speculative.draft.n_max = value;
+            params.speculative.draft.n_max          = value;
+            params.speculative.draft.n_max_explicit = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
