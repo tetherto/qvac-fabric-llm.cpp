@@ -210,13 +210,13 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    mem_attn->state_read(io, seq_id, flags);
-
     try {
+        mem_attn->state_read(io, seq_id, flags);
         mem_recr->state_read(io, seq_id, flags);
     } catch (...) {
-        // a failed restore leaves the sequence empty in both caches
+        // a failed restore drops the sequence from every cache
         mem_attn->state_clear(seq_id);
+        mem_recr->state_clear(seq_id);
 
         throw;
     }

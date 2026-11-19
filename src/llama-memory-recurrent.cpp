@@ -1676,6 +1676,10 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     return true;
 }
 
+void llama_memory_recurrent::state_clear(llama_seq_id seq_id) {
+    state_clear(seq_id, 0, 0);
+}
+
 // the cleared ranges mirror the write pattern of state_read_data() - keep both in sync
 // the transposed s layout is not handled - state_read_data() rejects it before any write
 void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count) {

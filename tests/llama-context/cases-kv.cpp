@@ -506,6 +506,112 @@ struct case_state_restore_failure : ctx_test {
     }
 };
 
+// a composite memory restores its parts one after the other, and a failure in a later part must not
+// leave the earlier ones restored: the sequence ends up either untouched or empty in every part
+// - decode A on seq 0 and save its full and partial states
+// - decode B, a prefix of A, on seq 0 instead
+// - restore each state of A cut off so that it fails after a part the restore went through
+struct case_state_restore_failure_part : ctx_test {
+    const char * name() const override { return "rf_part"; }
+
+    const char * description() const override {
+        return "a restore that fails in a later part of the memory leaves the sequence untouched or empty";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx      = 256;
+        opts.n_seq_max  = 2;
+        opts.kv_unified = 1;
+
+        auto ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        llama_memory_t mem = llama_get_memory(ctx.get());
+        if (mem == nullptr) {
+            TLOG_INF("no memory to test\n");
+            return case_result::pass();
+        }
+
+        const llama_pos n_a = std::min<llama_pos>(mr.tokens.size(), 24);
+        const llama_pos n_b = n_a / 2;
+        if (n_b == 0) {
+            TLOG_INF("the prompt is too short\n");
+            return case_result::pass();
+        }
+
+        llama_memory_clear(mem, true);
+
+        if (!decode_seq(ctx.get(), mr.tokens, 0, n_a, 0, true)) {
+            return case_result::fail();
+        }
+
+        std::vector<uint8_t> full_a;
+        std::vector<uint8_t> partial_a;
+        if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, full_a) ||
+            !get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, partial_a)) {
+            return case_result::fail();
+        }
+
+        // the magic and the sequence id
+        const size_t n_header = sizeof(uint32_t) + sizeof(llama_seq_id);
+
+        struct sub_case {
+            const char * name;
+            uint32_t flags;
+            const std::vector<uint8_t> * state;
+            size_t n_keep;
+        };
+
+        std::vector<sub_case> sub_cases;
+
+        // a composite writes the parts only the full state holds (non-SWA attention) before the parts the
+        // partial state holds as well (SWA, recurrent), so the full state cut at this length fails where the
+        // latter begin
+        if (partial_a.size() > n_header && partial_a.size() < full_a.size()) {
+            sub_cases.push_back({ "full", LLAMA_STATE_SEQ_FLAGS_NONE, &full_a, n_header + full_a.size() - partial_a.size() });
+        }
+
+        // the parts only the full state holds are skipped, so the first part read fails
+        if (partial_a.size() > n_header) {
+            sub_cases.push_back({ "partial", LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &partial_a, n_header });
+        }
+
+        // seq 1 is never used
+        const size_t n_empty = llama_state_seq_get_size(ctx.get(), 1);
+
+        for (const auto & sc : sub_cases) {
+            llama_memory_clear(mem, true);
+
+            if (!decode_seq(ctx.get(), mr.tokens, 0, n_b, 0, true)) {
+                return case_result::fail();
+            }
+
+            std::vector<uint8_t> before;
+            if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, before)) {
+                return case_result::fail();
+            }
+
+            CTX_REQUIRE(llama_state_seq_set_data_ext(ctx.get(), sc.state->data(), sc.n_keep, 0, sc.flags) == 0,
+                    std::string(sc.name) + ": restoring a cut-off state did not fail");
+
+            std::vector<uint8_t> after;
+            if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, after)) {
+                return case_result::fail();
+            }
+
+            CTX_REQUIRE(after == before || after.size() == n_empty,
+                    std::string(sc.name) + ": the failed restore left the sequence half restored (" +
+                        std::to_string(after.size()) + " bytes, " + std::to_string(before.size()) + " before, " +
+                        std::to_string(n_empty) + " empty)");
+        }
+
+        return case_result::pass();
+    }
+};
+
 // a KV state saved with attention rotation enabled must restore only into a context with the
 // same setting
 // note: rotation is only active for quantized KV caches with a head size that is a multiple of
@@ -1122,6 +1228,7 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_state_roundtrip>());
     cases.push_back(std::make_unique<case_state_partial_size>());
     cases.push_back(std::make_unique<case_state_restore_failure>());
+    cases.push_back(std::make_unique<case_state_restore_failure_part>());
     cases.push_back(std::make_unique<case_state_rotation>());
     cases.push_back(std::make_unique<case_state_restore_fragmented>());
     cases.push_back(std::make_unique<case_noalloc>());

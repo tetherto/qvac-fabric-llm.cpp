@@ -74,6 +74,9 @@ public:
     llama_kv_cache * get_mla() const;
     llama_kv_cache * get_lid() const;
 
+    // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
+    void state_clear(llama_seq_id seq_id);
+
 private:
     // we keep indexer KV cache hparams instance here as llama_kv_cache stores only reference to it
     llama_hparams hparams_lid;
