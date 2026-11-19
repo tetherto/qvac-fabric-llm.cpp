@@ -140,6 +140,10 @@ llama_sampler_ptr make_dist_sampler(uint32_t seed);
 // see [TAG_RESERVE_DIAG_DECAY] in llama-context.cpp
 bool arch_reserves_single_seq(const llama_model * model);
 
+// the metal backend reorders each graph for concurrency, and the order depends on the tensor shapes, so a
+// ubatch whose shapes differ from the reserve's can re-reserve at an unchanged graph size
+bool has_metal_backend();
+
 //
 // the state of a single model run, handed to every case
 //
