@@ -3173,7 +3173,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         std::vector<vk_tile_config> tc_mmq_k = {{s_warptile_mmq_k, s_mmq_wg_denoms_k, s_align}, {m_warptile_mmq_k, m_mmq_wg_denoms_k, m_align}, {l_warptile_mmq_k, l_mmq_wg_denoms_k, l_align}};
         std::vector<vk_tile_config> tc_mmqid = {{s_warptile_mmqid, s_mmqid_wg_denoms, s_align}, {m_warptile_mmqid, m_mmqid_wg_denoms, m_align}, {l_warptile_mmqid, l_mmqid_wg_denoms, l_align}};
 
-        const vk_tile_config narrow_n16 = {{128, 32, 16, 64, 0}, {32, 16, 1}, 64, 16};
+        // UMA NVIDIA (DGX Spark): BK 128 runs large-M quantized A up to 1.25x faster than BK 64; other devices keep BK 64.
+        constexpr uint32_t narrow_n16_bk_default = 64, narrow_n16_bk_uma_nvidia = 128;
+        const bool uma_nvidia = device->vendor_id == VK_VENDOR_ID_NVIDIA && device->uma;
+        const uint32_t narrow_n16_bk = uma_nvidia ? narrow_n16_bk_uma_nvidia : narrow_n16_bk_default;
+        const vk_tile_config narrow_n16 = {{128, 32, 16, narrow_n16_bk, 0}, {32, 16, 1}, narrow_n16_bk, 16};
         const vk_tile_config narrow_n32 = {{128, 32, 32, 128, 0}, {32, 32, 1}, 128, 32};
         for (auto * tc : {&tc_mm, &tc_mmq, &tc_mmq_k}) {
             tc->push_back(narrow_n16);
