@@ -73,6 +73,7 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 ```
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
+Without `--spec-draft-n-max`, `draft-dflash`, `draft-dflash2` and `draft-lilicorr` draft 5 tokens instead of the default 3; `draft-dspark` keeps 3.
 
 DFlash2, DSpark and LiliCorr drafts are DFlash backbones with a head on the block, and the head is read from the draft model.
 `draft-dflash` runs each of them with the driver of its head.
@@ -339,7 +340,7 @@ Use exactly one of these options:
                                         HuggingFace repository for the draft model
                                         (env: LLAMA_ARG_SPEC_DRAFT_HF_REPO)
 --spec-draft-n-max                      N
-                                        number of tokens to draft for speculative decoding (default: 3)
+                                        number of tokens to draft for speculative decoding (default: 3, 5 with --spec-type draft-dflash, draft-dflash2 or draft-lilicorr)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MAX)
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding; greedy drafts only, a draft sampled with

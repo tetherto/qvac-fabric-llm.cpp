@@ -290,6 +290,67 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
 
+    {
+        common_params dflash_params;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-type", "draft-dflash"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dflash_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(dflash_params.speculative.draft.n_max == common_params_speculative_draft::n_max_dflash);
+    }
+
+    {
+        common_params dflash_params;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-type", "draft-dflash", "--spec-draft-n-max", "3"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dflash_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(dflash_params.speculative.draft.n_max == 3);
+    }
+
+    {
+        common_params mtp_params;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-type", "draft-mtp"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mtp_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(mtp_params.speculative.draft.n_max == common_params_speculative_draft{}.n_max);
+    }
+
+    {
+        common_params dspark_params;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-type", "draft-dspark"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dspark_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(dspark_params.speculative.draft.n_max == common_params_speculative_draft{}.n_max);
+    }
+
+    // DFlash2 and LiliCorr drafts ran as draft-dflash before they had their own types
+    for (const char * type : {"draft-dflash2", "draft-lilicorr"}) {
+        common_params lattice_params;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-type", type};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), lattice_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(lattice_params.speculative.draft.n_max == common_params_speculative_draft::n_max_dflash);
+    }
+
+    {
+        // the server resolves the default after parsing, once it has resolved the models
+        common_params_speculative spec;
+        spec.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        common_speculative_set_default_n_max(spec);
+        assert(spec.draft.n_max == common_params_speculative_draft::n_max_dflash);
+
+        spec.draft.n_max          = 7;
+        spec.draft.n_max_explicit = true;
+        common_speculative_set_default_n_max(spec);
+        assert(spec.draft.n_max == 7);
+
+        for (auto type : { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2, COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR }) {
+            common_params_speculative spec_type;
+            spec_type.types = { type };
+            common_speculative_set_default_n_max(spec_type);
+            assert(spec_type.draft.n_max == common_params_speculative_draft::n_max_dflash);
+        }
+
+        common_params_speculative spec_dspark;
+        spec_dspark.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+        common_speculative_set_default_n_max(spec_dspark);
+        assert(spec_dspark.draft.n_max == common_params_speculative_draft{}.n_max);
+    }
+
     argv = {"binary_name", "--spec-draft-n-short", "7", "--spec-draft-long-cost", "1.4"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.speculative.draft.n_short == 7);
@@ -396,6 +457,16 @@ static void test(void) {
         assert(!cache_params.moe_cache_auto && !cache_params.moe_cache_auto_explicit);
         assert(cache_params.moe_cache_size == 0);
         unsetenv("LLAMA_ARG_MOE_CACHE_MIB");
+    }
+
+    {
+        common_params dflash_params;
+        dflash_params.model.path = "model_file.gguf";
+        setenv("LLAMA_ARG_SPEC_DRAFT_N_MAX", "7", true);
+        argv = {"binary_name", "--spec-type", "draft-dflash"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), dflash_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(dflash_params.speculative.draft.n_max == 7);
+        unsetenv("LLAMA_ARG_SPEC_DRAFT_N_MAX");
     }
 
     setenv("LLAMA_ARG_THREADS", "blah", true);
