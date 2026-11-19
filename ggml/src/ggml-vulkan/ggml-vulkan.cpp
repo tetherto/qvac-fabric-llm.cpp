@@ -3103,7 +3103,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     };
 
     auto add_narrow_n_cm1_tile = [&](std::vector<vk_tile_config>& configs, ggml_type type, uint32_t bn) {
-        constexpr uint32_t bm = 32, bk = 32;
+        // UMA NVIDIA (DGX Spark): BK 128 runs quantized A 1.1-1.6x faster than BK 32; other devices keep BK 32.
+        constexpr uint32_t bm = 32, bk_default = 32, bk_quant_uma_nvidia = 128;
+        const bool uma_nvidia = device->vendor_id == VK_VENDOR_ID_NVIDIA && device->uma;
+        const uint32_t bk = uma_nvidia && ggml_is_quantized(type) ? bk_quant_uma_nvidia : bk_default;
         const uint32_t tm = device->coopmat_m, tn = device->coopmat_n, tk = device->coopmat_k;
 
         const bool rdna = device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4;
