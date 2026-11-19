@@ -70,8 +70,8 @@ static constexpr __host__ __device__ int mmq_few_sram_stride(const ggml_type typ
     return mmq_few_unaligned(type, nunits_stage) && nchunks % 2 == 0 ? 16*(nchunks + 1) : 16*nchunks;
 }
 
-static constexpr __host__ __device__ int mmq_few_nbytes_shared(const ggml_type type, const int ncg, const int nmt) {
-    return MMQ_FEW_NWARPS*mmq_few_nstages(type)*nmt*MMQ_FEW_NROWS*mmq_few_sram_stride(type, mmq_few_nunits_stage(type, ncg, nmt));
+static constexpr __host__ __device__ int mmq_few_nbytes_shared(const ggml_type type, const int nmt, const int nunits_stage) {
+    return MMQ_FEW_NWARPS*mmq_few_nstages(type)*nmt*MMQ_FEW_NROWS*mmq_few_sram_stride(type, nunits_stage);
 }
 
 // With Q6_K and Q8_0 two CUDA blocks with 32-row tiles would not fit into an SM.
@@ -484,7 +484,7 @@ static __device__ __forceinline__ void mmq_few_vec_dot(const char * const (&x)[2
 
 #endif // defined(CP_ASYNC_AVAILABLE)
 
-template <ggml_type type, int ncg, int nmt>
+template <ggml_type type, int ncg, int nmt, int nus = mmq_few_nunits_stage(type, ncg, nmt)>
 __launch_bounds__(MMQ_FEW_NWARPS*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_q_few(
         const char * x, const int4 * y_ptr, float * dst,
@@ -498,7 +498,7 @@ static __global__ void mul_mat_q_few(
 
     constexpr int  unit_size    = mmq_few_unit_size(type);
     constexpr int  nrows        = nmt*MMQ_FEW_NROWS;
-    constexpr int  nunits_stage = mmq_few_nunits_stage(type, ncg, nmt);
+    constexpr int  nunits_stage = nus;
     constexpr int  nstages      = mmq_few_nstages(type);
     constexpr bool unaligned    = mmq_few_unaligned(type, nunits_stage);
     constexpr int  nchunks      = mmq_few_nchunks(type, nunits_stage);
@@ -1025,24 +1025,24 @@ static bool mmq_few_is_constant(const ggml_tensor * src0) {
         !(x_root->flags & GGML_TENSOR_FLAG_PARAM);
 }
 
-template <ggml_type type, int ncg, int nmt>
+template <ggml_type type, int ncg, int nmt, int nus = mmq_few_nunits_stage(type, ncg, nmt)>
 static void launch_mul_mat_q_few(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const int4 * src1_q, cudaStream_t stream) {
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     const int nunits = ne00 / QK_K;
-    GGML_ASSERT(nunits % mmq_few_nunits_stage(type, ncg, nmt) == 0);
+    GGML_ASSERT(nunits % nus == 0);
 
     const int warp_size     = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    const int nbytes_shared = mmq_few_nbytes_shared(type, ncg, nmt);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_few<type, ncg, nmt>), nbytes_shared);
+    const int nbytes_shared = mmq_few_nbytes_shared(type, nmt, nus);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_few<type, ncg, nmt, nus>), nbytes_shared);
 
     const bool x_is_constant = mmq_few_is_constant(src0);
 
     const dim3 block_nums((ne01 + nmt*MMQ_FEW_NROWS - 1) / (nmt*MMQ_FEW_NROWS), ne12, ne13);
     const dim3 block_dims(warp_size, MMQ_FEW_NWARPS, 1);
     const ggml_cuda_kernel_launch_params params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_q_few<type, ncg, nmt>, params,
+    ggml_cuda_kernel_launch(mul_mat_q_few<type, ncg, nmt, nus>, params,
         (const char *) src0->data, src1_q, (float *) dst->data,
         nunits, (int) ne01, (int) ne1, (int64_t) nb01, (int) (nb1/sizeof(float)),
         (int) (ne12/ne02), (int64_t) nb02, (int) (nb2/sizeof(float)),
@@ -1064,6 +1064,11 @@ static void launch_mul_mat_q_few_tall(const ggml_tensor * src0, const ggml_tenso
         const int4 * src1_q, cudaStream_t stream) {
     if constexpr (mmq_few_tall_supported(type)) {
         if (mmq_few_nmt(type, 2, src0->ne[1]) == 2) {
+            // DGX Spark: 16-row tiles with the stages of the 32-row kernel are faster and sum in the same order
+            if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK) {
+                launch_mul_mat_q_few<type, 2, 1, mmq_few_nunits_stage(type, 2, 2)>(src0, src1, dst, src1_q, stream);
+                return;
+            }
             launch_mul_mat_q_few<type, 2, 2>(src0, src1, dst, src1_q, stream);
             return;
         }
