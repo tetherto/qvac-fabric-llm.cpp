@@ -45,15 +45,15 @@ jobs:
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           BASES: ^(main|master)$
         run: |
-          pr=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f per_page=100 \
+          number=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f per_page=100 \
             -f head="${HEAD_REPO%%/*}:$HEAD_BRANCH" --jq '
               [.[] | select(.head.sha == env.HEAD_SHA
                 and (.head.repo.full_name | ascii_downcase) == (env.HEAD_REPO | ascii_downcase)
                 and (.base.ref | test(env.BASES)))]
-              | if length == 1 then "\(.[0].number) \(.[0].base.ref)" else "" end')
-          [ -n "$pr" ] || echo "::notice::No open PR at $HEAD_SHA to check"
-          echo "number=${pr%% *}" >> "$GITHUB_OUTPUT"
-          echo "base=${pr#* }" >> "$GITHUB_OUTPUT"
+              | if length == 1 then .[0].number else "" end')
+          [ -n "$number" ] || echo "::notice::No open PR at $HEAD_SHA to check"
+          [ -z "$number" ] || echo "PR #$number at $HEAD_SHA"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
 
       - name: Install @qvac/ci
         if: github.event_name == 'issue_comment' || steps.pr.outputs.number != ''

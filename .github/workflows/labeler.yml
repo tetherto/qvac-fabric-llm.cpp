@@ -31,6 +31,7 @@ jobs:
               and (.head.repo.full_name | ascii_downcase) == (env.HEAD_REPO | ascii_downcase))]
             | if length == 1 then .[0].number else "" end')
         [ -n "$number" ] || echo "::notice::No open PR at $HEAD_SHA to label"
+        [ -z "$number" ] || echo "PR #$number at $HEAD_SHA"
         echo "number=$number" >> "$GITHUB_OUTPUT"
     - uses: actions/checkout@v6
       if: steps.pr.outputs.number != ''
