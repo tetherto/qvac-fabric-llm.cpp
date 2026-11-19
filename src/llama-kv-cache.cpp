@@ -2542,8 +2542,15 @@ const slot_info_vec_t *   sinfos_in) {
 
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
-    if (n_stream_cur != n_stream) {
-        throw std::runtime_error("n_stream mismatch");
+    if (n_stream_cur == 0 || n_stream_cur > LLAMA_MAX_SEQ) {
+        throw std::runtime_error("failed to restore kv cache: invalid stream count");
+    }
+
+    // a single sequence saved with another stream count (kv_unified or n_seq_max changed) holds its
+    // cells in at most one saved stream, which is restored into the sequence's own stream
+    const bool remap = n_stream_cur != n_stream;
+    if (remap && seq_id == -1) {
+        throw std::runtime_error("failed to restore kv cache: n_stream mismatch (only a single-sequence restore can change the stream count)");
     }
 
     // a whole-context restore replaces every stream, so the cache is emptied once here
@@ -2552,39 +2559,69 @@ const slot_info_vec_t *   sinfos_in) {
         clear(true);
     }
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        uint32_t cell_count;
-        io.read(&cell_count, sizeof(cell_count));
+    bool restored = false;
 
-        if (cell_count == 0) {
-            // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
-            if (sinfos_in && !(*sinfos_in)[s].empty()) {
-                throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
+    try {
+        for (uint32_t s = 0; s < n_stream_cur; ++s) {
+            uint32_t cell_count;
+            io.read(&cell_count, sizeof(cell_count));
+
+            if (cell_count == 0) {
+                // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
+                // with the remap, the mirrored entries are compared after the loop
+                if (!remap && sinfos_in && !(*sinfos_in)[s].empty()) {
+                    throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
+                }
+                continue;
             }
-            continue;
+
+            if (seq_id != -1 && restored) {
+                throw std::runtime_error("failed to restore kv cache: the sequence spans several saved streams");
+            }
+
+            const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
+
+            // the slot info holds n_stream entries, so with the remap it is indexed by the stream restored into
+            const uint32_t slot = remap ? strm : s;
+
+            slot_info sinfo;
+
+            bool res = true;
+            res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[slot] : nullptr);
+
+            try {
+                res = res && state_read_data(io, strm, cell_count, sinfo);
+            } catch (...) {
+                res = false;
+            }
+
+            if (!res) {
+                state_clear(seq_id, strm, sinfo);
+                throw std::runtime_error("failed to restore kv cache");
+            }
+
+            if (sinfos_out) {
+                (*sinfos_out)[slot] = sinfo;
+            }
+
+            restored = true;
         }
 
-        const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
-
-        slot_info sinfo;
-
-        bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
-
-        try {
-            res = res && state_read_data(io, strm, cell_count, sinfo);
-        } catch (...) {
-            res = false;
+        // with the remap, a mirrored entry this restore did not take must be empty, whichever stream it is in
+        if (remap && sinfos_in) {
+            for (uint32_t i = 0; i < n_stream; ++i) {
+                const bool taken = restored && i == seq_to_stream[seq_id];
+                if (!taken && !(*sinfos_in)[i].empty()) {
+                    throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
+                }
+            }
         }
-
-        if (!res) {
-            state_clear(seq_id, strm, sinfo);
-            throw std::runtime_error("failed to restore kv cache");
+    } catch (...) {
+        // a failure after a stream was restored leaves nothing of it behind
+        if (seq_id != -1 && restored) {
+            state_clear(seq_id);
         }
-
-        if (sinfos_out) {
-            (*sinfos_out)[s] = sinfo;
-        }
+        throw;
     }
 }
 
@@ -2793,23 +2830,24 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            sinfo = *sinfo_in;
-
-            // the layout is cell indices, so it means the same in both caches only while their streams line up
-            sinfo.s0 = strm;
-            sinfo.s1 = strm;
-            sinfo.strm[0] = strm;
-
             // seq_rm above freed exactly the cells this sequence held
             // anything else in the way is a cache that had already drifted, which this restore must not hide
+            // checked before sinfo is set, so the caller's cleanup never zeroes cells other sequences hold
             for (uint32_t i = 0; i < cell_count; ++i) {
-                const uint32_t idx = sinfo.idxs[0][i];
+                const uint32_t idx = sinfo_in->idxs[0][i];
 
                 if (idx >= cells.size() || !cells.is_empty(idx)) {
                     LLAMA_LOG_ERROR("%s: cell %u of the mirrored slot layout is not free\n", __func__, idx);
                     return false;
                 }
             }
+
+            sinfo = *sinfo_in;
+
+            // the layout is cell indices, so it means the same in both caches only while their streams line up
+            sinfo.s0 = strm;
+            sinfo.s1 = strm;
+            sinfo.strm[0] = strm;
         } else {
             sinfo = find_slot(ubatch, false);
             if (sinfo.empty()) {
