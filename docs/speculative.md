@@ -73,6 +73,7 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 ```
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
+Without `--spec-draft-n-max`, `draft-dflash` drafts 5 tokens instead of the default 3.
 
 DFlash2 drafts add grouped convolution and a candidate selector. The selector is detected from the checkpoint; use the same `draft-dflash` type.
 For example, convert `incoai/Qwen3.8-27B-DFlash2` against its target tokenizer, then start the server:
@@ -303,7 +304,7 @@ Use exactly one of these options:
                                         HuggingFace repository for the draft model
                                         (env: LLAMA_ARG_SPEC_DRAFT_HF_REPO)
 --spec-draft-n-max                      N
-                                        number of tokens to draft for speculative decoding (default: 3)
+                                        number of tokens to draft for speculative decoding (default: 3, 5 with --spec-type draft-dflash)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MAX)
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding; greedy drafts only, a draft sampled with
