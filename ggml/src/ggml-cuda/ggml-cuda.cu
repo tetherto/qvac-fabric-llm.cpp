@@ -1218,7 +1218,7 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
 struct ggml_backend_cuda_buffer_type_context {
     int device;
     std::string name;
-    // A flag rather than a get_name of its own: MSVC /OPT:ICF merges functions with identical bodies.
+    // Marks CUTLASS repack types; get_name is shared because MSVC /OPT:ICF merges identical functions.
     bool repacked = false;
 };
 
@@ -1328,6 +1328,8 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
                 /* .device   = */ dev,
                 /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i)},
             };
+            // A plain buffer type must never classify as repacked.
+            GGML_ASSERT(!ggml_backend_buft_is_cuda_repacked(&ggml_backend_cuda_buffer_types[i]));
         }
         ggml_backend_cuda_buffer_type_initialized = true;
     }
@@ -1611,8 +1613,13 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_repacked_buffer_type(int dev
                 /* .iface    = */ ggml_backend_cuda_repacked_buffer_type_interface,
                 /* .device   = */ dev,
                 /* .context  = */
-                new ggml_backend_cuda_buffer_type_context{ i, GGML_CUDA_NAME + std::to_string(i) + "_REPACK", true },
+                new ggml_backend_cuda_buffer_type_context{
+                    /* .device   = */ i,
+                    /* .name     = */ GGML_CUDA_NAME + std::to_string(i) + "_REPACK",
+                    /* .repacked = */ true,
+                },
             };
+            GGML_ASSERT(ggml_backend_buft_is_cuda_repacked(&buffer_types[i]));
         }
         initialized = true;
     }
