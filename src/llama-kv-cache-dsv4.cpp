@@ -1836,19 +1836,27 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         throw std::runtime_error("DSV4 state flags mismatch");
     }
 
-    kv_raw->state_read(io, seq_id, flags);
+    try {
+        kv_raw->state_read(io, seq_id, flags);
 
-    if (!partial_only) {
+        if (!partial_only) {
+            clear_compressed(seq_id, true);
+
+            dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags, comp_il_src);
+            dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags, comp_il_src);
+            dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags, comp_il_src);
+        }
+
+        csa_state->state_read(io, seq_id, flags);
+        hca_state->state_read(io, seq_id, flags);
+        lid_state->state_read(io, seq_id, flags);
+    } catch (...) {
+        // a failed restore drops the sequence from every cache
+        kv_raw->state_clear(seq_id);
         clear_compressed(seq_id, true);
 
-        dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags, comp_il_src);
-        dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags, comp_il_src);
-        dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags, comp_il_src);
+        throw;
     }
-
-    csa_state->state_read(io, seq_id, flags);
-    hca_state->state_read(io, seq_id, flags);
-    lid_state->state_read(io, seq_id, flags);
 
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
