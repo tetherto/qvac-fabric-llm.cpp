@@ -2804,14 +2804,19 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const bool first_call = vec.empty();
         for (size_t i = 0; i < tile_configs.size(); i++) {
             const auto& tc = tile_configs[i];
+            if (tc.narrow_n_max != 0 && (key.mul_mat_id || device->disable_narrow_mul_mat)) {
+                continue;
+            }
 
             // Intel coopmat1 pins the required subgroup size to each warptile's WARP element.
-            const uint32_t rsgs = pin_subgroup_to_warp ? tc.warptile[WARP_SIZE_IDX] : required_subgroup_size;
-            const bool     rfs  = require_full_subgroups || pin_subgroup_to_warp;
+            const bool pin_sg = pin_subgroup_to_warp || (!device->coopmat2 && tc.narrow_n_max != 0);
+            const uint32_t rsgs = pin_sg ? tc.warptile[WARP_SIZE_IDX] : required_subgroup_size;
+            const bool     rfs  = require_full_subgroups || pin_sg;
 
             if (first_call) {
                 vk_matmul_pipeline_pair pair{};
                 pair.align = tc.align;
+                pair.narrow_n_max = tc.narrow_n_max;
                 std::string suffix = "_" + std::to_string(i);
                 pair.unaligned = std::make_shared<vk_pipeline_struct>();
                 if (create_aligned) {
@@ -2848,10 +2853,58 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             enabled[1] = is_id ? device->mul_mat_id_m[type] : device->mul_mat_m[type];
             enabled[2] = is_id ? device->mul_mat_id_l[type] : device->mul_mat_l[type];
         }
-        for (size_t i = 0; i < configs.size() && i < 3; i++) {
-            if (enabled[i]) result.push_back(configs[i]);
+        for (size_t i = 0; i < configs.size(); i++) {
+            if (configs[i].narrow_n_max != 0 || (i < 3 && enabled[i])) result.push_back(configs[i]);
         }
         return result;
+    };
+
+    auto add_narrow_n_cm1_tile = [&](std::vector<vk_tile_config>& configs, ggml_type type, uint32_t bn) {
+        constexpr uint32_t bm = 32, bk = 32;
+        const uint32_t tm = device->coopmat_m, tn = device->coopmat_n, tk = device->coopmat_k;
+
+        const bool rdna = device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4;
+        const uint32_t base_subgroup_size = rdna && device->subgroup_size_control ? device->subgroup_min_size : mul_mat_subgroup_size;
+        const uint32_t subgroup_size = std::max(base_subgroup_size, tm);
+
+        const uint32_t wm = subgroup_size > 32 ? 32 : 16;
+        const uint32_t wn = std::min(bn, subgroup_size > 64 ? 32u : 16u);
+        const uint32_t subgroup_count = (bm / wm) * (bn / wn);
+        const uint32_t workgroup_size = subgroup_count * subgroup_size;
+
+        // Two-element loads need at least BK/2 invocations; eight-element loads must fit both tiles.
+        if (workgroup_size < bk / 2 || workgroup_size > std::min(bm, bn) * bk / 8) {
+            return;
+        }
+
+        // Native matrices must tile each subgroup's output region and the K tile.
+        if (tm == 0 || tn == 0 || tk == 0 || wm % tm != 0 || wn % tn != 0 || bk % tk != 0) {
+            return;
+        }
+        const bool subgroup_size_supported = device->subgroup_size_control ?
+            subgroup_size >= device->subgroup_min_size && subgroup_size <= device->subgroup_max_size :
+            subgroup_size == device->subgroup_size;
+
+        // Tail stores use lane%TM for rows and lane/TM for columns of one native matrix.
+        if (!subgroup_size_supported || subgroup_size % tm != 0 || subgroup_size > tm * tn) {
+            return;
+        }
+        if (subgroup_size > device->properties.limits.maxComputeWorkGroupInvocations / subgroup_count ||
+            subgroup_size > device->properties.limits.maxComputeWorkGroupSize[0] / subgroup_count) {
+            return;
+        }
+
+        const std::vector<uint32_t> wt = {workgroup_size, bm, bn, bk, wm, wn, 2, tm, tn, tk, subgroup_size};
+        if (ggml_vk_matmul_shmem_support(device, wt, false, type)) {
+            configs.push_back({wt, {bm, bn, 1}, bk, bn});
+        }
+    };
+    auto add_narrow_n_cm1 = [&](std::vector<vk_tile_config>& configs, ggml_type type, bool is_id) {
+        if (is_id || configs.empty()) {
+            return;
+        }
+        add_narrow_n_cm1_tile(configs, type, 16);
+        add_narrow_n_cm1_tile(configs, type, 32);
     };
 
     std::vector<vk_tile_config> tc_mm = {{s_warptile, s_wg_denoms, s_align}, {m_warptile, m_wg_denoms, m_align}, {l_warptile, l_wg_denoms, l_align}};
@@ -2991,12 +3044,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         auto cm1_create = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                               const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
+            add_narrow_n_cm1(tc, key.type_a, key.mul_mat_id);
             if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, cm1_spec, false, true, 0, true, cm1_pin);
         };
         auto cm1_create_quant = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                                     const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
             spec_fn_t qs = [&, type_a=key.type_a](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec_quant(wt, a, (uint32_t)type_a); };
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
+            add_narrow_n_cm1(tc, key.type_a, key.mul_mat_id);
             if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, qs, false, true, 0, true, cm1_pin);
         };
         // int8 MMQ helper: per-type cm1 shader, warptile passed as-is (carries DEVICE_ARCH in
@@ -3508,10 +3563,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         device->matmul_tile_selector = [](uint32_t m, uint32_t n, uint32_t /*k*/, uint32_t /*shader_core_count*/,
                                           const std::vector<vk_matmul_pipeline_pair>& configs) -> uint32_t {
             if (configs.size() <= 1) return 0;
-            if (m <= 32 || n <= 32) return 0;
-            if (configs.size() == 2) return 1;
+            for (uint32_t i = 0; i < configs.size(); ++i) {
+                if (configs[i].narrow_n_max != 0 && n <= configs[i].narrow_n_max) return i;
+            }
+            uint32_t last = (uint32_t)configs.size() - 1;
+            while (last > 0 && configs[last].narrow_n_max != 0) --last;
+            if (last == 0 || m <= 32 || n <= 32) return 0;
+            if (last == 1) return 1;
             if (m <= 64 || n <= 64) return 1;
-            return (uint32_t)configs.size() - 1;
+            return last;
         };
         device->matmul_id_tile_selector = device->matmul_tile_selector;
     }
@@ -5007,6 +5067,7 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         const char* GGML_VK_DISABLE_GRAPH_OPTIMIZE = getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE");
         device->disable_graph_optimize = GGML_VK_DISABLE_GRAPH_OPTIMIZE != nullptr;
+        device->disable_narrow_mul_mat = getenv("GGML_VK_DISABLE_NARROW_MUL_MAT") != nullptr;
 
         bool fp16_storage = false;
         bool fp16_compute = false;
@@ -7157,7 +7218,7 @@ void deferred_memset(void * dst, uint32_t val, size_t size, std::vector<vk_stagi
     }
 }
 
-static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, bool disable_split_k, const vk_pipeline& pipeline, ggml_type src0_type = GGML_TYPE_COUNT) {
+static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, bool disable_split_k, const vk_pipeline& pipeline, ggml_type src0_type = GGML_TYPE_COUNT, bool narrow_n = false) {
     VK_LOG_DEBUG("ggml_vk_guess_split_k(" << m << ", " << n << ", " << k << ", " << disable_split_k << ")");
 
     if (disable_split_k) {
@@ -7179,8 +7240,19 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
         return 1;
     }
 
-    uint32_t split_k = 1;
-    if (ctx->device->shader_core_count != 0 && n >= pipeline->wg_denoms[1]) {
+    uint32_t split_k = narrow_n && ctx->device->shader_core_count == 0 ? 8u : 1u;
+    if (narrow_n && ctx->device->shader_core_count != 0 && k >= 2048 && n <= 32) {
+        // Small n gives too few workgroups to hide latency, aim for 8 per CU.
+        const uint32_t tiles = CEIL_DIV(m, pipeline->wg_denoms[0]) * CEIL_DIV(n, pipeline->wg_denoms[1]);
+        if (tiles < 4 * ctx->device->shader_core_count) {
+            split_k = std::min(8u, CEIL_DIV(8 * ctx->device->shader_core_count, tiles));
+        }
+        // Each split starts on a 256-value boundary; keep the last split nonempty.
+        while (split_k > 1 && ROUNDUP_POW2(CEIL_DIV(uint64_t(k), split_k), 256) * (split_k - 1) >= k) {
+            --split_k;
+        }
+    }
+    if (!narrow_n && ctx->device->shader_core_count != 0 && n >= pipeline->wg_denoms[1]) {
         // If k is 'large' and the SMs will fill less than halfway, use split_k.
         uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
         uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
@@ -8083,8 +8155,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     constexpr uint32_t convrot_small_split_k = 2;
     const bool convrot_small_split = src0_override != nullptr && full_f32 && !disable_split_k &&
                                      ggml_vk_convrot_gemm_prefers_split_k(ctx->device, ne01, ne11, ne10);
+    const bool narrow_n = mmp_map->back().narrow_n_max != 0 && ne11 <= mmp_map->back().narrow_n_max;
     const uint32_t split_k = split_k_override ? split_k_override :
-                             convrot_small_split ? convrot_small_split_k : ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline, src0->type);
+                             convrot_small_split ? convrot_small_split_k : ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline, src0->type, narrow_n);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
