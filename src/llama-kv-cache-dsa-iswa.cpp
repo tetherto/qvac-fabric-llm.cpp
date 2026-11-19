@@ -245,8 +245,16 @@ void llama_kv_cache_dsa_iswa::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_kv_cache_dsa_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    kv_dsa->state_read(io, seq_id, flags);
-    kv_swa->state_read(io, seq_id, flags);
+    try {
+        kv_dsa->state_read(io, seq_id, flags);
+        kv_swa->state_read(io, seq_id, flags);
+    } catch (...) {
+        // a failed restore drops the sequence from every cache
+        kv_dsa->state_clear(seq_id);
+        kv_swa->state_clear(seq_id);
+
+        throw;
+    }
 }
 
 llama_kv_cache_dsa * llama_kv_cache_dsa_iswa::get_dsa() const {
