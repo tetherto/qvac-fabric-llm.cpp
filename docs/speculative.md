@@ -104,6 +104,14 @@ llama-server -m Qwen3-8B.gguf -md Qwen3-8B-DSpine.gguf \
     --spec-type draft-dflash --spec-draft-n-max 15 -fa on --jinja
 ```
 
+A DSpine draft can be quantized. Keep the codebook in bf16, because the draft only reads its rows:
+
+```bash
+llama-quantize --tensor-type dspine_codebook=bf16 Qwen3.8-27B-DSpine.gguf Qwen3.8-27B-DSpine-Q6_K.gguf q6_K
+```
+
+With a `Qwen3.8-27B-UD-Q4_K_M` target on a DGX Spark, a Q6_K draft kept the bf16 draft's accepted tokens per step within 1% and made each step 3% to 23% faster, depending on the backend.
+
 The draft ubatch (`--spec-draft-n-ubatch`, default `--ubatch-size`) must hold one block per parallel sequence, that is `-np * (--spec-draft-n-max + 1)` tokens.
 `--spec-draft-vocab` is for DFlash2 drafters only and stops the speculative setup with an error for a DSpine draft.
 The draft reads rows of the target output head directly, so a head in a repacked or row-split buffer stops the draft context with an error.
