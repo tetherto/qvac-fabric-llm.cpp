@@ -700,6 +700,21 @@ if (GGML_VECTOR_INDEX)
     list(APPEND GGML_CORE_TARGETS ggml-vector-index)
 endif()
 
+if (GGML_BACKEND_DL)
+    if (TARGET ggml-vector-index)
+        target_link_libraries(ggml-vector-index PRIVATE ggml-base)
+    endif()
+    foreach (target ${GGML_CORE_TARGETS})
+        # Encode the native ABI in the filename, including Windows and Android.
+        set_target_properties(${target} PROPERTIES
+            OUTPUT_NAME "qvac-${target}-1"
+            INSTALL_RPATH "$ORIGIN"
+            BUILD_WITH_INSTALL_RPATH ON)
+        set_property(TARGET ${target} PROPERTY VERSION)
+        set_property(TARGET ${target} PROPERTY SOVERSION)
+    endforeach()
+endif()
+
 foreach (target ${GGML_CORE_TARGETS})
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump
@@ -735,4 +750,11 @@ if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
             target_compile_definitions(${target} PUBLIC  GGML_SHARED)
         endif()
     endforeach()
+endif()
+
+if (GGML_BACKEND_DL AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(linux-cxx-runtime.cmake)
+    qvac_configure_cxx_runtimes()
+    include(shared-core-runtime.cmake)
+    qvac_configure_shared_core_runtime()
 endif()
