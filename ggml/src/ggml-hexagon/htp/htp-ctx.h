@@ -189,5 +189,7 @@ int op_pool_1d(struct htp_ops_context * octx);
 int op_allreduce(struct htp_ops_context * octx);
 int op_roll(struct htp_ops_context * octx);
 int op_upscale(struct htp_ops_context * octx);
+int op_conv_taps_f32(struct htp_ops_context * octx);
+int op_snake(struct htp_ops_context * octx);
 
 #endif /* HTP_CTX_H */

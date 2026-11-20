@@ -1273,7 +1273,7 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_FLASH_ATTN_EXT:
             if (op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->src[1] &&
                 (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) && op->src[2] &&
-                (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) && op->src[4] == nullptr &&
+                (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) && op->src[4] == nullptr && op->src[5] == nullptr &&
                 ggml_is_contiguous_rows(op) && ggml_is_contiguous_rows(op->src[0])) {
                 float max_bias      = 0.0f;
                 float logit_softcap = 0.0f;
@@ -1654,6 +1654,7 @@ static void ggml_backend_et_device_get_props(ggml_backend_dev_t dev, struct ggml
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ false,
         /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false,
     };
 }
 

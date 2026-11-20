@@ -7,6 +7,7 @@ import ast
 import logging
 import contextlib
 import json
+import math
 import os
 import re
 import sys
@@ -327,6 +328,35 @@ class ModelBase:
             scale_vals = np.array(scales, dtype=np.float32)
             logger.info(f"  + {scale_name} (per-expert scale, shape [{len(scales)}])")
             self.gguf_writer.add_tensor(scale_name, scale_vals)
+
+    def _prepare_kv_cache_scales(self):
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith((".k_scale", ".v_scale")):
+                continue
+
+            mapped = self.tensor_map.get_type_and_name(key=name, try_suffixes=(".k_scale", ".v_scale"))
+            if mapped is None:
+                continue
+
+            tensor_type, new_name = mapped
+            if tensor_type not in (gguf.MODEL_TENSOR.ATTN_K, gguf.MODEL_TENSOR.ATTN_V, gguf.MODEL_TENSOR.ATTN_QKV):
+                continue
+
+            bid = int(new_name.split(".")[1])
+            scale_type = gguf.MODEL_TENSOR.ATTN_K if name.endswith(".k_scale") else gguf.MODEL_TENSOR.ATTN_V
+            suffix = ".k_scale" if name.endswith(".k_scale") else ".v_scale"
+            new_name = gguf.TENSOR_NAMES[scale_type].format(bid=bid) + suffix
+
+            scale = LazyTorchTensor.to_eager(self.model_tensors.pop(name)())
+            if scale.dtype != torch.float32 or scale.numel() != 1:
+                raise ValueError(f"KV cache scale {name!r} must be a scalar FP32 tensor")
+
+            value = float(scale.item())
+            if not math.isfinite(value) or value == 0.0:
+                raise ValueError(f"KV cache scale {name!r} must be finite and nonzero")
+
+            logger.info(f"  + {new_name} (KV cache scale, shape [1])")
+            self.gguf_writer.add_tensor(new_name, scale.flatten().numpy())
 
     def dequant_model(self):
         # If all quantized tensors were already handled (e.g. pure NVFP4), skip
@@ -911,8 +941,8 @@ class ModelBase:
         if not isinstance(transform, dict):
             raise ValueError("Hadamard manifest is missing transform metadata")
         block_size = transform.get("block_size")
-        if not isinstance(block_size, int) or block_size <= 0 or block_size & (block_size - 1):
-            raise ValueError(f"Invalid Hadamard block size: {block_size!r}")
+        if not isinstance(block_size, int) or block_size <= 0 or block_size > 8192 or block_size & (block_size - 1):
+            raise ValueError(f"Invalid Hadamard block size: {block_size!r}; maximum is 8192")
         if transform.get("name") != "normalized-signed-sylvester-walsh-hadamard":
             raise ValueError(f"Unsupported Hadamard transform: {transform.get('name')!r}")
         sign_mode = transform.get("sign_mode")
@@ -924,8 +954,18 @@ class ModelBase:
             signs = manifest.get("signs")
             if not isinstance(signs, dict) or not signs:
                 raise ValueError("explicit sign mode requires a signs table")
-            for width_str, vec in sorted(signs.items(), key=lambda kv: int(kv[0])):
-                width = int(width_str)
+            sign_items: list[tuple[int, list[int]]] = []
+            for width_str, vec in signs.items():
+                if not isinstance(width_str, str) or not isinstance(vec, list):
+                    raise ValueError("Hadamard signs must map string widths to integer vectors")
+                try:
+                    width = int(width_str)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid Hadamard sign width: {width_str!r}") from exc
+                if any(not isinstance(v, int) for v in vec):
+                    raise ValueError(f"invalid sign vector for width {width}")
+                sign_items.append((width, vec))
+            for width, vec in sorted(sign_items):
                 # same width rule as the runtime, so a manifest that converts also loads
                 if width <= 0 or width % block_size != 0:
                     raise ValueError(
@@ -934,7 +974,7 @@ class ModelBase:
                 if len(vec) != width or any(v not in (-1, 1) for v in vec):
                     raise ValueError(f"invalid sign vector for width {width}")
                 sign_widths.append(width)
-                sign_values.extend(int(v) for v in vec)
+                sign_values.extend(vec)
 
         tensor_records = manifest.get("tensors")
         if not isinstance(tensor_records, list) or not tensor_records:
@@ -966,6 +1006,10 @@ class ModelBase:
         )
         weight_names: list[str] = []
         inverse_weight_names: list[str] = []
+
+        def unavailable_tensor() -> Tensor:
+            raise AssertionError("tensor data is unavailable during metadata validation")
+
         for record in tensor_records:
             if not isinstance(record, dict) or not isinstance(record.get("name"), str):
                 raise ValueError("Hadamard manifest has an invalid tensor record")
@@ -974,7 +1018,7 @@ class ModelBase:
             role = record.get("role", "fold-before-matmul")
             if role not in ("fold-before-matmul", "inverse-after-lookup"):
                 raise ValueError(f"Unsupported Hadamard tensor role for {record['name']!r}: {role!r}")
-            filtered = self.filter_tensors((record["name"], lambda: torch.empty(0)))
+            filtered = self.filter_tensors((record["name"], unavailable_tensor))
             if filtered is None:
                 raise ValueError(f"Hadamard tensor is filtered out: {record['name']!r}")
             mapped = self.map_tensor_name(filtered[0])
@@ -1007,6 +1051,60 @@ class ModelBase:
                 raise ValueError(f"--fuse-qkv needs all of Q, K and V folded in layer {bid}, or none of them")
             weight_names = [name for name in weight_names if name not in qkv]
             weight_names.append(self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_QKV, bid))
+
+        if self.fuse_gate_up_exps:
+            split_patterns = {
+                kind: re.compile(
+                    "^" + re.escape(gguf.TENSOR_NAMES[key] + ".weight").replace(r"\{bid\}", r"(?P<bid>\d+)") + "$"
+                )
+                for kind, key in (
+                    ("gate", gguf.MODEL_TENSOR.FFN_GATE_EXP),
+                    ("up", gguf.MODEL_TENSOR.FFN_UP_EXP),
+                )
+            }
+            fused_pattern = re.compile(
+                "^" + re.escape(gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.FFN_GATE_UP_EXP] + ".weight")
+                .replace(r"\{bid\}", r"(?P<bid>\d+)") + "$"
+            )
+            split_records: dict[int, dict[str, int]] = {}
+            fused_layers: set[int] = set()
+            for index, name in enumerate(weight_names):
+                match = fused_pattern.fullmatch(name)
+                if match:
+                    bid = int(match.group("bid"))
+                    if bid in fused_layers:
+                        raise ValueError(f"duplicate Hadamard fused expert record for layer {bid}")
+                    fused_layers.add(bid)
+                    continue
+                for kind, pattern in split_patterns.items():
+                    match = pattern.fullmatch(name)
+                    if not match:
+                        continue
+                    bid = int(match.group("bid"))
+                    layer = split_records.setdefault(bid, {})
+                    if kind in layer:
+                        raise ValueError(f"duplicate Hadamard split expert record for layer {bid}")
+                    layer[kind] = index
+                    break
+
+            replacements: dict[int, str] = {}
+            skipped: set[int] = set()
+            for bid, layer in split_records.items():
+                if bid in fused_layers:
+                    raise ValueError(f"Hadamard manifest mixes fused and split expert weights for layer {bid}")
+                if set(layer) != {"gate", "up"}:
+                    raise ValueError(
+                        f"Hadamard fusion requires both ffn_gate_exps and ffn_up_exps for layer {bid}"
+                    )
+                first, second = sorted(layer.values())
+                replacements[first] = self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE_UP_EXP, bid)
+                skipped.add(second)
+
+            weight_names = [
+                replacements.get(index, name)
+                for index, name in enumerate(weight_names)
+                if index not in skipped
+            ]
 
         tied_output = manifest.get("tied_output", False)
         if not isinstance(tied_output, bool) or (schema_version == 3) != tied_output:
@@ -1426,6 +1524,8 @@ class ModelBase:
                     assert titem[0] in modules, f"quantized_layers entry {layer_name!r} is not in the model tensors"
                     self._nvfp4_layer_algo[titem[0]] = entry.get("quant_algo")
 
+        self._prepare_kv_cache_scales()
+
         # NVFP4 weights are repacked and written directly to gguf_writer.
         # This must run before dequant_model so NVFP4 tensors are removed
         # from model_tensors, leaving only non-NVFP4 (e.g. FP8) for dequant.
@@ -1614,8 +1714,6 @@ class ModelBase:
 
         logger.info("Set model quantization version")
         self.gguf_writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
-
-        self.add_hadamard_metadata()
 
         if self._prec_a4:
             names = sorted(self._prec_a4.keys())
@@ -1806,6 +1904,8 @@ class TextModel(ModelBase):
 
     def prepare_metadata(self, vocab_only: bool):
         super().prepare_metadata(vocab_only=vocab_only)
+        if not vocab_only:
+            self.add_hadamard_metadata()
 
         total_params = self.gguf_writer.get_total_parameter_count()[0]
         # Extract the encoding scheme from the file type name. e.g. 'gguf.LlamaFileType.MOSTLY_Q8_0' --> 'Q8_0'
@@ -2183,7 +2283,7 @@ class TextModel(ModelBase):
         if chkhsh == "a8594e3edff7c29c003940395316294b2c623e09894deebbc65f33f1515df79e":
             # ref: https://huggingface.co/databricks/dbrx-base
             res = "dbrx"
-        if chkhsh == "c7699093ba4255a91e702aa38a596aa81669f3525dae06c2953267dde580f448":
+        if chkhsh == "ff56fb99e60f4978c0aacffdb54ab8cc5a808741777dbcdb17fb986823d6ff7e":
             # ref: https://huggingface.co/jinaai/jina-reranker-v1-tiny-en
             res = "jina-v1-en"
         if chkhsh == "0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f":
@@ -2415,6 +2515,7 @@ class TextModel(ModelBase):
     def _set_vocab_hybriddna(self):
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
+        assert tokenizer is not None
         vocab = tokenizer.get_vocab()
         vocab_size = self.hparams.get("vocab_size", len(vocab))
         assert max(vocab.values()) < vocab_size
@@ -2428,11 +2529,11 @@ class TextModel(ModelBase):
         if tokenizer.k != 6 or tail not in ("pad_a", "pad_n"):
             raise NotImplementedError(f"HybridDNATokenizer with k={tokenizer.k}, tail={tail!r}")
         for kmer in [*tokenizer.kmers, *getattr(tokenizer, "npad_tokens", [])]:
-            reverse_vocab[tokenizer.dna_token_to_id[kmer]] = kmer + "\ue000"  # ty: ignore[unresolved-attribute]
+            reverse_vocab[tokenizer.dna_token_to_id[kmer]] = kmer + "\ue000"
         # older HybridDNATokenizer versions (Carbon-500M/3B/8B) do not register the base tokenizer's added tokens (<|im_start|>, <think>, ...) as their own
         # but they are still encoded as special tokens: take their types from the base tokenizer
         base_tokenizer = getattr(tokenizer, "_base_tokenizer", tokenizer)
-        added_tokens_decoder = {**base_tokenizer.added_tokens_decoder, **tokenizer.added_tokens_decoder}  # ty: ignore[unresolved-attribute]
+        added_tokens_decoder = {**base_tokenizer.added_tokens_decoder, **tokenizer.added_tokens_decoder}
 
         tokens: list[str] = []
         toktypes: list[int] = []

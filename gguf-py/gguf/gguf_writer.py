@@ -837,6 +837,9 @@ class GGUFWriter:
     def add_indexer_kpool_select_tail(self, value: bool) -> None:
         self.add_bool(Keys.Attention.Indexer.KPOOL_SELECT_TAIL.format(arch=self.arch), value)
 
+    def add_indexer_index_share_mtp(self, value: bool) -> None:
+        self.add_bool(Keys.Attention.Indexer.INDEX_SHARE_MTP.format(arch=self.arch), value)
+
     def add_max_alibi_bias(self, bias: float) -> None:
         self.add_float32(Keys.Attention.MAX_ALIBI_BIAS.format(arch=self.arch), bias)
 
@@ -1312,6 +1315,12 @@ class GGUFWriter:
     def add_lilicorr_logit_scale(self, value: float) -> None:
         self.add_float32(Keys.LiliCorr.LOGIT_SCALE, value)
 
+    def add_dspine_head_topk(self, value: int) -> None:
+        self.add_uint32(Keys.DSpine.HEAD_TOPK.format(arch=self.arch), value)
+
+    def add_dspine_eps(self, value: float) -> None:
+        self.add_float32(Keys.DSpine.EPS.format(arch=self.arch), value)
+
     def add_tokenizer_model(self, model: str) -> None:
         self.add_string(Keys.Tokenizer.MODEL, model)
 
@@ -1530,6 +1539,9 @@ class GGUFWriter:
 
     def add_vision_preproc_max_pixels_tolerance(self, value: float) -> None:
         self.add_float32(Keys.ClipVision.PREPROC_MAX_PIXELS_TOLERANCE, value)
+
+    def add_vision_preproc_no_upscale(self, value: bool) -> None:
+        self.add_bool(Keys.ClipVision.PREPROC_NO_UPSCALE, value)
 
     def add_vision_projector_query_side(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.Projector.QUERY_SIDE, value)

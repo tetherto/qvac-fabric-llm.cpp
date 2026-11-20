@@ -10,6 +10,7 @@
 #include "server-queue.h"
 #include "server-realtime.h"
 #include "server-schema.h"
+#include "server-spec-n-auto.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -31,6 +32,7 @@
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <thread>
 #include <utility>
 #include <fstream>
 
@@ -340,6 +342,9 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // storage of the checkpoints discarded by the current task
+    server_checkpoint_pool ckpt_pool;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -437,6 +442,7 @@ struct server_slot {
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
+        ckpt_pool.clear();
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -1092,6 +1098,10 @@ private:
 
     common_speculative_ptr spec;
 
+    // --spec-draft-n-auto; planned rows of the current step (0 = not timed)
+    server_spec_n_auto spec_n_auto;
+    int32_t spec_n_auto_rows = 0;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1251,6 +1261,10 @@ private:
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
+            mparams.image_tile_mode  = (int) params_base.image_tile_mode;
+            mparams.image_max_tiles  = params_base.image_max_tiles;
+            mparams.image_no_upscale = params_base.image_no_upscale;
+            mparams.skip_audio       = params_base.mmproj_no_audio;
             mparams.media_marker     = get_media_marker();
             // progress callback
             mparams.progress_callback           = load_progress_callback;
@@ -1949,6 +1963,10 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (spec_n_auto.ready()) {
+            spec_n_auto.reset_seq(slot.id);
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2735,7 +2753,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
-                it = slot.prompt.checkpoints.erase(it);
+                it = slot.ckpt_pool.discard(slot.prompt.checkpoints, it);
                 continue;
             }
 
@@ -2750,7 +2768,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.ckpt_pool.discard(slot.prompt.checkpoints, slot.prompt.checkpoints.begin());
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2759,14 +2777,14 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
-                    it = slot.prompt.checkpoints.erase(it);
+                    it = slot.ckpt_pool.discard(slot.prompt.checkpoints, it);
                 } else {
                     ++it;
                 }
             }
         }
 
-        auto & cur = slot.prompt.checkpoints.emplace_back();
+        auto & cur = slot.ckpt_pool.add(slot.prompt.checkpoints);
 
         cur.id_task = id_task;
 
@@ -3579,6 +3597,8 @@ private:
             }
         }
 
+        const int64_t t_step_start = ggml_time_us();
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -3607,6 +3627,10 @@ private:
         }
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+
+        // a step is timed only when it ran the planned rows (no short drafts, no skipped slots)
+        const int32_t n_step_rows = spec_n_auto_rows > 0 && (int32_t) batch.size() == spec_n_auto_rows ? spec_n_auto_rows : 0;
+        bool          step_failed = false;
 
         if (batch.slot_batched) {
             auto & slot_batched      = batch.slot_batched;
@@ -3654,6 +3678,7 @@ private:
             } catch (const std::exception & e) {
                 SRV_ERR("decode() failed: %s\n", e.what());
                 abort_all_slots("decode() failed: " + std::string(e.what()));
+                step_failed = true;
                 break; // stop any further processing
             }
 
@@ -3663,8 +3688,14 @@ private:
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
+                step_failed = true;
                 break; // stop any further processing
             }
+        }
+
+        // the whole step (draft, verify, sampling) is the cost of its rows
+        if (n_step_rows > 0 && !step_failed) {
+            spec_n_auto.observe_step(n_step_rows, 1e-6 * (double) (ggml_time_us() - t_step_start));
         }
     }
 
@@ -3836,6 +3867,29 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // --spec-draft-n-auto: one draft length for all generating slots
+        int32_t n_draft_cap = -1;
+        spec_n_auto_rows = 0;
+        if (spec && params_base.speculative.draft.n_auto) {
+            if (!spec_n_auto.ready()) {
+                spec_n_auto.init((int32_t) slots.size(), common_speculative_n_max(spec.get()), params_base.speculative.draft.n_min);
+            }
+
+            std::vector<int32_t> seqs;
+            bool timed = true; // no prompt tokens in the step
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    seqs.push_back(slot.id);
+                }
+                timed = timed && (!slot.is_processing() || slot.state == SLOT_STATE_GENERATING);
+            }
+
+            if (!seqs.empty()) {
+                n_draft_cap      = spec_n_auto.pick(seqs);
+                spec_n_auto_rows = timed ? (int32_t) seqs.size() * (n_draft_cap + 1) : 0;
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
@@ -3861,7 +3915,10 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+                if (n_draft_cap >= 0) {
+                    n_draft_max = std::min(n_draft_max, n_draft_cap);
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -4304,7 +4361,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
-                                        it = slot.prompt.checkpoints.erase(it);
+                                        it = slot.ckpt_pool.discard(slot.prompt.checkpoints, it);
                                     } else {
                                         ++it;
                                     }
@@ -4325,6 +4382,8 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        common_speculative_set_prompt_end(spec.get(), slot.id, input_tokens.pos_next());
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -4794,6 +4853,48 @@ private:
         return true;
     }
 
+    // sample one token for each slot, on up to 8 threads with at least 4 slots each: every slot has its own sampler and
+    // only reads the logits. a slot that fails keeps LLAMA_TOKEN_NULL and is sampled again by the caller
+    void sample_parallel(const std::vector<server_slot *> & to_sample, int32_t off, std::vector<llama_token> & out) {
+        const int n = (int) to_sample.size();
+        const int n_threads = std::min(n / 4, 8);
+        if (n_threads < 2) {
+            return;
+        }
+
+        // the first synchronization and logits access update the context, later calls only read it
+        llama_synchronize(ctx_tgt);
+        llama_get_logits(ctx_tgt);
+
+        // the debug sampling timings count the whole parallel section, once per slot sampled in it
+        const int64_t t_start = ggml_time_us();
+
+        auto work = [&](int t) {
+            for (int i = t; i < n; i += n_threads) {
+                server_slot & slot = *to_sample[i];
+                try {
+                    out[slot.id] = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, slot.i_batch - off);
+                } catch (const std::exception &) {
+                    out[slot.id] = LLAMA_TOKEN_NULL;
+                }
+            }
+        };
+
+        std::vector<std::thread> workers;
+        for (int t = 1; t < n_threads; ++t) {
+            workers.emplace_back(work, t);
+        }
+        work(0);
+        for (auto & w : workers) {
+            w.join();
+        }
+
+        t_sampl += ggml_time_us() - t_start;
+        for (const server_slot * slot : to_sample) {
+            n_sampl += out[slot->id] != LLAMA_TOKEN_NULL;
+        }
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -4814,6 +4915,22 @@ private:
             return params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
+
+        // the slots that sample one token from this sub-batch below, sampled first and in parallel
+        std::vector<llama_token> pre_sampled(slots.size(), LLAMA_TOKEN_NULL);
+        {
+            std::vector<server_slot *> to_sample;
+            for (auto & slot : slots) {
+                if (!is_inside_view(slot.i_batch) || (slot.can_speculate() && !slot.spec_draft.empty())) {
+                    continue;
+                }
+                const bool done_prompt = slot.state == SLOT_STATE_DONE_PROMPT && slot.task->need_sampling();
+                if (done_prompt || slot.state == SLOT_STATE_GENERATING) {
+                    to_sample.push_back(&slot);
+                }
+            }
+            sample_parallel(to_sample, off, pre_sampled);
+        }
 
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
@@ -4870,8 +4987,8 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
-            llama_token id;
-            {
+            llama_token id = pre_sampled[slot.id];
+            if (id == LLAMA_TOKEN_NULL) {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
@@ -4955,6 +5072,11 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                // a replay is not a new draft
+                if (params_base.speculative.draft.n_auto && spec_n_auto.ready() && !slot.spec_is_replay) {
+                    spec_n_auto.observe_verify(slot.id, (int32_t) n_draft, (int32_t) accepted.size() - 1);
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 

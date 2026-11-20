@@ -304,6 +304,15 @@ static void cache_debug_line(const char * kind, const std::string & key,
     fflush(stderr);
 }
 
+std::string cl_program_cache_sha256_hex(const void * data, size_t len) {
+    sha256_ctx c;
+    sha256_init(c);
+    sha256_update(c, data, len);
+    uint8_t digest[32];
+    sha256_final(c, digest);
+    return sha256_hex(digest);
+}
+
 cl_program_cache_state cl_program_cache_init(cl_device_id device) {
     cl_program_cache_state st;
 

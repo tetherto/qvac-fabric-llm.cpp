@@ -1,5 +1,5 @@
 [environment]
-extra-paths = ["./gguf-py", "./examples/model-conversion/scripts", "./tools/server/tests", "./scripts/snapdragon/qdc/tests"]
+extra-paths = ["./gguf-py", "./examples/model-conversion/scripts", "./tools/server/tests", "./scripts/snapdragon/qdc/tests", "./ggml/src/ggml-xdna/kernels"]
 python-version = "3.10"
 
 [rules]
@@ -30,3 +30,37 @@ include = [
 [overrides.rules]
 unsupported-operator = "ignore"
 not-subscriptable = "ignore"
+
+# The exporters use the separate, pinned Core ML environment. torch declares
+# Module.forward as a Callable attribute, so ty >= 0.0.88 rejects method overrides.
+[[overrides]]
+include = [
+    "./examples/embedding-coreml/export_coreml.py",
+    "./src/llama-coreml-ffn-templates/make_template.py",
+]
+
+[overrides.rules]
+unresolved-import = "ignore"
+invalid-mutable-override = "ignore"
+
+# The XDNA NPU kernel generators build IRON/MLIR-AIE designs. That toolchain
+# (aie.*, pyxrt, ml_dtypes) is not pip-installable and is not in requirements,
+# so its imports never resolve and every type behind them is Unknown.
+#
+# IRON also declares a tile type as np.ndarray[(N,), np.dtype[T]]. That is the
+# shape the toolchain expects and it is passed as a value, not used to annotate
+# anything, but it is not a valid type expression.
+[[overrides]]
+include = [
+    "./ggml/src/ggml-xdna/kernels/**",
+    "./ggml/src/ggml-xdna/probes/**",
+]
+
+[overrides.rules]
+unresolved-import = "ignore"
+unresolved-attribute = "ignore"
+not-subscriptable = "ignore"
+invalid-type-form = "ignore"
+invalid-type-arguments = "ignore"
+invalid-argument-type = "ignore"
+invalid-assignment = "ignore"

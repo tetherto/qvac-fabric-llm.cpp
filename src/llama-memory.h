@@ -147,8 +147,13 @@ struct llama_memory_i {
 
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
+    virtual uint32_t  seq_token_count(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    // the batches are split into ragged ubatches (llama_ubatch::seq_off) when their sequences have different lengths.
+    // the graphs of ragged ubatches differ from the equal-split ones, so the compute buffers are planned for each kind
+    virtual bool get_ragged() const { return false; }
 
     //
     // state write/read

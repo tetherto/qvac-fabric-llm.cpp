@@ -34,7 +34,10 @@ void llama_model_modern_bert::load_arch_hparams(llama_model_loader & ml) {
         hparams.act_cls = GGML_UNARY_OP_GELU_ERF;
     }
 
-    ml.get_key(LLM_KV_DECISION_BLOCK_COUNT, hparams.n_layer_decision, false);
+    // the laya arch keeps its decision blocks apart from the encoder layers, see laya.cpp
+    if (arch != LLM_ARCH_LAYA) {
+        ml.get_key(LLM_KV_DECISION_BLOCK_COUNT, hparams.n_layer_decision, false);
+    }
     if (hparams.n_layer_decision > 0) {
         if (hparams.n_layer_decision >= hparams.n_layer()) {
             throw std::runtime_error("invalid number of decision blocks");
@@ -136,6 +139,19 @@ std::unique_ptr<llm_graph_context> llama_model_modern_bert::build_arch_graph(con
 }
 
 llama_model_modern_bert::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    ggml_tensor * cur = build_encoder(model, inp_out_ids);
+
+    if (hparams.n_layer_decision > 0) {
+        cur = build_decision_head(model, cur, inp_attn, inp_out_ids);
+    }
+
+    res->t_embd = cur;
+    ggml_build_forward_expand(gf, cur);
+}
+
+ggml_tensor * llama_model_modern_bert::graph::build_encoder(const llama_model & model, ggml_tensor * inp_out_ids) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -152,9 +168,7 @@ llama_model_modern_bert::graph::graph(const llama_model & model, const llm_graph
     inpL = build_norm(inpL, model.tok_norm, nullptr, LLM_NORM, 0);
     cb(inpL, "inp_norm", 0);
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
-
-    auto * inp_attn = build_attn_inp_no_cache();
+    inp_attn = build_attn_inp_no_cache();
 
     const int n_layer_dec = hparams.n_layer_decision;
     const int n_layer_enc = n_layer - n_layer_dec;
@@ -236,12 +250,7 @@ llama_model_modern_bert::graph::graph(const llama_model & model, const llm_graph
             LLM_NORM, -1);
     cb(cur, "final_norm_out", -1);
 
-    if (n_layer_dec > 0) {
-        cur = build_decision_head(model, cur, inp_attn, inp_out_ids);
-    }
-
-    res->t_embd = cur;
-    ggml_build_forward_expand(gf, cur);
+    return cur;
 }
 
 // returns one score per question type for each output token, the caller reads them at the option markers

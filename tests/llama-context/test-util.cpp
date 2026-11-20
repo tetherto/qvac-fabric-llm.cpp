@@ -8,9 +8,12 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <string>
 
 const double NMSE_THRESHOLD = 1e-5;
 
@@ -297,10 +300,44 @@ bool corrupt_state(std::vector<uint8_t> & data) {
 // context
 //
 
+// the scheduler reads GGML_SCHED_DEBUG_REALLOC when the context is created; the models run on
+// several threads, so every context is created while holding this lock and the variable is only
+// changed under it
+static llama_context * init_from_model(llama_model * model, const llama_context_params & cparams, bool realloc_check) {
+    static std::mutex env_mutex;
+    std::lock_guard<std::mutex> lock(env_mutex);
+
+    if (realloc_check) {
+        return llama_init_from_model(model, cparams);
+    }
+
+    const auto set_env = [](const char * value) {
+#ifdef _WIN32
+        _putenv_s("GGML_SCHED_DEBUG_REALLOC", value ? value : "");
+#else
+        if (value) {
+            setenv("GGML_SCHED_DEBUG_REALLOC", value, 1);
+        } else {
+            unsetenv("GGML_SCHED_DEBUG_REALLOC");
+        }
+#endif
+    };
+
+    const char *      prev     = getenv("GGML_SCHED_DEBUG_REALLOC");
+    const bool        prev_set = prev != nullptr;
+    const std::string prev_val = prev_set ? prev : "";
+
+    set_env("0");
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    set_env(prev_set ? prev_val.c_str() : nullptr);
+
+    return ctx;
+}
+
 // fill the buffers of the cache before a restore - a restore that reads cells it never wrote
 // then produces garbage instead of silently passing
-llama_context_ptr init_ctx(llama_model * model, llama_context_params cparams, uint8_t fill) {
-    llama_context_ptr ctx{llama_init_from_model(model, cparams)};
+llama_context_ptr init_ctx(llama_model * model, llama_context_params cparams, uint8_t fill, bool realloc_check) {
+    llama_context_ptr ctx{init_from_model(model, cparams, realloc_check)};
     if (!ctx || fill == 0) {
         return ctx;
     }
@@ -357,7 +394,7 @@ llama_context_ptr make_ctx(llama_model * model, const common_params & params, co
         cparams.type_v = opts.type_v;
     }
 
-    return init_ctx(model, cparams, opts.fill);
+    return init_ctx(model, cparams, opts.fill, opts.realloc_check);
 }
 
 llama_sampler_ptr make_dist_sampler(uint32_t seed) {

@@ -53,6 +53,8 @@ set(METALLIB_KERNEL_SOURCES
     kernels/fa_vec_q5_0.metal
     kernels/fa_vec_q5_1.metal
     kernels/fa_vec_q8_0.metal
+    kernels/fa_back.metal
+    kernels/fa_back_mma.metal
     kernels/mul_mv.metal
     kernels/mul_mv_mma.metal
     kernels/mul_mm.metal
@@ -73,6 +75,8 @@ set(METALLIB_KERNEL_SOURCES
     kernels/argsort.metal
     kernels/pool.metal
     kernels/misc.metal
+    kernels/out_prod.metal
+    kernels/convrot.metal
 )
 
 if (GGML_METAL_EMBED_LIBRARY)

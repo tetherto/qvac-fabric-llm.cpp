@@ -162,7 +162,7 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         }
     }
 
-    char src1_str[128] = { 0 };
+    char src1_str[GGML_MAX_NAME + 128] = { 0 };
     if (src1) {
         snprintf(src1_str, sizeof(src1_str), "%s{%s}", src1->name, common_ggml_ne_string(src1).c_str());
     }

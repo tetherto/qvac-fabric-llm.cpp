@@ -20,6 +20,10 @@ llama-embedding.exe -m ./path/to/model --pooling mean --log-disable -p "Hello Wo
 
 The above command will output space-separated float values.
 
+## Core ML on Apple silicon
+
+EmbeddingGemma 2 can use a locally exported Core ML sidecar through `--coreml-model DIR`. Build with `-DLLAMA_COREML=ON` and use mean pooling. Output normalization and formats work as usual; unsupported batches use ggml. See the [Core ML build, exporter, and API guide](../embedding-coreml/README.md).
+
 ## extra parameters
 ### --embd-normalize $integer$
 | $integer$ | description         | formula |

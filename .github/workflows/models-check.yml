@@ -33,8 +33,12 @@ cache-mode: none
 permissions:
   contents: read
 
+# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
+# re-dispatch supersedes the in-flight run. The default branch deliberately
+# keeps upstream's run_id behaviour - master pushes must not cancel each other,
+# or a merged commit can end with no CI verdict. See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -47,18 +51,19 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  authorize:
+    permissions: {}
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   cuda:
-    runs-on: "hf-jobs-t4-medium:cuda13"
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
-
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y cmake time python3 python3-venv python3-pip
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
@@ -119,7 +124,9 @@ jobs:
           GGML_CUDA_DEVICES=4 ./build/bin/test-llama-archs -s 1
 
   metal:
-    runs-on: [self-hosted, macOS, ARM64]
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -159,6 +166,8 @@ jobs:
           GGML_METAL_DEVICES=4 ./build/bin/test-llama-archs -s 1
 
   rocm:
+    needs: authorize
+    if: false  # No matching AMD GPU hardware.
     runs-on: [self-hosted, Linux, gfx1201, 1accel]
     container: "rocm/dev-ubuntu-24.04:7.2.4-complete"
 
@@ -232,17 +241,14 @@ jobs:
           GGML_CUDA_DEVICES=4 ./build/bin/test-llama-archs -s 1
 
   vulkan-nvidia:
-    runs-on: "hf-jobs-t4-small:ubuntu26_04"
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
-
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y build-essential cmake libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan-dev glslc spirv-headers vulkan-tools mesa-vulkan-drivers libglvnd0 libgl1 libglx0 libegl1 libgles2 time python3 python3-venv python3-pip
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
@@ -299,6 +305,8 @@ jobs:
           ./build/bin/test-llama-archs -s 1
 
   vulkan-amd:
+    needs: authorize
+    if: false  # No matching AMD GPU hardware.
     runs-on: [self-hosted, Linux, gfx1201, 1accel]
     container: "ubuntu:26.04"
 
@@ -367,17 +375,14 @@ jobs:
           ./build/bin/test-llama-archs -s 1
 
   webgpu-nvidia:
-    runs-on: "hf-jobs-t4-small:ubuntu26_04"
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: qvac-ubuntu2404-x64-gpu
 
     steps:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
-
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y build-essential cmake libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan1 mesa-vulkan-drivers libglvnd0 libgl1 libglx0 libegl1 libgles2 time python3 python3-venv python3-pip
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24

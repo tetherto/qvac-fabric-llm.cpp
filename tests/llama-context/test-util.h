@@ -123,9 +123,13 @@ struct ctx_opts {
 
     // a probe that expects the context to be refused should not report it as an error
     bool quiet = false;
+
+    // false creates the context with GGML_SCHED_DEBUG_REALLOC=0, for a case whose re-reserves
+    // depend on the backend
+    bool realloc_check = true;
 };
 
-llama_context_ptr init_ctx(llama_model * model, llama_context_params cparams, uint8_t fill);
+llama_context_ptr init_ctx(llama_model * model, llama_context_params cparams, uint8_t fill, bool realloc_check = true);
 llama_context_ptr make_ctx(llama_model * model, const common_params & params, const ctx_opts & opts);
 
 llama_sampler_ptr make_dist_sampler(uint32_t seed);

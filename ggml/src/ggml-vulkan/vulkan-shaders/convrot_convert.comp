@@ -1,0 +1,38 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "convrot_f16.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform parameter {
+    uint count;
+    uint src_offset;
+    uint dst_offset;
+};
+layout(binding = 0, std430) readonly buffer S { uint data_s[]; };
+layout(binding = 1, std430) writeonly buffer D { uint data_d[]; };
+float load_value(uint i) {
+#ifdef SRC_I8
+    const uint j = src_offset + i;
+    return float(bitfieldExtract(int(data_s[j / 4]), int((j & 3) * 8), 8));
+#elif defined(SRC_F16)
+    const vec2 v = unpackHalf2x16(data_s[(src_offset + i) / 2]);
+    return ((src_offset + i) & 1) == 0 ? v.x : v.y;
+#else
+    return uintBitsToFloat(data_s[src_offset + i]);
+#endif
+}
+void main() {
+    const uint i = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256 + gl_LocalInvocationID.x;
+#ifdef DST_F16
+    if (2 * i < count) {
+        data_d[dst_offset + i] = convrot_pack_f16_rne(vec2(load_value(2 * i), load_value(2 * i + 1)));
+    }
+#else
+    if (i < count) {
+        float value = load_value(i);
+#ifdef ROUND_F16
+        value = unpackHalf2x16(convrot_f16_rne(value)).x;
+#endif
+        data_d[dst_offset + i] = floatBitsToUint(value);
+    }
+#endif
+}

@@ -7196,6 +7196,7 @@ static void ggml_backend_sycl_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ events,
         /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false,
     };
 }
 
@@ -7653,7 +7654,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_FLASH_ATTN_EXT:
-            return ggml_sycl_flash_attn_ext_supported(device, op);
+            // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+            return op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);
         default:
             return false;
     }

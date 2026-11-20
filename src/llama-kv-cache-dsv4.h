@@ -133,6 +133,8 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    uint32_t seq_token_count(llama_seq_id seq_id) const override;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -226,7 +228,7 @@ public:
     std::vector<ggml_tensor *> get_k_rot() const;
 
     void set_input_k_idxs(ggml_tensor * dst) const;
-    void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
 
     // token history of the raw (window) cells, for host-side n-gram hashing (deepseek41 Engram)
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

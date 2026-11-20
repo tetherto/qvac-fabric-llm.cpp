@@ -1,0 +1,70 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint group_size;
+    uint groups_per_row;
+    uint ne01;
+    uint ne02;
+    uint nb00;
+    uint nb01;
+    uint nb02;
+    uint nb03;
+    uint nb0;
+    uint nb1;
+    uint nb2;
+    uint nb3;
+    uint src_offset;
+    uint dst_offset;
+    uint total_groups;
+};
+
+layout(binding = 0, std430) readonly buffer A { float data_a[]; };
+layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
+
+shared float values[1024];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint group = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (group >= total_groups) return;
+
+    const uint g0 = group % groups_per_row;
+    const uint row = group / groups_per_row;
+    const uint i1 = row % ne01;
+    const uint i2 = (row / ne01) % ne02;
+    const uint i3 = row / (ne01 * ne02);
+    const uint k0 = g0 * group_size;
+    const uint src_row = src_offset + i1 * nb01 + i2 * nb02 + i3 * nb03;
+    const uint dst_row = dst_offset + i1 * nb1 + i2 * nb2 + i3 * nb3;
+
+    for (uint i = tid; i < group_size; i += 256) {
+        values[i] = data_a[src_row + (k0 + i) * nb00];
+    }
+    barrier();
+
+    for (uint stride = 1; stride < group_size; stride *= 4) {
+        for (uint butterfly = tid; butterfly < group_size / 4; butterfly += 256) {
+            const uint j = (butterfly / stride) * (4 * stride) + butterfly % stride;
+            precise float a = values[j];
+            precise float b = values[j + stride];
+            precise float c = values[j + 2 * stride];
+            precise float d = values[j + 3 * stride];
+            precise float ab = a + b;
+            precise float r0 = ((ab + c) - d) * 0.5;
+            precise float r1 = ((ab - c) + d) * 0.5;
+            precise float r2 = (((a - b) + c) + d) * 0.5;
+            precise float r3 = (((-a + b) + c) + d) * 0.5;
+            values[j] = r0;
+            values[j + stride] = r1;
+            values[j + 2 * stride] = r2;
+            values[j + 3 * stride] = r3;
+        }
+        barrier();
+    }
+
+    for (uint i = tid; i < group_size; i += 256) {
+        data_d[dst_row + (k0 + i) * nb0] = values[i];
+    }
+}

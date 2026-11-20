@@ -23,6 +23,9 @@ on:
       'ci/run.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
+      'ggml/include/**',
+      'src/**',
+      'tests/**',
       'ggml/src/*',
       'ggml/src/ggml-cpu/**'
     ]
@@ -31,8 +34,12 @@ cache-mode: none
 permissions:
   contents: read
 
+# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
+# re-dispatch supersedes the in-flight run. The default branch deliberately
+# keeps upstream's run_id behaviour - master pushes must not cancel each other,
+# or a merged commit can end with no CI verdict. See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -45,8 +52,15 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  authorize:
+    permissions: {}
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   cpu-x64-high-perf:
-    runs-on: [self-hosted, Linux, X64, CPU]
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: qvac-ubuntu2204-x64
+    timeout-minutes: 180
 
     steps:
       - name: Clone
@@ -56,9 +70,41 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp/$RUNNER_NAME ~/mnt/llama.cpp
 
+      - name: Diagnose k-pool with AMX disabled
+        if: ${{ failure() && !cancelled() }}
+        shell: bash
+        run: |
+          if ! grep -q 'FAIL: GLM5 k-pool' build-ci-debug/Testing/Temporary/LastTest.log; then
+            exit 0
+          fi
+          mkdir -p build-ci-noamx
+          cat > build-ci-noamx/no-amx <<'EOF'
+          #!/bin/bash
+          exec "$@" -mno-amx-tile -mno-amx-int8 -mno-amx-bf16
+          EOF
+          chmod +x build-ci-noamx/no-amx
+          cmake -S . -B build-ci-noamx -DCMAKE_BUILD_TYPE=Debug \
+            -DLLAMA_OPENSSL=OFF -DGGML_SCHED_NO_REALLOC=ON -DGGML_NATIVE=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER="$PWD/build-ci-noamx/no-amx" \
+            -DCMAKE_CXX_COMPILER_LAUNCHER="$PWD/build-ci-noamx/no-amx"
+          cmake --build build-ci-noamx --target test-llama-archs -j "$(nproc)"
+          ctest --test-dir build-ci-noamx --output-on-failure -R '^test-glm5-kpool-sequences$'
+
+      - name: Preserve failing CPU logs
+        if: ${{ failure() && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: cpu-failure-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 7
+          path: |
+            build-ci-*/CMakeCache.txt
+            build-ci-*/Testing/Temporary/*.log
+
   cpu-arm64-high-perf-graviton4:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: ah-ubuntu_24_04-c8g_8x
 
     steps:
@@ -74,6 +120,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
           apt-get install -y \
           build-essential \
+          coreutils \
           python3-venv \
           gpg \
           wget \
@@ -92,6 +139,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake
 
+          command -v nproc
+
       - name: Test
         id: ggml-ci
         run: |
@@ -103,6 +152,8 @@ jobs:
 
   # TODO: provision AMX-compatible machine
   #cpu-amx:
+  #  needs: authorize
+  #  if: needs.authorize.outputs.allowed == 'true'
   #  runs-on: [self-hosted, Linux, CPU, AMX]
 
   #  steps:

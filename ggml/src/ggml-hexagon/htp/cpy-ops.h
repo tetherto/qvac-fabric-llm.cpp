@@ -15,10 +15,16 @@ enum htp_copy_kernel_type {
     HTP_COPY_KERNEL_RESHAPE            = 4,
     HTP_COPY_KERNEL_SCALAR             = 5,
     HTP_COPY_KERNEL_GATHER_ROWS        = 6,
+    HTP_COPY_KERNEL_STRIDED_CONVERT    = 7,
 };
 
 struct htp_copy_convert_params {
     uint32_t              blk_rows;         // rows moved per DMA descriptor
+    struct fastdiv_values div_ne01;
+    struct fastdiv_values div_ne02_ne01;
+};
+
+struct htp_copy_strided_params {
     struct fastdiv_values div_ne01;
     struct fastdiv_values div_ne02_ne01;
 };
@@ -45,6 +51,7 @@ struct htp_copy_kernel_params {
     union {
         struct htp_copy_convert_params convert;
         struct htp_copy_reshape_params reshape;
+        struct htp_copy_strided_params strided;
         struct htp_gather_rows_params  gather;
     } u;
 };

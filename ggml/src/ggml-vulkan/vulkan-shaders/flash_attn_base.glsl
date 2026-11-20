@@ -13,19 +13,24 @@ layout (constant_id =  8) const uint32_t SubGroupSize = 32;
 layout (constant_id =  9) const uint32_t SHMEM_STAGING = 0;
 layout (constant_id = 10) const uint32_t Flags = 0;
 layout (constant_id = 11) const uint32_t LIMIT_OCCUPANCY_SHMEM = 0;
+#ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
 // ggml_type enumerant for K/V
 layout (constant_id = 12) const uint32_t FaTypeK = 0;
 layout (constant_id = 13) const uint32_t FaTypeV = 0;
 // sizeof(decode buffer): quants -> ggml block size; F32 -> 16 (decodeBufF32 vec4).
 layout (constant_id = 14) const uint32_t FaBlockBytesK = 2;
 layout (constant_id = 15) const uint32_t FaBlockBytesV = 2;
-
+#endif
 const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 // Sparse: gather binding-7 indices instead of scanning [0,KV); p.split_kv = n_kv_max.
 const bool USE_SPARSE      = (Flags & 16) != 0;
+// V is supplied transposed per head ([HSV][v_stride] with KV contiguous, from dequant_f16_transpose_vt), so a
+// coopmat1 P x V B-operand fragment is one contiguous 32-byte run per lane instead of 16 kv-strided halves.
+// coopmat1 only, f16 V, aligned, no shmem staging (which stages V rows from the row-major layout).
+const bool V_TRANSPOSED     = (Flags & 64) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -87,10 +92,13 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 
 #define MASK_OPT_ALL_NEG_INF 1
+// a mask value at or below this (f16 -inf, or the lowest finite f16 some mask writers use for it) hides the key
+#define FA_MASK_DEAD (-65504.0)
 #define MASK_OPT_ALL_ZERO 2
 
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
+#ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
 
 #include "fa_types.glsl"
 
@@ -111,6 +119,13 @@ layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 // through dequantize4 / the MMQ helpers to unpack from the packed block layout.
 #define USE_DECODE_K (FaTypeK != GGML_TYPE_F16)
 #define USE_DECODE_V (FaTypeV != GGML_TYPE_F16)
+// Vocabulary bridge: the FA shaders (shared with the TBQ compile-time path) use
+// FA_BLOCK_BYTES_K/V; in the b9518 runtime model these are the spec constants.
+#define FA_BLOCK_BYTES_K FaBlockBytesK
+#define FA_BLOCK_BYTES_V FaBlockBytesV
+#else
+#include "turbo-quant/flash_attn_base.glsl"
+#endif
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 

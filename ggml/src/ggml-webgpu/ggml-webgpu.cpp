@@ -1634,11 +1634,11 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
                                              ggml_tensor *    src1,
                                              ggml_tensor *    dst) {
     // Determine if this is a mat-vec operation
-    bool use_mat_vec = (dst->ne[1] <= 4);
+    bool use_mat_vec = (dst->ne[1] <= GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS);
 
     // use MMVQ path for mat-vec
-    bool use_mmvq = ggml_webgpu_can_use_mmvq(src0, src1, ctx->global_ctx->capabilities.supports_dot_product,
-                                             ctx->global_ctx->vendor);
+    bool use_mmvq = ggml_webgpu_can_use_mmvq(
+        src0, src1, dst, src1->ne[1], ctx->global_ctx->capabilities.supports_dot_product, ctx->global_ctx->vendor);
 
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
 
@@ -1965,7 +1965,8 @@ struct ggml_webgpu_flash_attn_op {
 static bool ggml_webgpu_flash_attn_use_vec_path(const webgpu_global_context & global_ctx,
                                                 const ggml_tensor *           Q,
                                                 const ggml_tensor *           K,
-                                                const ggml_tensor *           V) {
+                                                const ggml_tensor *           V,
+                                                int64_t                       n_q) {
     const size_t storage_offset_alignment = global_ctx->capabilities.limits.minStorageBufferOffsetAlignment;
 
     const bool k_float_vec4_aligned = (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_F32) ||
@@ -1979,7 +1980,7 @@ static bool ggml_webgpu_flash_attn_use_vec_path(const webgpu_global_context & gl
         ggml_is_quantized(V->type) ? ggml_blck_size(V->type) : GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH;
     const bool kv_vec_head_dims_aligned = Q->ne[0] % k_vec_head_align == 0 && V->ne[0] % v_vec_head_align == 0;
 
-    return global_ctx->capabilities.supports_subgroups && (Q->ne[1] < GGML_WEBGPU_FLASH_ATTN_VEC_MAX_SEQ_LEN) &&
+    return global_ctx->capabilities.supports_subgroups && (n_q < GGML_WEBGPU_FLASH_ATTN_VEC_MAX_SEQ_LEN) &&
            kv_vec_head_dims_aligned && k_float_vec4_aligned && v_float_vec4_aligned;
 }
 
@@ -2288,7 +2289,7 @@ static webgpu_encoded_op ggml_webgpu_flash_attn(webgpu_context & ctx,
                                                 ggml_tensor *    sinks,
                                                 ggml_tensor *    dst) {
     ggml_webgpu_flash_attn_op op = ggml_webgpu_flash_attn_prepare(ctx, Q, K, V, mask, sinks, dst);
-    if (ggml_webgpu_flash_attn_use_vec_path(ctx->global_ctx, Q, K, V)) {
+    if (ggml_webgpu_flash_attn_use_vec_path(ctx->global_ctx, Q, K, V, Q->ne[1])) {
         return ggml_webgpu_flash_attn_vec(ctx, Q, K, V, mask, sinks, dst, std::move(op));
     }
     return ggml_webgpu_flash_attn_direct(ctx, op);
@@ -3271,7 +3272,10 @@ static bool ggml_webgpu_can_fuse_rms_norm_mul(const struct ggml_cgraph * cgraph,
     return true;
 }
 
-static bool ggml_webgpu_can_fuse_gdn_cache(const struct ggml_cgraph * cgraph, int node_idx, int & num_encoded_ops) {
+static bool ggml_webgpu_can_fuse_gdn_cache(const webgpu_global_context & global_ctx,
+                                           const struct ggml_cgraph *    cgraph,
+                                           int                           node_idx,
+                                           int &                         num_encoded_ops) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
 
     // the kernel skips the snapshot tail, so the gdn output must not be a graph output
@@ -3324,6 +3328,12 @@ static bool ggml_webgpu_can_fuse_gdn_cache(const struct ggml_cgraph * cgraph, in
     if (cpy_dst->op != GGML_OP_VIEW || cpy_dst->type != GGML_TYPE_F32 || cpy_dst->data == nullptr ||
         !std::equal(expected_ne.begin(), expected_ne.end(), cpy_dst->ne) ||
         cpy_dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || cpy_dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        return false;
+    }
+
+    // a state read in place from the cache rows overlaps the cache write, and WebGPU does not allow a writable
+    // binding to alias another binding of the same dispatch: those take the unfused path
+    if (ggml_webgpu_tensor_binding_overlap(global_ctx, gdn->src[5], cpy_dst)) {
         return false;
     }
 
@@ -3471,7 +3481,7 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
             return ggml_webgpu_ssm_scan(ctx, src0, src1, src2, node->src[3], node->src[4], node->src[5], node->src[6],
                                         node);
         case GGML_OP_GATED_DELTA_NET:
-            if (ggml_webgpu_can_fuse_gdn_cache(cgraph, node_idx, num_encoded_ops)) {
+            if (ggml_webgpu_can_fuse_gdn_cache(ctx->global_ctx, cgraph, node_idx, num_encoded_ops)) {
                 ggml_tensor * dst_fuse = cgraph->nodes[node_idx + num_encoded_ops - 1]->src[1];
                 return ggml_webgpu_gated_delta_net(ctx, src0, src1, src2, node->src[3], node->src[4], node->src[5],
                                                    node, dst_fuse);
@@ -4012,7 +4022,10 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
                 const ggml_tensor * V            = tensor->src[2];
                 const ggml_tensor * mask         = tensor->src[3];
                 const auto &        capabilities = ctx->webgpu_global_ctx->capabilities;
-                if (ggml_webgpu_flash_attn_use_vec_path(ctx->webgpu_global_ctx, Q, K, V)) {
+                // the vec path scratch grows with the query rows, so a longer batch reserves the scratch of the
+                // longest vec batch and the size stays monotonic in the batch length
+                const int64_t       n_q = std::min<int64_t>(Q->ne[1], GGML_WEBGPU_FLASH_ATTN_VEC_MAX_SEQ_LEN - 1);
+                if (ggml_webgpu_flash_attn_use_vec_path(ctx->webgpu_global_ctx, Q, K, V, n_q)) {
                     const bool kv_direct =
                         ggml_webgpu_flash_attn_k_direct(Q, K, GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH) ||
                         ggml_webgpu_flash_attn_v_direct(Q, V, GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH);
@@ -4024,7 +4037,7 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
                     uint32_t       nwg = ggml_webgpu_flash_attn_vec_nwg(vec_nwg_cap, kv_tile, (uint32_t) K->ne[1]);
 
                     const size_t   align = capabilities.limits.minStorageBufferOffsetAlignment;
-                    const uint64_t nrows = (uint64_t) Q->ne[1] * Q->ne[2] * Q->ne[3];
+                    const uint64_t nrows = (uint64_t) n_q * Q->ne[2] * Q->ne[3];
                     if (nwg > 1u) {
                         const uint64_t tmp_data_elems  = nrows * (uint64_t) V->ne[0] * nwg;
                         const uint64_t tmp_stats_elems = nrows * 2u * nwg;
@@ -4036,7 +4049,7 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
                     }
                     if (mask != nullptr) {
                         const uint32_t blk_nblk0       = CEIL_DIV((uint32_t) K->ne[1], kv_tile);
-                        const uint32_t blk_nblk1       = CEIL_DIV((uint32_t) Q->ne[1], 1u);
+                        const uint32_t blk_nblk1       = (uint32_t) n_q;
                         const uint32_t stride_mask3    = (uint32_t) (mask->nb[3] / ggml_type_size(mask->type));
                         const uint32_t blk_batch_count = stride_mask3 > 0 ? (uint32_t) Q->ne[3] : 1u;
                         const uint64_t blk_elems       = (uint64_t) blk_nblk0 * blk_nblk1 * blk_batch_count;
@@ -4052,11 +4065,15 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
             {
                 const ggml_tensor * src0 = tensor->src[0];
                 const ggml_tensor * src1 = tensor->src[1];
-                bool                use_mmvq =
-                    ggml_webgpu_can_use_mmvq(src0, src1, ctx->webgpu_global_ctx->capabilities.supports_dot_product,
-                                             ctx->webgpu_global_ctx->vendor);
+
+                // the q8 copy of src1 grows with its rows, so a longer batch reserves the copy of the longest
+                // mmvq batch and the size stays monotonic in the batch length
+                const int64_t n_rows   = std::min<int64_t>(src1->ne[1], GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS);
+                const bool    use_mmvq = ggml_webgpu_can_use_mmvq(
+                    src0, src1, tensor, n_rows, ctx->webgpu_global_ctx->capabilities.supports_dot_product,
+                    ctx->webgpu_global_ctx->vendor);
                 if (use_mmvq) {
-                    const size_t q8_src1_size = src1->ne[3] * src1->ne[2] * src1->ne[1] *
+                    const size_t q8_src1_size = src1->ne[3] * src1->ne[2] * n_rows *
                                                 (36 /* sizeof(q8_1) */ * (src1->ne[0] / /* block_size */ 32));
                     res = ROUNDUP_POW2(res + q8_src1_size +
                                            ctx->webgpu_global_ctx->capabilities.limits.minStorageBufferOffsetAlignment,
@@ -4130,6 +4147,7 @@ static void ggml_backend_webgpu_device_get_props(ggml_backend_dev_t dev, struct 
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ false,
         /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false,
     };
 }
 
@@ -4156,6 +4174,7 @@ static void ggml_webgpu_init_memset_pipeline(webgpu_global_context & ctx) {
 
 static void ggml_backend_webgpu_request_adapter(wgpu::Instance & instance, wgpu::Adapter & adapter) {
     wgpu::RequestAdapterOptions options = {};
+    options.powerPreference             = wgpu::PowerPreference::HighPerformance;
 
 #if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
     // TODO: track need for these toggles: https://issues.chromium.org/issues/42251215
@@ -4590,7 +4609,8 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             {
                 // conservative support checks for whether the more resource-intensive shader paths
                 // can be used, to avoid cases where flash_attn is assigned to the CPU later on
-                supports_op = src0->type == GGML_TYPE_F32 &&
+                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+                supports_op = op->src[5] == nullptr && src0->type == GGML_TYPE_F32 &&
                               (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 ||
                                src1->type == GGML_TYPE_Q4_0 || src1->type == GGML_TYPE_Q8_0) &&
                               (src2->type == GGML_TYPE_F32 || src2->type == GGML_TYPE_F16 ||
@@ -4609,7 +4629,8 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
 
                 // subgroup matrix path requirements
                 const bool use_subgroup_matrix = ggml_webgpu_flash_attn_can_use_subgroup_matrix_path(
-                    capabilities.supports_subgroup_matrix, capabilities.sg_mat_k, capabilities.sg_mat_n, src0, src2);
+                    capabilities.supports_subgroup_matrix, capabilities.sg_mat_k, capabilities.sg_mat_n, src0, src2,
+                    op);
 
                 // tile path requirements
                 const bool float_vec4_aligned =
@@ -4869,7 +4890,9 @@ static ggml_backend_dev_t ggml_backend_webgpu_reg_get_device(ggml_backend_reg_t 
 
     ggml_backend_webgpu_reg_context * reg_ctx = static_cast<ggml_backend_webgpu_reg_context *>(reg->context);
 
-    create_webgpu_device(reg_ctx);
+    if (reg_ctx->webgpu_global_ctx->device == nullptr) {
+        create_webgpu_device(reg_ctx);
+    }
 
     static ggml_backend_webgpu_device_context device_ctx;
     device_ctx.device_name            = GGML_WEBGPU_NAME;
@@ -4895,6 +4918,15 @@ static const struct ggml_backend_reg_i ggml_backend_webgpu_reg_i = {
 
 /* End GGML Backend Registration Interface */
 
+// Dawn's Null backend accepts every feature and executes nothing, so a host
+// without a usable GPU would otherwise "run" inference on it and return
+// garbage instead of falling back to the CPU backend.
+static bool ggml_webgpu_adapter_is_null_backend(const wgpu::Adapter & adapter) {
+    wgpu::AdapterInfo info;
+    adapter.GetInfo(&info);
+    return info.backendType == wgpu::BackendType::Null;
+}
+
 ggml_backend_reg_t ggml_backend_webgpu_reg() {
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_reg()");
 
@@ -4908,15 +4940,14 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
         /* .context     = */ ctx,
     };
 
-    ctx->name         = GGML_WEBGPU_NAME;
-    ctx->device_count = 0;
+    ctx->name = GGML_WEBGPU_NAME;
 
-    // Keep one Dawn/WebGPU instance alive for the lifetime of the static backend
-    // registry. Recreating it on repeated registry lookups can invalidate
-    // adapter/device references that are still held by the backend/device layer.
-    if (ctx->webgpu_global_ctx != nullptr && ctx->webgpu_global_ctx->instance != nullptr) {
+    // Cache setup failures too, so repeated lookups do not retry or repeat diagnostics.
+    if (ctx->webgpu_global_ctx != nullptr) {
         return &reg;
     }
+
+    ctx->device_count = 0;
 
     wgpu::InstanceDescriptor               instance_descriptor{};
     std::vector<wgpu::InstanceFeatureName> instance_features = { wgpu::InstanceFeatureName::TimedWaitAny };
@@ -4942,11 +4973,22 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
     }
 
     // WebGPU backend requires f16 support and, on native, implicit device synchronization.
-    if (adapter != nullptr && adapter.HasFeature(wgpu::FeatureName::ShaderF16)
-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
-        && adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)
+    if (adapter == nullptr) {
+        GGML_LOG_WARN("ggml_webgpu: no adapter available, backend disabled\n");
+    } else if (ggml_webgpu_adapter_is_null_backend(adapter)) {
+        GGML_LOG_WARN("ggml_webgpu: only Dawn's Null adapter is available (no usable GPU), backend disabled\n");
+    } else if (!adapter.HasFeature(wgpu::FeatureName::ShaderF16)) {
+        GGML_LOG_WARN("ggml_webgpu: adapter lacks shader-f16, backend disabled\n");
+#ifdef __EMSCRIPTEN__
+        GGML_LOG_WARN(
+            "ggml_webgpu: on affected Chromium NVIDIA/Vulkan configurations, try "
+            "--enable-dawn-features=vulkan_enable_f16_on_nvidia\n");
 #endif
-    ) {
+#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+    } else if (!adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)) {
+        GGML_LOG_WARN("ggml_webgpu: adapter lacks implicit device synchronization, backend disabled\n");
+#endif
+    } else {
         ctx->device_count = 1;
     }
 

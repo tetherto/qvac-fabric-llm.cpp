@@ -141,10 +141,14 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
     const int                                      seq   = blockIdx.x / ((D / V) * a.H);
     const int                                      v0    = slice * V;
     const int64_t                                  soff  = ((int64_t) seq * a.H + h) * D * D;
-    const int64_t                                  qoff  = (seq / a.rq3) * a.sq3 + (h % a.H_k) * a.sq1;
-    const int64_t                                  voff  = seq * a.sv3 + h * a.sv1 + v0;
-    const int64_t                                  goff  = seq * a.sb3 + h * a.sb1;
-    float *                                        out   = a.dst + ((int64_t) seq * a.n_tokens * a.H + h) * D + v0;
+    // ragged: the seq's tokens start at token t_beg of a single sequence dimension
+    const int64_t                                  t_beg = a.seq_off ? a.seq_off[seq] : 0;
+    const int64_t                                  n_tok = a.seq_off ? a.seq_off[seq + 1] - t_beg : a.n_tokens;
+    const int64_t                                  qoff  = a.seq_off ? t_beg * a.sq2 + (h % a.H_k) * a.sq1
+                                                                     : (seq / a.rq3) * a.sq3 + (h % a.H_k) * a.sq1;
+    const int64_t                                  voff  = (a.seq_off ? t_beg * a.sv2 : seq * a.sv3) + h * a.sv1 + v0;
+    const int64_t                                  goff  = (a.seq_off ? t_beg * a.sb2 : seq * a.sb3) + h * a.sb1;
+    float *                                        out   = a.dst + ((a.seq_off ? t_beg : (int64_t) seq * a.n_tokens) * a.H + h) * D + v0;
     constexpr int                                  STATE_TILES = (D / 16) * (V / N);
     constexpr int                                  PER_WARP    = STATE_TILES / WARPS;
     static_assert(STATE_TILES % WARPS == 0, "state must divide across warps");
@@ -160,7 +164,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
     auto read_qk = [&](int64_t t, float4 & q, float4 & k) {
         t += warp;
         q = k = make_float4(0, 0, 0, 0);
-        if (t < a.n_tokens) {
+        if (t < n_tok) {
             const int64_t off = qoff + t * a.sq2 + 4 * lane;
             if ((((uintptr_t) (a.q + off) | (uintptr_t) (a.k + off)) & 15) == 0) {
                 q = *reinterpret_cast<const float4 *>(a.q + off);
@@ -177,8 +181,8 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
     if constexpr (PREFETCH) {
         read_qk(0, next_q, next_k);
     }
-    for (int64_t t0 = 0; t0 < a.n_tokens; t0 += C) {
-        const int valid = min((int64_t) C, a.n_tokens - t0);
+    for (int64_t t0 = 0; t0 < n_tok; t0 += C) {
+        const int valid = min((int64_t) C, n_tok - t0);
 #pragma unroll
         for (int j = 0; j < C / 8; ++j) {
             const int t = warp + 8 * j, d = 4 * lane;
@@ -223,7 +227,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         }
         __syncthreads();
         if constexpr (PREFETCH) {
-            if (t0 + C < a.n_tokens) {
+            if (t0 + C < n_tok) {
                 read_qk(t0 + C, next_q, next_k);
             }
         }

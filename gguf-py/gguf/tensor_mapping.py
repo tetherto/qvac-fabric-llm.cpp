@@ -219,6 +219,18 @@ class TensorNameMap:
         MODEL_TENSOR.LILICORR_ANCHOR_OUT_HEAD: (
             "model.lilicorr.anchor_out_head",
         ),
+        MODEL_TENSOR.DSPINE_CODEBOOK: (
+            "model.selected_prefix_bridge.codebook",
+        ),
+        MODEL_TENSOR.DSPINE_GATE: (
+            "model.selected_prefix_bridge.gate",
+        ),
+        MODEL_TENSOR.DSPINE_PRED_GATE: (
+            "model.selected_prefix_bridge.predecessor_gate",
+        ),
+        MODEL_TENSOR.DSPINE_PREV: (
+            "model.selected_prefix_bridge.prev",
+        ),
     }
 
     block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
@@ -1261,10 +1273,12 @@ class TensorNameMap:
 
         MODEL_TENSOR.ATTN_SUB_NORM: (
             "model.layers.{bid}.self_attn.inner_attn_ln",  # bitnet
+            "model.layers.{bid}.self_attn.attn_sub_norm",  # microsoft-bitnet
         ),
 
         MODEL_TENSOR.FFN_SUB_NORM: (
             "model.layers.{bid}.mlp.ffn_layernorm",  # bitnet
+            "model.layers.{bid}.mlp.ffn_sub_norm",   # microsoft-bitnet
         ),
 
         MODEL_TENSOR.DEC_ATTN_NORM: (
@@ -1626,6 +1640,14 @@ class TensorNameMap:
         ),
         MODEL_TENSOR.LILICORR_ATTN_IN_PROJ: (
             "model.lilicorr.layers.{bid}.attn.in_proj",
+        ),
+
+        MODEL_TENSOR.DSPINE_READ: (
+            "model.layers.{bid}.selected_prefix_bridge.read", # split from read_weight / early_read_weights
+        ),
+
+        MODEL_TENSOR.DSPINE_WRITE: (
+            "model.layers.{bid}.selected_prefix_bridge.write", # split from feature_write_weights
         ),
 
         MODEL_TENSOR.CLS: (

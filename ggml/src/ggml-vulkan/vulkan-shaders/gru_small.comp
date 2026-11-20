@@ -1,0 +1,77 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+#include "types.glsl"
+
+// Small-H fused GRU compiled per exact H (H_C; host selects p.H == H_C); fp op order matches
+// CPU reference / gru.comp exactly. whh [H,3H], gi [3H,B,L], bhh [3H] -> dst [H,B,L].
+#define WG_SIZE 128
+
+layout (push_constant) uniform parameter
+{
+    uint H;
+    uint B;
+    uint L;
+    uint reverse;
+} p;
+
+layout (binding = 0) readonly buffer W {float data_whh[];};
+layout (binding = 1) readonly buffer G {float data_gi[];};
+layout (binding = 2) readonly buffer BH {float data_bhh[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+shared float w_sh[H_C * 3 * H_C];   // whh, k-major per gate row
+shared float b_sh[3 * H_C];         // bhh
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint b    = gl_WorkGroupID.y * WG_SIZE + lane;    // global batch element
+    const uint H3   = 3u * H_C;
+
+    for (uint i = lane; i < H_C * H3; i += WG_SIZE) {
+        w_sh[i] = data_whh[i];
+    }
+    if (lane < H3) {
+        b_sh[lane] = data_bhh[lane];
+    }
+    barrier();
+
+    if (b >= p.B) {
+        return;                                             // after the only barrier
+    }
+
+    float h[H_C];
+    float gh[3 * H_C];
+    [[unroll]] for (uint j = 0u; j < H_C; ++j) {
+        h[j] = 0.0f;                                        // zero initial state
+    }
+
+    for (uint s = 0u; s < p.L; ++s) {
+        const uint t       = (p.reverse != 0u) ? (p.L - 1u - s) : s;
+        const uint gi_base = H3 * b + H3 * p.B * t;
+
+        // gh[g] = sum_k whh[k,g]*h[k] + bhh[g] (bias after accumulation, CPU order).
+        [[unroll]] for (uint g = 0u; g < 3u * H_C; ++g) {
+            float acc = 0.0f;
+            [[unroll]] for (uint k = 0u; k < H_C; ++k) {
+                acc += w_sh[H_C * g + k] * h[k];
+            }
+            gh[g] = acc + b_sh[g];
+        }
+
+        // gates + state update; exp/tanh args saturated (mobile drivers NaN on
+        // exp overflow instead of +inf); clamps bit-equivalent in fp32.
+        const uint obase = H_C * b + H_C * p.B * t;
+        [[unroll]] for (uint j = 0u; j < H_C; ++j) {
+            const float r  = 1.0f / (1.0f + exp(min(-(data_gi[gi_base + j] + gh[j]), 88.0f)));
+            const float z  = 1.0f / (1.0f + exp(min(-(data_gi[gi_base + H_C + j] + gh[H_C + j]), 88.0f)));
+            const float nc = tanh(clamp(data_gi[gi_base + 2u * H_C + j] + r * gh[2u * H_C + j], -15.0f, 15.0f));
+            const float hn = nc + z * (h[j] - nc);
+            data_d[obase + j] = hn;
+            h[j] = hn;
+        }
+    }
+}
