@@ -819,29 +819,49 @@ struct case_comp_padding : ctx_test {
     }
 };
 
-// a sequence saved with another stream count restores into its own stream: from a per-sequence
-// cache (kv_unified off, saved from seq 1, so its cells are in the second saved stream) into a
-// unified one under another seq id, and from there back into a per-sequence cache
-// the round trip saves back byte for byte, and each restored sequence continues as one decoded directly in the
-// same layout
-// a state whose stream count is 0 or above LLAMA_MAX_SEQ is rejected and leaves the sequence empty
+// a restored sequence continues as one decoded directly: the same next token gives the same logits
+static bool continues_as(llama_context * restored, llama_seq_id seq_restored, llama_context * reference, llama_seq_id seq_reference,
+                         llama_token token, llama_pos pos, double threshold, const std::string & what) {
+    if (!decode_one(restored, token, pos, seq_restored) || !decode_one(reference, token, pos, seq_reference)) {
+        TLOG_ERR("%s: %s: failed to decode after the restore\n", __func__, what.c_str());
+        return false;
+    }
+
+    const float * logits     = llama_get_logits(restored);
+    const float * logits_ref = llama_get_logits(reference);
+    if (!logits || !logits_ref) {
+        TLOG_ERR("%s: %s: missing logits after the restore\n", __func__, what.c_str());
+        return false;
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(restored)));
+
+    const logits_diff diff = compare_logits(logits, logits_ref, n_vocab);
+    if (diff.nmse() > threshold) {
+        TLOG_ERR("%s: %s: the logits differ from the reference: nmse %g\n", __func__, what.c_str(), diff.nmse());
+        return false;
+    }
+
+    return true;
+}
+
+// a sequence saved from a per-sequence cache restores into a unified one next to a live sequence, and back; the round trip saves back byte for byte
+// edited, invalid and truncated states are rejected, and no restore into seq 0 changes seq 1
 struct case_state_stream_count : ctx_test {
     const char * name() const override { return "streams"; }
 
     const char * description() const override {
-        return "a sequence restores across a change of kv_unified, in both directions, and an invalid stream count is rejected";
+        return "a sequence restores across a change of kv_unified, in both directions, next to another sequence, and bad states are rejected";
     }
 
     case_result run(model_run & mr) const override {
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
 
-        // a per-sequence cache reserves over n_seq_max streams and a one-sequence decode uses one, which
-        // changes the metal graph order and re-reserves there: on metal those contexts skip the realloc check
+        // metal re-reserves a per-sequence cache when a one-sequence decode changes the graph order, so those contexts skip the realloc check
         const bool metal = has_metal_backend();
 
-        // the cells restored into the unified cache come from a prompt decoded in the per-sequence layout, and the
-        // two layouts agree only up to rounding on some backends (vulkan without flash attention): that comparison
-        // gets a looser bound, and the byte-exact round trip below checks the restored cells themselves
+        // the unified restore takes cells decoded in the per-sequence layout, which differs by rounding on some backends (vulkan without flash attention)
+        // the byte-exact round trip below checks the restored cells themselves
         const double nmse_threshold_layout = 1e-3;
 
         const auto make = [&](int kv_unified) {
@@ -856,52 +876,109 @@ struct case_state_stream_count : ctx_test {
 
         llama_context_ptr split       = make(0);
         llama_context_ptr split_back  = make(0);
-        llama_context_ptr split_ref   = make(0);
         llama_context_ptr unified     = make(1);
         llama_context_ptr unified_ref = make(1);
-        if (!split || !split_back || !split_ref || !unified || !unified_ref) {
+        if (!split || !split_back || !unified || !unified_ref) {
             return case_result::fail();
         }
 
         const llama_pos n_tokens = (llama_pos) std::min<size_t>(64, mr.tokens.size());
 
-        if (!decode_seq(split.get(),       mr.tokens, 0, n_tokens, 1, true) ||
-            !decode_seq(split_ref.get(),   mr.tokens, 0, n_tokens, 1, true) ||
-            !decode_seq(unified_ref.get(), mr.tokens, 0, n_tokens, 0, true)) {
+        // seq 1 of both unified contexts is a neighbour with other tokens than the restored sequence, so a restore that writes over it shows
+        llama_tokens tokens_neighbour(n_tokens);
+        for (llama_pos pos = 0; pos < n_tokens; ++pos) {
+            tokens_neighbour[pos] = gen_token(n_vocab, 1, pos);
+        }
+
+        if (!decode_seq(split.get(),       mr.tokens,        0, n_tokens, 1, true) ||
+            !decode_seq(unified.get(),     tokens_neighbour, 0, n_tokens, 1, true) ||
+            !decode_seq(unified_ref.get(), tokens_neighbour, 0, n_tokens, 1, true) ||
+            !decode_seq(unified_ref.get(), mr.tokens,        0, n_tokens, 0, true)) {
             TLOG_ERR("%s: failed to decode the prompt\n", __func__);
             return case_result::fail();
         }
 
         std::vector<uint8_t> state_split;
-        if (!get_seq_state(split.get(), 1, LLAMA_STATE_SEQ_FLAGS_NONE, state_split)) {
+        std::vector<uint8_t> state_neighbour;
+        if (!get_seq_state(split.get(),   1, LLAMA_STATE_SEQ_FLAGS_NONE, state_split) ||
+            !get_seq_state(unified.get(), 1, LLAMA_STATE_SEQ_FLAGS_NONE, state_neighbour)) {
             return case_result::fail();
         }
 
-        // a stream count no writer produces is rejected, and leaves the sequence empty
-        // the sequence state starts with a magic and the seq id; where a KV cache comes first, its stream count follows
-        // DSV4 (its own magic) and recurrent caches (a cell count) start otherwise, so they skip this check
-        // called directly rather than through set_seq_state, which logs the expected failure as an error
+        std::vector<uint8_t> state;
+
+        const auto neighbour_kept = [&]() {
+            return get_seq_state(unified.get(), 1, LLAMA_STATE_SEQ_FLAGS_NONE, state) && blobs_equal(state_neighbour, state);
+        };
+
+        // where a KV cache comes first, the sequence state holds a magic, the seq id, the stream count, then each stream's cell count and cells
+        // seq 1 of the per-sequence cache is in saved stream 1, so stream 0 is empty; DSV4 (its own magic) and recurrent caches skip these checks
         const size_t n_stream_offset = 2*sizeof(uint32_t);
-        uint32_t n_stream_saved = 0;
-        if (state_split.size() >= n_stream_offset + sizeof(n_stream_saved)) {
-            memcpy(&n_stream_saved, state_split.data() + n_stream_offset, sizeof(n_stream_saved));
+        const size_t stream_0_offset = n_stream_offset + sizeof(uint32_t);
+        const size_t stream_1_offset = stream_0_offset + sizeof(uint32_t);
+
+        uint32_t n_stream_saved  = 0;
+        uint32_t n_cells_saved_0 = 0;
+        if (state_split.size() > stream_1_offset) {
+            memcpy(&n_stream_saved,  state_split.data() + n_stream_offset, sizeof(n_stream_saved));
+            memcpy(&n_cells_saved_0, state_split.data() + stream_0_offset, sizeof(n_cells_saved_0));
         }
-        if (n_stream_saved == 2) {
-            for (const uint32_t n_stream_bad : { 0u, 0xffffffffu }) {
+
+        if (n_stream_saved == 2 && n_cells_saved_0 == 0) {
+            // called directly rather than through set_seq_state, which logs the expected failures as errors
+            const auto rejected = [&](const std::vector<uint8_t> & state_bad) {
+                return llama_state_seq_set_data_ext(unified.get(), state_bad.data(), state_bad.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) == 0;
+            };
+
+            std::vector<uint8_t> state_empty;
+            if (!get_seq_state(unified.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state_empty)) {
+                return case_result::fail();
+            }
+
+            // seq 1's cells in both saved streams: the first is restored, the second is rejected, and the first is cleared again
+            // what follows the first copy starts with a non-zero count (the second copy's, or the next cache's), so the rejection comes before it is read
+            std::vector<uint8_t> state_spans(state_split.begin(), state_split.begin() + stream_0_offset);
+            state_spans.insert(state_spans.end(), state_split.begin() + stream_1_offset, state_split.end());
+            state_spans.insert(state_spans.end(), state_split.begin() + stream_1_offset, state_split.end());
+
+            CTX_REQUIRE(rejected(state_spans), "a sequence state spanning two saved streams was not rejected");
+            CTX_REQUIRE(get_seq_state(unified.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state) && blobs_equal(state_empty, state),
+                    "a sequence state rejected after one of its streams was restored left cells in seq 0");
+            CTX_REQUIRE(neighbour_kept(), "a sequence state spanning two saved streams changed seq 1");
+
+            // seq 0 holds the prompt, so a rejection shows whether it keeps the sequence or clears it
+            std::vector<uint8_t> state_seed;
+            if (!decode_seq(unified.get(), mr.tokens, 0, n_tokens, 0, true) ||
+                !get_seq_state(unified.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state_seed)) {
+                TLOG_ERR("%s: failed to decode the prompt into seq 0\n", __func__);
+                return case_result::fail();
+            }
+
+            // a stream count no writer produces is rejected before any cell is read: seq 0 is kept, or cleared by a cache that rolls back a failed restore
+            for (const uint32_t n_stream_bad : { 0u, (uint32_t) llama_max_parallel_sequences() + 1 }) {
                 std::vector<uint8_t> state_bad = state_split;
                 memcpy(state_bad.data() + n_stream_offset, &n_stream_bad, sizeof(n_stream_bad));
 
-                CTX_REQUIRE(llama_state_seq_set_data_ext(unified.get(), state_bad.data(), state_bad.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) == 0,
-                        "a sequence state with " + std::to_string(n_stream_bad) + " streams was not rejected");
-                CTX_REQUIRE(llama_memory_seq_pos_max(llama_get_memory(unified.get()), 0) == -1,
-                        "a rejected sequence state left cells behind");
+                const std::string what = "a sequence state with " + std::to_string(n_stream_bad) + " streams";
+
+                CTX_REQUIRE(rejected(state_bad), what + " was not rejected");
+                CTX_REQUIRE(get_seq_state(unified.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state) && (state == state_seed || blobs_equal(state_empty, state)),
+                        what + " left seq 0 neither kept nor empty");
+                CTX_REQUIRE(neighbour_kept(), what + " changed seq 1");
             }
+
+            // a state cut short fails on its last read
+            const std::vector<uint8_t> state_cut(state_split.begin(), state_split.end() - 1);
+
+            CTX_REQUIRE(rejected(state_cut), "a truncated sequence state was not rejected");
+            CTX_REQUIRE(neighbour_kept(), "a truncated sequence state changed seq 1");
         } else {
-            TLOG_INF("%s: the sequence state does not start with a KV stream count, skipping the invalid-count check\n", __func__);
+            TLOG_INF("%s: the sequence state does not start with a KV stream count, skipping the edited states\n", __func__);
         }
 
         CTX_REQUIRE(set_seq_state(unified.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state_split),
                 "a per-sequence state did not restore into a unified cache");
+        CTX_REQUIRE(neighbour_kept(), "the restore into seq 0 changed seq 1");
 
         std::vector<uint8_t> state_unified;
         if (!get_seq_state(unified.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state_unified)) {
@@ -916,47 +993,24 @@ struct case_state_stream_count : ctx_test {
         if (!get_seq_state(split_back.get(), 1, LLAMA_STATE_SEQ_FLAGS_NONE, state_back)) {
             return case_result::fail();
         }
-        CTX_REQUIRE(state_back == state_split, "the round trip through a unified cache changed the sequence state");
+        CTX_REQUIRE(blobs_equal(state_split, state_back), "the round trip through a unified cache changed the sequence state");
 
         const llama_token token = gen_token(n_vocab, 1, n_tokens);
 
-        const auto continues_as = [&](llama_context * restored, llama_seq_id seq_restored,
-                                      llama_context * reference, llama_seq_id seq_reference, double threshold, const char * what) {
-            if (!decode_one(restored, token, n_tokens, seq_restored) || !decode_one(reference, token, n_tokens, seq_reference)) {
-                TLOG_ERR("%s: %s: failed to decode after the restore\n", __func__, what);
-                return false;
-            }
-
-            const float * logits     = llama_get_logits(restored);
-            const float * logits_ref = llama_get_logits(reference);
-            if (!logits || !logits_ref) {
-                TLOG_ERR("%s: %s: missing logits after the restore\n", __func__, what);
-                return false;
-            }
-
-            const logits_diff diff = compare_logits(logits, logits_ref, n_vocab);
-            if (diff.nmse() > threshold) {
-                TLOG_ERR("%s: %s: the logits differ from the reference: nmse %g\n", __func__, what, diff.nmse());
-                return false;
-            }
-
-            return true;
-        };
-
-        CTX_REQUIRE(continues_as(unified.get(), 0, unified_ref.get(), 0, nmse_threshold_layout, "per-sequence -> unified"),
+        // split still holds seq 1 as decoded, so it is the reference of split_back
+        CTX_REQUIRE(continues_as(unified.get(), 0, unified_ref.get(), 0, token, n_tokens, nmse_threshold_layout, "per-sequence -> unified"),
                 "the sequence restored into the unified cache does not continue as the reference");
-        CTX_REQUIRE(continues_as(split_back.get(), 1, split_ref.get(), 1, NMSE_THRESHOLD, "unified -> per-sequence"),
+        CTX_REQUIRE(continues_as(unified.get(), 1, unified_ref.get(), 1, token, n_tokens, NMSE_THRESHOLD, "neighbour"),
+                "the neighbour of the restored sequence does not continue as the reference");
+        CTX_REQUIRE(continues_as(split_back.get(), 1, split.get(), 1, token, n_tokens, NMSE_THRESHOLD, "unified -> per-sequence"),
                 "the sequence restored into the per-sequence cache does not continue as the reference");
 
         return case_result::pass();
     }
 };
 
-// a sequence restores across a change of n_seq_max, with kv_unified on and off: saved from seq 1 of a
-// cache with 2 sequences, restored into seq 3 of one with 4, and from there into seq 0 of one with 2
-// a per-sequence cache has one stream per sequence, so its stream count follows n_seq_max; a unified one
-// has one stream, except where the memory keeps per-sequence streams anyway (DSV4)
-// each restored sequence must continue exactly as one decoded directly in the same layout
+// a sequence restores across a change of n_seq_max, with kv_unified on and off: from seq 1 of 2 into seq 3 of 4, then into seq 0 of 2
+// the stream count follows n_seq_max without kv_unified, and with it for DSV4, which keeps one stream per sequence
 struct case_state_seq_max : ctx_test {
     const char * name() const override { return "seq-max"; }
 
@@ -1001,13 +1055,15 @@ struct case_state_seq_max : ctx_test {
                 return case_result::fail();
             }
 
+            const std::string prefix = "kv_unified " + std::to_string(kv_unified) + ": ";
+
             std::vector<uint8_t> state_two;
             if (!get_seq_state(two.get(), 1, LLAMA_STATE_SEQ_FLAGS_NONE, state_two)) {
                 return case_result::fail();
             }
 
             CTX_REQUIRE(set_seq_state(four.get(), 3, LLAMA_STATE_SEQ_FLAGS_NONE, state_two),
-                    "kv_unified " + std::to_string(kv_unified) + ": a state saved with n_seq_max 2 did not restore with n_seq_max 4");
+                    prefix + "a state saved with n_seq_max 2 did not restore with n_seq_max 4");
 
             std::vector<uint8_t> state_four;
             if (!get_seq_state(four.get(), 3, LLAMA_STATE_SEQ_FLAGS_NONE, state_four)) {
@@ -1015,35 +1071,37 @@ struct case_state_seq_max : ctx_test {
             }
 
             CTX_REQUIRE(set_seq_state(back.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state_four),
-                    "kv_unified " + std::to_string(kv_unified) + ": a state saved with n_seq_max 4 did not restore with n_seq_max 2");
+                    prefix + "a state saved with n_seq_max 4 did not restore with n_seq_max 2");
 
-            const auto continues_as = [&](llama_context * restored, llama_seq_id seq_restored,
-                                          llama_context * reference, llama_seq_id seq_reference, const char * what) {
-                if (!decode_one(restored, token, n_tokens, seq_restored) || !decode_one(reference, token, n_tokens, seq_reference)) {
-                    TLOG_ERR("%s: kv_unified %d: %s: failed to decode after the restore\n", __func__, kv_unified, what);
-                    return false;
+            CTX_REQUIRE(continues_as(four.get(), 3, four_ref.get(), 3, token, n_tokens, NMSE_THRESHOLD, prefix + "n_seq_max 2 -> 4"),
+                    prefix + "the sequence restored with n_seq_max 4 does not continue as the reference");
+            CTX_REQUIRE(continues_as(back.get(), 0, back_ref.get(), 0, token, n_tokens, NMSE_THRESHOLD, prefix + "n_seq_max 4 -> 2"),
+                    prefix + "the sequence restored with n_seq_max 2 does not continue as the reference");
+
+            // a whole-context state cannot change the stream count: only a single sequence moves between streams
+            // the state holds the arch name, then the memory; where a KV cache comes first, its stream count follows, and recurrent caches skip this
+            if (kv_unified == 0 && !llama_model_is_recurrent(mr.model)) {
+                std::vector<uint8_t> state_ctx(llama_state_get_size(two.get()));
+                if (llama_state_get_data(two.get(), state_ctx.data(), state_ctx.size()) != state_ctx.size()) {
+                    TLOG_ERR("%s: failed to save the context state\n", __func__);
+                    return case_result::fail();
                 }
 
-                const float * logits     = llama_get_logits(restored);
-                const float * logits_ref = llama_get_logits(reference);
-                if (!logits || !logits_ref) {
-                    TLOG_ERR("%s: kv_unified %d: %s: missing logits after the restore\n", __func__, kv_unified, what);
-                    return false;
+                uint32_t n_arch         = 0;
+                uint32_t n_stream_saved = 0;
+                if (state_ctx.size() >= sizeof(n_arch)) {
+                    memcpy(&n_arch, state_ctx.data(), sizeof(n_arch));
+                }
+                const size_t n_stream_offset = sizeof(n_arch) + n_arch;
+                if (state_ctx.size() >= n_stream_offset + sizeof(n_stream_saved)) {
+                    memcpy(&n_stream_saved, state_ctx.data() + n_stream_offset, sizeof(n_stream_saved));
                 }
 
-                const logits_diff diff = compare_logits(logits, logits_ref, n_vocab);
-                if (diff.nmse() > NMSE_THRESHOLD) {
-                    TLOG_ERR("%s: kv_unified %d: %s: the logits differ from the reference: nmse %g\n", __func__, kv_unified, what, diff.nmse());
-                    return false;
+                if (n_stream_saved == 2) {
+                    CTX_REQUIRE(llama_state_set_data(four.get(), state_ctx.data(), state_ctx.size()) == 0,
+                            "a whole-context state saved with n_seq_max 2 was not rejected with n_seq_max 4");
                 }
-
-                return true;
-            };
-
-            CTX_REQUIRE(continues_as(four.get(), 3, four_ref.get(), 3, "n_seq_max 2 -> 4"),
-                    "kv_unified " + std::to_string(kv_unified) + ": the sequence restored with n_seq_max 4 does not continue as the reference");
-            CTX_REQUIRE(continues_as(back.get(), 0, back_ref.get(), 0, "n_seq_max 4 -> 2"),
-                    "kv_unified " + std::to_string(kv_unified) + ": the sequence restored with n_seq_max 2 does not continue as the reference");
+            }
         }
 
         return case_result::pass();
