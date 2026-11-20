@@ -1,5 +1,7 @@
 // checks common_speculative_draft_mismatch, the header-only check that a DFlash/DSpark draft model or an external MTP
-// head fits the model, and that common_speculative_types_from_gguf reads a malformed block_count as no type
+// head fits the model, that common_speculative_types_from_gguf reads a malformed block_count as no type, and that a
+// type inferred from the draft model gets its default draft length
+#include "arg.h"
 #include "common.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -81,6 +83,15 @@ static std::string mismatch(common_speculative_type type, const std::string & dr
     params.speculative.types = { type };
     params.speculative.draft.mparams.path = draft;
     return common_speculative_draft_mismatch(params, tgt);
+}
+
+// the draft length after the models are resolved for a draft model given without --spec-type
+static std::string inferred_n_max(const std::string & draft) {
+    common_params params;
+    params.speculative.draft.mparams.path = draft;
+    common_models_handler handler = common_models_handler_init(params, LLAMA_EXAMPLE_SERVER);
+    common_models_handler_apply(handler, params);
+    return std::to_string(params.speculative.draft.n_max);
 }
 
 static int failures = 0;
@@ -218,6 +229,14 @@ int main() {
     });
     expect("the last block's nextn projection is MTP",
             mtp_types.size() == 1 && mtp_types[0] == MTP ? "mtp" : "other", "mtp");
+
+    const std::string dflash = write_gguf("test-sdm-dflash.gguf", [](gguf_context * gguf, ggml_context *) {
+        gguf_set_val_str(gguf, "general.architecture", "dflash");
+    });
+    expect("an inferred draft-dflash drafts n_max_dflash", inferred_n_max(dflash),
+            std::to_string(common_params_speculative_draft::n_max_dflash));
+    expect("an inferred draft-dspark keeps the default", inferred_n_max(draft),
+            std::to_string(common_params_speculative_draft{}.n_max));
 
     for (const auto & path : written) {
         std::remove(path.c_str());
