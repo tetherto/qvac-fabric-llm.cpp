@@ -21,7 +21,7 @@ bool check_dispatch() {
     out.op = GGML_OP_FLASH_ATTN_EXT;
     out.src[0] = &q;
     out.src[1] = &k;
-    ggml_flash_attn_ext_set_prec(&out, GGML_PREC_F32);
+    if (!ggml_prec_set_acc(&out, GGML_PREC_F32)) { return false; }
     const auto selected = [&](bool device = true) {
         return ggml_cuda_fattn_tile_use_f32_pv<128, 128, 1, false>(device, &out);
     };
@@ -35,9 +35,9 @@ bool check_dispatch() {
     q.ne[1] = 32;
     if (selected()) { return false; }
     q.ne[1] = 33;
-    ggml_flash_attn_ext_set_prec(&out, GGML_PREC_DEFAULT);
+    if (!ggml_prec_set_acc(&out, GGML_PREC_DEFAULT)) { return false; }
     if (selected()) { return false; }
-    ggml_flash_attn_ext_set_prec(&out, GGML_PREC_F32);
+    if (!ggml_prec_set_acc(&out, GGML_PREC_F32)) { return false; }
     out.src[3] = &other;
     if (selected()) { return false; }
     out.src[3] = nullptr;
@@ -139,7 +139,7 @@ bool run_graph(ggml_backend_t backend, ggml_context * ctx, const test_shape & sh
     auto * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, shape.keys, shape.heads, shape.batches);
     auto * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, shape.keys, shape.heads, shape.batches);
     auto * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(out, shape.precision);
+    if (!ggml_prec_set_acc(out, shape.precision)) { return false; }
     if (!ggml_backend_supports_op(backend, out)) {
         std::fprintf(stderr, "Selected backend does not support the test operation\n");
         return false;
