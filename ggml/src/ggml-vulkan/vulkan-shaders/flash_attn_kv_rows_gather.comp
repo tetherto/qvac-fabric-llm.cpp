@@ -1,0 +1,33 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// 16-bit K/V rows, 8 values per element
+layout (binding = 0) readonly buffer A {uvec4 data_a[];};
+layout (binding = 1) readonly buffer R {int data_rows[];};
+layout (binding = 2) writeonly buffer D {uvec4 data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint ne0;         // row size in elements
+    uint KV;          // list length
+    uint nb1;         // K/V row stride in elements
+    uint nb2;         // K/V head stride in elements
+    uint rows_stride; // list stride between slices
+} p;
+
+// For the flash attention over kv_rows lists: gathers the listed rows of each slice into a per-head contiguous
+// copy, dst[s][h][c] = src[h][rows[s, c]]. Workgroups: (columns, head, slice). Negative rows (list padding) read
+// row 0, the mask hides them.
+void main() {
+    const uint h = gl_WorkGroupID.y;
+    const uint s = gl_WorkGroupID.z;
+    const uint n = p.ne0 * p.KV;
+    const uint dst0 = (s * gl_NumWorkGroups.y + h) * n;
+
+    for (uint i = gl_GlobalInvocationID.x; i < n; i += gl_NumWorkGroups.x * gl_WorkGroupSize.x) {
+        const uint c = i / p.ne0;
+        const uint d = i % p.ne0;
+        const uint r = uint(max(data_rows[s * p.rows_stride + c], 0));
+        data_d[dst0 + i] = data_a[r * p.nb1 + h * p.nb2 + d];
+    }
+}

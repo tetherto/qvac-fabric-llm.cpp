@@ -27,7 +27,8 @@ void main() {
             const uint i11 = gid_z / p.ne12;
             const uint i12 = gid_z % p.ne12;
 
-            const uint i01 = data_b[get_boffset() + i10*p.nb10 + i11*p.nb11 + i12*p.nb12];
+            // negative rows (padding of the flash attention kv_rows lists) read row 0
+            const uint i01 = uint(max(int(data_b[get_boffset() + i10*p.nb10 + i11*p.nb11 + i12*p.nb12]), 0));
 
             const uint a_offset = get_aoffset() + i01*p.nb01 + i11*p.nb02 + i12*p.nb03;
             const uint d_offset = get_doffset() + i10*p.nb21 + i11*p.nb22 + i12*p.nb23;

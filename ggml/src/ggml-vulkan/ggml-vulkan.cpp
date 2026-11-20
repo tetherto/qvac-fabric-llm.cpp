@@ -4027,6 +4027,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, it.second, "fa_mask_opt", fa_mask_opt_len, fa_mask_opt_data, "main", 2, sizeof(vk_op_flash_attn_mask_opt_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, BrBc.first, BrBc.second}, 1, true, true, device->subgroup_size);
     }
 
+    ggml_vk_create_pipeline(device, device->pipeline_fa_kv_rows_blocks, "fa_kv_rows_blocks", fa_kv_rows_blocks_len, fa_kv_rows_blocks_data, "main", 2, sizeof(vk_op_flash_attn_kv_rows_blocks_push_constants), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fa_kv_rows_gather_f16, "fa_kv_rows_gather_f16", fa_kv_rows_gather_f16_len, fa_kv_rows_gather_f16_data, "main", 3, sizeof(vk_op_flash_attn_kv_rows_gather_push_constants), {256, 1, 1}, {}, 1);
+
     {
         // Large workgroup so the per-row KV scan parallelizes; capped to device limits.
         const uint32_t compact_max = std::min({1024u, device->properties.limits.maxComputeWorkGroupInvocations, device->properties.limits.maxComputeWorkGroupSize[0]});
@@ -10647,7 +10650,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint32_t HSK = nek0;
     const uint32_t HSV = nev0;
     uint32_t N = neq1;
-    const uint32_t KV = nek1;
+
+    // kv_rows: K/V hold all cache rows and are shared by the q slices, mask column c of slice iq3 reads K/V row
+    // kv_rows[c, iq3]; the kernels iterate over the mask columns
+    const ggml_tensor * kv_rows = dst->src[5];
+    const uint32_t KV = kv_rows ? (uint32_t)kv_rows->ne[0] : (uint32_t)nek1;
 
     GGML_ASSERT(ne0 == HSV);
     GGML_ASSERT(ne2 == N);
@@ -10725,14 +10732,23 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                  v->nb[1] != (uint64_t)HSV * ggml_type_size(v->type)) &&
                                 (HSK % 8) == 0 && (HSV % 8) == 0;
     const size_t kv_scratch_ts = kv_raw_strided ? ggml_type_size(k->type) : sizeof(ggml_fp16_t);
-    const uint64_t kv_scratch_sz = ((uint64_t)ggml_nelements(k) + (uint64_t)ggml_nelements(v)) * kv_scratch_ts;
+    // with kv_rows the pass gathers the listed rows of each slice instead, in f16: [HSK, KV, nek2, neq3]
+    const uint64_t k_nel_scratch = kv_rows ? (uint64_t)HSK * KV * nek2 * neq3 : (uint64_t)ggml_nelements(k);
+    const uint64_t v_nel_scratch = kv_rows ? (uint64_t)HSV * KV * nev2 * neq3 : (uint64_t)ggml_nelements(v);
+    // f16 rows are copied 16 bytes at a time, quantized rows are dequantized by get_rows
+    auto kv_rows_gather_ok = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F16 ? t->ne[0] % 8 == 0 && t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 :
+               ggml_is_quantized(t->type) && ctx->device->pipeline_get_rows[t->type] != nullptr;
+    };
+    const bool kv_scratch_src_ok = kv_rows ? kv_rows_gather_ok(k) && kv_rows_gather_ok(v) : is_dense_kv_cache(k) && is_dense_kv_cache(v);
+    const uint64_t kv_scratch_sz = (k_nel_scratch + v_nel_scratch) * kv_scratch_ts;
     static const char * fa_dequant_env = getenv("GGML_VK_FA_DEQUANT");
     const bool fa_dequant_off = fa_dequant_env && fa_dequant_env[0] == '0';
     const bool fa_dequant_on  = fa_dequant_env && fa_dequant_env[0] == '1';
     const bool use_dequant_kv = !fa_dequant_off && ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
-                                is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
-                                (uint64_t)ggml_nelements(k) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
-                                (uint64_t)ggml_nelements(v) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
+                                kv_scratch_src_ok &&
+                                k_nel_scratch * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
+                                v_nel_scratch * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (kv_raw_strided ||
                                  (ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
                                   ctx->device->pipeline_dequant_transpose[v->type] != nullptr)) &&
@@ -10788,7 +10804,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                (t->nb[1] | t->nb[2] | t->nb[3]) % (4 * sizeof(ggml_fp16_t)) == 0;
     };
     // TBQ/PQ FA modules decode K/V densely (no sparse gather), so they stay on the dense path.
-    const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask &&
+    const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask && !kv_rows &&
                             max_bias == 0.0f && logit_softcap == 0.0f &&
                             !ggml_is_tbq_or_pq(k_type_eff) && !ggml_is_tbq_or_pq(v_type_eff) &&
                             (tuning_params.path != FA_COOPMAT2 || (sparse_gather_aligned(k) && sparse_gather_aligned(v))) &&
@@ -10850,6 +10866,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint64_t vt_offset = use_dequant_kv ? kv_scratch_sz : 0;
     const bool vt_eligible = fa_vt_env != 0 && tuning_params.path == FA_COOPMAT1 && aligned && !tuning_params.shmem_staging &&
                              v_type_eff == GGML_TYPE_F16 && !use_sparse && gqa_ratio == 1 && neq1 >= 64 && nev3 == 1 &&
+                             // kv_rows: V^T is built from the gathered rows of the only slice
+                             (!kv_rows || (use_dequant_kv && neq3 == 1)) &&
                              (KV % 64) == 0 && (HSV % 64) == 0 && KV < 65536 * 64 &&
                              ctx->device->pipeline_dequant_f16_transpose_vt != nullptr &&
                              (use_dequant_kv || ((nbv1 % 8) == 0 && (nbv2 % 8) == 0)) &&
@@ -10914,6 +10932,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+    // kv_rows: the kernel reads K/V through the lists, unless the contiguize pass already gathered the rows of each slice
+    const bool kv_rows_in_shader = kv_rows && !use_dequant_kv;
+    if (kv_rows_in_shader) {
+        fa_pipeline_state.flags |= FA_FLAG_KV_ROWS;
+    }
     if (use_vt) {
         fa_pipeline_state.flags |= FA_FLAG_V_TRANSPOSED;
     }
@@ -10943,7 +10966,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     bool xe_fa_supported_platform =
         (ctx->device.get()->architecture == INTEL_XE2 && ctx->device.get()->properties.deviceID != 0xFD80 && ctx->device.get()->properties.deviceID != 0xFD81) ||
         (ctx->device.get()->architecture == INTEL_XE1 && ctx->device.get()->coopmat_support && ctx->device.get()->uma);
-    bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && q->nb[1] > q->nb[2] && k->nb[1] > k->nb[2] && v->nb[1] > v->nb[2] && mask != nullptr;
+    bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && q->nb[1] > q->nb[2] && k->nb[1] > k->nb[2] && v->nb[1] > v->nb[2] && mask != nullptr &&
+                                 kv_rows == nullptr;
     bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && (mask != nullptr && mask->type == GGML_TYPE_F16);
     std::pair<vk_pipeline, vk_pipeline> xe_fa_pipeline_dual_phases = { nullptr , nullptr };
     vk_pipeline xe_fa_pipeline = nullptr;
@@ -11106,6 +11130,23 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
     }
 
+    // kv_rows read in the kernel: the lists are copied into prealloc_y after the mask opt bits, followed by the first
+    // cache row of every KV block whose rows are consecutive (-1 otherwise), see flash_attn_kv_rows_blocks.comp
+    const uint32_t kv_rows_n_blocks = CEIL_DIV(KV, Bc);
+    const uint64_t kv_rows_scratch_offset = use_mask_opt ?
+        ROUNDUP_POW2(mask_opt_size, (uint64_t)ctx->device->properties.limits.minStorageBufferOffsetAlignment) : 0;
+    const uint64_t kv_rows_scratch_size = kv_rows_in_shader ? sizeof(int32_t) * ((uint64_t)KV + kv_rows_n_blocks) * neq3 : 0;
+    if (kv_rows_in_shader) {
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_fa_kv_rows_blocks, 1);
+        if (ctx->prealloc_size_y < kv_rows_scratch_offset + kv_rows_scratch_size) {
+            ctx->prealloc_size_y = kv_rows_scratch_offset + kv_rows_scratch_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_y_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+    }
+
     const uint32_t n_head_kv   = neq2;
     const uint32_t n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head_kv));
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
@@ -11118,16 +11159,18 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
-    vk_subbuffer sparse_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
-    if (use_mask_opt || use_sparse) {
+    // binding 7: the sparse index lists, or the kv_rows lists and block rows when the kernel reads K/V through them
+    vk_subbuffer sparse_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) :
+                              kv_rows_in_shader ? vk_subbuffer{ ctx->prealloc_y, kv_rows_scratch_offset, kv_rows_scratch_size } : q_buf;
+    if (use_mask_opt || use_sparse || kv_rows_in_shader) {
         // the mask opt bits and the sparse index list overwrite a matmul input converted into prealloc_y
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
     }
 
     if (use_dequant_kv) {
-        const uint64_t k_sz = (uint64_t)ggml_nelements(k) * kv_scratch_ts;
-        const uint64_t v_sz = (uint64_t)ggml_nelements(v) * kv_scratch_ts;
+        const uint64_t k_sz = k_nel_scratch * kv_scratch_ts;
+        const uint64_t v_sz = v_nel_scratch * kv_scratch_ts;
         // the V^T region after K and V is reserved here: growing prealloc_x after the dispatches below would
         // replace the buffer they wrote
         const uint64_t need = k_sz + v_sz + (use_vt ? vt_size : 0);
@@ -11139,7 +11182,44 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         vk_subbuffer v_dst = vk_subbuffer{ ctx->prealloc_x, k_sz, v_sz };
         const uint32_t k_nel = (uint32_t)ggml_nelements(k);
         const uint32_t v_nel = (uint32_t)ggml_nelements(v);
-        if (kv_raw_strided) {
+        if (kv_rows) {
+            // gather the rows listed for each slice in f16: dst[s][h][c] = src[h][kv_rows[c, s]], padding reads row 0
+            const vk_subbuffer rows_buf = ggml_vk_tensor_subbuffer(ctx, kv_rows);
+            const uint32_t n_slices = (uint32_t)neq3;
+            const uint32_t rows_stride = (uint32_t)(kv_rows->nb[1] / sizeof(int32_t));
+            const auto & wg_max = ctx->device->properties.limits.maxComputeWorkGroupCount;
+            auto gather = [&](const ggml_tensor * t, uint32_t hs, uint32_t nh, const vk_subbuffer & src, const vk_subbuffer & dst) {
+                if (t->type == GGML_TYPE_F16) {
+                    vk_pipeline pl = ctx->device->pipeline_fa_kv_rows_gather_f16;
+                    ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+                    const vk_op_flash_attn_kv_rows_gather_push_constants pc = {
+                        hs / 8, KV, (uint32_t)(t->nb[1] / 16), (uint32_t)(t->nb[2] / 16), rows_stride,
+                    };
+                    ggml_vk_dispatch_pipeline(ctx, subctx, pl, { src, rows_buf, dst }, pc,
+                        { std::min(hs / 8 * KV, wg_max[0] * 256), nh, n_slices });
+                } else {
+                    vk_pipeline pl = ctx->device->pipeline_get_rows[t->type];
+                    ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+                    const uint32_t ts = (uint32_t)ggml_type_size(t->type);
+                    vk_op_binary_push_constants pc{};
+                    pc.ne   = hs * KV * nh * n_slices;
+                    pc.ne00 = hs; pc.ne01 = (uint32_t)t->ne[1]; pc.ne02 = nh; pc.ne03 = 1;
+                    pc.nb00 = 1;  pc.nb01 = (uint32_t)(t->nb[1] / ts); pc.nb02 = (uint32_t)(t->nb[2] / ts); pc.nb03 = 0;
+                    // one list per slice, shared by the heads
+                    pc.ne10 = KV; pc.ne11 = nh; pc.ne12 = n_slices; pc.ne13 = 1;
+                    pc.nb10 = 1;  pc.nb11 = 0;  pc.nb12 = rows_stride; pc.nb13 = 0;
+                    pc.ne20 = hs; pc.ne21 = KV; pc.ne22 = nh; pc.ne23 = n_slices;
+                    pc.nb20 = 1;  pc.nb21 = hs; pc.nb22 = hs * KV; pc.nb23 = hs * KV * nh;
+                    ggml_vk_dispatch_pipeline(ctx, subctx, pl, { src, rows_buf, dst }, pc,
+                        { hs, std::min(KV, wg_max[1]), std::min(nh * n_slices, wg_max[2]) });
+                }
+            };
+            if (ctx->prealloc_x_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+            gather(k, HSK, (uint32_t)nek2, k_buf, k_dst);
+            gather(v, HSV, (uint32_t)nev2, v_buf, v_dst);
+        } else if (kv_raw_strided) {
             vk_pipeline cp_k = ggml_vk_get_cpy_pipeline(ctx, k, nullptr, k->type);
             vk_pipeline cp_v = ggml_vk_get_cpy_pipeline(ctx, v, nullptr, v->type);
             ggml_pipeline_request_descriptor_sets(ctx, cp_k, 1);
@@ -11239,6 +11319,17 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
+    if (kv_rows_in_shader)
+    {
+        const vk_op_flash_attn_kv_rows_blocks_push_constants kb_pc = {
+            KV, Bc, kv_rows_n_blocks, (uint32_t)neq3, (uint32_t)(kv_rows->nb[1] / sizeof(int32_t)),
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_fa_kv_rows_blocks,
+                                  { ggml_vk_tensor_subbuffer(ctx, kv_rows), sparse_buf }, kb_pc,
+                                  { kv_rows_n_blocks, (uint32_t)neq3, 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
     if (use_sparse)
     {
         const vk_op_flash_attn_sparse_compact_push_constants sc_pc = {
@@ -11257,11 +11348,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
+    // kv_rows gathered into the scratch: one K/V copy per slice
+    const uint32_t nek3_eff = kv_rows && use_dequant_kv ? (uint32_t)neq3 : (uint32_t)nek3;
+    const uint32_t nev3_eff = kv_rows && use_dequant_kv ? (uint32_t)neq3 : (uint32_t)nev3;
     const vk_flash_attn_push_constants pc = { N, KV,
                                               (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3,
                                               (uint32_t)neq2, (uint32_t)neq3,
-                                              (uint32_t)nek2, (uint32_t)nek3,
-                                              (uint32_t)nev2, (uint32_t)nev3,
+                                              (uint32_t)nek2, nek3_eff,
+                                              (uint32_t)nev2, nev3_eff,
                                               nem1, nem2, nem3,
                                               q_stride, (uint32_t)nbq2, (uint32_t)nbq3,
                                               k_stride, nbk2_eff, nbk3_eff,
@@ -11372,7 +11466,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (use_dequant_kv) {
         ctx->prealloc_x_need_sync = true;
     }
-    if (use_mask_opt || use_sparse) {
+    if (use_mask_opt || use_sparse || kv_rows_in_shader) {
         ctx->prealloc_y_need_sync = true;
     }
 }
@@ -20726,8 +20820,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
-                if (op->src[5] != nullptr) {
+                // K/V row lists (ggml_flash_attn_ext_rows): the TBQ/PQ modules read K/V only densely
+                if (op->src[5] != nullptr && (ggml_is_tbq_or_pq(op->src[1]->type) || ggml_is_tbq_or_pq(op->src[2]->type))) {
                     return false;
                 }
                 bool coopmat2 = device->coopmat2;

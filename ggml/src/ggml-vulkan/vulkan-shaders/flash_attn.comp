@@ -225,10 +225,10 @@ void main() {
                     uint32_t c = (idx + tid) % Bc;
                     uint32_t r = (idx + tid) / Bc;
                     if (idx + tid < Bc * Br) {
-                        uint32_t kcol;
-                        bool kv_active = fa_kv_index(j * Bc + c, kcol);
-                        if (kv_active && (!nem1_bounds_check || i * Br + r < p.nem1)) {
-                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + kcol]);
+                        uint32_t mcol;
+                        bool m_active = fa_mask_index(j * Bc + c, mcol);
+                        if (m_active && (!nem1_bounds_check || i * Br + r < p.nem1)) {
+                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + mcol]);
                             masksh[c * masksh_stride + r] = m;
                             max_mask = max(max_mask, float(m));
                         } else {
@@ -252,6 +252,10 @@ void main() {
             }
         }
 
+        if (USE_KV_ROWS) {
+            fa_kv_rows_tile(j);
+        }
+
         ACC_TYPE Sf[rows_per_thread][cols_per_thread];
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
@@ -268,7 +272,7 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= Bc * HSK / 4 || c < Bc) {
                     FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
                     uint32_t kcol;
-                    if (fa_kv_index(j * Bc + c, kcol)) {
+                    if (fa_kv_index_tile(j, c, kcol)) {
                         if (USE_DECODE_K) {
                             uint coord = kcol * k_stride * BLOCK_SIZE_K + 4 * d;
                             uint ib = coord / BLOCK_SIZE_K;
@@ -293,7 +297,7 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= quant_iters || c < Bc) {
                     const uint buf_ib = c * qf_stride + block;
                     uint32_t kcol;
-                    if (fa_kv_index(j * Bc + c, kcol)) {
+                    if (fa_kv_index_tile(j, c, kcol)) {
                         const uint global_ib = kcol * k_stride + block;
                         k_block_to_shmem(buf_ib, global_ib, iqs, k_offset);
                     } else {
@@ -317,7 +321,7 @@ void main() {
 
                 [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
                     uint32_t kcol;
-                    bool kv_active = fa_kv_index(j * Bc + c * cols_per_iter + col_tid, kcol);
+                    bool kv_active = fa_kv_index_tile(j, c * cols_per_iter + col_tid, kcol);
                     if (!kv_active) {
                         continue;
                     }
@@ -345,7 +349,7 @@ void main() {
             // Avoids codebook LUT lookup in the inner loop entirely.
             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
                 uint32_t kcol;
-                bool kv_active = fa_kv_index(j * Bc + c * cols_per_iter + col_tid, kcol);
+                bool kv_active = fa_kv_index_tile(j, c * cols_per_iter + col_tid, kcol);
                 if (!kv_active) {
                     continue;
                 }
@@ -381,7 +385,7 @@ void main() {
 #else
             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
                 uint32_t kcol;
-                bool kv_active = fa_kv_index(j * Bc + c * cols_per_iter + col_tid, kcol);
+                bool kv_active = fa_kv_index_tile(j, c * cols_per_iter + col_tid, kcol);
                 if (!kv_active) {
                     continue;
                 }
@@ -412,7 +416,7 @@ void main() {
 
         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
             uint32_t kcol;
-            if (!fa_kv_index(j * Bc + c * cols_per_iter + col_tid, kcol)) {
+            if (!fa_kv_index_tile(j, c * cols_per_iter + col_tid, kcol)) {
                 continue;
             }
 
@@ -536,7 +540,7 @@ void main() {
                 }
                 [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
                     uint32_t kv_col;
-                    if (!fa_kv_index(j * Bc + c * cols_per_iter + col_tid, kv_col)) continue;
+                    if (!fa_kv_index_tile(j, c * cols_per_iter + col_tid, kv_col)) continue;
                     uint32_t k_block = kv_col * k_stride + qjl_block;
                     Sf[r][c] += ACC_TYPE(p.scale * qjl_correction_k(k_block, k_offset, proj_q_sum, proj_q_v4));
                 }
@@ -597,7 +601,7 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV / 4 || c < Bc) {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
                     uint32_t vcol;
-                    if (fa_kv_index(j * Bc + c, vcol)) {
+                    if (fa_kv_index_tile(j, c, vcol)) {
                         if (USE_DECODE_V) {
                             uint coord = vcol * v_stride * BLOCK_SIZE_V + 4 * d;
                             uint ib = coord / BLOCK_SIZE_V;
@@ -616,7 +620,7 @@ void main() {
 
         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
             uint32_t vcol;
-            bool kv_active = fa_kv_index(j * Bc + c * cols_per_iter + col_tid, vcol);
+            bool kv_active = fa_kv_index_tile(j, c * cols_per_iter + col_tid, vcol);
             if (!kv_active) {
                 continue;
             }
