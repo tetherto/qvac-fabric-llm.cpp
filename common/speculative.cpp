@@ -2947,6 +2947,7 @@ int32_t common_speculative_n_max(const common_speculative * spec) {
 }
 
 void common_speculative_set_default_n_max(common_params_speculative & spec) {
+    // draft-dspark keeps the generic default: its draft length has not been measured
     const bool is_dflash = std::find(spec.types.begin(), spec.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != spec.types.end();
     if (is_dflash && !spec.draft.n_max_explicit) {
         spec.draft.n_max = common_params_speculative_draft::n_max_dflash;
