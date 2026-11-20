@@ -176,6 +176,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
+    /*.op               =*/ LLM_FUSED_OP_TOP_K_MASK,
+    /*.name             =*/ "fused top-k mask",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -365,6 +371,10 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
 
+    // only the indexer models build this mask, skip the probe for the others
+    cparams.fused_top_k_mask = true;
+    cparams.auto_ftkm        = hparams.indexer_top_k > 0;
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
@@ -403,9 +413,14 @@ llama_context::llama_context(
     {
         cparams.fused_kv_rows = false;
 
+        // a one-sequence cache has a single stream like a unified one. qwen4exp attends only through the QSA row
+        // lists, which read the selected cells instead of the whole cache, so it takes them there too. a dense model
+        // would read its whole sequence through the list, so it keeps the dense mask
+        const bool sparse_rows_only = model.arch == LLM_ARCH_QWEN4EXP && hparams.indexer_kpool > 0;
+
         const char * LLAMA_KV_ROWS_DISABLE = getenv("LLAMA_KV_ROWS_DISABLE");
         if (!LLAMA_KV_ROWS_DISABLE) {
-            cparams.auto_fkvr = cparams.kv_unified;
+            cparams.auto_fkvr = cparams.kv_unified || (sparse_rows_only && cparams.n_seq_max == 1);
         } else {
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;
@@ -752,6 +767,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
+    }
+
+    if (cparams.auto_ftkm) {
+        LLAMA_LOG_INFO("%s: resolving fused top-k mask support:\n", func);
+        resolve(llm_fused_op_top_k_mask_probe, cparams.fused_top_k_mask);
+        cparams.auto_ftkm = false;
     }
 }
 

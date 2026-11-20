@@ -90,6 +90,7 @@
 #include "ggml-cuda/sigmoid-back.cuh"
 #include "ggml-cuda/ssm-conv-back.cuh"
 #include "ggml-cuda/nvrtc-fusion.cuh"
+#include "ggml-cuda/top-k-mask.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -3596,6 +3597,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context &          ctx,
             break;
         case GGML_OP_SIGMOID_BACK:
             ggml_cuda_op_sigmoid_back(ctx, dst);
+            break;
+        case GGML_OP_TOP_K_MASK:
+            ggml_cuda_op_top_k_mask(ctx, dst);
+            break;
+        case GGML_OP_TOP_K_ROWS:
+            ggml_cuda_op_top_k_rows(ctx, dst);
             break;
         default:
             return false;
@@ -8360,6 +8367,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    ggml_is_contiguous(op) &&
                    ggml_are_same_shape(op, op->src[0]) &&
                    ggml_are_same_shape(op, op->src[1]);
+        case GGML_OP_TOP_K_MASK:
+            return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_TOP_K_ROWS:
+            return op->type == GGML_TYPE_I32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+
         default:
             return false;
     }

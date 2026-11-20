@@ -254,6 +254,12 @@ typedef __hip_fp8_e4m3 __nv_fp8_e4m3;
 #define FP8_AVAILABLE
 #endif // HIP_VERSION >= 60300000
 
+// from ggml-org/llama.cpp#31259: the radix top-k and the QSA row lists use __ballot_sync,
+// which the HIP headers lack before 7.0 with HIP_DISABLE_WARP_SYNC_BUILTINS
+#if HIP_VERSION < 70000000
+#define __ballot_sync(mask, var) __ballot(var)
+#endif // HIP_VERSION < 70000000
+
 typedef int8_t int8x4_t __attribute__((ext_vector_type(4)));
 typedef uint8_t uint8x4_t __attribute__((ext_vector_type(4)));
 static __device__ __forceinline__ int __vsubss4(const int a, const int b) {
