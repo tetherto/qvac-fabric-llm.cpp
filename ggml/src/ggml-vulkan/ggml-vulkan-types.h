@@ -447,6 +447,7 @@ static constexpr uint32_t FA_FLAG_MULTI_ROW    = 128;   // host only: build the 
 static constexpr uint32_t FA_FLAG_MR_LAZY      = 256;   // multi-row: skip identity O rescales
 static constexpr uint32_t FA_FLAG_MR_NOEB      = 512;   // multi-row: no loop-end barrier
 static constexpr uint32_t FA_FLAG_MR_VPOST     = 1024;  // multi-row: V^T loads before the softmax barrier
+static constexpr uint32_t FA_FLAG_KV_ROWS      = 2048;  // K/V rows are read through the kv_rows lists (binding 7)
 
 struct vk_fa_pipeline_state {
     uint32_t HSK, HSV;
@@ -1142,6 +1143,8 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_fa_sparse_compact;
     vk_pipeline pipeline_fa_sparse_compact_subgroup;
+    vk_pipeline pipeline_fa_kv_rows_blocks;
+    vk_pipeline pipeline_fa_kv_rows_gather_f16;
     bool fa_sparse_compact_use_subgroups;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
