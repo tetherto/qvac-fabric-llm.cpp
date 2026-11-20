@@ -101,9 +101,26 @@ jobs:
             -DGGML_WEBGPU=ON \
             -DGGML_OPENMP=OFF \
             -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_WASM_MEM64=OFF \
             -DEMDAWNWEBGPU_DIR=emdawnwebgpu_pkg
 
-          time cmake --build build-wasm --config Release --target test-backend-ops llama-bench -j $(nproc)
+          time cmake --build build-wasm --config Release --target test-backend-ops test-log llama-bench -j $(nproc)
+          "$EMSDK_NODE" --experimental-wasm-jspi build-wasm/bin/test-log.js
+
+      - name: Build WASM Memory64
+        run: |
+          source emsdk/emsdk_env.sh
+          emcmake cmake -B build-wasm64 \
+            -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_WEBGPU=ON \
+            -DGGML_OPENMP=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_WASM_MEM64=ON \
+            -DEMDAWNWEBGPU_DIR=emdawnwebgpu_pkg
+
+          time cmake --build build-wasm64 --config Release --target test-backend-ops test-log llama-bench -j $(nproc)
+          "$EMSDK_NODE" --experimental-wasm-jspi build-wasm64/bin/test-log.js
 
       - name: ccache-buckets-save
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
