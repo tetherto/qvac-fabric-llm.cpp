@@ -510,7 +510,7 @@ struct case_state_restore_failure : ctx_test {
 // leave the earlier ones restored: the sequence ends up either untouched or empty in every part
 // - decode A on seq 0 and save its full and partial states
 // - decode B, a prefix of A, on seq 0 instead
-// - restore each state of A cut off so that it fails after a part the restore went through
+// - restore each state of A cut off so that it fails partway: where its partial parts begin, on its first read, and on its last read
 struct case_state_restore_failure_part : ctx_test {
     const char * name() const override { return "rf_part"; }
 
@@ -577,6 +577,13 @@ struct case_state_restore_failure_part : ctx_test {
         // the parts only the full state holds are skipped, so the first part read fails
         if (partial_a.size() > n_header) {
             sub_cases.push_back({ "partial", LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &partial_a, n_header });
+        }
+
+        // the full state cut after the header fails on the first read, while every part still holds B
+        // cut one byte short, it fails on the last read, after every earlier part was restored; neither depends on where the parts begin
+        if (full_a.size() > n_header + 1) {
+            sub_cases.push_back({ "full, first read", LLAMA_STATE_SEQ_FLAGS_NONE, &full_a, n_header });
+            sub_cases.push_back({ "full, last read",  LLAMA_STATE_SEQ_FLAGS_NONE, &full_a, full_a.size() - 1 });
         }
 
         // seq 1 is never used
