@@ -2546,8 +2546,7 @@ const slot_info_vec_t *   sinfos_in) {
         throw std::runtime_error("failed to restore kv cache: invalid stream count");
     }
 
-    // a single sequence saved with another stream count (kv_unified or n_seq_max changed) holds its
-    // cells in at most one saved stream, which is restored into the sequence's own stream
+    // one sequence saved with another stream count (kv_unified or n_seq_max changed) has its cells in at most one saved stream, restored into its own stream
     const bool remap = n_stream_cur != n_stream;
     if (remap && seq_id == -1) {
         throw std::runtime_error("failed to restore kv cache: n_stream mismatch (only a single-sequence restore can change the stream count)");
