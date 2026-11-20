@@ -14,6 +14,10 @@
 #include <vector>
 #include <algorithm>
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#    define COMMON_LOG_SYNC
+#endif
+
 int common_log_verbosity_thold = LOG_DEFAULT_LLAMA;
 
 int common_log_get_verbosity_thold(void) {
@@ -211,6 +215,9 @@ private:
     std::vector<common_log_entry> queue;
     size_t head;
     size_t tail;
+#ifdef COMMON_LOG_SYNC
+    bool flushing{ false };
+#endif
 
     bool print_entry(const common_log_entry & e, ggml_log_callback cb, void * cb_user_data) const {
         if (e.is_end) return true;
@@ -241,7 +248,31 @@ private:
     ggml_log_callback callback;
     void * callback_user_data;
 
-public:
+    void notify_or_print(std::unique_lock<std::mutex> & lock) {
+#ifdef COMMON_LOG_SYNC
+        if (flushing) {
+            return;
+        }
+
+        flushing = true;
+        while (!is_empty()) {
+            common_log_entry entry         = queue[head];
+            head                           = (head + 1) % queue.size();
+            ggml_log_callback cb           = callback;
+            void *            cb_user_data = callback_user_data;
+            cv_full.notify_all();
+            lock.unlock();
+            print_entry(entry, cb, cb_user_data);
+            lock.lock();
+        }
+        flushing = false;
+#else
+        GGML_UNUSED(lock);
+        cv_new.notify_one();
+#endif
+    }
+
+  public:
     bool is_full() const {
         return ((tail + 1) % queue.size()) == head;
     }
@@ -307,7 +338,7 @@ public:
         }
 
         tail = (tail + 1) % queue.size();
-        cv_new.notify_one();
+        notify_or_print(lock);
     }
 
     void add_json(const char * type, const common_json & obj) {
@@ -343,7 +374,7 @@ public:
         entry.timestamp = 0;
 
         tail = (tail + 1) % queue.size();
-        cv_new.notify_one();
+        notify_or_print(lock);
     }
 
     void resume() {
@@ -355,6 +386,9 @@ public:
 
         running = true;
 
+#ifdef COMMON_LOG_SYNC
+        return;
+#else
         thrd = std::thread([this]() {
             while (true) {
                 std::unique_lock<std::mutex> lock(mtx);
@@ -380,9 +414,14 @@ public:
                 }
             }
         });
+#endif
     }
 
     void pause() {
+#ifdef COMMON_LOG_SYNC
+        std::lock_guard<std::mutex> lock(mtx);
+        running = false;
+#else
         {
             std::lock_guard<std::mutex> lock(mtx);
 
@@ -403,6 +442,7 @@ public:
         }
 
         thrd.join();
+#endif
     }
 
     void set_file(const char * path) {
