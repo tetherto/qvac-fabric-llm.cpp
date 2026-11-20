@@ -4540,9 +4540,54 @@ static void ggml_webgpu_init_scatter_write_pipeline(webgpu_global_context & ctx)
     ctx->set_tensor_n_pipeline = ggml_webgpu_create_pipeline(ctx->device, wgsl_set_tensor_n, "set_tensor_n", constants);
 }
 
-static void ggml_backend_webgpu_request_adapter(wgpu::Instance & instance, wgpu::Adapter & adapter) {
+// Dawn's Null backend accepts every feature and executes nothing, so a host
+// without a usable GPU would otherwise return invalid results.
+static bool ggml_webgpu_adapter_is_null_backend(const wgpu::Adapter & adapter) {
+    wgpu::AdapterInfo info;
+    adapter.GetInfo(&info);
+    return info.backendType == wgpu::BackendType::Null;
+}
+
+static bool ggml_webgpu_adapter_is_compatible(const wgpu::Adapter & adapter) {
+    if (ggml_webgpu_adapter_is_null_backend(adapter)) {
+        GGML_LOG_WARN("ggml_webgpu: skipping Dawn's Null adapter\n");
+        return false;
+    }
+    if (!adapter.HasFeature(wgpu::FeatureName::ShaderF16)) {
+        GGML_LOG_WARN("ggml_webgpu: skipping adapter without shader-f16\n");
+#ifdef __EMSCRIPTEN__
+        GGML_LOG_WARN(
+            "ggml_webgpu: on affected Chromium NVIDIA/Vulkan configurations, try "
+            "--enable-dawn-features=vulkan_enable_f16_on_nvidia\n");
+#endif
+        return false;
+    }
+#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+    if (!adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)) {
+        GGML_LOG_WARN("ggml_webgpu: skipping adapter without implicit device synchronization\n");
+        return false;
+    }
+#endif
+    return true;
+}
+
+static bool ggml_webgpu_adapters_are_same(const wgpu::Adapter & first, const wgpu::Adapter & second) {
+    wgpu::AdapterInfo first_info;
+    wgpu::AdapterInfo second_info;
+    first.GetInfo(&first_info);
+    second.GetInfo(&second_info);
+    return first_info.backendType == second_info.backendType && first_info.vendorID == second_info.vendorID &&
+           first_info.deviceID == second_info.deviceID &&
+           std::string(first_info.vendor) == std::string(second_info.vendor) &&
+           std::string(first_info.architecture) == std::string(second_info.architecture) &&
+           std::string(first_info.device) == std::string(second_info.device) &&
+           std::string(first_info.description) == std::string(second_info.description);
+}
+
+static std::string ggml_backend_webgpu_request_adapter(wgpu::Instance & instance, wgpu::Adapter & adapter) {
     wgpu::RequestAdapterOptions options = {};
-    options.powerPreference             = wgpu::PowerPreference::HighPerformance;
+    std::string                 last_failure;
+    wgpu::Adapter               rejected_adapter;
 
 #if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
     // TODO: track need for these toggles: https://issues.chromium.org/issues/42251215
@@ -4553,21 +4598,40 @@ static void ggml_backend_webgpu_request_adapter(wgpu::Instance & instance, wgpu:
     options.nextInChain                   = &adapterTogglesDesc;
 #endif
 
-    instance.WaitAny(
-        instance.RequestAdapter(
-            &options, wgpu::CallbackMode::AllowSpontaneous,
-            [&adapter](wgpu::RequestAdapterStatus status, wgpu::Adapter _adapter, wgpu::StringView message) {
-                if (status != wgpu::RequestAdapterStatus::Success) {
-                    GGML_LOG_ERROR("ggml_webgpu: Failed to get an adapter: %s\n", std::string(message).c_str());
-                    return;
-                }
-                adapter = std::move(_adapter);
-            }),
-        UINT64_MAX);
+    const wgpu::PowerPreference preferences[] = {
+        wgpu::PowerPreference::HighPerformance,
+        wgpu::PowerPreference::LowPower,
+    };
+    for (wgpu::PowerPreference preference : preferences) {
+        options.powerPreference = preference;
+        wgpu::Adapter candidate;
+        instance.WaitAny(
+            instance.RequestAdapter(&options, wgpu::CallbackMode::AllowSpontaneous,
+                                    [&candidate, &last_failure](wgpu::RequestAdapterStatus status,
+                                                                wgpu::Adapter requested, wgpu::StringView message) {
+                                        if (status != wgpu::RequestAdapterStatus::Success) {
+                                            last_failure = std::string(message);
+                                            return;
+                                        }
+                                        candidate = std::move(requested);
+                                    }),
+            UINT64_MAX);
+        if (candidate != nullptr) {
+            last_failure.clear();
+            if (rejected_adapter != nullptr && ggml_webgpu_adapters_are_same(candidate, rejected_adapter)) {
+                continue;
+            }
+            if (ggml_webgpu_adapter_is_compatible(candidate)) {
+                adapter = std::move(candidate);
+                return {};
+            }
+            rejected_adapter = std::move(candidate);
+        }
+    }
+    return last_failure;
 }
 
 static void create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
-    ggml_backend_webgpu_request_adapter(ctx->webgpu_global_ctx->instance, ctx->webgpu_global_ctx->adapter);
     GGML_ASSERT(ctx->webgpu_global_ctx->adapter != nullptr);
 
     ctx->webgpu_global_ctx->adapter.GetLimits(&ctx->webgpu_global_ctx->capabilities.limits);
@@ -5323,15 +5387,6 @@ static const struct ggml_backend_reg_i ggml_backend_webgpu_reg_i = {
 
 /* End GGML Backend Registration Interface */
 
-// Dawn's Null backend accepts every feature and executes nothing, so a host
-// without a usable GPU would otherwise "run" inference on it and return
-// garbage instead of falling back to the CPU backend.
-static bool ggml_webgpu_adapter_is_null_backend(const wgpu::Adapter & adapter) {
-    wgpu::AdapterInfo info;
-    adapter.GetInfo(&info);
-    return info.backendType == wgpu::BackendType::Null;
-}
-
 ggml_backend_reg_t ggml_backend_webgpu_reg() {
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_reg()");
 
@@ -5371,28 +5426,19 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
     ctx->webgpu_global_ctx           = webgpu_global_context(new webgpu_global_context_struct());
     ctx->webgpu_global_ctx->instance = std::move(inst);
 
-    // Probe for adapter support
-    wgpu::Adapter adapter;
+    wgpu::Adapter & adapter = ctx->webgpu_global_ctx->adapter;
+    std::string     adapter_failure;
     if (ctx->webgpu_global_ctx->instance != nullptr) {
-        ggml_backend_webgpu_request_adapter(ctx->webgpu_global_ctx->instance, adapter);
+        adapter_failure = ggml_backend_webgpu_request_adapter(ctx->webgpu_global_ctx->instance, adapter);
     }
 
-    // WebGPU backend requires f16 support and, on native, implicit device synchronization.
     if (adapter == nullptr) {
-        GGML_LOG_WARN("ggml_webgpu: no adapter available, backend disabled\n");
-    } else if (ggml_webgpu_adapter_is_null_backend(adapter)) {
-        GGML_LOG_WARN("ggml_webgpu: only Dawn's Null adapter is available (no usable GPU), backend disabled\n");
-    } else if (!adapter.HasFeature(wgpu::FeatureName::ShaderF16)) {
-        GGML_LOG_WARN("ggml_webgpu: adapter lacks shader-f16, backend disabled\n");
-#ifdef __EMSCRIPTEN__
-        GGML_LOG_WARN(
-            "ggml_webgpu: on affected Chromium NVIDIA/Vulkan configurations, try "
-            "--enable-dawn-features=vulkan_enable_f16_on_nvidia\n");
-#endif
-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
-    } else if (!adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)) {
-        GGML_LOG_WARN("ggml_webgpu: adapter lacks implicit device synchronization, backend disabled\n");
-#endif
+        if (adapter_failure.empty()) {
+            GGML_LOG_WARN("ggml_webgpu: no compatible adapter available, backend disabled\n");
+        } else {
+            GGML_LOG_WARN("ggml_webgpu: no compatible adapter available, backend disabled: %s\n",
+                          adapter_failure.c_str());
+        }
     } else {
         ctx->device_count = 1;
     }

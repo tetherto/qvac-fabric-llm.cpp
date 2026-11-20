@@ -51,8 +51,8 @@ int common_log_get_verbosity(enum ggml_log_level level);
 
 void common_log_default_callback(enum ggml_log_level level, const char * text, void * user_data);
 
-// the common_log uses an internal worker thread to print/write log messages
-// when the worker thread is paused, incoming log messages are discarded
+// common_log uses a worker thread when threads are available and writes synchronously otherwise
+// when logging is paused, incoming log messages are discarded
 struct common_log;
 
 struct common_log * common_log_init();
@@ -61,8 +61,8 @@ struct common_log * common_log_init();
 // Call common_log_flush() before exit if you want to ensure all logs are flushed.
 struct common_log * common_log_main();
 
-void                common_log_pause (struct common_log * log); // pause  the worker thread, not thread-safe
-void                common_log_resume(struct common_log * log); // resume the worker thread, not thread-safe
+void                common_log_pause(struct common_log * log);   // pause  logging, not thread-safe
+void                common_log_resume(struct common_log * log);  // resume logging, not thread-safe
 void                common_log_free  (struct common_log * log);
 
 LOG_ATTRIBUTE_FORMAT(3, 4)
@@ -101,7 +101,7 @@ void common_log_flush         (struct common_log * log);                    // f
 
 // set a custom callback to handle log messages instead of printing to stdout/stderr
 // if callback is NULL, reverts to default printing behavior
-// note: the callback will be called from the worker thread
+// the callback runs on the worker thread when available, otherwise on the calling thread
 void common_log_set_callback(struct common_log * log, ggml_log_callback callback, void * user_data); // not thread-safe
 
 // helper macros for logging

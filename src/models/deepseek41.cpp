@@ -551,7 +551,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             const int64_t n_tok = nt/n_stream;
             GGML_ASSERT(ci.kq_mask->ne[1] == n_tok);
             const int64_t n_score = (fused_idx ? 1 : n_idx_head)*n_comp*n_stream;
-            const int64_t chunk   = std::max({ (n_tok + 63)/64, (INT64_C(1) << 26)/n_score, INT64_C(1) });
+            // wasm64 defines int64_t and INT64_C with distinct C++ types.
+            const int64_t chunk   = std::max<int64_t>({ (n_tok + 63) / 64, (INT64_C(1) << 26) / n_score, INT64_C(1) });
 
             const int32_t cand_src = hparams.dsv41_cand_src;
             const bool    pick_blk = cand_src == il && cand_pin;              // level one: pick the candidate blocks
