@@ -73,7 +73,9 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 ```
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
-Without `--spec-draft-n-max`, `draft-dflash`, `draft-dflash2` and `draft-lilicorr` draft 5 tokens instead of the default 3; `draft-dspark` keeps 3.
+Without `--spec-draft-n-max`, `draft-dflash`, `draft-dflash2` and `draft-lilicorr` draft 5 tokens instead of the default 3.
+A DSpark draft keeps 3, also under `draft-dflash`.
+A DSpine draft then needs a draft ubatch (`--spec-draft-n-ubatch`) of at least `6 * -np` tokens, see below.
 
 DFlash2, DSpark and LiliCorr drafts are DFlash backbones with a head on the block, and the head is read from the draft model.
 `draft-dflash` runs each of them with the driver of its head.
@@ -318,6 +320,8 @@ Use exactly one of these options:
 
 - `--spec-synth-rates P0,P1,...` sets unconditional per-position acceptance probabilities. Entry `i` is the probability that the first `i+1` draft tokens are all accepted. The number of entries must match the effective maximum draft length. Values must be finite, within `[0, 1]`, and monotonically non-increasing.
 - `--spec-synth-len L` sets the target mean acceptance length, including the target token. For `K` maximum draft tokens, `L` must be within `[1, K+1]`. The server finds a constant conditional probability `p` such that `p + p^2 + ... + p^K = L - 1`, then uses unconditional rates `[p, p^2, ..., p^K]`.
+
+Without `--spec-draft-n-max`, the maximum draft length of `draft-dflash`, `draft-dflash2` and `draft-lilicorr` is 5 (3 for a DSpark draft), so they take 5 rates and `L` within `[1, 6]`.
 
 ### General Speculative Parameters
 

@@ -3300,11 +3300,18 @@ int32_t common_speculative_n_max(const common_speculative * spec) {
 }
 
 void common_speculative_set_default_n_max(common_params_speculative & spec) {
-    // DFlash2 and LiliCorr drafts ran as draft-dflash before they had their own types; draft-dspark keeps the generic default
-    const bool is_dflash = std::any_of(spec.types.begin(), spec.types.end(), [](common_speculative_type t) {
-        return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
-               t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
-    });
+    const auto has_type = [&](common_speculative_type type) {
+        return std::find(spec.types.begin(), spec.types.end(), type) != spec.types.end();
+    };
+    // draft-dspark keeps the generic default: its draft length has not been measured. draft-dflash runs a draft with a
+    // Markov head as DSpark, so that draft keeps it too
+    const auto has_markov = [&]() {
+        common_speculative_gguf_header hdr;
+        return !spec.draft.mparams.path.empty() && common_speculative_read_header(spec.draft.mparams.path, hdr) && hdr.has_markov;
+    };
+    // DFlash2 and LiliCorr drafts ran as draft-dflash before they had their own types
+    const bool is_dflash = has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2) || has_type(COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR) ||
+                           (has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) && !has_markov());
     if (is_dflash && !spec.draft.n_max_explicit) {
         spec.draft.n_max = common_params_speculative_draft::n_max_dflash;
     }

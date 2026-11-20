@@ -37,7 +37,8 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
 // return the max number of draft tokens from the initialized implementations
 int32_t common_speculative_n_max(const common_speculative * spec);
 
-// draft-dflash, draft-dflash2 and draft-lilicorr draft n_max_dflash tokens unless n_max is explicit; call once the spec types are final
+// draft-dflash, draft-dflash2 and draft-lilicorr draft n_max_dflash tokens unless n_max is explicit or the draft has a Markov
+// head (DSpark); call once the spec types and the draft model path are final
 void common_speculative_set_default_n_max(common_params_speculative & spec);
 
 // how many of the n drafts of a lattice path to keep: n_short when the expected accepted tokens of all n drafts do not

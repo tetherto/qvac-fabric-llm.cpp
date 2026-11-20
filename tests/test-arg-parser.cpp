@@ -305,6 +305,13 @@ static void test(void) {
     }
 
     {
+        common_params dflash_params;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-draft-n-max", "3", "--spec-type", "draft-dflash"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dflash_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(dflash_params.speculative.draft.n_max == 3);
+    }
+
+    {
         common_params mtp_params;
         argv = {"binary_name", "-m", "abc.gguf", "--spec-type", "draft-mtp"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mtp_params, LLAMA_EXAMPLE_SPECULATIVE));
@@ -328,6 +335,18 @@ static void test(void) {
 
     {
         // the server resolves the default after parsing, once it has resolved the models
+        common_params server_params;
+        argv = {"binary_name", "--spec-type", "draft-dflash"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), server_params, LLAMA_EXAMPLE_SERVER));
+        assert(server_params.speculative.draft.n_max == common_params_speculative_draft{}.n_max);
+
+        common_models_handler handler = common_models_handler_init(server_params, LLAMA_EXAMPLE_SERVER);
+        common_models_handler_apply(handler, server_params);
+        assert(server_params.speculative.draft.n_max == common_params_speculative_draft::n_max_dflash);
+    }
+
+    {
+        // an explicit n_max is kept
         common_params_speculative spec;
         spec.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
         common_speculative_set_default_n_max(spec);
