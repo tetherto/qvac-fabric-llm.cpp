@@ -822,6 +822,7 @@ class LayaModel(ModernBertModel):
         # which follows the BPE merge order when a token scores minus the rank of its first merge.
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        assert tokenizer is not None
 
         merge_rank: dict[str, int] = {}
         for rank, merge in enumerate(tokenizer_json["model"]["merges"]):
@@ -829,7 +830,7 @@ class LayaModel(ModernBertModel):
             merge_rank.setdefault(left + right, rank)
 
         vocab_size = self.hparams["vocab_size"]
-        reverse_vocab = {id_: tok for tok, id_ in tokenizer.get_vocab().items()}  # ty: ignore[unresolved-attribute]
+        reverse_vocab = {id_: tok for tok, id_ in tokenizer.get_vocab().items()}
         added_tokens = {t["id"]: t for t in tokenizer_json["added_tokens"]}
         unk_token = tokenizer_json["model"].get("unk_token")
 
