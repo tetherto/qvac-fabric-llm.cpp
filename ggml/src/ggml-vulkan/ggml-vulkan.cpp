@@ -2277,6 +2277,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // Warptile layout (indices match mul_mm.comp constantIDs):
     //   [0..9]  : BLOCK_SIZE, BM, BN, BK, WM, WN, WMITER, TM, TN, TK
     //   [10]    : WARP / required_subgroup_size (read via WARP_SIZE_IDX)
+    static constexpr size_t TM_IDX = 7, TN_IDX = 8, TK_IDX = 9;
     static constexpr size_t WARP_SIZE_IDX = 10;
     std::vector<uint32_t> l_warptile, m_warptile, s_warptile,
                           l_warptile_f32, m_warptile_f32, s_warptile_f32,
@@ -3112,7 +3113,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         constexpr uint32_t bm = 32, bk_default = 32, bk_quant_uma_nvidia = 128;
         const bool uma_nvidia = device->vendor_id == VK_VENDOR_ID_NVIDIA && device->uma;
         const uint32_t bk = uma_nvidia && ggml_is_quantized(type) ? bk_quant_uma_nvidia : bk_default;
-        const uint32_t tm = device->coopmat_m, tn = device->coopmat_n, tk = device->coopmat_k;
+        // Use the shader's own native matrix shape; the fp32 shader is built for coopmat_f32_m/n/k.
+        const uint32_t tm = configs.front().warptile[TM_IDX];
+        const uint32_t tn = configs.front().warptile[TN_IDX];
+        const uint32_t tk = configs.front().warptile[TK_IDX];
 
         const bool rdna = device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4;
         const uint32_t base_subgroup_size = rdna && device->subgroup_size_control ? device->subgroup_min_size : mul_mat_subgroup_size;
