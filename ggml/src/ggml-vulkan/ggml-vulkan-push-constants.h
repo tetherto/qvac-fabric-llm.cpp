@@ -1128,6 +1128,22 @@ struct vk_op_flash_attn_sparse_compact_push_constants {
     uint32_t n_kv_max;
 };
 
+struct vk_op_flash_attn_kv_rows_blocks_push_constants {
+    uint32_t KV;
+    uint32_t Bc;
+    uint32_t n_blocks;
+    uint32_t n_slices;
+    uint32_t rows_stride;
+};
+
+struct vk_op_flash_attn_kv_rows_gather_push_constants {
+    uint32_t ne0;
+    uint32_t KV;
+    uint32_t nb1;
+    uint32_t nb2;
+    uint32_t rows_stride;
+};
+
 struct vk_op_flash_attn_back_absmax_push_constants {
     uint32_t ne0;
     uint32_t ne1;

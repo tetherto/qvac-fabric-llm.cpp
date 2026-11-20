@@ -1255,6 +1255,8 @@ void process_shaders() {
 #endif
 
     string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});
+    string_to_spv("fa_kv_rows_blocks", "flash_attn_kv_rows_blocks.comp", {});
+    string_to_spv("fa_kv_rows_gather_f16", "flash_attn_kv_rows_gather.comp", {});
     string_to_spv("fa_sparse_compact_subgroup", "flash_attn_sparse_compact.comp", {{"USE_SUBGROUPS", "1"}});
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
