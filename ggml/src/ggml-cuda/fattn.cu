@@ -692,15 +692,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
-    // only the MMA kernel reads K/V through kv_rows
-    if (kv_rows) {
-        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && mask && Q->ne[0] != 40 && Q->ne[0] != 72 ?
+    // kv_rows needs a mask; on AMD every kernel reads K/V through kv_rows, on NVIDIA only the MMA kernel is used for it
+    if (kv_rows && !mask) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+    if (kv_rows && !GGML_CUDA_CC_IS_AMD(cc)) {
+        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72 ?
             BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && n_kv % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc)) {
