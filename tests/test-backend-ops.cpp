@@ -18078,6 +18078,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
     }
 
+    // Large int8 MMQ tile: a dense FFN prefill shape and partial tiles in both dims (Q4_K keeps the old tile).
+    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_Q4_K }) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 512, 4096, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 300, 2048, { 1, 1 }, { 1, 1 }));
+    }
+
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
         for (int n = 1; n <= 8; ++n) {

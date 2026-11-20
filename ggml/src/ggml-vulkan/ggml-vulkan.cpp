@@ -2346,6 +2346,15 @@ static bool ggml_vk_shared_avail_rewrite_enabled(const vk::PhysicalDeviceDriverP
     return mesa && driver_version < kMesaSharedAvailFixVersion;
 }
 
+// GGML_VK_MMQ_CM1_WIDE=0 keeps the 32x32 warp tiles of the large int8 MMQ (coopmat1) tile on RDNA3.
+static bool ggml_vk_mmq_cm1_wide_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MMQ_CM1_WIDE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type, ggml_type v_type) {
     // qvac: scalar FlashAttn MMQ (_int8) variants are disabled on this fork. The
     // TurboQuant import replaced the scalar shader's MMQ path with the compile-time
@@ -2471,6 +2480,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                           l_warptile_mmq, m_warptile_mmq, s_warptile_mmq,
                           l_warptile_mmq_int, m_warptile_mmq_int, s_warptile_mmq_int,
                           l_warptile_mmq_cm1_int, m_warptile_mmq_cm1_int, s_warptile_mmq_cm1_int,
+                          l_warptile_mmq_cm1_int_wide,
                           l_warptile_mmq_cm1_int_k, m_warptile_mmq_cm1_int_k, s_warptile_mmq_cm1_int_k,
                           l_warptile_mmq_int_k, m_warptile_mmq_int_k, s_warptile_mmq_int_k,
                           l_warptile_mmq_k, m_warptile_mmq_k, s_warptile_mmq_k,
@@ -2606,6 +2616,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_warptile_mmq_cm1_int = { cm1_bs(128, 128), 128, 128, 32, std::min(cm1_sg, 128u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
         m_warptile_mmq_cm1_int = { cm1_bs( 64,  64),  64,  64, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
         s_warptile_mmq_cm1_int = { cm1_bs( 32,  32),  32,  32, 32, std::min(cm1_sg,  32u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
+        // 32x64 warp tiles: half the A-scale reads per WMMA; only used on wave32 RDNA3 for types without a min term
+        l_warptile_mmq_cm1_int_wide = { cm1_sg * (128 / 32) * (128 / 64), 128, 128, 32, 32, 64, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
 
         l_warptile_mmq_cm1_int_k = { cm1_bs( 64, 128),  64, 128, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
         m_warptile_mmq_cm1_int_k = { cm1_bs( 64,  64),  64,  64, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
@@ -3521,6 +3533,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             {m_warptile_mmq_cm1_int, m_mmq_wg_denoms, m_align},
             {l_warptile_mmq_cm1_int, l_mmq_wg_denoms, l_align},
         };
+        std::vector<vk_tile_config> tc_mmq_cm1_int_wide = {
+            {s_warptile_mmq_cm1_int, s_mmq_wg_denoms, s_align},
+            {m_warptile_mmq_cm1_int, m_mmq_wg_denoms, m_align},
+            {l_warptile_mmq_cm1_int_wide, l_mmq_wg_denoms, l_align},
+        };
         std::vector<vk_tile_config> tc_mmq_cm1_int_k = {
             {s_warptile_mmq_cm1_int_k, s_mmq_cm1_wg_denoms_k, s_align},
             {m_warptile_mmq_cm1_int_k, m_mmq_cm1_wg_denoms_k, m_align},
@@ -3530,6 +3547,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // Some quants are not performant on RDNA4, those fall back to FP16 matmul
         const bool rdna3 = device->architecture == AMD_RDNA3;
         const bool rdna4 = device->architecture == AMD_RDNA4;
+        const auto & tc_mmq_cm1_int_sym = (rdna3 && cm1_sg == 32 && ggml_vk_mmq_cm1_wide_enabled()) ? tc_mmq_cm1_int_wide : tc_mmq_cm1_int;
 
         if (device->coopmat_f32_support_16x16x16_f32acc) {
             std::vector<vk_tile_config> tc_mm_f32 = {{s_warptile_f32, s_wg_denoms, s_align}, {m_warptile_f32, m_wg_denoms, m_align}, {l_warptile_f32, l_wg_denoms, l_align}};
@@ -3607,14 +3625,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef X_CM1
 
         if (device->coopmat_int_support && (rdna3 || rdna4)) {
-            cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_0_q8_1",   matmul_q4_0_q8_1_cm1_len,   matmul_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_q4_0_q8_1",   matmul_q4_0_q8_1_cm1_len,   matmul_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q4_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_1_q8_1",   matmul_q4_1_q8_1_cm1_len,   matmul_q4_1_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
-            cm1_create_mmq({GGML_TYPE_Q5_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_0_q8_1",   matmul_q5_0_q8_1_cm1_len,   matmul_q5_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_Q5_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_q5_0_q8_1",   matmul_q5_0_q8_1_cm1_len,   matmul_q5_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q5_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_1_q8_1",   matmul_q5_1_q8_1_cm1_len,   matmul_q5_1_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
-            cm1_create_mmq({GGML_TYPE_Q8_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q8_0_q8_1",   matmul_q8_0_q8_1_cm1_len,   matmul_q8_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
-            cm1_create_mmq({GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_iq4_nl_q8_1", matmul_iq4_nl_q8_1_cm1_len, matmul_iq4_nl_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
-            cm1_create_mmq({GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_iq4_xs_q8_1", matmul_iq4_xs_q8_1_cm1_len, matmul_iq4_xs_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
-            cm1_create_mmq({GGML_TYPE_MXFP4,  GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_mxfp4_q8_1",  matmul_mxfp4_q8_1_cm1_len,  matmul_mxfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_Q8_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_q8_0_q8_1",   matmul_q8_0_q8_1_cm1_len,   matmul_q8_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_iq4_nl_q8_1", matmul_iq4_nl_q8_1_cm1_len, matmul_iq4_nl_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_iq4_xs_q8_1", matmul_iq4_xs_q8_1_cm1_len, matmul_iq4_xs_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_MXFP4,  GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_mxfp4_q8_1",  matmul_mxfp4_q8_1_cm1_len,  matmul_mxfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_push_constants), 3);
             cm1_create_mmq({GGML_TYPE_Q3_K,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_k, "matmul_q3_k_q8_1",   matmul_q3_k_q8_1_cm1_len,   matmul_q3_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q4_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_k_q8_1",   matmul_q4_k_q8_1_cm1_len,   matmul_q4_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q5_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_k_q8_1",   matmul_q5_k_q8_1_cm1_len,   matmul_q5_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
