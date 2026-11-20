@@ -1690,7 +1690,7 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
 
     // use MMVQ path for mat-vec
     bool use_mmvq = ggml_webgpu_can_use_mmvq(
-        src0, src1, src1->ne[1], ctx->global_ctx->capabilities.supports_dot_product, ctx->global_ctx->vendor);
+        src0, src1, dst, src1->ne[1], ctx->global_ctx->capabilities.supports_dot_product, ctx->global_ctx->vendor);
 
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
 
@@ -3413,7 +3413,10 @@ static bool ggml_webgpu_can_fuse_rms_norm_mul(const struct ggml_cgraph * cgraph,
     return true;
 }
 
-static bool ggml_webgpu_can_fuse_gdn_cache(const struct ggml_cgraph * cgraph, int node_idx, int & num_encoded_ops) {
+static bool ggml_webgpu_can_fuse_gdn_cache(const webgpu_global_context & global_ctx,
+                                           const struct ggml_cgraph *    cgraph,
+                                           int                           node_idx,
+                                           int &                         num_encoded_ops) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
 
     // the kernel skips the snapshot tail, so the gdn output must not be a graph output
@@ -3466,6 +3469,12 @@ static bool ggml_webgpu_can_fuse_gdn_cache(const struct ggml_cgraph * cgraph, in
     if (cpy_dst->op != GGML_OP_VIEW || cpy_dst->type != GGML_TYPE_F32 || cpy_dst->data == nullptr ||
         !std::equal(expected_ne.begin(), expected_ne.end(), cpy_dst->ne) ||
         cpy_dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || cpy_dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        return false;
+    }
+
+    // a state read in place from the cache rows overlaps the cache write, and WebGPU does not allow a writable
+    // binding to alias another binding of the same dispatch: those take the unfused path
+    if (ggml_webgpu_tensor_binding_overlap(global_ctx, gdn->src[5], cpy_dst)) {
         return false;
     }
 
@@ -3615,7 +3624,7 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
             return ggml_webgpu_ssm_scan(ctx, src0, src1, src2, node->src[3], node->src[4], node->src[5], node->src[6],
                                         node);
         case GGML_OP_GATED_DELTA_NET:
-            if (ggml_webgpu_can_fuse_gdn_cache(cgraph, node_idx, num_encoded_ops)) {
+            if (ggml_webgpu_can_fuse_gdn_cache(ctx->global_ctx, cgraph, node_idx, num_encoded_ops)) {
                 ggml_tensor * dst_fuse = cgraph->nodes[node_idx + num_encoded_ops - 1]->src[1];
                 return ggml_webgpu_gated_delta_net(ctx, src0, src1, src2, node->src[3], node->src[4], node->src[5],
                                                    node, dst_fuse);
@@ -4425,7 +4434,7 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
                 // mmvq batch and the size stays monotonic in the batch length
                 const int64_t n_rows   = std::min<int64_t>(src1->ne[1], GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS);
                 const bool    use_mmvq = ggml_webgpu_can_use_mmvq(
-                    src0, src1, n_rows, ctx->webgpu_global_ctx->capabilities.supports_dot_product,
+                    src0, src1, tensor, n_rows, ctx->webgpu_global_ctx->capabilities.supports_dot_product,
                     ctx->webgpu_global_ctx->vendor);
                 if (use_mmvq) {
                     const size_t q8_src1_size = src1->ne[3] * src1->ne[2] * n_rows *
@@ -4502,6 +4511,7 @@ static void ggml_backend_webgpu_device_get_props(ggml_backend_dev_t dev, struct 
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ false,
         /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false,
     };
 }
 
@@ -4527,6 +4537,7 @@ static void ggml_webgpu_init_scatter_write_pipeline(webgpu_global_context & ctx)
 
 static void ggml_backend_webgpu_request_adapter(wgpu::Instance & instance, wgpu::Adapter & adapter) {
     wgpu::RequestAdapterOptions options = {};
+    options.powerPreference             = wgpu::PowerPreference::HighPerformance;
 
 #if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
     // TODO: track need for these toggles: https://issues.chromium.org/issues/42251215
@@ -4985,7 +4996,8 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
 
                 // subgroup matrix path requirements
                 const bool use_subgroup_matrix = ggml_webgpu_flash_attn_can_use_subgroup_matrix_path(
-                    capabilities.supports_subgroup_matrix, capabilities.sg_mat_k, capabilities.sg_mat_n, src0, src2);
+                    capabilities.supports_subgroup_matrix, capabilities.sg_mat_k, capabilities.sg_mat_n, src0, src2,
+                    op);
 
                 // tile path requirements
                 const bool float_vec4_aligned =
@@ -5268,7 +5280,9 @@ static ggml_backend_dev_t ggml_backend_webgpu_reg_get_device(ggml_backend_reg_t 
 
     ggml_backend_webgpu_reg_context * reg_ctx = static_cast<ggml_backend_webgpu_reg_context *>(reg->context);
 
-    create_webgpu_device(reg_ctx);
+    if (reg_ctx->webgpu_global_ctx->device == nullptr) {
+        create_webgpu_device(reg_ctx);
+    }
 
     static ggml_backend_webgpu_device_context device_ctx;
     device_ctx.device_name            = GGML_WEBGPU_NAME;
@@ -5294,6 +5308,15 @@ static const struct ggml_backend_reg_i ggml_backend_webgpu_reg_i = {
 
 /* End GGML Backend Registration Interface */
 
+// Dawn's Null backend accepts every feature and executes nothing, so a host
+// without a usable GPU would otherwise "run" inference on it and return
+// garbage instead of falling back to the CPU backend.
+static bool ggml_webgpu_adapter_is_null_backend(const wgpu::Adapter & adapter) {
+    wgpu::AdapterInfo info;
+    adapter.GetInfo(&info);
+    return info.backendType == wgpu::BackendType::Null;
+}
+
 ggml_backend_reg_t ggml_backend_webgpu_reg() {
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_reg()");
 
@@ -5307,15 +5330,14 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
         /* .context     = */ ctx,
     };
 
-    ctx->name         = GGML_WEBGPU_NAME;
-    ctx->device_count = 0;
+    ctx->name = GGML_WEBGPU_NAME;
 
-    // Keep one Dawn/WebGPU instance alive for the lifetime of the static backend
-    // registry. Recreating it on repeated registry lookups can invalidate
-    // adapter/device references that are still held by the backend/device layer.
-    if (ctx->webgpu_global_ctx != nullptr && ctx->webgpu_global_ctx->instance != nullptr) {
+    // Cache setup failures too, so repeated lookups do not retry or repeat diagnostics.
+    if (ctx->webgpu_global_ctx != nullptr) {
         return &reg;
     }
+
+    ctx->device_count = 0;
 
     wgpu::InstanceDescriptor               instance_descriptor{};
     std::vector<wgpu::InstanceFeatureName> instance_features = { wgpu::InstanceFeatureName::TimedWaitAny };
@@ -5341,11 +5363,22 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
     }
 
     // WebGPU backend requires f16 support and, on native, implicit device synchronization.
-    if (adapter != nullptr && adapter.HasFeature(wgpu::FeatureName::ShaderF16)
-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
-        && adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)
+    if (adapter == nullptr) {
+        GGML_LOG_WARN("ggml_webgpu: no adapter available, backend disabled\n");
+    } else if (ggml_webgpu_adapter_is_null_backend(adapter)) {
+        GGML_LOG_WARN("ggml_webgpu: only Dawn's Null adapter is available (no usable GPU), backend disabled\n");
+    } else if (!adapter.HasFeature(wgpu::FeatureName::ShaderF16)) {
+        GGML_LOG_WARN("ggml_webgpu: adapter lacks shader-f16, backend disabled\n");
+#ifdef __EMSCRIPTEN__
+        GGML_LOG_WARN(
+            "ggml_webgpu: on affected Chromium NVIDIA/Vulkan configurations, try "
+            "--enable-dawn-features=vulkan_enable_f16_on_nvidia\n");
 #endif
-    ) {
+#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+    } else if (!adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)) {
+        GGML_LOG_WARN("ggml_webgpu: adapter lacks implicit device synchronization, backend disabled\n");
+#endif
+    } else {
         ctx->device_count = 1;
     }
 

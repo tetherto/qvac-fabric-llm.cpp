@@ -44,6 +44,7 @@
 /tags
 /.build/
 /build*
+/ggml/src/ggml-xdna/kernels/build/
 /release
 /debug
 /libllama.so
@@ -54,6 +55,13 @@
 /tmp/
 /autogen-*.md
 /common/build-info.cpp
+
+# Local TurboVec review artifacts
+/.cargo-turbovec-gen/
+/.cargo-turbovec-inspect/
+/ggml/build*/
+/results/
+/tests/turbovec-golden-gen/*.tmp.tv
 
 # Deprecated
 

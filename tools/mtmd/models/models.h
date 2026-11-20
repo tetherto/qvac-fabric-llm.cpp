@@ -16,6 +16,12 @@
 struct mtmd_graph_siglip : mtmd_graph {
     mtmd_graph_siglip(mtmd_subcontext * ctx, const mtmd_image_f32 & img) : mtmd_graph(ctx, img) {}
     ggml_cgraph * build() override;
+    // No support_batch(): batching is unreachable for the models on this graph, not just
+    // unimplemented. VisionPsy and idefics3 both put a text delimiter (<row_R_col_C>)
+    // between every slice, and the batch loops in mtmd-cli.cpp / server-context.cpp break
+    // the batch on any text chunk, so a grid always encodes as n_chunks = 1 regardless.
+    // Enabling it here buys nothing until the prompt layout changes, which the model
+    // defines. Measured: identical n_chunks with --image-tile-mode batched.
 };
 
 struct mtmd_graph_gemma4v : mtmd_graph {
@@ -64,6 +70,7 @@ struct mtmd_graph_qwen2vl : mtmd_graph {
 struct mtmd_graph_qwen3vl : mtmd_graph_qwen2vl {
     mtmd_graph_qwen3vl(mtmd_subcontext * ctx, const mtmd_image_f32 & img) : mtmd_graph_qwen2vl(ctx, img) {}
     ggml_cgraph * build() override;
+    bool support_batch() const override { return true; }
 };
 
 struct mtmd_graph_magevl : mtmd_graph {

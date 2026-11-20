@@ -498,6 +498,11 @@ void launch_mul_mat_vec_f_cuda(
     if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
         max_block_size = 128;
     }
+    // FP8 rows are short in bytes (5-6 KiB for a 27B model): smaller blocks keep more rows in flight per SM, which
+    // decodes 8% faster on the H100 than 256 threads
+    if constexpr (std::is_same_v<T, ggml_fp8_e4m3_t>) {
+        max_block_size = 128;
+    }
     for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
         const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
         if (niter < niter_best) {
@@ -974,6 +979,14 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
             }
             return ne11 <= MMVF_MAX_BATCH_SIZE;
         case GGML_TYPE_F8_E4M3:
+            // MMVF reads the src1 columns once per weight row; with fast memory the cuBLASLt FP8 GEMM, which reads
+            // each weight once for all columns, is faster from 3 columns on (H100) or 5 (RTX 5090)
+            if (cc == GGML_CUDA_CC_HOPPER) {
+                return ne11 <= 2;
+            }
+            if (cc == GGML_CUDA_CC_BLACKWELL) {
+                return ne11 <= 4;
+            }
             return ne11 <= MMVF_MAX_BATCH_SIZE;
         default:
             return false;

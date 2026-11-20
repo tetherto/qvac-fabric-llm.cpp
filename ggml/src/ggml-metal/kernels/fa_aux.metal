@@ -72,14 +72,16 @@ kernel void kernel_flash_attn_ext_rows(
 
     // note: the K/V cache is shared by all streams (ne13 = ne23 = 1), the row list selects the rows
     // each thread copies up to 4 half4 values (32 bytes) to keep the memory transactions large
+    // the chunks do not cross a head: with DK = 40 or 72 the half4 count per head is not a multiple of 4
 
     // K: all heads of this row
     {
         const int64_t per_head = args.ne10/4;
+        const int64_t nc       = (per_head + 3)/4; // chunks per head
 
-        for (int64_t i = 4*tiitg; i < args.ne_12_2*per_head; i += 4*ntg.x) {
-            const int64_t i2 = i/per_head;
-            const int64_t i0 = i%per_head;
+        for (int64_t i = tiitg; i < args.ne_12_2*nc; i += ntg.x) {
+            const int64_t i2 = i/nc;
+            const int64_t i0 = 4*(i%nc);
             const int      n  = (int) min((int64_t) 4, per_head - i0);
 
             device half4 * dst4 = k_dst + (i2*args.ne11 + i1)*per_head + i0;
@@ -100,10 +102,11 @@ kernel void kernel_flash_attn_ext_rows(
     // V: all heads of this row
     {
         const int64_t per_head = args.ne20/4;
+        const int64_t nc       = (per_head + 3)/4; // chunks per head
 
-        for (int64_t i = 4*tiitg; i < args.ne_12_2*per_head; i += 4*ntg.x) {
-            const int64_t i2 = i/per_head;
-            const int64_t i0 = i%per_head;
+        for (int64_t i = tiitg; i < args.ne_12_2*nc; i += ntg.x) {
+            const int64_t i2 = i/nc;
+            const int64_t i0 = 4*(i%nc);
             const int      n  = (int) min((int64_t) 4, per_head - i0);
 
             device half4 * dst4 = v_dst + (i2*args.ne11 + i1)*per_head + i0;
@@ -192,6 +195,7 @@ kernel void kernel_flash_attn_ext_pad(
     }
 }
 
+constant bool    FC_flash_attn_ext_blk_has_rows [[function_constant(FC_FLASH_ATTN_EXT_BLK + 5)]];
 constant int32_t FC_flash_attn_ext_blk_nqptg [[function_constant(FC_FLASH_ATTN_EXT_BLK + 24)]];
 constant int32_t FC_flash_attn_ext_blk_ncpsg [[function_constant(FC_FLASH_ATTN_EXT_BLK + 25)]];
 
@@ -199,10 +203,12 @@ constant int32_t FC_flash_attn_ext_blk_ncpsg [[function_constant(FC_FLASH_ATTN_E
 // 0 -     masked (i.e. full of -INF, skip)
 // 1 - not masked (i.e. at least one element of the mask is not -INF)
 // 2 - all zero
+// with kv_rows (one list of cache rows per mask slice), 4 is added when the C list entries are consecutive cache rows
 kernel void kernel_flash_attn_ext_blk(
         constant ggml_metal_kargs_flash_attn_ext_blk & args,
         device const char * mask,
         device       char * dst,
+        device const int  * rows,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]]) {
     // block size C x Q
@@ -243,6 +249,21 @@ kernel void kernel_flash_attn_ext_blk(
             } else {
                 res = 1;
             }
+        }
+    }
+
+    if (FC_flash_attn_ext_blk_has_rows && res != 0) {
+        device const int * list = rows + i3*args.ne30 + i0*C;
+
+        const int r0 = list[0];
+
+        bool seq = r0 >= 0;
+        for (short i = tiisg; i < C; i += NW) {
+            seq = seq && list[i] == r0 + i;
+        }
+
+        if (simd_all(seq)) {
+            res |= 4;
         }
     }
 

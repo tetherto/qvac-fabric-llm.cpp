@@ -100,6 +100,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_coreml_ffn;
 
 //
 // llm_graph_input
@@ -306,14 +307,31 @@ public:
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
-    ggml_tensor * s_copy_main; // I32 [n_seqs]
-    ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+    ggml_tensor * s_copy_main;  // I32 [n_seqs]
+    ggml_tensor * s_copy_tail;  // I32 [n_rs - 1]
+    ggml_tensor * s_copy_moved; // I32 [n_rs - i0], see build_rs with in_place (a view of s_copy_base when deferred)
+
+    // deferred gated delta net commit (see llama_memory_recurrent::gdn_deferred), else null:
+    // the ssm base states always live in plane 0, so they get their own copy indices
+    ggml_tensor * s_copy_base       = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_base_main  = nullptr; // I32 [n_seqs]
+    ggml_tensor * s_copy_base_extra = nullptr; // I32 [n_rs - n_seqs]
+    ggml_tensor * rec_idx           = nullptr; // I32 [3, n_seqs] {pending, read_row, write_row}
+    bool          s_base_inplace    = false;   // the base states are read and written in place (s_copy_moved)
+
+    // ragged ubatches (llama_ubatch::seq_off), else null
+    ggml_tensor * seq_off = nullptr; // I32 [n_seqs + 1]
 
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // rows [mv0, mv1) of the ubatch whose state is not in its own cell yet. with in_place, build_rs copies the
+    // states from i0 = mv0 (n_seqs when the range is empty) through the extra states
+    uint32_t mv0 = 0;
+    uint32_t mv1 = 0;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -337,6 +355,10 @@ struct llm_attn_mask {
     ggml_tensor * raw  = nullptr;
     ggml_tensor * rows = nullptr; // I32 [n_kv_rows, n_slices]
     uint32_t      n_kv = 0;
+
+    // false if the mask is never built over kv_rows, so it is reused like a dense mask
+    // (masks built with build_attn_inp_kq_mask)
+    bool allow_rows = false;
 
     // fill every token of a sequence with the mask row of its first token (dspark draft blocks)
     bool block_uniform = false;
@@ -805,6 +827,8 @@ struct llm_graph_params {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
 
+    llama_coreml_ffn * coreml_ffn = nullptr;
+
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
@@ -901,6 +925,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.draft_vocab != other.cparams.draft_vocab) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -914,7 +942,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            coreml_ffn == other.coreml_ffn;
     }
 };
 
@@ -1077,6 +1106,8 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+
+    llama_coreml_ffn * coreml_ffn;
 
     const llama_prec_policy * prec_policy;
 
@@ -1443,16 +1474,21 @@ struct llm_graph_context {
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr,
+                   bool   in_place = false) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 
+    // in_place: return a view of the cache rows of the ubatch instead of a gathered copy. the states from the first one
+    // that is not in its own cell yet through the extra states (s_copy_moved) are copied to their cells first. the
+    // caller must read the states before it writes the new ones
     ggml_tensor * build_rs(
             llm_graph_input_rs * inp,
             ggml_tensor * s,
                 int32_t   state_size,
                 int32_t   n_seqs,
-            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr,
+                   bool   in_place = false) const;
 
     // store the conv history of the ubatch cells, the last n_cols columns of conv_x {n_cols + n_seq_tokens, channels, n_seqs},
     // at byte offset offs of each row of s, and with n_rs_seq > 0 once per rollback slot of this ubatch

@@ -109,7 +109,7 @@ static void write_test_file(const std::filesystem::path & path) {
 }
 
 static void check_file(testing & t, const std::filesystem::path & path, bool use_direct_io) {
-    llama_file file(path.string().c_str(), "rb", use_direct_io);
+    llama_file_disk file(path.string().c_str(), "rb", use_direct_io);
     if (use_direct_io && !file.has_direct_io()) {
         t.skip("direct I/O is unavailable for the test file");
         return;
@@ -169,7 +169,7 @@ static void check_file(testing & t, const std::filesystem::path & path, bool use
 }
 
 static void check_direct_io_fallback(testing & t, const std::filesystem::path & path) {
-    llama_file file(path.string().c_str(), "rb", true);
+    llama_file_disk file(path.string().c_str(), "rb", true);
     if (!file.has_direct_io()) {
         t.skip("direct I/O is unavailable for the test file");
         return;
@@ -206,7 +206,7 @@ static void check_mmap(testing & t, const std::filesystem::path & path) {
         return;
     }
 
-    llama_file file(path.string().c_str(), "rb");
+    llama_file_disk file(path.string().c_str(), "rb");
     llama_mmap mapping(&file, 0, false);
     t.assert_equal(test_file_size, mapping.size());
     const auto * data = static_cast<const uint8_t *>(mapping.addr());

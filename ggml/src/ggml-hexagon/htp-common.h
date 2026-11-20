@@ -4,6 +4,20 @@
 #include "htp-opnode.h"
 #include "htp-repack.h"
 
+#include <cstring>
+
+static inline const ggml_tensor * htp_repack_owner(const ggml_tensor * tensor) {
+    if (!htp_is_tiled_weight_type(tensor->type)) {
+        return tensor;
+    }
+    while (tensor->view_src && tensor->view_offs == 0 && tensor->type == tensor->view_src->type &&
+           ggml_are_same_shape(tensor, tensor->view_src) &&
+           memcmp(tensor->nb, tensor->view_src->nb, sizeof(tensor->nb)) == 0) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
 extern int    opt_arch;
 extern size_t opt_ndev;
 extern size_t opt_nhvx;
@@ -53,16 +67,48 @@ static inline void ggml_hexagon_tensor_clear_flags(struct ggml_tensor * t, uint3
     t->extra = (void *) (uintptr_t) (ggml_hexagon_tensor_get_flags(t) & ~flags);
 }
 
+bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b);
+
+static inline bool htp_needs_canonical_tail(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_F16:
+            return false;
+        default:
+            return true;
+    }
+}
+
+static inline bool htp_can_store_tiled(const struct ggml_tensor * tensor) {
+    return htp_is_tiled_weight_tensor(tensor) &&
+           (tensor->op == GGML_OP_NONE || !htp_needs_canonical_tail(tensor->type));
+}
+
+static inline uint32_t htp_owned_flags(const struct ggml_tensor * tensor) {
+    const auto * owner = htp_repack_owner(tensor);
+    if (!owner->buffer || !ggml_backend_buffer_is_hexagon(owner->buffer)) {
+        return 0;
+    }
+    return ggml_hexagon_tensor_get_flags(owner);
+}
+
 static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t) {
     return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_FUSEABLE) != 0;
 }
 
 static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
-    return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_TILED) != 0;
+    return (htp_owned_flags(t) & HTP_TENSOR_TILED) != 0;
 }
 
 static inline bool ggml_hexagon_tensor_can_tile(const struct ggml_tensor * t) {
-    if (opt_rt_repack == 0) {
+    if (opt_rt_repack == 0 || !htp_can_store_tiled(t)) {
+        return false;
+    }
+    if (t->buffer && !ggml_backend_buffer_is_hexagon(t->buffer)) {
         return false;
     }
     if (t->buffer) {
@@ -71,7 +117,7 @@ static inline bool ggml_hexagon_tensor_can_tile(const struct ggml_tensor * t) {
             return false;
         }
     }
-    return htp_is_tiled_weight_tensor(t);
+    return true;
 }
 
 static inline bool ggml_hexagon_tensor_will_tile(const struct ggml_tensor * t) {

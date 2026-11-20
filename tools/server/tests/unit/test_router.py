@@ -886,6 +886,10 @@ def test_router_local_preset_listing():
 
         assert entries["local"]["source"] == "preset"
         assert "sidecars" not in entries["local"]
+
+        res = server.make_request("POST", "/models", data={"model": "local"})
+        assert res.status_code == 400
+        assert "model 'local' already exists" in res.body["error"]["message"]
     finally:
         os.remove(preset_path)
         os.remove(model_path)

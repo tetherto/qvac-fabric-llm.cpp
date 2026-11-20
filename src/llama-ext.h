@@ -144,6 +144,9 @@ LLAMA_API const char * llama_model_decision_label(const struct llama_model * mod
 // model/context data extraction
 //
 
+// true for a DSpine draft, whose lattice the DFlash2 lattice walk consumes
+LLAMA_API bool llama_model_is_dspine(const struct llama_model * model);
+
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out

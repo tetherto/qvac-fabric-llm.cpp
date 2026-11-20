@@ -151,6 +151,20 @@ struct mtmd_model_loader {
             model.proj_type = projector_type_from_string(proj_type);
 
             if (model.proj_type == PROJECTOR_TYPE_UNKNOWN) {
+                // Not a canonical name. Try the legacy aliases, which are gated on
+                // general.name so a generic string like "custom" only resolves for the
+                // one model that shipped it.
+                std::string model_name;
+                get_string(KEY_NAME, model_name, false);
+                model.proj_type = projector_type_from_alias(proj_type, model_name);
+                if (model.proj_type != PROJECTOR_TYPE_UNKNOWN) {
+                    LOG_WRN("%s: legacy projector type '%s' from general.name='%s' loaded as '%s'\n",
+                            __func__, proj_type.c_str(), model_name.c_str(),
+                            PROJECTOR_TYPE_NAMES.at(model.proj_type).c_str());
+                }
+            }
+
+            if (model.proj_type == PROJECTOR_TYPE_UNKNOWN) {
                 throw std::runtime_error(mtmd_format("%s: unknown projector type: %s\n", __func__, proj_type.c_str()));
             }
 
@@ -417,7 +431,31 @@ struct mtmd_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_LANCZOS;
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
                         get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        // Same optional key as VisionPsy below. Both run the idefics3 sizing
+                        // rule and --image-no-upscale is accepted for both, so a GGUF that
+                        // declares the rule must be honoured here too, or the flag is the only
+                        // way to reach it and metadata is silently ignored.
+                        get_bool(KEY_PREPROC_NO_UPSCALE, hparams.image_no_upscale, false);
                         hparams.set_limit_image_tokens();
+                    } break;
+                case PROJECTOR_TYPE_VISIONPSY:
+                    {
+                        // use default llava-uhd preprocessing params
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+                        get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        // The reference stretches straight to the refined size,
+                        // resize(img, [new_h, new_w]) in DynamicResize.forward, so the default
+                        // aspect-preserving pad would letterbox the slices instead. 640x488
+                        // refines to 1024x512, where PAD_CEIL would leave 176 black columns on
+                        // each side, about a third of the encoded pixels.
+                        hparams.image_pad_rf = PAD_NONE;
+                        // Optional; absent from every mmproj published so far, including the
+                        // VisionPsy Flash one, which is why --image-no-upscale exists. An
+                        // mmproj that carries the key needs no flag. gguf-py can write it
+                        // (add_vision_preproc_no_upscale, from the reference config's
+                        // resize_to_max_side_len == false); no converter in this repo emits
+                        // it yet because there is no VisionPsy conversion path here.
+                        get_bool(KEY_PREPROC_NO_UPSCALE, hparams.image_no_upscale, false);
                     } break;
                 case PROJECTOR_TYPE_COHERE2V:
                     {
@@ -642,7 +680,17 @@ struct mtmd_model_loader {
                             hparams.n_merge = 1;
                         }
                         hparams.set_limit_image_tokens(70, 1120);
-                        hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
+                        // hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
+                        // intentionally NOT calling set_warmup_n_tokens here: the previous
+                        // set_warmup_n_tokens(256) would override warmup_image_size with a
+                        // size smaller than the real-image max (1120 tokens), so the gallocr
+                        // reserved a buffer that didn't fit the actual graph and tripped the
+                        // bounds assert in ggml_backend_tensor_alloc on iOS Heavy9-Gemma4.
+                        // Letting set_limit_image_tokens(70, 1120) seed warmup_image_size
+                        // for the 1120-token upper bound matches what the real run will need.
+                        // The memory cost stays bounded here (max=1120 tokens) compared to
+                        // other projectors with thousands of tokens where the OOM-on-warmup
+                        // guard matters.
                     } break;
 
                 case PROJECTOR_TYPE_GEMMA3NV:
@@ -668,6 +716,34 @@ struct mtmd_model_loader {
                             throw std::runtime_error(mtmd_format("%s: spatial_merge_size (%d) must be 2\n", __func__, hparams.n_merge));
                         }
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
+                        // SigLIP2-Large ViT (n_head=16, n_layer=24) is used for 2B/4B — max_tiles=4 confirmed.
+                        // Larger ViT variants (8B+) use SigLIP2-SO-400M with unknown max_tiles.
+                        // Read from GGUF if present; otherwise default to 4 and warn for unknown ViTs.
+                        hparams.preproc_max_tiles = 4;
+                        const bool has_max_tiles_key = gguf_find_key(ctx_gguf.get(), KEY_PREPROC_MAX_TILES) >= 0;
+                        get_u32(KEY_PREPROC_MAX_TILES, hparams.preproc_max_tiles, false);
+                        if (has_max_tiles_key && (hparams.preproc_max_tiles < 1 || hparams.preproc_max_tiles > MTMD_PREPROC_MAX_TILES_LIMIT)) {
+                            LOG_WRN("%s: clip.vision.preproc_max_tiles=%d out of range [1,%d] in GGUF — defaulting to 4\n",
+                                    __func__, hparams.preproc_max_tiles, MTMD_PREPROC_MAX_TILES_LIMIT);
+                            hparams.preproc_max_tiles = 4;
+                        }
+                        if (!has_max_tiles_key && (hparams.n_head > 16 || hparams.n_layer > 24)) {
+                            const char * model_name =
+                                model.proj_type == PROJECTOR_TYPE_QWEN2VL  ? "Qwen2VL"  :
+                                model.proj_type == PROJECTOR_TYPE_QWEN25VL ? "Qwen2.5VL" : "Qwen3VL";
+                            // preproc_max_tiles is only read by the Qwen3VL preprocessor; Qwen2/2.5VL
+                            // use dyn_size, so --image-max-tiles is inert there and must not be suggested.
+                            if (model.proj_type == PROJECTOR_TYPE_QWEN3VL) {
+                                LOG_WRN("%s: %s large ViT detected (n_head=%d, n_layer=%d) but "
+                                        "clip.vision.preproc_max_tiles not in GGUF — defaulting to 4. "
+                                        "If using an 8B+ model, set the correct value with --image-max-tiles.\n",
+                                        __func__, model_name, hparams.n_head, hparams.n_layer);
+                            } else {
+                                LOG_WRN("%s: %s large ViT detected (n_head=%d, n_layer=%d) but "
+                                        "clip.vision.preproc_max_tiles not in GGUF — defaulting to 4.\n",
+                                        __func__, model_name, hparams.n_head, hparams.n_layer);
+                            }
+                        }
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
                         // optional limits of the model, the custom values take precedence
@@ -677,7 +753,7 @@ struct mtmd_model_loader {
                         if (hparams.custom_image_max_tokens <= 0) {
                             get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels, false);
                         }
-                        hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                        hparams.warmup_image_size = hparams.image_size; // warmup at actual tile size to match inference graph shape
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
                         if (hparams.image_min_pixels < warn_min_pixels) {
                             LOG_WRN("%s: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks\n", __func__);
@@ -921,6 +997,9 @@ struct mtmd_model_loader {
                         get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
                         get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
                         hparams.set_limit_image_tokens();
+                        if (hparams.image_min_pixels <= 0 || hparams.image_max_pixels <= 0) {
+                            throw std::runtime_error(mtmd_format("%s: GLM5V image_min_pixels and image_max_pixels must be positive\n", __func__));
+                        }
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                     } break;
                 case PROJECTOR_TYPE_LLAMA4:
@@ -1389,7 +1468,7 @@ struct mtmd_model_loader {
         }
     }
 
-    void load_tensors(mtmd_model & model, ggml_backend_buffer_type_t buft, bool no_alloc) {
+    void load_tensors(mtmd_model & model, ggml_backend_buffer_type_t buft, bool no_alloc, bool convert_bf16_to_f16 = false) {
         auto & hparams = model.hparams;
         std::map<std::string, size_t> tensor_offset;
         std::vector<ggml_tensor *> tensors_to_load;
@@ -1434,12 +1513,17 @@ struct mtmd_model_loader {
             }
             if (cur) {
                 tensors_to_load.push_back(cur);
-                ggml_tensor * data_tensor = ggml_dup_tensor(model.ctx_data.get(), cur);
+                ggml_tensor * data_tensor;
+                if (convert_bf16_to_f16 && cur->type == GGML_TYPE_BF16) {
+                    // Allocate the in-context tensor as F16; the actual values
+                    // get converted from BF16 in the load loop below.
+                    data_tensor = ggml_new_tensor(model.ctx_data.get(), GGML_TYPE_F16, ggml_n_dims(cur), cur->ne);
+                } else {
+                    data_tensor = ggml_dup_tensor(model.ctx_data.get(), cur);
+                }
                 ggml_set_name(data_tensor, cur->name);
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
-                // add to weight memory counter
-                model.mem_weights[ggml_backend_buft_get_device(buft)] += ggml_nbytes(cur);
             }
             return cur;
         };
@@ -1629,6 +1713,7 @@ struct mtmd_model_loader {
                     || model.proj_type == PROJECTOR_TYPE_GLM_EDGE
                     || model.proj_type == PROJECTOR_TYPE_GEMMA3
                     || model.proj_type == PROJECTOR_TYPE_IDEFICS3
+                    || model.proj_type == PROJECTOR_TYPE_VISIONPSY
                     || model.proj_type == PROJECTOR_TYPE_MINICPMV
                     || model.proj_type == PROJECTOR_TYPE_MINICPMV4_6
                     || model.proj_type == PROJECTOR_TYPE_MINICPMV4_7
@@ -2256,6 +2341,7 @@ struct mtmd_model_loader {
                     model.mm_soft_emb_norm_w = get_tensor(TN_MM_SOFT_EMB_N);
                 } break;
             case PROJECTOR_TYPE_IDEFICS3:
+            case PROJECTOR_TYPE_VISIONPSY:
                 {
                     model.mm_fc_w = get_tensor(mtmd_format(TN_MM_PROJECTOR, "weight"));
                 } break;
@@ -3796,11 +3882,111 @@ struct mtmd_model_loader {
             }
 
             // alloc memory and offload data
+            // On CPU, place quantized 2D weight matrices in the ggml "repack"
+            // extra buffer type (aarch64 i8mm interleaved layout, x86 AVX2, ...)
+            // so their mul_mat uses the much faster repacked GEMM. Only tensors
+            // the backend can actually repack+matmul go there (probed per-tensor);
+            // non-quant conv weights / biases / norms stay in the default buffer,
+            // else their non-matmul ops would become unsupported. On arches with
+            // no repack kernel the probe rejects everything and this is a no-op.
+            // Opt out with MTMD_CLIP_NO_REPACK=1.
+            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (cpu_dev && buft == ggml_backend_dev_buffer_type(cpu_dev) && !getenv("MTMD_CLIP_NO_REPACK")) {
+                ggml_backend_buffer_type_t repack_buft = nullptr;
+                {
+                    ggml_backend_reg_t cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+                    auto get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+                        ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+                    if (get_extra_bufts_fn) {
+                        ggml_backend_buffer_type_t * extra = get_extra_bufts_fn(cpu_dev);
+                        if (extra && extra[0]) repack_buft = extra[0];
+                    }
+                }
+                if (repack_buft) {
+                    // A weight goes to the repack buffer only if THIS arch can
+                    // actually repack it AND run its mul_mat there (probe like
+                    // llama's buft_supported). This is arch-correct: on x86 q8_0
+                    // isn't repackable so the probe fails and weights stay default;
+                    // on ARM (NEON+i8mm) it passes.
+                    ggml_backend_dev_t probe_dev = cpu_dev;
+                    ggml_backend_buffer_t probe_buf = ggml_backend_buft_alloc_buffer(repack_buft, 0);
+                    auto repack_ok = [&](const ggml_tensor * w) -> bool {
+                        if (ggml_n_dims(w) != 2) return false;
+                        ggml_init_params p = { ggml_tensor_overhead() * 4 + 256, nullptr, true };
+                        ggml_context * mctx = ggml_init(p);
+                        if (!mctx) return false;
+                        ggml_tensor * w2 = ggml_new_tensor_2d(mctx, w->type, w->ne[0], w->ne[1]);
+                        ggml_tensor * s1 = ggml_new_tensor_2d(mctx, GGML_TYPE_F32, w->ne[0], 8);
+                        ggml_tensor * op = ggml_mul_mat(mctx, w2, s1);
+                        w2->buffer = probe_buf; // pretend the weight lives in the repack buffer
+                        bool ok = ggml_backend_dev_supports_op(probe_dev, op);
+                        ggml_free(mctx);
+                        return ok;
+                    };
+                    // collect repackable weights
+                    std::vector<ggml_tensor *> repack_tensors;
+                    const size_t align = ggml_backend_buft_get_alignment(repack_buft);
+                    size_t repack_size = 0;
+                    for (ggml_tensor * t = ggml_get_first_tensor(model.ctx_data.get());
+                         t != nullptr; t = ggml_get_next_tensor(model.ctx_data.get(), t)) {
+                        if (repack_ok(t)) {
+                            repack_tensors.push_back(t);
+                            repack_size += GGML_PAD(ggml_backend_buft_get_alloc_size(repack_buft, t), align);
+                        }
+                    }
+                    if (probe_buf) ggml_backend_buffer_free(probe_buf);
+                    if (!repack_tensors.empty()) {
+                        model.buf_repack.reset(ggml_backend_buft_alloc_buffer(repack_buft, repack_size));
+                        if (!model.buf_repack) {
+                            // Repacking is only a speed-up: leave these weights to the
+                            // default buffer below rather than failing the load.
+                            LOG_WRN("%s: failed to allocate the %s buffer (%.1f MiB), keeping %zu weights unrepacked\n",
+                                    __func__, ggml_backend_buft_name(repack_buft),
+                                    repack_size / 1024.0 / 1024.0, repack_tensors.size());
+                        } else {
+                            ggml_backend_buffer_set_usage(model.buf_repack.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                            ggml_tallocr talloc = ggml_tallocr_new(model.buf_repack.get());
+                            for (ggml_tensor * t : repack_tensors) ggml_tallocr_alloc(&talloc, t);
+                            LOG_INF("%s: repacked %zu quantized weights into %s (%.1f MiB)\n",
+                                    __func__, repack_tensors.size(), ggml_backend_buft_name(repack_buft),
+                                    repack_size / 1024.0 / 1024.0);
+                        }
+                    }
+                }
+            }
+            // allocate everything not already placed (i.e. the non-repack tensors)
             model.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_data.get(), buft));
-            ggml_backend_buffer_set_usage(model.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (model.buf) {
+                ggml_backend_buffer_set_usage(model.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            } else {
+                // The allocator also returns NULL when nothing was left to place (every
+                // weight already went to the repack buffer). Only a weight that still has
+                // no storage is a failed allocation. Passing NULL on used to abort in
+                // ggml_backend_buffer_set_usage, silently where stderr isn't captured (iOS).
+                for (ggml_tensor * t = ggml_get_first_tensor(model.ctx_data.get()); t != nullptr;
+                     t = ggml_get_next_tensor(model.ctx_data.get(), t)) {
+                    if (t->data == nullptr && t->view_src == nullptr) {
+                        throw mtmd_backend_alloc_error(mtmd_format(
+                            "%s: failed to allocate the %s buffer for the projector weights (%.2f MiB)\n",
+                            __func__, ggml_backend_buft_name(buft), total_data_size / 1024.0 / 1024.0));
+                    }
+                }
+            }
+            for (auto * buf : {model.buf.get(), model.buf_repack.get()}) {
+                if (buf) {
+                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+                    if (!dev) {
+                        dev = cpu_dev;
+                    }
+                    model.mem_weights[dev] += ggml_backend_buffer_get_size(buf);
+                }
+            }
             // read the weight from file
             if (!no_alloc) {
                 size_t data_loaded = 0;
+                size_t n_converted = 0;
+                std::vector<float>       conv_f32;
+                std::vector<ggml_fp16_t> conv_f16;
                 for (auto & t : tensors_to_load) {
                     ggml_tensor * cur = ggml_get_tensor(model.ctx_data.get(), t->name);
                     GGML_ASSERT(cur && "tensor not found in ctx_data");
@@ -3811,8 +3997,41 @@ struct mtmd_model_loader {
                     if (!fin) {
                         throw std::runtime_error(mtmd_format("%s: failed to seek for tensor %s\n", __func__, t->name));
                     }
+                    const bool need_bf16_to_f16 =
+                        convert_bf16_to_f16 &&
+                        t->type == GGML_TYPE_BF16 &&
+                        cur->type == GGML_TYPE_F16;
+                    if (need_bf16_to_f16) {
+                        // Read raw bf16 from disk, convert to f32 then to f16, write to tensor.
+                        const int64_t n = ggml_nelements(cur);
+                        read_buf.resize(ggml_nbytes(t)); // bf16 layout
+                        fin.read(reinterpret_cast<char *>(read_buf.data()), read_buf.size());
+                        conv_f32.resize(n);
+                        conv_f16.resize(n);
+                        ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(read_buf.data()), conv_f32.data(), n);
+                        ggml_fp32_to_fp16_row(conv_f32.data(), conv_f16.data(), n);
+                        const size_t dst_bytes = ggml_nbytes(cur); // f16 layout
+                        // check the tensor's OWN buffer (weights may be split
+                        // across the default host buffer and the non-host repack buffer)
+                        if (ggml_backend_buft_is_host(ggml_backend_buffer_get_type(cur->buffer))) {
+                            memcpy(cur->data, conv_f16.data(), dst_bytes);
+                        } else {
+                            ggml_backend_tensor_set(cur, conv_f16.data(), 0, dst_bytes);
+                        }
+                        n_converted++;
+                        data_loaded += dst_bytes;
+                        if (progress_callback && total_data_size > 0) {
+                            const float progress = (float)data_loaded / (float)total_data_size;
+                            if (!progress_callback(progress, progress_callback_user_data)) {
+                                throw std::runtime_error(mtmd_format("%s: model loading cancelled by progress_callback\n", __func__));
+                            }
+                        }
+                        continue;
+                    }
                     size_t num_bytes = ggml_nbytes(cur);
-                    if (ggml_backend_buft_is_host(buft)) {
+                    // check the tensor's OWN buffer (weights may be split
+                    // across the default host buffer and the non-host repack buffer)
+                    if (ggml_backend_buft_is_host(ggml_backend_buffer_get_type(cur->buffer))) {
                         // for the CPU and Metal backend, we can read directly into the tensor
                         fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
                     } else {
@@ -3828,6 +4047,10 @@ struct mtmd_model_loader {
                             throw std::runtime_error(mtmd_format("%s: model loading cancelled by progress_callback\n", __func__));
                         }
                     }
+                }
+                if (n_converted > 0) {
+                    LOG_WRN("%s: %s does not support bf16; converted %zu bf16 weights to f16 on load\n",
+                            __func__, ggml_backend_buft_name(buft), n_converted);
                 }
                 LOG_DBG("%s: loaded %zu tensors from %s\n", __func__, tensors_to_load.size(), fname.c_str());
             } else {
@@ -3998,12 +4221,147 @@ mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params
         params.progress_callback,
         params.progress_callback_user_data);
 
+    if (params.image_tile_mode < 0 || params.image_tile_mode > 2) {
+        GGML_ABORT("invalid image_tile_mode %d; valid: 0=batched, 1=sequential, 2=disabled",
+                   params.image_tile_mode);
+    }
+
+    const char * func_name = __func__; // __func__ inside the lambda would read "operator()"
+
     auto load = [&](mtmd_modality modality) {
         auto model = std::make_unique<mtmd_model>();
         model->hparams.custom_image_min_tokens = params.image_min_tokens;
         model->hparams.custom_image_max_tokens = params.image_max_tokens;
+        model->hparams.image_tile_mode         = static_cast<mtmd_image_tile_mode>(params.image_tile_mode);
         loader.load_hparams(*model, modality);
-        loader.load_tensors(*model, buft, params.no_alloc);
+        // apply CLI/binding overrides after load_hparams so GGUF defaults don't clobber them.
+        // Only the Qwen3VL preprocessor reads preproc_max_tiles live; Qwen2/2.5VL use dyn_size
+        // and InternVL uses a candidate list already frozen in load_hparams, so the override is
+        // inert for them — apply (and validate) it only where it takes effect.
+        //
+        // Treat only a POSITIVE value as an explicit override. -1 is the documented unset
+        // sentinel, and 0 is what a zero-initialized mtmd_model_params / mtmd_context_params
+        // passes (bindings / direct C API callers that never set the field). Both are treated
+        // as unset here so those callers keep the GGUF/model default instead of silently
+        // forcing single-tile and losing multi-tile preprocessing on large/high-res images.
+        if (modality == MTMD_MODALITY_VISION && params.image_max_tiles > 0) {
+            if (model->proj_type != PROJECTOR_TYPE_QWEN3VL) {
+                LOG_WRN("%s: --image-max-tiles is only supported for Qwen3VL; ignoring for this model\n", func_name);
+            } else {
+                int max_tiles = params.image_max_tiles;
+                // Re-validate at this library boundary: bindings populate mtmd_context_params
+                // directly and bypass the CLI's [1,256] check. An unbounded value reaches the
+                // grid-fitting reserve in mtmd-image.cpp and can OOM the process.
+                if (max_tiles > MTMD_PREPROC_MAX_TILES_LIMIT) {
+                    LOG_WRN("%s: --image-max-tiles=%d exceeds [1,%d]; clamping\n",
+                            func_name, max_tiles, MTMD_PREPROC_MAX_TILES_LIMIT);
+                    max_tiles = MTMD_PREPROC_MAX_TILES_LIMIT;
+                }
+                model->hparams.preproc_max_tiles = max_tiles;
+                LOG_INF("%s: preproc_max_tiles: %d (custom value)\n", func_name, max_tiles);
+            }
+        }
+        // Same ordering rule as above: override the GGUF value, don't get clobbered by it.
+        // -1 is the unset sentinel; 0 and 1 are both explicit, unlike image_max_tiles, since
+        // "off" is a meaningful choice against a GGUF that turns it on. Only the idefics3
+        // preprocessor reads the flag, and VisionPsy shares that preprocessor.
+        if (modality == MTMD_MODALITY_VISION && params.image_no_upscale >= 0) {
+            const bool no_upscale = params.image_no_upscale != 0;
+            const projector_type pt = model->proj_type;
+            if (pt != PROJECTOR_TYPE_IDEFICS3 && pt != PROJECTOR_TYPE_VISIONPSY) {
+                LOG_WRN("%s: --image-no-upscale only affects idefics3-style preprocessing; ignoring for this model\n", func_name);
+            } else {
+                // Turning it OFF against a GGUF that turned it on is the one case that
+                // silently degrades quality, and it is also what a zero-initialized
+                // mtmd_model_params/mtmd_context_params passes (bindings and direct C
+                // API callers that never set the field). Say so rather than swallow it.
+                if (!no_upscale && model->hparams.image_no_upscale) {
+                    LOG_WRN("%s: image_no_upscale=0 overrides %s=true from the GGUF; "
+                            "pass -1 to keep the model default\n", func_name, KEY_PREPROC_NO_UPSCALE);
+                }
+                model->hparams.image_no_upscale = no_upscale;
+                LOG_INF("%s: preproc_no_upscale: %d (custom value)\n", func_name, no_upscale);
+            }
+        }
+        if (modality == MTMD_MODALITY_VISION) {
+            // Both idefics3-style sizing rules divide by image_size and cap with
+            // image_longest_edge, and neither degrades gracefully at zero: image_size 0 hits
+            // GGML_ASSERT(align_size > 0) at preprocess time, which aborts the process rather
+            // than failing the request, and image_longest_edge 0 makes the refined size {0,0},
+            // so the grid is empty and the model silently gets the overview alone, 64 image
+            // tokens where it expects hundreds. Fail the load instead, where it is reportable.
+            //
+            // Scoped to the two projectors that run this rule, NOT applied to every slicing
+            // model: image_size == 0 is legal elsewhere and means dynamic sizing, as the
+            // sanity check in load_hparams says, so a blanket check would reject Qwen-VL.
+            // Checked after the override above so it covers the flag as well as the GGUF key.
+            const auto & vp = model->hparams;
+            const projector_type slicing_pt = model->proj_type;
+            const bool idefics3_style = slicing_pt == PROJECTOR_TYPE_VISIONPSY ||
+                                        slicing_pt == PROJECTOR_TYPE_IDEFICS3;
+            // image_size is the divisor and the align size, and zero aborts the process at the
+            // first image, so it is a load failure for both.
+            if (idefics3_style && vp.image_size <= 0) {
+                throw std::runtime_error(
+                    mtmd_format("%s: this projector slices by image_size, which must be positive (%d)\n",
+                                func_name, vp.image_size));
+            }
+            // The cap is the one the two disagree on. VisionPsy's published mmprojs all carry
+            // it, so a missing cap there is broken metadata. idefics3 cannot throw: the shipped
+            // ggml-org/SmolVLM-500M-Instruct-GGUF mmproj has no preproc_image_size at all and
+            // would stop loading. It is already overview-only for that reason, so say so.
+            if (slicing_pt == PROJECTOR_TYPE_VISIONPSY && vp.image_longest_edge <= 0) {
+                throw std::runtime_error(
+                    mtmd_format("%s: this projector slices by image_size, so %s must be positive (%d)\n",
+                                func_name, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge));
+            }
+            if (slicing_pt == PROJECTOR_TYPE_IDEFICS3 && vp.image_longest_edge <= 0) {
+                LOG_WRN("%s: %s is missing, so the refined size is empty and every image will be "
+                        "encoded as the overview alone; slicing is effectively off\n",
+                        func_name, KEY_PREPROC_IMAGE_SIZE);
+            } else if (idefics3_style) {
+                // Past this point the cap is positive for both projectors, so the rest of the
+                // rule's invariants are checkable. They are `else` because the overview-only
+                // idefics3 above never reaches the sizing rule at all, and throwing there
+                // would contradict the warning we just printed.
+
+                // The cap is also the upper bound of the clamps in calc_size_no_upscale(), and
+                // std::clamp requires lo <= hi, so metadata that puts the cap below one slice is
+                // undefined behaviour rather than a bad result. Reject it here.
+                if (vp.image_no_upscale && vp.image_longest_edge < vp.image_size) {
+                    throw std::runtime_error(
+                        mtmd_format("%s: preproc_no_upscale needs %s (%d) >= image_size (%d)\n", func_name,
+                                    KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                }
+                // The slicing loop steps by image_size and both sizing rules round up to a
+                // multiple of it, so a cap that is not itself a multiple is the one input that
+                // breaks the invariant: calc_size_no_upscale() clamps the long side down to the
+                // cap and lands off-grid, giving a ragged trailing slice the reference splitter
+                // never emits. test-mtmd-preproc-sizing.cpp asserts the invariant; enforce it
+                // against real metadata here.
+                if (vp.image_longest_edge % vp.image_size != 0) {
+                    throw std::runtime_error(
+                        mtmd_format("%s: %s (%d) must be a multiple of image_size (%d)\n", func_name,
+                                    KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                }
+                // Upper bound, the counterpart of the image_max_tiles clamp above. The cap is a
+                // GGUF u32 read into an int, so a corrupt or hostile mmproj can declare a value
+                // that upscales every image to it: the grid is (cap/image_size)^2 slices and the
+                // loop in mtmd-image.cpp reserves one tile each, so cap=100000 at image_size=512
+                // is a 196x196 grid, ~30 GB of tiles, and a cap near INT32_MAX overflows the
+                // multiply-back in calc_size_preserved_ratio() first. Bound the grid, not the
+                // pixels, so the limit means the same thing as the Qwen-VL one.
+                const int64_t tiles_per_side = vp.image_longest_edge / vp.image_size;
+                if (tiles_per_side * tiles_per_side > MTMD_PREPROC_MAX_TILES_LIMIT) {
+                    throw std::runtime_error(
+                        mtmd_format("%s: %s (%d) at image_size %d implies %lld slices, over the limit of %d\n",
+                                    func_name, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size,
+                                    (long long) (tiles_per_side * tiles_per_side),
+                                    MTMD_PREPROC_MAX_TILES_LIMIT));
+                }
+            }
+        }
+        loader.load_tensors(*model, buft, params.no_alloc, params.convert_bf16_to_f16);
         const std::string & def = model->hparams.gen_default_voice;
         if (!def.empty() && model->gen_voices.find(def) == model->gen_voices.end()) {
             throw std::runtime_error(mtmd_format("%s: default voice \"%s\" is not a predefined voice\n", __func__, def.c_str()));
@@ -4018,7 +4376,14 @@ mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params
 
     // TODO: we don't support audio for Gemma 3N, but GGUF contains audio tensors
     // we can remove this check when we implement audio support for Gemma 3N
-    const bool skip_audio = res.v && res.v->proj_type == PROJECTOR_TYPE_GEMMA3NV;
+    bool skip_audio = res.v && res.v->proj_type == PROJECTOR_TYPE_GEMMA3NV;
+
+    // The caller can drop the audio tower when it never sends audio
+    if (loader.has_audio && !skip_audio && params.skip_audio) {
+        LOG_INF("%s: skipping the audio encoder at the caller's request\n", __func__);
+        skip_audio = true;
+    }
+
     if (loader.has_audio && !skip_audio) {
         res.a = load(MTMD_MODALITY_AUDIO);
     }
@@ -4215,16 +4580,36 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA4V:
         case PROJECTOR_TYPE_GEMMA4UV:
-        case PROJECTOR_TYPE_IDEFICS3:
-        case PROJECTOR_TYPE_COHERE2V:
         case PROJECTOR_TYPE_INTERNVL:
-        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
-        case PROJECTOR_TYPE_NEMOTRON_OMNI:
         case PROJECTOR_TYPE_LLAMA4:
             {
-                // both X and Y are downscaled by the scale factor
+                // These pool/reshape per dimension (ggml_pool_2d with pad 0, or a
+                // reshape that requires divisibility), so the graph emits
+                // floor(W/p/s) * floor(H/p/s). Round per dimension to match; this
+                // differs from floor(W/p * H/p / s^2) when a side is not divisible
+                // by s, which would otherwise mismatch the actual graph output and
+                // trip the token-count sanity check in mtmd_subcontext::encode.
                 int scale_factor = hparams.n_merge;
-                n_patches /= (scale_factor * scale_factor);
+                int x_patch = (img->nx() / patch_size) / scale_factor;
+                int y_patch = (img->ny() / patch_size) / scale_factor;
+                n_patches = x_patch * y_patch;
+            } break;
+        case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_COHERE2V:
+        case PROJECTOR_TYPE_VISIONPSY:
+        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
+        case PROJECTOR_TYPE_NEMOTRON_OMNI:
+            {
+                // These merge via build_patch_merge_permute(), which pads each
+                // dimension up to a multiple of the scale factor (MTMD_ALIGN)
+                // before the merge, so the graph emits
+                // ceil(W/p/s) * ceil(H/p/s). Match that rounding (mirrors the
+                // LFM2/KIMIVL and PaddleOCR merge cases below); floor would
+                // under-count on non-divisible grids and trip the sanity check.
+                int scale_factor = hparams.n_merge;
+                int x_patch = MTMD_ALIGN(img->nx() / patch_size, scale_factor) / scale_factor;
+                int y_patch = MTMD_ALIGN(img->ny() / patch_size, scale_factor) / scale_factor;
+                n_patches = x_patch * y_patch;
             } break;
         case PROJECTOR_TYPE_GEMMA3NV:
             {
@@ -4567,6 +4952,7 @@ int mtmd_model::n_mmproj_embd() const {
             return mm_input_proj_w->ne[1];
         case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_MUSE_SPARK_AUDIO:
+        case PROJECTOR_TYPE_VISIONPSY:
             return mm_fc_w->ne[1];
         case PROJECTOR_TYPE_VIBEVOICE_ASR:
             return mm_1_w->ne[1];

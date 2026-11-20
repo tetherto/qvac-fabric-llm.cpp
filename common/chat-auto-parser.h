@@ -61,6 +61,7 @@ struct generation_params {
     bool                                  stream              = true;
     std::string                           grammar;
     bool                                  add_generation_prompt  = false;
+    std::string                           generation_prompt;  // qvac: prefix string appended when add_generation_prompt is true
     common_chat_continuation              continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
     common_chat_msg                       continue_msg;
     bool                                  enable_thinking        = true;

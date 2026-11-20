@@ -163,7 +163,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
     ggml_context_ptr ctx { ctx_init };
 
     // must come after gguf_init_from_file_ptr, the llama_file constructor moves the file position
-    llama_file gguf_file(file);
+    llama_file_disk gguf_file(file);
 
     // check metadata
     {

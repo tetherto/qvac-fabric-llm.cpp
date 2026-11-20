@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -14,6 +15,110 @@
 //
 // mtmd_graph
 //
+
+// Whether the active GPU is an Arm Mali. Mali has no cooperative-matrix units,
+// so the Vulkan flash-attention kernel runs a slow scalar path; the explicit
+// mul_mat attention is faster there for short sequences. Detected from the
+// backend device description (e.g. "Mali-G715"). Safe-fails to false (which just
+// keeps the legacy flash-attention behavior), so a missed match never crashes.
+static bool mtmd_backend_is_mali(const mtmd_subcontext * ctx) {
+    if (!ctx->backends.backend || ctx->backends.backend == ctx->backends.backend_cpu) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backends.backend);
+    if (!dev) {
+        return false;
+    }
+    const char * strs[2] = { ggml_backend_dev_description(dev), ggml_backend_dev_name(dev) };
+    for (const char * s : strs) {
+        for (; s && *s; ++s) {
+            if ((s[0] == 'M' || s[0] == 'm') && (s[1] == 'a' || s[1] == 'A') &&
+                (s[2] == 'l' || s[2] == 'L') && (s[3] == 'i' || s[3] == 'I')) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Default explicit-attention cutoff (n_patches) applied on Mali when the user
+// hasn't set MTMD_CLIP_AUTO_FA_MIN_KV. Tuned for the Gemma 4 E2B vision encoder
+// on Pixel 9 Pro: 196-tok (1764) and 400-tok (3600) use explicit, 784-tok
+// (7056) uses flash-attention (explicit would OOM there).
+static const int MTMD_AUTO_FA_MIN_KV_MALI_DEFAULT = 4096;
+
+// mtmd_fa_effective_min_kv() — the pure AUTO-budget arithmetic — is defined
+// inline in mtmd-subcontext.h (so unit tests can exercise it without linking an
+// unexported symbol across the Windows mtmd.dll boundary). See there for the
+// full behavior contract.
+
+// Resolve the effective flash-attention mode for a single image graph.
+//
+// ENABLED/DISABLED are explicit user choices and are honored as-is. AUTO is
+// budget-aware: flash-attention is the memory-frugal path and is required for
+// long sequences, but on backends without cooperative-matrix (notably Arm
+// Mali) its scalar kernel is slower than the explicit mul_mat + softmax path
+// for short sequences. When MTMD_CLIP_AUTO_FA_MIN_KV is set (>0), AUTO uses
+// the explicit path below that attention length (n_patches) and flash-attention
+// at/above it. Unset (the default) preserves the legacy behavior: use
+// flash-attention whenever the backend supports it.
+static mtmd_flash_attn_type mtmd_resolve_flash_attn_type(mtmd_subcontext * ctx, int n_patches) {
+    if (ctx->flash_attn_type != MTMD_FLASH_ATTN_TYPE_AUTO) {
+        return ctx->flash_attn_type;
+    }
+    if (!ctx->flash_attn_supported) {
+        return MTMD_FLASH_ATTN_TYPE_DISABLED;
+    }
+    // Resolve the budget inputs once and cache them: getenv, Mali detection and
+    // the device-memory query don't change between images, so they must not run
+    // on the per-image hot path.
+    if (!ctx->fa_budget_cached) {
+        // Explicit-attention cutoff. The env var overrides on any backend (set
+        // to 0 to disable); otherwise it defaults on for Mali (where explicit is
+        // faster) and off everywhere else (where flash-attention is better).
+        const char * env_min_kv = std::getenv("MTMD_CLIP_AUTO_FA_MIN_KV");
+        if (env_min_kv && env_min_kv[0]) {
+            ctx->fa_auto_min_kv = (int) std::strtol(env_min_kv, nullptr, 10);
+        } else {
+            // Default the cutoff on for any backend without efficient (coopmat)
+            // FA — detected either at warmup via the backend query
+            // (fa_backend_inefficient) or by Mali device detection (covers
+            // paths where the warmup GPU-only probe doesn't run).
+            ctx->fa_auto_min_kv = (ctx->fa_backend_inefficient || mtmd_backend_is_mali(ctx))
+                                      ? MTMD_AUTO_FA_MIN_KV_MALI_DEFAULT : 0;
+        }
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_t dev = ctx->backends.backend ? ggml_backend_get_device(ctx->backends.backend) : nullptr;
+        if (dev) {
+            ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        }
+        ctx->fa_mem_total = total_mem;
+        ctx->fa_mem_free  = free_mem;
+        ctx->fa_budget_cached = true;
+    }
+
+    const int auto_fa_min_kv = ctx->fa_auto_min_kv;
+
+    // Cutoff disabled => legacy behavior: flash-attention whenever supported.
+    if (auto_fa_min_kv <= 0) {
+        return MTMD_FLASH_ATTN_TYPE_ENABLED;
+    }
+
+    // Explicit attention (mul_mat + softmax) is faster than the scalar FA kernel
+    // on no-coopmat GPUs for short sequences, but it materializes an
+    // O(n_patches^2 * n_head) score matrix. Memory-constrained devices can't
+    // hold that, so cap the "use explicit" cutoff by the memory budget (see
+    // mtmd_fa_effective_min_kv above: total memory = stable clamp, free memory
+    // = hard-fit check only, no memory info = conservative constant). This only
+    // ever lowers the cutoff, so constrained devices fall back to memory-frugal
+    // FA sooner.
+    const int eff_min_kv = mtmd_fa_effective_min_kv(
+        auto_fa_min_kv, ctx->fa_mem_total, ctx->fa_mem_free,
+        (int) ctx->model.hparams.n_head);
+
+    return (n_patches < eff_min_kv) ? MTMD_FLASH_ATTN_TYPE_DISABLED
+                                    : MTMD_FLASH_ATTN_TYPE_ENABLED;
+}
 
 mtmd_graph::mtmd_graph(mtmd_subcontext * ctx, const mtmd_image_f32 & img) :
         model(ctx->model),
@@ -32,7 +137,7 @@ mtmd_graph::mtmd_graph(mtmd_subcontext * ctx, const mtmd_image_f32 & img) :
         n_mmproj_embd(ctx->model.n_mmproj_embd()),
         eps(hparams.eps),
         kq_scale(d_head > 0 ? 1.0f / sqrtf((float)d_head) : 0.0f),
-        flash_attn_type(ctx->flash_attn_type) {
+        flash_attn_type(mtmd_resolve_flash_attn_type(ctx, n_patches)) {
     struct ggml_init_params params = {
         /*.mem_size   =*/ ctx->buf_compute_meta.size(),
         /*.mem_buffer =*/ ctx->buf_compute_meta.data(),
@@ -748,6 +853,7 @@ ggml_tensor * mtmd_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
 
 std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const mtmd_image_f32_batch & imgs,
                                                    const mtmd_subctx_encode_params * params) {
+    GGML_ASSERT(!imgs.entries.empty());
     const mtmd_image_f32 & img = imgs.entries[0];
     std::unique_ptr<mtmd_graph> builder;
 
@@ -755,6 +861,7 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_COHERE2V:
+        case PROJECTOR_TYPE_VISIONPSY:
         case PROJECTOR_TYPE_LFM2:
         case PROJECTOR_TYPE_D1OMNI_V:
         case PROJECTOR_TYPE_JANUS_PRO:

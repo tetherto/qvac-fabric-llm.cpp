@@ -50,6 +50,109 @@ struct Params {
 @group(0) @binding(PARAMS_BINDING)
 var<uniform> params: Params;
 
+#if defined(SIN) || defined(COS)
+const TWO_OVER_PI_WORDS = array<u32, 6>(0xa2f9836eu, 0x4e441529u, 0xfc2757d1u, 0xf534ddc0u, 0xdb629599u, 0x3c439041u);
+const PI_OVER_FOUR: f32 = 0.7853981633974483;
+const PI_OVER_TWO: f32 = 1.5707963267948966;
+const F32_SIGN_MASK: u32 = 0x80000000u;
+const F32_EXPONENT_MASK: u32 = 0x7f800000u;
+const F32_MANTISSA_MASK: u32 = 0x007fffffu;
+const F32_IMPLICIT_ONE: u32 = 0x00800000u;
+const F32_MANTISSA_BITS: u32 = 23u;
+const F32_EXPONENT_BIAS: i32 = 127;
+const F32_QUIET_NAN: u32 = 0x7fc00000u;
+const HALF_WORD_BITS: u32 = 16u;
+const HALF_WORD_MASK: u32 = 0xffffu;
+const WORD_BITS: u32 = 32u;
+const FIRST_WORD_MAX_SCALE: i32 = 33;
+const WORD_SKIP_BIAS: i32 = 2;
+const QUADRANT_WINDOW_LOW_BIT: i32 = 34;
+const QUADRANT_SHIFT: u32 = 30u;
+const QUADRANT_MASK: u32 = 3u;
+const FRACTION_MASK: u32 = 0x3fffffffu;
+const FRACTION_HALF: u32 = 0x20000000u;
+const FRACTION_ONE: i32 = 0x40000000;
+const FRACTION_SCALE: f32 = 9.313225746154785e-10;
+const COS_QUADRANT_OFFSET: u32 = 1u;
+
+struct ReducedAngle {
+    r: f32,
+    quadrant: u32,
+};
+
+fn mul_u32_wide(a: u32, b: u32) -> vec2<u32> {
+    let a_lo = a & HALF_WORD_MASK;
+    let a_hi = a >> HALF_WORD_BITS;
+    let b_lo = b & HALF_WORD_MASK;
+    let b_hi = b >> HALF_WORD_BITS;
+    let lo_lo = a_lo * b_lo;
+    let hi_lo = a_hi * b_lo;
+    let lo_hi = a_lo * b_hi;
+    let middle = (lo_lo >> HALF_WORD_BITS) + (hi_lo & HALF_WORD_MASK) + (lo_hi & HALF_WORD_MASK);
+    let lo = (middle << HALF_WORD_BITS) | (lo_lo & HALF_WORD_MASK);
+    let hi = a_hi * b_hi + (hi_lo >> HALF_WORD_BITS) + (lo_hi >> HALF_WORD_BITS) + (middle >> HALF_WORD_BITS);
+    return vec2<u32>(lo, hi);
+}
+
+fn carry_of(sum: u32, addend: u32) -> u32 {
+    return select(0u, 1u, sum < addend);
+}
+
+fn mul_mantissa_by_two_over_pi(mantissa: u32, first_word: u32) -> vec4<u32> {
+    let low = mul_u32_wide(mantissa, TWO_OVER_PI_WORDS[first_word + 2u]);
+    let mid = mul_u32_wide(mantissa, TWO_OVER_PI_WORDS[first_word + 1u]);
+    let high = mul_u32_wide(mantissa, TWO_OVER_PI_WORDS[first_word]);
+    let limb1 = low.y + mid.x;
+    let carry1 = carry_of(limb1, low.y);
+    let partial2 = mid.y + high.x;
+    let carry2 = carry_of(partial2, mid.y);
+    let limb2 = partial2 + carry1;
+    let carry3 = carry_of(limb2, partial2);
+    return vec4<u32>(low.x, limb1, limb2, high.y + carry2 + carry3);
+}
+
+fn funnel_shift_right(lo: u32, hi: u32, shift: u32) -> u32 {
+    return select((lo >> shift) | (hi << (WORD_BITS - shift)), lo, shift == 0u);
+}
+
+fn window_high_word(product: vec4<u32>, window_low_bit: u32) -> u32 {
+    let upper_limbs = window_low_bit >= WORD_BITS;
+    let below = select(product.y, product.z, upper_limbs);
+    let above = select(product.z, product.w, upper_limbs);
+    return funnel_shift_right(below, above, window_low_bit % WORD_BITS);
+}
+
+fn reduce_by_pio2(x: f32) -> ReducedAngle {
+    let bits = bitcast<u32>(x);
+    if ((bits & F32_EXPONENT_MASK) == F32_EXPONENT_MASK) {
+        return ReducedAngle(bitcast<f32>(bits | F32_QUIET_NAN), 0u);
+    }
+    if (abs(x) < PI_OVER_FOUR) {
+        return ReducedAngle(x, 0u);
+    }
+    let exponent = i32((bits & F32_EXPONENT_MASK) >> F32_MANTISSA_BITS) - F32_EXPONENT_BIAS;
+    let mantissa = (bits & F32_MANTISSA_MASK) | F32_IMPLICIT_ONE;
+    let scale = exponent - i32(F32_MANTISSA_BITS);
+    let first_word = select(0, (scale - WORD_SKIP_BIAS) / i32(WORD_BITS), scale > FIRST_WORD_MAX_SCALE);
+    let window_scale = scale - first_word * i32(WORD_BITS);
+    let product = mul_mantissa_by_two_over_pi(mantissa, u32(first_word));
+    let window = window_high_word(product, u32(QUADRANT_WINDOW_LOW_BIT - window_scale));
+    let fraction_bits = window & FRACTION_MASK;
+    let round_up = fraction_bits >= FRACTION_HALF;
+    let fraction = f32(i32(fraction_bits) - select(0, FRACTION_ONE, round_up)) * FRACTION_SCALE;
+    let quadrant = ((window >> QUADRANT_SHIFT) + select(0u, 1u, round_up)) & QUADRANT_MASK;
+    let r = fraction * PI_OVER_TWO;
+    let negative = (bits & F32_SIGN_MASK) != 0u;
+    return ReducedAngle(select(r, -r, negative), select(quadrant, (0u - quadrant) & QUADRANT_MASK, negative));
+}
+
+fn sin_in_quadrant(angle: ReducedAngle, quadrant_offset: u32) -> f32 {
+    let quadrant = angle.quadrant + quadrant_offset;
+    let magnitude = select(sin(angle.r), cos(angle.r), (quadrant & 1u) == 1u);
+    return select(magnitude, -magnitude, (quadrant & 2u) == 2u);
+}
+#endif
+
 fn erf_approx(x: TYPE) -> TYPE {
     let x_f32 = f32(x);
     let s = select(-1.0, 1.0, x_f32 >= 0.0);
@@ -183,11 +286,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     let res = TYPE(sqrt(f32(src[params.offset_src + src_idx])));
 #endif
 #ifdef SIN
-    let res_f32 = sin(f32(src[params.offset_src + src_idx]));
+    let res_f32 = sin_in_quadrant(reduce_by_pio2(f32(src[params.offset_src + src_idx])), 0u);
     let res = TYPE(res_f32);
 #endif
 #ifdef COS
-    let res_f32 = cos(f32(src[params.offset_src + src_idx]));
+    let res_f32 = sin_in_quadrant(reduce_by_pio2(f32(src[params.offset_src + src_idx])), COS_QUADRANT_OFFSET);
     let res = TYPE(res_f32);
 #endif
 #ifdef DIAG

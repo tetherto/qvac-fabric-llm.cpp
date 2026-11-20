@@ -58,6 +58,44 @@ server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_toke
 }
 
 //
+// server_checkpoint_pool
+//
+
+server_checkpoint_pool::checkpoint_list::iterator server_checkpoint_pool::discard(
+        checkpoint_list & checkpoints, checkpoint_list::iterator it) {
+    // a checkpoint shared with the prompt cache is still read from there, only the slot's reference goes
+    if (it->use_count() == 1) {
+        // add() and the slot restore create every checkpoint non-const, the list only hands out const views
+        spare.push_back(std::const_pointer_cast<common_prompt_checkpoint>(*it));
+    }
+    return checkpoints.erase(it);
+}
+
+common_prompt_checkpoint & server_checkpoint_pool::add(checkpoint_list & checkpoints) {
+    if (spare.empty()) {
+        auto cur = std::make_shared<common_prompt_checkpoint>();
+        checkpoints.push_back(cur);
+        return *cur;
+    }
+
+    auto cur = std::move(spare.front());
+    spare.pop_front();
+
+    // nothing of the old checkpoint may reach the new one: update_dft() leaves the draft data alone without a draft
+    // context and the speculative state is optional; the buffers keep their capacity, so refilling them neither
+    // allocates nor touches new pages (common_state_data does not zero what resize() adds)
+    cur->clear();
+    cur->id_task = -1;
+
+    checkpoints.push_back(cur);
+    return *cur;
+}
+
+void server_checkpoint_pool::clear() {
+    spare.clear();
+}
+
+//
 // server_prompt_cache
 //
 

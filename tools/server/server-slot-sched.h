@@ -47,6 +47,22 @@ struct server_prompt {
     server_prompt_reuse get_reuse(int32_t n_prefix, bool has_new_tokens, int32_t n_swa, llama_pos pos_min) const;
 };
 
+// discarded context checkpoints, kept so that new checkpoints reuse their memory instead of page-faulting fresh allocations
+// only a checkpoint that nothing else references is kept, one shared with the prompt cache is released
+struct server_checkpoint_pool {
+    using checkpoint_list = decltype(server_prompt::checkpoints);
+
+    std::list<std::shared_ptr<common_prompt_checkpoint>> spare;
+
+    // remove the checkpoint at `it` from `checkpoints` (into the pool if unshared), returns the iterator that follows it
+    checkpoint_list::iterator discard(checkpoint_list & checkpoints, checkpoint_list::iterator it);
+
+    // append an empty checkpoint to `checkpoints`; a reused one keeps the capacity of its buffers for update_tgt() and update_dft()
+    common_prompt_checkpoint & add(checkpoint_list & checkpoints);
+
+    void clear();
+};
+
 struct server_prompt_data {
     common_state_data main;
     common_state_data drft;

@@ -28,8 +28,12 @@ permissions:
   actions: write
   contents: read
 
+# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
+# re-dispatch supersedes the in-flight run. The default branch deliberately
+# keeps upstream's run_id behaviour — master pushes must not cancel each other,
+# or a merged commit can end with no CI verdict. See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -60,6 +64,11 @@ jobs:
         id: install_ninja
         run: |
           choco install ninja
+
+      - name: Install LLVM
+        run: |
+          choco install llvm --version=22.1.8
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
 
       - name: Install OpenCL Headers and Libs
         id: install_opencl
@@ -95,3 +104,123 @@ jobs:
           older: 5m
           min: 1
           dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
+
+  ubuntu-24-opencl:
+    runs-on: ubuntu-24.04
+
+    env:
+      POCL_VERSION: '7.2'
+      POCL_SHA256: 7ddc01a7afcd49d4ec7fa9bf94df20852db44fcda629a9763086a8c541e5da1e
+      POCL_LLVM_VERSION: '19'
+      POCL_HOST_CPU: x86-64-v3
+      OPENCL_TEST_OPS: CONV_2D,CONV_2D_DW,POOL_2D,HARDSWISH,HARDSIGMOID,GRU,ZERO_UPSAMPLE,CHANNEL_SHUFFLE,AFFINE_PRELU,SNAKE,GROUP_NORM,GROUP_NORM_MUL_ADD
+      OPENCL_FA_CHUNK_PARAMS: 'kv=256,nb=4100,'
+      OPENCL_FA_CHUNK_CASES: '2'
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: ubuntu-24-opencl
+          evict-old-files: 1d
+
+      - name: Dependencies
+        id: depends
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build clinfo \
+            ocl-icd-opencl-dev ocl-icd-dev opencl-headers opencl-clhpp-headers \
+            "llvm-${POCL_LLVM_VERSION}-dev" "libclang-${POCL_LLVM_VERSION}-dev" \
+            "libclang-cpp${POCL_LLVM_VERSION}-dev" "clang-${POCL_LLVM_VERSION}"
+
+      - name: Restore PoCL
+        id: pocl_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/pocl
+          key: pocl-${{ env.POCL_VERSION }}-llvm${{ env.POCL_LLVM_VERSION }}-${{ hashFiles('.github/workflows/build-opencl.yml') }}
+
+      - name: Fetch PoCL
+        if: steps.pocl_cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/pocl.tar.gz" "https://github.com/pocl/pocl/archive/refs/tags/v${POCL_VERSION}.tar.gz"
+          echo "${POCL_SHA256}  $RUNNER_TEMP/pocl.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/pocl.tar.gz" -C "$RUNNER_TEMP"
+
+      - name: Build PoCL with cl_khr_fp16 and LLVM builtins (SLEEF fabs lacks half)
+        if: steps.pocl_cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S "$RUNNER_TEMP/pocl-${POCL_VERSION}" -B "$RUNNER_TEMP/pocl-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/pocl" \
+            -DWITH_LLVM_CONFIG="/usr/bin/llvm-config-${POCL_LLVM_VERSION}" \
+            -DENABLE_ICD=ON \
+            -DENABLE_HOST_CPU_VECTORIZE_LIBMVEC=ON \
+            -DLLC_HOST_CPU="$POCL_HOST_CPU" \
+            -DENABLE_HWLOC=OFF \
+            -DENABLE_LOADABLE_DRIVERS=OFF \
+            -DENABLE_SPIRV=OFF \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_EXAMPLES=OFF
+          cmake --build "$RUNNER_TEMP/pocl-build" -j "$(nproc)"
+          cmake --install "$RUNNER_TEMP/pocl-build"
+          OCL_ICD_VENDORS="$RUNNER_TEMP/pocl/etc/OpenCL/vendors" clinfo | grep cl_khr_fp16
+
+      - name: Save PoCL
+        if: steps.pocl_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/pocl
+          key: ${{ steps.pocl_cache.outputs.cache-primary-key }}
+
+      - name: Build (GGML_OPENCL, portable kernels)
+        id: cmake_build
+        run: |
+          # NOTE: no -DLLAMA_FATAL_WARNINGS=ON — upstream ggml-opencl.cpp has
+          # intentional (un-annotated) case fall-throughs that GCC's
+          # -Wimplicit-fallthrough would turn into errors. This job's purpose is
+          # to run test-backend-ops, not to gate upstream warning-cleanliness.
+          # GGML_NATIVE defaults to ON for a native x86 build, which bakes
+          # -march=native into the CPU backend. The ccache key is shared across
+          # runs, so an object built on an AVX-512 runner gets reused on a runner
+          # without it and test-backend-ops dies with SIGILL (exit 132) before
+          # printing a single test. Every other x64 job here already sets OFF.
+          # Adreno kernels default ON and reject non-Adreno devices, so the
+          # POCL CPU device would be dropped and test-backend-ops would run no
+          # kernels. These ops do not need the Adreno kernels.
+          cmake -B build \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENCL=ON \
+            -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF
+          time cmake --build build --config Release -j $(nproc) --target test-backend-ops
+
+      - name: Test backend ops (OpenCL)
+        id: test_backend_ops
+        run: |
+          require_opencl_pass() {
+            if ! grep -q "Backend OpenCL: .*OK" "$1"; then
+              echo "::error::test-backend-ops did not run the OpenCL backend or it failed, see $1"
+              exit 1
+            fi
+          }
+          require_all_cases_pass() {
+            if ! grep -Eq "^ *$2/$2 tests passed$" "$1"; then
+              echo "::error::expected all $2 selected cases to run and pass on OpenCL, see $1"
+              exit 1
+            fi
+          }
+          export OCL_ICD_VENDORS="$RUNNER_TEMP/pocl/etc/OpenCL/vendors"
+          export GGML_OPENCL_ALLOW_GENERIC_DEVICE=1
+          clinfo -l
+          ./build/bin/test-backend-ops test -o "$OPENCL_TEST_OPS" | tee tbo.log
+          require_opencl_pass tbo.log
+          ./build/bin/test-backend-ops test -o FLASH_ATTN_EXT -p "$OPENCL_FA_CHUNK_PARAMS" | tee tbo-fa.log
+          require_all_cases_pass tbo-fa.log "$OPENCL_FA_CHUNK_CASES"

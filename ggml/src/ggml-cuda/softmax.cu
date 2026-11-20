@@ -142,6 +142,94 @@ static __global__ void soft_max_f32(
     }
 }
 
+// GGML_CUDA_DISABLE_SHORT_ROW_SOFTMAX=1 keeps every softmax on the block-per-row kernels, to A/B soft_max_f32_short_rows
+static bool ggml_cuda_short_row_softmax_disabled() {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SHORT_ROW_SOFTMAX");
+    return disabled;
+}
+
+// rows of at most this many values take soft_max_f32_short_rows when there are enough of them.
+// Measured on a T4 against the block-per-row kernels at 4096 to 357120 rows: 1.5x to 59x faster up to 16 values,
+// even at 20, and slower from 24 values with a mask, 1.3x there and 4x at 32 (one thread reads a whole row).
+// soft_max_f32_cuda has one instantiation per power of 2 up to this value: change both together.
+#define CUDA_SOFT_MAX_SHORT_ROW 16
+// limit on NVIDIA GPUs other than Turing and cc 12.0: on a DGX Spark (GB10, cc 12.1) the kernel was 1.3x slower at 16
+// values with a mask, the attention shape of 16-token windows, and 1.3x to 100x faster up to 12 values
+#define CUDA_SOFT_MAX_SHORT_ROW_NVIDIA_OTHER 12
+// limit on RDNA 3.5: on a Radeon 8060S (gfx1151) the kernel was 1.9x to 25x faster up to 8 values and up to 2.7x
+// slower at 12 and 16
+#define CUDA_SOFT_MAX_SHORT_ROW_RDNA3_5    8
+// fewest rows for that kernel, the lowest row count of the T4 sweep: smaller calls keep the block-per-row kernels
+#define CUDA_SOFT_MAX_SHORT_ROW_MIN_ROWS   4096
+// not tuned
+#define CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE 128
+
+// Longest row for soft_max_f32_short_rows on this GPU, 0 where it is not used. A T4 (Turing) and an RTX 5090 (cc 12.0)
+// were faster up to 16 values. Other NVIDIA GPUs from Turing on, measured only on a GB10 (cc 12.1), stop at 12, where
+// all three were faster. On AMD only RDNA 3.5 was measured. Every other GPU keeps the block-per-row kernels.
+static int ggml_cuda_short_row_softmax_limit(const int cc) {
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
+        const bool turing = cc < GGML_CUDA_CC_AMPERE;
+        return turing || cc == GGML_CUDA_CC_BLACKWELL ? CUDA_SOFT_MAX_SHORT_ROW : CUDA_SOFT_MAX_SHORT_ROW_NVIDIA_OTHER;
+    }
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+        return CUDA_SOFT_MAX_SHORT_ROW_RDNA3_5;
+    }
+    return 0;
+}
+
+// One thread per row. The other kernels use one block per row, which for hundreds of thousands of rows of a few
+// values (attention inside small windows) is mostly launch and reduction overhead. No sinks, no ALiBi bias.
+// max_cols is a power of 2 at or above the row length: with the loops unrolled to it, vals is indexed by constants
+// and stays in registers instead of local memory.
+template <typename T, int max_cols>
+static __global__ void soft_max_f32_short_rows(
+        const float * __restrict__ x, const T * __restrict__ mask, float * __restrict__ dst, const soft_max_params p) {
+    const int64_t row = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (row >= p.nrows_x) {
+        return;
+    }
+    const int ncols = p.ncols;
+
+    x   += row*ncols;
+    dst += row*ncols;
+    if (mask != nullptr) {
+        const int64_t i01 = row % p.ne01;
+        const int64_t i02 = (row / p.ne01) % p.ne02;
+        const int64_t i03 = row / (p.ne01*p.ne02);
+        mask += (i01*p.nb11 + (i02 % p.ne12)*p.nb12 + (i03 % p.ne13)*p.nb13) / sizeof(T);
+    }
+
+    float vals[max_cols];
+    float max_val = -INFINITY;
+#pragma unroll
+    for (int col = 0; col < max_cols; ++col) {
+        if (col < ncols) {
+            const float val = x[col]*p.scale + (mask ? t2f32(mask[col]) : 0.0f);
+            vals[col] = val;
+            max_val   = max(max_val, val);
+        }
+    }
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int col = 0; col < max_cols; ++col) {
+        if (col < ncols) {
+            const float val = expf(vals[col] - max_val);
+            vals[col] = val;
+            sum += val;
+        }
+    }
+
+    const float inv_sum = 1.0f / sum;
+#pragma unroll
+    for (int col = 0; col < max_cols; ++col) {
+        if (col < ncols) {
+            dst[col] = vals[col] * inv_sum;
+        }
+    }
+}
+
 template <int n_elem_per_thread = 0>
 static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __restrict__ x,
                                                                 float * __restrict__ dst,
@@ -397,6 +485,24 @@ static void soft_max_f32_cuda(const float *                                x,
                               [[maybe_unused]] ggml_backend_cuda_context & ctx) {
     int nth = WARP_SIZE;
     const int64_t ncols_x = params.ncols;
+
+    const int short_row_limit = ggml_cuda_short_row_softmax_limit(ggml_cuda_info().devices[ctx.device].cc);
+    if (ncols_x <= short_row_limit && params.nrows_x >= CUDA_SOFT_MAX_SHORT_ROW_MIN_ROWS && sinks == nullptr &&
+        params.max_bias == 0.0f && !ggml_cuda_short_row_softmax_disabled()) {
+        const int64_t n_blocks = (params.nrows_x + CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE - 1) / CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE;
+        GGML_ASSERT(n_blocks <= INT32_MAX);
+        const dim3 grid((unsigned int) n_blocks);
+        const dim3 block(CUDA_SOFT_MAX_SHORT_ROW_BLOCK_SIZE);
+        // one case per power of 2 up to CUDA_SOFT_MAX_SHORT_ROW: change both together
+        if (ncols_x <= 4) {
+            soft_max_f32_short_rows<T,  4><<<grid, block, 0, stream>>>(x, mask, dst, params);
+        } else if (ncols_x <= 8) {
+            soft_max_f32_short_rows<T,  8><<<grid, block, 0, stream>>>(x, mask, dst, params);
+        } else {
+            soft_max_f32_short_rows<T, 16><<<grid, block, 0, stream>>>(x, mask, dst, params);
+        }
+        return;
+    }
 
     while (nth < ncols_x && nth < CUDA_SOFT_MAX_BLOCK_SIZE) nth *= 2;
     const dim3 block_dims(nth,     1, 1);

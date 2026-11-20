@@ -22,6 +22,7 @@ add_library(${HTP_LIB} SHARED
     hmx-queue.c
     htp-dcache.c
     matmul-ops.c
+    conv-taps-ops.c
     flash-attn-ops.c
     gated-delta-net-ops.c
     binary-ops.c
@@ -51,6 +52,7 @@ add_library(${HTP_LIB} SHARED
     roll-ops.c
     pool-ops.c
     upscale-ops.c
+    snake-ops.c
     allreduce-ops.c
     dsv4-hc-ops.c
     lightning-indexer-ops.c
