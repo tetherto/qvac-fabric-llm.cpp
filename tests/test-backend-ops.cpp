@@ -14347,11 +14347,28 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     const int64_t n_slices;
     const ggml_type type_KV;
     const int64_t run;      // rows in runs of this many consecutive cells instead of random cells (0)
+    const float logit_softcap;
+    const bool sinks;
+    const ggml_type type_V; // type_KV unless set
 
     std::vector<int32_t> rows;
 
     std::string vars() override {
-        return VARS_TO_STR8(hs, nh, gqa, n_cells, kv, nb, n_slices, type_KV) + (run > 0 ? ",run=" + std::to_string(run) : "");
+        std::string s = VARS_TO_STR8(hs, nh, gqa, n_cells, kv, nb, n_slices, type_KV);
+        // only non-default values, so that the names of the other cases do not change
+        if (run > 0) {
+            s += ",run=" + std::to_string(run);
+        }
+        if (logit_softcap != 0.0f) {
+            s += "," + VAR_TO_STR(logit_softcap);
+        }
+        if (sinks) {
+            s += "," + VAR_TO_STR(sinks);
+        }
+        if (type_V != type_KV) {
+            s += "," + VAR_TO_STR(type_V);
+        }
+        return s;
     }
 
     double max_nmse_err() override {
@@ -14359,8 +14376,10 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     }
 
     test_flash_attn_ext_kv_rows(int64_t hs = 256, int64_t nh = 2, int64_t gqa = 8, int64_t n_cells = 2048, int64_t kv = 512,
-                                int64_t nb = 8, int64_t n_slices = 4, ggml_type type_KV = GGML_TYPE_F16, int64_t run = 0)
-        : hs(hs), nh(nh), gqa(gqa), n_cells(n_cells), kv(kv), nb(nb), n_slices(n_slices), type_KV(type_KV), run(run) {}
+                                int64_t nb = 8, int64_t n_slices = 4, ggml_type type_KV = GGML_TYPE_F16, int64_t run = 0,
+                                float logit_softcap = 0.0f, bool sinks = false, ggml_type type_V = GGML_TYPE_COUNT)
+        : hs(hs), nh(nh), gqa(gqa), n_cells(n_cells), kv(kv), nb(nb), n_slices(n_slices), type_KV(type_KV), run(run),
+          logit_softcap(logit_softcap), sinks(sinks), type_V(type_V == GGML_TYPE_COUNT ? type_KV : type_V) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_slices);
@@ -14368,7 +14387,7 @@ struct test_flash_attn_ext_kv_rows : public test_case {
 
         // cache layout [hs, nh, n_cells], shared by all slices
         ggml_tensor * k0 = ggml_new_tensor_3d(ctx, type_KV, hs, nh, n_cells);
-        ggml_tensor * v0 = ggml_new_tensor_3d(ctx, type_KV, hs, nh, n_cells);
+        ggml_tensor * v0 = ggml_new_tensor_3d(ctx, type_V,  hs, nh, n_cells);
         ggml_set_name(k0, "k0");
         ggml_set_name(v0, "v0");
 
@@ -14381,7 +14400,12 @@ struct test_flash_attn_ext_kv_rows : public test_case {
         ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, n_slices);
         ggml_set_name(r, "r");
 
-        ggml_tensor * out = ggml_flash_attn_ext_rows(ctx, q, k, v, m, r, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_tensor * out = ggml_flash_attn_ext_rows(ctx, q, k, v, m, r, 1.0f/sqrtf(hs), 0.0f, logit_softcap);
+        if (sinks) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh*gqa);
+            ggml_set_name(s, "s");
+            ggml_flash_attn_ext_add_sinks(out, s);
+        }
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
 
@@ -14416,6 +14440,8 @@ struct test_flash_attn_ext_kv_rows : public test_case {
             }
             if (strcmp(t->name, "r") == 0) {
                 ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
                 std::vector<float> f(ggml_nelements(t));
                 std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
@@ -19785,6 +19811,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 40, 4, 2, 1024, 256, nb, 4));
         test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 72, 4, 2, 1024, 256, nb, 4));
         test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 64, 4, 2, 1024, 257, nb, 4));
+        // runs of consecutive cells in lists that are not a multiple of the block size: bounds-checked consecutive blocks
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 64, 4, 2, 1024, 257, nb, 4, GGML_TYPE_F16,  100));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows(128, 4, 2, 2048, 300, nb, 4, GGML_TYPE_Q8_0, 100));
+    }
+
+    // logit softcap, attention sinks and K/V of different types
+    for (int64_t nb : {1, 8, 64}) {
+        for (int64_t run : {0, 40}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(128, 4, 2, 2048, 512, nb, 4, GGML_TYPE_F16,  run, 10.0f));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 4, 2048, 512, nb, 4, GGML_TYPE_F16,  run, 10.0f));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 64, 8, 8, 2048, 512, nb, 4, GGML_TYPE_F16,  run, 0.0f, true));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(128, 4, 2, 2048, 512, nb, 4, GGML_TYPE_Q8_0, run, 0.0f, true));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(128, 4, 2, 2048, 512, nb, 4, GGML_TYPE_Q8_0, run, 0.0f, false, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(128, 4, 2, 2048, 512, nb, 4, GGML_TYPE_F16,  run, 0.0f, false, GGML_TYPE_Q8_0));
+        }
     }
 
     // sparse mask with large batch size
