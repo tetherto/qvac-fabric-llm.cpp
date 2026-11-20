@@ -576,6 +576,169 @@ static bool ggml_vk_roll_bk_loop(const uint32_t * code, size_t word_count, std::
     return true;
 }
 
+struct vk_spv_shared_avail_scan {
+    std::unordered_map<uint32_t, uint32_t> pointer_storage;  // pointer type id -> storage class
+    std::unordered_set<uint32_t>           shared_pointers;  // value ids that point to Workgroup memory
+    std::unordered_map<uint32_t, uint32_t> uint_constants;   // constant id -> value
+    std::unordered_map<uint32_t, uint32_t> new_semantics;    // barrier semantics id -> new constant id
+    uint32_t                               bound = 0;
+    size_t                                 shared_accesses = 0;
+};
+
+// Index of the memory operand mask of a load/store, or 0 when the instruction has none.
+static size_t ggml_vk_spv_memory_operand_index(uint32_t op, uint32_t wc) {
+    size_t idx = 0;
+    switch (op) {
+        case spv::OpLoad:                     idx = 4; break;
+        case spv::OpStore:                    idx = 3; break;
+        case kSpvOpCooperativeMatrixLoadKHR:  idx = 6; break;
+        case kSpvOpCooperativeMatrixStoreKHR: idx = 5; break;
+        default: return 0;
+    }
+    return wc > idx ? idx : 0;
+}
+
+static uint32_t ggml_vk_spv_pointer_operand(const uint32_t * inst) {
+    const uint32_t op = inst[0] & spv::OpCodeMask;
+    return (op == spv::OpLoad || op == kSpvOpCooperativeMatrixLoadKHR) ? inst[3] : inst[1];
+}
+
+static bool ggml_vk_spv_is_pointer_producer(uint32_t op) {
+    return op == spv::OpVariable || op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain ||
+           op == spv::OpPtrAccessChain || op == spv::OpInBoundsPtrAccessChain || op == spv::OpCopyObject ||
+           op == spv::OpBitcast;
+}
+
+static bool ggml_vk_spv_has_shared_avail(const uint32_t * inst, uint32_t wc, const vk_spv_shared_avail_scan & scan) {
+    const size_t idx = ggml_vk_spv_memory_operand_index(inst[0] & spv::OpCodeMask, wc);
+    const uint32_t avail_vis = spv::MemoryAccessMakePointerAvailableKHRMask | spv::MemoryAccessMakePointerVisibleKHRMask;
+    return idx != 0 && (inst[idx] & avail_vis) && scan.shared_pointers.count(ggml_vk_spv_pointer_operand(inst));
+}
+
+// Collects types, constants and Workgroup pointers. Returns false when the module has nothing to rewrite.
+static bool ggml_vk_spv_scan_shared_avail(const uint32_t * code, size_t word_count, vk_spv_shared_avail_scan & scan) {
+    for (size_t pos = 5; pos < word_count; ) {
+        const uint32_t wc = code[pos] >> spv::WordCountShift;
+        const uint32_t op = code[pos] & spv::OpCodeMask;
+        if (wc == 0 || pos + wc > word_count) {
+            return false;
+        }
+        const uint32_t * inst = code + pos;
+        if (op == spv::OpTypePointer && wc >= 3) {
+            scan.pointer_storage[inst[1]] = inst[2];
+        } else if (ggml_vk_spv_is_pointer_producer(op) && wc >= 3) {
+            auto it = scan.pointer_storage.find(inst[1]);
+            if (it != scan.pointer_storage.end() && it->second == spv::StorageClassWorkgroup) {
+                scan.shared_pointers.insert(inst[2]);
+            }
+        } else if (op == spv::OpConstant && wc == 4) {
+            scan.uint_constants[inst[2]] = inst[3];
+        } else if ((op == spv::OpCopyMemory && wc > 3) || (op == spv::OpCopyMemorySized && wc > 4)) {
+            return false;
+        }
+        scan.shared_accesses += ggml_vk_spv_has_shared_avail(inst, wc, scan) ? 1 : 0;
+        pos += wc;
+    }
+    scan.bound = code[3];
+    return scan.shared_accesses > 0;
+}
+
+// Assigns a new semantics constant (with MakeAvailable and MakeVisible) to every ordering barrier on Workgroup memory.
+static bool ggml_vk_spv_plan_barriers(const uint32_t * code, size_t word_count, vk_spv_shared_avail_scan & scan) {
+    const uint32_t order = spv::MemorySemanticsAcquireMask | spv::MemorySemanticsReleaseMask |
+                           spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsSequentiallyConsistentMask;
+    const uint32_t avail_vis = spv::MemorySemanticsMakeAvailableKHRMask | spv::MemorySemanticsMakeVisibleKHRMask;
+    for (size_t pos = 5; pos < word_count; pos += code[pos] >> spv::WordCountShift) {
+        const uint32_t op = code[pos] & spv::OpCodeMask;
+        if (op != spv::OpControlBarrier && op != spv::OpMemoryBarrier) {
+            continue;
+        }
+        const uint32_t sem_id = code[pos + (op == spv::OpControlBarrier ? 3 : 2)];
+        auto it = scan.uint_constants.find(sem_id);
+        if (it == scan.uint_constants.end()) {
+            return false;
+        }
+        const uint32_t sem = it->second;
+        if ((sem & spv::MemorySemanticsWorkgroupMemoryMask) && (sem & order) && (sem & avail_vis) != avail_vis &&
+            !scan.new_semantics.count(sem_id)) {
+            scan.new_semantics[sem_id] = scan.bound++;
+        }
+    }
+    return true;
+}
+
+// Drops MakePointerAvailable/Visible and their scope operands; NonPrivatePointer stays.
+static bool ggml_vk_spv_append_stripped_access(const uint32_t * inst, uint32_t wc, const vk_spv_shared_avail_scan & scan, std::vector<uint32_t> & out) {
+    const size_t idx  = ggml_vk_spv_memory_operand_index(inst[0] & spv::OpCodeMask, wc);
+    const uint32_t mask = inst[idx];
+    const size_t aligned = (mask & spv::MemoryAccessAlignedMask) ? 1 : 0;
+    const size_t scopes  = ((mask & spv::MemoryAccessMakePointerAvailableKHRMask) ? 1 : 0) +
+                           ((mask & spv::MemoryAccessMakePointerVisibleKHRMask) ? 1 : 0);
+    for (size_t s = 0; s < scopes; ++s) {
+        auto it = scan.uint_constants.find(inst[idx + 1 + aligned + s]);
+        if (it == scan.uint_constants.end() || it->second != spv::ScopeWorkgroup) {
+            return false;
+        }
+    }
+    const size_t start = out.size();
+    out.insert(out.end(), inst, inst + idx);
+    out.push_back(mask & ~(spv::MemoryAccessMakePointerAvailableKHRMask | spv::MemoryAccessMakePointerVisibleKHRMask));
+    out.insert(out.end(), inst + idx + 1, inst + idx + 1 + aligned);
+    out.insert(out.end(), inst + idx + 1 + aligned + scopes, inst + wc);
+    out[start] = (uint32_t)((out.size() - start) << spv::WordCountShift) | (inst[0] & spv::OpCodeMask);
+    return true;
+}
+
+// Copies an instruction, pointing barriers at their new semantics and adding each new constant after its original.
+static void ggml_vk_spv_append_with_new_semantics(const uint32_t * inst, uint32_t wc, const vk_spv_shared_avail_scan & scan, std::vector<uint32_t> & out) {
+    const uint32_t op    = inst[0] & spv::OpCodeMask;
+    const size_t   start = out.size();
+    out.insert(out.end(), inst, inst + wc);
+
+    const size_t sem = op == spv::OpControlBarrier ? 3 : (op == spv::OpMemoryBarrier ? 2 : 0);
+    if (sem != 0) {
+        auto it = scan.new_semantics.find(inst[sem]);
+        if (it != scan.new_semantics.end()) {
+            out[start + sem] = it->second;
+        }
+    }
+    if (op == spv::OpConstant && wc == 4) {
+        auto it = scan.new_semantics.find(inst[2]);
+        if (it != scan.new_semantics.end()) {
+            const uint32_t avail_vis  = spv::MemorySemanticsMakeAvailableKHRMask | spv::MemorySemanticsMakeVisibleKHRMask;
+            const uint32_t constant[] = { (4u << spv::WordCountShift) | spv::OpConstant, inst[1], it->second, inst[3] | avail_vis };
+            out.insert(out.end(), std::begin(constant), std::end(constant));
+        }
+    }
+}
+
+static bool ggml_vk_spv_emit_shared_avail(const uint32_t * code, size_t word_count, const vk_spv_shared_avail_scan & scan, std::vector<uint32_t> & out) {
+    out.assign(code, code + 5);
+    out[3] = scan.bound;
+    for (size_t pos = 5; pos < word_count; ) {
+        const uint32_t   wc   = code[pos] >> spv::WordCountShift;
+        const uint32_t * inst = code + pos;
+        if (!ggml_vk_spv_has_shared_avail(inst, wc, scan)) {
+            ggml_vk_spv_append_with_new_semantics(inst, wc, scan, out);
+        } else if (!ggml_vk_spv_append_stripped_access(inst, wc, scan, out)) {
+            return false;
+        }
+        pos += wc;
+    }
+    return true;
+}
+
+// Mesa before 25.3 emits a memory barrier for every shared-memory MakePointerAvailable/Visible, which
+// glslang adds to all shared accesses under the Vulkan memory model; move them onto the barriers.
+static bool ggml_vk_move_shared_avail_to_barriers(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
+    vk_spv_shared_avail_scan scan;
+    if (word_count < 5 || !ggml_vk_spv_scan_shared_avail(code, word_count, scan) ||
+        !ggml_vk_spv_plan_barriers(code, word_count, scan)) {
+        return false;
+    }
+    return ggml_vk_spv_emit_shared_avail(code, word_count, scan, out);
+}
+
 static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipeline, size_t spv_size, const void* spv_data, const std::string entrypoint,
                                          uint32_t parameter_count, std::array<uint32_t, 3> wg_denoms, std::vector<uint32_t> specialization_constants,
                                          bool disable_robustness, bool require_full_subgroups, uint32_t required_subgroup_size) {
@@ -690,6 +853,16 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         }
     }
 #endif
+
+    if (device->shared_avail_to_barriers) {
+        const uint32_t * src   = spirv.empty() ? reinterpret_cast<const uint32_t *>(spv_data) : spirv.data();
+        size_t           src_n = spirv.empty() ? spv_size / sizeof(uint32_t) : spirv.size();
+        std::vector<uint32_t> moved;
+        if (ggml_vk_move_shared_avail_to_barriers(src, src_n, moved)) {
+            spirv = std::move(moved);
+            shader_module_create_info = vk::ShaderModuleCreateInfo({}, spirv.size() * sizeof(uint32_t), spirv.data());
+        }
+    }
 
     try {
         pipeline->shader_module = device->device.createShaderModule(shader_module_create_info);
@@ -2158,6 +2331,19 @@ static bool ggml_vk_mmq_packstore_enabled() {
         return e == nullptr || atoi(e) != 0;
     }();
     return on;
+}
+
+static constexpr char     kMesaDriverInfoPrefix[]    = "Mesa ";
+static constexpr uint32_t kMesaSharedAvailFixVersion = VK_MAKE_API_VERSION(0, 25, 3, 0);
+
+// GGML_VK_SHARED_AVAIL_REWRITE=0 keeps the per-access shared availability operations on Mesa before 25.3.
+static bool ggml_vk_shared_avail_rewrite_enabled(const vk::PhysicalDeviceDriverProperties & driver_props, uint32_t driver_version) {
+    const char * e = getenv("GGML_VK_SHARED_AVAIL_REWRITE");
+    if (e != nullptr && atoi(e) == 0) {
+        return false;
+    }
+    const bool mesa = strncmp(driver_props.driverInfo.data(), kMesaDriverInfoPrefix, sizeof(kMesaDriverInfoPrefix) - 1) == 0;
+    return mesa && driver_version < kMesaSharedAvailFixVersion;
 }
 
 static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type, ggml_type v_type) {
@@ -5520,6 +5706,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->properties = props2.properties;
         device->vendor_id = device->properties.vendorID;
         device->driver_id = driver_props.driverID;
+        device->shared_avail_to_barriers = ggml_vk_shared_avail_rewrite_enabled(driver_props, device->properties.driverVersion);
 
         device->external_memory_host = device->external_memory_host && ggml_vk_external_memory_host_usable(device->driver_id);
 

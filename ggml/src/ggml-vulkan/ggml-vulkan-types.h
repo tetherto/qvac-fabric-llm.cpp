@@ -76,6 +76,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -851,6 +852,7 @@ struct vk_device_struct {
     bool coopmat2;
     bool coopmat2_bf16_support {};
     bool coopmat2_decode_vector;
+    bool shared_avail_to_barriers {};
 
     bool dot2_f16 {};
     bool ocp_fp4 {};
@@ -1808,6 +1810,9 @@ static constexpr uint32_t kSpvOpCooperativeMatrixLoadTensorNV = 5367;
 static constexpr uint32_t kSpvCapabilityCooperativeMatrixDecodeVectorNV = 5447;
 
 static constexpr uint32_t kSpvTensorAddressingDecodeVectorFuncBit = 0x4;
+
+static constexpr uint32_t kSpvOpCooperativeMatrixLoadKHR  = 4457;
+static constexpr uint32_t kSpvOpCooperativeMatrixStoreKHR = 4458;
 
 struct vk_fa_tuning_params {
     FaCodePath path;
