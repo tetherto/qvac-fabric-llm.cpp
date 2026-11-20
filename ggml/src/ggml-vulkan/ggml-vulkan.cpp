@@ -4504,8 +4504,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
+        ggml_vk_create_pipeline(device, device->pipeline_swiglu_quantize_q8_1_x4, "swiglu_quantize_q8_1_x4", swiglu_quantize_q8_1_x4_subgroup_len, swiglu_quantize_q8_1_x4_subgroup_data, "main", 3, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
     } else {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_len, quantize_q8_1_x4_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_swiglu_quantize_q8_1_x4, "swiglu_quantize_q8_1_x4", swiglu_quantize_q8_1_x4_len, swiglu_quantize_q8_1_x4_data, "main", 3, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
     }
 
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
@@ -8257,11 +8259,8 @@ vk_pipeline ggml_vk_get_quantize_pipeline(ggml_backend_vk_context * ctx, ggml_ty
     }
 }
 
-void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne) {
-    VK_LOG_DEBUG("ggml_vk_quantize_q8_1(" << "buffer in size=" << in.buffer->size << ", buffer out size=" << out.buffer->size << ", " << ne << ")");
-
-    vk_pipeline pipeline = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
-
+static void ggml_vk_dispatch_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline& pipeline,
+                                           std::initializer_list<vk::DescriptorBufferInfo> const& buffers, uint32_t ne) {
     const uint32_t num_blocks = CEIL_DIV(ne, pipeline->wg_denoms[0]);
     // clamp the number of elements to the max workgroup count. The shader will iterate over the total number of blocks.
     const uint64_t max_elements = std::min<uint64_t>(uint64_t{ctx->device->properties.limits.maxComputeWorkGroupCount[0]} * pipeline->wg_denoms[0], std::numeric_limits<uint32_t>::max());
@@ -8272,8 +8271,22 @@ void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, co
         num_blocks,
     };
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { in, out }, pc, { elements, 1, 1 });
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, buffers, pc, { elements, 1, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
+}
+
+void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne) {
+    VK_LOG_DEBUG("ggml_vk_quantize_q8_1(" << "buffer in size=" << in.buffer->size << ", buffer out size=" << out.buffer->size << ", " << ne << ")");
+
+    vk_pipeline pipeline = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    ggml_vk_dispatch_quantize_q8_1(ctx, subctx, pipeline, { in, out }, ne);
+}
+
+// quantize_q8_1 of swiglu(gate, up) without writing the f32 GLU result
+static void ggml_vk_swiglu_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * glu, const vk_subbuffer & out, uint32_t ne) {
+    const vk_subbuffer gate = ggml_vk_tensor_subbuffer(ctx, glu->src[0]);
+    const vk_subbuffer up   = ggml_vk_tensor_subbuffer(ctx, glu->src[1]);
+    ggml_vk_dispatch_quantize_q8_1(ctx, subctx, ctx->device->pipeline_swiglu_quantize_q8_1_x4, { gate, up, out }, ne);
 }
 
 static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * ctx, vk_pipeline &pipeline) {
@@ -8638,6 +8651,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel     = y_kernel_type == GGML_TYPE_F32;
     const bool y_needs_reformat = !quantize_y && (!ggml_vk_dim01_contiguous(src1) || y_kernel_type != src1->type);
+    // GLU_MUL_MAT: src1 was not computed; it is quantized from the GLU inputs, or the GLU runs here first
+    ggml_tensor * fused_glu = ctx->fused_glu_q8_1 == src1 ? ctx->fused_glu_q8_1 : nullptr;
 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map = full_f32 ? full_f32_map :
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, ggml_prec_get_acc(dst));
@@ -8785,7 +8800,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_1, 1);
         }
         if (quantize_y) {
-            ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, fused_glu ? ctx->device->pipeline_swiglu_quantize_q8_1_x4 : to_q8_1, 1);
         }
         if (split_k > 1) {
             ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_matmul_split_k_reduce, 1);
@@ -8834,6 +8849,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         GGML_ASSERT(qy_sz == y_sz);
     }
 
+    if (fused_glu != nullptr && !quantize_y) {
+        ggml_vk_glu(ctx, subctx, fused_glu->src[0], fused_glu->src[1], fused_glu);
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
     if (x_non_contig || qx_needs_dequant) {
         if (ctx->prealloc_x_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
@@ -8867,7 +8887,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            if (fused_glu != nullptr) {
+                ggml_vk_swiglu_quantize_q8_1(ctx, subctx, fused_glu, ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            } else {
+                ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            }
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_k_padded = false;
@@ -17538,6 +17562,12 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         }
         break;
     case GGML_OP_GLU:
+        if (ctx->fused_glu_q8_1 == node) {
+            ggml_tensor * mm = cgraph->nodes[node_idx + 1];
+            ggml_vk_mul_mat_q_f16(ctx, compute_ctx, mm->src[0], mm->src[1], mm, false);
+            ctx->glu_mul_mat_fusion_count.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
         switch (ggml_get_glu_op(node)) {
         case GGML_GLU_OP_GEGLU:
         case GGML_GLU_OP_REGLU:
@@ -18792,6 +18822,43 @@ static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int
            ggml_get_op_params_f32(scale_out, 1) == 0.0f &&
            scale_in->src[0]->type == GGML_TYPE_F32 &&
            ggml_are_same_shape(scale_in->src[0], scale_out);
+}
+
+// GGML_VK_FUSE_GLU_Q8_1=0 keeps the SWIGLU and the quantize of its result as separate passes.
+static bool ggml_vk_fuse_glu_q8_1_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_GLU_Q8_1");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// SWIGLU(split)+MUL_MAT where ggml_vk_mul_mat reaches ggml_vk_mul_mat_q_f16 (no M split, no FWHT, no mat-vec);
+// the MMQ then quantizes swiglu(gate, up) straight into its B buffer.
+static bool ggml_vk_can_fuse_glu_mul_mat(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const enum ggml_op ops[]     = { GGML_OP_GLU, GGML_OP_MUL_MAT };
+    const int          outputs[] = { node_idx + 1 };
+    if (!ggml_vk_fuse_glu_q8_1_enabled() || !ggml_can_fuse_subgraph(cgraph, node_idx, 2, ops, outputs, 1)) {
+        return false;
+    }
+    const ggml_tensor * glu  = cgraph->nodes[node_idx];
+    const ggml_tensor * mm   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    const ggml_tensor * w    = mm->src[0];
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || up == nullptr || mm->src[1] != glu) {
+        return false;
+    }
+    if (glu->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(glu) || !ggml_is_contiguous(gate) || !ggml_is_contiguous(up) ||
+        !ggml_are_same_shape(gate, glu) || !ggml_are_same_shape(up, glu) ||
+        get_misalign_bytes(ctx, gate) != 0 || get_misalign_bytes(ctx, up) != 0) {
+        return false;
+    }
+    return ggml_is_quantized(w->type) && ggml_vk_dim01_contiguous(w) &&
+           mm->ne[1] > mul_mat_vec_max_cols && mm->ne[2] == 1 && mm->ne[3] == 1 &&
+           ggml_nbytes(w) <= ctx->device->properties.limits.maxStorageBufferRange &&
+           !ggml_vk_can_use_fwht(ctx, glu, mm);
 }
 
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
@@ -20056,6 +20123,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_fwht_signed = false;
+        ctx->fused_glu_q8_1 = nullptr;
         ctx->fused_concat_tail = -1;
         ctx->fused_ssm_conv_direct = -1;
         ctx->fused_extra_srcs[0] = ctx->fused_extra_srcs[1] = nullptr;
@@ -20093,6 +20161,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ID_MUL";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_glu_mul_mat(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_glu_q8_1 = cgraph->nodes[i];
+                fusion_string = "GLU_MUL_MAT";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
             } else if (ggml_can_fuse_subgraph(cgraph, i, rms_norm_mul_rope_view_set_rows_pattern, { i + 4 }) &&
                        ggml_check_edges(cgraph, i, rms_norm_mul_rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i) &&
@@ -20343,7 +20417,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
                 ctx->fused_fwht_signed = false;
+                ctx->fused_glu_q8_1 = nullptr;
             }
+        }
+        if (ctx->fused_glu_q8_1 != nullptr) {
+            // the fused matmul is the second node, so the flop count at the top of the loop did not see it
+            const uint64_t mm_flops = ggml_vk_get_node_flops(cgraph->nodes[i + 1]);
+            total_flops += mm_flops;
+            batch_flops += mm_flops;
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
@@ -20762,6 +20843,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[j]->op == GGML_OP_ADD &&
                       current_set.size() >= 2 && graph->nodes[current_set[current_set.size() - 2]]->op == GGML_OP_NORM) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
+                    // GLU -> MUL_MAT (GLU_MUL_MAT): keep the down projection behind its GLU only when the pair fuses
+                    !(j == c+1 && c == current_set.back() && ggml_vk_can_fuse_glu_mul_mat(ctx, graph, c)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
@@ -22541,6 +22624,12 @@ static uint64_t ggml_backend_vk_fwht_fusion_count(ggml_backend_t backend) {
     return ctx->fwht_fusion_count.load(std::memory_order_relaxed);
 }
 
+static uint64_t ggml_backend_vk_glu_mul_mat_fusion_count(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    return ctx->glu_mul_mat_fusion_count.load(std::memory_order_relaxed);
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     UNUSED(reg);
     if (strcmp(name, "ggml_backend_get_buffer_capacity") == 0) {
@@ -22577,6 +22666,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_fwht_fusion_count") == 0) {
         return (void *) ggml_backend_vk_fwht_fusion_count;
+    }
+    if (strcmp(name, "ggml_backend_vk_glu_mul_mat_fusion_count") == 0) {
+        return (void *) ggml_backend_vk_glu_mul_mat_fusion_count;
     }
     return nullptr;
 }

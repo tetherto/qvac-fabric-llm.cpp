@@ -13041,6 +13041,72 @@ struct test_rms_norm_rope : public test_case {
     }
 };
 
+// SWIGLU(split) feeding a MUL_MAT; f16_b asks for F16 precision of the GLU operand, so it is not quantized.
+// fuses: the Vulkan backend runs the pair as one GLU_MUL_MAT group.
+struct test_swiglu_mul_mat : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool f16_b;
+    const bool fuses;
+    mutable bool has_fusion_counter = false;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, f16_b);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SWIGLU_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    // f16_b drives the Vulkan path that runs the GLU first; CUDA MMQ asserts on an F16 src1 precision
+    bool skip_backend(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return f16_b && strcmp(ggml_backend_reg_name(reg), "Vulkan") != 0;
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn = uint64_t (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_glu_mul_mat_fusion_count");
+        has_fusion_counter = counter != nullptr;
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return fuses && has_fusion_counter; }
+
+    bool expect_no_fusion() override { return !fuses && has_fusion_counter; }
+
+    test_swiglu_mul_mat(ggml_type type_a, int64_t m, int64_t n, int64_t k, bool f16_b, bool fuses)
+        : type_a(type_a), m(m), n(n), k(k), f16_b(f16_b), fuses(fuses) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(up, "up");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * glu = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(glu, "glu");
+        ggml_tensor * out = ggml_mul_mat(ctx, w, glu);
+        if (f16_b) {
+            GGML_ASSERT(ggml_prec_set_src(out, GGML_PREC_F16, 1));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -18083,6 +18149,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 512, 4096, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 300, 2048, { 1, 1 }, { 1, 1 }));
     }
+
+    // SWIGLU into MUL_MAT: a long-K down projection, partial tiles, a min-term type, the smallest batch past
+    // the mat-vec limit, unquantized B (F16 precision, the GLU runs first), then a mat-vec batch and F16 weights.
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 512, 512, 12288, false, true));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q4_0, 300, 33, 2048, false, true));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q4_K, 256, 64, 1024, false, true));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 9, 1024, false, true));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 64, 1024, true, true));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 8, 1024, false, false));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_F16, 256, 64, 1024, false, false));
 
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
