@@ -76,6 +76,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -825,6 +826,7 @@ struct vk_device_struct {
     bool coopmat2;
     bool coopmat2_bf16_support {};
     bool coopmat2_decode_vector;
+    bool shared_avail_to_barriers {};
 
     bool dot2_f16 {};
     bool ocp_fp4 {};
@@ -873,6 +875,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_swiglu_quantize_q8_1_x4;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -1677,7 +1680,10 @@ struct ggml_backend_vk_context {
     // set while the current node is a direct conv: srcs read outside node->src (x, state) for the sync tracking
     const ggml_tensor * fused_extra_srcs[2] {};
     bool fused_fwht_signed {};
+    // GLU whose result the next MMQ quantizes directly from the GLU inputs (GLU_MUL_MAT fusion)
+    ggml_tensor * fused_glu_q8_1 {};
     std::atomic<uint64_t> fwht_fusion_count {};
+    std::atomic<uint64_t> glu_mul_mat_fusion_count {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -1746,6 +1752,9 @@ static constexpr uint32_t kSpvOpCooperativeMatrixLoadTensorNV = 5367;
 static constexpr uint32_t kSpvCapabilityCooperativeMatrixDecodeVectorNV = 5447;
 
 static constexpr uint32_t kSpvTensorAddressingDecodeVectorFuncBit = 0x4;
+
+static constexpr uint32_t kSpvOpCooperativeMatrixLoadKHR  = 4457;
+static constexpr uint32_t kSpvOpCooperativeMatrixStoreKHR = 4458;
 
 struct vk_fa_tuning_params {
     FaCodePath path;

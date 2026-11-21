@@ -602,6 +602,169 @@ static bool ggml_vk_roll_bk_loop(const uint32_t * code, size_t word_count, std::
     return true;
 }
 
+struct vk_spv_shared_avail_scan {
+    std::unordered_map<uint32_t, uint32_t> pointer_storage;  // pointer type id -> storage class
+    std::unordered_set<uint32_t>           shared_pointers;  // value ids that point to Workgroup memory
+    std::unordered_map<uint32_t, uint32_t> uint_constants;   // constant id -> value
+    std::unordered_map<uint32_t, uint32_t> new_semantics;    // barrier semantics id -> new constant id
+    uint32_t                               bound = 0;
+    size_t                                 shared_accesses = 0;
+};
+
+// Index of the memory operand mask of a load/store, or 0 when the instruction has none.
+static size_t ggml_vk_spv_memory_operand_index(uint32_t op, uint32_t wc) {
+    size_t idx = 0;
+    switch (op) {
+        case spv::OpLoad:                     idx = 4; break;
+        case spv::OpStore:                    idx = 3; break;
+        case kSpvOpCooperativeMatrixLoadKHR:  idx = 6; break;
+        case kSpvOpCooperativeMatrixStoreKHR: idx = 5; break;
+        default: return 0;
+    }
+    return wc > idx ? idx : 0;
+}
+
+static uint32_t ggml_vk_spv_pointer_operand(const uint32_t * inst) {
+    const uint32_t op = inst[0] & spv::OpCodeMask;
+    return (op == spv::OpLoad || op == kSpvOpCooperativeMatrixLoadKHR) ? inst[3] : inst[1];
+}
+
+static bool ggml_vk_spv_is_pointer_producer(uint32_t op) {
+    return op == spv::OpVariable || op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain ||
+           op == spv::OpPtrAccessChain || op == spv::OpInBoundsPtrAccessChain || op == spv::OpCopyObject ||
+           op == spv::OpBitcast;
+}
+
+static bool ggml_vk_spv_has_shared_avail(const uint32_t * inst, uint32_t wc, const vk_spv_shared_avail_scan & scan) {
+    const size_t idx = ggml_vk_spv_memory_operand_index(inst[0] & spv::OpCodeMask, wc);
+    const uint32_t avail_vis = spv::MemoryAccessMakePointerAvailableKHRMask | spv::MemoryAccessMakePointerVisibleKHRMask;
+    return idx != 0 && (inst[idx] & avail_vis) && scan.shared_pointers.count(ggml_vk_spv_pointer_operand(inst));
+}
+
+// Collects types, constants and Workgroup pointers. Returns false when the module has nothing to rewrite.
+static bool ggml_vk_spv_scan_shared_avail(const uint32_t * code, size_t word_count, vk_spv_shared_avail_scan & scan) {
+    for (size_t pos = 5; pos < word_count; ) {
+        const uint32_t wc = code[pos] >> spv::WordCountShift;
+        const uint32_t op = code[pos] & spv::OpCodeMask;
+        if (wc == 0 || pos + wc > word_count) {
+            return false;
+        }
+        const uint32_t * inst = code + pos;
+        if (op == spv::OpTypePointer && wc >= 3) {
+            scan.pointer_storage[inst[1]] = inst[2];
+        } else if (ggml_vk_spv_is_pointer_producer(op) && wc >= 3) {
+            auto it = scan.pointer_storage.find(inst[1]);
+            if (it != scan.pointer_storage.end() && it->second == spv::StorageClassWorkgroup) {
+                scan.shared_pointers.insert(inst[2]);
+            }
+        } else if (op == spv::OpConstant && wc == 4) {
+            scan.uint_constants[inst[2]] = inst[3];
+        } else if ((op == spv::OpCopyMemory && wc > 3) || (op == spv::OpCopyMemorySized && wc > 4)) {
+            return false;
+        }
+        scan.shared_accesses += ggml_vk_spv_has_shared_avail(inst, wc, scan) ? 1 : 0;
+        pos += wc;
+    }
+    scan.bound = code[3];
+    return scan.shared_accesses > 0;
+}
+
+// Assigns a new semantics constant (with MakeAvailable and MakeVisible) to every ordering barrier on Workgroup memory.
+static bool ggml_vk_spv_plan_barriers(const uint32_t * code, size_t word_count, vk_spv_shared_avail_scan & scan) {
+    const uint32_t order = spv::MemorySemanticsAcquireMask | spv::MemorySemanticsReleaseMask |
+                           spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsSequentiallyConsistentMask;
+    const uint32_t avail_vis = spv::MemorySemanticsMakeAvailableKHRMask | spv::MemorySemanticsMakeVisibleKHRMask;
+    for (size_t pos = 5; pos < word_count; pos += code[pos] >> spv::WordCountShift) {
+        const uint32_t op = code[pos] & spv::OpCodeMask;
+        if (op != spv::OpControlBarrier && op != spv::OpMemoryBarrier) {
+            continue;
+        }
+        const uint32_t sem_id = code[pos + (op == spv::OpControlBarrier ? 3 : 2)];
+        auto it = scan.uint_constants.find(sem_id);
+        if (it == scan.uint_constants.end()) {
+            return false;
+        }
+        const uint32_t sem = it->second;
+        if ((sem & spv::MemorySemanticsWorkgroupMemoryMask) && (sem & order) && (sem & avail_vis) != avail_vis &&
+            !scan.new_semantics.count(sem_id)) {
+            scan.new_semantics[sem_id] = scan.bound++;
+        }
+    }
+    return true;
+}
+
+// Drops MakePointerAvailable/Visible and their scope operands; NonPrivatePointer stays.
+static bool ggml_vk_spv_append_stripped_access(const uint32_t * inst, uint32_t wc, const vk_spv_shared_avail_scan & scan, std::vector<uint32_t> & out) {
+    const size_t idx  = ggml_vk_spv_memory_operand_index(inst[0] & spv::OpCodeMask, wc);
+    const uint32_t mask = inst[idx];
+    const size_t aligned = (mask & spv::MemoryAccessAlignedMask) ? 1 : 0;
+    const size_t scopes  = ((mask & spv::MemoryAccessMakePointerAvailableKHRMask) ? 1 : 0) +
+                           ((mask & spv::MemoryAccessMakePointerVisibleKHRMask) ? 1 : 0);
+    for (size_t s = 0; s < scopes; ++s) {
+        auto it = scan.uint_constants.find(inst[idx + 1 + aligned + s]);
+        if (it == scan.uint_constants.end() || it->second != spv::ScopeWorkgroup) {
+            return false;
+        }
+    }
+    const size_t start = out.size();
+    out.insert(out.end(), inst, inst + idx);
+    out.push_back(mask & ~(spv::MemoryAccessMakePointerAvailableKHRMask | spv::MemoryAccessMakePointerVisibleKHRMask));
+    out.insert(out.end(), inst + idx + 1, inst + idx + 1 + aligned);
+    out.insert(out.end(), inst + idx + 1 + aligned + scopes, inst + wc);
+    out[start] = (uint32_t)((out.size() - start) << spv::WordCountShift) | (inst[0] & spv::OpCodeMask);
+    return true;
+}
+
+// Copies an instruction, pointing barriers at their new semantics and adding each new constant after its original.
+static void ggml_vk_spv_append_with_new_semantics(const uint32_t * inst, uint32_t wc, const vk_spv_shared_avail_scan & scan, std::vector<uint32_t> & out) {
+    const uint32_t op    = inst[0] & spv::OpCodeMask;
+    const size_t   start = out.size();
+    out.insert(out.end(), inst, inst + wc);
+
+    const size_t sem = op == spv::OpControlBarrier ? 3 : (op == spv::OpMemoryBarrier ? 2 : 0);
+    if (sem != 0) {
+        auto it = scan.new_semantics.find(inst[sem]);
+        if (it != scan.new_semantics.end()) {
+            out[start + sem] = it->second;
+        }
+    }
+    if (op == spv::OpConstant && wc == 4) {
+        auto it = scan.new_semantics.find(inst[2]);
+        if (it != scan.new_semantics.end()) {
+            const uint32_t avail_vis  = spv::MemorySemanticsMakeAvailableKHRMask | spv::MemorySemanticsMakeVisibleKHRMask;
+            const uint32_t constant[] = { (4u << spv::WordCountShift) | spv::OpConstant, inst[1], it->second, inst[3] | avail_vis };
+            out.insert(out.end(), std::begin(constant), std::end(constant));
+        }
+    }
+}
+
+static bool ggml_vk_spv_emit_shared_avail(const uint32_t * code, size_t word_count, const vk_spv_shared_avail_scan & scan, std::vector<uint32_t> & out) {
+    out.assign(code, code + 5);
+    out[3] = scan.bound;
+    for (size_t pos = 5; pos < word_count; ) {
+        const uint32_t   wc   = code[pos] >> spv::WordCountShift;
+        const uint32_t * inst = code + pos;
+        if (!ggml_vk_spv_has_shared_avail(inst, wc, scan)) {
+            ggml_vk_spv_append_with_new_semantics(inst, wc, scan, out);
+        } else if (!ggml_vk_spv_append_stripped_access(inst, wc, scan, out)) {
+            return false;
+        }
+        pos += wc;
+    }
+    return true;
+}
+
+// Mesa before 25.3 emits a memory barrier for every shared-memory MakePointerAvailable/Visible, which
+// glslang adds to all shared accesses under the Vulkan memory model; move them onto the barriers.
+static bool ggml_vk_move_shared_avail_to_barriers(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
+    vk_spv_shared_avail_scan scan;
+    if (word_count < 5 || !ggml_vk_spv_scan_shared_avail(code, word_count, scan) ||
+        !ggml_vk_spv_plan_barriers(code, word_count, scan)) {
+        return false;
+    }
+    return ggml_vk_spv_emit_shared_avail(code, word_count, scan, out);
+}
+
 static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipeline, size_t spv_size, const void* spv_data, const std::string entrypoint,
                                          uint32_t parameter_count, std::array<uint32_t, 3> wg_denoms, std::vector<uint32_t> specialization_constants,
                                          bool disable_robustness, bool require_full_subgroups, uint32_t required_subgroup_size) {
@@ -716,6 +879,16 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         }
     }
 #endif
+
+    if (device->shared_avail_to_barriers) {
+        const uint32_t * src   = spirv.empty() ? reinterpret_cast<const uint32_t *>(spv_data) : spirv.data();
+        size_t           src_n = spirv.empty() ? spv_size / sizeof(uint32_t) : spirv.size();
+        std::vector<uint32_t> moved;
+        if (ggml_vk_move_shared_avail_to_barriers(src, src_n, moved)) {
+            spirv = std::move(moved);
+            shader_module_create_info = vk::ShaderModuleCreateInfo({}, spirv.size() * sizeof(uint32_t), spirv.data());
+        }
+    }
 
     try {
         pipeline->shader_module = device->device.createShaderModule(shader_module_create_info);
@@ -1939,6 +2112,28 @@ static bool ggml_vk_mmq_packstore_enabled() {
     return on;
 }
 
+static constexpr char     kMesaDriverInfoPrefix[]    = "Mesa ";
+static constexpr uint32_t kMesaSharedAvailFixVersion = VK_MAKE_API_VERSION(0, 25, 3, 0);
+
+// GGML_VK_SHARED_AVAIL_REWRITE=0 keeps the per-access shared availability operations on Mesa before 25.3.
+static bool ggml_vk_shared_avail_rewrite_enabled(const vk::PhysicalDeviceDriverProperties & driver_props, uint32_t driver_version) {
+    const char * e = getenv("GGML_VK_SHARED_AVAIL_REWRITE");
+    if (e != nullptr && atoi(e) == 0) {
+        return false;
+    }
+    const bool mesa = strncmp(driver_props.driverInfo.data(), kMesaDriverInfoPrefix, sizeof(kMesaDriverInfoPrefix) - 1) == 0;
+    return mesa && driver_version < kMesaSharedAvailFixVersion;
+}
+
+// GGML_VK_MMQ_CM1_WIDE=0 keeps the 32x32 warp tiles of the large int8 MMQ (coopmat1) tile on RDNA3.
+static bool ggml_vk_mmq_cm1_wide_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MMQ_CM1_WIDE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type, ggml_type v_type) {
     // qvac: scalar FlashAttn MMQ (_int8) variants are disabled on this fork. The
     // TurboQuant import replaced the scalar shader's MMQ path with the compile-time
@@ -2047,6 +2242,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                           l_warptile_mmq, m_warptile_mmq, s_warptile_mmq,
                           l_warptile_mmq_int, m_warptile_mmq_int, s_warptile_mmq_int,
                           l_warptile_mmq_cm1_int, m_warptile_mmq_cm1_int, s_warptile_mmq_cm1_int,
+                          l_warptile_mmq_cm1_int_wide,
                           l_warptile_mmq_cm1_int_k, m_warptile_mmq_cm1_int_k, s_warptile_mmq_cm1_int_k,
                           l_warptile_mmq_int_k, m_warptile_mmq_int_k, s_warptile_mmq_int_k,
                           l_warptile_mmq_k, m_warptile_mmq_k, s_warptile_mmq_k,
@@ -2182,6 +2378,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_warptile_mmq_cm1_int = { cm1_bs(128, 128), 128, 128, 32, std::min(cm1_sg, 128u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
         m_warptile_mmq_cm1_int = { cm1_bs( 64,  64),  64,  64, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
         s_warptile_mmq_cm1_int = { cm1_bs( 32,  32),  32,  32, 32, std::min(cm1_sg,  32u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
+        // 32x64 warp tiles: half the A-scale reads per WMMA; only used on wave32 RDNA3 for types without a min term
+        l_warptile_mmq_cm1_int_wide = { cm1_sg * (128 / 32) * (128 / 64), 128, 128, 32, 32, 64, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
 
         l_warptile_mmq_cm1_int_k = { cm1_bs( 64, 128),  64, 128, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
         m_warptile_mmq_cm1_int_k = { cm1_bs( 64,  64),  64,  64, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
@@ -3013,6 +3211,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             {m_warptile_mmq_cm1_int, m_mmq_wg_denoms, m_align},
             {l_warptile_mmq_cm1_int, l_mmq_wg_denoms, l_align},
         };
+        std::vector<vk_tile_config> tc_mmq_cm1_int_wide = {
+            {s_warptile_mmq_cm1_int, s_mmq_wg_denoms, s_align},
+            {m_warptile_mmq_cm1_int, m_mmq_wg_denoms, m_align},
+            {l_warptile_mmq_cm1_int_wide, l_mmq_wg_denoms, l_align},
+        };
         std::vector<vk_tile_config> tc_mmq_cm1_int_k = {
             {s_warptile_mmq_cm1_int_k, s_mmq_cm1_wg_denoms_k, s_align},
             {m_warptile_mmq_cm1_int_k, m_mmq_cm1_wg_denoms_k, m_align},
@@ -3022,6 +3225,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // Some quants are not performant on RDNA4, those fall back to FP16 matmul
         const bool rdna3 = device->architecture == AMD_RDNA3;
         const bool rdna4 = device->architecture == AMD_RDNA4;
+        const auto & tc_mmq_cm1_int_sym = (rdna3 && cm1_sg == 32 && ggml_vk_mmq_cm1_wide_enabled()) ? tc_mmq_cm1_int_wide : tc_mmq_cm1_int;
 
         if (device->coopmat_f32_support_16x16x16_f32acc) {
             std::vector<vk_tile_config> tc_mm_f32 = {{s_warptile_f32, s_wg_denoms, s_align}, {m_warptile_f32, m_wg_denoms, m_align}, {l_warptile_f32, l_wg_denoms, l_align}};
@@ -3099,14 +3303,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef X_CM1
 
         if (device->coopmat_int_support && (rdna3 || rdna4)) {
-            cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_0_q8_1",   matmul_q4_0_q8_1_cm1_len,   matmul_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_q4_0_q8_1",   matmul_q4_0_q8_1_cm1_len,   matmul_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q4_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_1_q8_1",   matmul_q4_1_q8_1_cm1_len,   matmul_q4_1_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
-            cm1_create_mmq({GGML_TYPE_Q5_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_0_q8_1",   matmul_q5_0_q8_1_cm1_len,   matmul_q5_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_Q5_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_q5_0_q8_1",   matmul_q5_0_q8_1_cm1_len,   matmul_q5_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q5_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_1_q8_1",   matmul_q5_1_q8_1_cm1_len,   matmul_q5_1_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
-            cm1_create_mmq({GGML_TYPE_Q8_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q8_0_q8_1",   matmul_q8_0_q8_1_cm1_len,   matmul_q8_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
-            cm1_create_mmq({GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_iq4_nl_q8_1", matmul_iq4_nl_q8_1_cm1_len, matmul_iq4_nl_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
-            cm1_create_mmq({GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_iq4_xs_q8_1", matmul_iq4_xs_q8_1_cm1_len, matmul_iq4_xs_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
-            cm1_create_mmq({GGML_TYPE_MXFP4,  GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_mxfp4_q8_1",  matmul_mxfp4_q8_1_cm1_len,  matmul_mxfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_Q8_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_q8_0_q8_1",   matmul_q8_0_q8_1_cm1_len,   matmul_q8_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_iq4_nl_q8_1", matmul_iq4_nl_q8_1_cm1_len, matmul_iq4_nl_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_iq4_xs_q8_1", matmul_iq4_xs_q8_1_cm1_len, matmul_iq4_xs_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_MXFP4,  GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_mxfp4_q8_1",  matmul_mxfp4_q8_1_cm1_len,  matmul_mxfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_push_constants), 3);
             cm1_create_mmq({GGML_TYPE_Q3_K,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_k, "matmul_q3_k_q8_1",   matmul_q3_k_q8_1_cm1_len,   matmul_q3_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q4_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_k_q8_1",   matmul_q4_k_q8_1_cm1_len,   matmul_q4_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q5_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_k_q8_1",   matmul_q5_k_q8_1_cm1_len,   matmul_q5_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
@@ -3965,8 +4169,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
+        ggml_vk_create_pipeline(device, device->pipeline_swiglu_quantize_q8_1_x4, "swiglu_quantize_q8_1_x4", swiglu_quantize_q8_1_x4_subgroup_len, swiglu_quantize_q8_1_x4_subgroup_data, "main", 3, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
     } else {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_len, quantize_q8_1_x4_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_swiglu_quantize_q8_1_x4, "swiglu_quantize_q8_1_x4", swiglu_quantize_q8_1_x4_len, swiglu_quantize_q8_1_x4_data, "main", 3, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
     }
 
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
@@ -5170,6 +5376,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->properties = props2.properties;
         device->vendor_id = device->properties.vendorID;
         device->driver_id = driver_props.driverID;
+        device->shared_avail_to_barriers = ggml_vk_shared_avail_rewrite_enabled(driver_props, device->properties.driverVersion);
 
         device->external_memory_host = device->external_memory_host && ggml_vk_external_memory_host_usable(device->driver_id);
 
@@ -7661,11 +7868,8 @@ vk_pipeline ggml_vk_get_quantize_pipeline(ggml_backend_vk_context * ctx, ggml_ty
     }
 }
 
-void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne) {
-    VK_LOG_DEBUG("ggml_vk_quantize_q8_1(" << "buffer in size=" << in.buffer->size << ", buffer out size=" << out.buffer->size << ", " << ne << ")");
-
-    vk_pipeline pipeline = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
-
+static void ggml_vk_dispatch_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline& pipeline,
+                                           std::initializer_list<vk::DescriptorBufferInfo> const& buffers, uint32_t ne) {
     const uint32_t num_blocks = CEIL_DIV(ne, pipeline->wg_denoms[0]);
     // clamp the number of elements to the max workgroup count. The shader will iterate over the total number of blocks.
     const uint64_t max_elements = std::min<uint64_t>(uint64_t{ctx->device->properties.limits.maxComputeWorkGroupCount[0]} * pipeline->wg_denoms[0], std::numeric_limits<uint32_t>::max());
@@ -7676,8 +7880,22 @@ void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, co
         num_blocks,
     };
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { in, out }, pc, { elements, 1, 1 });
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, buffers, pc, { elements, 1, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
+}
+
+void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne) {
+    VK_LOG_DEBUG("ggml_vk_quantize_q8_1(" << "buffer in size=" << in.buffer->size << ", buffer out size=" << out.buffer->size << ", " << ne << ")");
+
+    vk_pipeline pipeline = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    ggml_vk_dispatch_quantize_q8_1(ctx, subctx, pipeline, { in, out }, ne);
+}
+
+// quantize_q8_1 of swiglu(gate, up) without writing the f32 GLU result
+static void ggml_vk_swiglu_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * glu, const vk_subbuffer & out, uint32_t ne) {
+    const vk_subbuffer gate = ggml_vk_tensor_subbuffer(ctx, glu->src[0]);
+    const vk_subbuffer up   = ggml_vk_tensor_subbuffer(ctx, glu->src[1]);
+    ggml_vk_dispatch_quantize_q8_1(ctx, subctx, ctx->device->pipeline_swiglu_quantize_q8_1_x4, { gate, up, out }, ne);
 }
 
 static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * ctx, vk_pipeline &pipeline) {
@@ -8042,6 +8260,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel     = y_kernel_type == GGML_TYPE_F32;
     const bool y_needs_reformat = !quantize_y && (!ggml_vk_dim01_contiguous(src1) || y_kernel_type != src1->type);
+    // GLU_MUL_MAT: src1 was not computed; it is quantized from the GLU inputs, or the GLU runs here first
+    ggml_tensor * fused_glu = ctx->fused_glu_q8_1 == src1 ? ctx->fused_glu_q8_1 : nullptr;
 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map = full_f32 ? full_f32_map :
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, ggml_prec_get_acc(dst));
@@ -8188,7 +8408,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_1, 1);
         }
         if (quantize_y) {
-            ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, fused_glu ? ctx->device->pipeline_swiglu_quantize_q8_1_x4 : to_q8_1, 1);
         }
         if (split_k > 1) {
             ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_matmul_split_k_reduce, 1);
@@ -8237,6 +8457,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         GGML_ASSERT(qy_sz == y_sz);
     }
 
+    if (fused_glu != nullptr && !quantize_y) {
+        ggml_vk_glu(ctx, subctx, fused_glu->src[0], fused_glu->src[1], fused_glu);
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
     if (x_non_contig || qx_needs_dequant) {
         if (ctx->prealloc_x_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
@@ -8270,7 +8495,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            if (fused_glu != nullptr) {
+                ggml_vk_swiglu_quantize_q8_1(ctx, subctx, fused_glu, ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            } else {
+                ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            }
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_k_padded = false;
@@ -16698,6 +16927,12 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         }
         break;
     case GGML_OP_GLU:
+        if (ctx->fused_glu_q8_1 == node) {
+            ggml_tensor * mm = cgraph->nodes[node_idx + 1];
+            ggml_vk_mul_mat_q_f16(ctx, compute_ctx, mm->src[0], mm->src[1], mm, false);
+            ctx->glu_mul_mat_fusion_count.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
         switch (ggml_get_glu_op(node)) {
         case GGML_GLU_OP_GEGLU:
         case GGML_GLU_OP_REGLU:
@@ -17898,6 +18133,43 @@ static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int
            ggml_get_op_params_f32(scale_out, 1) == 0.0f &&
            scale_in->src[0]->type == GGML_TYPE_F32 &&
            ggml_are_same_shape(scale_in->src[0], scale_out);
+}
+
+// GGML_VK_FUSE_GLU_Q8_1=0 keeps the SWIGLU and the quantize of its result as separate passes.
+static bool ggml_vk_fuse_glu_q8_1_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_GLU_Q8_1");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// SWIGLU(split)+MUL_MAT where ggml_vk_mul_mat reaches ggml_vk_mul_mat_q_f16 (no M split, no FWHT, no mat-vec);
+// the MMQ then quantizes swiglu(gate, up) straight into its B buffer.
+static bool ggml_vk_can_fuse_glu_mul_mat(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const enum ggml_op ops[]     = { GGML_OP_GLU, GGML_OP_MUL_MAT };
+    const int          outputs[] = { node_idx + 1 };
+    if (!ggml_vk_fuse_glu_q8_1_enabled() || !ggml_can_fuse_subgraph(cgraph, node_idx, 2, ops, outputs, 1)) {
+        return false;
+    }
+    const ggml_tensor * glu  = cgraph->nodes[node_idx];
+    const ggml_tensor * mm   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    const ggml_tensor * w    = mm->src[0];
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || up == nullptr || mm->src[1] != glu) {
+        return false;
+    }
+    if (glu->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(glu) || !ggml_is_contiguous(gate) || !ggml_is_contiguous(up) ||
+        !ggml_are_same_shape(gate, glu) || !ggml_are_same_shape(up, glu) ||
+        get_misalign_bytes(ctx, gate) != 0 || get_misalign_bytes(ctx, up) != 0) {
+        return false;
+    }
+    return ggml_is_quantized(w->type) && ggml_vk_dim01_contiguous(w) &&
+           mm->ne[1] > mul_mat_vec_max_cols && mm->ne[2] == 1 && mm->ne[3] == 1 &&
+           ggml_nbytes(w) <= ctx->device->properties.limits.maxStorageBufferRange &&
+           !ggml_vk_can_use_fwht(ctx, glu, mm);
 }
 
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
@@ -19160,6 +19432,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_fwht_signed = false;
+        ctx->fused_glu_q8_1 = nullptr;
         ctx->fused_concat_tail = -1;
         ctx->fused_ssm_conv_direct = -1;
         ctx->fused_extra_srcs[0] = ctx->fused_extra_srcs[1] = nullptr;
@@ -19197,6 +19470,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ID_MUL";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_glu_mul_mat(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_glu_q8_1 = cgraph->nodes[i];
+                fusion_string = "GLU_MUL_MAT";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
             } else if (ggml_can_fuse_subgraph(cgraph, i, rms_norm_mul_rope_view_set_rows_pattern, { i + 4 }) &&
                        ggml_check_edges(cgraph, i, rms_norm_mul_rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i) &&
@@ -19447,7 +19726,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
                 ctx->fused_fwht_signed = false;
+                ctx->fused_glu_q8_1 = nullptr;
             }
+        }
+        if (ctx->fused_glu_q8_1 != nullptr) {
+            // the fused matmul is the second node, so the flop count at the top of the loop did not see it
+            const uint64_t mm_flops = ggml_vk_get_node_flops(cgraph->nodes[i + 1]);
+            total_flops += mm_flops;
+            batch_flops += mm_flops;
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
@@ -19856,6 +20142,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[j]->op == GGML_OP_ADD &&
                       current_set.size() >= 2 && graph->nodes[current_set[current_set.size() - 2]]->op == GGML_OP_NORM) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
+                    // GLU -> MUL_MAT (GLU_MUL_MAT): keep the down projection behind its GLU only when the pair fuses
+                    !(j == c+1 && c == current_set.back() && ggml_vk_can_fuse_glu_mul_mat(ctx, graph, c)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
@@ -21591,6 +21879,12 @@ static uint64_t ggml_backend_vk_fwht_fusion_count(ggml_backend_t backend) {
     return ctx->fwht_fusion_count.load(std::memory_order_relaxed);
 }
 
+static uint64_t ggml_backend_vk_glu_mul_mat_fusion_count(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    return ctx->glu_mul_mat_fusion_count.load(std::memory_order_relaxed);
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_get_buffer_capacity") == 0) {
@@ -21601,6 +21895,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_fwht_fusion_count") == 0) {
         return (void *) ggml_backend_vk_fwht_fusion_count;
+    }
+    if (strcmp(name, "ggml_backend_vk_glu_mul_mat_fusion_count") == 0) {
+        return (void *) ggml_backend_vk_glu_mul_mat_fusion_count;
     }
     return NULL;
 }
