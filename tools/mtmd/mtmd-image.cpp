@@ -2353,12 +2353,12 @@ mtmd_image_preproc_out mtmd_image_preprocessor_muse_glimmer::preprocess(const cl
 // mtmd_image_preprocessor_inkling2v
 //
 
-mtmd_image_preproc_out mtmd_image_preprocessor_inkling2v::preprocess(const mtmd_image_u8 & input) const {
+mtmd_image_preproc_out mtmd_image_preprocessor_inkling2v::preprocess(const clip_image_u8 & input) const {
     const int align = hparams.patch_size * hparams.n_merge;
     auto size = input.get_size();
-    mtmd_image_u8 resized;
+    clip_image_u8 resized;
     const bool too_large = hparams.image_max_pixels > 0 &&
-        int64_t(MTMD_ALIGN(size.width, align)) * MTMD_ALIGN(size.height, align) > hparams.image_max_pixels;
+        int64_t(CLIP_ALIGN(size.width, align)) * CLIP_ALIGN(size.height, align) > hparams.image_max_pixels;
     if (too_large) {
         // the reference does not resize; this only bounds the number of image tokens
         img_tool::calc_size_opt opts;
@@ -2367,10 +2367,10 @@ mtmd_image_preproc_out mtmd_image_preprocessor_inkling2v::preprocess(const mtmd_
         size = img_tool::calc_size_preserved_ratio(size, opts);
         img_tool::resize(input, resized, size, hparams.image_resize_algo, PAD_NONE);
     }
-    const mtmd_image_u8 & img = too_large ? resized : input;
-    const int width  = MTMD_ALIGN(size.width,  align);
-    const int height = MTMD_ALIGN(size.height, align);
-    mtmd_image_f32 padded;
+    const clip_image_u8 & img = too_large ? resized : input;
+    const int width  = CLIP_ALIGN(size.width,  align);
+    const int height = CLIP_ALIGN(size.height, align);
+    clip_image_f32 padded;
     padded.set_size({width, height}, img.is_placeholder(), false);
     if (!img.is_placeholder()) {
         std::vector<float> pixels(size_t(width) * height * 3, -1.0f);
@@ -2391,4 +2391,3 @@ mtmd_image_preproc_out mtmd_image_preprocessor_inkling2v::preprocess(const mtmd_
     result.append(hparams, padded, false);
     return result;
 }
-

@@ -1225,7 +1225,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             } break;
         case PROJECTOR_TYPE_INKLING2V:
             {
-                builder = std::make_unique<mtmd_graph_inkling2v>(ctx, img);
+                builder = std::make_unique<clip_graph_inkling2v>(ctx, img);
             } break;
         case PROJECTOR_TYPE_MUSE_GLIMMER:
             {
@@ -3241,13 +3241,13 @@ struct clip_model_loader {
                 {
                     // these come from the generic path above, where they are optional
                     if (!model.class_embedding || !model.position_embeddings || !model.pre_ln_w || !model.pre_ln_b) {
-                        throw std::runtime_error(mtmd_format("%s: missing class_embd, position_embd or pre_ln\n", __func__));
+                        throw std::runtime_error(string_format("%s: missing class_embd, position_embd or pre_ln\n", __func__));
                     }
                     model.class_position_embedding = get_tensor(TN_CLASS_POS_EMBD);
-                    model.mm_1_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 1, "weight"));
-                    model.mm_1_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 1, "bias"), false);
-                    model.mm_2_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "weight"));
-                    model.mm_2_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "bias"), false);
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"), false);
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"), false);
                 } break;
             case PROJECTOR_TYPE_MUSE_GLIMMER:
                 {

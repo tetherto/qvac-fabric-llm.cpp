@@ -111,7 +111,7 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(params);
+    return std::make_unique<graph>(*this, params);
 }
 
 class llm_graph_input_inkling2_pos : public llm_graph_input_i {
@@ -190,7 +190,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(ggml_tensor * cur, ggml_tens
     return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*kernel + 1));
 }
 
-llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     auto * inp = build_inp_mem_hybrid_iswa();
     auto * attn = inp->get_attn();
     auto * recr = inp->get_recr();

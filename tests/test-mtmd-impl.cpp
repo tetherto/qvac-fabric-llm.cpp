@@ -242,15 +242,15 @@ MAKE_TEST(test_image_preprocessor_lfm2_torch_resize) {
 }
 
 MAKE_TEST(test_image_preprocessor_inkling2v) {
-    mtmd_hparams hparams;
+    clip_hparams hparams;
     hparams.patch_size = 20;
     hparams.n_merge = 2;
     for (int c = 0; c < 3; ++c) {
         hparams.image_mean[c] = hparams.image_std[c] = 0.5f;
     }
     mtmd_image_preprocessor_inkling2v preproc(hparams);
-    for (const auto & size : std::vector<mtmd_image_size>{{1, 1}, {40, 40}, {61, 43}, {83, 45}, {161, 21}}) {
-        mtmd_image_u8 image;
+    for (const auto & size : std::vector<clip_image_size>{{1, 1}, {40, 40}, {61, 43}, {83, 45}, {161, 21}}) {
+        clip_image_u8 image;
         image.set_size(size, false);
         for (int y = 0; y < size.height; ++y) {
             for (int x = 0; x < size.width; ++x) {
@@ -283,7 +283,7 @@ MAKE_TEST(test_image_preprocessor_inkling2v) {
     }
     // an image above image_max_pixels is resized down, the output stays aligned
     hparams.image_max_pixels = 16 * 40 * 40;
-    mtmd_image_u8 large;
+    clip_image_u8 large;
     large.set_size({1000, 300}, false);
     large.cpy_buf(std::vector<uint8_t>(1000 * 300 * 3, 17));
     const auto capped = preproc.preprocess(large);

@@ -527,7 +527,7 @@ struct clip_graph_muse_glimmer : clip_graph {
     ggml_cgraph * build() override;
 };
 
-struct mtmd_graph_inkling2v : mtmd_graph {
-    using mtmd_graph::mtmd_graph;
+struct clip_graph_inkling2v : clip_graph {
+    clip_graph_inkling2v(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
 };
