@@ -68,10 +68,10 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_inkling2_loop::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(params);
+    return std::make_unique<graph>(*this, params);
 }
 
-llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama_model_inkling2::graph(params, no_build{}) {
+llama_model_inkling2_loop::graph::graph(const llama_model & model, const llm_graph_params & params) : llama_model_inkling2::graph(model, params, no_build{}) {
     const auto & m = static_cast<const llama_model_inkling2_loop &>(model);
     const int start = m.core_start;
     const int end   = m.core_end;

@@ -448,7 +448,7 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     res->t_logits = cur;
 }
 
-llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params), model(model) {
     ggml_tensor * cur = build_inputs();
 
     std::vector<ggml_tensor *> blocks;
