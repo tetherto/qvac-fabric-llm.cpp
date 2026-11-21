@@ -1096,6 +1096,9 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) { (void)ml; }
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const { (void)params; return nullptr; }
 
+    // optional, runs after the scale pass
+    virtual void post_arch_tensors(llama_model_loader &) {}
+
 protected:
     llama_model_params params;
 
