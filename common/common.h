@@ -328,9 +328,15 @@ struct common_params_model {
 };
 
 struct common_params_speculative_draft {
+    // n_max default for --spec-type draft-dflash: the fastest on Vulkan coopmat2, faster than 3 on CUDA and Metal (both
+    // fastest at 7), and 2-7% slower than 3 on Vulkan coopmat1
+    static constexpr int32_t n_max_dflash = 5;
+
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding; greedy drafts only, a draft
                        // sampled with probabilistic is kept at any length
+
+    bool n_max_explicit = false; // n_max was set by --spec-draft-n-max or its environment variable
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
