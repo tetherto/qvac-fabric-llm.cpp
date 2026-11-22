@@ -659,8 +659,14 @@ static bool ggml_vk_spv_plan_barriers(const uint32_t * code, size_t word_count, 
             return false;
         }
         const uint32_t sem = it->second;
-        if ((sem & spv::MemorySemanticsWorkgroupMemoryMask) && (sem & order) && (sem & avail_vis) != avail_vis &&
-            !scan.new_semantics.count(sem_id)) {
+        if (!(sem & spv::MemorySemanticsWorkgroupMemoryMask) || !(sem & order)) {
+            continue;
+        }
+        // MakeAvailable needs Release and MakeVisible needs Acquire; only AcquireRelease allows both
+        if (!(sem & spv::MemorySemanticsAcquireReleaseMask)) {
+            return false;
+        }
+        if ((sem & avail_vis) != avail_vis && !scan.new_semantics.count(sem_id)) {
             scan.new_semantics[sem_id] = scan.bound++;
         }
     }
@@ -728,8 +734,8 @@ static bool ggml_vk_spv_emit_shared_avail(const uint32_t * code, size_t word_cou
     return true;
 }
 
-// Mesa before 25.3 emits a memory barrier for every shared-memory MakePointerAvailable/Visible, which
-// glslang adds to all shared accesses under the Vulkan memory model; move them onto the barriers.
+// glslang adds MakePointerAvailable/Visible to every shared access under the Vulkan memory model, and Mesa before 25.3 emits a memory barrier for each.
+// This moves them onto the workgroup barriers.
 static bool ggml_vk_move_shared_avail_to_barriers(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
     vk_spv_shared_avail_scan scan;
     if (word_count < 5 || !ggml_vk_spv_scan_shared_avail(code, word_count, scan) ||
