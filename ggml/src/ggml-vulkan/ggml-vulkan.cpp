@@ -18833,9 +18833,9 @@ static bool ggml_vk_fuse_glu_q8_1_enabled() {
     return on;
 }
 
-// SWIGLU(split)+MUL_MAT where ggml_vk_mul_mat reaches ggml_vk_mul_mat_q_f16 (no M split, no FWHT, no mat-vec);
-// the MMQ then quantizes swiglu(gate, up) straight into its B buffer.
-static bool ggml_vk_can_fuse_glu_mul_mat(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+// The GLU_MUL_MAT conditions that do not depend on the token count, the tensor addresses or the context state.
+// graph_optimize orders by these alone, so every ubatch size gets the same node order.
+static bool ggml_vk_glu_mul_mat_pair_ok(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     const enum ggml_op ops[]     = { GGML_OP_GLU, GGML_OP_MUL_MAT };
     const int          outputs[] = { node_idx + 1 };
     if (!ggml_vk_fuse_glu_q8_1_enabled() || !ggml_can_fuse_subgraph(cgraph, node_idx, 2, ops, outputs, 1)) {
@@ -18851,13 +18851,23 @@ static bool ggml_vk_can_fuse_glu_mul_mat(const ggml_backend_vk_context * ctx, co
     }
     if (glu->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
         !ggml_is_contiguous(glu) || !ggml_is_contiguous(gate) || !ggml_is_contiguous(up) ||
-        !ggml_are_same_shape(gate, glu) || !ggml_are_same_shape(up, glu) ||
-        get_misalign_bytes(ctx, gate) != 0 || get_misalign_bytes(ctx, up) != 0) {
+        !ggml_are_same_shape(gate, glu) || !ggml_are_same_shape(up, glu)) {
         return false;
     }
-    return ggml_is_quantized(w->type) && ggml_vk_dim01_contiguous(w) &&
-           mm->ne[1] > mul_mat_vec_max_cols && mm->ne[2] == 1 && mm->ne[3] == 1 &&
-           ggml_nbytes(w) <= ctx->device->properties.limits.maxStorageBufferRange &&
+    return ggml_is_quantized(w->type) && ggml_vk_dim01_contiguous(w) && mm->ne[2] == 1 && mm->ne[3] == 1 &&
+           ggml_nbytes(w) <= ctx->device->properties.limits.maxStorageBufferRange;
+}
+
+// SWIGLU(split)+MUL_MAT where ggml_vk_mul_mat reaches ggml_vk_mul_mat_q_f16 (no M split, no FWHT, no mat-vec);
+// the MMQ then quantizes swiglu(gate, up) straight into its B buffer.
+static bool ggml_vk_can_fuse_glu_mul_mat(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_glu_mul_mat_pair_ok(ctx, cgraph, node_idx)) {
+        return false;
+    }
+    const ggml_tensor * glu = cgraph->nodes[node_idx];
+    const ggml_tensor * mm  = cgraph->nodes[node_idx + 1];
+    return mm->ne[1] > mul_mat_vec_max_cols &&
+           get_misalign_bytes(ctx, glu->src[0]) == 0 && get_misalign_bytes(ctx, glu->src[1]) == 0 &&
            !ggml_vk_can_use_fwht(ctx, glu, mm);
 }
 
@@ -20843,8 +20853,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[j]->op == GGML_OP_ADD &&
                       current_set.size() >= 2 && graph->nodes[current_set[current_set.size() - 2]]->op == GGML_OP_NORM) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
-                    // GLU -> MUL_MAT (GLU_MUL_MAT): keep the down projection behind its GLU only when the pair fuses
-                    !(j == c+1 && c == current_set.back() && ggml_vk_can_fuse_glu_mul_mat(ctx, graph, c)) &&
+                    // GLU -> MUL_MAT (GLU_MUL_MAT): keep the down projection behind its GLU when the pair can fuse at some batch size
+                    !(j == c+1 && c == current_set.back() && ggml_vk_glu_mul_mat_pair_ok(ctx, graph, c)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
