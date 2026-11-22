@@ -3155,8 +3155,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     };
     auto add_narrow_n_cm1 = [&](std::vector<vk_tile_config>& configs, ggml_type type, bool is_id) {
-        // AMD keeps the base tiles: on a Radeon 8060S (RADV) the narrow tiles made F16 9-32 row forwards 1.8-1.9x slower.
-        if (is_id || configs.empty() || device->vendor_id == VK_VENDOR_ID_AMD) {
+        // Only NVIDIA is measured (GB10, RTX 3080); on a Radeon 8060S (RADV) the narrow tiles made F16 9-32 row forwards 1.8-1.9x slower.
+        if (is_id || configs.empty() || device->vendor_id != VK_VENDOR_ID_NVIDIA) {
             return;
         }
         add_narrow_n_cm1_tile(configs, type, 16);
