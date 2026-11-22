@@ -13049,11 +13049,13 @@ struct test_swiglu_mul_mat : public test_case {
     const int64_t n;
     const int64_t k;
     const bool f16_b;
+    const bool tail;
     const bool fuses;
     mutable bool has_fusion_counter = false;
+    mutable bool supported = false;
 
     std::string vars() override {
-        return VARS_TO_STR5(type_a, m, n, k, f16_b);
+        return VARS_TO_STR6(type_a, m, n, k, f16_b, tail);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -13063,7 +13065,7 @@ struct test_swiglu_mul_mat : public test_case {
 
     bool run_whole_graph() override { return true; }
 
-    // f16_b drives the Vulkan path that runs the GLU first; CUDA MMQ asserts on an F16 src1 precision
+    // f16_b keeps B unquantized, so Vulkan must not fuse; CUDA MMQ asserts on an F16 src1 precision
     bool skip_backend(ggml_backend_t backend) override {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         return f16_b && strcmp(ggml_backend_reg_name(reg), "Vulkan") != 0;
@@ -13076,17 +13078,20 @@ struct test_swiglu_mul_mat : public test_case {
     uint64_t fusion_count(ggml_backend_t backend) override {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         using counter_fn = uint64_t (*)(ggml_backend_t);
+        using supported_fn = bool (*)(ggml_backend_t, ggml_type);
         auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_glu_mul_mat_fusion_count");
+        auto support = (supported_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_glu_mul_mat_supported");
         has_fusion_counter = counter != nullptr;
+        supported = support != nullptr && support(backend, type_a);
         return counter != nullptr ? counter(backend) : 0;
     }
 
-    bool expect_fusion() override { return fuses && has_fusion_counter; }
+    bool expect_fusion() override { return fuses && has_fusion_counter && supported; }
 
     bool expect_no_fusion() override { return !fuses && has_fusion_counter; }
 
-    test_swiglu_mul_mat(ggml_type type_a, int64_t m, int64_t n, int64_t k, bool f16_b, bool fuses)
-        : type_a(type_a), m(m), n(n), k(k), f16_b(f16_b), fuses(fuses) {}
+    test_swiglu_mul_mat(ggml_type type_a, int64_t m, int64_t n, int64_t k, bool f16_b, bool tail, bool fuses)
+        : type_a(type_a), m(m), n(n), k(k), f16_b(f16_b), tail(tail), fuses(fuses) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
@@ -13103,6 +13108,10 @@ struct test_swiglu_mul_mat : public test_case {
             GGML_ASSERT(ggml_prec_set_src(out, GGML_PREC_F16, 1));
         }
         ggml_set_name(out, "out");
+        if (tail) {
+            out = ggml_scale(ctx, out, 0.5f);
+            ggml_set_name(out, "out_scaled");
+        }
         return out;
     }
 };
@@ -18150,15 +18159,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 300, 2048, { 1, 1 }, { 1, 1 }));
     }
 
-    // SWIGLU into MUL_MAT: a long-K down projection, partial tiles, a min-term type, the smallest batch past
-    // the mat-vec limit, unquantized B (F16 precision, the GLU runs first), then a mat-vec batch and F16 weights.
-    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 512, 512, 12288, false, true));
-    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q4_0, 300, 33, 2048, false, true));
-    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q4_K, 256, 64, 1024, false, true));
-    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 9, 1024, false, true));
-    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 64, 1024, true, true));
-    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 8, 1024, false, false));
-    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_F16, 256, 64, 1024, false, false));
+    // SWIGLU into MUL_MAT that fuses: a long-K down projection, partial tiles, a min-term type, the smallest batch past the mat-vec limit.
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 512, 512, 12288, false, true, true));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q4_0, 300, 33, 2048, false, true, true));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q4_K, 256, 64, 1024, false, true, true));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 9, 1024, false, true, true));
+    // No fusion: F16 B precision, a mat-vec batch, F16 weights, and the MUL_MAT as the last computed node (an eval callback may read the GLU).
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 64, 1024, true, true, false));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 8, 1024, false, true, false));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_F16, 256, 64, 1024, false, true, false));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 64, 1024, false, false, false));
 
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
