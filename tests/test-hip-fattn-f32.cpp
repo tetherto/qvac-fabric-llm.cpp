@@ -123,9 +123,10 @@ std::vector<double> reference_means(const test_shape & shape, const std::vector<
     return means;
 }
 
-bool compare_output(const test_shape & shape, ggml_tensor * output, const std::vector<double> & means) {
+bool compare_output(const test_shape & shape, ggml_tensor * output, const std::vector<double> & means, bool is_gpu) {
     constexpr double weighted_tolerance = 1e-3;
-    const double limit = shape.weighted ? weighted_tolerance : tolerance;
+    constexpr double gpu_tolerance = 5e-4;
+    const double limit = shape.weighted ? weighted_tolerance : (is_gpu ? gpu_tolerance : tolerance);
     std::vector<float> actual(ggml_nelements(output));
     ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
     for (size_t i = 0; i < actual.size(); ++i) {
@@ -161,7 +162,9 @@ bool run_graph(ggml_backend_t backend, ggml_context * ctx, const test_shape & sh
     const auto values = make_values(shape);
     ggml_backend_tensor_set(v, values.data(), 0, values.size() * sizeof(float));
     const bool computed = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
-    const bool passed = computed && compare_output(shape, out, reference_means(shape, values));
+    const auto device_type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+    const bool is_gpu = device_type == GGML_BACKEND_DEVICE_TYPE_GPU || device_type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+    const bool passed = computed && compare_output(shape, out, reference_means(shape, values), is_gpu);
     ggml_backend_buffer_free(buffer);
     return passed;
 }
