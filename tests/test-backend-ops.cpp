@@ -3046,6 +3046,41 @@ struct test_set_rows : public test_case {
         return 1e-7;
     }
 
+    // TBQ/PQ: the backend and the CPU compute the block norm and the scaled values with slightly different floats, so
+    // an element close to a codebook boundary can land in the neighbouring centroid. Dequantization is cb[idx] * norm
+    // per element, so that moves one element of one block by one codebook gap times the block norm: at most 0.098^2
+    // (TQ3 d=64, the widest gap) of that block's energy. Leave out the worst block when it is within twice that, and
+    // hold the rest of the tensor to max_nmse_err().
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t blck = ggml_blck_size(type_dst);
+        if (!ggml_is_tbq_or_pq(type_dst) || n % blck != 0) {
+            return test_case::err(a, b, n);
+        }
+        double err_sum   = 0.0;
+        double ref_sum   = 0.0;
+        double worst_err = 0.0;
+        double worst_ref = 0.0;
+        for (size_t i0 = 0; i0 < n; i0 += blck) {
+            double e = 0.0;
+            double r = 0.0;
+            for (size_t i = i0; i < i0 + blck; i++) {
+                const double d = double(a[i]) - double(b[i]);
+                e += d*d;
+                r += double(a[i])*double(a[i]);
+            }
+            err_sum += e;
+            ref_sum += r;
+            if (e > worst_err) {
+                worst_err = e;
+                worst_ref = r;
+            }
+        }
+        if (worst_err <= 2.0*0.098*0.098*worst_ref) {
+            err_sum -= worst_err;
+        }
+        return err_sum/ref_sum;
+    }
+
     // See dicussion here: https://github.com/ggml-org/llama.cpp/pull/23760#issuecomment-4566312209
     double max_nmse_err(ggml_backend_t backend) override {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
