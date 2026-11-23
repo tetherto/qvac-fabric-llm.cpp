@@ -4,6 +4,8 @@
 
 void ggml_cuda_op_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+void ggml_cuda_op_rope_flux(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_op_rope_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * set_rows);
