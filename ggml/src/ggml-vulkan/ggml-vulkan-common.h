@@ -14,7 +14,7 @@ extern bool vk_enable_sync_logger;
 extern uint32_t vk_perf_logger_frequency;
 extern std::string vk_pipeline_stats_filter;
 extern void * const vk_ptr_base;
-extern vk_instance_t vk_instance;
+extern vk_instance_t & vk_instance;
 extern ggml_backend_buffer_i ggml_backend_vk_buffer_interface;
 
 // instance

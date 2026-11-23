@@ -62,6 +62,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -658,6 +659,34 @@ static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
 
 class vk_memory_logger;
 
+struct ggml_backend_vk_context;
+struct vk_event;
+
+template <typename T>
+class vk_live_set {
+public:
+    void add(T * item) {
+        std::lock_guard<std::mutex> guard(mutex);
+        items.insert(item);
+    }
+
+    void remove(T * item) {
+        std::lock_guard<std::mutex> guard(mutex);
+        items.erase(item);
+    }
+
+    std::vector<T *> take_all() {
+        std::lock_guard<std::mutex> guard(mutex);
+        std::vector<T *> taken(items.begin(), items.end());
+        items.clear();
+        return taken;
+    }
+
+private:
+    std::mutex mutex;
+    std::unordered_set<T *> items;
+};
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
@@ -1014,6 +1043,16 @@ struct vk_device_struct {
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
+    vk_live_set<ggml_backend_vk_context> live_backends;
+    vk_live_set<vk_event> live_events;
+    vk_live_set<vk_buffer_struct> live_buffers;
+
+    bool shut_down = false;
+    bool destroyed = false;
+
+    void wait_idle();
+    void shutdown();
+
     ~vk_device_struct();
 
 };
@@ -1043,17 +1082,28 @@ struct vk_buffer_struct {
     vk::DeviceAddress bda_addr {};
 
     vk_device device;
+    bool released = false;
 
-    ~vk_buffer_struct() {
-        if (size == 0) {
-            return;
-        }
-        VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
+    bool owns_allocation() const {
+        return size != 0 && !released;
+    }
 
+    void release() {
         // bump before destroying, so a thread that sees the buffer gone also sees the new count
         device->buffer_destroy_count.fetch_add(1, std::memory_order_release);
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
+        released = true;
+    }
+
+    ~vk_buffer_struct() {
+        if (!owns_allocation()) {
+            return;
+        }
+        VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
+
+        device->live_buffers.remove(this);
+        release();
     }
 };
 

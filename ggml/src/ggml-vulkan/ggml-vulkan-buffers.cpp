@@ -195,6 +195,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
 
     buf->device = device;
+    device->live_buffers.add(buf.get());
     buf->size = size;
 
     if (device->buffer_device_address) {
