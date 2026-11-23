@@ -661,6 +661,7 @@ ggml_tensor * llm_build_delta_net_base::build_rs_ssm(
 
     // in place: the op reads the base state of each cell before it writes the new one there. otherwise one gather of
     // all n_rs base states: the ubatch states, then the extra cells (see build_rs)
+    inp->moved_used |= inp->s_base_inplace;
     return build_rs(ssm_states_all, inp->s_base_inplace ? inp->s_copy_moved : inp->s_copy_base, inp->s_copy_base_main,
                     hparams.n_embd_s(), n_seqs,
                     mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z(),
