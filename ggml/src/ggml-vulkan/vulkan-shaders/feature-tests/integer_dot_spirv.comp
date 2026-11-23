@@ -1,0 +1,12 @@
+#version 460
+
+#define INTEGER_DOT_SPIRV_INTRINSICS
+#include "../integer_dot.glsl"
+
+layout(local_size_x = 1) in;
+layout(binding = 0) buffer B { int v[]; };
+
+void main()
+{
+    v[0] = dotPacked4x8EXT(v[1], v[2]) + dotPacked4x8AccSatEXT(v[3], v[4], v[5]);
+}

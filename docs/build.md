@@ -540,6 +540,8 @@ On Debian / Ubuntu, you can install the required dependencies using:
 sudo apt-get install libvulkan-dev glslc spirv-headers
 ```
 
+If the packaged `glslc` lacks `GL_EXT_integer_dot_product`, the build emits the same integer dot product instructions through `GL_EXT_spirv_intrinsics`, so the integer dot product shaders are still built.
+
 SPIRV-Headers (`spirv/unified1/spirv.hpp`) are required for the Vulkan backend and are **not** always pulled in by the Vulkan loader dev package alone. Other distros use names such as `spirv-headers` (Ubuntu / Debian / Arch), or `spirv-headers-devel` (Fedora / openSUSE). On Windows, the LunarG Vulkan SDK’s `Include` directory already contains these headers.
 
 #### Common steps
