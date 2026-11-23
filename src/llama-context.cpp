@@ -141,6 +141,12 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_kv_rows_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_flash_attn_idx_bias_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN_IDX_BIAS,
+    /*.name             =*/ "Flash Attention with an indexed bias",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
     /*.name             =*/ "Lightning Indexer",
@@ -428,6 +434,12 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;
         }
+    }
+
+    // only the models with a relative-position bias build it (Inkling 2), resolved after flash attention
+    {
+        cparams.fused_fa_idx_bias = false;
+        cparams.auto_ffib         = model.hparams.n_relative > 0 && !getenv("LLAMA_FA_IDX_BIAS_DISABLE");
     }
 
     // initialized later
@@ -794,6 +806,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     if (cparams.auto_fa) {
         resolve(llm_fused_op_flash_attn_probe, cparams.flash_attn);
         cparams.auto_fa = false;
+    }
+
+    // the fallback builds the bias of every head into the mask
+    if (cparams.auto_ffib) {
+        cparams.fused_fa_idx_bias = cparams.flash_attn;
+        resolve(llm_fused_op_flash_attn_idx_bias_probe, cparams.fused_fa_idx_bias);
+        cparams.auto_ffib = false;
     }
 
     // the fallback attends to the whole unified cache with a dense mask
