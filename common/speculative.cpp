@@ -2904,6 +2904,14 @@ static bool common_speculative_read_header(const std::string & path, common_spec
     const int64_t n_layer_nextn = common_speculative_gguf_int(ctx.get(), p + "nextn_predict_layers");
     hdr.n_layer = n_layer_all > n_layer_nextn ? n_layer_all - n_layer_nextn : 0;
 
+    // a looped model (Inkling 2 Mini) runs layers [loop.start, loop.end) loop.count times, its layer inputs are indexed by visit
+    const int64_t loop_count = common_speculative_gguf_int(ctx.get(), p + "loop.count");
+    const int64_t loop_start = common_speculative_gguf_int(ctx.get(), p + "loop.start");
+    const int64_t loop_end   = common_speculative_gguf_int(ctx.get(), p + "loop.end");
+    if (loop_count > 1 && loop_start < loop_end && loop_end <= hdr.n_layer && loop_count <= 64) {
+        hdr.n_layer += (loop_count - 1)*(loop_end - loop_start);
+    }
+
     const int64_t tokens_id = gguf_find_key(ctx.get(), "tokenizer.ggml.tokens");
     if (tokens_id >= 0 && gguf_get_kv_type(ctx.get(), tokens_id) == GGUF_TYPE_ARRAY) {
         hdr.n_vocab = (int64_t) gguf_get_arr_n(ctx.get(), tokens_id);
