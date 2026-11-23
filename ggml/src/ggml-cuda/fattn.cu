@@ -592,10 +592,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
 
-    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
-        return BEST_FATTN_KERNEL_NONE;
-    }
-
     const ggml_tensor * KQV   = dst;
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * K     = dst->src[1];
@@ -615,7 +611,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, if the mask has a head dimension,
     //     or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+    // an indexed bias reaches the kernels as a mask with a head dimension, see ggml_cuda_flash_attn_ext
+    const bool mask_per_head = mask && (mask->ne[2] != 1 || ggml_flash_attn_ext_has_indexed_bias(dst));
+
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && !mask_per_head && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -683,7 +682,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (mask && mask->ne[2] != 1) {
+    if (mask_per_head) {
         // the kv_rows mask is compacted per sequence, it has no head dimension
         if (kv_rows) {
             return BEST_FATTN_KERNEL_NONE;
@@ -848,8 +847,84 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// indexed bias (ggml_flash_attn_ext_add_indexed_bias) as a mask with a head dimension, F16 like the mask:
+//   dst[s][h][q][k] = mask[s][q][k] + table[s*n_q + q][h][indices[s*n_q + q][k]]
+// one block per (query, stream), the mask and index rows are read once for all heads
+static __global__ void k_fattn_indexed_bias_mask(
+        const half * __restrict__ mask, const float * __restrict__ table, const int32_t * __restrict__ indices, half * __restrict__ dst,
+        const int n_kv, const int n_q, const int n_head, const int n_bins,
+        const int64_t s_m1, const int64_t s_m3, const int64_t s_t1, const int64_t s_t2, const int64_t s_i1) {
+    const int q = blockIdx.x;
+    const int s = blockIdx.y;
+
+    const int64_t row = int64_t(s)*n_q + q;
+
+    const half    * m   = mask    + s*s_m3 + q*s_m1;
+    const int32_t * idx = indices + row*s_i1;
+    const float   * t   = table   + row*s_t2;
+    half          * d   = dst     + (int64_t(s)*n_head*n_q + q)*n_kv;
+
+    for (int k = threadIdx.x; k < n_kv; k += blockDim.x) {
+        const float mk = __half2float(m[k]);
+        const int   b  = min(max(idx[k], 0), n_bins - 1);
+        for (int h = 0; h < n_head; ++h) {
+            d[int64_t(h)*n_q*n_kv + k] = __float2half(mk + t[h*s_t1 + b]);
+        }
+    }
+}
+
+static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
+        const ggml_tensor * Q       = dst->src[0];
+        const ggml_tensor * mask    = dst->src[3];
+        const ggml_tensor * table   = dst->src[6];
+        const ggml_tensor * indices = dst->src[7];
+        GGML_ASSERT(mask && mask->type == GGML_TYPE_F16 && mask->ne[2] == 1);
+        GGML_ASSERT(table->type == GGML_TYPE_F32 && indices->type == GGML_TYPE_I32);
+
+        const int64_t n_kv     = mask->ne[0];
+        const int64_t n_q      = Q->ne[1];
+        const int64_t n_head   = Q->ne[2];
+        const int64_t n_stream = Q->ne[3];
+
+        ggml_cuda_pool_alloc<half> mask_h(ctx.pool(), n_kv*n_q*n_head*n_stream);
+
+        const dim3 blocks((unsigned) n_q, (unsigned) n_stream, 1);
+        const dim3 threads((unsigned) std::min<int64_t>(256, GGML_PAD(n_kv, WARP_SIZE)), 1, 1);
+        k_fattn_indexed_bias_mask<<<blocks, threads, 0, ctx.stream()>>>(
+            (const half *) mask->data, (const float *) table->data, (const int32_t *) indices->data, mask_h.get(),
+            (int) n_kv, (int) n_q, (int) n_head, (int) table->ne[0],
+            mask->nb[1]/sizeof(half), mask->nb[3]/sizeof(half), table->nb[1]/sizeof(float), table->nb[2]/sizeof(float), indices->nb[1]/sizeof(int32_t));
+        CUDA_CHECK(cudaGetLastError());
+
+        // the same op with the per-head mask and without the indexed bias
+        ggml_tensor mask_t = *mask;
+        mask_t.data     = mask_h.get();
+        mask_t.view_src = nullptr;
+        mask_t.ne[2]    = n_head;
+        mask_t.ne[3]    = n_stream;
+        mask_t.nb[1]    = n_kv*sizeof(half);
+        mask_t.nb[2]    = mask_t.nb[1]*n_q;
+        mask_t.nb[3]    = mask_t.nb[2]*n_head;
+
+        ggml_tensor dst_t = *dst;
+        dst_t.src[3] = &mask_t;
+        dst_t.src[6] = nullptr;
+        dst_t.src[7] = nullptr;
+        ggml_set_op_params_i32(&dst_t, 5, 0);
+
+        ggml_cuda_flash_attn_ext_dispatch(ctx, &dst_t);
+        return;
+    }
+
+    ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
+}
+
+static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (ggml_cuda_flash_attn_ext_f8_supported(ggml_cuda_get_device(), dst)) {
         ggml_cuda_flash_attn_ext_f8(ctx, dst);
         return;
