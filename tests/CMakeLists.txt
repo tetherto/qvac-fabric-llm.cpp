@@ -646,6 +646,12 @@ llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK 
 
 llama_build_and_test(test-convrot.cpp LINK ggml)
 
+llama_build(test-hip-scale-residual.cpp LINK ggml)
+llama_test(test-hip-scale-residual NAME test-hip-scale-residual-guards ARGS guards)
+if (GGML_CPU)
+    llama_test(test-hip-scale-residual NAME test-hip-scale-residual-cpu ARGS CPU)
+endif()
+
 llama_build(test-hip-fattn-f32.cpp LINK ggml)
 llama_test(test-hip-fattn-f32 NAME test-hip-fattn-f32-dispatch ARGS dispatch)
 if (GGML_CPU)

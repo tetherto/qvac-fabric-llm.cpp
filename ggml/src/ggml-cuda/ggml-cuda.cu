@@ -6014,6 +6014,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
         }
     }
 
+#if defined(GGML_USE_HIP)
+    if (node->op == GGML_OP_MUL) {
+        const auto & device = ggml_cuda_info().devices[cuda_ctx->device];
+        const bool is_gfx1151 = device.cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+        if (ggml_cuda_can_fuse_scale_residual_gfx1151(is_gfx1151, device.warp_size,
+                ggml_backend_cuda_buffer_type(cuda_ctx->device), cgraph, i)) {
+            ggml_cuda_op_scale_residual_gfx1151(*cuda_ctx, node->src[0], node->src[1], cgraph->nodes[i + 1]);
+            return 1;
+        }
+    }
+#endif
+
     // multi-(add or mul)
     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
         int     n_fuse = 0;
