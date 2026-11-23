@@ -1716,9 +1716,19 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
+// Q8_1 copy of src1 that the dense matmuls of one activation-plan group share; the first matmul to run writes it.
+struct ggml_cuda_mmq_shared_src1 {
+    char * q8_1      = nullptr;
+    size_t nbytes    = 0;
+    bool * quantized = nullptr;
+};
+
+// Bytes of the Q8_1 copy of src1 that the dense MMQ path of the MUL_MAT dst quantizes, 0 if it does not quantize to Q8_1.
+size_t ggml_cuda_mmq_shared_src1_nbytes(const ggml_tensor * dst, int device);
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+        const ggml_cuda_mm_fusion_args_host * fusion = nullptr, const ggml_cuda_mmq_shared_src1 * shared_src1 = nullptr);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 

@@ -169,9 +169,40 @@ static int ggml_cuda_mmq_get_J_best(
     return J_best;
 }
 
+// A tile of size J can read in at most J - 1 extra columns.
+// For simplicity, round up the padding of a full tile to a multiple of the number of bytes that nthreads can load in parallel.
+static size_t ggml_cuda_mmq_src1_padding(const int J_best, const int nthreads_best) {
+    const size_t src1_load_chunk_size = nthreads_best * sizeof(int);
+    return ((J_best * sizeof(block_q8_1_mmq) + src1_load_chunk_size - 1) / src1_load_chunk_size) * src1_load_chunk_size;
+}
+
+static size_t ggml_cuda_mmq_dense_src1_nbytes(const ggml_tensor * src1, const bool use_native_fp4, const int J_best, const int nthreads_best) {
+    const int64_t ne10_padded        = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const size_t  y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
+    const size_t  y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
+    return src1->ne[3]*src1->ne[2] * src1->ne[1]*ne10_padded * y_block_size/y_values_per_block +
+        ggml_cuda_mmq_src1_padding(J_best, nthreads_best);
+}
+
+size_t ggml_cuda_mmq_shared_src1_nbytes(const ggml_tensor * dst, const int device) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    const int    cc    = ggml_cuda_info().devices[device].cc;
+    const size_t smpbo = ggml_cuda_info().devices[device].smpbo;
+    if (ggml_cuda_mmq_get_prec_src1(src0->type, ggml_prec_get_src(dst, 1), cc) != GGML_PREC_Q8) {
+        return 0;
+    }
+
+    int nthreads_best = 0;
+    const int J_best  = ggml_cuda_mmq_get_J_best(
+        src0->type, src1->ne[1], ggml_cuda_mmq_needs_fallback(src0->ne[1]), cc, smpbo, GGML_PREC_Q8, &nthreads_best);
+    return J_best > 0 ? ggml_cuda_mmq_dense_src1_nbytes(src1, /*use_native_fp4 =*/ false, J_best, nthreads_best) : 0;
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const ggml_cuda_mmq_shared_src1 * shared_src1) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -268,23 +299,23 @@ void ggml_cuda_mul_mat_q(
     }
     GGML_ASSERT(J_best > 0);
 
-    // A tile of size J can read in at most J - 1 extra columns.
-    // For simplicity, round up the padding of a full tile to a multiple of the number of bytes that nthreads can load in parallel.
-    const size_t src1_load_chunk_size = nthreads_best * sizeof(int);
-    const size_t src1_q8_1_padding = ((J_best * sizeof(block_q8_1_mmq) + src1_load_chunk_size - 1) / src1_load_chunk_size)
-        * src1_load_chunk_size;
+    const size_t src1_q8_1_padding = ggml_cuda_mmq_src1_padding(J_best, nthreads_best);
 
     if (!ids) {
         const int ntj = (ne1 + J_best - 1) / J_best;
 
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        const size_t nbytes_src1_q8_1 = ggml_cuda_mmq_dense_src1_nbytes(src1, use_native_fp4, J_best, nthreads_best);
+        // The matmuls of one activation-plan group share the Q8_1 copy of src1; the first one to get here writes it.
+        const bool use_shared_src1 = shared_src1 != nullptr && !use_native_fp4 && fusion == nullptr;
+        GGML_ASSERT(!use_shared_src1 || shared_src1->nbytes >= nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<char> src1_q8_1_private(ctx.pool());
+        char * src1_q8_1 = use_shared_src1 ? shared_src1->q8_1 : src1_q8_1_private.alloc(nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
-        {
+        if (!use_shared_src1 || !*shared_src1->quantized) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -292,14 +323,17 @@ void ggml_cuda_mul_mat_q(
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
+        }
+        if (use_shared_src1) {
+            *shared_src1->quantized = true;
         }
 
         // Stride depends on quantization format
@@ -309,7 +343,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,

@@ -8667,6 +8667,49 @@ struct test_mul_mat_fp8_bf16_shared : public test_case {
     }
 };
 
+// Several quantized matmuls on one src1, as the projections of a transformer layer: MMQ can quantize src1 once for all.
+struct test_mul_mat_shared_src1 : public test_case {
+    const std::array<ggml_type, 3> type_a;
+    const std::array<int64_t, 3>   m;
+    const int64_t                  n;
+    const int64_t                  k;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    int graph_replays() override { return 2; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_shared_src1(std::array<ggml_type, 3> type_a, std::array<int64_t, 3> m, int64_t n = 512, int64_t k = 1024) :
+        type_a(type_a), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * out = nullptr;
+        for (size_t i = 0; i < type_a.size(); ++i) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a[i], k, m[i]);
+            ggml_set_name(a, ("a" + std::to_string(i)).c_str());
+            ggml_tensor * mm = ggml_mul_mat(ctx, a, x);
+            out = out == nullptr ? mm : ggml_concat(ctx, out, mm, 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_cutlass_mlp_bf16 : public test_case {
     static constexpr int n_weights = 3;
 
@@ -18550,6 +18593,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1152, 256, 1024, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  512, 384, 1024, {2, 3}, {1, 1}));
     }
+
+    // MMQ quantizes a shared src1 once per Q8_1 layout (Q8_0, Q6_K: D4; Q4_K: DS4); 96 rows take the bounds-checked kernel
+    test_cases.emplace_back(new test_mul_mat_shared_src1({GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {256, 96, 512}));
+    test_cases.emplace_back(new test_mul_mat_shared_src1({GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}, {256, 128, 512}, 200));
 
     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
