@@ -361,7 +361,16 @@ static bool ggml_vk_concat_is_transposed(const ggml_tensor * src0, const ggml_te
 }
 static bool vk_instance_initialized = false;
 
-vk_instance_t vk_instance;
+template <typename T>
+static T & ggml_vk_never_destroyed() {
+    static T * value = new T();
+    return *value;
+}
+
+vk_instance_t & vk_instance = ggml_vk_never_destroyed<vk_instance_t>();
+
+static void ggml_vk_register_exit_teardown();
+static void ggml_vk_release_live_children(vk_device_struct & device);
 
 static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context * ctx, const vk_buffer &buf, const VkDeviceSize offset) {
     const VkDeviceSize range = std::min(VkDeviceSize{buf->size - offset},
@@ -6207,6 +6216,7 @@ vk_device ggml_vk_get_device(size_t idx) {
             .setPEnabledExtensionNames(device_extensions);
         device_create_info.setPNext(&device_features2);
         device->device = device->physical_device.createDevice(device_create_info);
+        ggml_vk_register_exit_teardown();
 
         if (device->device_fault) {
             device->pfn_vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)
@@ -6648,6 +6658,35 @@ static void ggml_vk_print_gpu_info(size_t idx) {
 
 static DispatchLoaderDynamic ggml_vk_default_dispatcher_instance;
 
+static void ggml_vk_shutdown_devices() {
+    for (auto & device : vk_instance.devices) {
+        if (device) {
+            device->shutdown();
+        }
+    }
+}
+
+static void ggml_vk_instance_destroy() {
+    if (!vk_instance_initialized || !vk_instance.instance) {
+        return;
+    }
+    VK_LOG_DEBUG("ggml_vk_instance_destroy()");
+    ggml_vk_shutdown_devices();
+    vk_instance.instance.destroy();
+    vk_instance.instance = vk::Instance{};
+}
+
+// Exit handlers run in reverse order of registration, and the driver registers its own
+// when the instance or a device loads it. Registering after that destroys devices and
+// the instance first: the NVIDIA Tegra driver otherwise unmaps the code of a worker
+// thread that only vkDestroyDevice stops. Not on Windows, where exit handlers of a DLL
+// run under the loader lock and Vulkan calls there can deadlock.
+static void ggml_vk_register_exit_teardown() {
+#ifndef _WIN32
+    std::atexit(ggml_vk_instance_destroy);
+#endif
+}
+
 DispatchLoaderDynamic & ggml_vk_default_dispatcher() {
     return ggml_vk_default_dispatcher_instance;
 }
@@ -6752,6 +6791,7 @@ void ggml_vk_instance_init() {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance.instance);
 
     std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
+    ggml_vk_register_exit_teardown();
 
     // Emulate behavior of CUDA_VISIBLE_DEVICES for Vulkan
     char * devices_env = getenv("GGML_VK_VISIBLE_DEVICES");
@@ -6987,6 +7027,8 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     if (vk_perf_logger_enabled) {
         ctx->perf_logger = std::unique_ptr<vk_perf_logger>(new vk_perf_logger());
     }
+
+    ctx->device->live_backends.add(ctx);
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
     const char* skip_checks = getenv("GGML_VULKAN_SKIP_CHECKS");
@@ -17602,6 +17644,9 @@ void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
 
 void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
+    if (ctx->device->destroyed) {
+        return;
+    }
     // discard any unsubmitted command buffers
     ctx->compute_ctx.reset();
     // wait for any pending command buffers to finish
@@ -17655,6 +17700,10 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
         ctx->device->device.destroySemaphore(ctx->transfer_semaphore.s);
 
         ctx->transfer_cmd_pool.destroy(ctx->device->device);
+    }
+    if (ctx->query_pool) {
+        ctx->device->device.destroyQueryPool(ctx->query_pool);
+        ctx->query_pool = nullptr;
     }
     if (vk_perf_logger_enabled) {
         ctx->perf_logger->print_timings(true);
@@ -17941,6 +17990,7 @@ void ggml_backend_vk_free(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
+    ctx->device->live_backends.remove(ctx);
     ggml_vk_cleanup(ctx);
 
     delete ctx;
@@ -21976,11 +22026,27 @@ static ggml_backend_event_t ggml_backend_vk_device_event_new(ggml_backend_dev_t 
     vk::SemaphoreCreateInfo ci{};
     ci.setPNext(&tci);
     vkev->tl_semaphore = { device->device.createSemaphore(ci), 0 };
+    device->live_events.add(vkev);
 
     return new ggml_backend_event {
         /* .device  = */ dev,
         /* .context = */ vkev,
     };
+}
+
+static void ggml_vk_destroy_events(vk::Device device, const std::vector<vk::Event> & events) {
+    for (const auto & event : events) {
+        device.destroyEvent(event);
+    }
+}
+
+static void ggml_vk_destroy_event_handles(vk::Device device, const vk_event * vkev) {
+    device.destroySemaphore(vkev->tl_semaphore.s);
+    ggml_vk_destroy_events(device, vkev->events_free);
+    ggml_vk_destroy_events(device, vkev->events_submitted);
+    if (vkev->has_event) {
+        device.destroyEvent(vkev->event);
+    }
 }
 
 static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
@@ -21989,18 +22055,36 @@ static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backe
 
     vk_event *vkev = (vk_event *)event->context;
 
-    device->device.destroySemaphore(vkev->tl_semaphore.s);
-    for (auto& event : vkev->events_free) {
-        device->device.destroyEvent(event);
-    }
-    for (auto& event : vkev->events_submitted) {
-        device->device.destroyEvent(event);
-    }
-    if (vkev->has_event) {
-        device->device.destroyEvent(vkev->event);
+    device->live_events.remove(vkev);
+    if (!device->destroyed) {
+        ggml_vk_destroy_event_handles(device->device, vkev);
     }
     delete vkev;
     delete event;
+}
+
+static void ggml_vk_release_backends(vk_device_struct & device) {
+    for (auto * ctx : device.live_backends.take_all()) {
+        ggml_vk_cleanup(ctx);
+    }
+}
+
+static void ggml_vk_release_events(vk_device_struct & device) {
+    for (auto * vkev : device.live_events.take_all()) {
+        ggml_vk_destroy_event_handles(device.device, vkev);
+    }
+}
+
+static void ggml_vk_release_buffers(vk_device_struct & device) {
+    for (auto * buf : device.live_buffers.take_all()) {
+        buf->release();
+    }
+}
+
+static void ggml_vk_release_live_children(vk_device_struct & device) {
+    ggml_vk_release_backends(device);
+    ggml_vk_release_events(device);
+    ggml_vk_release_buffers(device);
 }
 
 static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
@@ -22381,13 +22465,41 @@ void vk_queue_handle_unsynchronized::submit(vk::ArrayProxy<const vk::SubmitInfo>
     }
 }
 
-vk_device_struct::~vk_device_struct() {
-    // the build failed before the device was created, nothing to destroy
-    if (device == VK_NULL_HANDLE) {
+void vk_device_struct::wait_idle() {
+    try {
+        device.waitIdle();
+    } catch (const vk::SystemError & e) {
+        VK_LOG_DEBUG("waitIdle before destroying device " << name << " failed: " << e.what());
+    }
+}
+
+bool vk_device_struct::allocator_is_empty() {
+    if (allocator == VK_NULL_HANDLE) {
+        return true;
+    }
+    VmaTotalStatistics stats = {};
+    vmaCalculateStatistics(allocator, &stats);
+    return stats.total.statistics.allocationCount == 0;
+}
+
+void vk_device_struct::destroy_allocator() {
+    if (allocator_is_empty()) {
+        vmaDestroyAllocator(allocator);
         return;
     }
+    VK_LOG_DEBUG("device " << name << " still holds allocations; leaving its allocator to the driver");
+}
 
+void vk_device_struct::shutdown() {
+    // a device whose build failed before it was created has nothing to destroy
+    if (shut_down || !device) {
+        return;
+    }
+    shut_down = true;
     VK_LOG_DEBUG("destroy device " << name);
+
+    wait_idle();
+    ggml_vk_release_live_children(*this);
 
     device.destroyFence(fence);
 
@@ -22413,9 +22525,14 @@ vk_device_struct::~vk_device_struct() {
 
     device.destroyDescriptorSetLayout(dsl);
 
-    vmaDestroyAllocator(allocator);
+    destroy_allocator();
 
     device.destroy();
+    destroyed = true;
+}
+
+vk_device_struct::~vk_device_struct() {
+    shutdown();
 }
 
 void vk_perf_logger::print_timings(bool force) {

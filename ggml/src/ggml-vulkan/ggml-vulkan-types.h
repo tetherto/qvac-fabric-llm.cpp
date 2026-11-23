@@ -720,6 +720,34 @@ static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_N    = 2048;
 static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_EL_W = 64;
 static constexpr uint32_t GGML_VK_FWHT_ROWS              = 4;
 
+struct ggml_backend_vk_context;
+struct vk_event;
+
+template <typename T>
+class vk_live_set {
+public:
+    void add(T * item) {
+        std::lock_guard<std::mutex> guard(mutex);
+        items.insert(item);
+    }
+
+    void remove(T * item) {
+        std::lock_guard<std::mutex> guard(mutex);
+        items.erase(item);
+    }
+
+    std::vector<T *> take_all() {
+        std::lock_guard<std::mutex> guard(mutex);
+        std::vector<T *> taken(items.begin(), items.end());
+        items.clear();
+        return taken;
+    }
+
+private:
+    std::mutex mutex;
+    std::unordered_set<T *> items;
+};
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
@@ -1176,6 +1204,18 @@ struct vk_device_struct {
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
+    vk_live_set<ggml_backend_vk_context> live_backends;
+    vk_live_set<vk_event> live_events;
+    vk_live_set<vk_buffer_struct> live_buffers;
+
+    bool shut_down = false;
+    bool destroyed = false;
+
+    void wait_idle();
+    bool allocator_is_empty();
+    void destroy_allocator();
+    void shutdown();
+
     ~vk_device_struct();
 
 };
@@ -1205,16 +1245,27 @@ struct vk_buffer_struct {
     vk::DeviceAddress bda_addr {};
 
     vk_device device;
+    bool released = false;
+
+    bool owns_allocation() const {
+        return size != 0 && !released;
+    }
+
+    void release() {
+        // bump before destroying, so a thread that sees the buffer gone also sees the new count
+        device->buffer_destroy_count.fetch_add(1, std::memory_order_release);
+        vmaDestroyBuffer(device->allocator, buffer, allocation);
+        released = true;
+    }
 
     ~vk_buffer_struct() {
-        if (size == 0) {
+        if (!owns_allocation()) {
             return;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
-        // bump before destroying, so a thread that sees the buffer gone also sees the new count
-        device->buffer_destroy_count.fetch_add(1, std::memory_order_release);
-        vmaDestroyBuffer(device->allocator, buffer, allocation);
+        device->live_buffers.remove(this);
+        release();
     }
 };
 
