@@ -41,6 +41,7 @@
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/l2-clip.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mm-small.cuh"
 #include "ggml-cuda/mmq-cutlass.cuh"
@@ -5783,6 +5784,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // row L2 clip (Inkling 2): 8 or 9 nodes in one kernel
+    if (node->op == GGML_OP_MUL || node->op == GGML_OP_SQR) {
+        ggml_cuda_l2_clip_match clip;
+        if (ggml_cuda_match_l2_clip(cgraph, i, clip)) {
+            ggml_cuda_op_l2_clip(*cuda_ctx, clip);
+            return clip.n_nodes - 1;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&

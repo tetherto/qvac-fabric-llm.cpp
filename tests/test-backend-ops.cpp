@@ -4815,6 +4815,52 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+// Row L2 clip of Inkling 2: x [* scale] * clamp(thr / (||x [* scale]|| + eps), 0, 1)
+struct test_l2_clip : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool  with_scale;
+    const float thr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "L2_CLIP";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, with_scale, thr);
+    }
+
+    test_l2_clip(std::array<int64_t, 4> ne = {128, 24, 3, 1}, bool with_scale = true, float thr = 22.6f)
+        : ne(ne), with_scale(with_scale), thr(thr) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_tensor * cur = a;
+        if (with_scale) {
+            ggml_tensor * scale = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            ggml_set_name(scale, "scale");
+            cur = ggml_mul(ctx, cur, scale);
+        }
+        ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur)));
+        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+        ggml_tensor * factor = ggml_div(ctx, ggml_fill(ctx, norm, thr), norm);
+        ggml_tensor * out = ggml_mul(ctx, cur, ggml_clamp(ctx, factor, 0.0f, 1.0f));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // rows with norms both below and above the threshold
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -4.0f, 4.0f);
+        }
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -18147,6 +18193,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, { 1536, 1, 1, 1 }, 1e-6f, false, false, true, false, false, GGML_TYPE_F32));
     // the ADD operand is the BF16 input itself, added in place
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true, false, GGML_TYPE_F32));
+    // Inkling 2 clips of Q (128 x 24 heads), K (128 x 8) and the relative-position queries (16 x 24)
+    for (bool with_scale : { false, true }) {
+        for (std::array<int64_t, 4> ne : { std::array<int64_t, 4>{128, 24, 1, 1}, std::array<int64_t, 4>{128, 8, 7, 1},
+                                           std::array<int64_t, 4>{16, 24, 5, 1}, std::array<int64_t, 4>{128, 24, 512, 1} }) {
+            test_cases.emplace_back(new test_l2_clip(ne, with_scale, ne[0] == 16 ? 8.0f : 22.6f));
+        }
+    }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
