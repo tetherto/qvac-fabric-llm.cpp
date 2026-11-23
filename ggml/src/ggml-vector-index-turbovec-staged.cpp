@@ -1105,6 +1105,9 @@ TurboVecPlanesStats stats_from_counts(int bits, int dim, const TurboVecStatCount
         stats.beta1 = stats.beta[0];
         return stats;
     }
+    if (bits != 4) {
+        return stats;
+    }
     // 4 bits: a least-squares fit of the levels on the bit signs, weighted
     // by how often each level occurs in the index.
     const uint64_t * hist = counts.level;
