@@ -2499,6 +2499,8 @@ struct llama_model_hunyuan_vl : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    llama_rope_params get_rope_params(const llama_cparams & cparams, int il) const override;
+
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
     };

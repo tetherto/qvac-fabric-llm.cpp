@@ -19,7 +19,11 @@ static bool ggml_is_power_of_2(int n) {
 }
 
 static bool llama_kv_cache_uses_mrope_shift(const llama_hparams & hparams) {
-    return hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE;
+    // the shift rotates each axis over its rope_sections share; an M-RoPE arch that rotates
+    // the axes itself and leaves the sections at zero (SenseNova U1) cannot be shifted this way
+    const auto & s = hparams.rope_sections;
+    return (hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE) &&
+           (s[0] > 0 || s[1] > 0 || s[2] > 0);
 }
 
 // orthonormal Walsh-Hadamard rotation matrix
@@ -769,7 +773,9 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
 
         if (cells.seq_has(i, seq_id)) {
-            if (cells.pos_add(i, shift, llama_kv_cache_uses_mrope_shift(hparams))) {
+            // the cells hold the model's M-RoPE positions even when this cache rotates nothing:
+            // the qwen4exp idx cache sets rope_type NONE and rotates its pooled keys from ext at read time
+            if (cells.pos_add(i, shift, llama_kv_cache_uses_mrope_shift(model.hparams))) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
