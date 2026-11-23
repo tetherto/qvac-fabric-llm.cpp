@@ -22535,8 +22535,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                // K/V row lists (ggml_flash_attn_ext_rows): the TBQ/PQ modules read K/V only densely
-                if (op->src[5] != nullptr && (ggml_is_tbq_or_pq(op->src[1]->type) || ggml_is_tbq_or_pq(op->src[2]->type))) {
+                // indexed bias: not implemented. K/V row lists (ggml_flash_attn_ext_rows): the TBQ/PQ modules read K/V
+                // only densely
+                if (ggml_flash_attn_ext_has_indexed_bias(op) ||
+                    (op->src[5] != nullptr && (ggml_is_tbq_or_pq(op->src[1]->type) || ggml_is_tbq_or_pq(op->src[2]->type)))) {
                     return false;
                 }
                 bool coopmat2 = device->coopmat2;
