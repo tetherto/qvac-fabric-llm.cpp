@@ -44,6 +44,10 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  authorize:
+    permissions: {}
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   cuda:
     runs-on: ubuntu-24.04
     container: nvidia/cuda:12.6.2-devel-ubuntu24.04
@@ -162,7 +166,9 @@ jobs:
           save: true
 
   musa:
-    runs-on: ubuntu-22.04
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: qvac-ubuntu2204-x64
     container: registry.mthreads.com/mcconline/musa_sdk:5.2.0-devel-ubuntu22.04-s5000
 
     steps:
