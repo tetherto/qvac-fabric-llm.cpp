@@ -1615,6 +1615,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         continue;
                     }
 
+                    // greedy markov context drafts: the graph already drew the argmax chain, no sampling over the vocabulary
+                    if (has_markov_context && params.p_min <= 0.0f) {
+                        const float * draws = llama_get_embeddings_nextn(ctx_dft);
+                        GGML_ASSERT(draws && "DSpark draws missing from h_nextn");
+                        for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
+                            result.push_back((llama_token) draws[(size_t) (beg + i) * n_embd_dec]);
+                        }
+                        if (result.size() < (size_t) params.n_min) {
+                            result.clear();
+                        }
+                        continue;
+                    }
+
                     // DSpark: read from the first draft slot, truncate below the confidence threshold
                     const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                     for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
@@ -1707,13 +1720,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             // the block attention is non-causal: a draft with a markov context decodes the full trained block, then reads n_draft of it
             const int32_t n_block_tokens = is_lilicorr || has_markov_context ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            // a markov context draft outputs only the anchor and the drafted positions, the graph runs its lm head and markov chain on them
+            const int32_t n_block_out = has_markov_context ? std::min(n_block_tokens, (sample_from_anchor ? 0 : 1) + n_draft) : n_block_tokens;
             if (batch.size() + n_block_tokens > n_decode_max && !decode_blocks()) {
                 return;
             }
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2 && !is_lilicorr);
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2 && !is_lilicorr && i < n_block_out);
                 if (is_lilicorr) {
                     // For LiliCorr drafting batch, set state embeddings for use in the associated transformer head.
                     const llama_pos pos = dp.pos0 - 1;
