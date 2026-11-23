@@ -9,6 +9,10 @@ cache-mode: none
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
 jobs:
   labeler:
     permissions:
@@ -33,12 +37,12 @@ jobs:
         [ -n "$number" ] || echo "::notice::No open PR at $HEAD_SHA to label"
         [ -z "$number" ] || echo "PR #$number at $HEAD_SHA"
         echo "number=$number" >> "$GITHUB_OUTPUT"
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # 6.1.0
       if: steps.pr.outputs.number != ''
       with:
         repository: "ggml-org/llama.cpp"
         persist-credentials: false
-    - uses: actions/labeler@v6
+    - uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # 6.2.0
       if: steps.pr.outputs.number != ''
       with:
         configuration-path: '.github/labeler.yml'

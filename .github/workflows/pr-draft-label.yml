@@ -12,6 +12,10 @@ permissions:
   issues: write
   contents: write # required for "gh pr ready" command, see https://github.com/cli/cli/issues/8910
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
 jobs:
   convert-to-draft:
     runs-on: ubuntu-slim
