@@ -182,6 +182,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 void llama_model_dflash::load_tensors_layers_base() {
     LLAMA_LOAD_LOCALS;
 
+    const bool has_ctx_mix = ml->get_tensor_meta("blk.0.ctx_mix.weight") != nullptr;
+
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
@@ -209,8 +211,8 @@ void llama_model_dflash::load_tensors_layers_base() {
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
 
         // optional: context K/V from this layer's own mix of the target features
-        layer.dflash_ctx_mix = create_tensor(tn(LLM_TENSOR_DFLASH_CTX_MIX, "weight", i), { (int64_t) target_layer_ids.size() }, TENSOR_NOT_REQUIRED);
-        if (layer.dflash_ctx_mix) {
+        if (has_ctx_mix) {
+            layer.dflash_ctx_mix         = create_tensor(tn(LLM_TENSOR_DFLASH_CTX_MIX,         "weight", i), { (int64_t) target_layer_ids.size() }, 0);
             layer.dflash_ctx_norm        = create_tensor(tn(LLM_TENSOR_DFLASH_CTX_NORM,        "weight", i), { n_embd }, 0);
             layer.dflash_wk_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_K_CTX,      "weight", i), { n_embd, n_embd_k_gqa }, 0);
             layer.dflash_wv_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_V_CTX,      "weight", i), { n_embd, n_embd_v_gqa }, 0);
