@@ -162,6 +162,10 @@ jobs:
           save: true
 
   musa:
+    # QVAC divergence from upstream
+    # disabled while dl.mthreads.com rejects apt requests (HTTP 403)
+    # upstream fix pending in ggml-org/llama.cpp#32672
+    if: false
     runs-on: ubuntu-22.04
     container: registry.mthreads.com/mcconline/musa_sdk:5.2.0-devel-ubuntu22.04-s5000
 
@@ -175,29 +179,19 @@ jobs:
         with:
           node-version: 22
 
-      # QVAC divergence from upstream: the MUSA packages come only from dl.mthreads.com, so while
-      # it is unreachable the build is skipped with a warning instead of failing every run
       - name: Dependencies
         id: depends
-        shell: bash
         run: |
-          if ! timeout 30 bash -c '</dev/tcp/dl.mthreads.com/443' 2>/dev/null; then
-            echo "::warning title=MUSA build skipped::dl.mthreads.com:443 is unreachable, so the MUSA packages cannot be installed"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           apt-get update
           apt-get install -y build-essential git cmake libssl-dev jq python3-venv musa-mualg-5-2 musa-muthrust-5-2 libmthreads-compute
 
       - name: ccache
-        if: ${{ steps.depends.outputs.skip != 'true' }}
         uses: ggml-org/ccache-action@v1.2.24
         with:
           restore: false
           save: false
 
       - name: ccache-buckets-restore
-        if: ${{ steps.depends.outputs.skip != 'true' }}
         uses: ./.github/actions/ccache-buckets
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
@@ -208,7 +202,6 @@ jobs:
 
       - name: Build with native CMake MUSA support
         id: cmake_build
-        if: ${{ steps.depends.outputs.skip != 'true' }}
         run: |
           cmake -B build -S . \
             -DGGML_MUSA=ON \
@@ -216,7 +209,7 @@ jobs:
           cmake --build build --config Release -j $(nproc)
 
       - name: ccache-buckets-save
-        if: ${{ steps.depends.outputs.skip != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
         uses: ./.github/actions/ccache-buckets
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
