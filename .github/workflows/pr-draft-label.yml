@@ -20,8 +20,8 @@ jobs:
   convert-to-draft:
     runs-on: ubuntu-slim
     steps:
-      # The open, non-draft PR labelled `draft` whose head is the triggering commit, from the API.
-      - name: Find the pull request
+      # The open, non-draft PRs labelled `draft` whose head is the triggering commit, from the API.
+      - name: Find the pull requests
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
@@ -29,20 +29,21 @@ jobs:
           HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          number=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f per_page=100 \
+          numbers=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f per_page=100 \
             -f head="${HEAD_REPO%%/*}:$HEAD_BRANCH" --jq '
-              [.[] | select(.head.sha == env.HEAD_SHA
+              .[] | select(.head.sha == env.HEAD_SHA
                 and (.head.repo.full_name | ascii_downcase) == (env.HEAD_REPO | ascii_downcase)
-                and (.draft | not) and any(.labels[]; .name == "draft"))]
-              | if length == 1 then .[0].number else "" end')
-          [ -z "$number" ] || echo "PR #$number at $HEAD_SHA"
-          echo "number=$number" >> "$GITHUB_OUTPUT"
+                and (.draft | not) and any(.labels[]; .name == "draft")) | .number' | xargs)
+          [ -z "$numbers" ] || echo "PRs $numbers at $HEAD_SHA"
+          echo "numbers=$numbers" >> "$GITHUB_OUTPUT"
 
-      - name: Convert PR to draft
-        if: steps.pr.outputs.number != ''
+      - name: Convert the PRs to draft
+        if: steps.pr.outputs.numbers != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
         run: |
-          gh pr ready --undo "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"
-          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label draft
+          for pr in $PR_NUMBERS; do
+            gh pr ready --undo "$pr" --repo "$GITHUB_REPOSITORY"
+            gh pr edit "$pr" --repo "$GITHUB_REPOSITORY" --remove-label draft
+          done

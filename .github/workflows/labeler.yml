@@ -20,8 +20,8 @@ jobs:
       pull-requests: write
     runs-on: ubuntu-slim
     steps:
-    # The open PR whose head is the triggering commit, from the API; the trigger gives only its head.
-    - name: Find the pull request
+    # The open PRs whose head is the triggering commit, from the API; the trigger gives only its head.
+    - name: Find the pull requests
       id: pr
       env:
         GH_TOKEN: ${{ github.token }}
@@ -29,21 +29,20 @@ jobs:
         HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
         HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
       run: |
-        number=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f per_page=100 \
+        numbers=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f per_page=100 \
           -f head="${HEAD_REPO%%/*}:$HEAD_BRANCH" --jq '
-            [.[] | select(.head.sha == env.HEAD_SHA
-              and (.head.repo.full_name | ascii_downcase) == (env.HEAD_REPO | ascii_downcase))]
-            | if length == 1 then .[0].number else "" end')
-        [ -n "$number" ] || echo "::notice::No open PR at $HEAD_SHA to label"
-        [ -z "$number" ] || echo "PR #$number at $HEAD_SHA"
-        echo "number=$number" >> "$GITHUB_OUTPUT"
+            .[] | select(.head.sha == env.HEAD_SHA
+              and (.head.repo.full_name | ascii_downcase) == (env.HEAD_REPO | ascii_downcase)) | .number')
+        [ -n "$numbers" ] || echo "::notice::No open PR at $HEAD_SHA to label"
+        [ -z "$numbers" ] || echo "PRs ${numbers//$'\n'/ } at $HEAD_SHA"
+        { echo "numbers<<EOF"; echo "$numbers"; echo "EOF"; } >> "$GITHUB_OUTPUT"
     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # 6.1.0
-      if: steps.pr.outputs.number != ''
+      if: steps.pr.outputs.numbers != ''
       with:
         repository: "ggml-org/llama.cpp"
         persist-credentials: false
     - uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # 6.2.0
-      if: steps.pr.outputs.number != ''
+      if: steps.pr.outputs.numbers != ''
       with:
         configuration-path: '.github/labeler.yml'
-        pr-number: ${{ steps.pr.outputs.number }}
+        pr-number: ${{ steps.pr.outputs.numbers }}
