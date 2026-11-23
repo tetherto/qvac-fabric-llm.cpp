@@ -709,9 +709,11 @@ int llama_file_disk::file_id() const {
 void llama_file_disk::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file_disk::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
+#ifndef _WIN32
 size_t llama_file_disk::read_raw_unsafe_at(void * ptr, size_t len, size_t offset) const {
     return pimpl->read_raw_unsafe_at(ptr, len, offset);
 }
+#endif
 
 #ifdef _WIN32
 void llama_file_disk::read_aligned_chunk(void * dest, size_t size) { pimpl->read_raw(dest, size); }
