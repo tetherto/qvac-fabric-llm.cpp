@@ -414,7 +414,9 @@ void main() {
             v_stride &= ~7;
         }
 #else
-#if BLOCK_SIZE == 1 || !defined(K_BLOCK_SIZE) || K_BLOCK_SIZE <= 1
+        // Strides of block-quantized K/V count blocks and need not be multiples of 8.
+        // Mixed K/V variants keep BLOCK_SIZE == 1, so it must not decide for K.
+#if !defined(K_BLOCK_SIZE) || K_BLOCK_SIZE <= 1
         k_stride &= ~7;
 #endif
 #if !defined(V_BLOCK_SIZE) || V_BLOCK_SIZE <= 1
