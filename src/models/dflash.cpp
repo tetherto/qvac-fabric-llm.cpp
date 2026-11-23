@@ -332,7 +332,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     }
 
     // drafts with per-layer context K/V (ctx_mix) have no shared fc
-    const int fc_flags = ml->get_tensor_meta("blk.0.ctx_mix.weight") ? TENSOR_NOT_REQUIRED : 0;
+    const bool has_ctx_mix = ml->get_tensor_meta("blk.0.ctx_mix.weight") != nullptr;
+    const int  fc_flags    = has_ctx_mix ? TENSOR_NOT_REQUIRED : 0;
 
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, fc_flags);
     fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
@@ -428,7 +429,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     }
 
     // optional: anchor-first DSpark block, slot k > 0 takes mask row k - 1 (Inkling2 DSpark)
-    dspark_mask_embd = create_tensor(tn(LLM_TENSOR_DSPARK_MASK_EMBD, "weight"), { n_embd, hparams.dflash_block_size - 1 }, TENSOR_NOT_REQUIRED);
+    if (markov_meta && hparams.dflash_block_size > 1) {
+        dspark_mask_embd = create_tensor(tn(LLM_TENSOR_DSPARK_MASK_EMBD, "weight"), { n_embd, hparams.dflash_block_size - 1 }, TENSOR_NOT_REQUIRED);
+    }
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -457,8 +460,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
 
         // optional: context K/V from this layer's own mix of the target features (Inkling2 DSpark)
-        layer.dflash_ctx_mix = create_tensor(tn(LLM_TENSOR_DFLASH_CTX_MIX, "weight", i), { (int64_t) target_layer_ids.size() }, TENSOR_NOT_REQUIRED);
-        if (layer.dflash_ctx_mix) {
+        if (has_ctx_mix) {
+            layer.dflash_ctx_mix         = create_tensor(tn(LLM_TENSOR_DFLASH_CTX_MIX,         "weight", i), { (int64_t) target_layer_ids.size() }, 0);
             layer.dflash_ctx_norm        = create_tensor(tn(LLM_TENSOR_DFLASH_CTX_NORM,        "weight", i), { n_embd }, 0);
             layer.dflash_wk_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_K_CTX,      "weight", i), { n_embd, n_embd_k_gqa }, 0);
             layer.dflash_wv_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_V_CTX,      "weight", i), { n_embd, n_embd_v_gqa }, 0);
