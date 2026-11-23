@@ -401,11 +401,11 @@ llama_test(
     NAME test-llama-context-gdn-deferred
     LABEL "main behavior backend"
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-llama-context-gdn-deferred"
-    ARGS --models "${MODEL_DIR}" -t 4 --test "rollback|replay|shared|swap"
+    ARGS --models "${MODEL_DIR}" --test "rollback|replay|shared|swap"
 )
 set_tests_properties(test-llama-context-gdn-deferred PROPERTIES
     FIXTURES_REQUIRED generate-models
-    ENVIRONMENT "LLAMA_GDN_DEFERRED=1;GGML_SCHED_DEBUG_REALLOC=1"
+    ENVIRONMENT "LLAMA_GDN_DEFERRED=1;GGML_SCHED_DEBUG_REALLOC=1;TEST_ARG_HARDWARE_CONCURRENCY=8"
     TIMEOUT 3600
 )
 
