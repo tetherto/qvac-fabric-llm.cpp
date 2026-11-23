@@ -422,6 +422,10 @@ void string_to_spv_func(std::string name, std::string in_path, std::string out_p
         cmd.push_back("-g");
     #endif
 
+    #ifdef GGML_VULKAN_INTEGER_DOT_SPIRV_INTRINSICS
+        cmd.push_back("-DINTEGER_DOT_SPIRV_INTRINSICS=1");
+    #endif
+
     for (const auto& define : defines) {
         cmd.push_back("-D" + define.first + "=" + define.second);
     }

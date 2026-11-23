@@ -1,6 +1,6 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types : require
-#extension GL_EXT_integer_dot_product : require
+#include "integer_dot.glsl"
 
 #define MMQ
 #define B_TYPE block_q8_1_x4

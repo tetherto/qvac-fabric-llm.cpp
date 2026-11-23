@@ -11,7 +11,7 @@
 #endif
 
 #ifdef MMQ
-#extension GL_EXT_integer_dot_product : require
+#include "integer_dot.glsl"
 #extension GL_KHR_shader_subgroup_clustered : require
 
 #include "mul_mmq_shmem_types.glsl"
