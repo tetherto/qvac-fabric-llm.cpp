@@ -55,6 +55,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, const vk::BufferCreate
     vmaGetAllocationMemoryProperties(device->allocator, buf->allocation, reinterpret_cast<VkMemoryPropertyFlags *>(&buf->memory_property_flags));
 
     buf->device = device;
+    device->live_buffers.add(buf.get());
     buf->size = buffer_info.size;
 
     if (device->buffer_device_address && (buffer_info.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
@@ -116,6 +117,7 @@ static vk_buffer ggml_vk_create_buffer_aligned(vk_device& device, const vk::Buff
     vmaGetAllocationMemoryProperties(device->allocator, buf->allocation, reinterpret_cast<VkMemoryPropertyFlags *>(&buf->memory_property_flags));
 
     buf->device = device;
+    device->live_buffers.add(buf.get());
     buf->size = buffer_info.size;
 
     if (device->buffer_device_address && (buffer_info.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
