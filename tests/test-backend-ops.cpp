@@ -3993,7 +3993,7 @@ struct test_scale : public test_case {
     float scale;
     float bias;
     bool inplace;
-    int v; // view (1 : non-contiguous a)
+    int v; // view (1 : non-contiguous a, 2 : the view starts ne[0] elements into each row)
 
     std::string vars() override {
         return VARS_TO_STR6(type, ne, scale, bias, inplace, v);
@@ -4020,7 +4020,8 @@ struct test_scale : public test_case {
         ggml_set_name(a, "a");
 
         if (v & 1) {
-            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+            const size_t offset = (v & 2) ? ne[0] * ggml_element_size(a) : 0;
+            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], offset);
             ggml_set_name(a, "view_of_a");
         }
 
@@ -17267,6 +17268,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, false, 1)); // view test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true, 1));  // view test, inplace
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 2.0f, 1.0f, true, 1)); // view test, inplace
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {1152, 8, 4, 1}, 0.5f, 0.0f, false, 3)); // second-half row view, as a split gate_up
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
     test_cases.emplace_back(new test_gelu_back());
