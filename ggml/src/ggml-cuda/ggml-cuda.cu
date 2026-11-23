@@ -3460,6 +3460,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context &          ctx,
         case GGML_OP_ROPE:
             ggml_cuda_op_rope(ctx, dst);
             break;
+        case GGML_OP_ROPE_FLUX:
+            ggml_cuda_op_rope_flux(ctx, dst);
+            break;
         case GGML_OP_ROPE_BACK:
             ggml_cuda_op_rope_back(ctx, dst);
             break;
@@ -8216,6 +8219,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ROPE_BACK: {
             return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
         }
+        case GGML_OP_ROPE_FLUX:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                (!op->src[1] || op->src[1]->type == GGML_TYPE_F32) &&
+                op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+                ggml_nelements(op) <= INT32_MAX;
         case GGML_OP_IM2COL:
         case GGML_OP_IM2COL_3D:
         case GGML_OP_CONV_2D:
