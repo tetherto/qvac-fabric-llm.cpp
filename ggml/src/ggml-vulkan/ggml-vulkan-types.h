@@ -283,10 +283,11 @@ struct vk_matmul_pipeline_key {
     bool mul_mat_id;
     bool f16acc;
     bool full_f32 = false;
+    bool stream_k = false;
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc, full_f32)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.full_f32);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, full_f32, stream_k)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.full_f32, o.stream_k);
     }
 };
 
@@ -903,6 +904,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mm_tbq_qjl[GGML_TYPE_COUNT][2];
 
     vk_pipeline pipeline_matmul_split_k_reduce;
+    vk_pipeline pipeline_matmul_stream_k_fixup;
     vk_pipeline pipeline_quantize_q8_1_x4;
     vk_pipeline pipeline_swiglu_quantize_q8_1_x4;
 
@@ -1199,6 +1201,8 @@ struct vk_device_struct {
     std::map<std::string, uint64_t> fusion_counts;
     bool disable_descriptor_reuse;
     std::atomic<uint64_t> buffer_destroy_count {};
+    bool disable_stream_k;
+    bool force_stream_k;
     bool disable_graph_optimize;
     bool xe_fa_support {};
     bool disable_narrow_mul_mat;
