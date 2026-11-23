@@ -646,6 +646,13 @@ llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK 
 
 llama_build_and_test(test-convrot.cpp LINK ggml)
 
+llama_build(test-hip-fattn-f32.cpp LINK ggml)
+llama_test(test-hip-fattn-f32 NAME test-hip-fattn-f32-dispatch ARGS dispatch)
+if (GGML_CPU)
+    llama_test(test-hip-fattn-f32 NAME test-hip-fattn-f32-cpu ARGS CPU)
+endif()
+
+
 if (GGML_OPENCL)
     find_package(Threads REQUIRED)
     llama_build_and_test(test-opencl-concurrent-upload.cpp LINK ggml Threads::Threads)
