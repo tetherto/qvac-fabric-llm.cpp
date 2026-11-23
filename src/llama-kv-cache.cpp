@@ -83,9 +83,9 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag,
-                 uint32_t   n_stream_k_extra,
-                    bool   is_indexer) :
+               const char * name_tag,
+                     bool   is_indexer,
+                 uint32_t   n_stream_k_extra) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),

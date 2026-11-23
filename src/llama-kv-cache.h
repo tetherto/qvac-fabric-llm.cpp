@@ -115,10 +115,10 @@ public:
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
-        // extra K streams past the cells, used for k-pool private rows
-                     uint32_t   n_stream_k_extra = 0,
         // lightning indexer keys are rotated with the indexer RoPE parameters
-                       bool   is_indexer = false);
+                       bool   is_indexer = false,
+        // extra K streams past the cells, used for k-pool private rows
+                     uint32_t   n_stream_k_extra = 0);
 
     ~llama_kv_cache() = default;
 

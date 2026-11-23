@@ -99,7 +99,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         return new llama_kv_cache(
             model, no_alloc, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_", kpool_n_stream_spare(model.hparams, kv_size, n_seq_max, unified));
+            nullptr, filter_idx, nullptr, nullptr, "idx_", false, kpool_n_stream_spare(model.hparams, kv_size, n_seq_max, unified));
     }()),
     n_kpool_priv(filter_idx == nullptr ? 0 : kpool_n_priv(model.hparams, kv_size, n_seq_max, unified)),
     n_kpool_spare(filter_idx == nullptr ? 0 : kv_size*kpool_n_stream_spare(model.hparams, kv_size, n_seq_max, unified)) {}
