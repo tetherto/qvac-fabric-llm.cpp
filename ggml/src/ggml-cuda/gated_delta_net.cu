@@ -264,7 +264,7 @@ __global__ void __launch_bounds__(128) gated_delta_net_decode_cuda(
     }
 #pragma unroll
     for (int m = 1; m < LPC; m *= 2) {
-        kv += __shfl_xor_sync(0xffffffff, kv, m, WARP_SIZE);
+        kv += ggml_cuda_shfl_xor(kv, m, WARP_SIZE);
     }
 
     const float delta = (vv - gate * kv) * bv;
@@ -281,7 +281,7 @@ __global__ void __launch_bounds__(128) gated_delta_net_decode_cuda(
     }
 #pragma unroll
     for (int m = 1; m < LPC; m *= 2) {
-        o += __shfl_xor_sync(0xffffffff, o, m, WARP_SIZE);
+        o += ggml_cuda_shfl_xor(o, m, WARP_SIZE);
     }
 
     if (sub == 0) {
