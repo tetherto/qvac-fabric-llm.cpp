@@ -12,5 +12,9 @@ bool ggml_cuda_mmvq_wide(enum ggml_type type, int cc);
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
+// The same for one MUL_MAT_ID node (src0: the experts, ids: [n_expert_used, n_tokens]): on DGX Spark MMQ takes
+// the batches that pick a sizable share of the experts, since it reads each picked expert once per batch.
+int ggml_cuda_mmid_mmvq_max_batch(const ggml_tensor * src0, const ggml_tensor * ids, int cc);
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
