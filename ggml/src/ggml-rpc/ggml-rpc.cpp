@@ -4069,7 +4069,8 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
     return op->op != GGML_OP_MUL_MAT_CONVROT && op->op != GGML_OP_CONVROT &&
            op->op != GGML_OP_SSM_CONV_RAGGED && op->op != GGML_OP_GATED_DELTA_NET_RAGGED &&
            op->op != GGML_OP_GATED_DELTA_NET_DEFERRED && op->op != GGML_OP_GDN_CONV_DEFERRED &&
-           op->op != GGML_OP_ROPE_FLUX && op->op != GGML_OP_TOP_K_ROWS;
+           op->op != GGML_OP_ROPE_FLUX && op->op != GGML_OP_TOP_K_ROWS &&
+           (op->op != GGML_OP_FLASH_ATTN_EXT || !ggml_flash_attn_ext_has_indexed_bias(op));
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
