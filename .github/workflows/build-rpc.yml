@@ -97,8 +97,9 @@ jobs:
       - name: Download model
         run: |
           cmake \
+            -DREPO=ggml-org-dev/stories15M \
             -DDEST="${GITHUB_WORKSPACE}/build/tinyllamas/stories15M-q4_0.gguf" \
-            -DNAME="tinyllamas/stories15M-q4_0.gguf" \
+            -DNAME="stories15M-q4_0.gguf" \
             -DHASH="SHA256=66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739" \
             -P cmake/download-models.cmake
 
