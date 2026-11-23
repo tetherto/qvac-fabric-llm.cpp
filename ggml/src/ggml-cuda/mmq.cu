@@ -564,6 +564,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 }
 
+bool ggml_cuda_mmq_stream_k_col_outer(const int cc) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_MMQ_COL_OUTER");
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && !disabled;
+}
+
 bool ggml_cuda_mmq_fusion_is_efficient(
         const ggml_type type, const ggml_prec prec_requested, const int64_t nrows_x, const int64_t ncols, const int64_t nchannels, const int device) {
     const int    cc    = ggml_cuda_info().devices[device].cc;
