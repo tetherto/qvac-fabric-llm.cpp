@@ -372,14 +372,16 @@ set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQ
 # is a threadpool barrier that needs all n_threads scheduled, so under external
 # CPU contention the wall time degrades superlinearly (measured: the save/load
 # sweep at 32 threads goes from 41 s idle to ~50 s per model with one competing
-# 32-thread load — >90 min for the sweep). The CI workflows export
-# LLAMA_ARG_THREADS=$(nproc); the explicit -t below overrides the env var.
+# 32-thread load — >90 min for the sweep). --models ignores -t and
+# LLAMA_ARG_THREADS: it runs min(hw/2, 4) models at once with (hw/2)/workers
+# threads each, so a 48-thread runner gets 4 x 6. TEST_ARG_HARDWARE_CONCURRENCY=8
+# pins that to 4 x 1.
 
 # Test context state handling across all architectures, using the generated dummy models
 llama_test(
     test-llama-context
     LABEL "main behavior backend"
-    ARGS --models "${MODEL_DIR}" -t 4
+    ARGS --models "${MODEL_DIR}"
 )
 # abort on graph reallocations that the initial reserve should have covered
 # TIMEOUT is belt and braces for badly contended runners; the property also
@@ -387,7 +389,7 @@ llama_test(
 # workflow jobs.
 set_tests_properties(test-llama-context PROPERTIES
     FIXTURES_REQUIRED generate-models
-    ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+    ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1;TEST_ARG_HARDWARE_CONCURRENCY=8"
     TIMEOUT 3600
 )
 
