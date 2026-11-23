@@ -5021,8 +5021,9 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                 const bool tile_can_dispatch_all_q_rows =
                     capabilities.limits.maxComputeInvocationsPerWorkgroup >=
                     GGML_WEBGPU_FLASH_ATTN_TILE_Q_TILE * capabilities.max_subgroup_size;
-                const bool use_tile = !use_subgroup_matrix && capabilities.supports_subgroups && float_vec4_aligned &&
-                                      tile_kv_head_dims_aligned && tile_can_dispatch_all_q_rows;
+                const bool tile_requirements = capabilities.supports_subgroups && float_vec4_aligned &&
+                                               tile_kv_head_dims_aligned && tile_can_dispatch_all_q_rows;
+                const bool use_tile          = !use_subgroup_matrix && tile_requirements;
 
                 if (!use_subgroup_matrix && !use_tile) {
                     supports_op = false;
@@ -5040,8 +5041,9 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                     capabilities.limits.maxComputeWorkgroupStorageSize, q_tile, kv_granularity, (uint32_t) src0->ne[0],
                     (uint32_t) src2->ne[0], op->src[3] != nullptr, kv_direct);
                 // get_flash_attn_pipeline falls back to the register tile path when the subgroup matrix tile does not fit
+                // and needs what use_tile needs (vec4 K/V loads, all Q rows in one workgroup)
                 const uint32_t fallback_kv_tile =
-                    use_subgroup_matrix ?
+                    use_subgroup_matrix && tile_requirements ?
                         ggml_webgpu_flash_attn_max_kv_tile(
                             capabilities.limits.maxComputeWorkgroupStorageSize, GGML_WEBGPU_FLASH_ATTN_TILE_Q_TILE, 1u,
                             (uint32_t) src0->ne[0], (uint32_t) src2->ne[0], op->src[3] != nullptr, false) :
