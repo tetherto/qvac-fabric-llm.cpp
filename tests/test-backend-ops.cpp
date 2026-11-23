@@ -17818,6 +17818,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // MUL_MAT_ID: K = 8 units (the warps split K, broadcast src1), K = 2 units (the warps split the rows, more than 8 tokens per expert, unaligned experts)
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, true,   72, 13, 2048));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32,  4, 2, false, 202, 24,  512));
+        // MUL_MAT_ID rows of 9 units, not a whole number of ring stages (edge kernel), also with strided experts
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false,  72,  5, 2304));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, true,   72, 13, 2304, 80));
+    }
+    // few-row MMQ edge kernel for Q8_0 and IQ4_NL rows that end with half a unit and are only 8 or 2 byte aligned:
+    // the Inkling 2 expert down projection (K = 1152), K = 1.5 and 8.5 units, a view of 8.5 units in rows of 9 units
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+        for (int64_t n : {2, 3, 8, 13}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 72, n, 1152));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, true,   72, 13, 1152, 80));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32,  4, 2, false, 202, 24,  384));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false,  72, 13, 2176));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000,  8, 2176, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 21, 2176, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000,  8, 2176, {1, 1}, {1, 1}, {0, 1, 2, 3}, 2304));
     }
     // permuted and broadcast src0/src1 for the 2 byte aligned types
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 64, 13, 2304, {2, 3}, {1, 1}, {0, 2, 1, 3}));

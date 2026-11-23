@@ -772,8 +772,10 @@ static __global__ void quantize_mmq_few_q8_1(
         return;
     }
 
-    const int g = blockIdx.x % MMQ_FEW_NCOLS; // column in group
-    int4 * yg = vy + ((blockIdx.z*(ne00/QK_K) + i0/QK_K)*(gridDim.x/MMQ_FEW_NCOLS) + blockIdx.x/MMQ_FEW_NCOLS)*MMQ_FEW_Q8_1_INT4;
+    // a row may end with half a unit, which is stored as a unit with its first 128 values
+    const int64_t nunits = (ne00 + QK_K - 1) / QK_K;
+    const int     g      = blockIdx.x % MMQ_FEW_NCOLS; // column in group
+    int4 * yg = vy + ((blockIdx.z*nunits + i0/QK_K)*(gridDim.x/MMQ_FEW_NCOLS) + blockIdx.x/MMQ_FEW_NCOLS)*MMQ_FEW_Q8_1_INT4;
     quantize_mmq_few_store<ds_layout>(xi, yg, i0 % QK_K, g);
 }
 
@@ -863,7 +865,7 @@ static __global__ void quantize_mmq_few_id_q8_1(
     const float4 xi = *(const float4 *) (x + it*s12 + (is % ne11)*s11 + i0);
 
     const int r = rank(blockIdx.x, e);
-    int4 * yg = vy + (int64_t(pair0[e] + r/MMQ_FEW_NCOLS)*(ne00/QK_K) + i0/QK_K)*MMQ_FEW_Q8_1_INT4;
+    int4 * yg = vy + (int64_t(pair0[e] + r/MMQ_FEW_NCOLS)*((ne00 + QK_K - 1) / QK_K) + i0/QK_K)*MMQ_FEW_Q8_1_INT4;
     quantize_mmq_few_store<ds_layout>(xi, yg, i0 % QK_K, r % MMQ_FEW_NCOLS);
 }
 
@@ -871,7 +873,7 @@ template <bool wmma>
 static void quantize_mmq_few_q8_1_launch(
         const float * x, void * vy, const mmq_q8_1_ds_layout ds_layout, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
-    GGML_ASSERT(ne00 % QK_K == 0);
+    GGML_ASSERT(ne00 % (wmma ? QK_K : QK_K/2) == 0); // whole warps of 128 values
 
     const int64_t block_num_y = (ne00 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(GGML_PAD(ne1, wmma ? MMQ_FEW_WMMA_NCOLS : MMQ_FEW_NCOLS), block_num_y, ne2*ne3);
@@ -906,7 +908,7 @@ void quantize_mmq_few_wmma_q8_1_cuda(
 void quantize_mmq_few_id_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, int * pairs, const mmq_q8_1_ds_layout ds_layout, const int64_t ne00, const int64_t s11, const int64_t s12,
         const int64_t ne11, const int64_t n_experts, const int64_t n_expert_used, const int64_t n_tokens, const int64_t si1, const int64_t npairs_max, cudaStream_t stream) {
-    GGML_ASSERT(ne00 % QK_K == 0);
+    GGML_ASSERT(ne00 % (QK_K/2) == 0); // whole warps of 128 values
     GGML_ASSERT(n_tokens <= 32); // one bit per token
 
     const int64_t block_num_y   = (ne00 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
