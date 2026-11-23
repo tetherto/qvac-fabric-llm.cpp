@@ -12,7 +12,7 @@
 // Several columns (batched decode, ALU bound): passes of CG columns; per block decode all rows once per level, pack the trits and dot them with every column of the pass.
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
-#extension GL_EXT_integer_dot_product : require
+#include "integer_dot.glsl"
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 
 #define B_TYPE block_q8_1_x4

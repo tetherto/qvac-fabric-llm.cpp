@@ -72,6 +72,27 @@ function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VA
     endif()
 endfunction()
 
+# Function to test that glslc compiles a shader, for features that need more than a supported #extension
+# Parameters:
+#  TEST_SHADER_FILE - Path to the test shader file
+#  RESULT_VARIABLE - Name of the variable to set (ON/OFF) and forward to vulkan-shaders-gen
+function(test_shader_compiles TEST_SHADER_FILE RESULT_VARIABLE)
+    execute_process(
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
+        RESULT_VARIABLE glslc_result
+        OUTPUT_QUIET
+        ERROR_QUIET
+    )
+
+    if (glslc_result EQUAL 0)
+        set(${RESULT_VARIABLE} ON PARENT_SCOPE)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -D${RESULT_VARIABLE}=ON)
+        set(VULKAN_SHADER_GEN_CMAKE_ARGS "${VULKAN_SHADER_GEN_CMAKE_ARGS}" PARENT_SCOPE)
+    else()
+        set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
+    endif()
+endfunction()
+
 if (Vulkan_FOUND)
     message(STATUS "Vulkan found")
 
@@ -125,6 +146,20 @@ if (Vulkan_FOUND)
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot.comp"
         "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
     )
+
+    # without GL_EXT_integer_dot_product, emit the same dot product instructions through GL_EXT_spirv_intrinsics
+    if (NOT GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+        test_shader_compiles(
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot_spirv.comp"
+            "GGML_VULKAN_INTEGER_DOT_SPIRV_INTRINSICS"
+        )
+        if (GGML_VULKAN_INTEGER_DOT_SPIRV_INTRINSICS)
+            message(STATUS "GL_EXT_integer_dot_product emulated with GL_EXT_spirv_intrinsics")
+            set(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT ON)
+            add_compile_definitions(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+            list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT=ON)
+        endif()
+    endif()
 
     test_shader_extension_support(
         "GL_EXT_bfloat16"
