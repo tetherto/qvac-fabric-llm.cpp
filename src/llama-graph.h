@@ -333,6 +333,9 @@ public:
     // states from i0 = mv0 (n_seqs when the range is empty) through the extra states
     uint32_t mv0 = 0;
     uint32_t mv1 = 0;
+
+    // the graph reads s_copy_moved, so its topology depends on [mv0, mv1); other graphs can be reused for any range
+    bool     moved_used = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

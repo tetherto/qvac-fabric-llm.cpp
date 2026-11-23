@@ -536,6 +536,9 @@ static void llm_graph_set_input_rs(llm_graph_input_rs * inp, const llama_memory_
 }
 
 static bool llm_graph_rs_moved_match(const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx, uint32_t n_seqs) {
+    if (!inp->moved_used) {
+        return true;
+    }
     uint32_t i0;
     uint32_t i1;
     mctx->get_moved_range(n_seqs, i0, i1);
@@ -4297,6 +4300,7 @@ ggml_tensor * llm_graph_context::build_rs(
     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
     ggml_tensor * state_copy = in_place ? inp->s_copy_moved : get_state_rows ? inp->s_copy_tail : inp->s_copy;
+    inp->moved_used |= in_place;
 
     return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
