@@ -32,6 +32,7 @@ uint nibble_k_pair(uint row, uint load_vec) {
     return (row / loads_per_block) * 16 + (row % loads_per_block) * (load_vec / 4);
 }
 
+#if !defined(MM_PREFETCH)   // MM_PREFETCH variants take load_a_to_shmem from mul_mm_pf_funcs.glsl
 // bounds_check is a literal at every call site: the caller only passes true for
 // the ragged last tile in M, so interior tiles fold the checks away entirely.
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const bool bounds_check, const uint block, const uint end_k) {
@@ -782,6 +783,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
     }
 #endif
 }
+#endif // !MM_PREFETCH
 
 #if !defined(MUL_MAT_ID)
 // bounds_check is a literal at every call site: the caller only passes true for

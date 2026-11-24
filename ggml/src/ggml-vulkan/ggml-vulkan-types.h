@@ -266,6 +266,9 @@ struct vk_pipeline_struct {
     std::atomic<bool> compiled {};
     // number of registers used, extracted from pipeline executable properties
     uint32_t register_count {};
+    // spilled SGPRs + VGPRs and scratch bytes, from the same statistics (RADV reports them)
+    uint32_t spilled_regs {};
+    uint32_t scratch_size {};
 
 #if defined(VK_EXT_shader_64bit_indexing)
     bool is_64b_indexing {};
@@ -283,11 +286,13 @@ struct vk_matmul_pipeline_key {
     bool mul_mat_id;
     bool f16acc;
     bool full_f32 = false;
+    bool pf = false;    // register-prefetch KHR coopmat variant (mul_mm_pf_funcs.glsl)
+    bool xl = false;    // its 256x256 tile, chosen per shape by ggml_vk_mm_xl_pipeline
     bool stream_k = false;
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc, full_f32, stream_k)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.full_f32, o.stream_k);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, full_f32, pf, xl, stream_k)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.full_f32, o.pf, o.xl, o.stream_k);
     }
 };
 
