@@ -1,0 +1,147 @@
+{
+  "_schema": {
+    "description": "Cards of the Speech Bench highlights page built by build-highlights.py: a few GPU results per machine for a blog post or a short update. Each card names one chart of the hub (machine, backend, task, model, input, timing scope and comparison set) and the page draws QVAC against every other engine of that chart.",
+    "fields": {
+      "title": "Page title.",
+      "lede": "One paragraph under the title.",
+      "machines": "Machines in page order: host (dashboard-data folder), backend (one GPU backend) and the cards of that machine.",
+      "cards": "task, model, scenario and timing_class as runs.json spells them, and set: weekly for the Sunday run, report for the rows copied from the comparison report."
+    }
+  },
+  "title": "Speech Bench highlights",
+  "lede": "A few GPU results from the Speech Bench: QVAC (qvac-fabric-speech.cpp) against other engines on the same machine, backend, input and timing scope. The full hub covers every model, the CPU backends and the cases where another engine is faster.",
+  "machines": [
+    {
+      "host": "spark-d9ca",
+      "backend": "cuda",
+      "cards": [
+        {
+          "task": "ASR",
+          "model": "Parakeet TDT 0.6B v3",
+          "scenario": "abcba",
+          "timing_class": "resident_api",
+          "set": "report"
+        },
+        {
+          "task": "TTS",
+          "model": "Supertonic 3",
+          "scenario": "fixed_prompt",
+          "timing_class": "fresh_process",
+          "set": "report"
+        },
+        {
+          "task": "TTS",
+          "model": "Audio8 TTS Preview 0.6B",
+          "scenario": "fixed_prompt",
+          "timing_class": "fresh_process",
+          "set": "report"
+        },
+        {
+          "task": "Music",
+          "model": "MiniMax Music3",
+          "scenario": "music_10s",
+          "timing_class": "fresh_process",
+          "set": "report"
+        }
+      ]
+    },
+    {
+      "host": "qvac-dev-strix-1",
+      "backend": "vulkan",
+      "cards": [
+        {
+          "task": "ASR",
+          "model": "Parakeet TDT 0.6B v3",
+          "scenario": "abcba",
+          "timing_class": "resident_api",
+          "set": "report"
+        },
+        {
+          "task": "ASR",
+          "model": "Nemotron 3.5 ASR Streaming 0.6B",
+          "scenario": "abcba",
+          "timing_class": "resident_api",
+          "set": "report"
+        },
+        {
+          "task": "TTS",
+          "model": "Supertonic 3",
+          "scenario": "fixed_prompt",
+          "timing_class": "fresh_process",
+          "set": "report"
+        },
+        {
+          "task": "TTS",
+          "model": "Audio8 TTS Preview 0.6B",
+          "scenario": "fixed_prompt",
+          "timing_class": "fresh_process",
+          "set": "report"
+        },
+        {
+          "task": "Music",
+          "model": "ACE-Step 1.5 Turbo",
+          "scenario": "music_30s",
+          "timing_class": "fresh_process",
+          "set": "report"
+        }
+      ]
+    },
+    {
+      "host": "qvac-dev-mac-arm64",
+      "backend": "metal",
+      "cards": [
+        {
+          "task": "ASR",
+          "model": "Parakeet TDT 0.6B v3",
+          "scenario": "jfk",
+          "timing_class": "native_excl_load",
+          "set": "weekly",
+          "variant": "Q8_0"
+        },
+        {
+          "task": "ASR",
+          "model": "Parakeet TDT 0.6B v3",
+          "scenario": "abcba",
+          "timing_class": "native_excl_load",
+          "set": "weekly"
+        },
+        {
+          "task": "ASR",
+          "model": "Nemotron 3.5 ASR Streaming 0.6B",
+          "scenario": "abcba",
+          "timing_class": "native_excl_load",
+          "set": "weekly"
+        },
+        {
+          "task": "ASR",
+          "model": "Whisper small multilingual",
+          "scenario": "abcba",
+          "timing_class": "fresh_process",
+          "set": "weekly"
+        },
+        {
+          "task": "TTS",
+          "model": "Chatterbox Turbo",
+          "scenario": "fixed_prompt",
+          "timing_class": "fresh_process",
+          "set": "weekly"
+        },
+        {
+          "task": "TTS",
+          "model": "Audio8 TTS Preview 0.6B",
+          "scenario": "fixed_prompt",
+          "timing_class": "fresh_process",
+          "set": "weekly",
+          "variant": "LM Q8_0 · decoder Q8_0"
+        },
+        {
+          "task": "Music",
+          "model": "MiniMax Music3",
+          "scenario": "music_30s",
+          "timing_class": "fresh_process",
+          "set": "weekly"
+        }
+      ]
+    }
+  ]
+}

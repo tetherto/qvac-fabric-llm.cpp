@@ -1,0 +1,7 @@
+#!/usr/bin/perl
+use strict;
+use Time::HiRes qw(gettimeofday);
+my ($seconds, $micros) = gettimeofday();
+my $format = $ARGV[0] // "+%s%N";
+my $nanos = sprintf("%09d", $micros * 1000);
+print(($format eq "+%N" ? $nanos : $seconds . $nanos) . "\n");

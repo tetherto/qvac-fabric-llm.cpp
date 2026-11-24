@@ -1,0 +1,409 @@
+mlrecipe 1
+template parler-dac-w128
+spec_sha256 c90967d2c6508243753e92a65440c5a858ef7aa7fc42ff37b36c81d5ef5c0cee
+weight_bin_size 108316032
+blobs 227
+
+# Parler-TTS DAC decoder, 128-frame window (scripts/parler/export-dac-coreml.py --window 128, fp16).
+# Every dac.dec tensor is F32 in every quantization tier. Per Snake the exporter writes the
+# scale alpha / pi (f32) and the four sin^2 polynomial coefficients inv * c_k, where
+# inv = clip(1 / (f64(alpha) + 1e-9), +-6e4) is computed in f64 and cast to f32 (highest power
+# first). Each transposed convolution is written in its phase form: the [IC, OC, 2s] kernel becomes
+# a two-tap [s*OC, IC, 2] convolution with out[r*OC+o, i, 0] = w[i, o, r+s] and
+# out[r*OC+o, i, 1] = w[i, o, r]. The zeros and ones blobs are the halo padding and unit scales of the
+# convolutions coremltools folds into rows of 8192 samples.
+source "dac.dec.conv_in.weight" f32 [1536,1024,7]
+source "dac.dec.conv_in.bias" f32 [1536]
+source "dac.dec.blk.0.snake.alpha" f32 [1,1536,1]
+source "dac.dec.blk.0.convt.bias" f32 [768]
+source "dac.dec.blk.0.res.0.snake1.alpha" f32 [1,768,1]
+source "dac.dec.blk.0.res.0.conv1.weight" f32 [768,768,7]
+source "dac.dec.blk.0.res.0.conv1.bias" f32 [768]
+source "dac.dec.blk.0.res.0.snake2.alpha" f32 [1,768,1]
+source "dac.dec.blk.0.res.0.conv2.weight" f32 [768,768,1]
+source "dac.dec.blk.0.res.0.conv2.bias" f32 [768]
+source "dac.dec.blk.0.res.1.snake1.alpha" f32 [1,768,1]
+source "dac.dec.blk.0.res.1.conv1.weight" f32 [768,768,7]
+source "dac.dec.blk.0.res.1.conv1.bias" f32 [768]
+source "dac.dec.blk.0.res.1.snake2.alpha" f32 [1,768,1]
+source "dac.dec.blk.0.res.1.conv2.weight" f32 [768,768,1]
+source "dac.dec.blk.0.res.1.conv2.bias" f32 [768]
+source "dac.dec.blk.0.res.2.snake1.alpha" f32 [1,768,1]
+source "dac.dec.blk.0.res.2.conv1.weight" f32 [768,768,7]
+source "dac.dec.blk.0.res.2.conv1.bias" f32 [768]
+source "dac.dec.blk.0.res.2.snake2.alpha" f32 [1,768,1]
+source "dac.dec.blk.0.res.2.conv2.weight" f32 [768,768,1]
+source "dac.dec.blk.0.res.2.conv2.bias" f32 [768]
+source "dac.dec.blk.1.snake.alpha" f32 [1,768,1]
+source "dac.dec.blk.1.convt.bias" f32 [384]
+source "dac.dec.blk.1.res.0.snake1.alpha" f32 [1,384,1]
+source "dac.dec.blk.1.res.0.conv1.weight" f32 [384,384,7]
+source "dac.dec.blk.1.res.0.conv1.bias" f32 [384]
+source "dac.dec.blk.1.res.0.snake2.alpha" f32 [1,384,1]
+source "dac.dec.blk.1.res.0.conv2.weight" f32 [384,384,1]
+source "dac.dec.blk.1.res.0.conv2.bias" f32 [384]
+source "dac.dec.blk.1.res.1.snake1.alpha" f32 [1,384,1]
+source "dac.dec.blk.1.res.1.conv1.weight" f32 [384,384,7]
+source "dac.dec.blk.1.res.1.conv1.bias" f32 [384]
+source "dac.dec.blk.1.res.1.snake2.alpha" f32 [1,384,1]
+source "dac.dec.blk.1.res.1.conv2.weight" f32 [384,384,1]
+source "dac.dec.blk.1.res.1.conv2.bias" f32 [384]
+source "dac.dec.blk.1.res.2.snake1.alpha" f32 [1,384,1]
+source "dac.dec.blk.1.res.2.conv1.weight" f32 [384,384,7]
+source "dac.dec.blk.1.res.2.conv1.bias" f32 [384]
+source "dac.dec.blk.1.res.2.snake2.alpha" f32 [1,384,1]
+source "dac.dec.blk.1.res.2.conv2.weight" f32 [384,384,1]
+source "dac.dec.blk.1.res.2.conv2.bias" f32 [384]
+source "dac.dec.blk.2.snake.alpha" f32 [1,384,1]
+source "dac.dec.blk.2.convt.bias" f32 [192]
+source "dac.dec.blk.2.res.0.snake1.alpha" f32 [1,192,1]
+source "dac.dec.blk.2.res.0.conv1.weight" f32 [192,192,7]
+source "dac.dec.blk.2.res.0.conv1.bias" f32 [192]
+source "dac.dec.blk.2.res.0.snake2.alpha" f32 [1,192,1]
+source "dac.dec.blk.2.res.0.conv2.weight" f32 [192,192,1]
+source "dac.dec.blk.2.res.0.conv2.bias" f32 [192]
+source "dac.dec.blk.2.res.1.snake1.alpha" f32 [1,192,1]
+source "dac.dec.blk.2.res.1.conv1.weight" f32 [192,192,7]
+source "dac.dec.blk.2.res.1.conv1.bias" f32 [192]
+source "dac.dec.blk.2.res.1.snake2.alpha" f32 [1,192,1]
+source "dac.dec.blk.2.res.1.conv2.weight" f32 [192,192,1]
+source "dac.dec.blk.2.res.1.conv2.bias" f32 [192]
+source "dac.dec.blk.2.res.2.snake1.alpha" f32 [1,192,1]
+source "dac.dec.blk.2.res.2.conv1.weight" f32 [192,192,7]
+source "dac.dec.blk.2.res.2.conv1.bias" f32 [192]
+source "dac.dec.blk.2.res.2.snake2.alpha" f32 [1,192,1]
+source "dac.dec.blk.2.res.2.conv2.weight" f32 [192,192,1]
+source "dac.dec.blk.2.res.2.conv2.bias" f32 [192]
+source "dac.dec.blk.3.snake.alpha" f32 [1,192,1]
+source "dac.dec.blk.3.convt.bias" f32 [96]
+source "dac.dec.blk.3.res.0.snake1.alpha" f32 [1,96,1]
+source "dac.dec.blk.3.res.0.conv1.weight" f32 [96,96,7]
+source "dac.dec.blk.3.res.0.conv1.bias" f32 [96]
+source "dac.dec.blk.3.res.0.snake2.alpha" f32 [1,96,1]
+source "dac.dec.blk.3.res.0.conv2.weight" f32 [96,96,1]
+source "dac.dec.blk.3.res.0.conv2.bias" f32 [96]
+source "dac.dec.blk.3.res.1.snake1.alpha" f32 [1,96,1]
+source "dac.dec.blk.3.res.1.conv1.weight" f32 [96,96,7]
+source "dac.dec.blk.3.res.1.conv1.bias" f32 [96]
+source "dac.dec.blk.3.res.1.snake2.alpha" f32 [1,96,1]
+source "dac.dec.blk.3.res.1.conv2.weight" f32 [96,96,1]
+source "dac.dec.blk.3.res.1.conv2.bias" f32 [96]
+source "dac.dec.blk.3.res.2.snake1.alpha" f32 [1,96,1]
+source "dac.dec.blk.3.res.2.conv1.weight" f32 [96,96,7]
+source "dac.dec.blk.3.res.2.conv1.bias" f32 [96]
+source "dac.dec.blk.3.res.2.snake2.alpha" f32 [1,96,1]
+source "dac.dec.blk.3.res.2.conv2.weight" f32 [96,96,1]
+source "dac.dec.blk.3.res.2.conv2.bias" f32 [96]
+source "dac.dec.snake_out.alpha" f32 [1,96,1]
+source "dac.dec.conv_out.weight" f32 [1,96,7]
+source "dac.dec.conv_out.bias" f32 [1]
+source "dac.dec.blk.0.convt.weight" f32 [1536,768,16]
+source "dac.dec.blk.1.convt.weight" f32 [768,384,16]
+source "dac.dec.blk.2.convt.weight" f32 [384,192,8]
+source "dac.dec.blk.3.convt.weight" f32 [192,96,4]
+
+blob 64 fp16 11010048 f16(t("dac.dec.conv_in.weight"))
+blob 22020224 fp16 1536 f16(t("dac.dec.conv_in.bias"))
+let blk_0_snake = t("dac.dec.blk.0.snake.alpha")
+let blk_0_snake_inv = clip(recip(add(f64(blk_0_snake), 1e-9)), -60000, 60000)
+blob 22023360 fp16 1536 f16(div(blk_0_snake, 3.141592653589793))
+blob 22026496 fp16 1536 f16(f32(mul(blk_0_snake_inv, -23.29808439)))
+blob 22029632 fp16 1536 f16(f32(mul(blk_0_snake_inv, 41.426299)))
+blob 22032768 fp16 1536 f16(f32(mul(blk_0_snake_inv, -32.37042703)))
+blob 22035904 fp16 1536 f16(f32(mul(blk_0_snake_inv, 9.8672466)))
+let blk_0_convt_w = t("dac.dec.blk.0.convt.weight")
+blob 22039040 fp16 18874368 f16(reshape(permute(concat(3,
+    reshape(take(blk_0_convt_w, 2, [8,9,10,11,12,13,14,15]), [1536,768,8,1]),
+    reshape(take(blk_0_convt_w, 2, [0,1,2,3,4,5,6,7]), [1536,768,8,1])),
+  [2,1,0,3]), [6144,1536,2]))
+blob 59787840 fp16 768 f16(t("dac.dec.blk.0.convt.bias"))
+let blk_0_res_0_snake1 = t("dac.dec.blk.0.res.0.snake1.alpha")
+let blk_0_res_0_snake1_inv = clip(recip(add(f64(blk_0_res_0_snake1), 1e-9)), -60000, 60000)
+blob 59789440 fp16 768 f16(div(blk_0_res_0_snake1, 3.141592653589793))
+blob 59791040 fp16 768 f16(f32(mul(blk_0_res_0_snake1_inv, -23.29808439)))
+blob 59792640 fp16 768 f16(f32(mul(blk_0_res_0_snake1_inv, 41.426299)))
+blob 59794240 fp16 768 f16(f32(mul(blk_0_res_0_snake1_inv, -32.37042703)))
+blob 59795840 fp16 768 f16(f32(mul(blk_0_res_0_snake1_inv, 9.8672466)))
+blob 59797440 fp16 4128768 f16(t("dac.dec.blk.0.res.0.conv1.weight"))
+blob 68055040 fp16 768 f16(t("dac.dec.blk.0.res.0.conv1.bias"))
+let blk_0_res_0_snake2 = t("dac.dec.blk.0.res.0.snake2.alpha")
+let blk_0_res_0_snake2_inv = clip(recip(add(f64(blk_0_res_0_snake2), 1e-9)), -60000, 60000)
+blob 68056640 fp16 768 f16(div(blk_0_res_0_snake2, 3.141592653589793))
+blob 68058240 fp16 768 f16(f32(mul(blk_0_res_0_snake2_inv, -23.29808439)))
+blob 68059840 fp16 768 f16(f32(mul(blk_0_res_0_snake2_inv, 41.426299)))
+blob 68061440 fp16 768 f16(f32(mul(blk_0_res_0_snake2_inv, -32.37042703)))
+blob 68063040 fp16 768 f16(f32(mul(blk_0_res_0_snake2_inv, 9.8672466)))
+blob 68064640 fp16 589824 f16(t("dac.dec.blk.0.res.0.conv2.weight"))
+blob 69244352 fp16 768 f16(t("dac.dec.blk.0.res.0.conv2.bias"))
+let blk_0_res_1_snake1 = t("dac.dec.blk.0.res.1.snake1.alpha")
+let blk_0_res_1_snake1_inv = clip(recip(add(f64(blk_0_res_1_snake1), 1e-9)), -60000, 60000)
+blob 69245952 fp16 768 f16(div(blk_0_res_1_snake1, 3.141592653589793))
+blob 69247552 fp16 768 f16(f32(mul(blk_0_res_1_snake1_inv, -23.29808439)))
+blob 69249152 fp16 768 f16(f32(mul(blk_0_res_1_snake1_inv, 41.426299)))
+blob 69250752 fp16 768 f16(f32(mul(blk_0_res_1_snake1_inv, -32.37042703)))
+blob 69252352 fp16 768 f16(f32(mul(blk_0_res_1_snake1_inv, 9.8672466)))
+blob 69253952 fp16 4128768 f16(t("dac.dec.blk.0.res.1.conv1.weight"))
+blob 77511552 fp16 768 f16(t("dac.dec.blk.0.res.1.conv1.bias"))
+let blk_0_res_1_snake2 = t("dac.dec.blk.0.res.1.snake2.alpha")
+let blk_0_res_1_snake2_inv = clip(recip(add(f64(blk_0_res_1_snake2), 1e-9)), -60000, 60000)
+blob 77513152 fp16 768 f16(div(blk_0_res_1_snake2, 3.141592653589793))
+blob 77514752 fp16 768 f16(f32(mul(blk_0_res_1_snake2_inv, -23.29808439)))
+blob 77516352 fp16 768 f16(f32(mul(blk_0_res_1_snake2_inv, 41.426299)))
+blob 77517952 fp16 768 f16(f32(mul(blk_0_res_1_snake2_inv, -32.37042703)))
+blob 77519552 fp16 768 f16(f32(mul(blk_0_res_1_snake2_inv, 9.8672466)))
+blob 77521152 fp16 589824 f16(t("dac.dec.blk.0.res.1.conv2.weight"))
+blob 78700864 fp16 768 f16(t("dac.dec.blk.0.res.1.conv2.bias"))
+let blk_0_res_2_snake1 = t("dac.dec.blk.0.res.2.snake1.alpha")
+let blk_0_res_2_snake1_inv = clip(recip(add(f64(blk_0_res_2_snake1), 1e-9)), -60000, 60000)
+blob 78702464 fp16 768 f16(div(blk_0_res_2_snake1, 3.141592653589793))
+blob 78704064 fp16 768 f16(f32(mul(blk_0_res_2_snake1_inv, -23.29808439)))
+blob 78705664 fp16 768 f16(f32(mul(blk_0_res_2_snake1_inv, 41.426299)))
+blob 78707264 fp16 768 f16(f32(mul(blk_0_res_2_snake1_inv, -32.37042703)))
+blob 78708864 fp16 768 f16(f32(mul(blk_0_res_2_snake1_inv, 9.8672466)))
+blob 78710464 fp16 4128768 f16(t("dac.dec.blk.0.res.2.conv1.weight"))
+blob 86968064 fp16 768 f16(t("dac.dec.blk.0.res.2.conv1.bias"))
+let blk_0_res_2_snake2 = t("dac.dec.blk.0.res.2.snake2.alpha")
+let blk_0_res_2_snake2_inv = clip(recip(add(f64(blk_0_res_2_snake2), 1e-9)), -60000, 60000)
+blob 86969664 fp16 768 f16(div(blk_0_res_2_snake2, 3.141592653589793))
+blob 86971264 fp16 768 f16(f32(mul(blk_0_res_2_snake2_inv, -23.29808439)))
+blob 86972864 fp16 768 f16(f32(mul(blk_0_res_2_snake2_inv, 41.426299)))
+blob 86974464 fp16 768 f16(f32(mul(blk_0_res_2_snake2_inv, -32.37042703)))
+blob 86976064 fp16 768 f16(f32(mul(blk_0_res_2_snake2_inv, 9.8672466)))
+blob 86977664 fp16 589824 f16(t("dac.dec.blk.0.res.2.conv2.weight"))
+blob 88157376 fp16 768 f16(t("dac.dec.blk.0.res.2.conv2.bias"))
+let blk_1_snake = t("dac.dec.blk.1.snake.alpha")
+let blk_1_snake_inv = clip(recip(add(f64(blk_1_snake), 1e-9)), -60000, 60000)
+blob 88158976 fp16 768 f16(div(blk_1_snake, 3.141592653589793))
+blob 88160576 fp16 768 f16(f32(mul(blk_1_snake_inv, -23.29808439)))
+blob 88162176 fp16 768 f16(f32(mul(blk_1_snake_inv, 41.426299)))
+blob 88163776 fp16 768 f16(f32(mul(blk_1_snake_inv, -32.37042703)))
+blob 88165376 fp16 768 f16(f32(mul(blk_1_snake_inv, 9.8672466)))
+let blk_1_convt_w = t("dac.dec.blk.1.convt.weight")
+blob 88166976 fp16 4718592 f16(reshape(permute(concat(3,
+    reshape(take(blk_1_convt_w, 2, [8,9,10,11,12,13,14,15]), [768,384,8,1]),
+    reshape(take(blk_1_convt_w, 2, [0,1,2,3,4,5,6,7]), [768,384,8,1])),
+  [2,1,0,3]), [3072,768,2]))
+blob 97604224 fp16 384 f16(t("dac.dec.blk.1.convt.bias"))
+let blk_1_res_0_snake1 = t("dac.dec.blk.1.res.0.snake1.alpha")
+let blk_1_res_0_snake1_inv = clip(recip(add(f64(blk_1_res_0_snake1), 1e-9)), -60000, 60000)
+blob 97605056 fp16 384 f16(div(blk_1_res_0_snake1, 3.141592653589793))
+blob 97605888 fp16 384 f16(f32(mul(blk_1_res_0_snake1_inv, -23.29808439)))
+blob 97606720 fp16 384 f16(f32(mul(blk_1_res_0_snake1_inv, 41.426299)))
+blob 97607552 fp16 384 f16(f32(mul(blk_1_res_0_snake1_inv, -32.37042703)))
+blob 97608384 fp16 384 f16(f32(mul(blk_1_res_0_snake1_inv, 9.8672466)))
+blob 97609216 fp16 1032192 f16(t("dac.dec.blk.1.res.0.conv1.weight"))
+blob 99673664 fp16 384 f16(t("dac.dec.blk.1.res.0.conv1.bias"))
+let blk_1_res_0_snake2 = t("dac.dec.blk.1.res.0.snake2.alpha")
+let blk_1_res_0_snake2_inv = clip(recip(add(f64(blk_1_res_0_snake2), 1e-9)), -60000, 60000)
+blob 99674496 fp16 384 f16(div(blk_1_res_0_snake2, 3.141592653589793))
+blob 99675328 fp16 384 f16(f32(mul(blk_1_res_0_snake2_inv, -23.29808439)))
+blob 99676160 fp16 384 f16(f32(mul(blk_1_res_0_snake2_inv, 41.426299)))
+blob 99676992 fp16 384 f16(f32(mul(blk_1_res_0_snake2_inv, -32.37042703)))
+blob 99677824 fp16 384 f16(f32(mul(blk_1_res_0_snake2_inv, 9.8672466)))
+blob 99678656 fp16 147456 f16(t("dac.dec.blk.1.res.0.conv2.weight"))
+blob 99973632 fp16 384 f16(t("dac.dec.blk.1.res.0.conv2.bias"))
+let blk_1_res_1_snake1 = t("dac.dec.blk.1.res.1.snake1.alpha")
+let blk_1_res_1_snake1_inv = clip(recip(add(f64(blk_1_res_1_snake1), 1e-9)), -60000, 60000)
+blob 99974464 fp16 384 f16(div(blk_1_res_1_snake1, 3.141592653589793))
+blob 99975296 fp16 384 f16(f32(mul(blk_1_res_1_snake1_inv, -23.29808439)))
+blob 99976128 fp16 384 f16(f32(mul(blk_1_res_1_snake1_inv, 41.426299)))
+blob 99976960 fp16 384 f16(f32(mul(blk_1_res_1_snake1_inv, -32.37042703)))
+blob 99977792 fp16 384 f16(f32(mul(blk_1_res_1_snake1_inv, 9.8672466)))
+blob 99978624 fp16 1032192 f16(t("dac.dec.blk.1.res.1.conv1.weight"))
+blob 102043072 fp16 384 f16(t("dac.dec.blk.1.res.1.conv1.bias"))
+let blk_1_res_1_snake2 = t("dac.dec.blk.1.res.1.snake2.alpha")
+let blk_1_res_1_snake2_inv = clip(recip(add(f64(blk_1_res_1_snake2), 1e-9)), -60000, 60000)
+blob 102043904 fp16 384 f16(div(blk_1_res_1_snake2, 3.141592653589793))
+blob 102044736 fp16 384 f16(f32(mul(blk_1_res_1_snake2_inv, -23.29808439)))
+blob 102045568 fp16 384 f16(f32(mul(blk_1_res_1_snake2_inv, 41.426299)))
+blob 102046400 fp16 384 f16(f32(mul(blk_1_res_1_snake2_inv, -32.37042703)))
+blob 102047232 fp16 384 f16(f32(mul(blk_1_res_1_snake2_inv, 9.8672466)))
+blob 102048064 fp16 147456 f16(t("dac.dec.blk.1.res.1.conv2.weight"))
+blob 102343040 fp16 384 f16(t("dac.dec.blk.1.res.1.conv2.bias"))
+let blk_1_res_2_snake1 = t("dac.dec.blk.1.res.2.snake1.alpha")
+let blk_1_res_2_snake1_inv = clip(recip(add(f64(blk_1_res_2_snake1), 1e-9)), -60000, 60000)
+blob 102343872 fp16 384 f16(div(blk_1_res_2_snake1, 3.141592653589793))
+blob 102344704 fp16 384 f16(f32(mul(blk_1_res_2_snake1_inv, -23.29808439)))
+blob 102345536 fp16 384 f16(f32(mul(blk_1_res_2_snake1_inv, 41.426299)))
+blob 102346368 fp16 384 f16(f32(mul(blk_1_res_2_snake1_inv, -32.37042703)))
+blob 102347200 fp16 384 f16(f32(mul(blk_1_res_2_snake1_inv, 9.8672466)))
+blob 102348032 fp16 1032192 f16(t("dac.dec.blk.1.res.2.conv1.weight"))
+blob 104412480 fp16 384 f16(t("dac.dec.blk.1.res.2.conv1.bias"))
+let blk_1_res_2_snake2 = t("dac.dec.blk.1.res.2.snake2.alpha")
+let blk_1_res_2_snake2_inv = clip(recip(add(f64(blk_1_res_2_snake2), 1e-9)), -60000, 60000)
+blob 104413312 fp16 384 f16(div(blk_1_res_2_snake2, 3.141592653589793))
+blob 104414144 fp16 384 f16(f32(mul(blk_1_res_2_snake2_inv, -23.29808439)))
+blob 104414976 fp16 384 f16(f32(mul(blk_1_res_2_snake2_inv, 41.426299)))
+blob 104415808 fp16 384 f16(f32(mul(blk_1_res_2_snake2_inv, -32.37042703)))
+blob 104416640 fp16 384 f16(f32(mul(blk_1_res_2_snake2_inv, 9.8672466)))
+blob 104417472 fp16 147456 f16(t("dac.dec.blk.1.res.2.conv2.weight"))
+blob 104712448 fp16 384 f16(t("dac.dec.blk.1.res.2.conv2.bias"))
+let blk_2_snake = t("dac.dec.blk.2.snake.alpha")
+let blk_2_snake_inv = clip(recip(add(f64(blk_2_snake), 1e-9)), -60000, 60000)
+blob 104713280 fp16 384 f16(div(blk_2_snake, 3.141592653589793))
+blob 104714112 fp16 384 f16(f32(mul(blk_2_snake_inv, -23.29808439)))
+blob 104714944 fp16 384 f16(f32(mul(blk_2_snake_inv, 41.426299)))
+blob 104715776 fp16 384 f16(f32(mul(blk_2_snake_inv, -32.37042703)))
+blob 104716608 fp16 384 f16(f32(mul(blk_2_snake_inv, 9.8672466)))
+let blk_2_convt_w = t("dac.dec.blk.2.convt.weight")
+blob 104717440 fp16 589824 f16(reshape(permute(concat(3,
+    reshape(take(blk_2_convt_w, 2, [4,5,6,7]), [384,192,4,1]),
+    reshape(take(blk_2_convt_w, 2, [0,1,2,3]), [384,192,4,1])),
+  [2,1,0,3]), [768,384,2]))
+blob 105897152 fp16 192 f16(t("dac.dec.blk.2.convt.bias"))
+let blk_2_res_0_snake1 = t("dac.dec.blk.2.res.0.snake1.alpha")
+let blk_2_res_0_snake1_inv = clip(recip(add(f64(blk_2_res_0_snake1), 1e-9)), -60000, 60000)
+blob 105897600 fp16 192 f16(div(blk_2_res_0_snake1, 3.141592653589793))
+blob 105898048 fp16 192 f16(zeros([192]))
+blob 105898496 fp16 192 f16(ones([192]))
+blob 105898944 fp16 192 f16(f32(mul(blk_2_res_0_snake1_inv, -23.29808439)))
+blob 105899392 fp16 192 f16(f32(mul(blk_2_res_0_snake1_inv, 41.426299)))
+blob 105899840 fp16 192 f16(f32(mul(blk_2_res_0_snake1_inv, -32.37042703)))
+blob 105900288 fp16 192 f16(f32(mul(blk_2_res_0_snake1_inv, 9.8672466)))
+blob 105900736 fp16 576 f16(zeros([576]))
+blob 105901952 fp16 258048 f16(t("dac.dec.blk.2.res.0.conv1.weight"))
+blob 106418112 fp16 192 f16(t("dac.dec.blk.2.res.0.conv1.bias"))
+let blk_2_res_0_snake2 = t("dac.dec.blk.2.res.0.snake2.alpha")
+let blk_2_res_0_snake2_inv = clip(recip(add(f64(blk_2_res_0_snake2), 1e-9)), -60000, 60000)
+blob 106418560 fp16 192 f16(div(blk_2_res_0_snake2, 3.141592653589793))
+blob 106419008 fp16 192 f16(f32(mul(blk_2_res_0_snake2_inv, -23.29808439)))
+blob 106419456 fp16 192 f16(f32(mul(blk_2_res_0_snake2_inv, 41.426299)))
+blob 106419904 fp16 192 f16(f32(mul(blk_2_res_0_snake2_inv, -32.37042703)))
+blob 106420352 fp16 192 f16(f32(mul(blk_2_res_0_snake2_inv, 9.8672466)))
+blob 106420800 fp16 36864 f16(t("dac.dec.blk.2.res.0.conv2.weight"))
+blob 106494592 fp16 192 f16(t("dac.dec.blk.2.res.0.conv2.bias"))
+let blk_2_res_1_snake1 = t("dac.dec.blk.2.res.1.snake1.alpha")
+let blk_2_res_1_snake1_inv = clip(recip(add(f64(blk_2_res_1_snake1), 1e-9)), -60000, 60000)
+blob 106495040 fp16 192 f16(div(blk_2_res_1_snake1, 3.141592653589793))
+blob 106495488 fp16 192 f16(f32(mul(blk_2_res_1_snake1_inv, -23.29808439)))
+blob 106495936 fp16 192 f16(f32(mul(blk_2_res_1_snake1_inv, 41.426299)))
+blob 106496384 fp16 192 f16(f32(mul(blk_2_res_1_snake1_inv, -32.37042703)))
+blob 106496832 fp16 192 f16(f32(mul(blk_2_res_1_snake1_inv, 9.8672466)))
+blob 106497280 fp16 1728 f16(zeros([1728]))
+blob 106500800 fp16 258048 f16(t("dac.dec.blk.2.res.1.conv1.weight"))
+blob 107016960 fp16 192 f16(t("dac.dec.blk.2.res.1.conv1.bias"))
+let blk_2_res_1_snake2 = t("dac.dec.blk.2.res.1.snake2.alpha")
+let blk_2_res_1_snake2_inv = clip(recip(add(f64(blk_2_res_1_snake2), 1e-9)), -60000, 60000)
+blob 107017408 fp16 192 f16(div(blk_2_res_1_snake2, 3.141592653589793))
+blob 107017856 fp16 192 f16(f32(mul(blk_2_res_1_snake2_inv, -23.29808439)))
+blob 107018304 fp16 192 f16(f32(mul(blk_2_res_1_snake2_inv, 41.426299)))
+blob 107018752 fp16 192 f16(f32(mul(blk_2_res_1_snake2_inv, -32.37042703)))
+blob 107019200 fp16 192 f16(f32(mul(blk_2_res_1_snake2_inv, 9.8672466)))
+blob 107019648 fp16 36864 f16(t("dac.dec.blk.2.res.1.conv2.weight"))
+blob 107093440 fp16 192 f16(t("dac.dec.blk.2.res.1.conv2.bias"))
+let blk_2_res_2_snake1 = t("dac.dec.blk.2.res.2.snake1.alpha")
+let blk_2_res_2_snake1_inv = clip(recip(add(f64(blk_2_res_2_snake1), 1e-9)), -60000, 60000)
+blob 107093888 fp16 192 f16(div(blk_2_res_2_snake1, 3.141592653589793))
+blob 107094336 fp16 192 f16(f32(mul(blk_2_res_2_snake1_inv, -23.29808439)))
+blob 107094784 fp16 192 f16(f32(mul(blk_2_res_2_snake1_inv, 41.426299)))
+blob 107095232 fp16 192 f16(f32(mul(blk_2_res_2_snake1_inv, -32.37042703)))
+blob 107095680 fp16 192 f16(f32(mul(blk_2_res_2_snake1_inv, 9.8672466)))
+blob 107096128 fp16 5184 f16(zeros([5184]))
+blob 107106560 fp16 258048 f16(t("dac.dec.blk.2.res.2.conv1.weight"))
+blob 107622720 fp16 192 f16(t("dac.dec.blk.2.res.2.conv1.bias"))
+let blk_2_res_2_snake2 = t("dac.dec.blk.2.res.2.snake2.alpha")
+let blk_2_res_2_snake2_inv = clip(recip(add(f64(blk_2_res_2_snake2), 1e-9)), -60000, 60000)
+blob 107623168 fp16 192 f16(div(blk_2_res_2_snake2, 3.141592653589793))
+blob 107623616 fp16 192 f16(f32(mul(blk_2_res_2_snake2_inv, -23.29808439)))
+blob 107624064 fp16 192 f16(f32(mul(blk_2_res_2_snake2_inv, 41.426299)))
+blob 107624512 fp16 192 f16(f32(mul(blk_2_res_2_snake2_inv, -32.37042703)))
+blob 107624960 fp16 192 f16(f32(mul(blk_2_res_2_snake2_inv, 9.8672466)))
+blob 107625408 fp16 36864 f16(t("dac.dec.blk.2.res.2.conv2.weight"))
+blob 107699200 fp16 192 f16(t("dac.dec.blk.2.res.2.conv2.bias"))
+let blk_3_snake = t("dac.dec.blk.3.snake.alpha")
+let blk_3_snake_inv = clip(recip(add(f64(blk_3_snake), 1e-9)), -60000, 60000)
+blob 107699648 fp16 192 f16(div(blk_3_snake, 3.141592653589793))
+blob 107700096 fp16 192 f16(f32(mul(blk_3_snake_inv, -23.29808439)))
+blob 107700544 fp16 192 f16(f32(mul(blk_3_snake_inv, 41.426299)))
+blob 107700992 fp16 192 f16(f32(mul(blk_3_snake_inv, -32.37042703)))
+blob 107701440 fp16 192 f16(f32(mul(blk_3_snake_inv, 9.8672466)))
+blob 107701888 fp16 192 f16(zeros([192]))
+let blk_3_convt_w = t("dac.dec.blk.3.convt.weight")
+blob 107702336 fp16 73728 f16(reshape(permute(concat(3,
+    reshape(take(blk_3_convt_w, 2, [2,3]), [192,96,2,1]),
+    reshape(take(blk_3_convt_w, 2, [0,1]), [192,96,2,1])),
+  [2,1,0,3]), [192,192,2]))
+blob 107849856 fp16 96 f16(t("dac.dec.blk.3.convt.bias"))
+let blk_3_res_0_snake1 = t("dac.dec.blk.3.res.0.snake1.alpha")
+let blk_3_res_0_snake1_inv = clip(recip(add(f64(blk_3_res_0_snake1), 1e-9)), -60000, 60000)
+blob 107850112 fp16 96 f16(div(blk_3_res_0_snake1, 3.141592653589793))
+blob 107850368 fp16 96 f16(zeros([96]))
+blob 107850624 fp16 96 f16(ones([96]))
+blob 107850880 fp16 96 f16(f32(mul(blk_3_res_0_snake1_inv, -23.29808439)))
+blob 107851136 fp16 96 f16(f32(mul(blk_3_res_0_snake1_inv, 41.426299)))
+blob 107851392 fp16 96 f16(f32(mul(blk_3_res_0_snake1_inv, -32.37042703)))
+blob 107851648 fp16 96 f16(f32(mul(blk_3_res_0_snake1_inv, 9.8672466)))
+blob 107851904 fp16 288 f16(zeros([288]))
+blob 107852544 fp16 64512 f16(t("dac.dec.blk.3.res.0.conv1.weight"))
+blob 107981632 fp16 96 f16(t("dac.dec.blk.3.res.0.conv1.bias"))
+let blk_3_res_0_snake2 = t("dac.dec.blk.3.res.0.snake2.alpha")
+let blk_3_res_0_snake2_inv = clip(recip(add(f64(blk_3_res_0_snake2), 1e-9)), -60000, 60000)
+blob 107981888 fp16 96 f16(div(blk_3_res_0_snake2, 3.141592653589793))
+blob 107982144 fp16 96 f16(zeros([96]))
+blob 107982400 fp16 96 f16(ones([96]))
+blob 107982656 fp16 96 f16(f32(mul(blk_3_res_0_snake2_inv, -23.29808439)))
+blob 107982912 fp16 96 f16(f32(mul(blk_3_res_0_snake2_inv, 41.426299)))
+blob 107983168 fp16 96 f16(f32(mul(blk_3_res_0_snake2_inv, -32.37042703)))
+blob 107983424 fp16 96 f16(f32(mul(blk_3_res_0_snake2_inv, 9.8672466)))
+blob 107983680 fp16 9216 f16(t("dac.dec.blk.3.res.0.conv2.weight"))
+blob 108002176 fp16 96 f16(t("dac.dec.blk.3.res.0.conv2.bias"))
+let blk_3_res_1_snake1 = t("dac.dec.blk.3.res.1.snake1.alpha")
+let blk_3_res_1_snake1_inv = clip(recip(add(f64(blk_3_res_1_snake1), 1e-9)), -60000, 60000)
+blob 108002432 fp16 96 f16(div(blk_3_res_1_snake1, 3.141592653589793))
+blob 108002688 fp16 96 f16(zeros([96]))
+blob 108002944 fp16 96 f16(ones([96]))
+blob 108003200 fp16 96 f16(f32(mul(blk_3_res_1_snake1_inv, -23.29808439)))
+blob 108003456 fp16 96 f16(f32(mul(blk_3_res_1_snake1_inv, 41.426299)))
+blob 108003712 fp16 96 f16(f32(mul(blk_3_res_1_snake1_inv, -32.37042703)))
+blob 108003968 fp16 96 f16(f32(mul(blk_3_res_1_snake1_inv, 9.8672466)))
+blob 108004224 fp16 864 f16(zeros([864]))
+blob 108006016 fp16 64512 f16(t("dac.dec.blk.3.res.1.conv1.weight"))
+blob 108135104 fp16 96 f16(t("dac.dec.blk.3.res.1.conv1.bias"))
+let blk_3_res_1_snake2 = t("dac.dec.blk.3.res.1.snake2.alpha")
+let blk_3_res_1_snake2_inv = clip(recip(add(f64(blk_3_res_1_snake2), 1e-9)), -60000, 60000)
+blob 108135360 fp16 96 f16(div(blk_3_res_1_snake2, 3.141592653589793))
+blob 108135616 fp16 96 f16(zeros([96]))
+blob 108135872 fp16 96 f16(ones([96]))
+blob 108136128 fp16 96 f16(f32(mul(blk_3_res_1_snake2_inv, -23.29808439)))
+blob 108136384 fp16 96 f16(f32(mul(blk_3_res_1_snake2_inv, 41.426299)))
+blob 108136640 fp16 96 f16(f32(mul(blk_3_res_1_snake2_inv, -32.37042703)))
+blob 108136896 fp16 96 f16(f32(mul(blk_3_res_1_snake2_inv, 9.8672466)))
+blob 108137152 fp16 9216 f16(t("dac.dec.blk.3.res.1.conv2.weight"))
+blob 108155648 fp16 96 f16(t("dac.dec.blk.3.res.1.conv2.bias"))
+let blk_3_res_2_snake1 = t("dac.dec.blk.3.res.2.snake1.alpha")
+let blk_3_res_2_snake1_inv = clip(recip(add(f64(blk_3_res_2_snake1), 1e-9)), -60000, 60000)
+blob 108155904 fp16 96 f16(div(blk_3_res_2_snake1, 3.141592653589793))
+blob 108156160 fp16 96 f16(zeros([96]))
+blob 108156416 fp16 96 f16(ones([96]))
+blob 108156672 fp16 96 f16(f32(mul(blk_3_res_2_snake1_inv, -23.29808439)))
+blob 108156928 fp16 96 f16(f32(mul(blk_3_res_2_snake1_inv, 41.426299)))
+blob 108157184 fp16 96 f16(f32(mul(blk_3_res_2_snake1_inv, -32.37042703)))
+blob 108157440 fp16 96 f16(f32(mul(blk_3_res_2_snake1_inv, 9.8672466)))
+blob 108157696 fp16 2592 f16(zeros([2592]))
+blob 108162944 fp16 64512 f16(t("dac.dec.blk.3.res.2.conv1.weight"))
+blob 108292032 fp16 96 f16(t("dac.dec.blk.3.res.2.conv1.bias"))
+let blk_3_res_2_snake2 = t("dac.dec.blk.3.res.2.snake2.alpha")
+let blk_3_res_2_snake2_inv = clip(recip(add(f64(blk_3_res_2_snake2), 1e-9)), -60000, 60000)
+blob 108292288 fp16 96 f16(div(blk_3_res_2_snake2, 3.141592653589793))
+blob 108292544 fp16 96 f16(zeros([96]))
+blob 108292800 fp16 96 f16(ones([96]))
+blob 108293056 fp16 96 f16(f32(mul(blk_3_res_2_snake2_inv, -23.29808439)))
+blob 108293312 fp16 96 f16(f32(mul(blk_3_res_2_snake2_inv, 41.426299)))
+blob 108293568 fp16 96 f16(f32(mul(blk_3_res_2_snake2_inv, -32.37042703)))
+blob 108293824 fp16 96 f16(f32(mul(blk_3_res_2_snake2_inv, 9.8672466)))
+blob 108294080 fp16 9216 f16(t("dac.dec.blk.3.res.2.conv2.weight"))
+blob 108312576 fp16 96 f16(t("dac.dec.blk.3.res.2.conv2.bias"))
+let snake_out = t("dac.dec.snake_out.alpha")
+let snake_out_inv = clip(recip(add(f64(snake_out), 1e-9)), -60000, 60000)
+blob 108312832 fp16 96 f16(div(snake_out, 3.141592653589793))
+blob 108313088 fp16 96 f16(zeros([96]))
+blob 108313344 fp16 96 f16(ones([96]))
+blob 108313600 fp16 96 f16(f32(mul(snake_out_inv, -23.29808439)))
+blob 108313856 fp16 96 f16(f32(mul(snake_out_inv, 41.426299)))
+blob 108314112 fp16 96 f16(f32(mul(snake_out_inv, -32.37042703)))
+blob 108314368 fp16 96 f16(f32(mul(snake_out_inv, 9.8672466)))
+blob 108314624 fp16 672 f16(t("dac.dec.conv_out.weight"))
+# conv_out's one-element bias is an inline constant of the program (conv_out_bias_to_fp16), not a
+# weight.bin blob: the patch writes it into model.mlmodel.
+patch 170847 fp16 1 f16(t("dac.dec.conv_out.bias"))
+end

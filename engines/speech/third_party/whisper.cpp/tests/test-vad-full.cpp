@@ -1,0 +1,87 @@
+#include "whisper.h"
+#include "common-whisper.h"
+
+#include <cstdio>
+#include <cfloat>
+#include <string>
+#include <cstring>
+
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+
+#include <cassert>
+
+int main() {
+    ggml_backend_load_all();
+
+    std::string whisper_model_path = WHISPER_MODEL_PATH;
+    std::string vad_model_path     = VAD_MODEL_PATH;
+    std::string sample_path        = SAMPLE_PATH;
+
+    // Load the sample audio file
+    std::vector<float> pcmf32;
+    std::vector<std::vector<float>> pcmf32s;
+    assert(read_audio_data(sample_path.c_str(), pcmf32, pcmf32s, false));
+
+    struct whisper_context_params cparams = whisper_context_default_params();
+    struct whisper_context * wctx = whisper_init_from_file_with_params(
+            whisper_model_path.c_str(),
+            cparams);
+
+    if (!wctx) {
+        fprintf(stderr, "failed to load model '%s'\n", whisper_model_path.c_str());
+        return 1;
+    }
+
+    struct whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH);
+    wparams.vad            = true;
+    wparams.vad_model_path = vad_model_path.c_str();
+
+    wparams.vad_params.threshold               = 0.5f;
+    wparams.vad_params.min_speech_duration_ms  = 250;
+    wparams.vad_params.min_silence_duration_ms = 100;
+    wparams.vad_params.max_speech_duration_s   = FLT_MAX;
+    wparams.vad_params.speech_pad_ms           = 30;
+
+    assert(whisper_full_parallel(wctx, wparams, pcmf32.data(), pcmf32.size(), 1) == 0);
+
+    const int n_segments = whisper_full_n_segments(wctx);
+    assert(n_segments == 1);
+
+
+    printf("Segment text:\n%s", whisper_full_get_segment_text(wctx, 0));
+    assert(strcmp(" And so my fellow Americans, ask not what your country can do for you,"
+                  " ask what you can do for your country.",
+           whisper_full_get_segment_text(wctx, 0)) == 0);
+    assert(whisper_full_get_segment_t0(wctx, 0) == 32);
+    assert(whisper_full_get_segment_t1(wctx, 0) == 1051);
+
+    // token times mapped back to the original timeline: ordered, non-negative duration
+    const int n_tokens = whisper_full_n_tokens(wctx, 0);
+    assert(n_tokens > 0);
+    int64_t prev_t0 = -1;
+    for (int j = 0; j < n_tokens; ++j) {
+        const int64_t t0 = whisper_full_get_token_t0(wctx, 0, j);
+        const int64_t t1 = whisper_full_get_token_t1(wctx, 0, j);
+        assert(t0 >= 0 && t1 >= t0);
+        assert(t0 >= prev_t0);
+        prev_t0 = t0;
+    }
+
+    // internal VAD speech segments, on the original audio timeline (centiseconds)
+    const int n_vad = whisper_full_n_vad_segments(wctx);
+    assert(n_vad > 0);
+    int64_t vad_prev_end = -1;
+    for (int i = 0; i < n_vad; ++i) {
+        const int64_t t0 = whisper_full_get_vad_segment_t0(wctx, i);
+        const int64_t t1 = whisper_full_get_vad_segment_t1(wctx, i);
+        assert(t1 > t0);
+        assert(t0 >= vad_prev_end); // segments are ordered and non-overlapping
+        vad_prev_end = t1;
+    }
+
+    whisper_free(wctx);
+
+    return 0;
+}

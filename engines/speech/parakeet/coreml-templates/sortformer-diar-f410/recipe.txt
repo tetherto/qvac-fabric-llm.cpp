@@ -1,0 +1,2033 @@
+mlrecipe 1
+template sortformer-diar-f410
+spec_sha256 732a9607097e69529a535cc3489bf0ab2d2f03a8ca87d8cda81700537b64f5a1
+weight_bin_size 231783616
+blobs 1014
+source "encoder.blk.0.norm_ff1.weight" f32 [512]
+source "encoder.blk.0.norm_ff1.bias" f32 [512]
+source "encoder.blk.0.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.0.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.0.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.0.ff1.linear2.bias" f32 [512]
+source "encoder.blk.0.norm_attn.weight" f32 [512]
+source "encoder.blk.0.norm_attn.bias" f32 [512]
+source "encoder.blk.0.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.0.attn.q.bias" f32 [512]
+source "encoder.blk.0.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.0.attn.k.bias" f32 [512]
+source "encoder.blk.0.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.0.attn.v.bias" f32 [512]
+source "encoder.blk.0.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.0.attn.out.bias" f32 [512]
+source "encoder.blk.0.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.0.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.0.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.0.norm_conv.weight" f32 [512]
+source "encoder.blk.0.norm_conv.bias" f32 [512]
+source "encoder.blk.0.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.0.conv.pw1.bias" f32 [1024]
+source "encoder.blk.0.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.0.conv.dw.bias" f32 [512]
+source "encoder.blk.0.conv.bn.scale" f32 [512]
+source "encoder.blk.0.conv.bn.shift" f32 [512]
+source "encoder.blk.0.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.0.conv.pw2.bias" f32 [512]
+source "encoder.blk.0.norm_ff2.weight" f32 [512]
+source "encoder.blk.0.norm_ff2.bias" f32 [512]
+source "encoder.blk.0.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.0.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.0.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.0.ff2.linear2.bias" f32 [512]
+source "encoder.blk.0.norm_out.weight" f32 [512]
+source "encoder.blk.0.norm_out.bias" f32 [512]
+source "encoder.blk.1.norm_ff1.weight" f32 [512]
+source "encoder.blk.1.norm_ff1.bias" f32 [512]
+source "encoder.blk.1.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.1.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.1.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.1.ff1.linear2.bias" f32 [512]
+source "encoder.blk.1.norm_attn.weight" f32 [512]
+source "encoder.blk.1.norm_attn.bias" f32 [512]
+source "encoder.blk.1.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.1.attn.q.bias" f32 [512]
+source "encoder.blk.1.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.1.attn.k.bias" f32 [512]
+source "encoder.blk.1.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.1.attn.v.bias" f32 [512]
+source "encoder.blk.1.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.1.attn.out.bias" f32 [512]
+source "encoder.blk.1.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.1.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.1.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.1.norm_conv.weight" f32 [512]
+source "encoder.blk.1.norm_conv.bias" f32 [512]
+source "encoder.blk.1.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.1.conv.pw1.bias" f32 [1024]
+source "encoder.blk.1.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.1.conv.dw.bias" f32 [512]
+source "encoder.blk.1.conv.bn.scale" f32 [512]
+source "encoder.blk.1.conv.bn.shift" f32 [512]
+source "encoder.blk.1.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.1.conv.pw2.bias" f32 [512]
+source "encoder.blk.1.norm_ff2.weight" f32 [512]
+source "encoder.blk.1.norm_ff2.bias" f32 [512]
+source "encoder.blk.1.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.1.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.1.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.1.ff2.linear2.bias" f32 [512]
+source "encoder.blk.1.norm_out.weight" f32 [512]
+source "encoder.blk.1.norm_out.bias" f32 [512]
+source "encoder.blk.2.norm_ff1.weight" f32 [512]
+source "encoder.blk.2.norm_ff1.bias" f32 [512]
+source "encoder.blk.2.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.2.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.2.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.2.ff1.linear2.bias" f32 [512]
+source "encoder.blk.2.norm_attn.weight" f32 [512]
+source "encoder.blk.2.norm_attn.bias" f32 [512]
+source "encoder.blk.2.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.2.attn.q.bias" f32 [512]
+source "encoder.blk.2.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.2.attn.k.bias" f32 [512]
+source "encoder.blk.2.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.2.attn.v.bias" f32 [512]
+source "encoder.blk.2.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.2.attn.out.bias" f32 [512]
+source "encoder.blk.2.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.2.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.2.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.2.norm_conv.weight" f32 [512]
+source "encoder.blk.2.norm_conv.bias" f32 [512]
+source "encoder.blk.2.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.2.conv.pw1.bias" f32 [1024]
+source "encoder.blk.2.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.2.conv.dw.bias" f32 [512]
+source "encoder.blk.2.conv.bn.scale" f32 [512]
+source "encoder.blk.2.conv.bn.shift" f32 [512]
+source "encoder.blk.2.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.2.conv.pw2.bias" f32 [512]
+source "encoder.blk.2.norm_ff2.weight" f32 [512]
+source "encoder.blk.2.norm_ff2.bias" f32 [512]
+source "encoder.blk.2.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.2.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.2.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.2.ff2.linear2.bias" f32 [512]
+source "encoder.blk.2.norm_out.weight" f32 [512]
+source "encoder.blk.2.norm_out.bias" f32 [512]
+source "encoder.blk.3.norm_ff1.weight" f32 [512]
+source "encoder.blk.3.norm_ff1.bias" f32 [512]
+source "encoder.blk.3.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.3.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.3.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.3.ff1.linear2.bias" f32 [512]
+source "encoder.blk.3.norm_attn.weight" f32 [512]
+source "encoder.blk.3.norm_attn.bias" f32 [512]
+source "encoder.blk.3.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.3.attn.q.bias" f32 [512]
+source "encoder.blk.3.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.3.attn.k.bias" f32 [512]
+source "encoder.blk.3.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.3.attn.v.bias" f32 [512]
+source "encoder.blk.3.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.3.attn.out.bias" f32 [512]
+source "encoder.blk.3.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.3.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.3.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.3.norm_conv.weight" f32 [512]
+source "encoder.blk.3.norm_conv.bias" f32 [512]
+source "encoder.blk.3.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.3.conv.pw1.bias" f32 [1024]
+source "encoder.blk.3.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.3.conv.dw.bias" f32 [512]
+source "encoder.blk.3.conv.bn.scale" f32 [512]
+source "encoder.blk.3.conv.bn.shift" f32 [512]
+source "encoder.blk.3.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.3.conv.pw2.bias" f32 [512]
+source "encoder.blk.3.norm_ff2.weight" f32 [512]
+source "encoder.blk.3.norm_ff2.bias" f32 [512]
+source "encoder.blk.3.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.3.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.3.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.3.ff2.linear2.bias" f32 [512]
+source "encoder.blk.3.norm_out.weight" f32 [512]
+source "encoder.blk.3.norm_out.bias" f32 [512]
+source "encoder.blk.4.norm_ff1.weight" f32 [512]
+source "encoder.blk.4.norm_ff1.bias" f32 [512]
+source "encoder.blk.4.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.4.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.4.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.4.ff1.linear2.bias" f32 [512]
+source "encoder.blk.4.norm_attn.weight" f32 [512]
+source "encoder.blk.4.norm_attn.bias" f32 [512]
+source "encoder.blk.4.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.4.attn.q.bias" f32 [512]
+source "encoder.blk.4.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.4.attn.k.bias" f32 [512]
+source "encoder.blk.4.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.4.attn.v.bias" f32 [512]
+source "encoder.blk.4.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.4.attn.out.bias" f32 [512]
+source "encoder.blk.4.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.4.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.4.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.4.norm_conv.weight" f32 [512]
+source "encoder.blk.4.norm_conv.bias" f32 [512]
+source "encoder.blk.4.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.4.conv.pw1.bias" f32 [1024]
+source "encoder.blk.4.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.4.conv.dw.bias" f32 [512]
+source "encoder.blk.4.conv.bn.scale" f32 [512]
+source "encoder.blk.4.conv.bn.shift" f32 [512]
+source "encoder.blk.4.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.4.conv.pw2.bias" f32 [512]
+source "encoder.blk.4.norm_ff2.weight" f32 [512]
+source "encoder.blk.4.norm_ff2.bias" f32 [512]
+source "encoder.blk.4.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.4.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.4.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.4.ff2.linear2.bias" f32 [512]
+source "encoder.blk.4.norm_out.weight" f32 [512]
+source "encoder.blk.4.norm_out.bias" f32 [512]
+source "encoder.blk.5.norm_ff1.weight" f32 [512]
+source "encoder.blk.5.norm_ff1.bias" f32 [512]
+source "encoder.blk.5.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.5.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.5.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.5.ff1.linear2.bias" f32 [512]
+source "encoder.blk.5.norm_attn.weight" f32 [512]
+source "encoder.blk.5.norm_attn.bias" f32 [512]
+source "encoder.blk.5.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.5.attn.q.bias" f32 [512]
+source "encoder.blk.5.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.5.attn.k.bias" f32 [512]
+source "encoder.blk.5.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.5.attn.v.bias" f32 [512]
+source "encoder.blk.5.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.5.attn.out.bias" f32 [512]
+source "encoder.blk.5.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.5.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.5.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.5.norm_conv.weight" f32 [512]
+source "encoder.blk.5.norm_conv.bias" f32 [512]
+source "encoder.blk.5.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.5.conv.pw1.bias" f32 [1024]
+source "encoder.blk.5.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.5.conv.dw.bias" f32 [512]
+source "encoder.blk.5.conv.bn.scale" f32 [512]
+source "encoder.blk.5.conv.bn.shift" f32 [512]
+source "encoder.blk.5.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.5.conv.pw2.bias" f32 [512]
+source "encoder.blk.5.norm_ff2.weight" f32 [512]
+source "encoder.blk.5.norm_ff2.bias" f32 [512]
+source "encoder.blk.5.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.5.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.5.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.5.ff2.linear2.bias" f32 [512]
+source "encoder.blk.5.norm_out.weight" f32 [512]
+source "encoder.blk.5.norm_out.bias" f32 [512]
+source "encoder.blk.6.norm_ff1.weight" f32 [512]
+source "encoder.blk.6.norm_ff1.bias" f32 [512]
+source "encoder.blk.6.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.6.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.6.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.6.ff1.linear2.bias" f32 [512]
+source "encoder.blk.6.norm_attn.weight" f32 [512]
+source "encoder.blk.6.norm_attn.bias" f32 [512]
+source "encoder.blk.6.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.6.attn.q.bias" f32 [512]
+source "encoder.blk.6.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.6.attn.k.bias" f32 [512]
+source "encoder.blk.6.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.6.attn.v.bias" f32 [512]
+source "encoder.blk.6.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.6.attn.out.bias" f32 [512]
+source "encoder.blk.6.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.6.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.6.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.6.norm_conv.weight" f32 [512]
+source "encoder.blk.6.norm_conv.bias" f32 [512]
+source "encoder.blk.6.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.6.conv.pw1.bias" f32 [1024]
+source "encoder.blk.6.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.6.conv.dw.bias" f32 [512]
+source "encoder.blk.6.conv.bn.scale" f32 [512]
+source "encoder.blk.6.conv.bn.shift" f32 [512]
+source "encoder.blk.6.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.6.conv.pw2.bias" f32 [512]
+source "encoder.blk.6.norm_ff2.weight" f32 [512]
+source "encoder.blk.6.norm_ff2.bias" f32 [512]
+source "encoder.blk.6.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.6.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.6.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.6.ff2.linear2.bias" f32 [512]
+source "encoder.blk.6.norm_out.weight" f32 [512]
+source "encoder.blk.6.norm_out.bias" f32 [512]
+source "encoder.blk.7.norm_ff1.weight" f32 [512]
+source "encoder.blk.7.norm_ff1.bias" f32 [512]
+source "encoder.blk.7.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.7.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.7.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.7.ff1.linear2.bias" f32 [512]
+source "encoder.blk.7.norm_attn.weight" f32 [512]
+source "encoder.blk.7.norm_attn.bias" f32 [512]
+source "encoder.blk.7.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.7.attn.q.bias" f32 [512]
+source "encoder.blk.7.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.7.attn.k.bias" f32 [512]
+source "encoder.blk.7.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.7.attn.v.bias" f32 [512]
+source "encoder.blk.7.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.7.attn.out.bias" f32 [512]
+source "encoder.blk.7.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.7.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.7.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.7.norm_conv.weight" f32 [512]
+source "encoder.blk.7.norm_conv.bias" f32 [512]
+source "encoder.blk.7.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.7.conv.pw1.bias" f32 [1024]
+source "encoder.blk.7.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.7.conv.dw.bias" f32 [512]
+source "encoder.blk.7.conv.bn.scale" f32 [512]
+source "encoder.blk.7.conv.bn.shift" f32 [512]
+source "encoder.blk.7.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.7.conv.pw2.bias" f32 [512]
+source "encoder.blk.7.norm_ff2.weight" f32 [512]
+source "encoder.blk.7.norm_ff2.bias" f32 [512]
+source "encoder.blk.7.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.7.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.7.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.7.ff2.linear2.bias" f32 [512]
+source "encoder.blk.7.norm_out.weight" f32 [512]
+source "encoder.blk.7.norm_out.bias" f32 [512]
+source "encoder.blk.8.norm_ff1.weight" f32 [512]
+source "encoder.blk.8.norm_ff1.bias" f32 [512]
+source "encoder.blk.8.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.8.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.8.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.8.ff1.linear2.bias" f32 [512]
+source "encoder.blk.8.norm_attn.weight" f32 [512]
+source "encoder.blk.8.norm_attn.bias" f32 [512]
+source "encoder.blk.8.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.8.attn.q.bias" f32 [512]
+source "encoder.blk.8.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.8.attn.k.bias" f32 [512]
+source "encoder.blk.8.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.8.attn.v.bias" f32 [512]
+source "encoder.blk.8.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.8.attn.out.bias" f32 [512]
+source "encoder.blk.8.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.8.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.8.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.8.norm_conv.weight" f32 [512]
+source "encoder.blk.8.norm_conv.bias" f32 [512]
+source "encoder.blk.8.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.8.conv.pw1.bias" f32 [1024]
+source "encoder.blk.8.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.8.conv.dw.bias" f32 [512]
+source "encoder.blk.8.conv.bn.scale" f32 [512]
+source "encoder.blk.8.conv.bn.shift" f32 [512]
+source "encoder.blk.8.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.8.conv.pw2.bias" f32 [512]
+source "encoder.blk.8.norm_ff2.weight" f32 [512]
+source "encoder.blk.8.norm_ff2.bias" f32 [512]
+source "encoder.blk.8.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.8.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.8.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.8.ff2.linear2.bias" f32 [512]
+source "encoder.blk.8.norm_out.weight" f32 [512]
+source "encoder.blk.8.norm_out.bias" f32 [512]
+source "encoder.blk.9.norm_ff1.weight" f32 [512]
+source "encoder.blk.9.norm_ff1.bias" f32 [512]
+source "encoder.blk.9.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.9.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.9.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.9.ff1.linear2.bias" f32 [512]
+source "encoder.blk.9.norm_attn.weight" f32 [512]
+source "encoder.blk.9.norm_attn.bias" f32 [512]
+source "encoder.blk.9.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.9.attn.q.bias" f32 [512]
+source "encoder.blk.9.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.9.attn.k.bias" f32 [512]
+source "encoder.blk.9.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.9.attn.v.bias" f32 [512]
+source "encoder.blk.9.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.9.attn.out.bias" f32 [512]
+source "encoder.blk.9.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.9.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.9.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.9.norm_conv.weight" f32 [512]
+source "encoder.blk.9.norm_conv.bias" f32 [512]
+source "encoder.blk.9.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.9.conv.pw1.bias" f32 [1024]
+source "encoder.blk.9.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.9.conv.dw.bias" f32 [512]
+source "encoder.blk.9.conv.bn.scale" f32 [512]
+source "encoder.blk.9.conv.bn.shift" f32 [512]
+source "encoder.blk.9.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.9.conv.pw2.bias" f32 [512]
+source "encoder.blk.9.norm_ff2.weight" f32 [512]
+source "encoder.blk.9.norm_ff2.bias" f32 [512]
+source "encoder.blk.9.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.9.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.9.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.9.ff2.linear2.bias" f32 [512]
+source "encoder.blk.9.norm_out.weight" f32 [512]
+source "encoder.blk.9.norm_out.bias" f32 [512]
+source "encoder.blk.10.norm_ff1.weight" f32 [512]
+source "encoder.blk.10.norm_ff1.bias" f32 [512]
+source "encoder.blk.10.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.10.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.10.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.10.ff1.linear2.bias" f32 [512]
+source "encoder.blk.10.norm_attn.weight" f32 [512]
+source "encoder.blk.10.norm_attn.bias" f32 [512]
+source "encoder.blk.10.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.10.attn.q.bias" f32 [512]
+source "encoder.blk.10.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.10.attn.k.bias" f32 [512]
+source "encoder.blk.10.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.10.attn.v.bias" f32 [512]
+source "encoder.blk.10.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.10.attn.out.bias" f32 [512]
+source "encoder.blk.10.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.10.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.10.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.10.norm_conv.weight" f32 [512]
+source "encoder.blk.10.norm_conv.bias" f32 [512]
+source "encoder.blk.10.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.10.conv.pw1.bias" f32 [1024]
+source "encoder.blk.10.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.10.conv.dw.bias" f32 [512]
+source "encoder.blk.10.conv.bn.scale" f32 [512]
+source "encoder.blk.10.conv.bn.shift" f32 [512]
+source "encoder.blk.10.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.10.conv.pw2.bias" f32 [512]
+source "encoder.blk.10.norm_ff2.weight" f32 [512]
+source "encoder.blk.10.norm_ff2.bias" f32 [512]
+source "encoder.blk.10.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.10.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.10.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.10.ff2.linear2.bias" f32 [512]
+source "encoder.blk.10.norm_out.weight" f32 [512]
+source "encoder.blk.10.norm_out.bias" f32 [512]
+source "encoder.blk.11.norm_ff1.weight" f32 [512]
+source "encoder.blk.11.norm_ff1.bias" f32 [512]
+source "encoder.blk.11.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.11.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.11.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.11.ff1.linear2.bias" f32 [512]
+source "encoder.blk.11.norm_attn.weight" f32 [512]
+source "encoder.blk.11.norm_attn.bias" f32 [512]
+source "encoder.blk.11.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.11.attn.q.bias" f32 [512]
+source "encoder.blk.11.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.11.attn.k.bias" f32 [512]
+source "encoder.blk.11.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.11.attn.v.bias" f32 [512]
+source "encoder.blk.11.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.11.attn.out.bias" f32 [512]
+source "encoder.blk.11.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.11.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.11.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.11.norm_conv.weight" f32 [512]
+source "encoder.blk.11.norm_conv.bias" f32 [512]
+source "encoder.blk.11.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.11.conv.pw1.bias" f32 [1024]
+source "encoder.blk.11.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.11.conv.dw.bias" f32 [512]
+source "encoder.blk.11.conv.bn.scale" f32 [512]
+source "encoder.blk.11.conv.bn.shift" f32 [512]
+source "encoder.blk.11.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.11.conv.pw2.bias" f32 [512]
+source "encoder.blk.11.norm_ff2.weight" f32 [512]
+source "encoder.blk.11.norm_ff2.bias" f32 [512]
+source "encoder.blk.11.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.11.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.11.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.11.ff2.linear2.bias" f32 [512]
+source "encoder.blk.11.norm_out.weight" f32 [512]
+source "encoder.blk.11.norm_out.bias" f32 [512]
+source "encoder.blk.12.norm_ff1.weight" f32 [512]
+source "encoder.blk.12.norm_ff1.bias" f32 [512]
+source "encoder.blk.12.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.12.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.12.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.12.ff1.linear2.bias" f32 [512]
+source "encoder.blk.12.norm_attn.weight" f32 [512]
+source "encoder.blk.12.norm_attn.bias" f32 [512]
+source "encoder.blk.12.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.12.attn.q.bias" f32 [512]
+source "encoder.blk.12.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.12.attn.k.bias" f32 [512]
+source "encoder.blk.12.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.12.attn.v.bias" f32 [512]
+source "encoder.blk.12.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.12.attn.out.bias" f32 [512]
+source "encoder.blk.12.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.12.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.12.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.12.norm_conv.weight" f32 [512]
+source "encoder.blk.12.norm_conv.bias" f32 [512]
+source "encoder.blk.12.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.12.conv.pw1.bias" f32 [1024]
+source "encoder.blk.12.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.12.conv.dw.bias" f32 [512]
+source "encoder.blk.12.conv.bn.scale" f32 [512]
+source "encoder.blk.12.conv.bn.shift" f32 [512]
+source "encoder.blk.12.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.12.conv.pw2.bias" f32 [512]
+source "encoder.blk.12.norm_ff2.weight" f32 [512]
+source "encoder.blk.12.norm_ff2.bias" f32 [512]
+source "encoder.blk.12.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.12.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.12.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.12.ff2.linear2.bias" f32 [512]
+source "encoder.blk.12.norm_out.weight" f32 [512]
+source "encoder.blk.12.norm_out.bias" f32 [512]
+source "encoder.blk.13.norm_ff1.weight" f32 [512]
+source "encoder.blk.13.norm_ff1.bias" f32 [512]
+source "encoder.blk.13.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.13.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.13.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.13.ff1.linear2.bias" f32 [512]
+source "encoder.blk.13.norm_attn.weight" f32 [512]
+source "encoder.blk.13.norm_attn.bias" f32 [512]
+source "encoder.blk.13.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.13.attn.q.bias" f32 [512]
+source "encoder.blk.13.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.13.attn.k.bias" f32 [512]
+source "encoder.blk.13.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.13.attn.v.bias" f32 [512]
+source "encoder.blk.13.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.13.attn.out.bias" f32 [512]
+source "encoder.blk.13.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.13.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.13.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.13.norm_conv.weight" f32 [512]
+source "encoder.blk.13.norm_conv.bias" f32 [512]
+source "encoder.blk.13.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.13.conv.pw1.bias" f32 [1024]
+source "encoder.blk.13.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.13.conv.dw.bias" f32 [512]
+source "encoder.blk.13.conv.bn.scale" f32 [512]
+source "encoder.blk.13.conv.bn.shift" f32 [512]
+source "encoder.blk.13.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.13.conv.pw2.bias" f32 [512]
+source "encoder.blk.13.norm_ff2.weight" f32 [512]
+source "encoder.blk.13.norm_ff2.bias" f32 [512]
+source "encoder.blk.13.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.13.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.13.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.13.ff2.linear2.bias" f32 [512]
+source "encoder.blk.13.norm_out.weight" f32 [512]
+source "encoder.blk.13.norm_out.bias" f32 [512]
+source "encoder.blk.14.norm_ff1.weight" f32 [512]
+source "encoder.blk.14.norm_ff1.bias" f32 [512]
+source "encoder.blk.14.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.14.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.14.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.14.ff1.linear2.bias" f32 [512]
+source "encoder.blk.14.norm_attn.weight" f32 [512]
+source "encoder.blk.14.norm_attn.bias" f32 [512]
+source "encoder.blk.14.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.14.attn.q.bias" f32 [512]
+source "encoder.blk.14.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.14.attn.k.bias" f32 [512]
+source "encoder.blk.14.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.14.attn.v.bias" f32 [512]
+source "encoder.blk.14.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.14.attn.out.bias" f32 [512]
+source "encoder.blk.14.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.14.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.14.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.14.norm_conv.weight" f32 [512]
+source "encoder.blk.14.norm_conv.bias" f32 [512]
+source "encoder.blk.14.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.14.conv.pw1.bias" f32 [1024]
+source "encoder.blk.14.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.14.conv.dw.bias" f32 [512]
+source "encoder.blk.14.conv.bn.scale" f32 [512]
+source "encoder.blk.14.conv.bn.shift" f32 [512]
+source "encoder.blk.14.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.14.conv.pw2.bias" f32 [512]
+source "encoder.blk.14.norm_ff2.weight" f32 [512]
+source "encoder.blk.14.norm_ff2.bias" f32 [512]
+source "encoder.blk.14.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.14.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.14.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.14.ff2.linear2.bias" f32 [512]
+source "encoder.blk.14.norm_out.weight" f32 [512]
+source "encoder.blk.14.norm_out.bias" f32 [512]
+source "encoder.blk.15.norm_ff1.weight" f32 [512]
+source "encoder.blk.15.norm_ff1.bias" f32 [512]
+source "encoder.blk.15.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.15.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.15.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.15.ff1.linear2.bias" f32 [512]
+source "encoder.blk.15.norm_attn.weight" f32 [512]
+source "encoder.blk.15.norm_attn.bias" f32 [512]
+source "encoder.blk.15.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.15.attn.q.bias" f32 [512]
+source "encoder.blk.15.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.15.attn.k.bias" f32 [512]
+source "encoder.blk.15.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.15.attn.v.bias" f32 [512]
+source "encoder.blk.15.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.15.attn.out.bias" f32 [512]
+source "encoder.blk.15.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.15.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.15.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.15.norm_conv.weight" f32 [512]
+source "encoder.blk.15.norm_conv.bias" f32 [512]
+source "encoder.blk.15.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.15.conv.pw1.bias" f32 [1024]
+source "encoder.blk.15.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.15.conv.dw.bias" f32 [512]
+source "encoder.blk.15.conv.bn.scale" f32 [512]
+source "encoder.blk.15.conv.bn.shift" f32 [512]
+source "encoder.blk.15.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.15.conv.pw2.bias" f32 [512]
+source "encoder.blk.15.norm_ff2.weight" f32 [512]
+source "encoder.blk.15.norm_ff2.bias" f32 [512]
+source "encoder.blk.15.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.15.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.15.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.15.ff2.linear2.bias" f32 [512]
+source "encoder.blk.15.norm_out.weight" f32 [512]
+source "encoder.blk.15.norm_out.bias" f32 [512]
+source "encoder.blk.16.norm_ff1.weight" f32 [512]
+source "encoder.blk.16.norm_ff1.bias" f32 [512]
+source "encoder.blk.16.ff1.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.16.ff1.linear1.bias" f32 [2048]
+source "encoder.blk.16.ff1.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.16.ff1.linear2.bias" f32 [512]
+source "encoder.blk.16.norm_attn.weight" f32 [512]
+source "encoder.blk.16.norm_attn.bias" f32 [512]
+source "encoder.blk.16.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.16.attn.q.bias" f32 [512]
+source "encoder.blk.16.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.16.attn.k.bias" f32 [512]
+source "encoder.blk.16.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.16.attn.v.bias" f32 [512]
+source "encoder.blk.16.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.16.attn.out.bias" f32 [512]
+source "encoder.blk.16.attn.pos.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.16.attn.pos_bias_u" f32 [8,64]
+source "encoder.blk.16.attn.pos_bias_v" f32 [8,64]
+source "encoder.blk.16.norm_conv.weight" f32 [512]
+source "encoder.blk.16.norm_conv.bias" f32 [512]
+source "encoder.blk.16.conv.pw1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [1024,512]
+source "encoder.blk.16.conv.pw1.bias" f32 [1024]
+source "encoder.blk.16.conv.dw.weight" f32,f16,bf16 [512,1,9]
+source "encoder.blk.16.conv.dw.bias" f32 [512]
+source "encoder.blk.16.conv.bn.scale" f32 [512]
+source "encoder.blk.16.conv.bn.shift" f32 [512]
+source "encoder.blk.16.conv.pw2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.blk.16.conv.pw2.bias" f32 [512]
+source "encoder.blk.16.norm_ff2.weight" f32 [512]
+source "encoder.blk.16.norm_ff2.bias" f32 [512]
+source "encoder.blk.16.ff2.linear1.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.blk.16.ff2.linear1.bias" f32 [2048]
+source "encoder.blk.16.ff2.linear2.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.blk.16.ff2.linear2.bias" f32 [512]
+source "encoder.blk.16.norm_out.weight" f32 [512]
+source "encoder.blk.16.norm_out.bias" f32 [512]
+source "sortformer.encoder_proj.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,512]
+source "sortformer.encoder_proj.bias" f32 [192]
+source "sortformer.transformer.blk.0.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.0.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.0.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.0.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.0.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.0.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.0.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.0.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.0.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.0.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.0.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.0.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.0.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.0.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.0.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.0.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.1.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.1.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.1.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.1.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.1.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.1.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.1.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.1.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.1.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.1.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.1.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.1.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.1.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.1.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.1.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.1.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.2.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.2.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.2.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.2.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.2.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.2.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.2.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.2.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.2.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.2.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.2.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.2.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.2.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.2.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.2.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.2.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.3.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.3.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.3.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.3.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.3.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.3.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.3.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.3.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.3.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.3.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.3.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.3.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.3.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.3.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.3.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.3.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.4.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.4.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.4.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.4.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.4.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.4.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.4.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.4.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.4.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.4.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.4.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.4.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.4.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.4.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.4.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.4.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.5.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.5.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.5.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.5.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.5.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.5.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.5.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.5.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.5.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.5.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.5.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.5.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.5.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.5.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.5.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.5.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.6.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.6.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.6.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.6.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.6.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.6.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.6.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.6.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.6.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.6.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.6.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.6.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.6.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.6.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.6.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.6.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.7.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.7.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.7.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.7.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.7.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.7.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.7.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.7.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.7.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.7.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.7.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.7.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.7.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.7.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.7.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.7.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.8.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.8.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.8.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.8.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.8.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.8.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.8.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.8.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.8.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.8.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.8.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.8.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.8.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.8.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.8.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.8.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.9.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.9.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.9.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.9.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.9.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.9.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.9.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.9.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.9.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.9.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.9.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.9.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.9.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.9.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.9.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.9.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.10.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.10.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.10.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.10.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.10.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.10.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.10.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.10.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.10.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.10.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.10.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.10.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.10.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.10.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.10.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.10.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.11.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.11.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.11.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.11.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.11.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.11.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.11.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.11.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.11.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.11.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.11.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.11.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.11.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.11.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.11.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.11.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.12.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.12.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.12.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.12.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.12.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.12.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.12.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.12.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.12.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.12.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.12.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.12.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.12.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.12.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.12.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.12.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.13.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.13.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.13.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.13.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.13.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.13.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.13.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.13.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.13.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.13.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.13.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.13.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.13.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.13.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.13.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.13.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.14.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.14.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.14.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.14.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.14.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.14.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.14.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.14.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.14.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.14.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.14.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.14.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.14.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.14.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.14.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.14.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.15.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.15.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.15.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.15.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.15.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.15.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.15.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.15.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.15.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.15.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.15.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.15.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.15.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.15.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.15.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.15.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.16.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.16.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.16.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.16.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.16.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.16.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.16.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.16.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.16.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.16.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.16.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.16.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.16.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.16.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.16.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.16.ln2.bias" f32 [192]
+source "sortformer.transformer.blk.17.attn.q.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.17.attn.q.bias" f32 [192]
+source "sortformer.transformer.blk.17.attn.k.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.17.attn.k.bias" f32 [192]
+source "sortformer.transformer.blk.17.attn.v.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.17.attn.v.bias" f32 [192]
+source "sortformer.transformer.blk.17.attn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.transformer.blk.17.attn.out.bias" f32 [192]
+source "sortformer.transformer.blk.17.ln1.weight" f32 [192]
+source "sortformer.transformer.blk.17.ln1.bias" f32 [192]
+source "sortformer.transformer.blk.17.ffn.in.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [768,192]
+source "sortformer.transformer.blk.17.ffn.in.bias" f32 [768]
+source "sortformer.transformer.blk.17.ffn.out.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,768]
+source "sortformer.transformer.blk.17.ffn.out.bias" f32 [192]
+source "sortformer.transformer.blk.17.ln2.weight" f32 [192]
+source "sortformer.transformer.blk.17.ln2.bias" f32 [192]
+source "sortformer.head.first_hidden_to_hidden.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [192,192]
+source "sortformer.head.first_hidden_to_hidden.bias" f32 [192]
+source "sortformer.head.single_hidden_to_spks.weight" f32,f16,bf16,q8_0,q4_0,q6_k,q5_k,q4_k [4,192]
+source "sortformer.head.single_hidden_to_spks.bias" f32 [4]
+blob 64 fp16 512 f16(zeros([512]))
+blob 1152 fp16 512 f16(ones([512]))
+blob 2240 fp16 512 f16(t("encoder.blk.0.norm_ff1.weight"))
+blob 3328 fp16 512 f16(t("encoder.blk.0.norm_ff1.bias"))
+blob 4416 fp16 1048576 f16(t("encoder.blk.0.ff1.linear1.weight"))
+blob 2101632 fp16 2048 f16(t("encoder.blk.0.ff1.linear1.bias"))
+blob 2105792 fp16 1048576 f16(mul(t("encoder.blk.0.ff1.linear2.weight"), 0.5))
+blob 4203008 fp16 512 f16(mul(t("encoder.blk.0.ff1.linear2.bias"), 0.5))
+blob 4204096 fp16 512 f16(t("encoder.blk.0.norm_attn.weight"))
+blob 4205184 fp16 512 f16(t("encoder.blk.0.norm_attn.bias"))
+blob 4206272 fp16 262144 f16(mul(t("encoder.blk.0.attn.q.weight"), 0.125))
+blob 4730624 fp16 512 f16(mul(t("encoder.blk.0.attn.q.bias"), 0.125))
+blob 4731712 fp16 262144 f16(t("encoder.blk.0.attn.k.weight"))
+blob 5256064 fp16 512 f16(t("encoder.blk.0.attn.k.bias"))
+blob 5257152 fp16 262144 f16(t("encoder.blk.0.attn.v.weight"))
+blob 5781504 fp16 512 f16(t("encoder.blk.0.attn.v.bias"))
+blob 5782592 fp16 512 f16(mul(t("encoder.blk.0.attn.pos_bias_u"), 0.125))
+blob 5783680 fp16 512 f16(mul(t("encoder.blk.0.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos0 = concat(1, slice(t("encoder.blk.0.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.0.attn.pos.weight"), 1, 1, 512, 2))
+blob 5784768 fp16 32768 f16(permute(slice(pos0, 0, 0, 64), [1, 0]))
+# the query-side sine table of the angle-difference identity at this capacity (weight-independent)
+blob 5850368 fp16 104960 f16(lit("phase_sine"))
+# the query-side cosine table of the angle-difference identity at this capacity (weight-independent)
+blob 6060352 fp16 104960 f16(lit("phase_cosine"))
+# the key-side cos/sin table at this capacity, a 1x1 convolution (weight-independent)
+blob 6270336 fp16 209920 f16(lit("phase_keys"))
+blob 6690240 fp16 32768 f16(permute(slice(pos0, 0, 64, 128), [1, 0]))
+blob 6755840 fp16 32768 f16(permute(slice(pos0, 0, 128, 192), [1, 0]))
+blob 6821440 fp16 32768 f16(permute(slice(pos0, 0, 192, 256), [1, 0]))
+blob 6887040 fp16 32768 f16(permute(slice(pos0, 0, 256, 320), [1, 0]))
+blob 6952640 fp16 32768 f16(permute(slice(pos0, 0, 320, 384), [1, 0]))
+blob 7018240 fp16 32768 f16(permute(slice(pos0, 0, 384, 448), [1, 0]))
+blob 7083840 fp16 32768 f16(permute(slice(pos0, 0, 448, 512), [1, 0]))
+blob 7149440 fp16 262144 f16(t("encoder.blk.0.attn.out.weight"))
+blob 7673792 fp16 512 f16(t("encoder.blk.0.attn.out.bias"))
+blob 7674880 fp16 512 f16(t("encoder.blk.0.norm_conv.weight"))
+blob 7675968 fp16 512 f16(t("encoder.blk.0.norm_conv.bias"))
+blob 7677056 fp16 524288 f16(t("encoder.blk.0.conv.pw1.weight"))
+blob 8725696 fp16 1024 f16(t("encoder.blk.0.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 8727808 fp16 4608 f16(mul(t("encoder.blk.0.conv.dw.weight"), reshape(t("encoder.blk.0.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 8737088 fp16 512 f16(add(mul(t("encoder.blk.0.conv.dw.bias"), t("encoder.blk.0.conv.bn.scale")), t("encoder.blk.0.conv.bn.shift")))
+blob 8738176 fp16 262144 f16(t("encoder.blk.0.conv.pw2.weight"))
+blob 9262528 fp16 512 f16(t("encoder.blk.0.conv.pw2.bias"))
+blob 9263616 fp16 512 f16(t("encoder.blk.0.norm_ff2.weight"))
+blob 9264704 fp16 512 f16(t("encoder.blk.0.norm_ff2.bias"))
+blob 9265792 fp16 1048576 f16(t("encoder.blk.0.ff2.linear1.weight"))
+blob 11363008 fp16 2048 f16(t("encoder.blk.0.ff2.linear1.bias"))
+blob 11367168 fp16 1048576 f16(mul(t("encoder.blk.0.ff2.linear2.weight"), 0.5))
+blob 13464384 fp16 512 f16(mul(t("encoder.blk.0.ff2.linear2.bias"), 0.5))
+blob 13465472 fp16 512 f16(t("encoder.blk.0.norm_out.weight"))
+blob 13466560 fp16 512 f16(t("encoder.blk.0.norm_out.bias"))
+blob 13467648 fp16 512 f16(t("encoder.blk.1.norm_ff1.weight"))
+blob 13468736 fp16 512 f16(t("encoder.blk.1.norm_ff1.bias"))
+blob 13469824 fp16 1048576 f16(t("encoder.blk.1.ff1.linear1.weight"))
+blob 15567040 fp16 2048 f16(t("encoder.blk.1.ff1.linear1.bias"))
+blob 15571200 fp16 1048576 f16(mul(t("encoder.blk.1.ff1.linear2.weight"), 0.5))
+blob 17668416 fp16 512 f16(mul(t("encoder.blk.1.ff1.linear2.bias"), 0.5))
+blob 17669504 fp16 512 f16(t("encoder.blk.1.norm_attn.weight"))
+blob 17670592 fp16 512 f16(t("encoder.blk.1.norm_attn.bias"))
+blob 17671680 fp16 262144 f16(mul(t("encoder.blk.1.attn.q.weight"), 0.125))
+blob 18196032 fp16 512 f16(mul(t("encoder.blk.1.attn.q.bias"), 0.125))
+blob 18197120 fp16 262144 f16(t("encoder.blk.1.attn.k.weight"))
+blob 18721472 fp16 512 f16(t("encoder.blk.1.attn.k.bias"))
+blob 18722560 fp16 262144 f16(t("encoder.blk.1.attn.v.weight"))
+blob 19246912 fp16 512 f16(t("encoder.blk.1.attn.v.bias"))
+blob 19248000 fp16 512 f16(mul(t("encoder.blk.1.attn.pos_bias_u"), 0.125))
+blob 19249088 fp16 512 f16(mul(t("encoder.blk.1.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos1 = concat(1, slice(t("encoder.blk.1.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.1.attn.pos.weight"), 1, 1, 512, 2))
+blob 19250176 fp16 32768 f16(permute(slice(pos1, 0, 0, 64), [1, 0]))
+blob 19315776 fp16 32768 f16(permute(slice(pos1, 0, 64, 128), [1, 0]))
+blob 19381376 fp16 32768 f16(permute(slice(pos1, 0, 128, 192), [1, 0]))
+blob 19446976 fp16 32768 f16(permute(slice(pos1, 0, 192, 256), [1, 0]))
+blob 19512576 fp16 32768 f16(permute(slice(pos1, 0, 256, 320), [1, 0]))
+blob 19578176 fp16 32768 f16(permute(slice(pos1, 0, 320, 384), [1, 0]))
+blob 19643776 fp16 32768 f16(permute(slice(pos1, 0, 384, 448), [1, 0]))
+blob 19709376 fp16 32768 f16(permute(slice(pos1, 0, 448, 512), [1, 0]))
+blob 19774976 fp16 262144 f16(t("encoder.blk.1.attn.out.weight"))
+blob 20299328 fp16 512 f16(t("encoder.blk.1.attn.out.bias"))
+blob 20300416 fp16 512 f16(t("encoder.blk.1.norm_conv.weight"))
+blob 20301504 fp16 512 f16(t("encoder.blk.1.norm_conv.bias"))
+blob 20302592 fp16 524288 f16(t("encoder.blk.1.conv.pw1.weight"))
+blob 21351232 fp16 1024 f16(t("encoder.blk.1.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 21353344 fp16 4608 f16(mul(t("encoder.blk.1.conv.dw.weight"), reshape(t("encoder.blk.1.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 21362624 fp16 512 f16(add(mul(t("encoder.blk.1.conv.dw.bias"), t("encoder.blk.1.conv.bn.scale")), t("encoder.blk.1.conv.bn.shift")))
+blob 21363712 fp16 262144 f16(t("encoder.blk.1.conv.pw2.weight"))
+blob 21888064 fp16 512 f16(t("encoder.blk.1.conv.pw2.bias"))
+blob 21889152 fp16 512 f16(t("encoder.blk.1.norm_ff2.weight"))
+blob 21890240 fp16 512 f16(t("encoder.blk.1.norm_ff2.bias"))
+blob 21891328 fp16 1048576 f16(t("encoder.blk.1.ff2.linear1.weight"))
+blob 23988544 fp16 2048 f16(t("encoder.blk.1.ff2.linear1.bias"))
+blob 23992704 fp16 1048576 f16(mul(t("encoder.blk.1.ff2.linear2.weight"), 0.5))
+blob 26089920 fp16 512 f16(mul(t("encoder.blk.1.ff2.linear2.bias"), 0.5))
+blob 26091008 fp16 512 f16(t("encoder.blk.1.norm_out.weight"))
+blob 26092096 fp16 512 f16(t("encoder.blk.1.norm_out.bias"))
+blob 26093184 fp16 512 f16(t("encoder.blk.2.norm_ff1.weight"))
+blob 26094272 fp16 512 f16(t("encoder.blk.2.norm_ff1.bias"))
+blob 26095360 fp16 1048576 f16(t("encoder.blk.2.ff1.linear1.weight"))
+blob 28192576 fp16 2048 f16(t("encoder.blk.2.ff1.linear1.bias"))
+blob 28196736 fp16 1048576 f16(mul(t("encoder.blk.2.ff1.linear2.weight"), 0.5))
+blob 30293952 fp16 512 f16(mul(t("encoder.blk.2.ff1.linear2.bias"), 0.5))
+blob 30295040 fp16 512 f16(t("encoder.blk.2.norm_attn.weight"))
+blob 30296128 fp16 512 f16(t("encoder.blk.2.norm_attn.bias"))
+blob 30297216 fp16 262144 f16(mul(t("encoder.blk.2.attn.q.weight"), 0.125))
+blob 30821568 fp16 512 f16(mul(t("encoder.blk.2.attn.q.bias"), 0.125))
+blob 30822656 fp16 262144 f16(t("encoder.blk.2.attn.k.weight"))
+blob 31347008 fp16 512 f16(t("encoder.blk.2.attn.k.bias"))
+blob 31348096 fp16 262144 f16(t("encoder.blk.2.attn.v.weight"))
+blob 31872448 fp16 512 f16(t("encoder.blk.2.attn.v.bias"))
+blob 31873536 fp16 512 f16(mul(t("encoder.blk.2.attn.pos_bias_u"), 0.125))
+blob 31874624 fp16 512 f16(mul(t("encoder.blk.2.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos2 = concat(1, slice(t("encoder.blk.2.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.2.attn.pos.weight"), 1, 1, 512, 2))
+blob 31875712 fp16 32768 f16(permute(slice(pos2, 0, 0, 64), [1, 0]))
+blob 31941312 fp16 32768 f16(permute(slice(pos2, 0, 64, 128), [1, 0]))
+blob 32006912 fp16 32768 f16(permute(slice(pos2, 0, 128, 192), [1, 0]))
+blob 32072512 fp16 32768 f16(permute(slice(pos2, 0, 192, 256), [1, 0]))
+blob 32138112 fp16 32768 f16(permute(slice(pos2, 0, 256, 320), [1, 0]))
+blob 32203712 fp16 32768 f16(permute(slice(pos2, 0, 320, 384), [1, 0]))
+blob 32269312 fp16 32768 f16(permute(slice(pos2, 0, 384, 448), [1, 0]))
+blob 32334912 fp16 32768 f16(permute(slice(pos2, 0, 448, 512), [1, 0]))
+blob 32400512 fp16 262144 f16(t("encoder.blk.2.attn.out.weight"))
+blob 32924864 fp16 512 f16(t("encoder.blk.2.attn.out.bias"))
+blob 32925952 fp16 512 f16(t("encoder.blk.2.norm_conv.weight"))
+blob 32927040 fp16 512 f16(t("encoder.blk.2.norm_conv.bias"))
+blob 32928128 fp16 524288 f16(t("encoder.blk.2.conv.pw1.weight"))
+blob 33976768 fp16 1024 f16(t("encoder.blk.2.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 33978880 fp16 4608 f16(mul(t("encoder.blk.2.conv.dw.weight"), reshape(t("encoder.blk.2.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 33988160 fp16 512 f16(add(mul(t("encoder.blk.2.conv.dw.bias"), t("encoder.blk.2.conv.bn.scale")), t("encoder.blk.2.conv.bn.shift")))
+blob 33989248 fp16 262144 f16(t("encoder.blk.2.conv.pw2.weight"))
+blob 34513600 fp16 512 f16(t("encoder.blk.2.conv.pw2.bias"))
+blob 34514688 fp16 512 f16(t("encoder.blk.2.norm_ff2.weight"))
+blob 34515776 fp16 512 f16(t("encoder.blk.2.norm_ff2.bias"))
+blob 34516864 fp16 1048576 f16(t("encoder.blk.2.ff2.linear1.weight"))
+blob 36614080 fp16 2048 f16(t("encoder.blk.2.ff2.linear1.bias"))
+blob 36618240 fp16 1048576 f16(mul(t("encoder.blk.2.ff2.linear2.weight"), 0.5))
+blob 38715456 fp16 512 f16(mul(t("encoder.blk.2.ff2.linear2.bias"), 0.5))
+blob 38716544 fp16 512 f16(t("encoder.blk.2.norm_out.weight"))
+blob 38717632 fp16 512 f16(t("encoder.blk.2.norm_out.bias"))
+blob 38718720 fp16 512 f16(t("encoder.blk.3.norm_ff1.weight"))
+blob 38719808 fp16 512 f16(t("encoder.blk.3.norm_ff1.bias"))
+blob 38720896 fp16 1048576 f16(t("encoder.blk.3.ff1.linear1.weight"))
+blob 40818112 fp16 2048 f16(t("encoder.blk.3.ff1.linear1.bias"))
+blob 40822272 fp16 1048576 f16(mul(t("encoder.blk.3.ff1.linear2.weight"), 0.5))
+blob 42919488 fp16 512 f16(mul(t("encoder.blk.3.ff1.linear2.bias"), 0.5))
+blob 42920576 fp16 512 f16(t("encoder.blk.3.norm_attn.weight"))
+blob 42921664 fp16 512 f16(t("encoder.blk.3.norm_attn.bias"))
+blob 42922752 fp16 262144 f16(mul(t("encoder.blk.3.attn.q.weight"), 0.125))
+blob 43447104 fp16 512 f16(mul(t("encoder.blk.3.attn.q.bias"), 0.125))
+blob 43448192 fp16 262144 f16(t("encoder.blk.3.attn.k.weight"))
+blob 43972544 fp16 512 f16(t("encoder.blk.3.attn.k.bias"))
+blob 43973632 fp16 262144 f16(t("encoder.blk.3.attn.v.weight"))
+blob 44497984 fp16 512 f16(t("encoder.blk.3.attn.v.bias"))
+blob 44499072 fp16 512 f16(mul(t("encoder.blk.3.attn.pos_bias_u"), 0.125))
+blob 44500160 fp16 512 f16(mul(t("encoder.blk.3.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos3 = concat(1, slice(t("encoder.blk.3.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.3.attn.pos.weight"), 1, 1, 512, 2))
+blob 44501248 fp16 32768 f16(permute(slice(pos3, 0, 0, 64), [1, 0]))
+blob 44566848 fp16 32768 f16(permute(slice(pos3, 0, 64, 128), [1, 0]))
+blob 44632448 fp16 32768 f16(permute(slice(pos3, 0, 128, 192), [1, 0]))
+blob 44698048 fp16 32768 f16(permute(slice(pos3, 0, 192, 256), [1, 0]))
+blob 44763648 fp16 32768 f16(permute(slice(pos3, 0, 256, 320), [1, 0]))
+blob 44829248 fp16 32768 f16(permute(slice(pos3, 0, 320, 384), [1, 0]))
+blob 44894848 fp16 32768 f16(permute(slice(pos3, 0, 384, 448), [1, 0]))
+blob 44960448 fp16 32768 f16(permute(slice(pos3, 0, 448, 512), [1, 0]))
+blob 45026048 fp16 262144 f16(t("encoder.blk.3.attn.out.weight"))
+blob 45550400 fp16 512 f16(t("encoder.blk.3.attn.out.bias"))
+blob 45551488 fp16 512 f16(t("encoder.blk.3.norm_conv.weight"))
+blob 45552576 fp16 512 f16(t("encoder.blk.3.norm_conv.bias"))
+blob 45553664 fp16 524288 f16(t("encoder.blk.3.conv.pw1.weight"))
+blob 46602304 fp16 1024 f16(t("encoder.blk.3.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 46604416 fp16 4608 f16(mul(t("encoder.blk.3.conv.dw.weight"), reshape(t("encoder.blk.3.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 46613696 fp16 512 f16(add(mul(t("encoder.blk.3.conv.dw.bias"), t("encoder.blk.3.conv.bn.scale")), t("encoder.blk.3.conv.bn.shift")))
+blob 46614784 fp16 262144 f16(t("encoder.blk.3.conv.pw2.weight"))
+blob 47139136 fp16 512 f16(t("encoder.blk.3.conv.pw2.bias"))
+blob 47140224 fp16 512 f16(t("encoder.blk.3.norm_ff2.weight"))
+blob 47141312 fp16 512 f16(t("encoder.blk.3.norm_ff2.bias"))
+blob 47142400 fp16 1048576 f16(t("encoder.blk.3.ff2.linear1.weight"))
+blob 49239616 fp16 2048 f16(t("encoder.blk.3.ff2.linear1.bias"))
+blob 49243776 fp16 1048576 f16(mul(t("encoder.blk.3.ff2.linear2.weight"), 0.5))
+blob 51340992 fp16 512 f16(mul(t("encoder.blk.3.ff2.linear2.bias"), 0.5))
+blob 51342080 fp16 512 f16(t("encoder.blk.3.norm_out.weight"))
+blob 51343168 fp16 512 f16(t("encoder.blk.3.norm_out.bias"))
+blob 51344256 fp16 512 f16(t("encoder.blk.4.norm_ff1.weight"))
+blob 51345344 fp16 512 f16(t("encoder.blk.4.norm_ff1.bias"))
+blob 51346432 fp16 1048576 f16(t("encoder.blk.4.ff1.linear1.weight"))
+blob 53443648 fp16 2048 f16(t("encoder.blk.4.ff1.linear1.bias"))
+blob 53447808 fp16 1048576 f16(mul(t("encoder.blk.4.ff1.linear2.weight"), 0.5))
+blob 55545024 fp16 512 f16(mul(t("encoder.blk.4.ff1.linear2.bias"), 0.5))
+blob 55546112 fp16 512 f16(t("encoder.blk.4.norm_attn.weight"))
+blob 55547200 fp16 512 f16(t("encoder.blk.4.norm_attn.bias"))
+blob 55548288 fp16 262144 f16(mul(t("encoder.blk.4.attn.q.weight"), 0.125))
+blob 56072640 fp16 512 f16(mul(t("encoder.blk.4.attn.q.bias"), 0.125))
+blob 56073728 fp16 262144 f16(t("encoder.blk.4.attn.k.weight"))
+blob 56598080 fp16 512 f16(t("encoder.blk.4.attn.k.bias"))
+blob 56599168 fp16 262144 f16(t("encoder.blk.4.attn.v.weight"))
+blob 57123520 fp16 512 f16(t("encoder.blk.4.attn.v.bias"))
+blob 57124608 fp16 512 f16(mul(t("encoder.blk.4.attn.pos_bias_u"), 0.125))
+blob 57125696 fp16 512 f16(mul(t("encoder.blk.4.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos4 = concat(1, slice(t("encoder.blk.4.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.4.attn.pos.weight"), 1, 1, 512, 2))
+blob 57126784 fp16 32768 f16(permute(slice(pos4, 0, 0, 64), [1, 0]))
+blob 57192384 fp16 32768 f16(permute(slice(pos4, 0, 64, 128), [1, 0]))
+blob 57257984 fp16 32768 f16(permute(slice(pos4, 0, 128, 192), [1, 0]))
+blob 57323584 fp16 32768 f16(permute(slice(pos4, 0, 192, 256), [1, 0]))
+blob 57389184 fp16 32768 f16(permute(slice(pos4, 0, 256, 320), [1, 0]))
+blob 57454784 fp16 32768 f16(permute(slice(pos4, 0, 320, 384), [1, 0]))
+blob 57520384 fp16 32768 f16(permute(slice(pos4, 0, 384, 448), [1, 0]))
+blob 57585984 fp16 32768 f16(permute(slice(pos4, 0, 448, 512), [1, 0]))
+blob 57651584 fp16 262144 f16(t("encoder.blk.4.attn.out.weight"))
+blob 58175936 fp16 512 f16(t("encoder.blk.4.attn.out.bias"))
+blob 58177024 fp16 512 f16(t("encoder.blk.4.norm_conv.weight"))
+blob 58178112 fp16 512 f16(t("encoder.blk.4.norm_conv.bias"))
+blob 58179200 fp16 524288 f16(t("encoder.blk.4.conv.pw1.weight"))
+blob 59227840 fp16 1024 f16(t("encoder.blk.4.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 59229952 fp16 4608 f16(mul(t("encoder.blk.4.conv.dw.weight"), reshape(t("encoder.blk.4.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 59239232 fp16 512 f16(add(mul(t("encoder.blk.4.conv.dw.bias"), t("encoder.blk.4.conv.bn.scale")), t("encoder.blk.4.conv.bn.shift")))
+blob 59240320 fp16 262144 f16(t("encoder.blk.4.conv.pw2.weight"))
+blob 59764672 fp16 512 f16(t("encoder.blk.4.conv.pw2.bias"))
+blob 59765760 fp16 512 f16(t("encoder.blk.4.norm_ff2.weight"))
+blob 59766848 fp16 512 f16(t("encoder.blk.4.norm_ff2.bias"))
+blob 59767936 fp16 1048576 f16(t("encoder.blk.4.ff2.linear1.weight"))
+blob 61865152 fp16 2048 f16(t("encoder.blk.4.ff2.linear1.bias"))
+blob 61869312 fp16 1048576 f16(mul(t("encoder.blk.4.ff2.linear2.weight"), 0.5))
+blob 63966528 fp16 512 f16(mul(t("encoder.blk.4.ff2.linear2.bias"), 0.5))
+blob 63967616 fp16 512 f16(t("encoder.blk.4.norm_out.weight"))
+blob 63968704 fp16 512 f16(t("encoder.blk.4.norm_out.bias"))
+blob 63969792 fp16 512 f16(t("encoder.blk.5.norm_ff1.weight"))
+blob 63970880 fp16 512 f16(t("encoder.blk.5.norm_ff1.bias"))
+blob 63971968 fp16 1048576 f16(t("encoder.blk.5.ff1.linear1.weight"))
+blob 66069184 fp16 2048 f16(t("encoder.blk.5.ff1.linear1.bias"))
+blob 66073344 fp16 1048576 f16(mul(t("encoder.blk.5.ff1.linear2.weight"), 0.5))
+blob 68170560 fp16 512 f16(mul(t("encoder.blk.5.ff1.linear2.bias"), 0.5))
+blob 68171648 fp16 512 f16(t("encoder.blk.5.norm_attn.weight"))
+blob 68172736 fp16 512 f16(t("encoder.blk.5.norm_attn.bias"))
+blob 68173824 fp16 262144 f16(mul(t("encoder.blk.5.attn.q.weight"), 0.125))
+blob 68698176 fp16 512 f16(mul(t("encoder.blk.5.attn.q.bias"), 0.125))
+blob 68699264 fp16 262144 f16(t("encoder.blk.5.attn.k.weight"))
+blob 69223616 fp16 512 f16(t("encoder.blk.5.attn.k.bias"))
+blob 69224704 fp16 262144 f16(t("encoder.blk.5.attn.v.weight"))
+blob 69749056 fp16 512 f16(t("encoder.blk.5.attn.v.bias"))
+blob 69750144 fp16 512 f16(mul(t("encoder.blk.5.attn.pos_bias_u"), 0.125))
+blob 69751232 fp16 512 f16(mul(t("encoder.blk.5.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos5 = concat(1, slice(t("encoder.blk.5.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.5.attn.pos.weight"), 1, 1, 512, 2))
+blob 69752320 fp16 32768 f16(permute(slice(pos5, 0, 0, 64), [1, 0]))
+blob 69817920 fp16 32768 f16(permute(slice(pos5, 0, 64, 128), [1, 0]))
+blob 69883520 fp16 32768 f16(permute(slice(pos5, 0, 128, 192), [1, 0]))
+blob 69949120 fp16 32768 f16(permute(slice(pos5, 0, 192, 256), [1, 0]))
+blob 70014720 fp16 32768 f16(permute(slice(pos5, 0, 256, 320), [1, 0]))
+blob 70080320 fp16 32768 f16(permute(slice(pos5, 0, 320, 384), [1, 0]))
+blob 70145920 fp16 32768 f16(permute(slice(pos5, 0, 384, 448), [1, 0]))
+blob 70211520 fp16 32768 f16(permute(slice(pos5, 0, 448, 512), [1, 0]))
+blob 70277120 fp16 262144 f16(t("encoder.blk.5.attn.out.weight"))
+blob 70801472 fp16 512 f16(t("encoder.blk.5.attn.out.bias"))
+blob 70802560 fp16 512 f16(t("encoder.blk.5.norm_conv.weight"))
+blob 70803648 fp16 512 f16(t("encoder.blk.5.norm_conv.bias"))
+blob 70804736 fp16 524288 f16(t("encoder.blk.5.conv.pw1.weight"))
+blob 71853376 fp16 1024 f16(t("encoder.blk.5.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 71855488 fp16 4608 f16(mul(t("encoder.blk.5.conv.dw.weight"), reshape(t("encoder.blk.5.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 71864768 fp16 512 f16(add(mul(t("encoder.blk.5.conv.dw.bias"), t("encoder.blk.5.conv.bn.scale")), t("encoder.blk.5.conv.bn.shift")))
+blob 71865856 fp16 262144 f16(t("encoder.blk.5.conv.pw2.weight"))
+blob 72390208 fp16 512 f16(t("encoder.blk.5.conv.pw2.bias"))
+blob 72391296 fp16 512 f16(t("encoder.blk.5.norm_ff2.weight"))
+blob 72392384 fp16 512 f16(t("encoder.blk.5.norm_ff2.bias"))
+blob 72393472 fp16 1048576 f16(t("encoder.blk.5.ff2.linear1.weight"))
+blob 74490688 fp16 2048 f16(t("encoder.blk.5.ff2.linear1.bias"))
+blob 74494848 fp16 1048576 f16(mul(t("encoder.blk.5.ff2.linear2.weight"), 0.5))
+blob 76592064 fp16 512 f16(mul(t("encoder.blk.5.ff2.linear2.bias"), 0.5))
+blob 76593152 fp16 512 f16(t("encoder.blk.5.norm_out.weight"))
+blob 76594240 fp16 512 f16(t("encoder.blk.5.norm_out.bias"))
+blob 76595328 fp16 512 f16(t("encoder.blk.6.norm_ff1.weight"))
+blob 76596416 fp16 512 f16(t("encoder.blk.6.norm_ff1.bias"))
+blob 76597504 fp16 1048576 f16(t("encoder.blk.6.ff1.linear1.weight"))
+blob 78694720 fp16 2048 f16(t("encoder.blk.6.ff1.linear1.bias"))
+blob 78698880 fp16 1048576 f16(mul(t("encoder.blk.6.ff1.linear2.weight"), 0.5))
+blob 80796096 fp16 512 f16(mul(t("encoder.blk.6.ff1.linear2.bias"), 0.5))
+blob 80797184 fp16 512 f16(t("encoder.blk.6.norm_attn.weight"))
+blob 80798272 fp16 512 f16(t("encoder.blk.6.norm_attn.bias"))
+blob 80799360 fp16 262144 f16(mul(t("encoder.blk.6.attn.q.weight"), 0.125))
+blob 81323712 fp16 512 f16(mul(t("encoder.blk.6.attn.q.bias"), 0.125))
+blob 81324800 fp16 262144 f16(t("encoder.blk.6.attn.k.weight"))
+blob 81849152 fp16 512 f16(t("encoder.blk.6.attn.k.bias"))
+blob 81850240 fp16 262144 f16(t("encoder.blk.6.attn.v.weight"))
+blob 82374592 fp16 512 f16(t("encoder.blk.6.attn.v.bias"))
+blob 82375680 fp16 512 f16(mul(t("encoder.blk.6.attn.pos_bias_u"), 0.125))
+blob 82376768 fp16 512 f16(mul(t("encoder.blk.6.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos6 = concat(1, slice(t("encoder.blk.6.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.6.attn.pos.weight"), 1, 1, 512, 2))
+blob 82377856 fp16 32768 f16(permute(slice(pos6, 0, 0, 64), [1, 0]))
+blob 82443456 fp16 32768 f16(permute(slice(pos6, 0, 64, 128), [1, 0]))
+blob 82509056 fp16 32768 f16(permute(slice(pos6, 0, 128, 192), [1, 0]))
+blob 82574656 fp16 32768 f16(permute(slice(pos6, 0, 192, 256), [1, 0]))
+blob 82640256 fp16 32768 f16(permute(slice(pos6, 0, 256, 320), [1, 0]))
+blob 82705856 fp16 32768 f16(permute(slice(pos6, 0, 320, 384), [1, 0]))
+blob 82771456 fp16 32768 f16(permute(slice(pos6, 0, 384, 448), [1, 0]))
+blob 82837056 fp16 32768 f16(permute(slice(pos6, 0, 448, 512), [1, 0]))
+blob 82902656 fp16 262144 f16(t("encoder.blk.6.attn.out.weight"))
+blob 83427008 fp16 512 f16(t("encoder.blk.6.attn.out.bias"))
+blob 83428096 fp16 512 f16(t("encoder.blk.6.norm_conv.weight"))
+blob 83429184 fp16 512 f16(t("encoder.blk.6.norm_conv.bias"))
+blob 83430272 fp16 524288 f16(t("encoder.blk.6.conv.pw1.weight"))
+blob 84478912 fp16 1024 f16(t("encoder.blk.6.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 84481024 fp16 4608 f16(mul(t("encoder.blk.6.conv.dw.weight"), reshape(t("encoder.blk.6.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 84490304 fp16 512 f16(add(mul(t("encoder.blk.6.conv.dw.bias"), t("encoder.blk.6.conv.bn.scale")), t("encoder.blk.6.conv.bn.shift")))
+blob 84491392 fp16 262144 f16(t("encoder.blk.6.conv.pw2.weight"))
+blob 85015744 fp16 512 f16(t("encoder.blk.6.conv.pw2.bias"))
+blob 85016832 fp16 512 f16(t("encoder.blk.6.norm_ff2.weight"))
+blob 85017920 fp16 512 f16(t("encoder.blk.6.norm_ff2.bias"))
+blob 85019008 fp16 1048576 f16(t("encoder.blk.6.ff2.linear1.weight"))
+blob 87116224 fp16 2048 f16(t("encoder.blk.6.ff2.linear1.bias"))
+blob 87120384 fp16 1048576 f16(mul(t("encoder.blk.6.ff2.linear2.weight"), 0.5))
+blob 89217600 fp16 512 f16(mul(t("encoder.blk.6.ff2.linear2.bias"), 0.5))
+blob 89218688 fp16 512 f16(t("encoder.blk.6.norm_out.weight"))
+blob 89219776 fp16 512 f16(t("encoder.blk.6.norm_out.bias"))
+blob 89220864 fp16 512 f16(t("encoder.blk.7.norm_ff1.weight"))
+blob 89221952 fp16 512 f16(t("encoder.blk.7.norm_ff1.bias"))
+blob 89223040 fp16 1048576 f16(t("encoder.blk.7.ff1.linear1.weight"))
+blob 91320256 fp16 2048 f16(t("encoder.blk.7.ff1.linear1.bias"))
+blob 91324416 fp16 1048576 f16(mul(t("encoder.blk.7.ff1.linear2.weight"), 0.5))
+blob 93421632 fp16 512 f16(mul(t("encoder.blk.7.ff1.linear2.bias"), 0.5))
+blob 93422720 fp16 512 f16(t("encoder.blk.7.norm_attn.weight"))
+blob 93423808 fp16 512 f16(t("encoder.blk.7.norm_attn.bias"))
+blob 93424896 fp16 262144 f16(mul(t("encoder.blk.7.attn.q.weight"), 0.125))
+blob 93949248 fp16 512 f16(mul(t("encoder.blk.7.attn.q.bias"), 0.125))
+blob 93950336 fp16 262144 f16(t("encoder.blk.7.attn.k.weight"))
+blob 94474688 fp16 512 f16(t("encoder.blk.7.attn.k.bias"))
+blob 94475776 fp16 262144 f16(t("encoder.blk.7.attn.v.weight"))
+blob 95000128 fp16 512 f16(t("encoder.blk.7.attn.v.bias"))
+blob 95001216 fp16 512 f16(mul(t("encoder.blk.7.attn.pos_bias_u"), 0.125))
+blob 95002304 fp16 512 f16(mul(t("encoder.blk.7.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos7 = concat(1, slice(t("encoder.blk.7.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.7.attn.pos.weight"), 1, 1, 512, 2))
+blob 95003392 fp16 32768 f16(permute(slice(pos7, 0, 0, 64), [1, 0]))
+blob 95068992 fp16 32768 f16(permute(slice(pos7, 0, 64, 128), [1, 0]))
+blob 95134592 fp16 32768 f16(permute(slice(pos7, 0, 128, 192), [1, 0]))
+blob 95200192 fp16 32768 f16(permute(slice(pos7, 0, 192, 256), [1, 0]))
+blob 95265792 fp16 32768 f16(permute(slice(pos7, 0, 256, 320), [1, 0]))
+blob 95331392 fp16 32768 f16(permute(slice(pos7, 0, 320, 384), [1, 0]))
+blob 95396992 fp16 32768 f16(permute(slice(pos7, 0, 384, 448), [1, 0]))
+blob 95462592 fp16 32768 f16(permute(slice(pos7, 0, 448, 512), [1, 0]))
+blob 95528192 fp16 262144 f16(t("encoder.blk.7.attn.out.weight"))
+blob 96052544 fp16 512 f16(t("encoder.blk.7.attn.out.bias"))
+blob 96053632 fp16 512 f16(t("encoder.blk.7.norm_conv.weight"))
+blob 96054720 fp16 512 f16(t("encoder.blk.7.norm_conv.bias"))
+blob 96055808 fp16 524288 f16(t("encoder.blk.7.conv.pw1.weight"))
+blob 97104448 fp16 1024 f16(t("encoder.blk.7.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 97106560 fp16 4608 f16(mul(t("encoder.blk.7.conv.dw.weight"), reshape(t("encoder.blk.7.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 97115840 fp16 512 f16(add(mul(t("encoder.blk.7.conv.dw.bias"), t("encoder.blk.7.conv.bn.scale")), t("encoder.blk.7.conv.bn.shift")))
+blob 97116928 fp16 262144 f16(t("encoder.blk.7.conv.pw2.weight"))
+blob 97641280 fp16 512 f16(t("encoder.blk.7.conv.pw2.bias"))
+blob 97642368 fp16 512 f16(t("encoder.blk.7.norm_ff2.weight"))
+blob 97643456 fp16 512 f16(t("encoder.blk.7.norm_ff2.bias"))
+blob 97644544 fp16 1048576 f16(t("encoder.blk.7.ff2.linear1.weight"))
+blob 99741760 fp16 2048 f16(t("encoder.blk.7.ff2.linear1.bias"))
+blob 99745920 fp16 1048576 f16(mul(t("encoder.blk.7.ff2.linear2.weight"), 0.5))
+blob 101843136 fp16 512 f16(mul(t("encoder.blk.7.ff2.linear2.bias"), 0.5))
+blob 101844224 fp16 512 f16(t("encoder.blk.7.norm_out.weight"))
+blob 101845312 fp16 512 f16(t("encoder.blk.7.norm_out.bias"))
+blob 101846400 fp16 512 f16(t("encoder.blk.8.norm_ff1.weight"))
+blob 101847488 fp16 512 f16(t("encoder.blk.8.norm_ff1.bias"))
+blob 101848576 fp16 1048576 f16(t("encoder.blk.8.ff1.linear1.weight"))
+blob 103945792 fp16 2048 f16(t("encoder.blk.8.ff1.linear1.bias"))
+blob 103949952 fp16 1048576 f16(mul(t("encoder.blk.8.ff1.linear2.weight"), 0.5))
+blob 106047168 fp16 512 f16(mul(t("encoder.blk.8.ff1.linear2.bias"), 0.5))
+blob 106048256 fp16 512 f16(t("encoder.blk.8.norm_attn.weight"))
+blob 106049344 fp16 512 f16(t("encoder.blk.8.norm_attn.bias"))
+blob 106050432 fp16 262144 f16(mul(t("encoder.blk.8.attn.q.weight"), 0.125))
+blob 106574784 fp16 512 f16(mul(t("encoder.blk.8.attn.q.bias"), 0.125))
+blob 106575872 fp16 262144 f16(t("encoder.blk.8.attn.k.weight"))
+blob 107100224 fp16 512 f16(t("encoder.blk.8.attn.k.bias"))
+blob 107101312 fp16 262144 f16(t("encoder.blk.8.attn.v.weight"))
+blob 107625664 fp16 512 f16(t("encoder.blk.8.attn.v.bias"))
+blob 107626752 fp16 512 f16(mul(t("encoder.blk.8.attn.pos_bias_u"), 0.125))
+blob 107627840 fp16 512 f16(mul(t("encoder.blk.8.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos8 = concat(1, slice(t("encoder.blk.8.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.8.attn.pos.weight"), 1, 1, 512, 2))
+blob 107628928 fp16 32768 f16(permute(slice(pos8, 0, 0, 64), [1, 0]))
+blob 107694528 fp16 32768 f16(permute(slice(pos8, 0, 64, 128), [1, 0]))
+blob 107760128 fp16 32768 f16(permute(slice(pos8, 0, 128, 192), [1, 0]))
+blob 107825728 fp16 32768 f16(permute(slice(pos8, 0, 192, 256), [1, 0]))
+blob 107891328 fp16 32768 f16(permute(slice(pos8, 0, 256, 320), [1, 0]))
+blob 107956928 fp16 32768 f16(permute(slice(pos8, 0, 320, 384), [1, 0]))
+blob 108022528 fp16 32768 f16(permute(slice(pos8, 0, 384, 448), [1, 0]))
+blob 108088128 fp16 32768 f16(permute(slice(pos8, 0, 448, 512), [1, 0]))
+blob 108153728 fp16 262144 f16(t("encoder.blk.8.attn.out.weight"))
+blob 108678080 fp16 512 f16(t("encoder.blk.8.attn.out.bias"))
+blob 108679168 fp16 512 f16(t("encoder.blk.8.norm_conv.weight"))
+blob 108680256 fp16 512 f16(t("encoder.blk.8.norm_conv.bias"))
+blob 108681344 fp16 524288 f16(t("encoder.blk.8.conv.pw1.weight"))
+blob 109729984 fp16 1024 f16(t("encoder.blk.8.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 109732096 fp16 4608 f16(mul(t("encoder.blk.8.conv.dw.weight"), reshape(t("encoder.blk.8.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 109741376 fp16 512 f16(add(mul(t("encoder.blk.8.conv.dw.bias"), t("encoder.blk.8.conv.bn.scale")), t("encoder.blk.8.conv.bn.shift")))
+blob 109742464 fp16 262144 f16(t("encoder.blk.8.conv.pw2.weight"))
+blob 110266816 fp16 512 f16(t("encoder.blk.8.conv.pw2.bias"))
+blob 110267904 fp16 512 f16(t("encoder.blk.8.norm_ff2.weight"))
+blob 110268992 fp16 512 f16(t("encoder.blk.8.norm_ff2.bias"))
+blob 110270080 fp16 1048576 f16(t("encoder.blk.8.ff2.linear1.weight"))
+blob 112367296 fp16 2048 f16(t("encoder.blk.8.ff2.linear1.bias"))
+blob 112371456 fp16 1048576 f16(mul(t("encoder.blk.8.ff2.linear2.weight"), 0.5))
+blob 114468672 fp16 512 f16(mul(t("encoder.blk.8.ff2.linear2.bias"), 0.5))
+blob 114469760 fp16 512 f16(t("encoder.blk.8.norm_out.weight"))
+blob 114470848 fp16 512 f16(t("encoder.blk.8.norm_out.bias"))
+blob 114471936 fp16 512 f16(t("encoder.blk.9.norm_ff1.weight"))
+blob 114473024 fp16 512 f16(t("encoder.blk.9.norm_ff1.bias"))
+blob 114474112 fp16 1048576 f16(t("encoder.blk.9.ff1.linear1.weight"))
+blob 116571328 fp16 2048 f16(t("encoder.blk.9.ff1.linear1.bias"))
+blob 116575488 fp16 1048576 f16(mul(t("encoder.blk.9.ff1.linear2.weight"), 0.5))
+blob 118672704 fp16 512 f16(mul(t("encoder.blk.9.ff1.linear2.bias"), 0.5))
+blob 118673792 fp16 512 f16(t("encoder.blk.9.norm_attn.weight"))
+blob 118674880 fp16 512 f16(t("encoder.blk.9.norm_attn.bias"))
+blob 118675968 fp16 262144 f16(mul(t("encoder.blk.9.attn.q.weight"), 0.125))
+blob 119200320 fp16 512 f16(mul(t("encoder.blk.9.attn.q.bias"), 0.125))
+blob 119201408 fp16 262144 f16(t("encoder.blk.9.attn.k.weight"))
+blob 119725760 fp16 512 f16(t("encoder.blk.9.attn.k.bias"))
+blob 119726848 fp16 262144 f16(t("encoder.blk.9.attn.v.weight"))
+blob 120251200 fp16 512 f16(t("encoder.blk.9.attn.v.bias"))
+blob 120252288 fp16 512 f16(mul(t("encoder.blk.9.attn.pos_bias_u"), 0.125))
+blob 120253376 fp16 512 f16(mul(t("encoder.blk.9.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos9 = concat(1, slice(t("encoder.blk.9.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.9.attn.pos.weight"), 1, 1, 512, 2))
+blob 120254464 fp16 32768 f16(permute(slice(pos9, 0, 0, 64), [1, 0]))
+blob 120320064 fp16 32768 f16(permute(slice(pos9, 0, 64, 128), [1, 0]))
+blob 120385664 fp16 32768 f16(permute(slice(pos9, 0, 128, 192), [1, 0]))
+blob 120451264 fp16 32768 f16(permute(slice(pos9, 0, 192, 256), [1, 0]))
+blob 120516864 fp16 32768 f16(permute(slice(pos9, 0, 256, 320), [1, 0]))
+blob 120582464 fp16 32768 f16(permute(slice(pos9, 0, 320, 384), [1, 0]))
+blob 120648064 fp16 32768 f16(permute(slice(pos9, 0, 384, 448), [1, 0]))
+blob 120713664 fp16 32768 f16(permute(slice(pos9, 0, 448, 512), [1, 0]))
+blob 120779264 fp16 262144 f16(t("encoder.blk.9.attn.out.weight"))
+blob 121303616 fp16 512 f16(t("encoder.blk.9.attn.out.bias"))
+blob 121304704 fp16 512 f16(t("encoder.blk.9.norm_conv.weight"))
+blob 121305792 fp16 512 f16(t("encoder.blk.9.norm_conv.bias"))
+blob 121306880 fp16 524288 f16(t("encoder.blk.9.conv.pw1.weight"))
+blob 122355520 fp16 1024 f16(t("encoder.blk.9.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 122357632 fp16 4608 f16(mul(t("encoder.blk.9.conv.dw.weight"), reshape(t("encoder.blk.9.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 122366912 fp16 512 f16(add(mul(t("encoder.blk.9.conv.dw.bias"), t("encoder.blk.9.conv.bn.scale")), t("encoder.blk.9.conv.bn.shift")))
+blob 122368000 fp16 262144 f16(t("encoder.blk.9.conv.pw2.weight"))
+blob 122892352 fp16 512 f16(t("encoder.blk.9.conv.pw2.bias"))
+blob 122893440 fp16 512 f16(t("encoder.blk.9.norm_ff2.weight"))
+blob 122894528 fp16 512 f16(t("encoder.blk.9.norm_ff2.bias"))
+blob 122895616 fp16 1048576 f16(t("encoder.blk.9.ff2.linear1.weight"))
+blob 124992832 fp16 2048 f16(t("encoder.blk.9.ff2.linear1.bias"))
+blob 124996992 fp16 1048576 f16(mul(t("encoder.blk.9.ff2.linear2.weight"), 0.5))
+blob 127094208 fp16 512 f16(mul(t("encoder.blk.9.ff2.linear2.bias"), 0.5))
+blob 127095296 fp16 512 f16(t("encoder.blk.9.norm_out.weight"))
+blob 127096384 fp16 512 f16(t("encoder.blk.9.norm_out.bias"))
+blob 127097472 fp16 512 f16(t("encoder.blk.10.norm_ff1.weight"))
+blob 127098560 fp16 512 f16(t("encoder.blk.10.norm_ff1.bias"))
+blob 127099648 fp16 1048576 f16(t("encoder.blk.10.ff1.linear1.weight"))
+blob 129196864 fp16 2048 f16(t("encoder.blk.10.ff1.linear1.bias"))
+blob 129201024 fp16 1048576 f16(mul(t("encoder.blk.10.ff1.linear2.weight"), 0.5))
+blob 131298240 fp16 512 f16(mul(t("encoder.blk.10.ff1.linear2.bias"), 0.5))
+blob 131299328 fp16 512 f16(t("encoder.blk.10.norm_attn.weight"))
+blob 131300416 fp16 512 f16(t("encoder.blk.10.norm_attn.bias"))
+blob 131301504 fp16 262144 f16(mul(t("encoder.blk.10.attn.q.weight"), 0.125))
+blob 131825856 fp16 512 f16(mul(t("encoder.blk.10.attn.q.bias"), 0.125))
+blob 131826944 fp16 262144 f16(t("encoder.blk.10.attn.k.weight"))
+blob 132351296 fp16 512 f16(t("encoder.blk.10.attn.k.bias"))
+blob 132352384 fp16 262144 f16(t("encoder.blk.10.attn.v.weight"))
+blob 132876736 fp16 512 f16(t("encoder.blk.10.attn.v.bias"))
+blob 132877824 fp16 512 f16(mul(t("encoder.blk.10.attn.pos_bias_u"), 0.125))
+blob 132878912 fp16 512 f16(mul(t("encoder.blk.10.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos10 = concat(1, slice(t("encoder.blk.10.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.10.attn.pos.weight"), 1, 1, 512, 2))
+blob 132880000 fp16 32768 f16(permute(slice(pos10, 0, 0, 64), [1, 0]))
+blob 132945600 fp16 32768 f16(permute(slice(pos10, 0, 64, 128), [1, 0]))
+blob 133011200 fp16 32768 f16(permute(slice(pos10, 0, 128, 192), [1, 0]))
+blob 133076800 fp16 32768 f16(permute(slice(pos10, 0, 192, 256), [1, 0]))
+blob 133142400 fp16 32768 f16(permute(slice(pos10, 0, 256, 320), [1, 0]))
+blob 133208000 fp16 32768 f16(permute(slice(pos10, 0, 320, 384), [1, 0]))
+blob 133273600 fp16 32768 f16(permute(slice(pos10, 0, 384, 448), [1, 0]))
+blob 133339200 fp16 32768 f16(permute(slice(pos10, 0, 448, 512), [1, 0]))
+blob 133404800 fp16 262144 f16(t("encoder.blk.10.attn.out.weight"))
+blob 133929152 fp16 512 f16(t("encoder.blk.10.attn.out.bias"))
+blob 133930240 fp16 512 f16(t("encoder.blk.10.norm_conv.weight"))
+blob 133931328 fp16 512 f16(t("encoder.blk.10.norm_conv.bias"))
+blob 133932416 fp16 524288 f16(t("encoder.blk.10.conv.pw1.weight"))
+blob 134981056 fp16 1024 f16(t("encoder.blk.10.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 134983168 fp16 4608 f16(mul(t("encoder.blk.10.conv.dw.weight"), reshape(t("encoder.blk.10.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 134992448 fp16 512 f16(add(mul(t("encoder.blk.10.conv.dw.bias"), t("encoder.blk.10.conv.bn.scale")), t("encoder.blk.10.conv.bn.shift")))
+blob 134993536 fp16 262144 f16(t("encoder.blk.10.conv.pw2.weight"))
+blob 135517888 fp16 512 f16(t("encoder.blk.10.conv.pw2.bias"))
+blob 135518976 fp16 512 f16(t("encoder.blk.10.norm_ff2.weight"))
+blob 135520064 fp16 512 f16(t("encoder.blk.10.norm_ff2.bias"))
+blob 135521152 fp16 1048576 f16(t("encoder.blk.10.ff2.linear1.weight"))
+blob 137618368 fp16 2048 f16(t("encoder.blk.10.ff2.linear1.bias"))
+blob 137622528 fp16 1048576 f16(mul(t("encoder.blk.10.ff2.linear2.weight"), 0.5))
+blob 139719744 fp16 512 f16(mul(t("encoder.blk.10.ff2.linear2.bias"), 0.5))
+blob 139720832 fp16 512 f16(t("encoder.blk.10.norm_out.weight"))
+blob 139721920 fp16 512 f16(t("encoder.blk.10.norm_out.bias"))
+blob 139723008 fp16 512 f16(t("encoder.blk.11.norm_ff1.weight"))
+blob 139724096 fp16 512 f16(t("encoder.blk.11.norm_ff1.bias"))
+blob 139725184 fp16 1048576 f16(t("encoder.blk.11.ff1.linear1.weight"))
+blob 141822400 fp16 2048 f16(t("encoder.blk.11.ff1.linear1.bias"))
+blob 141826560 fp16 1048576 f16(mul(t("encoder.blk.11.ff1.linear2.weight"), 0.5))
+blob 143923776 fp16 512 f16(mul(t("encoder.blk.11.ff1.linear2.bias"), 0.5))
+blob 143924864 fp16 512 f16(t("encoder.blk.11.norm_attn.weight"))
+blob 143925952 fp16 512 f16(t("encoder.blk.11.norm_attn.bias"))
+blob 143927040 fp16 262144 f16(mul(t("encoder.blk.11.attn.q.weight"), 0.125))
+blob 144451392 fp16 512 f16(mul(t("encoder.blk.11.attn.q.bias"), 0.125))
+blob 144452480 fp16 262144 f16(t("encoder.blk.11.attn.k.weight"))
+blob 144976832 fp16 512 f16(t("encoder.blk.11.attn.k.bias"))
+blob 144977920 fp16 262144 f16(t("encoder.blk.11.attn.v.weight"))
+blob 145502272 fp16 512 f16(t("encoder.blk.11.attn.v.bias"))
+blob 145503360 fp16 512 f16(mul(t("encoder.blk.11.attn.pos_bias_u"), 0.125))
+blob 145504448 fp16 512 f16(mul(t("encoder.blk.11.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos11 = concat(1, slice(t("encoder.blk.11.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.11.attn.pos.weight"), 1, 1, 512, 2))
+blob 145505536 fp16 32768 f16(permute(slice(pos11, 0, 0, 64), [1, 0]))
+blob 145571136 fp16 32768 f16(permute(slice(pos11, 0, 64, 128), [1, 0]))
+blob 145636736 fp16 32768 f16(permute(slice(pos11, 0, 128, 192), [1, 0]))
+blob 145702336 fp16 32768 f16(permute(slice(pos11, 0, 192, 256), [1, 0]))
+blob 145767936 fp16 32768 f16(permute(slice(pos11, 0, 256, 320), [1, 0]))
+blob 145833536 fp16 32768 f16(permute(slice(pos11, 0, 320, 384), [1, 0]))
+blob 145899136 fp16 32768 f16(permute(slice(pos11, 0, 384, 448), [1, 0]))
+blob 145964736 fp16 32768 f16(permute(slice(pos11, 0, 448, 512), [1, 0]))
+blob 146030336 fp16 262144 f16(t("encoder.blk.11.attn.out.weight"))
+blob 146554688 fp16 512 f16(t("encoder.blk.11.attn.out.bias"))
+blob 146555776 fp16 512 f16(t("encoder.blk.11.norm_conv.weight"))
+blob 146556864 fp16 512 f16(t("encoder.blk.11.norm_conv.bias"))
+blob 146557952 fp16 524288 f16(t("encoder.blk.11.conv.pw1.weight"))
+blob 147606592 fp16 1024 f16(t("encoder.blk.11.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 147608704 fp16 4608 f16(mul(t("encoder.blk.11.conv.dw.weight"), reshape(t("encoder.blk.11.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 147617984 fp16 512 f16(add(mul(t("encoder.blk.11.conv.dw.bias"), t("encoder.blk.11.conv.bn.scale")), t("encoder.blk.11.conv.bn.shift")))
+blob 147619072 fp16 262144 f16(t("encoder.blk.11.conv.pw2.weight"))
+blob 148143424 fp16 512 f16(t("encoder.blk.11.conv.pw2.bias"))
+blob 148144512 fp16 512 f16(t("encoder.blk.11.norm_ff2.weight"))
+blob 148145600 fp16 512 f16(t("encoder.blk.11.norm_ff2.bias"))
+blob 148146688 fp16 1048576 f16(t("encoder.blk.11.ff2.linear1.weight"))
+blob 150243904 fp16 2048 f16(t("encoder.blk.11.ff2.linear1.bias"))
+blob 150248064 fp16 1048576 f16(mul(t("encoder.blk.11.ff2.linear2.weight"), 0.5))
+blob 152345280 fp16 512 f16(mul(t("encoder.blk.11.ff2.linear2.bias"), 0.5))
+blob 152346368 fp16 512 f16(t("encoder.blk.11.norm_out.weight"))
+blob 152347456 fp16 512 f16(t("encoder.blk.11.norm_out.bias"))
+blob 152348544 fp16 512 f16(t("encoder.blk.12.norm_ff1.weight"))
+blob 152349632 fp16 512 f16(t("encoder.blk.12.norm_ff1.bias"))
+blob 152350720 fp16 1048576 f16(t("encoder.blk.12.ff1.linear1.weight"))
+blob 154447936 fp16 2048 f16(t("encoder.blk.12.ff1.linear1.bias"))
+blob 154452096 fp16 1048576 f16(mul(t("encoder.blk.12.ff1.linear2.weight"), 0.5))
+blob 156549312 fp16 512 f16(mul(t("encoder.blk.12.ff1.linear2.bias"), 0.5))
+blob 156550400 fp16 512 f16(t("encoder.blk.12.norm_attn.weight"))
+blob 156551488 fp16 512 f16(t("encoder.blk.12.norm_attn.bias"))
+blob 156552576 fp16 262144 f16(mul(t("encoder.blk.12.attn.q.weight"), 0.125))
+blob 157076928 fp16 512 f16(mul(t("encoder.blk.12.attn.q.bias"), 0.125))
+blob 157078016 fp16 262144 f16(t("encoder.blk.12.attn.k.weight"))
+blob 157602368 fp16 512 f16(t("encoder.blk.12.attn.k.bias"))
+blob 157603456 fp16 262144 f16(t("encoder.blk.12.attn.v.weight"))
+blob 158127808 fp16 512 f16(t("encoder.blk.12.attn.v.bias"))
+blob 158128896 fp16 512 f16(mul(t("encoder.blk.12.attn.pos_bias_u"), 0.125))
+blob 158129984 fp16 512 f16(mul(t("encoder.blk.12.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos12 = concat(1, slice(t("encoder.blk.12.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.12.attn.pos.weight"), 1, 1, 512, 2))
+blob 158131072 fp16 32768 f16(permute(slice(pos12, 0, 0, 64), [1, 0]))
+blob 158196672 fp16 32768 f16(permute(slice(pos12, 0, 64, 128), [1, 0]))
+blob 158262272 fp16 32768 f16(permute(slice(pos12, 0, 128, 192), [1, 0]))
+blob 158327872 fp16 32768 f16(permute(slice(pos12, 0, 192, 256), [1, 0]))
+blob 158393472 fp16 32768 f16(permute(slice(pos12, 0, 256, 320), [1, 0]))
+blob 158459072 fp16 32768 f16(permute(slice(pos12, 0, 320, 384), [1, 0]))
+blob 158524672 fp16 32768 f16(permute(slice(pos12, 0, 384, 448), [1, 0]))
+blob 158590272 fp16 32768 f16(permute(slice(pos12, 0, 448, 512), [1, 0]))
+blob 158655872 fp16 262144 f16(t("encoder.blk.12.attn.out.weight"))
+blob 159180224 fp16 512 f16(t("encoder.blk.12.attn.out.bias"))
+blob 159181312 fp16 512 f16(t("encoder.blk.12.norm_conv.weight"))
+blob 159182400 fp16 512 f16(t("encoder.blk.12.norm_conv.bias"))
+blob 159183488 fp16 524288 f16(t("encoder.blk.12.conv.pw1.weight"))
+blob 160232128 fp16 1024 f16(t("encoder.blk.12.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 160234240 fp16 4608 f16(mul(t("encoder.blk.12.conv.dw.weight"), reshape(t("encoder.blk.12.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 160243520 fp16 512 f16(add(mul(t("encoder.blk.12.conv.dw.bias"), t("encoder.blk.12.conv.bn.scale")), t("encoder.blk.12.conv.bn.shift")))
+blob 160244608 fp16 262144 f16(t("encoder.blk.12.conv.pw2.weight"))
+blob 160768960 fp16 512 f16(t("encoder.blk.12.conv.pw2.bias"))
+blob 160770048 fp16 512 f16(t("encoder.blk.12.norm_ff2.weight"))
+blob 160771136 fp16 512 f16(t("encoder.blk.12.norm_ff2.bias"))
+blob 160772224 fp16 1048576 f16(t("encoder.blk.12.ff2.linear1.weight"))
+blob 162869440 fp16 2048 f16(t("encoder.blk.12.ff2.linear1.bias"))
+blob 162873600 fp16 1048576 f16(mul(t("encoder.blk.12.ff2.linear2.weight"), 0.5))
+blob 164970816 fp16 512 f16(mul(t("encoder.blk.12.ff2.linear2.bias"), 0.5))
+blob 164971904 fp16 512 f16(t("encoder.blk.12.norm_out.weight"))
+blob 164972992 fp16 512 f16(t("encoder.blk.12.norm_out.bias"))
+blob 164974080 fp16 512 f16(t("encoder.blk.13.norm_ff1.weight"))
+blob 164975168 fp16 512 f16(t("encoder.blk.13.norm_ff1.bias"))
+blob 164976256 fp16 1048576 f16(t("encoder.blk.13.ff1.linear1.weight"))
+blob 167073472 fp16 2048 f16(t("encoder.blk.13.ff1.linear1.bias"))
+blob 167077632 fp16 1048576 f16(mul(t("encoder.blk.13.ff1.linear2.weight"), 0.5))
+blob 169174848 fp16 512 f16(mul(t("encoder.blk.13.ff1.linear2.bias"), 0.5))
+blob 169175936 fp16 512 f16(t("encoder.blk.13.norm_attn.weight"))
+blob 169177024 fp16 512 f16(t("encoder.blk.13.norm_attn.bias"))
+blob 169178112 fp16 262144 f16(mul(t("encoder.blk.13.attn.q.weight"), 0.125))
+blob 169702464 fp16 512 f16(mul(t("encoder.blk.13.attn.q.bias"), 0.125))
+blob 169703552 fp16 262144 f16(t("encoder.blk.13.attn.k.weight"))
+blob 170227904 fp16 512 f16(t("encoder.blk.13.attn.k.bias"))
+blob 170228992 fp16 262144 f16(t("encoder.blk.13.attn.v.weight"))
+blob 170753344 fp16 512 f16(t("encoder.blk.13.attn.v.bias"))
+blob 170754432 fp16 512 f16(mul(t("encoder.blk.13.attn.pos_bias_u"), 0.125))
+blob 170755520 fp16 512 f16(mul(t("encoder.blk.13.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos13 = concat(1, slice(t("encoder.blk.13.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.13.attn.pos.weight"), 1, 1, 512, 2))
+blob 170756608 fp16 32768 f16(permute(slice(pos13, 0, 0, 64), [1, 0]))
+blob 170822208 fp16 32768 f16(permute(slice(pos13, 0, 64, 128), [1, 0]))
+blob 170887808 fp16 32768 f16(permute(slice(pos13, 0, 128, 192), [1, 0]))
+blob 170953408 fp16 32768 f16(permute(slice(pos13, 0, 192, 256), [1, 0]))
+blob 171019008 fp16 32768 f16(permute(slice(pos13, 0, 256, 320), [1, 0]))
+blob 171084608 fp16 32768 f16(permute(slice(pos13, 0, 320, 384), [1, 0]))
+blob 171150208 fp16 32768 f16(permute(slice(pos13, 0, 384, 448), [1, 0]))
+blob 171215808 fp16 32768 f16(permute(slice(pos13, 0, 448, 512), [1, 0]))
+blob 171281408 fp16 262144 f16(t("encoder.blk.13.attn.out.weight"))
+blob 171805760 fp16 512 f16(t("encoder.blk.13.attn.out.bias"))
+blob 171806848 fp16 512 f16(t("encoder.blk.13.norm_conv.weight"))
+blob 171807936 fp16 512 f16(t("encoder.blk.13.norm_conv.bias"))
+blob 171809024 fp16 524288 f16(t("encoder.blk.13.conv.pw1.weight"))
+blob 172857664 fp16 1024 f16(t("encoder.blk.13.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 172859776 fp16 4608 f16(mul(t("encoder.blk.13.conv.dw.weight"), reshape(t("encoder.blk.13.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 172869056 fp16 512 f16(add(mul(t("encoder.blk.13.conv.dw.bias"), t("encoder.blk.13.conv.bn.scale")), t("encoder.blk.13.conv.bn.shift")))
+blob 172870144 fp16 262144 f16(t("encoder.blk.13.conv.pw2.weight"))
+blob 173394496 fp16 512 f16(t("encoder.blk.13.conv.pw2.bias"))
+blob 173395584 fp16 512 f16(t("encoder.blk.13.norm_ff2.weight"))
+blob 173396672 fp16 512 f16(t("encoder.blk.13.norm_ff2.bias"))
+blob 173397760 fp16 1048576 f16(t("encoder.blk.13.ff2.linear1.weight"))
+blob 175494976 fp16 2048 f16(t("encoder.blk.13.ff2.linear1.bias"))
+blob 175499136 fp16 1048576 f16(mul(t("encoder.blk.13.ff2.linear2.weight"), 0.5))
+blob 177596352 fp16 512 f16(mul(t("encoder.blk.13.ff2.linear2.bias"), 0.5))
+blob 177597440 fp16 512 f16(t("encoder.blk.13.norm_out.weight"))
+blob 177598528 fp16 512 f16(t("encoder.blk.13.norm_out.bias"))
+blob 177599616 fp16 512 f16(t("encoder.blk.14.norm_ff1.weight"))
+blob 177600704 fp16 512 f16(t("encoder.blk.14.norm_ff1.bias"))
+blob 177601792 fp16 1048576 f16(t("encoder.blk.14.ff1.linear1.weight"))
+blob 179699008 fp16 2048 f16(t("encoder.blk.14.ff1.linear1.bias"))
+blob 179703168 fp16 1048576 f16(mul(t("encoder.blk.14.ff1.linear2.weight"), 0.5))
+blob 181800384 fp16 512 f16(mul(t("encoder.blk.14.ff1.linear2.bias"), 0.5))
+blob 181801472 fp16 512 f16(t("encoder.blk.14.norm_attn.weight"))
+blob 181802560 fp16 512 f16(t("encoder.blk.14.norm_attn.bias"))
+blob 181803648 fp16 262144 f16(mul(t("encoder.blk.14.attn.q.weight"), 0.125))
+blob 182328000 fp16 512 f16(mul(t("encoder.blk.14.attn.q.bias"), 0.125))
+blob 182329088 fp16 262144 f16(t("encoder.blk.14.attn.k.weight"))
+blob 182853440 fp16 512 f16(t("encoder.blk.14.attn.k.bias"))
+blob 182854528 fp16 262144 f16(t("encoder.blk.14.attn.v.weight"))
+blob 183378880 fp16 512 f16(t("encoder.blk.14.attn.v.bias"))
+blob 183379968 fp16 512 f16(mul(t("encoder.blk.14.attn.pos_bias_u"), 0.125))
+blob 183381056 fp16 512 f16(mul(t("encoder.blk.14.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos14 = concat(1, slice(t("encoder.blk.14.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.14.attn.pos.weight"), 1, 1, 512, 2))
+blob 183382144 fp16 32768 f16(permute(slice(pos14, 0, 0, 64), [1, 0]))
+blob 183447744 fp16 32768 f16(permute(slice(pos14, 0, 64, 128), [1, 0]))
+blob 183513344 fp16 32768 f16(permute(slice(pos14, 0, 128, 192), [1, 0]))
+blob 183578944 fp16 32768 f16(permute(slice(pos14, 0, 192, 256), [1, 0]))
+blob 183644544 fp16 32768 f16(permute(slice(pos14, 0, 256, 320), [1, 0]))
+blob 183710144 fp16 32768 f16(permute(slice(pos14, 0, 320, 384), [1, 0]))
+blob 183775744 fp16 32768 f16(permute(slice(pos14, 0, 384, 448), [1, 0]))
+blob 183841344 fp16 32768 f16(permute(slice(pos14, 0, 448, 512), [1, 0]))
+blob 183906944 fp16 262144 f16(t("encoder.blk.14.attn.out.weight"))
+blob 184431296 fp16 512 f16(t("encoder.blk.14.attn.out.bias"))
+blob 184432384 fp16 512 f16(t("encoder.blk.14.norm_conv.weight"))
+blob 184433472 fp16 512 f16(t("encoder.blk.14.norm_conv.bias"))
+blob 184434560 fp16 524288 f16(t("encoder.blk.14.conv.pw1.weight"))
+blob 185483200 fp16 1024 f16(t("encoder.blk.14.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 185485312 fp16 4608 f16(mul(t("encoder.blk.14.conv.dw.weight"), reshape(t("encoder.blk.14.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 185494592 fp16 512 f16(add(mul(t("encoder.blk.14.conv.dw.bias"), t("encoder.blk.14.conv.bn.scale")), t("encoder.blk.14.conv.bn.shift")))
+blob 185495680 fp16 262144 f16(t("encoder.blk.14.conv.pw2.weight"))
+blob 186020032 fp16 512 f16(t("encoder.blk.14.conv.pw2.bias"))
+blob 186021120 fp16 512 f16(t("encoder.blk.14.norm_ff2.weight"))
+blob 186022208 fp16 512 f16(t("encoder.blk.14.norm_ff2.bias"))
+blob 186023296 fp16 1048576 f16(t("encoder.blk.14.ff2.linear1.weight"))
+blob 188120512 fp16 2048 f16(t("encoder.blk.14.ff2.linear1.bias"))
+blob 188124672 fp16 1048576 f16(mul(t("encoder.blk.14.ff2.linear2.weight"), 0.5))
+blob 190221888 fp16 512 f16(mul(t("encoder.blk.14.ff2.linear2.bias"), 0.5))
+blob 190222976 fp16 512 f16(t("encoder.blk.14.norm_out.weight"))
+blob 190224064 fp16 512 f16(t("encoder.blk.14.norm_out.bias"))
+blob 190225152 fp16 512 f16(t("encoder.blk.15.norm_ff1.weight"))
+blob 190226240 fp16 512 f16(t("encoder.blk.15.norm_ff1.bias"))
+blob 190227328 fp16 1048576 f16(t("encoder.blk.15.ff1.linear1.weight"))
+blob 192324544 fp16 2048 f16(t("encoder.blk.15.ff1.linear1.bias"))
+blob 192328704 fp16 1048576 f16(mul(t("encoder.blk.15.ff1.linear2.weight"), 0.5))
+blob 194425920 fp16 512 f16(mul(t("encoder.blk.15.ff1.linear2.bias"), 0.5))
+blob 194427008 fp16 512 f16(t("encoder.blk.15.norm_attn.weight"))
+blob 194428096 fp16 512 f16(t("encoder.blk.15.norm_attn.bias"))
+blob 194429184 fp16 262144 f16(mul(t("encoder.blk.15.attn.q.weight"), 0.125))
+blob 194953536 fp16 512 f16(mul(t("encoder.blk.15.attn.q.bias"), 0.125))
+blob 194954624 fp16 262144 f16(t("encoder.blk.15.attn.k.weight"))
+blob 195478976 fp16 512 f16(t("encoder.blk.15.attn.k.bias"))
+blob 195480064 fp16 262144 f16(t("encoder.blk.15.attn.v.weight"))
+blob 196004416 fp16 512 f16(t("encoder.blk.15.attn.v.bias"))
+blob 196005504 fp16 512 f16(mul(t("encoder.blk.15.attn.pos_bias_u"), 0.125))
+blob 196006592 fp16 512 f16(mul(t("encoder.blk.15.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos15 = concat(1, slice(t("encoder.blk.15.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.15.attn.pos.weight"), 1, 1, 512, 2))
+blob 196007680 fp16 32768 f16(permute(slice(pos15, 0, 0, 64), [1, 0]))
+blob 196073280 fp16 32768 f16(permute(slice(pos15, 0, 64, 128), [1, 0]))
+blob 196138880 fp16 32768 f16(permute(slice(pos15, 0, 128, 192), [1, 0]))
+blob 196204480 fp16 32768 f16(permute(slice(pos15, 0, 192, 256), [1, 0]))
+blob 196270080 fp16 32768 f16(permute(slice(pos15, 0, 256, 320), [1, 0]))
+blob 196335680 fp16 32768 f16(permute(slice(pos15, 0, 320, 384), [1, 0]))
+blob 196401280 fp16 32768 f16(permute(slice(pos15, 0, 384, 448), [1, 0]))
+blob 196466880 fp16 32768 f16(permute(slice(pos15, 0, 448, 512), [1, 0]))
+blob 196532480 fp16 262144 f16(t("encoder.blk.15.attn.out.weight"))
+blob 197056832 fp16 512 f16(t("encoder.blk.15.attn.out.bias"))
+blob 197057920 fp16 512 f16(t("encoder.blk.15.norm_conv.weight"))
+blob 197059008 fp16 512 f16(t("encoder.blk.15.norm_conv.bias"))
+blob 197060096 fp16 524288 f16(t("encoder.blk.15.conv.pw1.weight"))
+blob 198108736 fp16 1024 f16(t("encoder.blk.15.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 198110848 fp16 4608 f16(mul(t("encoder.blk.15.conv.dw.weight"), reshape(t("encoder.blk.15.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 198120128 fp16 512 f16(add(mul(t("encoder.blk.15.conv.dw.bias"), t("encoder.blk.15.conv.bn.scale")), t("encoder.blk.15.conv.bn.shift")))
+blob 198121216 fp16 262144 f16(t("encoder.blk.15.conv.pw2.weight"))
+blob 198645568 fp16 512 f16(t("encoder.blk.15.conv.pw2.bias"))
+blob 198646656 fp16 512 f16(t("encoder.blk.15.norm_ff2.weight"))
+blob 198647744 fp16 512 f16(t("encoder.blk.15.norm_ff2.bias"))
+blob 198648832 fp16 1048576 f16(t("encoder.blk.15.ff2.linear1.weight"))
+blob 200746048 fp16 2048 f16(t("encoder.blk.15.ff2.linear1.bias"))
+blob 200750208 fp16 1048576 f16(mul(t("encoder.blk.15.ff2.linear2.weight"), 0.5))
+blob 202847424 fp16 512 f16(mul(t("encoder.blk.15.ff2.linear2.bias"), 0.5))
+blob 202848512 fp16 512 f16(t("encoder.blk.15.norm_out.weight"))
+blob 202849600 fp16 512 f16(t("encoder.blk.15.norm_out.bias"))
+blob 202850688 fp16 512 f16(t("encoder.blk.16.norm_ff1.weight"))
+blob 202851776 fp16 512 f16(t("encoder.blk.16.norm_ff1.bias"))
+blob 202852864 fp16 1048576 f16(t("encoder.blk.16.ff1.linear1.weight"))
+blob 204950080 fp16 2048 f16(t("encoder.blk.16.ff1.linear1.bias"))
+blob 204954240 fp16 1048576 f16(mul(t("encoder.blk.16.ff1.linear2.weight"), 0.5))
+blob 207051456 fp16 512 f16(mul(t("encoder.blk.16.ff1.linear2.bias"), 0.5))
+blob 207052544 fp16 512 f16(t("encoder.blk.16.norm_attn.weight"))
+blob 207053632 fp16 512 f16(t("encoder.blk.16.norm_attn.bias"))
+blob 207054720 fp16 262144 f16(mul(t("encoder.blk.16.attn.q.weight"), 0.125))
+blob 207579072 fp16 512 f16(mul(t("encoder.blk.16.attn.q.bias"), 0.125))
+blob 207580160 fp16 262144 f16(t("encoder.blk.16.attn.k.weight"))
+blob 208104512 fp16 512 f16(t("encoder.blk.16.attn.k.bias"))
+blob 208105600 fp16 262144 f16(t("encoder.blk.16.attn.v.weight"))
+blob 208629952 fp16 512 f16(t("encoder.blk.16.attn.v.bias"))
+blob 208631040 fp16 512 f16(mul(t("encoder.blk.16.attn.pos_bias_u"), 0.125))
+blob 208632128 fp16 512 f16(mul(t("encoder.blk.16.attn.pos_bias_v"), 0.125))
+# the relative-position projection with its input columns in phase order (even, then odd),
+# one 1x1 convolution per head (exporter head_projection)
+let pos16 = concat(1, slice(t("encoder.blk.16.attn.pos.weight"), 1, 0, 512, 2), slice(t("encoder.blk.16.attn.pos.weight"), 1, 1, 512, 2))
+blob 208633216 fp16 32768 f16(permute(slice(pos16, 0, 0, 64), [1, 0]))
+blob 208698816 fp16 32768 f16(permute(slice(pos16, 0, 64, 128), [1, 0]))
+blob 208764416 fp16 32768 f16(permute(slice(pos16, 0, 128, 192), [1, 0]))
+blob 208830016 fp16 32768 f16(permute(slice(pos16, 0, 192, 256), [1, 0]))
+blob 208895616 fp16 32768 f16(permute(slice(pos16, 0, 256, 320), [1, 0]))
+blob 208961216 fp16 32768 f16(permute(slice(pos16, 0, 320, 384), [1, 0]))
+blob 209026816 fp16 32768 f16(permute(slice(pos16, 0, 384, 448), [1, 0]))
+blob 209092416 fp16 32768 f16(permute(slice(pos16, 0, 448, 512), [1, 0]))
+blob 209158016 fp16 262144 f16(t("encoder.blk.16.attn.out.weight"))
+blob 209682368 fp16 512 f16(t("encoder.blk.16.attn.out.bias"))
+blob 209683456 fp16 512 f16(t("encoder.blk.16.norm_conv.weight"))
+blob 209684544 fp16 512 f16(t("encoder.blk.16.norm_conv.bias"))
+blob 209685632 fp16 524288 f16(t("encoder.blk.16.conv.pw1.weight"))
+blob 210734272 fp16 1024 f16(t("encoder.blk.16.conv.pw1.bias"))
+# the depthwise convolution with the batch-norm scale folded in
+blob 210736384 fp16 4608 f16(mul(t("encoder.blk.16.conv.dw.weight"), reshape(t("encoder.blk.16.conv.bn.scale"), [512, 1, 1])))
+# its bias with the batch-norm scale and shift folded in
+blob 210745664 fp16 512 f16(add(mul(t("encoder.blk.16.conv.dw.bias"), t("encoder.blk.16.conv.bn.scale")), t("encoder.blk.16.conv.bn.shift")))
+blob 210746752 fp16 262144 f16(t("encoder.blk.16.conv.pw2.weight"))
+blob 211271104 fp16 512 f16(t("encoder.blk.16.conv.pw2.bias"))
+blob 211272192 fp16 512 f16(t("encoder.blk.16.norm_ff2.weight"))
+blob 211273280 fp16 512 f16(t("encoder.blk.16.norm_ff2.bias"))
+blob 211274368 fp16 1048576 f16(t("encoder.blk.16.ff2.linear1.weight"))
+blob 213371584 fp16 2048 f16(t("encoder.blk.16.ff2.linear1.bias"))
+blob 213375744 fp16 1048576 f16(mul(t("encoder.blk.16.ff2.linear2.weight"), 0.5))
+blob 215472960 fp16 512 f16(mul(t("encoder.blk.16.ff2.linear2.bias"), 0.5))
+blob 215474048 fp16 512 f16(t("encoder.blk.16.norm_out.weight"))
+blob 215475136 fp16 512 f16(t("encoder.blk.16.norm_out.bias"))
+blob 215476224 fp16 98304 f16(t("sortformer.encoder_proj.weight"))
+blob 215672896 fp16 192 f16(t("sortformer.encoder_proj.bias"))
+blob 215673344 fp16 36864 f16(mul(t("sortformer.transformer.blk.0.attn.q.weight"), 0.20412415266036987))
+blob 215747136 fp16 192 f16(mul(t("sortformer.transformer.blk.0.attn.q.bias"), 0.20412415266036987))
+blob 215747584 fp16 36864 f16(t("sortformer.transformer.blk.0.attn.k.weight"))
+blob 215821376 fp16 192 f16(t("sortformer.transformer.blk.0.attn.k.bias"))
+blob 215821824 fp16 36864 f16(t("sortformer.transformer.blk.0.attn.v.weight"))
+blob 215895616 fp16 192 f16(t("sortformer.transformer.blk.0.attn.v.bias"))
+blob 215896064 fp16 36864 f16(t("sortformer.transformer.blk.0.attn.out.weight"))
+blob 215969856 fp16 192 f16(t("sortformer.transformer.blk.0.attn.out.bias"))
+blob 215970304 fp16 192 f16(zeros([192]))
+blob 215970752 fp16 192 f16(ones([192]))
+blob 215971200 fp16 192 f16(t("sortformer.transformer.blk.0.ln1.weight"))
+blob 215971648 fp16 192 f16(t("sortformer.transformer.blk.0.ln1.bias"))
+blob 215972096 fp16 147456 f16(t("sortformer.transformer.blk.0.ffn.in.weight"))
+blob 216267072 fp16 768 f16(t("sortformer.transformer.blk.0.ffn.in.bias"))
+blob 216268672 fp16 147456 f16(t("sortformer.transformer.blk.0.ffn.out.weight"))
+blob 216563648 fp16 192 f16(t("sortformer.transformer.blk.0.ffn.out.bias"))
+blob 216564096 fp16 192 f16(t("sortformer.transformer.blk.0.ln2.weight"))
+blob 216564544 fp16 192 f16(t("sortformer.transformer.blk.0.ln2.bias"))
+blob 216564992 fp16 36864 f16(mul(t("sortformer.transformer.blk.1.attn.q.weight"), 0.20412415266036987))
+blob 216638784 fp16 192 f16(mul(t("sortformer.transformer.blk.1.attn.q.bias"), 0.20412415266036987))
+blob 216639232 fp16 36864 f16(t("sortformer.transformer.blk.1.attn.k.weight"))
+blob 216713024 fp16 192 f16(t("sortformer.transformer.blk.1.attn.k.bias"))
+blob 216713472 fp16 36864 f16(t("sortformer.transformer.blk.1.attn.v.weight"))
+blob 216787264 fp16 192 f16(t("sortformer.transformer.blk.1.attn.v.bias"))
+blob 216787712 fp16 36864 f16(t("sortformer.transformer.blk.1.attn.out.weight"))
+blob 216861504 fp16 192 f16(t("sortformer.transformer.blk.1.attn.out.bias"))
+blob 216861952 fp16 192 f16(t("sortformer.transformer.blk.1.ln1.weight"))
+blob 216862400 fp16 192 f16(t("sortformer.transformer.blk.1.ln1.bias"))
+blob 216862848 fp16 147456 f16(t("sortformer.transformer.blk.1.ffn.in.weight"))
+blob 217157824 fp16 768 f16(t("sortformer.transformer.blk.1.ffn.in.bias"))
+blob 217159424 fp16 147456 f16(t("sortformer.transformer.blk.1.ffn.out.weight"))
+blob 217454400 fp16 192 f16(t("sortformer.transformer.blk.1.ffn.out.bias"))
+blob 217454848 fp16 192 f16(t("sortformer.transformer.blk.1.ln2.weight"))
+blob 217455296 fp16 192 f16(t("sortformer.transformer.blk.1.ln2.bias"))
+blob 217455744 fp16 36864 f16(mul(t("sortformer.transformer.blk.2.attn.q.weight"), 0.20412415266036987))
+blob 217529536 fp16 192 f16(mul(t("sortformer.transformer.blk.2.attn.q.bias"), 0.20412415266036987))
+blob 217529984 fp16 36864 f16(t("sortformer.transformer.blk.2.attn.k.weight"))
+blob 217603776 fp16 192 f16(t("sortformer.transformer.blk.2.attn.k.bias"))
+blob 217604224 fp16 36864 f16(t("sortformer.transformer.blk.2.attn.v.weight"))
+blob 217678016 fp16 192 f16(t("sortformer.transformer.blk.2.attn.v.bias"))
+blob 217678464 fp16 36864 f16(t("sortformer.transformer.blk.2.attn.out.weight"))
+blob 217752256 fp16 192 f16(t("sortformer.transformer.blk.2.attn.out.bias"))
+blob 217752704 fp16 192 f16(t("sortformer.transformer.blk.2.ln1.weight"))
+blob 217753152 fp16 192 f16(t("sortformer.transformer.blk.2.ln1.bias"))
+blob 217753600 fp16 147456 f16(t("sortformer.transformer.blk.2.ffn.in.weight"))
+blob 218048576 fp16 768 f16(t("sortformer.transformer.blk.2.ffn.in.bias"))
+blob 218050176 fp16 147456 f16(t("sortformer.transformer.blk.2.ffn.out.weight"))
+blob 218345152 fp16 192 f16(t("sortformer.transformer.blk.2.ffn.out.bias"))
+blob 218345600 fp16 192 f16(t("sortformer.transformer.blk.2.ln2.weight"))
+blob 218346048 fp16 192 f16(t("sortformer.transformer.blk.2.ln2.bias"))
+blob 218346496 fp16 36864 f16(mul(t("sortformer.transformer.blk.3.attn.q.weight"), 0.20412415266036987))
+blob 218420288 fp16 192 f16(mul(t("sortformer.transformer.blk.3.attn.q.bias"), 0.20412415266036987))
+blob 218420736 fp16 36864 f16(t("sortformer.transformer.blk.3.attn.k.weight"))
+blob 218494528 fp16 192 f16(t("sortformer.transformer.blk.3.attn.k.bias"))
+blob 218494976 fp16 36864 f16(t("sortformer.transformer.blk.3.attn.v.weight"))
+blob 218568768 fp16 192 f16(t("sortformer.transformer.blk.3.attn.v.bias"))
+blob 218569216 fp16 36864 f16(t("sortformer.transformer.blk.3.attn.out.weight"))
+blob 218643008 fp16 192 f16(t("sortformer.transformer.blk.3.attn.out.bias"))
+blob 218643456 fp16 192 f16(t("sortformer.transformer.blk.3.ln1.weight"))
+blob 218643904 fp16 192 f16(t("sortformer.transformer.blk.3.ln1.bias"))
+blob 218644352 fp16 147456 f16(t("sortformer.transformer.blk.3.ffn.in.weight"))
+blob 218939328 fp16 768 f16(t("sortformer.transformer.blk.3.ffn.in.bias"))
+blob 218940928 fp16 147456 f16(t("sortformer.transformer.blk.3.ffn.out.weight"))
+blob 219235904 fp16 192 f16(t("sortformer.transformer.blk.3.ffn.out.bias"))
+blob 219236352 fp16 192 f16(t("sortformer.transformer.blk.3.ln2.weight"))
+blob 219236800 fp16 192 f16(t("sortformer.transformer.blk.3.ln2.bias"))
+blob 219237248 fp16 36864 f16(mul(t("sortformer.transformer.blk.4.attn.q.weight"), 0.20412415266036987))
+blob 219311040 fp16 192 f16(mul(t("sortformer.transformer.blk.4.attn.q.bias"), 0.20412415266036987))
+blob 219311488 fp16 36864 f16(t("sortformer.transformer.blk.4.attn.k.weight"))
+blob 219385280 fp16 192 f16(t("sortformer.transformer.blk.4.attn.k.bias"))
+blob 219385728 fp16 36864 f16(t("sortformer.transformer.blk.4.attn.v.weight"))
+blob 219459520 fp16 192 f16(t("sortformer.transformer.blk.4.attn.v.bias"))
+blob 219459968 fp16 36864 f16(t("sortformer.transformer.blk.4.attn.out.weight"))
+blob 219533760 fp16 192 f16(t("sortformer.transformer.blk.4.attn.out.bias"))
+blob 219534208 fp16 192 f16(t("sortformer.transformer.blk.4.ln1.weight"))
+blob 219534656 fp16 192 f16(t("sortformer.transformer.blk.4.ln1.bias"))
+blob 219535104 fp16 147456 f16(t("sortformer.transformer.blk.4.ffn.in.weight"))
+blob 219830080 fp16 768 f16(t("sortformer.transformer.blk.4.ffn.in.bias"))
+blob 219831680 fp16 147456 f16(t("sortformer.transformer.blk.4.ffn.out.weight"))
+blob 220126656 fp16 192 f16(t("sortformer.transformer.blk.4.ffn.out.bias"))
+blob 220127104 fp16 192 f16(t("sortformer.transformer.blk.4.ln2.weight"))
+blob 220127552 fp16 192 f16(t("sortformer.transformer.blk.4.ln2.bias"))
+blob 220128000 fp16 36864 f16(mul(t("sortformer.transformer.blk.5.attn.q.weight"), 0.20412415266036987))
+blob 220201792 fp16 192 f16(mul(t("sortformer.transformer.blk.5.attn.q.bias"), 0.20412415266036987))
+blob 220202240 fp16 36864 f16(t("sortformer.transformer.blk.5.attn.k.weight"))
+blob 220276032 fp16 192 f16(t("sortformer.transformer.blk.5.attn.k.bias"))
+blob 220276480 fp16 36864 f16(t("sortformer.transformer.blk.5.attn.v.weight"))
+blob 220350272 fp16 192 f16(t("sortformer.transformer.blk.5.attn.v.bias"))
+blob 220350720 fp16 36864 f16(t("sortformer.transformer.blk.5.attn.out.weight"))
+blob 220424512 fp16 192 f16(t("sortformer.transformer.blk.5.attn.out.bias"))
+blob 220424960 fp16 192 f16(t("sortformer.transformer.blk.5.ln1.weight"))
+blob 220425408 fp16 192 f16(t("sortformer.transformer.blk.5.ln1.bias"))
+blob 220425856 fp16 147456 f16(t("sortformer.transformer.blk.5.ffn.in.weight"))
+blob 220720832 fp16 768 f16(t("sortformer.transformer.blk.5.ffn.in.bias"))
+blob 220722432 fp16 147456 f16(t("sortformer.transformer.blk.5.ffn.out.weight"))
+blob 221017408 fp16 192 f16(t("sortformer.transformer.blk.5.ffn.out.bias"))
+blob 221017856 fp16 192 f16(t("sortformer.transformer.blk.5.ln2.weight"))
+blob 221018304 fp16 192 f16(t("sortformer.transformer.blk.5.ln2.bias"))
+blob 221018752 fp16 36864 f16(mul(t("sortformer.transformer.blk.6.attn.q.weight"), 0.20412415266036987))
+blob 221092544 fp16 192 f16(mul(t("sortformer.transformer.blk.6.attn.q.bias"), 0.20412415266036987))
+blob 221092992 fp16 36864 f16(t("sortformer.transformer.blk.6.attn.k.weight"))
+blob 221166784 fp16 192 f16(t("sortformer.transformer.blk.6.attn.k.bias"))
+blob 221167232 fp16 36864 f16(t("sortformer.transformer.blk.6.attn.v.weight"))
+blob 221241024 fp16 192 f16(t("sortformer.transformer.blk.6.attn.v.bias"))
+blob 221241472 fp16 36864 f16(t("sortformer.transformer.blk.6.attn.out.weight"))
+blob 221315264 fp16 192 f16(t("sortformer.transformer.blk.6.attn.out.bias"))
+blob 221315712 fp16 192 f16(t("sortformer.transformer.blk.6.ln1.weight"))
+blob 221316160 fp16 192 f16(t("sortformer.transformer.blk.6.ln1.bias"))
+blob 221316608 fp16 147456 f16(t("sortformer.transformer.blk.6.ffn.in.weight"))
+blob 221611584 fp16 768 f16(t("sortformer.transformer.blk.6.ffn.in.bias"))
+blob 221613184 fp16 147456 f16(t("sortformer.transformer.blk.6.ffn.out.weight"))
+blob 221908160 fp16 192 f16(t("sortformer.transformer.blk.6.ffn.out.bias"))
+blob 221908608 fp16 192 f16(t("sortformer.transformer.blk.6.ln2.weight"))
+blob 221909056 fp16 192 f16(t("sortformer.transformer.blk.6.ln2.bias"))
+blob 221909504 fp16 36864 f16(mul(t("sortformer.transformer.blk.7.attn.q.weight"), 0.20412415266036987))
+blob 221983296 fp16 192 f16(mul(t("sortformer.transformer.blk.7.attn.q.bias"), 0.20412415266036987))
+blob 221983744 fp16 36864 f16(t("sortformer.transformer.blk.7.attn.k.weight"))
+blob 222057536 fp16 192 f16(t("sortformer.transformer.blk.7.attn.k.bias"))
+blob 222057984 fp16 36864 f16(t("sortformer.transformer.blk.7.attn.v.weight"))
+blob 222131776 fp16 192 f16(t("sortformer.transformer.blk.7.attn.v.bias"))
+blob 222132224 fp16 36864 f16(t("sortformer.transformer.blk.7.attn.out.weight"))
+blob 222206016 fp16 192 f16(t("sortformer.transformer.blk.7.attn.out.bias"))
+blob 222206464 fp16 192 f16(t("sortformer.transformer.blk.7.ln1.weight"))
+blob 222206912 fp16 192 f16(t("sortformer.transformer.blk.7.ln1.bias"))
+blob 222207360 fp16 147456 f16(t("sortformer.transformer.blk.7.ffn.in.weight"))
+blob 222502336 fp16 768 f16(t("sortformer.transformer.blk.7.ffn.in.bias"))
+blob 222503936 fp16 147456 f16(t("sortformer.transformer.blk.7.ffn.out.weight"))
+blob 222798912 fp16 192 f16(t("sortformer.transformer.blk.7.ffn.out.bias"))
+blob 222799360 fp16 192 f16(t("sortformer.transformer.blk.7.ln2.weight"))
+blob 222799808 fp16 192 f16(t("sortformer.transformer.blk.7.ln2.bias"))
+blob 222800256 fp16 36864 f16(mul(t("sortformer.transformer.blk.8.attn.q.weight"), 0.20412415266036987))
+blob 222874048 fp16 192 f16(mul(t("sortformer.transformer.blk.8.attn.q.bias"), 0.20412415266036987))
+blob 222874496 fp16 36864 f16(t("sortformer.transformer.blk.8.attn.k.weight"))
+blob 222948288 fp16 192 f16(t("sortformer.transformer.blk.8.attn.k.bias"))
+blob 222948736 fp16 36864 f16(t("sortformer.transformer.blk.8.attn.v.weight"))
+blob 223022528 fp16 192 f16(t("sortformer.transformer.blk.8.attn.v.bias"))
+blob 223022976 fp16 36864 f16(t("sortformer.transformer.blk.8.attn.out.weight"))
+blob 223096768 fp16 192 f16(t("sortformer.transformer.blk.8.attn.out.bias"))
+blob 223097216 fp16 192 f16(t("sortformer.transformer.blk.8.ln1.weight"))
+blob 223097664 fp16 192 f16(t("sortformer.transformer.blk.8.ln1.bias"))
+blob 223098112 fp16 147456 f16(t("sortformer.transformer.blk.8.ffn.in.weight"))
+blob 223393088 fp16 768 f16(t("sortformer.transformer.blk.8.ffn.in.bias"))
+blob 223394688 fp16 147456 f16(t("sortformer.transformer.blk.8.ffn.out.weight"))
+blob 223689664 fp16 192 f16(t("sortformer.transformer.blk.8.ffn.out.bias"))
+blob 223690112 fp16 192 f16(t("sortformer.transformer.blk.8.ln2.weight"))
+blob 223690560 fp16 192 f16(t("sortformer.transformer.blk.8.ln2.bias"))
+blob 223691008 fp16 36864 f16(mul(t("sortformer.transformer.blk.9.attn.q.weight"), 0.20412415266036987))
+blob 223764800 fp16 192 f16(mul(t("sortformer.transformer.blk.9.attn.q.bias"), 0.20412415266036987))
+blob 223765248 fp16 36864 f16(t("sortformer.transformer.blk.9.attn.k.weight"))
+blob 223839040 fp16 192 f16(t("sortformer.transformer.blk.9.attn.k.bias"))
+blob 223839488 fp16 36864 f16(t("sortformer.transformer.blk.9.attn.v.weight"))
+blob 223913280 fp16 192 f16(t("sortformer.transformer.blk.9.attn.v.bias"))
+blob 223913728 fp16 36864 f16(t("sortformer.transformer.blk.9.attn.out.weight"))
+blob 223987520 fp16 192 f16(t("sortformer.transformer.blk.9.attn.out.bias"))
+blob 223987968 fp16 192 f16(t("sortformer.transformer.blk.9.ln1.weight"))
+blob 223988416 fp16 192 f16(t("sortformer.transformer.blk.9.ln1.bias"))
+blob 223988864 fp16 147456 f16(t("sortformer.transformer.blk.9.ffn.in.weight"))
+blob 224283840 fp16 768 f16(t("sortformer.transformer.blk.9.ffn.in.bias"))
+blob 224285440 fp16 147456 f16(t("sortformer.transformer.blk.9.ffn.out.weight"))
+blob 224580416 fp16 192 f16(t("sortformer.transformer.blk.9.ffn.out.bias"))
+blob 224580864 fp16 192 f16(t("sortformer.transformer.blk.9.ln2.weight"))
+blob 224581312 fp16 192 f16(t("sortformer.transformer.blk.9.ln2.bias"))
+blob 224581760 fp16 36864 f16(mul(t("sortformer.transformer.blk.10.attn.q.weight"), 0.20412415266036987))
+blob 224655552 fp16 192 f16(mul(t("sortformer.transformer.blk.10.attn.q.bias"), 0.20412415266036987))
+blob 224656000 fp16 36864 f16(t("sortformer.transformer.blk.10.attn.k.weight"))
+blob 224729792 fp16 192 f16(t("sortformer.transformer.blk.10.attn.k.bias"))
+blob 224730240 fp16 36864 f16(t("sortformer.transformer.blk.10.attn.v.weight"))
+blob 224804032 fp16 192 f16(t("sortformer.transformer.blk.10.attn.v.bias"))
+blob 224804480 fp16 36864 f16(t("sortformer.transformer.blk.10.attn.out.weight"))
+blob 224878272 fp16 192 f16(t("sortformer.transformer.blk.10.attn.out.bias"))
+blob 224878720 fp16 192 f16(t("sortformer.transformer.blk.10.ln1.weight"))
+blob 224879168 fp16 192 f16(t("sortformer.transformer.blk.10.ln1.bias"))
+blob 224879616 fp16 147456 f16(t("sortformer.transformer.blk.10.ffn.in.weight"))
+blob 225174592 fp16 768 f16(t("sortformer.transformer.blk.10.ffn.in.bias"))
+blob 225176192 fp16 147456 f16(t("sortformer.transformer.blk.10.ffn.out.weight"))
+blob 225471168 fp16 192 f16(t("sortformer.transformer.blk.10.ffn.out.bias"))
+blob 225471616 fp16 192 f16(t("sortformer.transformer.blk.10.ln2.weight"))
+blob 225472064 fp16 192 f16(t("sortformer.transformer.blk.10.ln2.bias"))
+blob 225472512 fp16 36864 f16(mul(t("sortformer.transformer.blk.11.attn.q.weight"), 0.20412415266036987))
+blob 225546304 fp16 192 f16(mul(t("sortformer.transformer.blk.11.attn.q.bias"), 0.20412415266036987))
+blob 225546752 fp16 36864 f16(t("sortformer.transformer.blk.11.attn.k.weight"))
+blob 225620544 fp16 192 f16(t("sortformer.transformer.blk.11.attn.k.bias"))
+blob 225620992 fp16 36864 f16(t("sortformer.transformer.blk.11.attn.v.weight"))
+blob 225694784 fp16 192 f16(t("sortformer.transformer.blk.11.attn.v.bias"))
+blob 225695232 fp16 36864 f16(t("sortformer.transformer.blk.11.attn.out.weight"))
+blob 225769024 fp16 192 f16(t("sortformer.transformer.blk.11.attn.out.bias"))
+blob 225769472 fp16 192 f16(t("sortformer.transformer.blk.11.ln1.weight"))
+blob 225769920 fp16 192 f16(t("sortformer.transformer.blk.11.ln1.bias"))
+blob 225770368 fp16 147456 f16(t("sortformer.transformer.blk.11.ffn.in.weight"))
+blob 226065344 fp16 768 f16(t("sortformer.transformer.blk.11.ffn.in.bias"))
+blob 226066944 fp16 147456 f16(t("sortformer.transformer.blk.11.ffn.out.weight"))
+blob 226361920 fp16 192 f16(t("sortformer.transformer.blk.11.ffn.out.bias"))
+blob 226362368 fp16 192 f16(t("sortformer.transformer.blk.11.ln2.weight"))
+blob 226362816 fp16 192 f16(t("sortformer.transformer.blk.11.ln2.bias"))
+blob 226363264 fp16 36864 f16(mul(t("sortformer.transformer.blk.12.attn.q.weight"), 0.20412415266036987))
+blob 226437056 fp16 192 f16(mul(t("sortformer.transformer.blk.12.attn.q.bias"), 0.20412415266036987))
+blob 226437504 fp16 36864 f16(t("sortformer.transformer.blk.12.attn.k.weight"))
+blob 226511296 fp16 192 f16(t("sortformer.transformer.blk.12.attn.k.bias"))
+blob 226511744 fp16 36864 f16(t("sortformer.transformer.blk.12.attn.v.weight"))
+blob 226585536 fp16 192 f16(t("sortformer.transformer.blk.12.attn.v.bias"))
+blob 226585984 fp16 36864 f16(t("sortformer.transformer.blk.12.attn.out.weight"))
+blob 226659776 fp16 192 f16(t("sortformer.transformer.blk.12.attn.out.bias"))
+blob 226660224 fp16 192 f16(t("sortformer.transformer.blk.12.ln1.weight"))
+blob 226660672 fp16 192 f16(t("sortformer.transformer.blk.12.ln1.bias"))
+blob 226661120 fp16 147456 f16(t("sortformer.transformer.blk.12.ffn.in.weight"))
+blob 226956096 fp16 768 f16(t("sortformer.transformer.blk.12.ffn.in.bias"))
+blob 226957696 fp16 147456 f16(t("sortformer.transformer.blk.12.ffn.out.weight"))
+blob 227252672 fp16 192 f16(t("sortformer.transformer.blk.12.ffn.out.bias"))
+blob 227253120 fp16 192 f16(t("sortformer.transformer.blk.12.ln2.weight"))
+blob 227253568 fp16 192 f16(t("sortformer.transformer.blk.12.ln2.bias"))
+blob 227254016 fp16 36864 f16(mul(t("sortformer.transformer.blk.13.attn.q.weight"), 0.20412415266036987))
+blob 227327808 fp16 192 f16(mul(t("sortformer.transformer.blk.13.attn.q.bias"), 0.20412415266036987))
+blob 227328256 fp16 36864 f16(t("sortformer.transformer.blk.13.attn.k.weight"))
+blob 227402048 fp16 192 f16(t("sortformer.transformer.blk.13.attn.k.bias"))
+blob 227402496 fp16 36864 f16(t("sortformer.transformer.blk.13.attn.v.weight"))
+blob 227476288 fp16 192 f16(t("sortformer.transformer.blk.13.attn.v.bias"))
+blob 227476736 fp16 36864 f16(t("sortformer.transformer.blk.13.attn.out.weight"))
+blob 227550528 fp16 192 f16(t("sortformer.transformer.blk.13.attn.out.bias"))
+blob 227550976 fp16 192 f16(t("sortformer.transformer.blk.13.ln1.weight"))
+blob 227551424 fp16 192 f16(t("sortformer.transformer.blk.13.ln1.bias"))
+blob 227551872 fp16 147456 f16(t("sortformer.transformer.blk.13.ffn.in.weight"))
+blob 227846848 fp16 768 f16(t("sortformer.transformer.blk.13.ffn.in.bias"))
+blob 227848448 fp16 147456 f16(t("sortformer.transformer.blk.13.ffn.out.weight"))
+blob 228143424 fp16 192 f16(t("sortformer.transformer.blk.13.ffn.out.bias"))
+blob 228143872 fp16 192 f16(t("sortformer.transformer.blk.13.ln2.weight"))
+blob 228144320 fp16 192 f16(t("sortformer.transformer.blk.13.ln2.bias"))
+blob 228144768 fp16 36864 f16(mul(t("sortformer.transformer.blk.14.attn.q.weight"), 0.20412415266036987))
+blob 228218560 fp16 192 f16(mul(t("sortformer.transformer.blk.14.attn.q.bias"), 0.20412415266036987))
+blob 228219008 fp16 36864 f16(t("sortformer.transformer.blk.14.attn.k.weight"))
+blob 228292800 fp16 192 f16(t("sortformer.transformer.blk.14.attn.k.bias"))
+blob 228293248 fp16 36864 f16(t("sortformer.transformer.blk.14.attn.v.weight"))
+blob 228367040 fp16 192 f16(t("sortformer.transformer.blk.14.attn.v.bias"))
+blob 228367488 fp16 36864 f16(t("sortformer.transformer.blk.14.attn.out.weight"))
+blob 228441280 fp16 192 f16(t("sortformer.transformer.blk.14.attn.out.bias"))
+blob 228441728 fp16 192 f16(t("sortformer.transformer.blk.14.ln1.weight"))
+blob 228442176 fp16 192 f16(t("sortformer.transformer.blk.14.ln1.bias"))
+blob 228442624 fp16 147456 f16(t("sortformer.transformer.blk.14.ffn.in.weight"))
+blob 228737600 fp16 768 f16(t("sortformer.transformer.blk.14.ffn.in.bias"))
+blob 228739200 fp16 147456 f16(t("sortformer.transformer.blk.14.ffn.out.weight"))
+blob 229034176 fp16 192 f16(t("sortformer.transformer.blk.14.ffn.out.bias"))
+blob 229034624 fp16 192 f16(t("sortformer.transformer.blk.14.ln2.weight"))
+blob 229035072 fp16 192 f16(t("sortformer.transformer.blk.14.ln2.bias"))
+blob 229035520 fp16 36864 f16(mul(t("sortformer.transformer.blk.15.attn.q.weight"), 0.20412415266036987))
+blob 229109312 fp16 192 f16(mul(t("sortformer.transformer.blk.15.attn.q.bias"), 0.20412415266036987))
+blob 229109760 fp16 36864 f16(t("sortformer.transformer.blk.15.attn.k.weight"))
+blob 229183552 fp16 192 f16(t("sortformer.transformer.blk.15.attn.k.bias"))
+blob 229184000 fp16 36864 f16(t("sortformer.transformer.blk.15.attn.v.weight"))
+blob 229257792 fp16 192 f16(t("sortformer.transformer.blk.15.attn.v.bias"))
+blob 229258240 fp16 36864 f16(t("sortformer.transformer.blk.15.attn.out.weight"))
+blob 229332032 fp16 192 f16(t("sortformer.transformer.blk.15.attn.out.bias"))
+blob 229332480 fp16 192 f16(t("sortformer.transformer.blk.15.ln1.weight"))
+blob 229332928 fp16 192 f16(t("sortformer.transformer.blk.15.ln1.bias"))
+blob 229333376 fp16 147456 f16(t("sortformer.transformer.blk.15.ffn.in.weight"))
+blob 229628352 fp16 768 f16(t("sortformer.transformer.blk.15.ffn.in.bias"))
+blob 229629952 fp16 147456 f16(t("sortformer.transformer.blk.15.ffn.out.weight"))
+blob 229924928 fp16 192 f16(t("sortformer.transformer.blk.15.ffn.out.bias"))
+blob 229925376 fp16 192 f16(t("sortformer.transformer.blk.15.ln2.weight"))
+blob 229925824 fp16 192 f16(t("sortformer.transformer.blk.15.ln2.bias"))
+blob 229926272 fp16 36864 f16(mul(t("sortformer.transformer.blk.16.attn.q.weight"), 0.20412415266036987))
+blob 230000064 fp16 192 f16(mul(t("sortformer.transformer.blk.16.attn.q.bias"), 0.20412415266036987))
+blob 230000512 fp16 36864 f16(t("sortformer.transformer.blk.16.attn.k.weight"))
+blob 230074304 fp16 192 f16(t("sortformer.transformer.blk.16.attn.k.bias"))
+blob 230074752 fp16 36864 f16(t("sortformer.transformer.blk.16.attn.v.weight"))
+blob 230148544 fp16 192 f16(t("sortformer.transformer.blk.16.attn.v.bias"))
+blob 230148992 fp16 36864 f16(t("sortformer.transformer.blk.16.attn.out.weight"))
+blob 230222784 fp16 192 f16(t("sortformer.transformer.blk.16.attn.out.bias"))
+blob 230223232 fp16 192 f16(t("sortformer.transformer.blk.16.ln1.weight"))
+blob 230223680 fp16 192 f16(t("sortformer.transformer.blk.16.ln1.bias"))
+blob 230224128 fp16 147456 f16(t("sortformer.transformer.blk.16.ffn.in.weight"))
+blob 230519104 fp16 768 f16(t("sortformer.transformer.blk.16.ffn.in.bias"))
+blob 230520704 fp16 147456 f16(t("sortformer.transformer.blk.16.ffn.out.weight"))
+blob 230815680 fp16 192 f16(t("sortformer.transformer.blk.16.ffn.out.bias"))
+blob 230816128 fp16 192 f16(t("sortformer.transformer.blk.16.ln2.weight"))
+blob 230816576 fp16 192 f16(t("sortformer.transformer.blk.16.ln2.bias"))
+blob 230817024 fp16 36864 f16(mul(t("sortformer.transformer.blk.17.attn.q.weight"), 0.20412415266036987))
+blob 230890816 fp16 192 f16(mul(t("sortformer.transformer.blk.17.attn.q.bias"), 0.20412415266036987))
+blob 230891264 fp16 36864 f16(t("sortformer.transformer.blk.17.attn.k.weight"))
+blob 230965056 fp16 192 f16(t("sortformer.transformer.blk.17.attn.k.bias"))
+blob 230965504 fp16 36864 f16(t("sortformer.transformer.blk.17.attn.v.weight"))
+blob 231039296 fp16 192 f16(t("sortformer.transformer.blk.17.attn.v.bias"))
+blob 231039744 fp16 36864 f16(t("sortformer.transformer.blk.17.attn.out.weight"))
+blob 231113536 fp16 192 f16(t("sortformer.transformer.blk.17.attn.out.bias"))
+blob 231113984 fp16 192 f16(t("sortformer.transformer.blk.17.ln1.weight"))
+blob 231114432 fp16 192 f16(t("sortformer.transformer.blk.17.ln1.bias"))
+blob 231114880 fp16 147456 f16(t("sortformer.transformer.blk.17.ffn.in.weight"))
+blob 231409856 fp16 768 f16(t("sortformer.transformer.blk.17.ffn.in.bias"))
+blob 231411456 fp16 147456 f16(t("sortformer.transformer.blk.17.ffn.out.weight"))
+blob 231706432 fp16 192 f16(t("sortformer.transformer.blk.17.ffn.out.bias"))
+blob 231706880 fp16 192 f16(t("sortformer.transformer.blk.17.ln2.weight"))
+blob 231707328 fp16 192 f16(t("sortformer.transformer.blk.17.ln2.bias"))
+blob 231707776 fp16 36864 f16(t("sortformer.head.first_hidden_to_hidden.weight"))
+blob 231781568 fp16 192 f16(t("sortformer.head.first_hidden_to_hidden.bias"))
+blob 231782016 fp16 768 f16(neg(t("sortformer.head.single_hidden_to_spks.weight")))
+# the speaker-head bias, negated for 1 / (1 + exp(-x)), is an inline constant of the spec
+patch 2166378 fp16 4 f16(neg(t("sortformer.head.single_hidden_to_spks.bias")))
+end

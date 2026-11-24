@@ -1,0 +1,1317 @@
+{
+  "hardware": {
+    "mac": "Apple M4 MacBook Air, 16 GB, macOS 27.0.1",
+    "iphone": "iPhone 16e, A18, iOS 18.6.2",
+    "build": "Xcode 26.5; GGML 6fe02a1; four GGML threads; Core ML scheduling"
+  },
+  "offline": [
+    {"device": "mac","case": "cpu-en-auto","language": "auto","audio_seconds": 11.0,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "CPU","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 167.179,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 846020608,"gate_probability": 0.0343,"gate_route": "en","median_ms": 450.507,"rtf": 0.040955,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "metal-en-auto","language": "auto","audio_seconds": 11.0,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "MTL0","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 177.737,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 680525824,"gate_probability": 0.0343,"gate_route": "en","median_ms": 92.853,"rtf": 0.008441,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "mac","case": "cpu-fr-auto","language": "auto","audio_seconds": 3.258313,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "CPU","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 183.477,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 719372288,"gate_probability": 0.9395,"gate_route": "other","median_ms": 136.568,"rtf": 0.041914,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "metal-fr-auto","language": "auto","audio_seconds": 3.258313,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "MTL0","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 176.433,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 675479552,"gate_probability": 0.9397,"gate_route": "other","median_ms": 44.392,"rtf": 0.013624,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "mac","case": "cpu-long-en","language": "auto","audio_seconds": 300.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "CPU","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 189.954,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 440,"peak_rss_bytes": 1405632512,"gate_probability": 0.0518,"gate_route": "en","median_ms": 17003.926,"rtf": 0.05668,"window_sec": "60","overlap": "0.25","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "metal-long-en","language": "auto","audio_seconds": 300.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "MTL0","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 174.284,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 440,"peak_rss_bytes": 741195776,"gate_probability": 0.0518,"gate_route": "en","median_ms": 2337.644,"rtf": 0.007792,"window_sec": "60","overlap": "0.25","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "mac","case": "cpu-long-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "CPU","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 168.086,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"peak_rss_bytes": 1267220480,"gate_probability": 0.9791,"gate_route": "other","median_ms": 2331.434,"rtf": 0.045625,"window_sec": "60","overlap": "0.25","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "metal-long-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "MTL0","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 173.314,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"peak_rss_bytes": 695812096,"gate_probability": 0.9791,"gate_route": "other","median_ms": 341.225,"rtf": 0.006678,"window_sec": "60","overlap": "0.25","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "mac","case": "unwindowed-cpu-en","language": "auto","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "CPU","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 168.578,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 1344651264,"gate_probability": 0.0518,"gate_route": "en","median_ms": 2818.327,"rtf": 0.046972,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "unwindowed-metal-en","language": "auto","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "MTL0","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 176.557,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 709181440,"gate_probability": 0.0518,"gate_route": "en","median_ms": 401.927,"rtf": 0.006699,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "mac","case": "unwindowed-cpu-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "CPU","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 172.981,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"peak_rss_bytes": 1267253248,"gate_probability": 0.9791,"gate_route": "other","median_ms": 2340.993,"rtf": 0.045812,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "unwindowed-metal-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "MTL0","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 173.934,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"peak_rss_bytes": 701759488,"gate_probability": 0.9791,"gate_route": "other","median_ms": 349.243,"rtf": 0.006835,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "mac","case": "units-all-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 361.914,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 691355648,"gate_probability": 0.0342,"gate_route": "en","median_ms": 35.204,"rtf": 0.0032,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "all"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "units-all-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 377.461,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 687669248,"gate_probability": 0.9392,"gate_route": "other","median_ms": 30.346,"rtf": 0.009313,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "all"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "decoder-units-all","language": "en","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 351.571,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 690978816,"decoder_dispatches": [46,46,46,46],"median_ms": 93.714,"rtf": 0.008519,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "all","PARAKEET_ANE_BATCH_DECODE": "1"},"decoder_backend": "coreml-all","encoder_plans": []},
+    {"device": "mac","case": "decoder-units-cpu_and_ane","language": "en","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 349.788,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 690995200,"decoder_dispatches": [46,46,46,46],"median_ms": 98.79,"rtf": 0.008981,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_ane","PARAKEET_ANE_BATCH_DECODE": "1"},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "mac","case": "crossover-15-coreml","language": "en","audio_seconds": 15.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 352.679,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 691486720,"decoder_dispatches": [60,60,60,60],"median_ms": 127.482,"rtf": 0.008499,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane"},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "mac","case": "crossover-15-host","language": "en","audio_seconds": 15.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 372.13,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 692207616,"median_ms": 38.664,"rtf": 0.002578,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_ANE_DECODE_HOST": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "crossover-60-coreml","language": "en","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 356.797,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 696614912,"decoder_dispatches": [72,72,72,72],"median_ms": 200.653,"rtf": 0.003344,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane"},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "mac","case": "crossover-60-host","language": "en","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 364.031,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 700170240,"median_ms": 108.609,"rtf": 0.00181,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_ANE_DECODE_HOST": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "crossover-120-coreml","language": "en","audio_seconds": 120.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 361.136,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"peak_rss_bytes": 698531840,"decoder_dispatches": [72,72,72,72],"median_ms": 255.406,"rtf": 0.002128,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane"},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "mac","case": "crossover-120-host","language": "en","audio_seconds": 120.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 346.302,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"peak_rss_bytes": 709345280,"median_ms": 203.366,"rtf": 0.001695,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_ANE_DECODE_HOST": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "crossover-240-coreml","language": "en","audio_seconds": 240.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 353.446,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 352,"peak_rss_bytes": 711720960,"decoder_dispatches": [77,77,77,77],"median_ms": 398.251,"rtf": 0.001659,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane"},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "mac","case": "crossover-240-host","language": "en","audio_seconds": 240.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 346.506,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 352,"peak_rss_bytes": 718553088,"median_ms": 393.251,"rtf": 0.001639,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_ANE_DECODE_HOST": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "cpu-en-auto","language": "auto","audio_seconds": 11.0,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "CPU","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 277.684,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 805289984,"thermal_state": 0,"gate_probability": 0.0343,"gate_route": "en","median_ms": 1421.759,"rtf": 0.129251,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "metal-en-auto","language": "auto","audio_seconds": 11.0,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "MTL0","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 191.234,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 683409408,"thermal_state": 0,"gate_probability": 0.0343,"gate_route": "en","median_ms": 182.697,"rtf": 0.016609,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "mac","case": "coreml-en-other","language": "other","audio_seconds": 11.0,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 348.538,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 690405376,"median_ms": 22.311,"rtf": 0.002028,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "coreml-fr-en","language": "en","audio_seconds": 3.258313,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 365.09,"wer": 0.8571428571428571,"cer": 0.3,"word_edits": 6,"reference_words": 7,"peak_rss_bytes": 686686208,"median_ms": 19.723,"rtf": 0.006053,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "native-decoder-long-en","language": "auto","audio_seconds": 300.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 353.942,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 440,"peak_rss_bytes": 756580352,"gate_probability": 0.0534,"gate_route": "en","median_ms": 740.049,"rtf": 0.002467,"window_sec": "60","overlap": "0.25","settings": {"PARAKEET_ANE_BATCH_DECODE": "0"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "native-decoder-long-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 347.502,"wer": 0.09523809523809523,"cer": 0.01094391244870041,"word_edits": 8,"reference_words": 84,"peak_rss_bytes": 705904640,"gate_probability": 0.9802,"gate_route": "other","median_ms": 152.269,"rtf": 0.00298,"window_sec": "60","overlap": "0.25","settings": {"PARAKEET_ANE_BATCH_DECODE": "0"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "palette6-long-en","language": "auto","audio_seconds": 300.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 34128.334,"wer": 0.011363636363636364,"cer": 0.012863268222963315,"word_edits": 5,"reference_words": 440,"peak_rss_bytes": 910442496,"peak_footprint_bytes": 730924424,"gate_probability": 0.0538,"gate_route": "en","median_ms": 752.684,"rtf": 0.002509,"window_sec": "60","overlap": "0.25","settings": {},"decoder_backend": "CPU","encoder_plans": [{"window": 187,"context": 46,"advance": 95}],"measured_at": "2026-11-11","receipt": "quant6-refresh-20261111/mac-palette6-long-en.json"},
+    {"device": "mac","case": "palette6-long-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 477.879,"wer": 0.09523809523809523,"cer": 0.01094391244870041,"word_edits": 8,"reference_words": 84,"peak_rss_bytes": 706904064,"peak_footprint_bytes": 716670200,"gate_probability": 0.9802,"gate_route": "other","median_ms": 156.11,"rtf": 0.003055,"window_sec": "60","overlap": "0.25","settings": {},"decoder_backend": "CPU","encoder_plans": [{"window": 187,"context": 46,"advance": 95}],"measured_at": "2026-11-11","receipt": "quant6-refresh-20261111/mac-palette6-long-fr.json"},
+    {"device": "mac","case": "q8-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 464.138,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 409583616,"gate_probability": 0.0342,"gate_route": "en","median_ms": 33.266,"rtf": 0.003024,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "palette6-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 396.498,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 679034880,"gate_probability": 0.0347,"gate_route": "en","median_ms": 35.724,"rtf": 0.003248,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "q8-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 450.767,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 407060480,"gate_probability": 0.9392,"gate_route": "other","median_ms": 29.166,"rtf": 0.008951,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "palette6-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 371.986,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 688635904,"gate_probability": 0.938,"gate_route": "other","median_ms": 30.781,"rtf": 0.009447,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "coreml-silence","language": "auto","audio_seconds": 0.8,"timed_runs": 1,"warmup_runs": 0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 352.955,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 0,"peak_rss_bytes": 687030272,"gate_probability": 0.5347,"gate_route": "en","median_ms": 39.827,"rtf": 0.049784,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "coreml-partial","language": "auto","audio_seconds": 0.8,"timed_runs": 1,"warmup_runs": 0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 350.325,"peak_rss_bytes": 687030272,"gate_probability": 0.201,"gate_route": "en","median_ms": 39.277,"rtf": 0.049096,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "coreml-stability","language": "auto","audio_seconds": 7.290875,"timed_runs": 1,"warmup_runs": 0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 354.464,"peak_rss_bytes": 688914432,"gate_probability": 0.96,"gate_route": "other","median_ms": 48.948,"rtf": 0.006714,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "crossover-15-cpu","language": "en","audio_seconds": 15.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 350.325,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 698515456,"decoder_dispatches": [60,60,60,60],"median_ms": 51.596,"rtf": 0.00344,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_only"},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "mac","case": "crossover-60-cpu","language": "en","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 345.818,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 703578112,"decoder_dispatches": [72,72,72,72],"median_ms": 102.333,"rtf": 0.001706,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_only"},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "mac","case": "crossover-120-cpu","language": "en","audio_seconds": 120.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 347.333,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"peak_rss_bytes": 705609728,"decoder_dispatches": [72,72,72,72],"median_ms": 163.796,"rtf": 0.001365,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_only"},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "mac","case": "crossover-240-cpu","language": "en","audio_seconds": 240.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 346.881,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 352,"peak_rss_bytes": 718979072,"decoder_dispatches": [76,76,76,76],"median_ms": 289.346,"rtf": 0.001206,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_only"},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "iphone","case": "coreml-en-other","language": "other","audio_seconds": 11.0,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 493.371,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 694484992,"thermal_state": 0,"median_ms": 38.29,"rtf": 0.003481,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "cpu-fr-auto","language": "auto","audio_seconds": 3.258313,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "CPU","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 182.247,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 724549632,"thermal_state": 0,"gate_probability": 0.9397,"gate_route": "other","median_ms": 457.151,"rtf": 0.140303,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "metal-fr-auto","language": "auto","audio_seconds": 3.258313,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "MTL0","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 191.432,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 677838848,"thermal_state": 0,"gate_probability": 0.9397,"gate_route": "other","median_ms": 81.839,"rtf": 0.025117,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "iphone","case": "coreml-fr-en","language": "en","audio_seconds": 3.258313,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 505.087,"wer": 0.8571428571428571,"cer": 0.3,"word_edits": 6,"reference_words": 7,"peak_rss_bytes": 694272000,"thermal_state": 0,"median_ms": 29.206,"rtf": 0.008964,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "cpu-long-en","language": "auto","audio_seconds": 300.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "CPU","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 182.215,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 440,"peak_rss_bytes": 1402011648,"thermal_state": 0,"gate_probability": 0.0518,"gate_route": "en","median_ms": 66339.779,"rtf": 0.221133,"window_sec": "60","overlap": "0.25","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "metal-long-en","language": "auto","audio_seconds": 300.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "MTL0","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 199.727,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 440,"peak_rss_bytes": 741703680,"thermal_state": 0,"gate_probability": 0.0518,"gate_route": "en","median_ms": 6937.676,"rtf": 0.023126,"window_sec": "60","overlap": "0.25","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "iphone","case": "cpu-long-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "CPU","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 187.716,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"peak_rss_bytes": 1266401280,"thermal_state": 0,"gate_probability": 0.9791,"gate_route": "other","median_ms": 8943.13,"rtf": 0.175013,"window_sec": "60","overlap": "0.25","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "metal-long-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "MTL0","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 213.18,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"peak_rss_bytes": 699875328,"thermal_state": 0,"gate_probability": 0.9791,"gate_route": "other","median_ms": 1018.157,"rtf": 0.019925,"window_sec": "60","overlap": "0.25","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "iphone","case": "native-decoder-long-en","language": "auto","audio_seconds": 300.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 503.137,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 440,"peak_rss_bytes": 684392448,"thermal_state": 0,"gate_probability": 0.0534,"gate_route": "en","median_ms": 1719.375,"rtf": 0.005731,"window_sec": "60","overlap": "0.25","settings": {"PARAKEET_ANE_BATCH_DECODE": "0"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "native-decoder-long-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 501.076,"wer": 0.09523809523809523,"cer": 0.01094391244870041,"word_edits": 8,"reference_words": 84,"peak_rss_bytes": 708149248,"thermal_state": 0,"gate_probability": 0.9802,"gate_route": "other","median_ms": 329.588,"rtf": 0.00645,"window_sec": "60","overlap": "0.25","settings": {"PARAKEET_ANE_BATCH_DECODE": "0"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "unwindowed-cpu-en","language": "auto","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "CPU","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 199.921,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 1342095360,"thermal_state": 0,"gate_probability": 0.0518,"gate_route": "en","median_ms": 10548.276,"rtf": 0.175805,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "unwindowed-metal-en","language": "auto","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "MTL0","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 205.199,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 706183168,"thermal_state": 0,"gate_probability": 0.0518,"gate_route": "en","median_ms": 1158.687,"rtf": 0.019311,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "iphone","case": "unwindowed-cpu-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "CPU","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 201.173,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"peak_rss_bytes": 1266352128,"thermal_state": 0,"gate_probability": 0.9791,"gate_route": "other","median_ms": 8977.955,"rtf": 0.175695,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "unwindowed-metal-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "MTL0","encoder_coreml_all_runs": false,"decoder_coreml_all_runs": false,"load_ms": 205.236,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"peak_rss_bytes": 699875328,"thermal_state": 0,"gate_probability": 0.9791,"gate_route": "other","median_ms": 1025.764,"rtf": 0.020074,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_COREML_DISABLE": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "iphone","case": "palette6-long-en","language": "auto","audio_seconds": 300.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 27986.255,"wer": 0.011363636363636364,"cer": 0.012863268222963315,"word_edits": 5,"reference_words": 440,"peak_rss_bytes": 887029760,"peak_footprint_bytes": 712885280,"thermal_state": 0,"gate_probability": 0.0538,"gate_route": "en","median_ms": 1058.619,"rtf": 0.003529,"window_sec": "60","overlap": "0.25","settings": {},"decoder_backend": "CPU","encoder_plans": [{"window": 187,"context": 46,"advance": 95}],"measured_at": "2026-11-11","receipt": "quant6-refresh-20261111/iphone-palette6-long-en.json"},
+    {"device": "iphone","case": "palette6-long-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 486.086,"wer": 0.09523809523809523,"cer": 0.01094391244870041,"word_edits": 8,"reference_words": 84,"peak_rss_bytes": 708952064,"peak_footprint_bytes": 680969176,"thermal_state": 0,"gate_probability": 0.9802,"gate_route": "other","median_ms": 238.1,"rtf": 0.00466,"window_sec": "60","overlap": "0.25","settings": {},"decoder_backend": "CPU","encoder_plans": [{"window": 187,"context": 46,"advance": 95}],"measured_at": "2026-11-11","receipt": "quant6-refresh-20261111/iphone-palette6-long-fr.json"},
+    {"device": "iphone","case": "units-all-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 1368.398,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 675725312,"thermal_state": 0,"gate_probability": 0.0342,"gate_route": "en","median_ms": 53.732,"rtf": 0.004885,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "all"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "units-all-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 521.265,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 696139776,"thermal_state": 0,"gate_probability": 0.9392,"gate_route": "other","median_ms": 44.957,"rtf": 0.013798,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "all"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "hybrid-metal-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 592.218,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 697958400,"gate_probability": 0.0342,"gate_route": "en","median_ms": 60.229,"rtf": 0.005475,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "mac","case": "owned-hybrid-metal-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 235.425,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 157204480,"gate_probability": 0.0342,"gate_route": "en","median_ms": 43.288,"rtf": 0.003935,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_ONLY": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "mac","case": "hybrid-metal-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 351.137,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 695582720,"gate_probability": 0.9392,"gate_route": "other","median_ms": 37.033,"rtf": 0.011366,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "mac","case": "owned-hybrid-metal-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 233.575,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 155844608,"gate_probability": 0.9392,"gate_route": "other","median_ms": 46.739,"rtf": 0.014345,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_ONLY": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "mac","case": "unwindowed-decoder-en","language": "auto","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 352.936,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 2192834560,"gate_probability": 0.0534,"gate_route": "en","decoder_dispatches": [227,227,227,227],"median_ms": 998.211,"rtf": 0.016637,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1"},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "mac","case": "unwindowed-decoder-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 345.72,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"peak_rss_bytes": 2116911104,"gate_probability": 0.9802,"gate_route": "other","decoder_dispatches": [277,277,277,277],"median_ms": 813.67,"rtf": 0.015923,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1"},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "mac","case": "only-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 225.276,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 150470656,"gate_probability": 0.0342,"gate_route": "en","median_ms": 35.032,"rtf": 0.003185,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_ONLY": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "only-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 222.251,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 146866176,"gate_probability": 0.9392,"gate_route": "other","median_ms": 29.77,"rtf": 0.009137,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_ONLY": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "hybrid-metal-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 973.192,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 698646528,"thermal_state": 0,"gate_probability": 0.0342,"gate_route": "en","median_ms": 94.709,"rtf": 0.00861,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "iphone","case": "owned-hybrid-metal-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 324.544,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 157630464,"thermal_state": 0,"gate_probability": 0.0342,"gate_route": "en","median_ms": 102.267,"rtf": 0.009297,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_ONLY": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "iphone","case": "hybrid-metal-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 460.764,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 696532992,"thermal_state": 0,"gate_probability": 0.9392,"gate_route": "other","median_ms": 69.555,"rtf": 0.021347,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "iphone","case": "owned-hybrid-metal-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 321.314,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 155189248,"thermal_state": 0,"gate_probability": 0.9392,"gate_route": "other","median_ms": 62.583,"rtf": 0.019207,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_ONLY": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "iphone","case": "unwindowed-decoder-en","language": "auto","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 480.163,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 2192113664,"thermal_state": 0,"gate_probability": 0.0534,"gate_route": "en","decoder_dispatches": [227,227,227,227],"median_ms": 1740.688,"rtf": 0.029011,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1"},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "iphone","case": "unwindowed-decoder-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 501.776,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"peak_rss_bytes": 2115829760,"thermal_state": 0,"gate_probability": 0.9802,"gate_route": "other","decoder_dispatches": [277,277,277,277],"median_ms": 1561.144,"rtf": 0.030551,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1"},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "iphone","case": "decoder-units-all","language": "en","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 821.309,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 699482112,"thermal_state": 0,"decoder_dispatches": [46,46,46,46],"median_ms": 84.213,"rtf": 0.007656,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "all","PARAKEET_ANE_BATCH_DECODE": "1"},"decoder_backend": "coreml-all","encoder_plans": []},
+    {"device": "iphone","case": "decoder-units-cpu_and_ane","language": "en","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 501.101,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 689881088,"thermal_state": 0,"decoder_dispatches": [46,46,46,46],"median_ms": 83.595,"rtf": 0.0076,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_ane","PARAKEET_ANE_BATCH_DECODE": "1"},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "iphone","case": "only-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 347.426,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 157138944,"thermal_state": 0,"gate_probability": 0.0342,"gate_route": "en","median_ms": 52.171,"rtf": 0.004743,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_ONLY": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "q8-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 519.657,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 409731072,"thermal_state": 0,"gate_probability": 0.0342,"gate_route": "en","median_ms": 44.11,"rtf": 0.00401,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "palette6-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 934.032,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 699006976,"thermal_state": 0,"gate_probability": 0.0347,"gate_route": "en","median_ms": 54.138,"rtf": 0.004922,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "only-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 359.876,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 153436160,"thermal_state": 0,"gate_probability": 0.9392,"gate_route": "other","median_ms": 39.13,"rtf": 0.012009,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_ONLY": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "q8-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 408.311,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 406896640,"thermal_state": 0,"gate_probability": 0.9392,"gate_route": "other","median_ms": 34.423,"rtf": 0.010565,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "palette6-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 639.874,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 696647680,"thermal_state": 0,"gate_probability": 0.938,"gate_route": "other","median_ms": 40.308,"rtf": 0.012371,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "coreml-silence","language": "auto","audio_seconds": 0.8,"timed_runs": 1,"warmup_runs": 0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 507.205,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 0,"peak_rss_bytes": 695664640,"thermal_state": 0,"gate_probability": 0.5347,"gate_route": "en","median_ms": 120.115,"rtf": 0.150144,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "coreml-partial","language": "auto","audio_seconds": 0.8,"timed_runs": 1,"warmup_runs": 0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 470.013,"peak_rss_bytes": 695582720,"thermal_state": 0,"gate_probability": 0.201,"gate_route": "en","median_ms": 47.473,"rtf": 0.059341,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "coreml-stability","language": "auto","audio_seconds": 7.290875,"timed_runs": 1,"warmup_runs": 0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 462.281,"peak_rss_bytes": 695779328,"thermal_state": 0,"gate_probability": 0.96,"gate_route": "other","median_ms": 84.388,"rtf": 0.011574,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "crossover-15-coreml","language": "en","audio_seconds": 15.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 462.067,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 690749440,"thermal_state": 0,"decoder_dispatches": [60,60,60,60],"median_ms": 120.495,"rtf": 0.008033,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane"},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "iphone","case": "crossover-15-host","language": "en","audio_seconds": 15.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 462.934,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 697679872,"thermal_state": 0,"median_ms": 62.326,"rtf": 0.004155,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane","PARAKEET_ANE_DECODE_HOST": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "crossover-15-cpu","language": "en","audio_seconds": 15.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 462.644,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 710115328,"thermal_state": 0,"decoder_dispatches": [60,60,60,60],"median_ms": 293.659,"rtf": 0.019577,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_only"},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "iphone","case": "crossover-60-coreml","language": "en","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 481.322,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 696238080,"thermal_state": 0,"decoder_dispatches": [72,72,72,72],"median_ms": 189.442,"rtf": 0.003157,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane"},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "iphone","case": "crossover-60-host","language": "en","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 462.537,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 707297280,"thermal_state": 0,"median_ms": 183.799,"rtf": 0.003063,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane","PARAKEET_ANE_DECODE_HOST": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "crossover-60-cpu","language": "en","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 500.179,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 715669504,"thermal_state": 0,"decoder_dispatches": [72,72,72,72],"median_ms": 472.687,"rtf": 0.007878,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_only"},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "iphone","case": "crossover-120-coreml","language": "en","audio_seconds": 120.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 491.264,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"peak_rss_bytes": 699924480,"thermal_state": 0,"decoder_dispatches": [72,72,72,72],"median_ms": 266.508,"rtf": 0.002221,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane"},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "iphone","case": "crossover-120-host","language": "en","audio_seconds": 120.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 476.238,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"peak_rss_bytes": 709443584,"thermal_state": 0,"median_ms": 370.472,"rtf": 0.003087,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane","PARAKEET_ANE_DECODE_HOST": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "crossover-120-cpu","language": "en","audio_seconds": 120.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 506.432,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"peak_rss_bytes": 719208448,"thermal_state": 0,"decoder_dispatches": [72,72,72,72],"median_ms": 767.372,"rtf": 0.006395,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_only"},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "iphone","case": "crossover-240-coreml","language": "en","audio_seconds": 240.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 503.311,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 352,"peak_rss_bytes": 712392704,"thermal_state": 0,"decoder_dispatches": [77,77,77,77],"median_ms": 431.051,"rtf": 0.001796,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane"},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "iphone","case": "crossover-240-host","language": "en","audio_seconds": 240.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 483.234,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 352,"peak_rss_bytes": 718831616,"thermal_state": 0,"median_ms": 747.148,"rtf": 0.003113,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_and_ane","PARAKEET_ANE_DECODE_HOST": "1"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "crossover-240-cpu","language": "en","audio_seconds": 240.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 511.713,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 352,"peak_rss_bytes": 731856896,"thermal_state": 0,"decoder_dispatches": [76,76,76,76],"median_ms": 946.522,"rtf": 0.003944,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_ANE_BATCH_DECODE": "1","PARAKEET_COREML_DECODER_COMPUTE_UNITS": "cpu_only"},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "mac","case": "hybrid-unwindowed-en","language": "auto","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu-gpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 228.136,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 3068166144,"peak_footprint_bytes": 891930400,"gate_probability": 0.0534,"gate_route": "en","median_ms": 377.017,"rtf": 0.006284,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_COREML_ONLY": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "mac","case": "unwindowed-coreml-en","language": "auto","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu-gpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 351.511,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 2708946944,"peak_footprint_bytes": 1383794800,"gate_probability": 0.0534,"gate_route": "en","median_ms": 361.061,"rtf": 0.006018,"window_sec": "0","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "unwindowed-coreml-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu-gpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 344.806,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"peak_rss_bytes": 3035807744,"peak_footprint_bytes": 1469483120,"gate_probability": 0.9802,"gate_route": "other","median_ms": 365.478,"rtf": 0.007152,"window_sec": "0","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "hybrid-unwindowed-en","language": "auto","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 824.835,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 1596555264,"peak_footprint_bytes": 657065616,"thermal_state": 0,"gate_probability": 0.0534,"gate_route": "en","median_ms": 1443.283,"rtf": 0.024055,"window_sec": "0","overlap": "auto","settings": {"PARAKEET_COREML_ONLY": "1"},"decoder_backend": "MTL0","encoder_plans": []},
+    {"device": "iphone","case": "unwindowed-coreml-en","language": "auto","audio_seconds": 60.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 499.722,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 88,"peak_rss_bytes": 2181234688,"peak_footprint_bytes": 1173735464,"thermal_state": 0,"gate_probability": 0.0534,"gate_route": "en","median_ms": 1410.852,"rtf": 0.023514,"window_sec": "0","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "unwindowed-coreml-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 487.062,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"peak_rss_bytes": 2081931264,"peak_footprint_bytes": 1099761608,"thermal_state": 0,"gate_probability": 0.9802,"gate_route": "other","median_ms": 1199.189,"rtf": 0.023468,"window_sec": "0","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "coreml-long-en","language": "auto","audio_seconds": 300.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 691.993,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 440,"peak_rss_bytes": 756924416,"peak_footprint_bytes": 730793280,"gate_probability": 0.0534,"gate_route": "en","median_ms": 730.392,"rtf": 0.002435,"window_sec": "60","overlap": "0.25","settings": {},"decoder_backend": "CPU","encoder_plans": [{"window": 187,"context": 46,"advance": 95}]},
+    {"device": "mac","case": "coreml-long-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 328.713,"wer": 0.09523809523809523,"cer": 0.01094391244870041,"word_edits": 8,"reference_words": 84,"peak_rss_bytes": 705609728,"peak_footprint_bytes": 715441424,"gate_probability": 0.9802,"gate_route": "other","median_ms": 154.333,"rtf": 0.00302,"window_sec": "60","overlap": "0.25","settings": {},"decoder_backend": "CPU","encoder_plans": [{"window": 187,"context": 46,"advance": 95}]},
+    {"device": "mac","case": "units-cpu_and_gpu-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu-gpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 238.287,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 3129606144,"peak_footprint_bytes": 942033320,"gate_probability": 0.0343,"gate_route": "en","median_ms": 120.904,"rtf": 0.010991,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_gpu"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "units-cpu_and_gpu-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu-gpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 235.68,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 3061727232,"peak_footprint_bytes": 874170696,"gate_probability": 0.9397,"gate_route": "other","median_ms": 85.012,"rtf": 0.026091,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_gpu"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "units-cpu_only-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 228.895,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 2262827008,"peak_footprint_bytes": 770738408,"gate_probability": 0.0343,"gate_route": "en","median_ms": 156.535,"rtf": 0.01423,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_only"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "units-cpu_only-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 237.368,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 2016870400,"peak_footprint_bytes": 698877992,"gate_probability": 0.9397,"gate_route": "other","median_ms": 61.507,"rtf": 0.018877,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_only"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "decoder-units-cpu_and_gpu","language": "en","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu-gpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 235.011,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 1968979968,"peak_footprint_bytes": 831031240,"decoder_dispatches": [46,46,46,46],"median_ms": 77.482,"rtf": 0.007044,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_gpu","PARAKEET_ANE_BATCH_DECODE": "1"},"decoder_backend": "coreml-cpu-gpu","encoder_plans": []},
+    {"device": "mac","case": "decoder-units-cpu_only","language": "en","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 233.75,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 1738719232,"peak_footprint_bytes": 771164128,"decoder_dispatches": [46,46,46,46],"median_ms": 110.124,"rtf": 0.010011,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_only","PARAKEET_ANE_BATCH_DECODE": "1"},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "iphone","case": "coreml-long-en","language": "auto","audio_seconds": 300.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 439.957,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 440,"peak_rss_bytes": 758366208,"peak_footprint_bytes": 728220608,"thermal_state": 0,"gate_probability": 0.0534,"gate_route": "en","median_ms": 996.889,"rtf": 0.003323,"window_sec": "60","overlap": "0.25","settings": {},"decoder_backend": "CPU","encoder_plans": [{"window": 187,"context": 46,"advance": 95}]},
+    {"device": "iphone","case": "coreml-long-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 440.445,"wer": 0.09523809523809523,"cer": 0.01094391244870041,"word_edits": 8,"reference_words": 84,"peak_rss_bytes": 707985408,"peak_footprint_bytes": 680985536,"thermal_state": 0,"gate_probability": 0.9802,"gate_route": "other","median_ms": 231.983,"rtf": 0.00454,"window_sec": "60","overlap": "0.25","settings": {},"decoder_backend": "CPU","encoder_plans": [{"window": 187,"context": 46,"advance": 95}]},
+    {"device": "iphone","case": "units-cpu_and_gpu-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 305.197,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 2280488960,"peak_footprint_bytes": 745769072,"thermal_state": 0,"gate_probability": 0.0343,"gate_route": "en","median_ms": 209.268,"rtf": 0.019024,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_gpu"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "units-cpu_and_gpu-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 316.782,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 2166095872,"peak_footprint_bytes": 681445416,"thermal_state": 0,"gate_probability": 0.9397,"gate_route": "other","median_ms": 89.276,"rtf": 0.027399,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_gpu"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "units-cpu_only-en","language": "auto","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 309.085,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 2280538112,"peak_footprint_bytes": 764856408,"thermal_state": 0,"gate_probability": 0.0343,"gate_route": "en","median_ms": 211.689,"rtf": 0.019244,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_only"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "units-cpu_only-fr","language": "auto","audio_seconds": 3.258313,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 314.066,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 2166063104,"peak_footprint_bytes": 681396240,"thermal_state": 0,"gate_probability": 0.9397,"gate_route": "other","median_ms": 90.035,"rtf": 0.027632,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_only"},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "decoder-units-cpu_and_gpu","language": "en","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 312.924,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 1752907776,"peak_footprint_bytes": 749094640,"thermal_state": 0,"decoder_dispatches": [46,46,46,46],"median_ms": 321.033,"rtf": 0.029185,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_gpu","PARAKEET_ANE_BATCH_DECODE": "1"},"decoder_backend": "coreml-cpu-gpu","encoder_plans": []},
+    {"device": "iphone","case": "decoder-units-cpu_only","language": "en","audio_seconds": 11.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 304.722,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 1752924160,"peak_footprint_bytes": 749094664,"thermal_state": 0,"decoder_dispatches": [46,46,46,46],"median_ms": 332.58,"rtf": 0.030235,"window_sec": "auto","overlap": "auto","settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_only","PARAKEET_ANE_BATCH_DECODE": "1"},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "mac","case": "coreml-en-auto","language": "auto","audio_seconds": 11.0,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 352.01,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 690864128,"peak_footprint_bytes": 700663056,"gate_probability": 0.0342,"gate_route": "en","median_ms": 34.784,"rtf": 0.003162,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "coreml-fr-auto","language": "auto","audio_seconds": 3.258313,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 348.897,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 687767552,"peak_footprint_bytes": 697550072,"gate_probability": 0.9392,"gate_route": "other","median_ms": 30.144,"rtf": 0.009251,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "coreml-en-en","language": "en","audio_seconds": 11.0,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 340.934,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 689881088,"peak_footprint_bytes": 699598048,"median_ms": 22.113,"rtf": 0.00201,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "coreml-fr-other","language": "other","audio_seconds": 3.258313,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 344.741,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 686833664,"peak_footprint_bytes": 696583368,"median_ms": 18.407,"rtf": 0.005649,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "mac","case": "auto-window-coreml-long-en","language": "auto","audio_seconds": 300.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 351.692,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 440,"peak_rss_bytes": 731004928,"peak_footprint_bytes": 721388768,"gate_probability": 0.0534,"gate_route": "en","decoder_dispatches": [130,130,130,130],"median_ms": 386.384,"rtf": 0.001288,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "mac","case": "auto-window-coreml-long-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 329.936,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 84,"peak_rss_bytes": 708165632,"peak_footprint_bytes": 699155656,"gate_probability": 0.9802,"gate_route": "other","decoder_dispatches": [68,68,68,68],"median_ms": 115.522,"rtf": 0.002261,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "coreml-cpu","encoder_plans": []},
+    {"device": "iphone","case": "coreml-en-auto","language": "auto","audio_seconds": 11.0,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 983.172,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 675840000,"peak_footprint_bytes": 671974360,"thermal_state": 0,"gate_probability": 0.0342,"gate_route": "en","median_ms": 48.712,"rtf": 0.004428,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "coreml-fr-auto","language": "auto","audio_seconds": 3.258313,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 441.208,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 696090624,"peak_footprint_bytes": 668828632,"thermal_state": 0,"gate_probability": 0.9392,"gate_route": "other","median_ms": 38.869,"rtf": 0.011929,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "coreml-en-en","language": "en","audio_seconds": 11.0,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 438.995,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"peak_rss_bytes": 696532992,"peak_footprint_bytes": 669205440,"thermal_state": 0,"median_ms": 35.567,"rtf": 0.003233,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "coreml-fr-other","language": "other","audio_seconds": 3.258313,"timed_runs": 5,"warmup_runs": 2,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 434.738,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"peak_rss_bytes": 694337536,"peak_footprint_bytes": 667009984,"thermal_state": 0,"median_ms": 26.778,"rtf": 0.008218,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []},
+    {"device": "iphone","case": "auto-window-coreml-long-en","language": "auto","audio_seconds": 300.0,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"load_ms": 436.358,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 440,"peak_rss_bytes": 722944000,"peak_footprint_bytes": 695993280,"thermal_state": 0,"gate_probability": 0.0534,"gate_route": "en","decoder_dispatches": [130,130,130,130],"median_ms": 557.714,"rtf": 0.001859,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "coreml-ane","encoder_plans": []},
+    {"device": "iphone","case": "auto-window-coreml-long-fr","language": "auto","audio_seconds": 51.09975,"timed_runs": 3,"warmup_runs": 1,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"load_ms": 422.619,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 84,"peak_rss_bytes": 709033984,"peak_footprint_bytes": 681640872,"thermal_state": 0,"gate_probability": 0.9802,"gate_route": "other","median_ms": 207.028,"rtf": 0.004051,"window_sec": "auto","overlap": "auto","settings": {},"decoder_backend": "CPU","encoder_plans": []}
+  ],
+  "streaming": [
+    {"device": "mac","wav": "jfk.wav","backend": "cpu","language": "en","mode": "push","inference_ms": [1120.3,1123.9,1135.2],"median_ms": 1123.9,"peak_rss_bytes": [984399872,984367104,984170496],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "jfk.wav","backend": "metal","language": "en","mode": "push","inference_ms": [250.2,239.3,240.4],"median_ms": 240.4,"peak_rss_bytes": [752156672,752025600,752238592],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "fr-multipiece-16k.wav","backend": "cpu","language": "other","mode": "push","inference_ms": [98.7,98.7,98.5],"median_ms": 98.7,"peak_rss_bytes": [758185984,758218752,758185984],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "fr-multipiece-16k.wav","backend": "metal","language": "other","mode": "push","inference_ms": [55.2,46.7,64.2],"median_ms": 55.2,"peak_rss_bytes": [737820672,738033664,737984512],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "en-60s.wav","backend": "cpu","language": "auto","mode": "push","inference_ms": [11523.5,12014.8,12258.7],"median_ms": 12014.8,"peak_rss_bytes": [1049313280,1049247744,1049296896],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "en-60s.wav","backend": "metal","language": "auto","mode": "push","inference_ms": [1929.9,1825.9,1816.7],"median_ms": 1825.9,"peak_rss_bytes": [760037376,761593856,760315904],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "fr-long.wav","backend": "cpu","language": "auto","mode": "push","inference_ms": [10238.4,10515.2,10616.5],"median_ms": 10515.2,"peak_rss_bytes": [1074167808,1074380800,1074233344],"repeats_identical": true,"wer": 0.07142857142857142,"cer": 0.008207934336525308},
+    {"device": "mac","wav": "fr-long.wav","backend": "metal","language": "auto","mode": "push","inference_ms": [1621.4,1560.8,1594.6],"median_ms": 1594.6,"peak_rss_bytes": [763412480,759382016,761856000],"repeats_identical": true,"wer": 0.07142857142857142,"cer": 0.008207934336525308},
+    {"device": "iphone","wav": "jfk.wav","backend": "cpu","language": "en","mode": "push","inference_ms": [3636.3,3766.8,3852.3],"median_ms": 3766.8,"peak_rss_bytes": [989347840,989265920,989298688],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "jfk.wav","backend": "metal","language": "en","mode": "push","inference_ms": [478.1,472.4,469.2],"median_ms": 472.4,"peak_rss_bytes": [692338688,692322304,692289536],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "fr-multipiece-16k.wav","backend": "cpu","language": "other","mode": "push","inference_ms": [307.8,310.9,325.8],"median_ms": 310.9,"peak_rss_bytes": [696401920,696385536,696451072],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "fr-multipiece-16k.wav","backend": "metal","language": "other","mode": "push","inference_ms": [75.6,80.6,74.4],"median_ms": 75.6,"peak_rss_bytes": [676282368,676265984,676265984],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "en-60s.wav","backend": "cpu","language": "auto","mode": "push","inference_ms": [51964.1,51464.8,51461.0],"median_ms": 51464.8,"peak_rss_bytes": [1166737408,1166704640,1166704640],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "en-60s.wav","backend": "metal","language": "auto","mode": "push","inference_ms": [5407.1,5315.8,5335.4],"median_ms": 5335.4,"peak_rss_bytes": [702676992,702578688,702578688],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "fr-long.wav","backend": "metal","language": "auto","mode": "push","inference_ms": [3231.5,3294.2,3337.2],"median_ms": 3294.2,"peak_rss_bytes": [704233472,704348160,704430080],"repeats_identical": true,"wer": 0.07142857142857142,"cer": 0.008207934336525308},
+    {"device": "iphone","wav": "fr-long.wav","backend": "cpu","language": "auto","mode": "push","inference_ms": [31849.0,31786.4],"median_ms": 31817.7,"peak_rss_bytes": [1167966208,1167917056],"repeats_identical": true,"wer": 0.07142857142857142,"cer": 0.008207934336525308,"thermal_states": [0,0],"excluded_thermal_repeats": [1]},
+    {"device": "mac","wav": "jfk.wav","backend": "cpu","language": "en","mode": "callback","inference_ms": [322.7,321.5,321.3],"median_ms": 321.5,"peak_rss_bytes": [825032704,825065472,825098240],"peak_footprint_bytes": [836977960,837010728,837043496],"encoder_placements": ["CPU","CPU","CPU"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "jfk.wav","backend": "metal","language": "en","mode": "callback","inference_ms": [93.0,98.3,89.4],"median_ms": 93.0,"peak_rss_bytes": [740622336,740737024,740638720],"peak_footprint_bytes": [754615616,754697488,754599184],"encoder_placements": ["MTL0","MTL0","MTL0"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "jfk.wav","backend": "coreml","language": "en","mode": "callback","inference_ms": [483.9,480.7,454.4],"median_ms": 480.7,"peak_rss_bytes": [2625781760,2625716224,2625798144],"peak_footprint_bytes": [899319824,900073512,895436816],"encoder_placements": ["coreml-cpu-gpu","coreml-cpu-gpu","coreml-cpu-gpu"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "jfk.wav","backend": "coreml","language": "en","mode": "push","inference_ms": [703.0,710.9,707.8],"median_ms": 707.8,"peak_rss_bytes": [2635907072,2636120064,2635972608],"peak_footprint_bytes": [906283048,906053648,906610704],"encoder_placements": ["coreml-cpu-gpu","coreml-cpu-gpu","coreml-cpu-gpu"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "fr-multipiece-16k.wav","backend": "cpu","language": "other","mode": "callback","inference_ms": [99.5,100.7,99.7],"median_ms": 99.7,"peak_rss_bytes": [757497856,758824960,757399552],"peak_footprint_bytes": [769410296,770737400,769311992],"encoder_placements": ["CPU","CPU","CPU"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "fr-multipiece-16k.wav","backend": "metal","language": "other","mode": "callback","inference_ms": [63.4,51.0,51.4],"median_ms": 51.4,"peak_rss_bytes": [737017856,737001472,736919552],"peak_footprint_bytes": [750847224,750830840,750765328],"encoder_placements": ["MTL0","MTL0","MTL0"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "fr-multipiece-16k.wav","backend": "coreml","language": "other","mode": "callback","inference_ms": [473.1,469.9,464.8],"median_ms": 469.9,"peak_rss_bytes": [2629419008,2629812224,2629386240],"peak_footprint_bytes": [897321000,897255512,897239032],"encoder_placements": ["coreml-cpu-gpu","coreml-cpu-gpu","coreml-cpu-gpu"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "fr-multipiece-16k.wav","backend": "coreml","language": "other","mode": "push","inference_ms": [468.7,463.7,459.7],"median_ms": 463.7,"peak_rss_bytes": [2639806464,2639724544,2639626240],"peak_footprint_bytes": [883673176,885327888,885082104],"encoder_placements": ["coreml-cpu-gpu","coreml-cpu-gpu","coreml-cpu-gpu"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "en-60s.wav","backend": "cpu","language": "auto","mode": "callback","inference_ms": [2612.0,2654.1,2693.8],"median_ms": 2654.1,"peak_rss_bytes": [1390428160,1389232128,1389199360],"peak_footprint_bytes": [1401898688,1400719064,1400653504],"encoder_placements": ["CPU","CPU","CPU"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "en-60s.wav","backend": "metal","language": "auto","mode": "callback","inference_ms": [437.7,439.0,434.5],"median_ms": 437.7,"peak_rss_bytes": [762806272,763002880,762871808],"peak_footprint_bytes": [776684864,776881472,776750400],"encoder_placements": ["MTL0","MTL0","MTL0"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "en-60s.wav","backend": "coreml","language": "auto","mode": "callback","inference_ms": [2234.6,890.2,905.9],"median_ms": 905.9,"peak_rss_bytes": [3416571904,3417210880,3417227264],"peak_footprint_bytes": [1392560720,1396656744,1393183384],"encoder_placements": ["coreml-cpu-gpu","coreml-cpu-gpu","coreml-cpu-gpu"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "en-60s.wav","backend": "coreml","language": "auto","mode": "push","inference_ms": [2387.5,2365.6,2393.2],"median_ms": 2387.5,"peak_rss_bytes": [3287597056,3287646208,3287678976],"peak_footprint_bytes": [926893856,926959392,926975800],"encoder_placements": ["coreml-cpu-gpu","coreml-cpu-gpu","coreml-cpu-gpu"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "mac","wav": "fr-long.wav","backend": "cpu","language": "auto","mode": "callback","inference_ms": [2283.5,2336.2,2380.6],"median_ms": 2336.2,"peak_rss_bytes": [1313783808,1313652736,1313734656],"peak_footprint_bytes": [1325123216,1325024936,1325074112],"encoder_placements": ["CPU","CPU","CPU"],"repeats_identical": true,"wer": 0.13095238095238096,"cer": 0.015047879616963064},
+    {"device": "mac","wav": "fr-long.wav","backend": "metal","language": "auto","mode": "callback","inference_ms": [408.2,407.1,401.0],"median_ms": 407.1,"peak_rss_bytes": [759709696,759906304,759775232],"peak_footprint_bytes": [773588312,773784920,773637440],"encoder_placements": ["MTL0","MTL0","MTL0"],"repeats_identical": true,"wer": 0.13095238095238096,"cer": 0.015047879616963064},
+    {"device": "mac","wav": "fr-long.wav","backend": "coreml","language": "auto","mode": "callback","inference_ms": [2210.6,913.8,911.6],"median_ms": 913.8,"peak_rss_bytes": [3422535680,3423256576,3423191040],"peak_footprint_bytes": [1399179856,1388038736,1399638608],"encoder_placements": ["coreml-cpu-gpu","coreml-cpu-gpu","coreml-cpu-gpu"],"repeats_identical": true,"wer": 0.13095238095238096,"cer": 0.015047879616963064},
+    {"device": "mac","wav": "fr-long.wav","backend": "coreml","language": "auto","mode": "push","inference_ms": [2869.9,2101.1,2110.6],"median_ms": 2110.6,"peak_rss_bytes": [3291037696,3291119616,3291070464],"peak_footprint_bytes": [926336824,926402336,926369544],"encoder_placements": ["coreml-cpu-gpu","coreml-cpu-gpu","coreml-cpu-gpu"],"repeats_identical": true,"wer": 0.07142857142857142,"cer": 0.008207934336525308},
+    {"device": "iphone","wav": "jfk.wav","backend": "cpu","language": "en","mode": "callback","inference_ms": [971.7,970.1,1001.4],"median_ms": 971.7,"peak_rss_bytes": [767295488,767262720,767311872],"peak_footprint_bytes": [754385928,754435056,754615328],"encoder_placements": ["CPU","CPU","CPU"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "jfk.wav","backend": "metal","language": "en","mode": "callback","inference_ms": [155.5,152.0,152.9],"median_ms": 152.9,"peak_rss_bytes": [680083456,680050688,679804928],"peak_footprint_bytes": [669451200,669434816,669369328],"encoder_placements": ["MTL0","MTL0","MTL0"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "jfk.wav","backend": "coreml","language": "en","mode": "callback","inference_ms": [274.5,277.9,270.6],"median_ms": 274.5,"peak_rss_bytes": [1739440128,1739341824,1739407360],"peak_footprint_bytes": [711280416,730203840,730302240],"encoder_placements": ["coreml-cpu","coreml-cpu","coreml-cpu"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "jfk.wav","backend": "coreml","language": "en","mode": "push","inference_ms": [669.2,677.6,688.2],"median_ms": 677.6,"peak_rss_bytes": [1839382528,1839316992,1839431680],"peak_footprint_bytes": [827721528,829966208,827803400],"encoder_placements": ["coreml-cpu","coreml-cpu","coreml-cpu"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "fr-multipiece-16k.wav","backend": "cpu","language": "other","mode": "callback","inference_ms": [326.5,325.5,325.7],"median_ms": 325.7,"peak_rss_bytes": [695812096,695762944,695779328],"peak_footprint_bytes": [684360688,684229640,684262336],"encoder_placements": ["CPU","CPU","CPU"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "fr-multipiece-16k.wav","backend": "metal","language": "other","mode": "callback","inference_ms": [80.7,80.3,79.6],"median_ms": 80.3,"peak_rss_bytes": [674152448,674250752,674086912],"peak_footprint_bytes": [664634256,664519568,664568720],"encoder_placements": ["MTL0","MTL0","MTL0"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "fr-multipiece-16k.wav","backend": "coreml","language": "other","mode": "callback","inference_ms": [404.7,185.2,194.8],"median_ms": 194.8,"peak_rss_bytes": [1669873664,1669808128,1669922816],"peak_footprint_bytes": [661439400,661406632,661275584],"encoder_placements": ["coreml-cpu","coreml-cpu","coreml-cpu"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "fr-multipiece-16k.wav","backend": "coreml","language": "other","mode": "push","inference_ms": [198.8,191.3,196.1],"median_ms": 196.1,"peak_rss_bytes": [1673625600,1673527296,1673641984],"peak_footprint_bytes": [678151824,677987984,678119056],"encoder_placements": ["coreml-cpu","coreml-cpu","coreml-cpu"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "en-60s.wav","backend": "cpu","language": "auto","mode": "callback","inference_ms": [8372.7,8742.4,8967.1],"median_ms": 8742.4,"peak_rss_bytes": [1347305472,1347338240,1347321856],"peak_footprint_bytes": [1313146272,1313244576,1313146248],"encoder_placements": ["CPU","CPU","CPU"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "en-60s.wav","backend": "metal","language": "auto","mode": "callback","inference_ms": [866.5,862.9,862.6],"median_ms": 862.9,"peak_rss_bytes": [700792832,700710912,700727296],"peak_footprint_bytes": [687424568,687178760,687293448],"encoder_placements": ["MTL0","MTL0","MTL0"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "en-60s.wav","backend": "coreml","language": "auto","mode": "callback","inference_ms": [2649.4,2066.8,1975.9],"median_ms": 2066.8,"peak_rss_bytes": [2773762048,2773794816,2773860352],"peak_footprint_bytes": [1170147776,1172310464,1170344456],"encoder_placements": ["coreml-cpu","coreml-cpu","coreml-cpu"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "en-60s.wav","backend": "coreml","language": "auto","mode": "push","inference_ms": [7310.8,7985.9,4961.5],"median_ms": 7310.8,"peak_rss_bytes": [2416312320,2416361472,2416541696],"peak_footprint_bytes": [834521368,834488504,835045608],"encoder_placements": ["coreml-cpu","coreml-cpu","coreml-cpu"],"repeats_identical": true,"wer": 0.0,"cer": 0.0},
+    {"device": "iphone","wav": "fr-long.wav","backend": "cpu","language": "auto","mode": "callback","inference_ms": [6913.1,7230.8,7469.8],"median_ms": 7230.8,"peak_rss_bytes": [1258749952,1258717184,1258782720],"peak_footprint_bytes": [1225262448,1225246112,1225229680],"encoder_placements": ["CPU","CPU","CPU"],"repeats_identical": true,"wer": 0.13095238095238096,"cer": 0.015047879616963064},
+    {"device": "iphone","wav": "fr-long.wav","backend": "metal","language": "auto","mode": "callback","inference_ms": [778.3,781.1,783.0],"median_ms": 781.1,"peak_rss_bytes": [697352192,697401344,697434112],"peak_footprint_bytes": [684459016,684508240,693896248],"encoder_placements": ["MTL0","MTL0","MTL0"],"repeats_identical": true,"wer": 0.13095238095238096,"cer": 0.015047879616963064},
+    {"device": "iphone","wav": "fr-long.wav","backend": "coreml","language": "auto","mode": "callback","inference_ms": [2674.1,1743.9,1720.5],"median_ms": 1743.9,"peak_rss_bytes": [2705850368,2705784832,2705670144],"peak_footprint_bytes": [1105611200,1105562000,1103251904],"encoder_placements": ["coreml-cpu","coreml-cpu","coreml-cpu"],"repeats_identical": true,"wer": 0.13095238095238096,"cer": 0.015047879616963064},
+    {"device": "iphone","wav": "fr-long.wav","backend": "coreml","language": "auto","mode": "push","inference_ms": [6265.6,6953.1,4153.6],"median_ms": 6265.6,"peak_rss_bytes": [2418278400,2418262016,2418556928],"peak_footprint_bytes": [834111672,834046160,834341096],"encoder_placements": ["coreml-cpu","coreml-cpu","coreml-cpu"],"repeats_identical": true,"wer": 0.07142857142857142,"cer": 0.008207934336525308}
+  ],
+  "warm_streaming": [
+    {"device": "mac","backend": "metal","mode": "callback","audio_seconds": 51.09975,"first_ms": 443.729,"warm_ms": [368.853,376.401,392.837],"warm_median_ms": 376.401,"encoder_backend": "MTL0","text_identical": true,"thermal_state": null},
+    {"device": "mac","backend": "metal","mode": "push","audio_seconds": 51.09975,"first_ms": 1686.501,"warm_ms": [1703.536,1701.656,1711.56],"warm_median_ms": 1703.536,"encoder_backend": "MTL0","text_identical": true,"thermal_state": null},
+    {"device": "mac","backend": "coreml","mode": "callback","audio_seconds": 51.09975,"first_ms": 5003.898,"warm_ms": [469.328,445.996,446.621],"warm_median_ms": 446.621,"encoder_backend": "coreml-cpu-gpu","text_identical": true,"thermal_state": null},
+    {"device": "mac","backend": "coreml","mode": "push","audio_seconds": 51.09975,"first_ms": 3558.309,"warm_ms": [1742.763,1680.924,1714.85],"warm_median_ms": 1714.85,"encoder_backend": "coreml-cpu-gpu","text_identical": true,"thermal_state": null},
+    {"device": "iphone","backend": "metal","mode": "callback","audio_seconds": 51.09975,"first_ms": 828.003,"warm_ms": [714.71,715.155,713.322],"warm_median_ms": 714.71,"encoder_backend": "MTL0","text_identical": true,"thermal_state": 0},
+    {"device": "iphone","backend": "metal","mode": "push","audio_seconds": 51.09975,"first_ms": 3160.386,"warm_ms": [3159.336,3159.067,3154.442],"warm_median_ms": 3159.067,"encoder_backend": "MTL0","text_identical": true,"thermal_state": 0},
+    {"device": "iphone","backend": "coreml","mode": "callback","audio_seconds": 51.09975,"first_ms": 1724.679,"warm_ms": [1234.707,1269.898,1283.092],"warm_median_ms": 1269.898,"encoder_backend": "coreml-cpu","text_identical": true,"thermal_state": 0},
+    {"device": "iphone","backend": "coreml","mode": "push","audio_seconds": 51.09975,"first_ms": 4525.523,"warm_ms": [4688.949,4759.466,4822.74],"warm_median_ms": 4759.466,"encoder_backend": "coreml-cpu","text_identical": true,"thermal_state": 0}
+  ],
+  "default_chunk_quality": [
+    {"device": "mac","wav": "jfk.wav","language": "auto","chunk_ms": 1000,"native_equal": true,"word_edits": 0,"reference_words": 22,"wer": 0.0,"cer": 0.0,"normalized_exact": true,"requested_chunk_ms": 1000},
+    {"device": "mac","wav": "fr-multipiece-16k.wav","language": "auto","chunk_ms": 1000,"native_equal": true,"word_edits": 0,"reference_words": 7,"wer": 0.0,"cer": 0.0,"normalized_exact": true,"requested_chunk_ms": 1000},
+    {"device": "mac","wav": "fr-long.wav","language": "auto","chunk_ms": 1000,"native_equal": true,"word_edits": 36,"reference_words": 84,"wer": 0.42857142857142855,"cer": 0.3789329685362517,"normalized_exact": false,"requested_chunk_ms": 1000},
+    {"device": "mac","wav": "jfk.wav","language": "other","chunk_ms": 1000,"native_equal": true,"word_edits": 8,"reference_words": 22,"wer": 0.36363636363636365,"cer": 0.3557692307692308,"normalized_exact": false,"requested_chunk_ms": 1000},
+    {"device": "mac","wav": "jfk.wav","language": "auto","requested_chunk_ms": 0,"chunk_ms": 2000,"native_equal": true,"word_edits": 0,"reference_words": 22,"wer": 0.0,"cer": 0.0,"normalized_exact": true},
+    {"device": "mac","wav": "fr-multipiece-16k.wav","language": "auto","requested_chunk_ms": 0,"chunk_ms": 2000,"native_equal": true,"word_edits": 0,"reference_words": 7,"wer": 0.0,"cer": 0.0,"normalized_exact": true},
+    {"device": "mac","wav": "fr-long.wav","language": "auto","requested_chunk_ms": 0,"chunk_ms": 2000,"native_equal": true,"word_edits": 6,"reference_words": 84,"wer": 0.07142857142857142,"cer": 0.008207934336525308,"normalized_exact": false},
+    {"device": "mac","wav": "jfk.wav","language": "other","requested_chunk_ms": 0,"chunk_ms": 2000,"native_equal": true,"word_edits": 0,"reference_words": 22,"wer": 0.0,"cer": 0.0,"normalized_exact": true},
+    {"device": "iphone","wav": "jfk.wav","language": "auto","requested_chunk_ms": 0,"chunk_ms": 2000,"native_equal": true,"word_edits": 0,"reference_words": 22,"wer": 0.0,"cer": 0.0,"normalized_exact": true},
+    {"device": "iphone","wav": "jfk.wav","language": "auto","requested_chunk_ms": 1000,"chunk_ms": 1000,"native_equal": true,"word_edits": 0,"reference_words": 22,"wer": 0.0,"cer": 0.0,"normalized_exact": true},
+    {"device": "iphone","wav": "fr-multipiece-16k.wav","language": "auto","requested_chunk_ms": 0,"chunk_ms": 2000,"native_equal": true,"word_edits": 0,"reference_words": 7,"wer": 0.0,"cer": 0.0,"normalized_exact": true},
+    {"device": "iphone","wav": "fr-multipiece-16k.wav","language": "auto","requested_chunk_ms": 1000,"chunk_ms": 1000,"native_equal": true,"word_edits": 0,"reference_words": 7,"wer": 0.0,"cer": 0.0,"normalized_exact": true},
+    {"device": "iphone","wav": "fr-long.wav","language": "auto","requested_chunk_ms": 0,"chunk_ms": 2000,"native_equal": true,"word_edits": 6,"reference_words": 84,"wer": 0.07142857142857142,"cer": 0.008207934336525308,"normalized_exact": false},
+    {"device": "iphone","wav": "fr-long.wav","language": "auto","requested_chunk_ms": 1000,"chunk_ms": 1000,"native_equal": true,"word_edits": 36,"reference_words": 84,"wer": 0.42857142857142855,"cer": 0.3789329685362517,"normalized_exact": false},
+    {"device": "iphone","wav": "jfk.wav","language": "other","requested_chunk_ms": 0,"chunk_ms": 2000,"native_equal": true,"word_edits": 0,"reference_words": 22,"wer": 0.0,"cer": 0.0,"normalized_exact": true},
+    {"device": "iphone","wav": "jfk.wav","language": "other","requested_chunk_ms": 1000,"chunk_ms": 1000,"native_equal": true,"word_edits": 8,"reference_words": 22,"wer": 0.36363636363636365,"cer": 0.3557692307692308,"normalized_exact": false}
+  ],
+  "compiled_fp16_6bit": {
+    "cases": 18,
+    "groups": [
+      {
+        "precision": "6-bit",
+        "route": "en",
+        "cases": 3,
+        "max_relative_l2": 0.07290649469133914,
+        "max_absolute": 0.11123716831207275
+      },
+      {
+        "precision": "6-bit",
+        "route": "gate",
+        "cases": 3,
+        "max_relative_l2": 0.09436023582708145,
+        "max_absolute": 17.49367332458496
+      },
+      {
+        "precision": "6-bit",
+        "route": "other",
+        "cases": 3,
+        "max_relative_l2": 0.1043209304314607,
+        "max_absolute": 0.04953271150588989
+      },
+      {
+        "precision": "FP16",
+        "route": "en",
+        "cases": 3,
+        "max_relative_l2": 0.057462131670452596,
+        "max_absolute": 0.10403501987457275
+      },
+      {
+        "precision": "FP16",
+        "route": "gate",
+        "cases": 3,
+        "max_relative_l2": 0.08970721172850978,
+        "max_absolute": 16.69894790649414
+      },
+      {
+        "precision": "FP16",
+        "route": "other",
+        "cases": 3,
+        "max_relative_l2": 0.05735801074524091,
+        "max_absolute": 0.03435641527175903
+      }
+    ],
+    "gate_results": [
+      {
+        "wav": "en-15s.wav",
+        "route": "gate",
+        "precision": "FP16",
+        "frames": 188,
+        "relative_l2": 0.08970721172850978,
+        "max_absolute": 16.69894790649414,
+        "reference_gate": 0.04736552760004997,
+        "compiled_gate": 0.04809887707233429,
+        "gate_absolute_error": 0.000733349472284317
+      },
+      {
+        "wav": "en-15s.wav",
+        "route": "gate",
+        "precision": "6-bit",
+        "frames": 188,
+        "relative_l2": 0.09436023582708145,
+        "max_absolute": 17.49367332458496,
+        "reference_gate": 0.04736552760004997,
+        "compiled_gate": 0.048787493258714676,
+        "gate_absolute_error": 0.0014219656586647034
+      },
+      {
+        "wav": "en-partial.wav",
+        "route": "gate",
+        "precision": "FP16",
+        "frames": 10,
+        "relative_l2": 0.03796080748084333,
+        "max_absolute": 4.739894866943359,
+        "reference_gate": 0.20352917909622192,
+        "compiled_gate": 0.20097361505031586,
+        "gate_absolute_error": 0.002555564045906067
+      },
+      {
+        "wav": "en-partial.wav",
+        "route": "gate",
+        "precision": "6-bit",
+        "frames": 10,
+        "relative_l2": 0.045491354170985786,
+        "max_absolute": 5.927394866943359,
+        "reference_gate": 0.20352917909622192,
+        "compiled_gate": 0.21241353452205658,
+        "gate_absolute_error": 0.008884355425834656
+      },
+      {
+        "wav": "fr-multipiece-16k.wav",
+        "route": "gate",
+        "precision": "FP16",
+        "frames": 41,
+        "relative_l2": 0.047466119166559725,
+        "max_absolute": 5.848173141479492,
+        "reference_gate": 0.9396547675132751,
+        "compiled_gate": 0.9391770362854004,
+        "gate_absolute_error": 0.00047773122787475586
+      },
+      {
+        "wav": "fr-multipiece-16k.wav",
+        "route": "gate",
+        "precision": "6-bit",
+        "frames": 41,
+        "relative_l2": 0.05643541228981808,
+        "max_absolute": 7.27374267578125,
+        "reference_gate": 0.9396547675132751,
+        "compiled_gate": 0.9380075335502625,
+        "gate_absolute_error": 0.0016472339630126953
+      }
+    ]
+  },
+  "compiled_fp32": {
+    "cases": 110,
+    "groups": [
+      {
+        "placement": "coreml-cpu",
+        "route": "en",
+        "cases": 16,
+        "max_relative_l2": 6.062118482236681e-07,
+        "max_absolute": 5.960464477539062e-07
+      },
+      {
+        "placement": "coreml-cpu",
+        "route": "gate",
+        "cases": 16,
+        "max_relative_l2": 8.138800994549732e-07,
+        "max_absolute": 9.5367431640625e-05
+      },
+      {
+        "placement": "coreml-cpu",
+        "route": "other",
+        "cases": 16,
+        "max_relative_l2": 1.1238050465994893e-06,
+        "max_absolute": 1.4603137969970703e-06
+      },
+      {
+        "placement": "coreml-cpu-gpu",
+        "route": "en",
+        "cases": 31,
+        "max_relative_l2": 1.1055880877457953e-05,
+        "max_absolute": 2.1651387214660645e-05
+      },
+      {
+        "placement": "coreml-cpu-gpu",
+        "route": "other",
+        "cases": 31,
+        "max_relative_l2": 1.2331092591086114e-05,
+        "max_absolute": 9.2238187789917e-06
+      }
+    ]
+  },
+  "config_regressions": [
+    {"device": "mac","case": "explicit-context-auto","language": "en","audio_seconds": 120.0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 330.8,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"settings": {},"median_ms": 231.773},
+    {"device": "mac","case": "explicit-context-0","language": "en","audio_seconds": 120.0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 328.175,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"settings": {"PARAKEET_ANE_BATCH_DECODE": "0"},"median_ms": 234.104},
+    {"device": "mac","case": "explicit-context-1","language": "en","audio_seconds": 120.0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"encoder_owned_by_coreml": false,"load_ms": 326.133,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"settings": {"PARAKEET_ANE_BATCH_DECODE": "1"},"median_ms": 342.865},
+    {"device": "mac","case": "precise-load-cpu_only-en","language": "en","audio_seconds": 11.0,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 235.883,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_only"},"median_ms": 1812.96},
+    {"device": "mac","case": "precise-load-cpu_only-other","language": "other","audio_seconds": 3.258313,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 237.454,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_only"},"median_ms": 1738.345},
+    {"device": "mac","case": "precise-load-cpu_only-auto","language": "auto","audio_seconds": 3.258313,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 234.6,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_only"},"median_ms": 1017.144},
+    {"device": "mac","case": "precise-load-cpu_and_gpu-en","language": "en","audio_seconds": 11.0,"encoder_backend": "coreml-cpu-gpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 237.041,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_gpu"},"median_ms": 2135.215},
+    {"device": "mac","case": "precise-load-cpu_and_gpu-other","language": "other","audio_seconds": 3.258313,"encoder_backend": "coreml-cpu-gpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 229.975,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_gpu"},"median_ms": 2028.618},
+    {"device": "mac","case": "precise-load-cpu_and_gpu-auto","language": "auto","audio_seconds": 3.258313,"encoder_backend": "coreml-cpu-gpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 234.436,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_gpu"},"median_ms": 505.317},
+    {"device": "iphone","case": "explicit-context-auto","language": "en","audio_seconds": 120.0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 507.929,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"thermal_state": 0,"settings": {},"median_ms": 319.996},
+    {"device": "iphone","case": "explicit-context-0","language": "en","audio_seconds": 120.0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 439.396,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"thermal_state": 0,"settings": {"PARAKEET_ANE_BATCH_DECODE": "0"},"median_ms": 329.048},
+    {"device": "iphone","case": "explicit-context-1","language": "en","audio_seconds": 120.0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"encoder_owned_by_coreml": false,"load_ms": 440.268,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"thermal_state": 0,"settings": {"PARAKEET_ANE_BATCH_DECODE": "1"},"median_ms": 866.881},
+    {"device": "iphone","case": "precise-load-cpu_only-en","language": "en","audio_seconds": 11.0,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 337.057,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"thermal_state": 0,"settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_only"},"median_ms": 3359.539},
+    {"device": "iphone","case": "precise-load-cpu_only-other","language": "other","audio_seconds": 3.258313,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 307.454,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"thermal_state": 0,"settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_only"},"median_ms": 5106.563},
+    {"device": "iphone","case": "precise-load-cpu_only-auto","language": "auto","audio_seconds": 3.258313,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 325.774,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"thermal_state": 0,"settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_only"},"median_ms": 7852.205},
+    {"device": "iphone","case": "precise-load-cpu_and_gpu-en","language": "en","audio_seconds": 11.0,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 470.624,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 22,"thermal_state": 0,"settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_gpu"},"median_ms": 4493.996},
+    {"device": "iphone","case": "precise-load-cpu_and_gpu-other","language": "other","audio_seconds": 3.258313,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 319.377,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"thermal_state": 0,"settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_gpu"},"median_ms": 370.714},
+    {"device": "iphone","case": "precise-load-cpu_and_gpu-auto","language": "auto","audio_seconds": 3.258313,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 309.935,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"thermal_state": 0,"settings": {"PARAKEET_COREML_COMPUTE_UNITS": "cpu_and_gpu"},"median_ms": 480.167}
+  ],
+  "auto_quality_regressions": [
+    {"device": "mac","case": "auto-quality-short","language": "auto","audio_seconds": 3.258313,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 369.295,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"settings": {},"median_ms": 46.519},
+    {"device": "mac","case": "auto-quality-long","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"encoder_owned_by_coreml": false,"load_ms": 317.73,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 84,"settings": {},"median_ms": 127.507},
+    {"device": "mac","case": "auto-quality-above-crossover","language": "auto","audio_seconds": 120.0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"encoder_owned_by_coreml": false,"load_ms": 334.999,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"settings": {},"median_ms": 190.102},
+    {"device": "mac","case": "auto-quality-continuous","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-cpu-gpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 321.509,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"settings": {"PARAKEET_ANE_BATCH_DECODE": "0"},"median_ms": 774.425},
+    {"device": "mac","case": "auto-quality-forced","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"encoder_owned_by_coreml": false,"load_ms": 331.865,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 84,"settings": {"PARAKEET_ANE_BATCH_DECODE": "1"},"median_ms": 126.904},
+    {"device": "mac","case": "no-decoder-short","language": "auto","audio_seconds": 3.258313,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 19148.766,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"settings": {},"median_ms": 52.883},
+    {"device": "mac","case": "no-decoder-long","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 374.67,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 84,"settings": {},"median_ms": 142.615},
+    {"device": "mac","case": "no-decoder-above-crossover","language": "auto","audio_seconds": 120.0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 338.156,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"settings": {},"median_ms": 229.407},
+    {"device": "mac","case": "no-decoder-continuous","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-cpu-gpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 337.231,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"settings": {"PARAKEET_ANE_BATCH_DECODE": "0"},"median_ms": 3777.826},
+    {"device": "mac","case": "no-decoder-forced","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 332.561,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 84,"settings": {"PARAKEET_ANE_BATCH_DECODE": "1"},"median_ms": 140.053},
+    {"device": "mac","case": "no-decoder-owned-long","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": true,"load_ms": 222.523,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 84,"settings": {"PARAKEET_COREML_ONLY": "1"},"median_ms": 146.642},
+    {"device": "iphone","case": "auto-quality-short","language": "auto","audio_seconds": 3.258313,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 30128.126,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"thermal_state": 0,"settings": {},"median_ms": 81.508},
+    {"device": "iphone","case": "auto-quality-long","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 897.865,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 84,"thermal_state": 0,"settings": {},"median_ms": 227.171},
+    {"device": "iphone","case": "auto-quality-above-crossover","language": "auto","audio_seconds": 120.0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"encoder_owned_by_coreml": false,"load_ms": 444.988,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"thermal_state": 0,"settings": {},"median_ms": 293.189},
+    {"device": "iphone","case": "auto-quality-continuous","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 513.801,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"thermal_state": 0,"settings": {"PARAKEET_ANE_BATCH_DECODE": "0"},"median_ms": 7084.19},
+    {"device": "iphone","case": "auto-quality-forced","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": true,"encoder_owned_by_coreml": false,"load_ms": 650.909,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 84,"thermal_state": 0,"settings": {"PARAKEET_ANE_BATCH_DECODE": "1"},"median_ms": 259.125},
+    {"device": "iphone","case": "no-decoder-short","language": "auto","audio_seconds": 3.258313,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 29026.575,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 7,"thermal_state": 0,"settings": {},"median_ms": 71.287},
+    {"device": "iphone","case": "no-decoder-long","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 523.998,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 84,"thermal_state": 0,"settings": {},"median_ms": 430.021},
+    {"device": "iphone","case": "no-decoder-above-crossover","language": "auto","audio_seconds": 120.0,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 485.427,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 176,"thermal_state": 0,"settings": {},"median_ms": 385.433},
+    {"device": "iphone","case": "no-decoder-continuous","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-cpu","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 502.251,"wer": 0.13095238095238096,"cer": 0.015047879616963064,"word_edits": 11,"reference_words": 84,"thermal_state": 0,"settings": {"PARAKEET_ANE_BATCH_DECODE": "0"},"median_ms": 4687.853},
+    {"device": "iphone","case": "no-decoder-forced","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": false,"load_ms": 518.366,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 84,"thermal_state": 0,"settings": {"PARAKEET_ANE_BATCH_DECODE": "1"},"median_ms": 245.154},
+    {"device": "iphone","case": "no-decoder-owned-long","language": "auto","audio_seconds": 51.09975,"encoder_backend": "coreml-ane","encoder_coreml_all_runs": true,"decoder_coreml_all_runs": false,"encoder_owned_by_coreml": true,"load_ms": 355.833,"wer": 0.0,"cer": 0.0,"word_edits": 0,"reference_words": 84,"thermal_state": 0,"settings": {"PARAKEET_COREML_ONLY": "1"},"median_ms": 236.905}
+  ],
+  "schema_version": 1,
+  "model": "qvac/TranscribePsy-250M-EU",
+  "date": "2026-11-10",
+  "quantization_refresh": {
+    "date": "2026-11-11",
+    "long_cases_refreshed": 4,
+    "short_cases_retained_from": "2026-11-10",
+    "validated_fixed_encoder_bits": [
+      0,
+      6
+    ],
+    "exportable_but_not_evaluated_fixed_encoder_bits": [
+      2,
+      3,
+      4,
+      8
+    ],
+    "tested_decoder_precision": "FP16 throughout, including joint output projection; no palettization",
+    "precise_fp32_palettization": "rejected intentionally",
+    "compiled_program_size_KiB": {
+      "encoder_en": {
+        "fp16": 460352,
+        "palette6": 183052
+      },
+      "encoder_other": {
+        "fp16": 461336,
+        "palette6": 183476
+      },
+      "encoder_gate": {
+        "fp16": 234776,
+        "palette6": 94452
+      },
+      "decoder": {
+        "fp16": 18296,
+        "models6": 18296
+      }
+    },
+    "sixbit_weight_storage": "Eligible grouped-channel weights use uint6 LUT indices; some constants remain FP16; compute is FP16",
+    "q8_gguf_note": "Q8_0 GGUF plus FP16 Core ML sidecars is a hybrid, not a Q8 Core ML encoder"
+  },
+  "route_sharing_experiments": {
+    "date": "2026-11-16",
+    "experimental_only": true,
+    "integrated_into_engine": false,
+    "hardware": {
+      "mac": "Apple M4 MacBook Air, 16 GB, macOS 27.0.1",
+      "iphone": "iPhone 16e, A18, iOS 18.6.2"
+    },
+    "export_environment": "coremltools 9.0, torch 2.7.0, Xcode 26.5; source F16 GGUF",
+    "window_mel_frames": 2001,
+    "fixtures": [
+      "en-15s",
+      "en-60s (first 2001 mel frames)",
+      "en-partial (800 ms)",
+      "fr-multipiece-16k",
+      "hi-16k",
+      "silence800"
+    ],
+    "compiled_sizes": {
+      "fp16": {
+        "separate_compiled_bytes": 1191921536,
+        "shared_compiled_bytes": 477510394,
+        "unified_compiled_bytes": 476269593,
+        "shared_reduction_percent": 59.938,
+        "unified_reduction_percent": 60.042
+      },
+      "sixbit": {
+        "separate_compiled_bytes": 479747170,
+        "shared_compiled_bytes": 193054579,
+        "unified_compiled_bytes": 191739826,
+        "shared_reduction_percent": 59.759,
+        "unified_reduction_percent": 60.033
+      }
+    },
+    "devices": {
+      "mac": {
+        "fp16": {
+          "variants": {
+            "separate": {
+              "completed_finite_predictions": 18,
+              "identical_to_separate": 18,
+              "max_absolute_to_separate": 0.0,
+              "max_relative_l2_to_fp32": 0.13263638143858486,
+              "gate_decisions_matching_fp32": 6,
+              "gate_probabilities": {
+                "en-15s": 0.0480989,
+                "en-60s": 0.0543655,
+                "en-partial": 0.2009736,
+                "fr-multipiece-16k": 0.939177,
+                "hi-16k": 0.9600492,
+                "silence800": 0.5346584
+              },
+              "preferred_devices": {
+                "en": {
+                  "None": 3542,
+                  "MLNeuralEngineComputeDevice": 1537
+                },
+                "other": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1561
+                },
+                "gate": {
+                  "None": 1802,
+                  "MLNeuralEngineComputeDevice": 781
+                }
+              },
+              "all_compute_operations_prefer_ane": true,
+              "observed_load_ms": {
+                "en": 392.3,
+                "other": 326.909,
+                "gate": 166.233
+              },
+              "warm_median_ms_full_window": {
+                "en": 20.185,
+                "other": 20.228,
+                "gate": 11.331
+              },
+              "thermal_state_after_route": {
+                "en": 0,
+                "other": 0,
+                "gate": 0
+              }
+            },
+            "shared": {
+              "completed_finite_predictions": 18,
+              "identical_to_separate": 18,
+              "max_absolute_to_separate": 0.0,
+              "max_relative_l2_to_fp32": 0.13263638143858486,
+              "gate_decisions_matching_fp32": 6,
+              "gate_probabilities": {
+                "en-15s": 0.0480989,
+                "en-60s": 0.0543655,
+                "en-partial": 0.2009736,
+                "fr-multipiece-16k": 0.939177,
+                "hi-16k": 0.9600492,
+                "silence800": 0.5346584
+              },
+              "preferred_devices": {
+                "en": {
+                  "None": 3542,
+                  "MLNeuralEngineComputeDevice": 1537
+                },
+                "other": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1561
+                },
+                "gate": {
+                  "None": 1802,
+                  "MLNeuralEngineComputeDevice": 781
+                }
+              },
+              "all_compute_operations_prefer_ane": true,
+              "observed_load_ms": {
+                "en": 364.365,
+                "other": 356.12,
+                "gate": 251.497
+              },
+              "warm_median_ms_full_window": {
+                "en": 19.986,
+                "other": 19.884,
+                "gate": 11.186
+              },
+              "thermal_state_after_route": {
+                "en": 0,
+                "other": 0,
+                "gate": 0
+              }
+            },
+            "unified": {
+              "completed_finite_predictions": 18,
+              "identical_to_separate": 18,
+              "max_absolute_to_separate": 0.0,
+              "max_relative_l2_to_fp32": 0.13263638143858486,
+              "gate_decisions_matching_fp32": 6,
+              "gate_probabilities": {
+                "en-15s": 0.0480989,
+                "en-60s": 0.0543655,
+                "en-partial": 0.2009736,
+                "fr-multipiece-16k": 0.939177,
+                "hi-16k": 0.9600492,
+                "silence800": 0.5346584
+              },
+              "preferred_devices": {
+                "en": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1567
+                },
+                "other": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1567
+                },
+                "gate": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1567
+                }
+              },
+              "all_compute_operations_prefer_ane": true,
+              "observed_load_ms": {
+                "en": 289.45,
+                "other": 71.386,
+                "gate": 68.366
+              },
+              "warm_median_ms_full_window": {
+                "en": 20.086,
+                "other": 20.053,
+                "gate": 20.187
+              },
+              "thermal_state_after_route": {
+                "en": 0,
+                "other": 0,
+                "gate": 0
+              }
+            }
+          },
+          "loading_only": {
+            "load-eager": {
+              "processes": 3,
+              "median_load_ms": 186.807,
+              "load_range_ms": [
+                174.524,
+                206.896
+              ],
+              "median_current_footprint_bytes": 28099184,
+              "thermal_states": [
+                0
+              ]
+            },
+            "load-en": {
+              "processes": 3,
+              "median_load_ms": 73.407,
+              "load_range_ms": [
+                70.805,
+                73.563
+              ],
+              "median_current_footprint_bytes": 26854000,
+              "thermal_states": [
+                0
+              ]
+            },
+            "load-other": {
+              "processes": 3,
+              "median_load_ms": 73.546,
+              "load_range_ms": [
+                73.041,
+                74.51
+              ],
+              "median_current_footprint_bytes": 27394672,
+              "thermal_states": [
+                0
+              ]
+            },
+            "load-auto-en": {
+              "processes": 3,
+              "median_load_ms": 110.755,
+              "load_range_ms": [
+                108.208,
+                126.515
+              ],
+              "median_current_footprint_bytes": 27427464,
+              "thermal_states": [
+                0
+              ]
+            },
+            "load-auto-other": {
+              "processes": 3,
+              "median_load_ms": 112.651,
+              "load_range_ms": [
+                111.517,
+                112.744
+              ],
+              "median_current_footprint_bytes": 27787888,
+              "thermal_states": [
+                0
+              ]
+            }
+          }
+        },
+        "sixbit": {
+          "variants": {
+            "separate": {
+              "completed_finite_predictions": 18,
+              "identical_to_separate": 18,
+              "max_absolute_to_separate": 0.0,
+              "max_relative_l2_to_fp32": 0.13783479383561187,
+              "gate_decisions_matching_fp32": 6,
+              "gate_probabilities": {
+                "en-15s": 0.0487875,
+                "en-60s": 0.0548328,
+                "en-partial": 0.2124136,
+                "fr-multipiece-16k": 0.9380075,
+                "hi-16k": 0.961548,
+                "silence800": 0.5581152
+              },
+              "preferred_devices": {
+                "en": {
+                  "None": 3542,
+                  "MLNeuralEngineComputeDevice": 1537
+                },
+                "other": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1561
+                },
+                "gate": {
+                  "None": 1802,
+                  "MLNeuralEngineComputeDevice": 781
+                }
+              },
+              "all_compute_operations_prefer_ane": true,
+              "observed_load_ms": {
+                "en": 11397.376,
+                "other": 11557.244,
+                "gate": 5705.29
+              },
+              "warm_median_ms_full_window": {
+                "en": 20.3,
+                "other": 20.628,
+                "gate": 11.531
+              },
+              "thermal_state_after_route": {
+                "en": 0,
+                "other": 0,
+                "gate": 0
+              }
+            },
+            "shared": {
+              "completed_finite_predictions": 18,
+              "identical_to_separate": 18,
+              "max_absolute_to_separate": 0.0,
+              "max_relative_l2_to_fp32": 0.13783479383561187,
+              "gate_decisions_matching_fp32": 6,
+              "gate_probabilities": {
+                "en-15s": 0.0487875,
+                "en-60s": 0.0548328,
+                "en-partial": 0.2124136,
+                "fr-multipiece-16k": 0.9380075,
+                "hi-16k": 0.961548,
+                "silence800": 0.5581152
+              },
+              "preferred_devices": {
+                "en": {
+                  "None": 3542,
+                  "MLNeuralEngineComputeDevice": 1537
+                },
+                "other": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1561
+                },
+                "gate": {
+                  "None": 1802,
+                  "MLNeuralEngineComputeDevice": 781
+                }
+              },
+              "all_compute_operations_prefer_ane": true,
+              "observed_load_ms": {
+                "en": 11872.712,
+                "other": 11694.751,
+                "gate": 5952.402
+              },
+              "warm_median_ms_full_window": {
+                "en": 20.348,
+                "other": 20.277,
+                "gate": 11.505
+              },
+              "thermal_state_after_route": {
+                "en": 0,
+                "other": 1,
+                "gate": 1
+              }
+            },
+            "unified": {
+              "completed_finite_predictions": 18,
+              "identical_to_separate": 18,
+              "max_absolute_to_separate": 0.0,
+              "max_relative_l2_to_fp32": 0.13783479383561187,
+              "gate_decisions_matching_fp32": 6,
+              "gate_probabilities": {
+                "en-15s": 0.0487875,
+                "en-60s": 0.0548328,
+                "en-partial": 0.2124136,
+                "fr-multipiece-16k": 0.9380075,
+                "hi-16k": 0.961548,
+                "silence800": 0.5581152
+              },
+              "preferred_devices": {
+                "en": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1567
+                },
+                "other": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1567
+                },
+                "gate": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1567
+                }
+              },
+              "all_compute_operations_prefer_ane": true,
+              "observed_load_ms": {
+                "en": 11483.478,
+                "other": 75.861,
+                "gate": 72.274
+              },
+              "warm_median_ms_full_window": {
+                "en": 20.284,
+                "other": 20.292,
+                "gate": 20.152
+              },
+              "thermal_state_after_route": {
+                "en": 1,
+                "other": 1,
+                "gate": 1
+              }
+            }
+          },
+          "loading_only": {
+            "load-eager": {
+              "processes": 3,
+              "median_load_ms": 193.549,
+              "load_range_ms": [
+                193.005,
+                200.141
+              ],
+              "median_current_footprint_bytes": 28836440,
+              "thermal_states": [
+                0,
+                1
+              ]
+            },
+            "load-en": {
+              "processes": 3,
+              "median_load_ms": 78.867,
+              "load_range_ms": [
+                78.163,
+                80.872
+              ],
+              "median_current_footprint_bytes": 27738712,
+              "thermal_states": [
+                0,
+                1
+              ]
+            },
+            "load-other": {
+              "processes": 3,
+              "median_load_ms": 81.196,
+              "load_range_ms": [
+                78.944,
+                81.827
+              ],
+              "median_current_footprint_bytes": 28164696,
+              "thermal_states": [
+                0,
+                1
+              ]
+            },
+            "load-auto-en": {
+              "processes": 3,
+              "median_load_ms": 118.626,
+              "load_range_ms": [
+                118.25,
+                119.193
+              ],
+              "median_current_footprint_bytes": 28181080,
+              "thermal_states": [
+                0,
+                1
+              ]
+            },
+            "load-auto-other": {
+              "processes": 3,
+              "median_load_ms": 120.429,
+              "load_range_ms": [
+                119.609,
+                120.863
+              ],
+              "median_current_footprint_bytes": 28607064,
+              "thermal_states": [
+                0,
+                1
+              ]
+            }
+          }
+        }
+      },
+      "iphone": {
+        "fp16": {
+          "variants": {
+            "separate": {
+              "completed_finite_predictions": 18,
+              "identical_to_separate": 18,
+              "max_absolute_to_separate": 0.0,
+              "max_relative_l2_to_fp32": 0.13263638143858486,
+              "gate_decisions_matching_fp32": 6,
+              "gate_probabilities": {
+                "en-15s": 0.0480989,
+                "en-60s": 0.0543655,
+                "en-partial": 0.2009736,
+                "fr-multipiece-16k": 0.939177,
+                "hi-16k": 0.9600492,
+                "silence800": 0.5346584
+              },
+              "preferred_devices": {
+                "en": {
+                  "None": 3542,
+                  "MLNeuralEngineComputeDevice": 1537
+                },
+                "other": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1561
+                },
+                "gate": {
+                  "None": 1802,
+                  "MLNeuralEngineComputeDevice": 781
+                }
+              },
+              "all_compute_operations_prefer_ane": true,
+              "observed_load_ms": {
+                "en": 10467.973,
+                "other": 11286.274,
+                "gate": 5800.667
+              },
+              "warm_median_ms_full_window": {
+                "en": 21.835,
+                "other": 22.014,
+                "gate": 12.097
+              },
+              "thermal_state_after_route": {
+                "en": 0,
+                "other": 0,
+                "gate": 0
+              }
+            },
+            "shared": {
+              "completed_finite_predictions": 18,
+              "identical_to_separate": 18,
+              "max_absolute_to_separate": 0.0,
+              "max_relative_l2_to_fp32": 0.13263638143858486,
+              "gate_decisions_matching_fp32": 6,
+              "gate_probabilities": {
+                "en-15s": 0.0480989,
+                "en-60s": 0.0543655,
+                "en-partial": 0.2009736,
+                "fr-multipiece-16k": 0.939177,
+                "hi-16k": 0.9600492,
+                "silence800": 0.5346584
+              },
+              "preferred_devices": {
+                "en": {
+                  "None": 3542,
+                  "MLNeuralEngineComputeDevice": 1537
+                },
+                "other": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1561
+                },
+                "gate": {
+                  "None": 1802,
+                  "MLNeuralEngineComputeDevice": 781
+                }
+              },
+              "all_compute_operations_prefer_ane": true,
+              "observed_load_ms": {
+                "en": 12168.129,
+                "other": 11648.455,
+                "gate": 6328.855
+              },
+              "warm_median_ms_full_window": {
+                "en": 22.165,
+                "other": 22.837,
+                "gate": 12.651
+              },
+              "thermal_state_after_route": {
+                "en": 0,
+                "other": 0,
+                "gate": 0
+              }
+            },
+            "unified": {
+              "completed_finite_predictions": 18,
+              "identical_to_separate": 18,
+              "max_absolute_to_separate": 0.0,
+              "max_relative_l2_to_fp32": 0.13263638143858486,
+              "gate_decisions_matching_fp32": 6,
+              "gate_probabilities": {
+                "en-15s": 0.0480989,
+                "en-60s": 0.0543655,
+                "en-partial": 0.2009736,
+                "fr-multipiece-16k": 0.939177,
+                "hi-16k": 0.9600492,
+                "silence800": 0.5346584
+              },
+              "preferred_devices": {
+                "en": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1567
+                },
+                "other": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1567
+                },
+                "gate": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1567
+                }
+              },
+              "all_compute_operations_prefer_ane": true,
+              "observed_load_ms": {
+                "en": 12656.843,
+                "other": 254.98,
+                "gate": 248.447
+              },
+              "warm_median_ms_full_window": {
+                "en": 23.742,
+                "other": 25.366,
+                "gate": 21.85
+              },
+              "thermal_state_after_route": {
+                "en": 1,
+                "other": 1,
+                "gate": 1
+              }
+            }
+          },
+          "loading_only": {
+            "load-eager": {
+              "processes": 3,
+              "median_load_ms": 616.211,
+              "load_range_ms": [
+                273.704,
+                647.497
+              ],
+              "median_current_footprint_bytes": 9290064,
+              "thermal_states": [
+                1
+              ]
+            },
+            "load-en": {
+              "processes": 3,
+              "median_load_ms": 135.149,
+              "load_range_ms": [
+                133.222,
+                139.007
+              ],
+              "median_current_footprint_bytes": 8929592,
+              "thermal_states": [
+                1
+              ]
+            },
+            "load-other": {
+              "processes": 3,
+              "median_load_ms": 138.515,
+              "load_range_ms": [
+                135.447,
+                143.304
+              ],
+              "median_current_footprint_bytes": 8716600,
+              "thermal_states": [
+                1
+              ]
+            },
+            "load-auto-en": {
+              "processes": 3,
+              "median_load_ms": 188.699,
+              "load_range_ms": [
+                184.406,
+                193.163
+              ],
+              "median_current_footprint_bytes": 9142584,
+              "thermal_states": [
+                1
+              ]
+            },
+            "load-auto-other": {
+              "processes": 3,
+              "median_load_ms": 185.17,
+              "load_range_ms": [
+                184.378,
+                192.601
+              ],
+              "median_current_footprint_bytes": 8913232,
+              "thermal_states": [
+                1
+              ]
+            }
+          }
+        },
+        "sixbit": {
+          "variants": {
+            "separate": {
+              "completed_finite_predictions": 18,
+              "identical_to_separate": 18,
+              "max_absolute_to_separate": 0.0,
+              "max_relative_l2_to_fp32": 0.13783479383561187,
+              "gate_decisions_matching_fp32": 6,
+              "gate_probabilities": {
+                "en-15s": 0.0487875,
+                "en-60s": 0.0548328,
+                "en-partial": 0.2124136,
+                "fr-multipiece-16k": 0.9380075,
+                "hi-16k": 0.961548,
+                "silence800": 0.5581152
+              },
+              "preferred_devices": {
+                "en": {
+                  "None": 3542,
+                  "MLNeuralEngineComputeDevice": 1537
+                },
+                "other": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1561
+                },
+                "gate": {
+                  "None": 1802,
+                  "MLNeuralEngineComputeDevice": 781
+                }
+              },
+              "all_compute_operations_prefer_ane": true,
+              "observed_load_ms": {
+                "en": 13946.671,
+                "other": 14531.145,
+                "gate": 7267.919
+              },
+              "warm_median_ms_full_window": {
+                "en": 24.814,
+                "other": 25.829,
+                "gate": 14.772
+              },
+              "thermal_state_after_route": {
+                "en": 1,
+                "other": 1,
+                "gate": 1
+              }
+            },
+            "shared": {
+              "completed_finite_predictions": 18,
+              "identical_to_separate": 18,
+              "max_absolute_to_separate": 0.0,
+              "max_relative_l2_to_fp32": 0.13783479383561187,
+              "gate_decisions_matching_fp32": 6,
+              "gate_probabilities": {
+                "en-15s": 0.0487875,
+                "en-60s": 0.0548328,
+                "en-partial": 0.2124136,
+                "fr-multipiece-16k": 0.9380075,
+                "hi-16k": 0.961548,
+                "silence800": 0.5581152
+              },
+              "preferred_devices": {
+                "en": {
+                  "None": 3542,
+                  "MLNeuralEngineComputeDevice": 1537
+                },
+                "other": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1561
+                },
+                "gate": {
+                  "None": 1802,
+                  "MLNeuralEngineComputeDevice": 781
+                }
+              },
+              "all_compute_operations_prefer_ane": true,
+              "observed_load_ms": {
+                "en": 14861.611,
+                "other": 14903.058,
+                "gate": 7750.633
+              },
+              "warm_median_ms_full_window": {
+                "en": 25.795,
+                "other": 26.111,
+                "gate": 14.773
+              },
+              "thermal_state_after_route": {
+                "en": 1,
+                "other": 1,
+                "gate": 1
+              }
+            },
+            "unified": {
+              "completed_finite_predictions": 18,
+              "identical_to_separate": 18,
+              "max_absolute_to_separate": 0.0,
+              "max_relative_l2_to_fp32": 0.13783479383561187,
+              "gate_decisions_matching_fp32": 6,
+              "gate_probabilities": {
+                "en-15s": 0.0487875,
+                "en-60s": 0.0548328,
+                "en-partial": 0.2124136,
+                "fr-multipiece-16k": 0.9380075,
+                "hi-16k": 0.961548,
+                "silence800": 0.5581152
+              },
+              "preferred_devices": {
+                "en": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1567
+                },
+                "other": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1567
+                },
+                "gate": {
+                  "None": 3632,
+                  "MLNeuralEngineComputeDevice": 1567
+                }
+              },
+              "all_compute_operations_prefer_ane": true,
+              "observed_load_ms": {
+                "en": 14358.409,
+                "other": 252.456,
+                "gate": 244.738
+              },
+              "warm_median_ms_full_window": {
+                "en": 24.93,
+                "other": 25.897,
+                "gate": 22.676
+              },
+              "thermal_state_after_route": {
+                "en": 1,
+                "other": 1,
+                "gate": 1
+              }
+            }
+          },
+          "loading_only": {
+            "load-eager": {
+              "processes": 3,
+              "median_load_ms": 312.677,
+              "load_range_ms": [
+                298.046,
+                473.02
+              ],
+              "median_current_footprint_bytes": 9322856,
+              "thermal_states": [
+                1
+              ]
+            },
+            "load-en": {
+              "processes": 3,
+              "median_load_ms": 144.198,
+              "load_range_ms": [
+                143.382,
+                145.033
+              ],
+              "median_current_footprint_bytes": 9044352,
+              "thermal_states": [
+                1
+              ]
+            },
+            "load-other": {
+              "processes": 3,
+              "median_load_ms": 146.729,
+              "load_range_ms": [
+                145.601,
+                147.919
+              ],
+              "median_current_footprint_bytes": 8749440,
+              "thermal_states": [
+                1
+              ]
+            },
+            "load-auto-en": {
+              "processes": 3,
+              "median_load_ms": 196.992,
+              "load_range_ms": [
+                194.972,
+                202.94
+              ],
+              "median_current_footprint_bytes": 9372008,
+              "thermal_states": [
+                1
+              ]
+            },
+            "load-auto-other": {
+              "processes": 3,
+              "median_load_ms": 203.306,
+              "load_range_ms": [
+                198.847,
+                206.751
+              ],
+              "median_current_footprint_bytes": 8995128,
+              "thermal_states": [
+                1
+              ]
+            }
+          }
+        }
+      }
+    },
+    "measurement_scope": [
+      "Encoder-only prototypes; excludes GGUF, decoder and precise FP32 programs.",
+      "Feature equality and sample gate decisions; no integrated transcription/corpus validation.",
+      "OS specialization caches retained; observed first-seen loads are not fresh-install bounds.",
+      "Loading-only footprint excludes inference allocations and Core ML service processes.",
+      "Native function-specific compute plans; placement is not an Instruments hardware trace.",
+      "Automatic non-English unified execution requires two full predictions."
+    ],
+    "artifact_directory": "artifacts/transcribepsy-eu-coreml-experiments-20261116"
+  }
+}

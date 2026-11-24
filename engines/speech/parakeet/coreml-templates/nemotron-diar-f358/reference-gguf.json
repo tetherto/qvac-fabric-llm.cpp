@@ -1,0 +1,6413 @@
+{
+ "gguf_version": 3,
+ "metadata": [
+  {
+   "gguf_type": 8,
+   "key": "general.architecture",
+   "value": "sortformer"
+  },
+  {
+   "gguf_type": 8,
+   "key": "general.name",
+   "value": "Nemotron-3-Diarization.q8_0"
+  },
+  {
+   "gguf_type": 8,
+   "key": "sortformer.version",
+   "value": "v3"
+  },
+  {
+   "gguf_type": 4,
+   "key": "general.file_type",
+   "value": 7
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.encoder.d_model",
+   "value": 512
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.encoder.n_layers",
+   "value": 31
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.encoder.n_heads",
+   "value": 8
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.encoder.d_ff",
+   "value": 2048
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.encoder.conv_kernel_size",
+   "value": 0
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.encoder.subsampling_factor",
+   "value": 8
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.encoder.subsampling_conv_channels",
+   "value": 256
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.encoder.feat_in",
+   "value": 128
+  },
+  {
+   "gguf_type": 7,
+   "key": "sortformer.encoder.xscaling",
+   "value": false
+  },
+  {
+   "gguf_type": 7,
+   "key": "sortformer.encoder.use_bias",
+   "value": true
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.encoder.pos_emb_max_len",
+   "value": 5000
+  },
+  {
+   "gguf_type": 8,
+   "key": "sortformer.encoder.conv_norm",
+   "value": "batch_norm"
+  },
+  {
+   "gguf_type": 8,
+   "key": "sortformer.encoder.conv_context",
+   "value": "symmetric"
+  },
+  {
+   "gguf_type": 8,
+   "key": "sortformer.encoder.att_context_style",
+   "value": "regular"
+  },
+  {
+   "gguf_type": 8,
+   "key": "sortformer.encoder.type",
+   "value": "transformer_rope"
+  },
+  {
+   "gguf_type": 8,
+   "key": "sortformer.encoder.subsampling_type",
+   "value": "feature_stacking"
+  },
+  {
+   "gguf_type": 7,
+   "key": "sortformer.encoder.qkv_bias",
+   "value": false
+  },
+  {
+   "gguf_type": 7,
+   "key": "sortformer.encoder.qk_norm",
+   "value": false
+  },
+  {
+   "gguf_type": 7,
+   "key": "sortformer.encoder.pre_block_norm",
+   "value": true
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.encoder.rope_base",
+   "value": 10000.0
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.encoder.rotary_fraction",
+   "value": 1.0
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.transformer.n_layers",
+   "value": 0
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.transformer.hidden_size",
+   "value": 192
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.transformer.inner_size",
+   "value": 0
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.transformer.n_heads",
+   "value": 0
+  },
+  {
+   "gguf_type": 7,
+   "key": "sortformer.transformer.pre_ln",
+   "value": true
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.num_speakers",
+   "value": 8
+  },
+  {
+   "gguf_type": 7,
+   "key": "sortformer.high_resolution",
+   "value": true
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.output_subsampling_factor",
+   "value": 1
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.upsample_factor",
+   "value": 8
+  },
+  {
+   "gguf_type": 7,
+   "key": "sortformer.learnable_silence",
+   "value": true
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.preprocessor.sample_rate",
+   "value": 16000
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.preprocessor.window_size",
+   "value": 0.02500000037252903
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.preprocessor.window_stride",
+   "value": 0.009999999776482582
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.preprocessor.n_fft",
+   "value": 512
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.preprocessor.features",
+   "value": 128
+  },
+  {
+   "gguf_type": 8,
+   "key": "sortformer.preprocessor.normalize",
+   "value": "NA"
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.preprocessor.preemph",
+   "value": 0.9700000286102295
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.preprocessor.dither",
+   "value": 9.999999747378752e-06
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.preprocessor.log_zero_guard",
+   "value": 5.960464477539063e-08
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.scoring.spkcache_sil_frames_per_spk",
+   "value": 1
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.scoring.pred_score_threshold",
+   "value": 0.25
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.scoring.scores_boost_latest",
+   "value": 0.05000000074505806
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.scoring.sil_threshold",
+   "value": 0.20000000298023224
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.scoring.strong_boost_rate",
+   "value": 0.75
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.scoring.weak_boost_rate",
+   "value": 1.5
+  },
+  {
+   "gguf_type": 6,
+   "key": "sortformer.scoring.min_pos_scores_rate",
+   "value": 0.5
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.streaming.spkcache_len",
+   "value": 264
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.streaming.fifo_len",
+   "value": 0
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.streaming.chunk_len",
+   "value": 264
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.streaming.spkcache_update_period",
+   "value": 264
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.streaming.chunk_left_context",
+   "value": 0
+  },
+  {
+   "gguf_type": 4,
+   "key": "sortformer.streaming.chunk_right_context",
+   "value": 0
+  }
+ ],
+ "schema": 1,
+ "tensors": [
+  {
+   "n_dims": 2,
+   "name": "preprocessor.fb",
+   "ne": [
+    257,
+    128,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.04248046875,
+    "mean": 0.00012434468195132245,
+    "min": -0.0,
+    "std": 0.001475998532097723
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.pre_encode.proj.weight",
+   "ne": [
+    1024,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.96893310546875,
+    "mean": 2.4607667569398473e-05,
+    "min": -0.7383270263671875,
+    "std": 0.07048966877526454
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.embed_norm.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.78125,
+    "mean": 2.2812347412109375,
+    "min": 0.71484375,
+    "std": 0.3846801814827776
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.embed_norm.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 4.15625,
+    "mean": -0.042021024972200394,
+    "min": -12.3125,
+    "std": 0.7978663705519485
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.0.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.2265625,
+    "mean": 0.31789398193359375,
+    "min": 0.10107421875,
+    "std": 0.10199023662702575
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.0.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1875,
+    "mean": 0.031580176670104265,
+    "min": -0.416015625,
+    "std": 0.12112964497830886
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.0.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.2034149169921875,
+    "mean": 0.0002607989748260782,
+    "min": -1.5551376342773438,
+    "std": 0.09110440488149053
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.0.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.577301025390625,
+    "mean": 0.0001274800952160149,
+    "min": -3.126617431640625,
+    "std": 0.0943272416863298
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.0.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.52734375,
+    "mean": -0.004181321710348129,
+    "min": -1.640625,
+    "std": 0.08992152231217054
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.0.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.453125,
+    "mean": 0.6652851104736328,
+    "min": 0.1552734375,
+    "std": 0.20005858100787016
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.0.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.046875,
+    "mean": -0.04758167266845703,
+    "min": -0.41015625,
+    "std": 0.09310923825536642
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.0.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.937744140625,
+    "mean": 0.0029307291129043733,
+    "min": -5.313629150390625,
+    "std": 0.10810339453641604
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.0.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.447265625,
+    "mean": -0.04045515786856413,
+    "min": -0.42578125,
+    "std": 0.10442490062314361
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.0.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.6412506103515625,
+    "mean": -0.0001900480364156465,
+    "min": -4.123779296875,
+    "std": 0.054369210182193706
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.0.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.671875,
+    "mean": 0.0007312335073947906,
+    "min": -1.953125,
+    "std": 0.18422502866733867
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.1.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.76171875,
+    "mean": 0.4378509521484375,
+    "min": 0.0162353515625,
+    "std": 0.1533645136028045
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.1.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.37890625,
+    "mean": -0.01745041273534298,
+    "min": -0.52734375,
+    "std": 0.08718088098491682
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.1.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.9180641174316406,
+    "mean": 0.00027005209388638224,
+    "min": -0.9490699768066406,
+    "std": 0.10101703626022172
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.1.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.8232421875,
+    "mean": 5.121335334479227e-05,
+    "min": -4.185791015625,
+    "std": 0.10044629617695476
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.1.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.390625,
+    "mean": 0.003817293792963028,
+    "min": -1.2578125,
+    "std": 0.16353744486688887
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.1.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.703125,
+    "mean": 0.77276611328125,
+    "min": 0.083984375,
+    "std": 0.2377595662620241
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.1.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.859375,
+    "mean": -0.016076508909463882,
+    "min": -0.67578125,
+    "std": 0.09294613416051611
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.1.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.7497711181640625,
+    "mean": 0.0006199031831783941,
+    "min": -4.251678466796875,
+    "std": 0.10971526145423381
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.1.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.388671875,
+    "mean": -0.031353959697298706,
+    "min": -0.431640625,
+    "std": 0.07575744260144451
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.1.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 6.87554931640625,
+    "mean": -2.538074113545008e-06,
+    "min": -5.8446044921875,
+    "std": 0.05795622224349239
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.1.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.703125,
+    "mean": 0.00090789794921875,
+    "min": -1.859375,
+    "std": 0.18980055849707683
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.2.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.86328125,
+    "mean": 0.4970836639404297,
+    "min": 0.111328125,
+    "std": 0.13542884849710465
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.2.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.396484375,
+    "mean": -0.004764868877828121,
+    "min": -0.451171875,
+    "std": 0.08550262412844695
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.2.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7266998291015625,
+    "mean": -5.616224977226618e-06,
+    "min": -0.7853202819824219,
+    "std": 0.10108401623137352
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.2.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.530792236328125,
+    "mean": 3.832009679172188e-05,
+    "min": -4.15478515625,
+    "std": 0.1033963661408113
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.2.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.140625,
+    "mean": 0.0004746364429593086,
+    "min": -1.1953125,
+    "std": 0.11396349270789981
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.2.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.578125,
+    "mean": 0.8413496017456055,
+    "min": 0.08447265625,
+    "std": 0.22416271848398306
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.2.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.66015625,
+    "mean": -0.00613803556188941,
+    "min": -0.9453125,
+    "std": 0.0879612014566806
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.2.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 4.123779296875,
+    "mean": -0.00031405080335389357,
+    "min": -3.2342987060546875,
+    "std": 0.11096086423329614
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.2.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.251953125,
+    "mean": -0.036215259111486375,
+    "min": -0.310546875,
+    "std": 0.06242076283307879
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.2.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 6.1856689453125,
+    "mean": 0.0001052540467298968,
+    "min": -4.344696044921875,
+    "std": 0.06277791437636664
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.2.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.953125,
+    "mean": 0.003225737833417952,
+    "min": -1.421875,
+    "std": 0.20102126790095187
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.3.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.8359375,
+    "mean": 0.5414276123046875,
+    "min": 0.1923828125,
+    "std": 0.11295908197837524
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.3.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.421875,
+    "mean": -0.002915378659963608,
+    "min": -0.388671875,
+    "std": 0.09067721758834042
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.3.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7189483642578125,
+    "mean": -6.976837479063154e-05,
+    "min": -0.7460784912109375,
+    "std": 0.10273465682692892
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.3.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.98431396484375,
+    "mean": 2.993541147588985e-05,
+    "min": -2.3028564453125,
+    "std": 0.09769242681967111
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.3.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.4375,
+    "mean": 0.0023864582180976868,
+    "min": -0.671875,
+    "std": 0.11826831725319277
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.3.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.3125,
+    "mean": 0.8374309539794922,
+    "min": 0.1005859375,
+    "std": 0.1905186937156011
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.3.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.478515625,
+    "mean": 0.005973596125841141,
+    "min": -0.8203125,
+    "std": 0.08241269965899033
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.3.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.468841552734375,
+    "mean": -0.0016653777165629435,
+    "min": -1.8671340942382813,
+    "std": 0.11174023711700391
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.3.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.2158203125,
+    "mean": -0.03975968703161925,
+    "min": -0.294921875,
+    "std": 0.0516492137593664
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.3.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.999755859375,
+    "mean": 0.00014558959662736015,
+    "min": -2.391326904296875,
+    "std": 0.061988034816739944
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.3.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.765625,
+    "mean": 0.005075734108686447,
+    "min": -1.0234375,
+    "std": 0.19241836396552142
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.4.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.84375,
+    "mean": 0.6280479431152344,
+    "min": 0.203125,
+    "std": 0.1161699662967873
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.4.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.41796875,
+    "mean": -0.0010192859917879105,
+    "min": -0.439453125,
+    "std": 0.08880401428404139
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.4.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6835823059082031,
+    "mean": 4.1706650032817073e-05,
+    "min": -0.6327133178710938,
+    "std": 0.10077369561673785
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.4.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.484344482421875,
+    "mean": 2.696567025850527e-05,
+    "min": -1.6249008178710938,
+    "std": 0.09954916138594429
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.4.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.34375,
+    "mean": 0.0020845672115683556,
+    "min": -0.263671875,
+    "std": 0.11192697463079895
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.4.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.2421875,
+    "mean": 0.8252344131469727,
+    "min": 0.11572265625,
+    "std": 0.165650765810277
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.4.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.50390625,
+    "mean": 0.007071731612086296,
+    "min": -0.75390625,
+    "std": 0.07828751534383817
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.4.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.453338623046875,
+    "mean": -0.001650859418532491,
+    "min": -1.0784225463867188,
+    "std": 0.11200588199125154
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.4.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.138671875,
+    "mean": -0.04357169805371086,
+    "min": -0.275390625,
+    "std": 0.0479150376161406
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.4.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 5.12371826171875,
+    "mean": 0.00011310081686133344,
+    "min": -1.8671340942382813,
+    "std": 0.06440075867950645
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.4.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.234375,
+    "mean": 0.0031414739787578583,
+    "min": -0.88671875,
+    "std": 0.17201357238796983
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.5.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.859375,
+    "mean": 0.6511440277099609,
+    "min": 0.220703125,
+    "std": 0.11873082727446108
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.5.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.373046875,
+    "mean": -0.00027549779042601585,
+    "min": -0.50390625,
+    "std": 0.08861561494253907
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.5.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7732086181640625,
+    "mean": 3.0583765086097024e-05,
+    "min": -0.7228240966796875,
+    "std": 0.10478262997243996
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.5.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.2499237060546875,
+    "mean": -3.064027532673208e-05,
+    "min": -1.2421722412109375,
+    "std": 0.0940472471242018
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.5.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.390625,
+    "mean": 0.0030970193911343813,
+    "min": -0.34765625,
+    "std": 0.11439871219878839
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.5.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.2578125,
+    "mean": 0.8411312103271484,
+    "min": 0.1591796875,
+    "std": 0.15343757025469118
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.5.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.515625,
+    "mean": 0.009054076275788248,
+    "min": -0.734375,
+    "std": 0.07706645772917839
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.5.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.3051528930664063,
+    "mean": -0.0014143629646241607,
+    "min": -2.468841552734375,
+    "std": 0.11142252833524749
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.5.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.1318359375,
+    "mean": -0.047546995425364,
+    "min": -0.2197265625,
+    "std": 0.04480602855553178
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.5.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 4.72064208984375,
+    "mean": 0.0001524841446780556,
+    "min": -2.04437255859375,
+    "std": 0.06674493958301154
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.5.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.21875,
+    "mean": 0.005028277635574341,
+    "min": -0.92578125,
+    "std": 0.1650380534294806
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.6.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0703125,
+    "mean": 0.7586193084716797,
+    "min": 0.130859375,
+    "std": 0.17939541509312384
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.6.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.53515625,
+    "mean": 0.0010433327406644821,
+    "min": -0.67578125,
+    "std": 0.0955981685896265
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.6.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7460784912109375,
+    "mean": 0.00011520277560824373,
+    "min": -0.6990852355957031,
+    "std": 0.10480222135831758
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.6.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.331268310546875,
+    "mean": 7.68561312725069e-06,
+    "min": -1.523162841796875,
+    "std": 0.09757233154953203
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.6.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.9921875,
+    "mean": 0.0022336123511195183,
+    "min": -0.310546875,
+    "std": 0.09849143382222242
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.6.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.2109375,
+    "mean": 0.8418655395507813,
+    "min": 0.193359375,
+    "std": 0.13920157280529527
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.6.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.52734375,
+    "mean": 0.0071508921682834625,
+    "min": -0.703125,
+    "std": 0.07644531823740704
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.6.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.9141883850097656,
+    "mean": -0.0009778934122550709,
+    "min": -1.2964324951171875,
+    "std": 0.11148665367178438
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.6.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.1416015625,
+    "mean": -0.04734676226507872,
+    "min": -0.25390625,
+    "std": 0.0467273314680327
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.6.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 5.7825927734375,
+    "mean": 0.00014154126915855159,
+    "min": -1.6171493530273438,
+    "std": 0.06827748408251484
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.6.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.8359375,
+    "mean": 0.002463899552822113,
+    "min": -1.0546875,
+    "std": 0.15105899688230123
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.7.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.078125,
+    "mean": 0.82843017578125,
+    "min": 0.197265625,
+    "std": 0.16995309126428282
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.7.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6953125,
+    "mean": 0.003420324996113777,
+    "min": -0.765625,
+    "std": 0.09934122545927031
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.7.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0076904296875,
+    "mean": -5.35061541692509e-05,
+    "min": -1.2886810302734375,
+    "std": 0.10355732082319276
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.7.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.461151123046875,
+    "mean": 2.8585009204107337e-05,
+    "min": -1.1326828002929688,
+    "std": 0.09889267382986743
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.7.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.84375,
+    "mean": 0.0007342882454395294,
+    "min": -0.5234375,
+    "std": 0.09672781953913237
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.7.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.15625,
+    "mean": 0.8544578552246094,
+    "min": 0.26953125,
+    "std": 0.13502339138914848
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.7.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.53125,
+    "mean": 0.006898477906361222,
+    "min": -0.60546875,
+    "std": 0.07389974038967292
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.7.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.8865737915039063,
+    "mean": -0.0005137971202202607,
+    "min": -0.9374427795410156,
+    "std": 0.11209049178940181
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.7.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.11181640625,
+    "mean": -0.04402093181852251,
+    "min": -0.1982421875,
+    "std": 0.043908385364367794
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.7.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.1877899169921875,
+    "mean": 6.91768357228284e-05,
+    "min": -1.4531707763671875,
+    "std": 0.07065261621067212
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.7.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.5390625,
+    "mean": 0.0009066220372915268,
+    "min": -1.34375,
+    "std": 0.14242282507231893
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.8.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.125,
+    "mean": 0.8197288513183594,
+    "min": 0.2314453125,
+    "std": 0.16535706393768096
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.8.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.55078125,
+    "mean": 0.005011077970266342,
+    "min": -0.57421875,
+    "std": 0.0867111707282978
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.8.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7499542236328125,
+    "mean": -2.725288322835695e-05,
+    "min": -0.8710708618164063,
+    "std": 0.10334942463745854
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.8.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.9766845703125,
+    "mean": 1.2504535334301181e-05,
+    "min": -1.3594131469726563,
+    "std": 0.10114130820607499
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.8.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.4453125,
+    "mean": 0.000591334086493589,
+    "min": -0.59765625,
+    "std": 0.0855920429425216
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.8.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1640625,
+    "mean": 0.8739204406738281,
+    "min": 0.326171875,
+    "std": 0.1275948540070781
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.8.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.53125,
+    "mean": 0.005245376378297806,
+    "min": -0.57421875,
+    "std": 0.07365622313681192
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.8.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6835823059082031,
+    "mean": 5.5404578233719803e-05,
+    "min": -1.03094482421875,
+    "std": 0.11089922594289864
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.8.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.09619140625,
+    "mean": -0.047087046317756176,
+    "min": -0.2236328125,
+    "std": 0.04314943381784054
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.8.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.391326904296875,
+    "mean": -3.309142198304471e-05,
+    "min": -2.1723480224609375,
+    "std": 0.07189148366905647
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.8.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.515625,
+    "mean": -0.0006882883608341217,
+    "min": -1.8515625,
+    "std": 0.15098052353058372
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.9.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1015625,
+    "mean": 0.8390369415283203,
+    "min": 0.1806640625,
+    "std": 0.1584060423074196
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.9.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.55078125,
+    "mean": 0.005691166967153549,
+    "min": -0.57421875,
+    "std": 0.0908238324464577
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.9.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7460784912109375,
+    "mean": -5.093390185114307e-05,
+    "min": -0.8516921997070313,
+    "std": 0.10324101004120609
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.9.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.04644775390625,
+    "mean": 4.038861698063556e-05,
+    "min": -0.799163818359375,
+    "std": 0.10043557646315539
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.9.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.15625,
+    "mean": 0.00019993819296360016,
+    "min": -0.79296875,
+    "std": 0.07827994524363768
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.9.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.171875,
+    "mean": 0.88555908203125,
+    "min": 0.3046875,
+    "std": 0.12957231795490085
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.9.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.60546875,
+    "mean": 0.005268753506243229,
+    "min": -0.451171875,
+    "std": 0.07882846730998061
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.9.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7538299560546875,
+    "mean": 0.00029647868450410897,
+    "min": -0.9141883850097656,
+    "std": 0.11036264668482382
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.9.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.171875,
+    "mean": -0.04561442890553735,
+    "min": -0.4296875,
+    "std": 0.04494851364075824
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.9.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.1568450927734375,
+    "mean": -0.0001916750948112167,
+    "min": -2.0308837890625,
+    "std": 0.0734694299504039
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.9.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.234375,
+    "mean": -0.0025711432099342346,
+    "min": -2.1875,
+    "std": 0.15313801557161535
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.10.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.21875,
+    "mean": 0.9192924499511719,
+    "min": 0.185546875,
+    "std": 0.17187616664689662
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.10.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.671875,
+    "mean": 0.004941247403621674,
+    "min": -0.71875,
+    "std": 0.0942256996658357
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.10.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6133346557617188,
+    "mean": 0.00013118939326280574,
+    "min": -0.8240776062011719,
+    "std": 0.10055508505134855
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.10.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.2576751708984375,
+    "mean": 4.974176954419818e-05,
+    "min": -1.2266693115234375,
+    "std": 0.10963594458010847
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.10.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.921875,
+    "mean": 0.0004466501995921135,
+    "min": -0.8828125,
+    "std": 0.07519812330884937
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.10.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1328125,
+    "mean": 0.856597900390625,
+    "min": 0.205078125,
+    "std": 0.11227220397206823
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.10.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.625,
+    "mean": 0.004155293572694063,
+    "min": -0.38671875,
+    "std": 0.07543783221257358
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.10.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7189483642578125,
+    "mean": 0.0007301028867914283,
+    "min": -0.8826980590820313,
+    "std": 0.10840544520299561
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.10.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.166015625,
+    "mean": -0.0473917662166059,
+    "min": -0.255859375,
+    "std": 0.04796648287901755
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.10.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.7343902587890625,
+    "mean": -0.00018632276783137058,
+    "min": -2.3428802490234375,
+    "std": 0.07621619114287068
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.10.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0703125,
+    "mean": -0.0037783775478601456,
+    "min": -2.125,
+    "std": 0.1469004181609846
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.11.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1015625,
+    "mean": 0.8988418579101563,
+    "min": 0.220703125,
+    "std": 0.1343733026343948
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.11.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.75,
+    "mean": 0.006230543367564678,
+    "min": -0.59375,
+    "std": 0.09945412347861461
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.11.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6758308410644531,
+    "mean": 5.856725814131399e-05,
+    "min": -0.6288375854492188,
+    "std": 0.09799548625485868
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.11.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.3361587524414063,
+    "mean": 7.367351827269886e-06,
+    "min": -1.468902587890625,
+    "std": 0.1079008048278275
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.11.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0234375,
+    "mean": 0.0013752356171607971,
+    "min": -1.0625,
+    "std": 0.09037189474895957
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.11.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0859375,
+    "mean": 0.8452835083007813,
+    "min": 0.1640625,
+    "std": 0.10826647061704041
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.11.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7578125,
+    "mean": 0.004512716084718704,
+    "min": -0.48828125,
+    "std": 0.08049020562908281
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.11.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6797065734863281,
+    "mean": 0.0009374383917020168,
+    "min": -1.2111663818359375,
+    "std": 0.10670740071068628
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.11.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.125,
+    "mean": -0.0501983764115721,
+    "min": -0.244140625,
+    "std": 0.052474663922411326
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.11.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.8283767700195313,
+    "mean": -0.00024127357960423979,
+    "min": -2.3273773193359375,
+    "std": 0.08212207290558991
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.11.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0,
+    "mean": -0.0039372518658638,
+    "min": -2.046875,
+    "std": 0.13870325150141305
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.12.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0859375,
+    "mean": 0.8550949096679688,
+    "min": 0.240234375,
+    "std": 0.14773970879729464
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.12.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.62890625,
+    "mean": 0.00765746645629406,
+    "min": -0.55078125,
+    "std": 0.08848752284282552
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.12.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.3129043579101563,
+    "mean": 2.2322081349557266e-05,
+    "min": -1.0076904296875,
+    "std": 0.0971910274175476
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.12.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.3826675415039063,
+    "mean": -0.00010995177763106767,
+    "min": -1.6249008178710938,
+    "std": 0.11119861927189971
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.12.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.3515625,
+    "mean": 0.0037523293867707253,
+    "min": -1.0234375,
+    "std": 0.10390908832892407
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.12.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0859375,
+    "mean": 0.8440876007080078,
+    "min": 0.1748046875,
+    "std": 0.1018105907318508
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.12.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.64453125,
+    "mean": 0.005784076842246577,
+    "min": -0.5703125,
+    "std": 0.07258628932580506
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.12.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7383270263671875,
+    "mean": 0.0013586816439783433,
+    "min": -1.1879119873046875,
+    "std": 0.10695943422787164
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.12.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.15234375,
+    "mean": -0.049691425694618374,
+    "min": -0.375,
+    "std": 0.054430280819920976
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.12.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.466064453125,
+    "mean": -0.0002210851007475867,
+    "min": -2.7963409423828125,
+    "std": 0.08246749450296487
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.12.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.953125,
+    "mean": -0.002724025398492813,
+    "min": -1.890625,
+    "std": 0.13580922783776878
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.13.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0859375,
+    "mean": 0.8947696685791016,
+    "min": 0.2431640625,
+    "std": 0.10777061798170644
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.13.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.8203125,
+    "mean": 0.010704881511628628,
+    "min": -0.69921875,
+    "std": 0.09446080636656537
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.13.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.9451942443847656,
+    "mean": -3.392515585195118e-05,
+    "min": -0.8633193969726563,
+    "std": 0.09477342953136536
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.13.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.7576446533203125,
+    "mean": 5.613496250589378e-05,
+    "min": -1.461151123046875,
+    "std": 0.11195052446832512
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.13.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.03125,
+    "mean": 0.004656795063056052,
+    "min": -0.9375,
+    "std": 0.13256078243862607
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.13.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.046875,
+    "mean": 0.8136920928955078,
+    "min": 0.140625,
+    "std": 0.1013885076933684
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.13.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.875,
+    "mean": 0.007142744958400726,
+    "min": -0.6796875,
+    "std": 0.07806076627049884
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.13.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7422027587890625,
+    "mean": 0.0017506626604699704,
+    "min": -1.430145263671875,
+    "std": 0.10863354688237598
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.13.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.1318359375,
+    "mean": -0.05099006987074972,
+    "min": -0.275390625,
+    "std": 0.05922875040107578
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.13.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.7498321533203125,
+    "mean": -0.00018028505519396276,
+    "min": -3.530792236328125,
+    "std": 0.08414702487567667
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.13.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.265625,
+    "mean": -0.0015202537178993225,
+    "min": -1.84375,
+    "std": 0.14185713790869628
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.14.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0625,
+    "mean": 0.8538894653320313,
+    "min": 0.173828125,
+    "std": 0.12679989420960794
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.14.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.734375,
+    "mean": 0.015193962113698944,
+    "min": -0.65234375,
+    "std": 0.08599922664097029
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.14.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.2034149169921875,
+    "mean": -0.00012975089157407638,
+    "min": -1.445648193359375,
+    "std": 0.09733939198813196
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.14.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.015380859375,
+    "mean": 0.0001954384133568965,
+    "min": -2.3118743896484375,
+    "std": 0.11419749620925135
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.14.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.375,
+    "mean": 0.008068987401202321,
+    "min": -0.640625,
+    "std": 0.14908048250796896
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.14.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0859375,
+    "mean": 0.8735256195068359,
+    "min": 0.1181640625,
+    "std": 0.11956970891993242
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.14.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0078125,
+    "mean": 0.011972375214099884,
+    "min": -0.6796875,
+    "std": 0.08804581429244401
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.14.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.9103126525878906,
+    "mean": 0.0013944744378022733,
+    "min": -1.523162841796875,
+    "std": 0.114150129994439
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.14.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.201171875,
+    "mean": -0.05153642676305026,
+    "min": -0.3359375,
+    "std": 0.06676833914928068
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.14.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.577301025390625,
+    "mean": -8.201672994800902e-05,
+    "min": -3.7807769775390625,
+    "std": 0.09092058307503871
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.14.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.6796875,
+    "mean": -0.00030713528394699097,
+    "min": -1.609375,
+    "std": 0.14948327619687446
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.15.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.984375,
+    "mean": 0.7800693511962891,
+    "min": 0.1552734375,
+    "std": 0.11906919244257232
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.15.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.5703125,
+    "mean": 0.0201738472096622,
+    "min": -0.70703125,
+    "std": 0.07809168793764962
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.15.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6913337707519531,
+    "mean": -9.416362324069875e-05,
+    "min": -0.8318290710449219,
+    "std": 0.09951163369424748
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.15.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.7188873291015625,
+    "mean": -7.221601299534086e-05,
+    "min": -1.530914306640625,
+    "std": 0.11132169056353425
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.15.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.109375,
+    "mean": 0.006797648500651121,
+    "min": -0.52734375,
+    "std": 0.14056235201083797
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.15.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1171875,
+    "mean": 0.8514022827148438,
+    "min": 0.1298828125,
+    "std": 0.11806783792615294
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.15.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.890625,
+    "mean": 0.015750104561448097,
+    "min": -0.68359375,
+    "std": 0.10051303539832793
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.15.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.9219398498535156,
+    "mean": 0.0008951540071393538,
+    "min": -0.9529457092285156,
+    "std": 0.11840458008322784
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.15.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.2119140625,
+    "mean": -0.05659442534670234,
+    "min": -0.333984375,
+    "std": 0.07875828285092656
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.15.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.6102447509765625,
+    "mean": 2.865038050003932e-05,
+    "min": -3.06182861328125,
+    "std": 0.10353229017973792
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.15.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.8984375,
+    "mean": 0.0013153161853551865,
+    "min": -1.1640625,
+    "std": 0.1532144052325585
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.16.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.96875,
+    "mean": 0.7708339691162109,
+    "min": 0.15625,
+    "std": 0.11780033317420138
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.16.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.75,
+    "mean": 0.02716072741895914,
+    "min": -0.68359375,
+    "std": 0.0749968791611776
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.16.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.8982009887695313,
+    "mean": 0.0003864805991421842,
+    "min": -0.8943252563476563,
+    "std": 0.10202946815851431
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.16.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.6326522827148438,
+    "mean": 0.00013585216856881743,
+    "min": -2.015380859375,
+    "std": 0.11182031639207879
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.16.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.09375,
+    "mean": 0.006014155223965645,
+    "min": -0.55078125,
+    "std": 0.13125416371922596
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.16.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0859375,
+    "mean": 0.8627300262451172,
+    "min": 0.1591796875,
+    "std": 0.120144149987715
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.16.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.85546875,
+    "mean": 0.023198287934064865,
+    "min": -0.65625,
+    "std": 0.10068666387700466
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.16.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0784225463867188,
+    "mean": 0.00022768704593545408,
+    "min": -1.2421722412109375,
+    "std": 0.11742274293057889
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.16.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.1865234375,
+    "mean": -0.05930325219378574,
+    "min": -0.34765625,
+    "std": 0.0806278672073131
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.16.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 4.685760498046875,
+    "mean": 7.876796144046239e-05,
+    "min": -4.185791015625,
+    "std": 0.10169576155169932
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.16.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.328125,
+    "mean": 0.0016575129702687263,
+    "min": -1.0078125,
+    "std": 0.1562108752323717
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.17.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.9296875,
+    "mean": 0.7315540313720703,
+    "min": 0.169921875,
+    "std": 0.10869232628302591
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.17.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7109375,
+    "mean": 0.03329662512987852,
+    "min": -0.51171875,
+    "std": 0.07402474350843248
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.17.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.96893310546875,
+    "mean": 0.000150438771621945,
+    "min": -0.7814445495605469,
+    "std": 0.10305498911322714
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.17.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.453399658203125,
+    "mean": -3.331646348669892e-05,
+    "min": -1.5628890991210938,
+    "std": 0.11368207190965358
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.17.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.03125,
+    "mean": 0.00547990296036005,
+    "min": -0.52734375,
+    "std": 0.1231247753180076
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.17.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0390625,
+    "mean": 0.859893798828125,
+    "min": 0.173828125,
+    "std": 0.11880840430682793
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.17.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.75,
+    "mean": 0.027121967170387506,
+    "min": -0.59765625,
+    "std": 0.09105886332210647
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.17.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1171798706054688,
+    "mean": 1.5562327462248504e-06,
+    "min": -0.9921875,
+    "std": 0.11476913441717744
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.17.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.150390625,
+    "mean": -0.058581294724717736,
+    "min": -0.341796875,
+    "std": 0.07722226652134521
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.17.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 7.03057861328125,
+    "mean": 0.00023801485508556652,
+    "min": -3.07733154296875,
+    "std": 0.09967103566543038
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.17.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.859375,
+    "mean": 0.004603642970323563,
+    "min": -0.8515625,
+    "std": 0.17587591544605935
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.18.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.98046875,
+    "mean": 0.7870559692382813,
+    "min": 0.1904296875,
+    "std": 0.12488774734603669
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.18.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6484375,
+    "mean": 0.029755608644336462,
+    "min": -0.546875,
+    "std": 0.071738494326557
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.18.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.8865737915039063,
+    "mean": 4.622742684053567e-06,
+    "min": -0.8904495239257813,
+    "std": 0.10150295821421959
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.18.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.3118743896484375,
+    "mean": 1.900480219774181e-05,
+    "min": -1.445648193359375,
+    "std": 0.1164423994930816
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.18.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.7578125,
+    "mean": 0.0050462279468774796,
+    "min": -0.51953125,
+    "std": 0.10646037082732118
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.18.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.09375,
+    "mean": 0.8914451599121094,
+    "min": 0.205078125,
+    "std": 0.12202082483196192
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.18.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.71484375,
+    "mean": 0.031621008878573775,
+    "min": -0.5234375,
+    "std": 0.0932879576480907
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.18.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.2576751708984375,
+    "mean": -0.0002643863572302507,
+    "min": -0.99993896484375,
+    "std": 0.11726899664281398
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.18.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.1953125,
+    "mean": -0.06053915683878586,
+    "min": -0.345703125,
+    "std": 0.08520412121839628
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.18.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 6.75152587890625,
+    "mean": 0.00028220585977578594,
+    "min": -7.592559814453125,
+    "std": 0.10735195457294486
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.18.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.5625,
+    "mean": 0.003407305252039805,
+    "min": -0.5546875,
+    "std": 0.17121028237878394
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.19.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.98046875,
+    "mean": 0.813507080078125,
+    "min": 0.2265625,
+    "std": 0.10609475866380413
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.19.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6015625,
+    "mean": 0.033993612974882126,
+    "min": -0.55078125,
+    "std": 0.07864123106031402
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.19.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6172103881835938,
+    "mean": 9.956900673084117e-05,
+    "min": -0.6017074584960938,
+    "std": 0.10020369358137249
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.19.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.9378662109375,
+    "mean": 7.960592392919352e-05,
+    "min": -1.8310546875,
+    "std": 0.11017009471334792
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.19.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.6640625,
+    "mean": 0.004218988120555878,
+    "min": -0.486328125,
+    "std": 0.10013160165948892
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.19.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1171875,
+    "mean": 0.893096923828125,
+    "min": 0.181640625,
+    "std": 0.11709724367889005
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.19.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.57421875,
+    "mean": 0.03177095204591751,
+    "min": -0.6484375,
+    "std": 0.09834947128706756
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.19.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0551681518554688,
+    "mean": -0.000437211851021857,
+    "min": -1.0386962890625,
+    "std": 0.11653223729803193
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.19.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.177734375,
+    "mean": -0.06338871899060905,
+    "min": -0.3359375,
+    "std": 0.08777645297973555
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.19.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 6.344573974609375,
+    "mean": 0.00033052728690563526,
+    "min": -5.344635009765625,
+    "std": 0.110854257283937
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.19.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.578125,
+    "mean": 0.004089112393558025,
+    "min": -0.333984375,
+    "std": 0.16748131808475455
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.20.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0078125,
+    "mean": 0.8185977935791016,
+    "min": 0.1904296875,
+    "std": 0.12967891379179836
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.20.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.59375,
+    "mean": 0.035508802509866655,
+    "min": -0.4453125,
+    "std": 0.07138065869177097
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.20.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7383270263671875,
+    "mean": 4.7213846604184555e-06,
+    "min": -0.6758308410644531,
+    "std": 0.10333809175556048
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.20.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.04638671875,
+    "mean": 6.699147434119368e-05,
+    "min": -2.015380859375,
+    "std": 0.1186694874575399
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.20.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.71875,
+    "mean": 0.0036983322352170944,
+    "min": -0.451171875,
+    "std": 0.09790770302822298
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.20.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1171875,
+    "mean": 0.9247913360595703,
+    "min": 0.1904296875,
+    "std": 0.12272479960504232
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.20.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.60546875,
+    "mean": 0.03514159098267555,
+    "min": -0.69921875,
+    "std": 0.11632397959256528
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.20.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.01544189453125,
+    "mean": -0.0007266142101798323,
+    "min": -1.0939254760742188,
+    "std": 0.11670351154661954
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.20.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.2255859375,
+    "mean": -0.06240567582426593,
+    "min": -0.291015625,
+    "std": 0.07330492591067568
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.20.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 5.06170654296875,
+    "mean": 0.0003873696784921776,
+    "min": -5.8135986328125,
+    "std": 0.11457148167247802
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.20.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.96875,
+    "mean": 0.004647901281714439,
+    "min": -0.41015625,
+    "std": 0.19126577478654028
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.21.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.953125,
+    "mean": 0.7786979675292969,
+    "min": 0.24609375,
+    "std": 0.1166403668312579
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.21.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.59375,
+    "mean": 0.03956081625074148,
+    "min": -0.462890625,
+    "std": 0.07204718384574793
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.21.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6680793762207031,
+    "mean": -9.424040702773102e-05,
+    "min": -0.6249618530273438,
+    "std": 0.10353230050651623
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.21.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.8748855590820313,
+    "mean": -3.19769324050867e-05,
+    "min": -1.9213943481445313,
+    "std": 0.11500291322219952
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.21.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.578125,
+    "mean": 0.002542593516409397,
+    "min": -0.4296875,
+    "std": 0.09286814352860022
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.21.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.28125,
+    "mean": 1.0433158874511719,
+    "min": 0.158203125,
+    "std": 0.15188811282301284
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.21.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.578125,
+    "mean": 0.03620061930269003,
+    "min": -0.66796875,
+    "std": 0.1389110397869923
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.21.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0386962890625,
+    "mean": -0.0005031892192164378,
+    "min": -1.2111663818359375,
+    "std": 0.1190001141436891
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.21.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.26171875,
+    "mean": -0.05659918658784591,
+    "min": -0.3671875,
+    "std": 0.0717550925795157
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.21.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 5.344635009765625,
+    "mean": 0.0006207518845258164,
+    "min": -5.09271240234375,
+    "std": 0.12078259141741807
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.21.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.296875,
+    "mean": 0.00592166930437088,
+    "min": -0.6796875,
+    "std": 0.23430616396248108
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.22.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.046875,
+    "mean": 0.8645572662353516,
+    "min": 0.2392578125,
+    "std": 0.12355824475214738
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.22.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.55078125,
+    "mean": 0.050765447318553925,
+    "min": -0.52734375,
+    "std": 0.07762359557131791
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.22.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.5740928649902344,
+    "mean": 0.0001049072009967252,
+    "min": -0.6288375854492188,
+    "std": 0.10444732631045496
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.22.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.2963714599609375,
+    "mean": -6.143061182228848e-05,
+    "min": -1.988983154296875,
+    "std": 0.11726796453986969
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.22.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1953125,
+    "mean": 0.0029869647696614265,
+    "min": -0.451171875,
+    "std": 0.0834954981046731
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.22.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.25,
+    "mean": 1.0247440338134766,
+    "min": 0.1708984375,
+    "std": 0.13999464259557906
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.22.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.75,
+    "mean": 0.041436078026890755,
+    "min": -1.015625,
+    "std": 0.16968722700965452
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.22.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0861740112304688,
+    "mean": -0.0010520467249079957,
+    "min": -0.8904495239257813,
+    "std": 0.11754577491855774
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.22.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.306640625,
+    "mean": -0.0576878369320184,
+    "min": -0.328125,
+    "std": 0.07073952817737286
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.22.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 4.592742919921875,
+    "mean": 0.0006665486610017979,
+    "min": -3.468780517578125,
+    "std": 0.1349396839336513
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.22.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.140625,
+    "mean": 0.005142606794834137,
+    "min": -0.609375,
+    "std": 0.2067830814761087
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.23.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.046875,
+    "mean": 0.8268966674804688,
+    "min": 0.271484375,
+    "std": 0.09810571205293915
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.23.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.47265625,
+    "mean": 0.04025040939450264,
+    "min": -0.5078125,
+    "std": 0.07629154450374934
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.23.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7460784912109375,
+    "mean": 6.04509114054963e-05,
+    "min": -0.6525764465332031,
+    "std": 0.10100439079647194
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.23.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.2032928466796875,
+    "mean": 0.0002675291143532377,
+    "min": -1.6249008178710938,
+    "std": 0.12762177212302306
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.23.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1171875,
+    "mean": 0.0017470773309469223,
+    "min": -0.474609375,
+    "std": 0.08307039374634609
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.23.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1640625,
+    "mean": 0.929473876953125,
+    "min": 0.203125,
+    "std": 0.11549876884298664
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.23.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.546875,
+    "mean": 0.04092230834066868,
+    "min": -0.6640625,
+    "std": 0.1321860037420802
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.23.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.9568214416503906,
+    "mean": -0.001185688985970046,
+    "min": -0.8943252563476563,
+    "std": 0.11379189305474911
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.23.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.3125,
+    "mean": -0.05584556859685108,
+    "min": -0.326171875,
+    "std": 0.06932401617986968
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.23.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 5.685699462890625,
+    "mean": 0.0003174161363403982,
+    "min": -3.6567535400390625,
+    "std": 0.12772812982226125
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.23.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.8125,
+    "mean": 0.004283003509044647,
+    "min": -0.6640625,
+    "std": 0.1985724411149459
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.24.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0234375,
+    "mean": 0.7983894348144531,
+    "min": 0.283203125,
+    "std": 0.07568729366595447
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.24.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.52734375,
+    "mean": 0.042275093495845795,
+    "min": -0.4609375,
+    "std": 0.07379805580382985
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.24.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7305755615234375,
+    "mean": 5.4944694056757726e-05,
+    "min": -0.6952095031738281,
+    "std": 0.09923006109002623
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.24.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.523162841796875,
+    "mean": -7.843815819796873e-05,
+    "min": -1.5706405639648438,
+    "std": 0.12771876158843762
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.24.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1953125,
+    "mean": 0.00011180434376001358,
+    "min": -0.5078125,
+    "std": 0.08832024510295601
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.24.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.09375,
+    "mean": 0.8550052642822266,
+    "min": 0.2294921875,
+    "std": 0.09488077166528851
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.24.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.486328125,
+    "mean": 0.0342696588486433,
+    "min": -0.6484375,
+    "std": 0.11301728123422575
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.24.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.01544189453125,
+    "mean": -0.0006899143963892129,
+    "min": -0.8439407348632813,
+    "std": 0.10910626638899526
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.24.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.400390625,
+    "mean": -0.054287017934257165,
+    "min": -0.34765625,
+    "std": 0.06824830291925514
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.24.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 4.84466552734375,
+    "mean": 0.00025065326462936355,
+    "min": -2.7343292236328125,
+    "std": 0.12913408007700747
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.24.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.28125,
+    "mean": 0.0033102557063102722,
+    "min": -0.69140625,
+    "std": 0.18053028311526928
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.25.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.078125,
+    "mean": 0.8730659484863281,
+    "min": 0.328125,
+    "std": 0.08417254597633292
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.25.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.447265625,
+    "mean": 0.03737812954932451,
+    "min": -0.56640625,
+    "std": 0.07781647441596799
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.25.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6443405151367188,
+    "mean": -0.0001799122486166501,
+    "min": -0.5939559936523438,
+    "std": 0.09683651407252629
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.25.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.6481552124023438,
+    "mean": -8.575996525905794e-05,
+    "min": -1.6559066772460938,
+    "std": 0.14086686607096852
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.25.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.2578125,
+    "mean": 0.00038426928222179413,
+    "min": -0.486328125,
+    "std": 0.10005513901320376
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.25.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1796875,
+    "mean": 0.7733821868896484,
+    "min": 0.2412109375,
+    "std": 0.09297150356780828
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.25.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.458984375,
+    "mean": 0.03713475167751312,
+    "min": -0.67578125,
+    "std": 0.10713704212794561
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.25.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.8788223266601563,
+    "mean": -0.0012249848869032576,
+    "min": -0.7930717468261719,
+    "std": 0.10409081870444936
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.25.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.2119140625,
+    "mean": -0.04985725070582703,
+    "min": -0.4921875,
+    "std": 0.07300655991659935
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.25.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 5.468658447265625,
+    "mean": 0.00043472068296068755,
+    "min": -3.561798095703125,
+    "std": 0.1431830056596893
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.25.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.75,
+    "mean": 0.0014116538222879171,
+    "min": -0.38671875,
+    "std": 0.14642863200342793
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.26.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.21875,
+    "mean": 0.8629913330078125,
+    "min": 0.3359375,
+    "std": 0.10217499246484965
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.26.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.50390625,
+    "mean": 0.043796394020318985,
+    "min": -0.3515625,
+    "std": 0.07385095379830314
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.26.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7499542236328125,
+    "mean": -8.663828339194879e-07,
+    "min": -0.6603279113769531,
+    "std": 0.09412068263508135
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.26.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.1714401245117188,
+    "mean": 7.599824130011257e-05,
+    "min": -1.04644775390625,
+    "std": 0.13845386270870078
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.26.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.8515625,
+    "mean": -0.0013107974082231522,
+    "min": -0.44140625,
+    "std": 0.08171650584851918
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.26.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.328125,
+    "mean": 0.7457370758056641,
+    "min": 0.1806640625,
+    "std": 0.11029433311876913
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.26.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.470703125,
+    "mean": 0.03341353451833129,
+    "min": -0.58984375,
+    "std": 0.0990025966895167
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.26.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7305755615234375,
+    "mean": -0.0013114490006955748,
+    "min": -0.8163261413574219,
+    "std": 0.10079711070819149
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.26.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.2353515625,
+    "mean": -0.050346922827884555,
+    "min": -0.2890625,
+    "std": 0.06758959520248761
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.26.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 4.061767578125,
+    "mean": 0.0003581445621421153,
+    "min": -2.6258087158203125,
+    "std": 0.1622397735331021
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.26.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0,
+    "mean": -0.0008493289351463318,
+    "min": -0.35546875,
+    "std": 0.11947703714585278
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.27.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.6328125,
+    "mean": 0.9245452880859375,
+    "min": 0.3203125,
+    "std": 0.15540377751451231
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.27.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.5703125,
+    "mean": 0.041297461837530136,
+    "min": -0.326171875,
+    "std": 0.07565566285959403
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.27.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.8279533386230469,
+    "mean": 6.701407134338903e-05,
+    "min": -0.7891960144042969,
+    "std": 0.09507074610566008
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.27.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.549896240234375,
+    "mean": 0.0003597018212531111,
+    "min": -1.7266387939453125,
+    "std": 0.15332779216265902
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.27.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.0390625,
+    "mean": -0.00445440411567688,
+    "min": -0.96484375,
+    "std": 0.09121399842259277
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.27.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.4296875,
+    "mean": 0.7530689239501953,
+    "min": 0.17578125,
+    "std": 0.12928848665661197
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.27.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.58984375,
+    "mean": 0.032654677517712116,
+    "min": -0.470703125,
+    "std": 0.09354331913916537
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.27.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6913337707519531,
+    "mean": -0.0015925782772683306,
+    "min": -0.6719551086425781,
+    "std": 0.09955948164746886
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.27.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.2275390625,
+    "mean": -0.05139068537391722,
+    "min": -0.51171875,
+    "std": 0.06949178385026704
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.27.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 4.344696044921875,
+    "mean": 0.0001047371683853271,
+    "min": -2.95330810546875,
+    "std": 0.18661957181251787
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.27.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.341796875,
+    "mean": -0.0031717109959572554,
+    "min": -0.625,
+    "std": 0.08912390820864403
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.28.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.03125,
+    "mean": 1.0260276794433594,
+    "min": 0.271484375,
+    "std": 0.20291013594638158
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.28.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.5,
+    "mean": 0.037553141242824495,
+    "min": -0.392578125,
+    "std": 0.07979825458207893
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.28.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.8008232116699219,
+    "mean": -1.1389851958180467e-05,
+    "min": -0.7891960144042969,
+    "std": 0.09400346663203714
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.28.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.6481552124023438,
+    "mean": -0.00014012895917403512,
+    "min": -1.523162841796875,
+    "std": 0.15880134845425908
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.28.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.2109375,
+    "mean": -0.004285105736926198,
+    "min": -1.4296875,
+    "std": 0.10901673354587187
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.28.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.5625,
+    "mean": 0.7727851867675781,
+    "min": 0.1494140625,
+    "std": 0.13725715315440404
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.28.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.443359375,
+    "mean": 0.01712727453559637,
+    "min": -0.3828125,
+    "std": 0.09118689946971265
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.28.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7383270263671875,
+    "mean": -0.00016791011967143277,
+    "min": -0.6210861206054688,
+    "std": 0.09884823695429311
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.28.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.3828125,
+    "mean": -0.051061033038422465,
+    "min": -0.380859375,
+    "std": 0.0686220666246326
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.28.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.1722869873046875,
+    "mean": -0.00014287219164543785,
+    "min": -3.2342987060546875,
+    "std": 0.21019749336324625
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.28.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.259765625,
+    "mean": 0.0007191449403762817,
+    "min": -0.32421875,
+    "std": 0.08378002337137344
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.29.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.9765625,
+    "mean": 1.0279159545898438,
+    "min": 0.322265625,
+    "std": 0.19228162969931747
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.29.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.46484375,
+    "mean": 0.027126250322908163,
+    "min": -0.189453125,
+    "std": 0.05946949654644501
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.29.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.8400650024414063,
+    "mean": 9.116841920331353e-05,
+    "min": -0.9103126525878906,
+    "std": 0.09881438046581296
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.29.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.04638671875,
+    "mean": -0.0001382198570354376,
+    "min": -1.953369140625,
+    "std": 0.17429292727382162
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.29.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.89453125,
+    "mean": -0.0031405072659254074,
+    "min": -1.6953125,
+    "std": 0.11809670206156986
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.29.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.46875,
+    "mean": 0.7752761840820313,
+    "min": 0.15234375,
+    "std": 0.11841016133645692
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.29.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.349609375,
+    "mean": 0.020135406870394945,
+    "min": -0.451171875,
+    "std": 0.09301868640537453
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.29.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.8749465942382813,
+    "mean": -0.0006456930977947195,
+    "min": -0.8749465942382813,
+    "std": 0.10132748799818837
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.29.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.3828125,
+    "mean": -0.057372018811292946,
+    "min": -1.4453125,
+    "std": 0.09062968703427988
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.29.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 4.592742919921875,
+    "mean": -0.00017065141582861543,
+    "min": -5.561676025390625,
+    "std": 0.23276538950090686
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.29.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.28125,
+    "mean": -0.0011820148793049157,
+    "min": -0.357421875,
+    "std": 0.08870679541559714
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.30.norm1.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.859375,
+    "mean": 1.2562294006347656,
+    "min": 0.376953125,
+    "std": 0.1552976343038395
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.30.norm1.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.6171875,
+    "mean": 0.0866432823240757,
+    "min": -0.1220703125,
+    "std": 0.07720212462262055
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.30.attn.w_qkv.weight",
+   "ne": [
+    512,
+    1536,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.8826980590820313,
+    "mean": -8.560804296090889e-05,
+    "min": -0.9335670471191406,
+    "std": 0.09453609662568839
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.30.attn.out_proj.weight",
+   "ne": [
+    512,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.8903884887695313,
+    "mean": 7.73569609009428e-05,
+    "min": -1.7808990478515625,
+    "std": 0.1793709605742245
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.30.attn.out_proj.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.578125,
+    "mean": -0.0014636591076850891,
+    "min": -1.5625,
+    "std": 0.17783875104521935
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.30.norm2.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 2.625,
+    "mean": 1.7353401184082031,
+    "min": 0.494140625,
+    "std": 0.22991210152008848
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.30.norm2.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.7578125,
+    "mean": -0.03320237249135971,
+    "min": -1.0859375,
+    "std": 0.15638270948626892
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.30.ffn.net.0.weight",
+   "ne": [
+    512,
+    2048,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.8593826293945313,
+    "mean": 0.002804751022495111,
+    "min": -1.2964324951171875,
+    "std": 0.13301768464996477
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.30.ffn.net.0.bias",
+   "ne": [
+    2048,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.333984375,
+    "mean": -0.04093568283133209,
+    "min": -1.4921875,
+    "std": 0.12484807303147895
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder.layers.30.ffn.net.3.weight",
+   "ne": [
+    2048,
+    512,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 12.123291015625,
+    "mean": -0.00020644022060878342,
+    "min": -12.50311279296875,
+    "std": 0.2401343299487338
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.layers.30.ffn.net.3.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.94140625,
+    "mean": 0.00046199746429920197,
+    "min": -1.453125,
+    "std": 0.14508479436512017
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.final_norm.weight",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 3.59375,
+    "mean": 2.0276091769337654,
+    "min": 0.000492095947265625,
+    "std": 0.5452285003137036
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder.final_norm.bias",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.279296875,
+    "mean": -0.00324162095785141,
+    "min": -0.26171875,
+    "std": 0.0813499320901519
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "learnable_sil_emb",
+   "ne": [
+    512,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.0174560546875,
+    "mean": -0.00015361071564257145,
+    "min": -0.0167236328125,
+    "std": 0.005274804972360719
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "head.first_hidden_to_hidden.weight",
+   "ne": [
+    192,
+    192,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.765625,
+    "mean": -0.07010703298065993,
+    "min": -3.109375,
+    "std": 0.3120741284091158
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "head.first_hidden_to_hidden.bias",
+   "ne": [
+    192,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.65234375,
+    "mean": 0.4365030924479167,
+    "min": 0.1875,
+    "std": 0.08824504224184061
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "head.single_hidden_to_spks.weight",
+   "ne": [
+    192,
+    8,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.333984375,
+    "mean": -0.03396287781652063,
+    "min": -0.427734375,
+    "std": 0.08926133196809574
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "head.single_hidden_to_spks.bias",
+   "ne": [
+    8,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": -0.0341796875,
+    "mean": -0.52392578125,
+    "min": -1.359375,
+    "std": 0.4098823722881344
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "head.activity_head.0.weight",
+   "ne": [
+    192,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 1.3203125,
+    "mean": 1.0357869466145833,
+    "min": 0.92578125,
+    "std": 0.05219053917574054
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "head.activity_head.0.bias",
+   "ne": [
+    192,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.07080078125,
+    "mean": 0.009167969226837158,
+    "min": -0.06640625,
+    "std": 0.04577760761812886
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "head.activity_head.1.weight",
+   "ne": [
+    192,
+    3,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.41796875,
+    "mean": -0.0030050244596269396,
+    "min": -0.3984375,
+    "std": 0.0856727137361668
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "head.activity_head.1.bias",
+   "ne": [
+    3,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.109375,
+    "mean": 0.016845703125,
+    "min": -0.035400390625,
+    "std": 0.0656101149374741
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 2,
+   "name": "encoder_proj.weight",
+   "ne": [
+    512,
+    192,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.51934814453125,
+    "mean": -0.00016485803280374967,
+    "min": -0.6133346557617188,
+    "std": 0.03303520824332591
+   },
+   "type": "q8_0"
+  },
+  {
+   "n_dims": 1,
+   "name": "encoder_proj.bias",
+   "ne": [
+    192,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.056640625,
+    "mean": 0.0009779582420984905,
+    "min": -0.10693359375,
+    "std": 0.028432781053049347
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 3,
+   "name": "subpixel_upsample.weight",
+   "ne": [
+    3,
+    192,
+    1536,
+    1
+   ],
+   "stats": {
+    "max": 1.0390625,
+    "mean": 0.002100225674843791,
+    "min": -0.1728515625,
+    "std": 0.041448324234192924
+   },
+   "type": "f16"
+  },
+  {
+   "n_dims": 1,
+   "name": "subpixel_upsample.bias",
+   "ne": [
+    1536,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.0186767578125,
+    "mean": 0.001634262395479406,
+    "min": -0.0172119140625,
+    "std": 0.004109468715606264
+   },
+   "type": "f32"
+  }
+ ]
+}

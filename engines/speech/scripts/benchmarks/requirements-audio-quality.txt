@@ -1,0 +1,19 @@
+# Benchmark dependencies: CPython 3.11/3.12, Linux x86_64 or macOS arm64.
+# Only official PyPI wheels are allowed; source builds are disabled.
+--only-binary=:all:
+--require-hashes
+
+numpy==1.26.4 \
+    --hash=sha256:edd8b5fe47dab091176d21bb6de568acdd906d1887a4584a15a9a96a1dca06ef \
+    --hash=sha256:666dbfb6ec68962c033a450943ded891bed2d54e6755e35e5835d63f4f6931d5 \
+    --hash=sha256:03a8c78d01d9781b28a6989f6fa1bb2c4f2d51201cf99d3dd875df6fbd96b23b \
+    --hash=sha256:675d61ffbfa78604709862923189bad94014bef562cc35cf61d3a07bba02a7ed
+
+scipy==1.11.4 \
+    --hash=sha256:1b7c3dca977f30a739e0409fb001056484661cb2541a01aba0bb0029f7b68db8 \
+    --hash=sha256:530f9ad26440e85766509dbf78edcfe13ffd0ab7fec2560ee5c36ff74d6269ff \
+    --hash=sha256:2c6ff6ef9cc27f9b3db93a6f8b38f97387e6e0591600369a297a50a8e96e835d \
+    --hash=sha256:ad669df80528aeca5f557712102538f4f37e503f0c5b9541655016dd0932ca79
+
+pystoi==0.4.1 \
+    --hash=sha256:e277b671663d26d35a2416c9c8010a74084e6c3970354506398051a554896939

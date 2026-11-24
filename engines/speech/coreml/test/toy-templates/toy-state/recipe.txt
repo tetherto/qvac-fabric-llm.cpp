@@ -1,0 +1,10 @@
+mlrecipe 1
+template toy-state
+spec_sha256 f8b1f9fbb04a44e1e65f717c4e3e35f9c055b821b37d5f1b27321e7db8b987af
+weight_bin_size 768
+blobs 2
+source "toy.w1" f32 [32,8]
+source "toy.b1" f32 [32]
+blob 64 fp16 256 f16(t("toy.w1"))
+blob 640 fp16 32 f16(t("toy.b1"))
+end

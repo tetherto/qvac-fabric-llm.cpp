@@ -1,0 +1,177 @@
+tts-cpp
+Copyright 2026 QVAC contributors
+
+The tts-cpp package code is licensed under MIT. It is the multi-engine
+tts component of qvac-fabric-speech.cpp, not a bundled copy of one
+model project. Model checkpoints, upstream reference implementations, and
+optional conversion-time Python packages remain under their own licenses.
+No model weights are distributed in this source directory.
+
+=========================================================================
+Upstream model and reference implementations
+=========================================================================
+
+MIT
+
+  Resemble Chatterbox Turbo and Multilingual
+    Code: https://github.com/resemble-ai/chatterbox
+    Models: https://huggingface.co/ResembleAI/chatterbox-turbo
+            https://huggingface.co/ResembleAI/chatterbox
+    The upstream repository and model cards identify the code and weights as
+    MIT-licensed. The native implementation covers T3, S3Gen, HiFT, voice
+    encoders, tokenizers, and voice-feature preprocessing.
+
+MIT reference code; CC-BY-4.0 model weights
+
+  Kyutai Pocket TTS
+    Code: https://github.com/kyutai-labs/pocket-tts
+    Models: https://huggingface.co/kyutai/pocket-tts
+    The FlowLM and Mimi implementations and validation scripts follow the upstream
+    reference at 0c2db3bdea7c991c568989cc11b503f14483fabc. The reference is an
+    optional Python test dependency. No Pocket model weights are distributed.
+
+MIT sample code; BigScience OpenRAIL-M model weights
+
+  Supertone Supertonic 1, 2, and 3
+    https://huggingface.co/Supertone/supertonic
+    https://huggingface.co/Supertone/supertonic-2
+    https://huggingface.co/Supertone/supertonic-3
+    The canonical model cards identify sample code as MIT and accompanying
+    model weights as OpenRAIL-M. The native implementation covers text
+    preprocessing, duration, text encoder, vector estimator, and vocoder.
+
+Apache License 2.0
+
+  Parler-TTS Mini/Large and Indic Parler-TTS
+    https://github.com/huggingface/parler-tts
+    https://huggingface.co/parler-tts/parler-tts-mini-v1
+    https://huggingface.co/parler-tts/parler-tts-large-v1
+    https://huggingface.co/ai4bharat/indic-parler-tts
+    The canonical model cards identify these model weights as Apache-2.0.
+
+  FunAudioLLM CosyVoice / Fun-CosyVoice3-0.5B-2512
+    https://github.com/FunAudioLLM/CosyVoice
+    https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+    The canonical repository and model card identify the code and weights as
+    Apache-2.0. The closed-source CosyVoice-ttsfrd frontend is not linked or
+    redistributed by this package.
+
+  Audio8 TTS Preview 0.6B
+    https://github.com/Audio8-AI/Audio8_TTS
+    https://huggingface.co/Audio8/Audio8-TTS-Preview-0.6b
+    The canonical model card identifies code and weights as Apache-2.0 and
+    points to the upstream NOTICE for additional attribution:
+    https://github.com/Audio8-AI/Audio8_TTS/blob/master/NOTICE
+
+  LavaSR
+    https://github.com/ysharma3501/LavaSR
+    https://huggingface.co/YatharthS/LavaSR
+    The canonical repository and model card identify code and weights as
+    Apache-2.0.
+
+  MOSS-SoundEffect-v2.0
+    https://github.com/OpenMOSS/MOSS-TTS/tree/main/moss_soundeffect_v2
+    https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect-v2.0
+    The canonical repository and model card identify code and weights as
+    Apache-2.0. The native implementation covers the Qwen3 text encoder, the
+    audio DiT, the flow-matching sampler, and the DAC decoder.
+
+  MOSS-Speech
+    https://github.com/OpenMOSS/MOSS-Speech
+    https://huggingface.co/fnlp/MOSS-Speech
+    https://huggingface.co/fnlp/MOSS-Speech-Codec
+    The canonical repository identifies the code as Apache-2.0. The native
+    implementation covers the split Qwen3 language model, the Whisper-VQ speech
+    tokenizer, and the CosyVoice2 flow decoder, HiFT vocoder, and CAM++ speaker
+    embedding; the default reply voice is the repository's assets/prompt_en.wav.
+
+=========================================================================
+C++ dependencies
+=========================================================================
+
+MIT
+
+  ggml (fabric)
+    https://github.com/tetherto/qvac-fabric-llm.cpp/tree/master/ggml
+    The default and vcpkg paths use find_package(ggml CONFIG REQUIRED).
+    Bundled development builds may manually stage the same ggml tree under
+    tts/ggml; no ggml source or patch overlay is tracked in this
+    package.
+
+  JSON for Modern C++ (nlohmann/json)
+    src/json.hpp
+    https://github.com/nlohmann/json
+
+Unlicense or MIT-0, at the recipient's option
+
+  dr_wav
+    src/dr_wav.h
+    https://github.com/mackron/dr_libs
+
+Apache License 2.0 with LLVM exception, when linked by the toolchain
+
+  libc++
+    https://github.com/llvm/llvm-project
+
+=========================================================================
+Optional conversion and reference-script dependencies
+=========================================================================
+
+These packages are used by scripts only and are not runtime dependencies of
+the C++ inference library. The list reflects imports present in scripts/.
+
+Apache License 2.0
+
+  huggingface_hub  https://github.com/huggingface/huggingface_hub
+  onnx             https://github.com/onnx/onnx
+  safetensors      https://github.com/huggingface/safetensors
+  transformers     https://github.com/huggingface/transformers
+
+BSD 3-Clause
+
+  NumPy            https://numpy.org/
+  SciPy            https://scipy.org/
+  PyTorch          https://pytorch.org/
+  torchaudio       https://pytorch.org/audio/
+  SoundFile        https://github.com/bastibe/python-soundfile
+
+MIT
+
+  ONNX Runtime     https://github.com/microsoft/onnxruntime
+  gguf             https://github.com/ggml-org/llama.cpp/tree/master/gguf-py
+  einops           https://github.com/arogozhnikov/einops
+
+ISC
+
+  librosa          https://librosa.org/
+  resampy          https://github.com/bmcfee/resampy
+
+MIT or WTFPL wrapper code; IPADIC dictionary distribution terms
+
+  ipadic           https://github.com/polm/ipadic-py
+    The Python wrapper is offered under MIT or WTFPL. The bundled IPADIC
+    dictionary is copyright Nara Institute of Science and Technology and ICOT
+    and is distributed under the terms in:
+    https://github.com/polm/ipadic-py/blob/master/ipadic/dicdir/COPYING
+
+Some reference scripts import the corresponding upstream model packages or
+checkpoint-provided Python modules. Those modules retain the model-project
+licenses listed above and are not copied into the C++ inference binary.
+
+=========================================================================
+Additional MOSS model and reference sources
+=========================================================================
+
+Apache License 2.0
+
+  MOSS-TTS-v1.5 and MOSS-TTSD-v1.0 (MossTTSDelay architecture)
+    Code: https://github.com/OpenMOSS/MOSS-TTS
+    Models: https://huggingface.co/OpenMOSS-Team/MOSS-TTS-v1.5
+            https://huggingface.co/OpenMOSS-Team/MOSS-TTSD-v1.0
+    The reference repository and model cards identify Apache-2.0 licenses.
+    Native synthesis, dialogue and cloning implement the delay-pattern path.
+
+  MOSS-Audio-Tokenizer
+    https://huggingface.co/OpenMOSS-Team/MOSS-Audio-Tokenizer
+    The model card identifies the code and weights as Apache-2.0. The native
+    codec encoder/decoder supports the MOSS Delay and TTSD pipelines.

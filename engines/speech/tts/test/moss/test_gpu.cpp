@@ -1,0 +1,397 @@
+#include "gguf_fixtures.h"
+#include "sfx_fixtures.h"
+#include "speech_fixtures.h"
+#include "../test_env_portable.h"
+#include "../../../test/moss_gpu_arm.h"
+#include "../../../test/moss_precision.h"
+#include "backend_selection.h"
+#include "moss/codec.h"
+#include "moss/delay_lm.h"
+#include "moss/sfx_networks.h"
+#include "moss/speech_lm.h"
+#include "moss/speech_tokenizer.h"
+#include "tts-cpp/moss/fit.h"
+#include "tts-cpp/moss/sound_effect_fit.h"
+#include "ggml-backend.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+
+using namespace tts_cpp::moss::detail;
+
+namespace {
+
+struct Fixture {
+    std::filesystem::path path;
+    ~Fixture() { std::error_code ec; std::filesystem::remove(path, ec); }
+    std::string str() const { return path.string(); }
+};
+
+void require(bool ok, const std::string & message) {
+    if (!ok) throw std::runtime_error(message);
+}
+
+MossGpuArm arm;
+
+constexpr int FIT_PROMPT_ROWS = 8;
+constexpr int FIT_CONTEXT = 512;
+constexpr int FIT_MAX_NEW_TOKENS = 64;
+constexpr int SLOT_STEPS = 3;
+constexpr const char * TRUNCATION_FAILURE = "changed while loaded";
+
+bool hexagon_arm() {
+    return arm.request == "hexagon";
+}
+
+BackendRequest device_request() {
+    if (hexagon_arm()) return {arm.request, false};
+    if (arm.request == "xdna") return {"XDNA0", false};
+    return {"", true};
+}
+
+std::vector<ggml_type> precisions() {
+    std::vector<ggml_type> types{GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0};
+    if (hexagon_arm()) types.push_back(GGML_TYPE_Q4_0);
+    return types;
+}
+
+template <typename Run>
+void require_truncation_failure(const char * stage, const std::filesystem::path & path, Run run) {
+    std::filesystem::resize_file(path, 0);
+    try {
+        run();
+    } catch (const std::runtime_error & e) {
+        require(std::string(e.what()).find(TRUNCATION_FAILURE) != std::string::npos,
+                std::string(stage) + ": wrong truncation failure: " + e.what());
+        return;
+    }
+    throw std::runtime_error(std::string(stage) + ": a model file truncated under the engine was accepted");
+}
+
+void compare(const char * stage, const std::vector<float> & cpu, const std::vector<float> & gpu) {
+    require(!cpu.empty() && cpu.size() == gpu.size(), std::string(stage) + ": output shape");
+    double error = 0, norm = 0;
+    float worst = 0;
+    for (size_t i = 0; i < cpu.size(); ++i) {
+        require(std::isfinite(cpu[i]) && std::isfinite(gpu[i]), std::string(stage) + ": nonfinite output");
+        const double d = (double) cpu[i] - gpu[i];
+        error += d * d;
+        norm += (double) cpu[i] * cpu[i];
+        worst = std::max(worst, (float) std::fabs(d));
+    }
+    const double relative = std::sqrt(error / std::max(norm, 1e-20));
+    std::printf("%s: max_abs=%g rel_l2=%g\n", stage, worst, relative);
+    require(worst < 2e-4f || relative < 0.01, std::string(stage) + ": CPU/" + arm.prefix + " mismatch");
+}
+
+std::vector<float> signal(size_t count) {
+    std::vector<float> values(count);
+    for (size_t i = 0; i < count; ++i) values[i] = 0.2f * std::sin((float) i * 0.31f);
+    return values;
+}
+
+void fit_on_host_memory(const std::string & backbone, const std::string & decoder) {
+    tts_cpp::moss::EngineOptions options;
+    options.backbone_path = backbone;
+    options.decoder_path = decoder;
+    options.backend = arm.request;
+    options.context = FIT_CONTEXT;
+    options.max_new_tokens = FIT_MAX_NEW_TOKENS;
+    const tts_cpp::FitResult fit = tts_cpp::moss::fit_params(options, {FIT_PROMPT_ROWS, 0, false, 0});
+    arm.require(fit.device_name.c_str());
+    require(fit.device_shares_host_memory && fit.device_free_bytes > 0 && fit.fits,
+            "Hexagon fit projects against host memory: " + fit.reason);
+}
+
+std::vector<float> slot_values(const DelayLogits & logits) {
+    return {logits.text[(size_t) moss_fixtures::GEN_SLOT], logits.text[(size_t) moss_fixtures::DELAY_SLOT]};
+}
+
+template <typename Load>
+void require_hexagon_refusal(const char * stage, Load load, const char * unoffered_tier = nullptr) {
+    try {
+        load();
+    } catch (const std::runtime_error & e) {
+        const std::string message = e.what();
+        require(message.find("Hexagon cannot run") != std::string::npos,
+                std::string(stage) + ": wrong refusal: " + message);
+        if (unoffered_tier) {
+            require(message.find(unoffered_tier) == std::string::npos,
+                    std::string(stage) + ": refusal offers " + unoffered_tier + ": " + message);
+        }
+        return;
+    }
+    throw std::runtime_error(std::string(stage) + ": Hexagon accepted bf16 weights");
+}
+
+void hexagon_refuses_bf16() {
+    using namespace moss_fixtures;
+    std::mt19937 rng(26342);
+    Fixture lm_file{temp_gguf("gpu-delay-bf16")};
+    {
+        GgufBuilder b;
+        b.random = &rng;
+        add_backbone_meta(b.file);
+        add_backbone_tensors(b);
+        b.write(lm_file.path);
+    }
+    moss_fixture_precision(lm_file.path, GGML_TYPE_BF16);
+    require_hexagon_refusal("delay bf16", [&] { DelayLM lm(lm_file.str(), device_request(), 2, FIT_CONTEXT); });
+    Fixture decoder{write_decoder("gpu-codec-bf16", N_VQ, 3 * D_MODEL, [](gguf_context *) {}, &rng)};
+    moss_fixture_precision(decoder.path, GGML_TYPE_BF16);
+    require_hexagon_refusal("codec bf16", [&] { Codec codec(decoder.str(), device_request(), 2); });
+    Fixture sfx_file{moss_sfx_fixtures::write_sfx_model("gpu-sfx-bf16", 26342)};
+    moss_fixture_precision(sfx_file.path, GGML_TYPE_BF16);
+    require_hexagon_refusal("sfx bf16", [&] { SfxModel model(sfx_file.str(), device_request(), 2); });
+    Fixture speech_file{moss_speech_fixtures::write_lm("gpu-speech-bf16", 26342)};
+    moss_fixture_precision(speech_file.path, GGML_TYPE_BF16);
+    require_hexagon_refusal("speech bf16", [&] { SpeechLM lm(speech_file.str(), device_request(), 2); });
+    Fixture vq{moss_speech_fixtures::write_vq("gpu-speech-vq-bf16", 26342)};
+    moss_fixture_precision(vq.path, GGML_TYPE_BF16);
+    require_hexagon_refusal("speech tokenizer bf16", [&] { SpeechTokenizer t(vq.str(), device_request(), 2); },
+                            ggml_type_name(GGML_TYPE_Q4_0));
+}
+
+void fit_sfx_on_host_memory(const std::string & model) {
+    tts_cpp::moss::SoundEffectOptions options;
+    options.model_path = model;
+    options.backend = arm.request;
+    tts_cpp::moss::SoundEffectRequest request;
+    request.prompt = "rain";
+    request.seconds = moss_sfx_fixtures::MAX_SECONDS;
+    const tts_cpp::FitResult fit = tts_cpp::moss::fit_params(options, request, 0);
+    arm.require(fit.device_name.c_str());
+    require(fit.device_shares_host_memory && fit.device_free_bytes > 0 && fit.fits,
+            "Hexagon sfx fit projects against host memory: " + fit.reason);
+}
+
+void delay(ggml_type precision) {
+    using namespace moss_fixtures;
+    std::mt19937 rng(26342);
+    Fixture lm_file{temp_gguf("gpu-delay")};
+    {
+        GgufBuilder b;
+        b.random = &rng;
+        add_backbone_meta(b.file);
+        add_backbone_tensors(b);
+        b.write(lm_file.path);
+    }
+    moss_fixture_precision(lm_file.path, precision);
+    DelayLM cpu(lm_file.str(), {}, 2, 512), gpu(lm_file.str(), device_request(), 2, 512);
+    arm.require(gpu.backend_name());
+    require(gpu.tables_on_host() == hexagon_arm(), "delay tables placement");
+    require(gpu.fused_attention() == hexagon_arm(), "delay attention layout");
+    const std::vector<DelayRow> rows{{1, {0, 1}}, {3, {2, 3}}, {6, {4, 5}}};
+    auto check_audio = [](const DelayLogits & a, const DelayLogits & b) {
+        require(a.audio.size() == b.audio.size(), "delay audio heads");
+        for (size_t i = 0; i < a.audio.size(); ++i) compare("delay audio", a.audio[i], b.audio[i]);
+    };
+    auto check = [&](const DelayLogits & a, const DelayLogits & b) {
+        compare("delay text", a.text, b.text);
+        check_audio(a, b);
+    };
+    auto check_slots = [&](const DelayLogits & a, const DelayLogits & b) {
+        compare("delay text slots", slot_values(a), slot_values(b));
+        check_audio(a, b);
+    };
+    check(cpu.prefill(rows), gpu.prefill(rows));
+    for (int i = 0; i < 5; ++i) check(cpu.step(rows.back()), gpu.step(rows.back()));
+    for (int i = 0; i < SLOT_STEPS; ++i) check_slots(cpu.step(rows.back()), gpu.step(rows.back(), TextLogits::Slots));
+    check_audio(cpu.step(rows.back()), gpu.step(rows.back(), TextLogits::None));
+    cpu.reset(); gpu.reset();
+    check(cpu.prefill(rows), gpu.prefill(rows));
+
+    Fixture decoder{write_decoder("gpu-codec", N_VQ, 3 * D_MODEL, [](gguf_context *) {}, &rng)};
+    moss_fixture_precision(decoder.path, precision);
+    Codec c(decoder.str(), {}, 2), g(decoder.str(), device_request(), 2);
+    arm.require(g.backend_name());
+    require(g.fused_attention() == hexagon_arm(), "codec attention layout");
+    std::vector<int32_t> codes(40 * N_VQ);
+    for (size_t i = 0; i < codes.size(); ++i) codes[i] = (int32_t) (i % CODE_SIZE);
+    const auto full = c.decode(codes);
+    compare("codec batch", full, g.decode(codes));
+    compare("codec streaming", full, decode_in_windows(g, codes, 3));
+    // TTSD uses fewer residual quantizers than the codec has available.
+    codes.resize(19);
+    compare("codec dialogue channels", c.decode(codes, 1), g.decode(codes, 1));
+
+    Fixture encoder{temp_gguf("gpu-codec-encoder")};
+    {
+        GgufBuilder b;
+        b.random = &rng;
+        add_encoder_meta(b.file);
+        add_encoder_tensors(b);
+        b.write(encoder.path);
+    }
+    moss_fixture_precision(encoder.path, precision);
+    Codec ec(encoder.str(), {}, 2), eg(encoder.str(), device_request(), 2);
+    arm.require(eg.backend_name());
+    require(ec.encode(signal(160)) == eg.encode(signal(160)), "codec encoder codes differ");
+    if (hexagon_arm()) {
+        fit_on_host_memory(lm_file.str(), decoder.str());
+        require_truncation_failure("delay", lm_file.path, [&] { gpu.step(rows.back()); });
+    }
+}
+
+constexpr int TTS_AUDIO_HEADS = 32;
+constexpr int MANY_HEAD_SEED = 217;
+constexpr int MANY_HEAD_EMBD = 32;
+constexpr int MANY_HEAD_VOCAB = 128;
+
+void configure_audio_heads(moss_fixtures::GgufBuilder & builder) {
+    gguf_set_val_u32(builder.file, "moss-tts-delay.n_vq", TTS_AUDIO_HEADS);
+    gguf_set_val_u32(builder.file, "moss-tts-delay.audio_vocab_size", MANY_HEAD_VOCAB - 1);
+    gguf_set_val_u32(builder.file, "moss-tts-delay.audio_pad_code", MANY_HEAD_VOCAB - 1);
+    for (int i = 0; i < TTS_AUDIO_HEADS; ++i) {
+        builder.shapes["token_embd_audio." + std::to_string(i) + ".weight"] = {MANY_HEAD_EMBD, MANY_HEAD_VOCAB};
+        builder.shapes["output_audio." + std::to_string(i) + ".weight"] = {MANY_HEAD_EMBD, MANY_HEAD_VOCAB};
+    }
+}
+
+void add_extra_audio_heads(moss_fixtures::GgufBuilder & builder) {
+    using namespace moss_fixtures;
+    for (int i = N_VQ; i < TTS_AUDIO_HEADS; ++i) {
+        builder.add2("token_embd_audio." + std::to_string(i) + ".weight", MANY_HEAD_EMBD, MANY_HEAD_VOCAB);
+        builder.add2("output_audio." + std::to_string(i) + ".weight", MANY_HEAD_EMBD, MANY_HEAD_VOCAB);
+    }
+}
+
+void compare_audio_heads(const DelayLogits & expected, const DelayLogits & actual) {
+    require(expected.audio.size() == TTS_AUDIO_HEADS && actual.audio.size() == TTS_AUDIO_HEADS,
+            "all audio heads returned");
+    for (int i = 0; i < TTS_AUDIO_HEADS; ++i) {
+        require(actual.audio[i].size() == MANY_HEAD_VOCAB, "audio head vocabulary preserved");
+        compare("delay packed audio head", expected.audio[i], actual.audio[i]);
+    }
+}
+
+void delay_many_heads(ggml_type precision) {
+    using namespace moss_fixtures;
+    std::mt19937 rng(MANY_HEAD_SEED);
+    Fixture file{temp_gguf("gpu-delay-many-heads")};
+    {
+        GgufBuilder builder;
+        builder.random = &rng;
+        add_backbone_meta(builder.file, MANY_HEAD_EMBD);
+        configure_audio_heads(builder);
+        add_backbone_tensors(builder, MANY_HEAD_EMBD);
+        add_extra_audio_heads(builder);
+        builder.write(file.path);
+    }
+    moss_fixture_precision(file.path, precision);
+    DelayLM cpu(file.str(), {}, 2, FIT_CONTEXT), gpu(file.str(), device_request(), 2, FIT_CONTEXT);
+    arm.require(gpu.backend_name());
+    const DelayRow row{GEN_SLOT, std::vector<int32_t>(TTS_AUDIO_HEADS, 1)};
+    compare_audio_heads(cpu.prefill({row, row}), gpu.prefill({row, row}));
+    compare_audio_heads(cpu.step(row), gpu.step(row));
+    cpu.reset();
+    gpu.reset();
+    compare_audio_heads(cpu.prefill({row}), gpu.prefill({row}));
+}
+
+void sfx(ggml_type precision) {
+    Fixture file{moss_sfx_fixtures::write_sfx_model("gpu-sfx", 26342)};
+    moss_fixture_precision(file.path, precision);
+    SfxModel cpu(file.str(), {}, 2), gpu(file.str(), device_request(), 2);
+    arm.require(gpu.backend_name());
+    require(gpu.table_on_host() == hexagon_arm(), "sfx table placement");
+    require(gpu.fused_attention() == hexagon_arm(), "sfx attention layout");
+    require(gpu.fused_dit_attention() == hexagon_arm(), "sfx DiT attention layout");
+    const auto context = encode_text(cpu, {1, 8, 9, 2});
+    compare("sfx text", context, encode_text(gpu, {1, 8, 9, 2}));
+    const int frames = 17;
+    auto latents = signal(frames * moss_sfx_fixtures::LATENT);
+    {
+        SfxDitSession c(cpu, frames), g(gpu, frames, false, 2);
+        const std::vector<float> empty(context.size(), 0.0f);
+        g.prepare_contexts({context, empty});
+        for (float time : {1.0f, 0.5f, 0.0f}) {
+            compare("sfx dit", c.velocity(latents, time, context), g.velocity(latents, time, context));
+            compare("sfx dit negative", c.velocity(latents, time, empty), g.velocity(latents, time, empty));
+        }
+    }
+    compare("sfx vae", decode_latents(cpu, latents, frames, frames, 8, {}),
+            decode_latents(gpu, latents, frames, frames, 8, {}));
+    // Reuse the scheduler after switching from diffusion to the VAE.
+    compare("sfx text reload", context, encode_text(gpu, {1, 8, 9, 2}));
+    if (hexagon_arm()) fit_sfx_on_host_memory(file.str());
+}
+
+void speech(ggml_type precision) {
+    using namespace moss_speech_fixtures;
+    Fixture file{write_lm("gpu-speech", 26342)};
+    moss_fixture_precision(file.path, precision);
+    SpeechLM cpu(file.str(), {}, 2), gpu(file.str(), device_request(), 2);
+    arm.require(gpu.backend_name());
+    require(gpu.tables_on_host() == hexagon_arm(), "speech tables placement");
+    require(gpu.fused_attention() == hexagon_arm(), "speech attention layout");
+    require(!gpu.runs_on_cpu(), "speech LM runs off the CPU");
+    const std::vector<SpeechRow> rows{{TOKEN_IM_START, TOKEN_AUDIO_PAD},
+        {TOKEN_SPEECH_START, TOKEN_AUDIO_PAD}, {TOKEN_TEXT_PLACEHOLDER, 7}, {TOKEN_TEXT_PLACEHOLDER, 8}};
+    auto check = [](const SpeechLogits & a, const SpeechLogits & b) {
+        compare("speech text", a.text, b.text);
+        compare("speech audio", a.audio, b.audio);
+    };
+    for (int batch : {1, 3, 4}) {
+        cpu.begin(512); gpu.begin(512);
+        const SpeechLogits expected = cpu.prefill(rows, batch);
+        check(expected, gpu.prefill(rows, batch));
+        gpu.release_generation();
+        require(gpu.context() == 0 && gpu.position() == 0, "speech release leaves no KV state");
+        gpu.begin(512);
+        check(expected, gpu.prefill(rows, batch));
+        gpu.release_weights();
+        arm.require(gpu.backend_name());
+        gpu.begin(512);
+        check(expected, gpu.prefill(rows, batch));
+        for (int i = 0; i < 5; ++i) check(cpu.step(rows.back()), gpu.step(rows.back()));
+        compare("speech audio-only", cpu.step(rows.back(), {false, true}).audio,
+                gpu.step(rows.back(), {false, true}).audio);
+    }
+    if (hexagon_arm()) require_truncation_failure("speech", file.path, [&] { gpu.step(rows.back()); });
+    Fixture vq{write_vq("gpu-speech-vq", 26342)};
+    moss_fixture_precision(vq.path, precision == GGML_TYPE_BF16 ? GGML_TYPE_F16 : precision);
+    SpeechTokenizer c(vq.str(), {}, 2), g(vq.str(), device_request(), 2);
+    arm.require(g.backend_name());
+    require(g.fused_attention() == hexagon_arm(), "speech tokenizer attention layout");
+    const auto pcm = signal(VQ_CHUNK + 37);
+    require(c.encode(pcm) == g.encode(pcm), "speech tokenizer codes differ");
+}
+
+} // namespace
+
+int main(int argc, char ** argv) {
+    if (argc != 2) {
+        std::fprintf(stderr, "usage: %s cuda|vulkan|hexagon|xdna|opencl|webgpu\n", argv[0]);
+        return 2;
+    }
+    try {
+        arm = moss_gpu_arm(argv[1]);
+        if (arm.request == "xdna") {
+            tts_cpp::detail::ensure_backends_loaded();
+            delay(GGML_TYPE_F16);
+            delay_many_heads(GGML_TYPE_F16);
+            std::puts("MOSS TTS CPU/XDNA parity: OK");
+            return 0;
+        }
+        if (!hexagon_arm()) setenv("TTS_CPP_GPU_BACKEND", arm.request.c_str(), 1);
+        tts_cpp::detail::ensure_backends_loaded();
+        for (ggml_type type : precisions()) {
+            std::printf("precision: %s\n", ggml_type_name(type));
+            delay(type);
+            if (arm.request == "vulkan") delay_many_heads(type);
+            sfx(type);
+            speech(type);
+        }
+        // MOSS-Speech's default LM export is BF16. Devices without native
+        // BF16 must execute it correctly through the scheduler's CPU fallback.
+        if (!hexagon_arm()) speech(GGML_TYPE_BF16);
+        if (hexagon_arm()) hexagon_refuses_bf16();
+        std::printf("MOSS CPU/%s parity: OK\n", arm.prefix.c_str());
+        return 0;
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "FAIL: %s\n", e.what());
+        return 1;
+    }
+}

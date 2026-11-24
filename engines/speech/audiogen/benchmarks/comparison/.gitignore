@@ -1,0 +1,17 @@
+models/
+vendor/
+out/
+*.gguf
+*.wav
+*.mp3
+ggml-src/
+ggml-install/
+ggml-install-cpu/
+ggml-install-metal/
+build-*/
+reports/*/logs/
+reports/*/samples/
+reports/*/rounds/
+__pycache__/
+.venv/
+quality/checkpoints/

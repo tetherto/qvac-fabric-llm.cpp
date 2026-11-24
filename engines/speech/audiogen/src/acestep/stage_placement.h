@@ -1,0 +1,157 @@
+#pragma once
+
+// Stage-placement policy for the ACE-Step pipeline: given the registry name of
+// the active GPU backend plus the environment escape hatches, decide which of
+// the encoder / LM / FSQ-detokenizer stages run on it and which fall back to
+// the CPU. Engine::create() applies the answer (engine.cpp).
+//
+// This lives apart from backend_registry.h, and takes a plain `const char *`
+// rather than a ggml_backend_t, so the policy is exercisable with no GPU and
+// no ggml context -- see test/test_acestep_units.cpp. The placement decides
+// which numerical path generated audio takes, so it is regression tested
+// rather than only observed on a device lane. The Hexagon weight-type policy
+// below reads GGUF metadata only, so it is testable the same way.
+
+#include "ggml.h"
+#include "gguf.h"
+
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+
+namespace tts_cpp::acestep {
+
+// Backend predicates over the REGISTRY name (backend_reg_name()), which carries
+// no device-index suffix -- `ggml_backend_name()` returns "Vulkan0" / "MTL0"
+// and would never match here.
+inline bool backend_name_is_vulkan(const char * name) {
+    return name && std::strcmp(name, "Vulkan") == 0;
+}
+
+// ggml-metal registers as "MTL"; older ggml reported "Metal". Match both, or the
+// check is silently dead on one of them.
+inline bool backend_name_is_metal(const char * name) {
+    return name && (std::strcmp(name, "MTL") == 0 || std::strcmp(name, "Metal") == 0);
+}
+
+// ggml-opencl registers as "OpenCL" (ggml-opencl.cpp, reg get_name); the device
+// itself reports as "GPUOpenCL", which is not what reaches here.
+inline bool backend_name_is_opencl(const char * name) {
+    return name && std::strcmp(name, "OpenCL") == 0;
+}
+
+// ggml-cuda registers as "CUDA" (also covers the HIP/MUSA builds, which reuse
+// the CUDA backend under the "ROCm"/"MUSA" names -- those stay off the
+// allowlist until measured).
+inline bool backend_name_is_cuda(const char * name) {
+    return name && std::strcmp(name, "CUDA") == 0;
+}
+
+inline bool backend_name_is_hexagon(const char * name) {
+    return name && std::strcmp(name, "HTP") == 0;
+}
+
+// ggml-webgpu registers as "WebGPU" (GGML_WEBGPU_NAME); Dawn picks the
+// adapter, so one registry name covers Vulkan, Metal and D3D12 hosts.
+inline bool backend_name_is_webgpu(const char * name) {
+    return name && std::strcmp(name, "WebGPU") == 0;
+}
+
+inline bool backend_name_is_xdna(const char * name) {
+    return name && std::strcmp(name, "XDNA") == 0;
+}
+
+// The src0 types ggml_hexagon_supported_mul_mat accepts plus the F16/BF16
+// tables HTP GET_ROWS gathers from. The stages compute their graphs directly
+// on the backend, so any other quantisation reaches the DSP and faults.
+inline constexpr ggml_type HEXAGON_WEIGHT_TYPES[] = {
+    GGML_TYPE_F32,  GGML_TYPE_F16,  GGML_TYPE_BF16,   GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4,
+};
+
+inline bool hexagon_runs_weight_type(ggml_type type) {
+    for (const ggml_type runnable : HEXAGON_WEIGHT_TYPES) {
+        if (type == runnable) return true;
+    }
+    return false;
+}
+
+inline int64_t first_tensor_hexagon_cannot_run(const gguf_context * weights) {
+    const int64_t n_tensors = gguf_get_n_tensors(weights);
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        if (!hexagon_runs_weight_type(gguf_get_tensor_type(weights, i))) return i;
+    }
+    return -1;
+}
+
+inline bool device_desc_has_marker(const char * device_desc, const char * marker) {
+    return device_desc && std::strstr(device_desc, marker) != nullptr;
+}
+
+// Per-device Vulkan LM denylist, keyed on the driver family that appears in the
+// device description. Vulkan runs the LM on the GPU everywhere except the
+// devices where it is known to miscompute: on Mali the LM collapses to repeated
+// semantic codes and truncates the song (README "Backends").
+inline bool vulkan_device_lm_blocked(const char * device_desc) {
+    return device_desc_has_marker(device_desc, "Mali");
+}
+
+// Environment escape hatches, read once at create(). Presence is what counts:
+// ACESTEP_LM_CPU=0 still forces the LM to the CPU, matching the getenv() checks
+// this replaced.
+struct PlacementOverrides {
+    bool lm_gpu       = false;  // ACESTEP_LM_GPU
+    bool lm_cpu       = false;  // ACESTEP_LM_CPU
+    bool detok_gpu    = false;  // ACESTEP_DETOK_GPU
+    bool detok_cpu    = false;  // ACESTEP_DETOK_CPU
+    bool encoders_cpu = false;  // ACESTEP_ENCODERS_CPU
+};
+
+// Per-stage answer. Defaults are the "GPU is active and allowlisted" case.
+// DiT and VAE backend resolution lives in engine_backends.h.
+struct StagePlacement {
+    bool enc_on_gpu   = true;
+    bool lm_on_gpu    = true;
+    bool detok_on_gpu = true;
+};
+
+// Backend allowlist, then the per-device Vulkan denylist, then the overrides. An
+// unmeasured backend keeps the CPU placement (README "Backends"); Vulkan carries
+// the whole GPU pipeline unless the device is denylisted. Only consulted when a
+// GPU backend actually initialised.
+inline StagePlacement resolve_stage_placement(const char * reg_name, const char * device_desc,
+                                              const PlacementOverrides & ov) {
+    StagePlacement p;
+
+    if (backend_name_is_xdna(reg_name)) p.enc_on_gpu = false;
+
+    if (backend_name_is_vulkan(reg_name)) {
+        p.lm_on_gpu = !vulkan_device_lm_blocked(device_desc);
+    } else if (!backend_name_is_metal(reg_name) && !backend_name_is_opencl(reg_name) &&
+               !backend_name_is_cuda(reg_name) && !backend_name_is_hexagon(reg_name)) {
+        p.lm_on_gpu    = false;
+        p.detok_on_gpu = false;
+    }
+
+    // Applied after the allowlist; CPU wins if both are set for a stage.
+    if (ov.lm_gpu)    p.lm_on_gpu    = true;
+    if (ov.lm_cpu)    p.lm_on_gpu    = false;
+    if (ov.detok_gpu) p.detok_on_gpu = true;
+    if (ov.detok_cpu) p.detok_on_gpu = false;
+
+    if (ov.encoders_cpu) p.enc_on_gpu = false;
+
+    return p;
+}
+
+inline PlacementOverrides placement_overrides_from_env() {
+    PlacementOverrides ov;
+    ov.lm_gpu       = std::getenv("ACESTEP_LM_GPU") != nullptr;
+    ov.lm_cpu       = std::getenv("ACESTEP_LM_CPU") != nullptr;
+    ov.detok_gpu    = std::getenv("ACESTEP_DETOK_GPU") != nullptr;
+    ov.detok_cpu    = std::getenv("ACESTEP_DETOK_CPU") != nullptr;
+    ov.encoders_cpu = std::getenv("ACESTEP_ENCODERS_CPU") != nullptr;
+    return ov;
+}
+
+}  // namespace tts_cpp::acestep
