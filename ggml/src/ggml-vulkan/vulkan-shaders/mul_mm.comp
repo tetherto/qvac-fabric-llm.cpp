@@ -94,6 +94,11 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
 #if defined(A_TYPE_PACKED32)
 layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
 #endif
+#if defined(MM_PREFETCH)
+// dword and word views of A for the register-prefetch loaders
+layout (binding = 0) readonly buffer A_U32 {uint data_a_u32[];};
+layout (binding = 0) readonly buffer A_U16 {uint16_t data_a_u16[];};
+#endif
 #else
 // Unpacked struct aliases
 layout (binding = 0) readonly buffer BUF_Q1_0     { block_q1_0 data[];     } a_q1_0;
@@ -222,11 +227,24 @@ shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
 shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #endif
 
+#if defined(MM_PREFETCH) && (defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K))
+// (d * scale, -dmin * min) of the 8 sub-blocks of the current superblock for every tile row. f16 pairs keep the 128x128
+// tile at 2 workgroups per CU.
+#define SCACHE_T f16vec2
+shared SCACHE_T scache_dm[BM * 8];
+#endif
+
 #if defined(DATA_A_PTQ1_0)
 #include "ptq1_0.glsl"
 #endif
 #include "mul_mm_id_funcs.glsl"
 #include "mul_mm_funcs.glsl"
+#if defined(MM_PREFETCH)
+#include "mul_mm_pf_funcs.glsl"
+#endif
+#if !defined(SCACHE_REFILL)
+#define SCACHE_REFILL(pos, blk)
+#endif
 
 #ifdef MULMAT_QUANT
 #include "iq_shmem_init.glsl"
@@ -413,9 +431,16 @@ void main() {
 #endif
 
     if (!bounds_check_a && !bounds_check_b) {
+#if defined(MM_PREFETCH)
+        if (ALIGNED != 0) {
+#include "mul_mm_pf_k_loop.glsl"
+        } else
+#endif
+        {
 #define MM_LOAD_BOUNDS_CHECK false
 #include "mul_mm_k_loop.glsl"
 #undef MM_LOAD_BOUNDS_CHECK
+        }
     } else {
 #define MM_LOAD_BOUNDS_CHECK true
 #include "mul_mm_k_loop.glsl"

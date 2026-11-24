@@ -742,6 +742,21 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         }
     }
 
+    // Register-prefetch variants of the KHR coopmat quant matmul (mul_mm_pf_funcs.glsl): dense, f16 B, f32 accumulator
+    if (coopmat && fp16 && !f16acc && matmul_id_type == MatMulIdType::NONE) {
+        for (const auto& tname : {"q4_k", "q5_k", "q6_k", "iq4_xs"}) {
+            const std::string t(tname);
+            const std::string lva = (t == "q4_k" || t == "q5_k") ? "4" : "8";
+            const std::map<std::string, std::string> float_type_dict = {
+                {"FLOAT_TYPE",   FLOAT_TYPE(1, t)},
+                {"FLOAT_TYPEV2", FLOAT_TYPE(2, t)},
+                {"FLOAT_TYPEV4", FLOAT_TYPE(4, t)},
+                {"FLOAT_TYPEV8", FLOAT_TYPE(8, t)},
+            };
+            string_to_spv(shader_name + "_" + t + "_f16_pf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{"DATA_A_" + to_uppercase(t), "1"}, {"MM_PREFETCH", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+        }
+    }
+
     // Quant shader: one SPIR-V for all quant types, selected via MmTypeA spec constant
     {
         const std::map<std::string, std::string> quant_float_type_dict = {

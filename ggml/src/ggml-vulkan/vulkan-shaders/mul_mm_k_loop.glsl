@@ -2,6 +2,7 @@
 // to false for tiles fully inside A/B (the bounds checks fold away and the loop
 // stays branch-free), and to true for the ragged last tiles in M/N.
     for (uint block = start_k; block < end_k; block += BK) {
+        SCACHE_REFILL(pos_a, block)
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, MM_LOAD_BOUNDS_CHECK, block, end_k);
         }

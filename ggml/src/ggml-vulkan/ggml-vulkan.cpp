@@ -758,6 +758,14 @@ static bool ggml_vk_shared_avail_rewrite_skipped(const std::string & pipeline_na
     return false;
 }
 
+static uint64_t ggml_vk_statistic_u64(const vk::PipelineExecutableStatisticKHR & s) {
+    switch (s.format) {
+        case vk::PipelineExecutableStatisticFormatKHR::eUint64: return s.value.u64;
+        case vk::PipelineExecutableStatisticFormatKHR::eInt64:  return (uint64_t) std::max<int64_t>(s.value.i64, 0);
+        default:                                                return 0;
+    }
+}
+
 static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipeline, size_t spv_size, const void* spv_data, const std::string entrypoint,
                                          uint32_t parameter_count, std::array<uint32_t, 3> wg_denoms, std::vector<uint32_t> specialization_constants,
                                          bool disable_robustness, bool require_full_subgroups, uint32_t required_subgroup_size) {
@@ -987,6 +995,8 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         executableInfo.pipeline = pipeline->pipeline;
 
         auto statistics = device->device.getPipelineExecutableStatisticsKHR(executableInfo);
+        uint64_t spilled_regs = 0;
+        uint64_t scratch_size = 0;
 
         bool print_stats = !vk_pipeline_stats_filter.empty() &&
                            pipeline->name.find(vk_pipeline_stats_filter) != std::string::npos;
@@ -1018,7 +1028,15 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
                 VK_LOG_DEBUG(pipeline->name << " " << s.name << ": " << s.value.u64 << " registers");
                 pipeline->register_count = (uint32_t)s.value.u64;
             }
+            // RADV reports spills and scratch; the MUL_MAT XL tile falls back to the L tile where its pipeline spills
+            if (strcmp(s.name, "Spilled SGPRs") == 0 || strcmp(s.name, "Spilled VGPRs") == 0) {
+                spilled_regs += ggml_vk_statistic_u64(s);
+            } else if (strcmp(s.name, "Scratch size") == 0) {
+                scratch_size = ggml_vk_statistic_u64(s);
+            }
         }
+        pipeline->spilled_regs = (uint32_t) spilled_regs;
+        pipeline->scratch_size = (uint32_t) scratch_size;
     }
 
     {
@@ -2417,6 +2435,116 @@ static bool ggml_vk_is_radv_rdna3(const vk_device & device) {
            device->architecture == vk_device_architecture::AMD_RDNA3;
 }
 
+// RADV RDNA3 runs some dense q4_K / q5_K / q6_K / iq4_xs prefill GEMMs faster as f16-B KHR coopmat matmuls than as int8 MMQ
+// (ggml_vk_dense_f16coopmat_route).
+static bool ggml_vk_dense_f16coopmat_device(const vk_device & device) {
+    return ggml_vk_is_radv_rdna3(device) && device->coopmat_support && !device->coopmat2;
+}
+
+// GGML_VK_DENSE_F16COOPMAT=0 keeps these GEMMs on int8 MMQ.
+static bool ggml_vk_dense_f16coopmat_enabled(const vk_device & device) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_DENSE_F16COOPMAT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on && ggml_vk_dense_f16coopmat_device(device);
+}
+
+// GGML_VK_MM_PREFETCH=0 runs the f16-B GEMMs on the generic quant coopmat matmul, which has no XL tile.
+static bool ggml_vk_mm_prefetch_enabled(const vk_device & device) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MM_PREFETCH");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on && ggml_vk_dense_f16coopmat_device(device);
+}
+
+static bool ggml_vk_mm_prefetch_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// A shorter K cannot amortise the conversion of B to f16; a narrower N stays on int8 MMQ or the mat-vec shaders.
+static constexpr uint64_t dense_f16coopmat_min_k = 1024;
+static constexpr uint64_t dense_f16coopmat_min_n = 32;
+
+static bool ggml_vk_dense_f16coopmat_shape(ggml_type type, uint64_t k, uint64_t n) {
+    return ggml_vk_mm_prefetch_type(type) && k >= dense_f16coopmat_min_k && n >= dense_f16coopmat_min_n;
+}
+
+// GGML_VK_MM_XL=0 keeps the prefetch matmuls on their 128x128 L tile.
+static bool ggml_vk_mm_xl_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MM_XL");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static constexpr uint32_t mm_xl_tile         = 256;  // BM = BN of the XL tile
+static constexpr uint32_t mm_xl_l_tile       = 128;  // BM = BN of the L tile it replaces
+static constexpr uint32_t mm_xl_l_wgs_per_cu = 2;    // L workgroups resident per CU, against one XL workgroup
+static constexpr uint32_t mm_xl_wave_cost    = 2;    // an XL wave does the work of two L waves
+static constexpr uint32_t mm_xl_min_m        = 1024;
+static constexpr uint32_t mm_xl_min_k        = 1024;
+
+// XL pays off where its rounded-up wave count costs no more than the L tile's.
+static bool ggml_vk_mm_xl_ok(const vk_device & device, uint32_t m, uint32_t n, uint32_t k) {
+    if (m < mm_xl_min_m || k < mm_xl_min_k) {
+        return false;
+    }
+    const uint32_t cu       = std::max(device->shader_core_count, 1u);
+    const uint32_t waves_xl = CEIL_DIV(CEIL_DIV(m, mm_xl_tile) * CEIL_DIV(n, mm_xl_tile), cu);
+    const uint32_t waves_l  = CEIL_DIV(CEIL_DIV(m, mm_xl_l_tile) * CEIL_DIV(n, mm_xl_l_tile), mm_xl_l_wgs_per_cu * cu);
+    return mm_xl_wave_cost * waves_xl <= waves_l;
+}
+
+// Whether the XL pipeline spills depends on the GPU and the compiler; where it does, the L tile is kept.
+static bool ggml_vk_mm_xl_spills(vk_device device, vk_pipeline & pipeline) {
+    if (!pipeline->compiled) {
+        ggml_vk_load_shaders_big_stack(device, pipeline);
+    }
+    const bool spills = pipeline->spilled_regs > 0 || pipeline->scratch_size > 0;
+    static std::atomic<bool> logged {false};
+    if (spills && !logged.exchange(true)) {
+        GGML_LOG_INFO("ggml_vulkan: MUL_MAT XL tile spills (%s: %u spilled registers, scratch %u bytes), using the L tile\n",
+                      pipeline->name.c_str(), pipeline->spilled_regs, pipeline->scratch_size);
+    }
+    return spills;
+}
+
+// The aligned XL pipeline of a dense prefetch GEMM (m = ne01, n = ne11, k = ne10), or nullptr where the L tile stays.
+static vk_pipeline ggml_vk_mm_xl_pipeline(const vk_device & device, ggml_type type, uint32_t m, uint32_t n, uint32_t k) {
+    if (!ggml_vk_mm_prefetch_type(type) || !ggml_vk_mm_xl_ok(device, m, n, k)) {
+        return nullptr;
+    }
+    const auto it = device->pipeline_matmul.find({ type, GGML_TYPE_F16, false, false, false, true, true });
+    if (it == device->pipeline_matmul.end() || it->second.empty()) {
+        return nullptr;
+    }
+    vk_pipeline & pipeline = it->second[0].aligned;
+    if (pipeline == nullptr || k % pipeline->align != 0 || ggml_vk_mm_xl_spills(device, pipeline)) {
+        return nullptr;
+    }
+    return pipeline;
+}
+
+// gfx1151 us per call (int8 MMQ / f16 L / f16 XL): XL wins for every type (q5_K 5120x6144: 1382 / 1342 / 1020), L only for
+// q4_K (10240x5120: 2226 / 2010; q6_K: 1462 / 1587). A fused GLU_MUL_MAT pair leaves int8 only for XL (3937 vs 463 + 2814).
+static bool ggml_vk_dense_f16coopmat_route(const vk_device & device, ggml_type type, uint32_t m, uint32_t n, uint32_t k, bool glu_pair) {
+    if (!ggml_vk_dense_f16coopmat_enabled(device) || !ggml_vk_dense_f16coopmat_shape(type, k, n)) {
+        return false;
+    }
+    return (type == GGML_TYPE_Q4_K && !glu_pair) || ggml_vk_mm_xl_pipeline(device, type, m, n, k) != nullptr;
+}
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -3675,6 +3803,79 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             FOR_EACH_LUT_FP4_TYPE(X_CM1)
         }
 #undef X_CM1
+
+        if (ggml_vk_mm_prefetch_enabled(device)) {
+            static constexpr size_t BLOCK_SIZE_IDX = 0, BM_IDX = 1, BN_IDX = 2, WM_IDX = 4, WN_IDX = 5, TM_IDX = 7, TN_IDX = 8;
+            static constexpr uint32_t wave32 = 32;
+            // RDNA3 WMMA is wave32-native (a wave64 subgroup issues each coopmat op as two halves): keep BLOCK_SIZE and halve WM,
+            // else WN, until the wave32 warp grid tiles BM x BN again. A tile without such a grid keeps its WARP.
+            auto retile_wave32 = [](vk_tile_config tc) {
+                std::vector<uint32_t> & w = tc.warptile;
+                const uint32_t n_warps = w[BLOCK_SIZE_IDX] / wave32;
+                uint32_t wm = w[WM_IDX];
+                uint32_t wn = w[WN_IDX];
+                while ((w[BM_IDX] / wm) * (w[BN_IDX] / wn) < n_warps) {
+                    if (wm > w[TM_IDX] && wm >= wn) {
+                        wm /= 2;
+                    } else if (wn > w[TN_IDX]) {
+                        wn /= 2;
+                    } else {
+                        break;
+                    }
+                }
+                if ((w[BM_IDX] / wm) * (w[BN_IDX] / wn) == n_warps) {
+                    w[WM_IDX] = wm;
+                    w[WN_IDX] = wn;
+                    w[WARP_SIZE_IDX] = wave32;
+                }
+                return tc;
+            };
+            auto retile_all_wave32 = [&](std::vector<vk_tile_config> tcs) {
+                for (auto & tc : tcs) {
+                    tc = retile_wave32(tc);
+                }
+                return tcs;
+            };
+            const std::vector<vk_tile_config> tc_mmq_pf = cm1_use_wave32 ? retile_all_wave32(tc_mmq) : tc_mmq;
+            auto cm1_create_pf = [&](vk_matmul_pipeline_key key, const std::string& name, size_t len, const void* data) {
+                auto tc = filter_tc(tc_mmq_pf, key.type_a, key.mul_mat_id);
+                if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, sizeof(vk_mat_mat_push_constants), 3, cm1_spec, false, true, 0, true, cm1_use_wave32);
+            };
+            // 256x256 XL tile: 16 wave32 subgroups of 64x64 on 16x16x16 coopmats, the same SPIR-V (ggml_vk_mm_xl_pipeline picks it)
+            static constexpr size_t BK_IDX = 3, TK_IDX = 9;
+            static constexpr uint32_t shmem_stride_pad = 4;  // SHMEM_STRIDE_PAD, in FLOAT_TYPEV2
+            static constexpr uint32_t scache_row_size = 8 * sizeof(ggml_fp16_t) * 2;  // scache_dm: 8 f16 pairs per q4_K / q5_K row
+            static constexpr uint32_t iq4_lut_size = 64;
+            const vk_tile_config tc_xl = {{ 512, mm_xl_tile, mm_xl_tile, 32, 64, 64, 2, 16, 16, 16, wave32 }, { mm_xl_tile, mm_xl_tile, 1 }, l_align};
+            const bool xl_device = ggml_vk_mm_xl_enabled() && cm1_use_wave32 && device->coopmat_m == tc_xl.warptile[TM_IDX] &&
+                                   device->coopmat_n == tc_xl.warptile[TN_IDX] && device->coopmat_k == tc_xl.warptile[TK_IDX] &&
+                                   device->properties.limits.maxComputeWorkGroupInvocations >= tc_xl.warptile[BLOCK_SIZE_IDX];
+            // the A and B tiles, the f32 coopmat stage of every warp and the per-type caches (mul_mm.comp)
+            auto xl_shmem_fits = [&](ggml_type type) {
+                const std::vector<uint32_t> & w = tc_xl.warptile;
+                const uint32_t ab    = (w[BM_IDX] + w[BN_IDX]) * (w[BK_IDX] / 2 + shmem_stride_pad) * 2 * sizeof(ggml_fp16_t);
+                const uint32_t stage = w[TM_IDX] * w[TN_IDX] * (w[BLOCK_SIZE_IDX] / w[WARP_SIZE_IDX]) * sizeof(float);
+                const uint32_t extra = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? w[BM_IDX] * scache_row_size :
+                                       type == GGML_TYPE_IQ4_XS ? iq4_lut_size : 0;
+                return ab + stage + extra <= device->properties.limits.maxComputeSharedMemorySize;
+            };
+            auto cm1_create_xl = [&](ggml_type type, const std::string& name, size_t len, const void* data) {
+                if (xl_device && xl_shmem_fits(type)) {
+                    create_mm_pipelines({type, GGML_TYPE_F16, false, false, false, true, true}, {tc_xl}, name, len, data, sizeof(vk_mat_mat_push_constants), 3, cm1_spec, false, true, 0, true, true);
+                }
+            };
+            // f32 accumulator only, like the int8 MMQ path these GEMMs leave
+            if (device->coopmat_acc_f32_support) {
+                cm1_create_pf({GGML_TYPE_Q4_K,   GGML_TYPE_F16, false, false, false, true}, "matmul_q4_k_f16_pf",   matmul_q4_k_f16_pf_cm1_len,   matmul_q4_k_f16_pf_cm1_data);
+                cm1_create_pf({GGML_TYPE_Q5_K,   GGML_TYPE_F16, false, false, false, true}, "matmul_q5_k_f16_pf",   matmul_q5_k_f16_pf_cm1_len,   matmul_q5_k_f16_pf_cm1_data);
+                cm1_create_pf({GGML_TYPE_Q6_K,   GGML_TYPE_F16, false, false, false, true}, "matmul_q6_k_f16_pf",   matmul_q6_k_f16_pf_cm1_len,   matmul_q6_k_f16_pf_cm1_data);
+                cm1_create_pf({GGML_TYPE_IQ4_XS, GGML_TYPE_F16, false, false, false, true}, "matmul_iq4_xs_f16_pf", matmul_iq4_xs_f16_pf_cm1_len, matmul_iq4_xs_f16_pf_cm1_data);
+                cm1_create_xl(GGML_TYPE_Q4_K,   "matmul_q4_k_f16_pf_xl",   matmul_q4_k_f16_pf_cm1_len,   matmul_q4_k_f16_pf_cm1_data);
+                cm1_create_xl(GGML_TYPE_Q5_K,   "matmul_q5_k_f16_pf_xl",   matmul_q5_k_f16_pf_cm1_len,   matmul_q5_k_f16_pf_cm1_data);
+                cm1_create_xl(GGML_TYPE_Q6_K,   "matmul_q6_k_f16_pf_xl",   matmul_q6_k_f16_pf_cm1_len,   matmul_q6_k_f16_pf_cm1_data);
+                cm1_create_xl(GGML_TYPE_IQ4_XS, "matmul_iq4_xs_f16_pf_xl", matmul_iq4_xs_f16_pf_cm1_len, matmul_iq4_xs_f16_pf_cm1_data);
+            }
+        }
 
         if (device->coopmat_int_support && (rdna3 || rdna4)) {
             cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_q4_0_q8_1",   matmul_q4_0_q8_1_cm1_len,   matmul_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
@@ -8107,10 +8308,20 @@ static bool ggml_vk_mul_mat_requests_full_f32(const ggml_tensor * src0, const gg
     return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32;
 }
 
+// prefetch: take the register-prefetch variant when the device has one for these types (f32 accumulator only)
 static const std::vector<vk_matmul_pipeline_pair> * ggml_vk_get_mul_mat_mat_pipeline_map(
         ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec,
-        bool mul_mat_id = false, bool stream_k = false) {
+        bool mul_mat_id = false, bool stream_k = false, bool prefetch = false) {
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
+    if (prefetch) {
+        vk_matmul_pipeline_key kp{src0_type, src1_type, mul_mat_id, f16acc, false, true};
+        auto itp = ctx->device->pipeline_matmul.find(kp);
+        if ((itp == ctx->device->pipeline_matmul.end() || itp->second.empty()) && f16acc) {
+            kp.f16acc = false;
+            itp = ctx->device->pipeline_matmul.find(kp);
+        }
+        if (itp != ctx->device->pipeline_matmul.end() && !itp->second.empty()) return &itp->second;
+    }
     vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc};
     key.stream_k = stream_k;
     auto it = ctx->device->pipeline_matmul.find(key);
@@ -8812,7 +9023,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const ggml_type x_reformat_type = full_f32 ? GGML_TYPE_F32 : f16_type;
 
     const bool is_coopmat = ctx->device->coopmat_support || ctx->device->coopmat2;
-    const bool can_quantize_y = ggml_vk_can_quantize_y(ctx, src1, dst, x_non_contig);
+    // GLU_MUL_MAT: src1 was not computed; it is quantized from the GLU inputs, or the GLU runs here first
+    ggml_tensor * fused_glu = ctx->fused_glu_q8_1 == src1 ? ctx->fused_glu_q8_1 : nullptr;
+    const bool f16coopmat_route = ggml_vk_dense_f16coopmat_route(ctx->device, src0->type, ne01, ne11, ne10, fused_glu != nullptr);
+    const bool can_quantize_y = ggml_vk_can_quantize_y(ctx, src1, dst, x_non_contig) && !f16coopmat_route;
+    const bool prefetch = ggml_vk_dense_f16coopmat_shape(src0->type, ne10, ne11) && ggml_vk_mm_prefetch_enabled(ctx->device);
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
@@ -8822,13 +9037,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel     = y_kernel_type == GGML_TYPE_F32;
     const bool y_needs_reformat = !quantize_y && (!ggml_vk_dim01_contiguous(src1) || y_kernel_type != src1->type);
-    // GLU_MUL_MAT: src1 was not computed; it is quantized from the GLU inputs, or the GLU runs here first
-    ggml_tensor * fused_glu = ctx->fused_glu_q8_1 == src1 ? ctx->fused_glu_q8_1 : nullptr;
 
     ggml_type mmp_type_a = src0->type;
     const ggml_type mmp_type_b = y_kernel_type;
     const std::vector<vk_matmul_pipeline_pair>* mmp_map = full_f32 ? full_f32_map :
-        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, mmp_type_a, mmp_type_b, ggml_prec_get_acc(dst));
+        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, mmp_type_a, mmp_type_b, ggml_prec_get_acc(dst), false, false, prefetch);
 
     bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
     const bool qy_needs_dequant = y_needs_reformat;
@@ -8861,6 +9074,16 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
+    vk_pipeline xl_pipeline = prefetch && aligned && y_kernel_type == GGML_TYPE_F16 && !qx_needs_dequant ?
+                              ggml_vk_mm_xl_pipeline(ctx->device, src0->type, ne01, ne11, ne10) : nullptr;
+    if (xl_pipeline != nullptr) {
+        static std::atomic<bool> xl_logged {false};
+        if (!xl_logged.exchange(true)) {
+            GGML_LOG_INFO("ggml_vulkan: MUL_MAT XL tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type),
+                          (uint32_t) ne01, (uint32_t) ne11, (uint32_t) ne10);
+        }
+        pipeline = xl_pipeline;
+    }
     if (!quantize_y && !qx_needs_dequant && src0->type == GGML_TYPE_Q8_0 && y_f32_kernel) {
         const bool bk64_f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, GGML_TYPE_F32, (ggml_prec)dst->op_params[0]);
         vk_pipeline hot_pipeline = ggml_vk_get_q8_0_bk64_pipeline(ctx, ne01, ne11, ne10, ne12*ne13, aligned, bk64_f16acc);
@@ -19178,7 +19401,7 @@ static bool ggml_vk_has_compute_node_after(const struct ggml_cgraph * cgraph, in
     return false;
 }
 
-// SWIGLU(split)+MUL_MAT that reaches the Q8_1 B path of ggml_vk_mul_mat_q_f16 (no M split, FWHT or mat-vec); the GLU tensor is never written.
+// SWIGLU(split)+MUL_MAT that reaches the Q8_1 B path of ggml_vk_mul_mat_q_f16 (no M split, FWHT, mat-vec or XL f16-B tile); the GLU tensor is never written.
 // The MUL_MAT must not be the last computed node: a caller that splits the graph there may read its srcs (the llama-imatrix eval callback).
 static bool ggml_vk_can_fuse_glu_mul_mat(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (!ggml_vk_glu_mul_mat_pair_ok(ctx, cgraph, node_idx) || !ggml_vk_has_compute_node_after(cgraph, node_idx + 1)) {
@@ -19186,9 +19409,11 @@ static bool ggml_vk_can_fuse_glu_mul_mat(const ggml_backend_vk_context * ctx, co
     }
     const ggml_tensor * glu = cgraph->nodes[node_idx];
     const ggml_tensor * mm  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * w   = mm->src[0];
     return mm->ne[1] > mul_mat_vec_max_cols && ggml_vk_can_quantize_y(ctx, glu, mm, false) &&
            get_misalign_bytes(ctx, glu->src[0]) == 0 && get_misalign_bytes(ctx, glu->src[1]) == 0 &&
-           !ggml_vk_can_use_fwht(ctx, glu, mm);
+           !ggml_vk_can_use_fwht(ctx, glu, mm) &&
+           !ggml_vk_dense_f16coopmat_route(ctx->device, w->type, w->ne[1], mm->ne[1], w->ne[0], true);
 }
 
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
@@ -23023,6 +23248,13 @@ static bool ggml_backend_vk_glu_mul_mat_supported(ggml_backend_t backend, ggml_t
     return ggml_vk_glu_mul_mat_device_ok((ggml_backend_vk_context *) backend->context, w_type, GGML_PREC_UNDEFINED);
 }
 
+// A GLU_MUL_MAT pair of this down projection shape runs unfused, its MUL_MAT on the XL f16-B tile.
+static bool ggml_backend_vk_glu_mul_mat_unfused_xl(ggml_backend_t backend, ggml_type w_type, int64_t m, int64_t n, int64_t k) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
+    return ggml_vk_dense_f16coopmat_route(ctx->device, w_type, (uint32_t) m, (uint32_t) n, (uint32_t) k, true);
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     UNUSED(reg);
     if (strcmp(name, "ggml_backend_get_buffer_capacity") == 0) {
@@ -23065,6 +23297,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_glu_mul_mat_supported") == 0) {
         return (void *) ggml_backend_vk_glu_mul_mat_supported;
+    }
+    if (strcmp(name, "ggml_backend_vk_glu_mul_mat_unfused_xl") == 0) {
+        return (void *) ggml_backend_vk_glu_mul_mat_unfused_xl;
     }
     return nullptr;
 }
