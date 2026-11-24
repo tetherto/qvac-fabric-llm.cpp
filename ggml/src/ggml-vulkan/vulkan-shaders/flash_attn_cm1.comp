@@ -675,21 +675,24 @@ void main() {
                         const uint ib = coord / BLOCK_SIZE_V;
                         const uint iqs = coord % BLOCK_SIZE_V;
 
-                        if ((!mask_v || v_visible[row] != 0) && (kv_gather ? (kv_active && v_col < HSV) : (!KV_bounds_check || (kv_active && v_col < HSV)))) {
+                        if (kv_gather ? (kv_active && v_col < HSV) : (!KV_bounds_check || (kv_active && v_col < HSV))) {
+                            // the load does not wait on v_visible; a hidden key still stores zero
+                            FLOAT_TYPEV4 V_Tf;
 #if !defined(BFLOAT16)
                             if (USE_DECODE_V) {
-                                kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+                                V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
                             } else
 #endif
                             {
                                 if (V_TRANSPOSED) {
                                     [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
-                                        kvsh[row * vsh_stride + col][k] = data_v[v_offset + (v_col + k) * v_stride + v_row];
+                                        V_Tf[k] = data_v[v_offset + (v_col + k) * v_stride + v_row];
                                     }
                                 } else {
-                                    kvsh[row * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
+                                    V_Tf = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
                                 }
                             }
+                            kvsh[row * vsh_stride + col] = (!mask_v || v_visible[row] != 0) ? V_Tf : FLOAT_TYPEV4(0.0f);
                         } else {
                             kvsh[row * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
                         }
