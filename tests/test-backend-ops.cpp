@@ -5538,6 +5538,50 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+// situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb) on the gate and up halves of one gate_up
+// tensor, built like build_moe_ffn so backends can fuse the chain
+struct test_situ : public test_case {
+    const std::array<int64_t, 3> ne; // n_ff, n_expert_used, n_tokens
+    const float beta;
+    const float lb;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SITU";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, beta, lb);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_situ(std::array<int64_t, 3> ne = {1152, 8, 4}, float beta = 4.0f, float lb = 25.0f)
+        : ne(ne), beta(beta), lb(lb) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -40.0f, 40.0f);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * ne[0], ne[1], ne[2]);
+        ggml_set_name(gate_up, "gate_up");
+
+        ggml_tensor * gate = ggml_view_3d(ctx, gate_up, ne[0], ne[1], ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_tensor * up   = ggml_view_3d(ctx, gate_up, ne[0], ne[1], ne[2], gate_up->nb[1], gate_up->nb[2], ne[0] * ggml_element_size(gate_up));
+
+        ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f / beta)), beta);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, gate));
+        up  = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f / lb)), lb);
+
+        ggml_tensor * out = ggml_mul(ctx, act, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -16385,6 +16429,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    test_cases.emplace_back(new test_situ({67, 3, 1}));
+    test_cases.emplace_back(new test_situ({1152, 8, 4}));
+    test_cases.emplace_back(new test_situ({1152, 8, 64}));
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)
