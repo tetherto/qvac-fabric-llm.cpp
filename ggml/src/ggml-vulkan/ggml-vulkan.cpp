@@ -7545,15 +7545,17 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
         return 1;
     }
 
+    const bool rdna = ctx->device->architecture == AMD_RDNA3 || ctx->device->architecture == AMD_RDNA4;
     uint32_t split_k = narrow_n && ctx->device->shader_core_count == 0 ? 8u : 1u;
-    if (narrow_n && ctx->device->shader_core_count != 0 && k >= 2048 && n <= 32) {
+    if ((narrow_n || rdna) && ctx->device->shader_core_count != 0 && k >= 2048 && n <= 32) {
         // Small n gives too few workgroups to hide latency, aim for 8 per CU.
         const uint32_t tiles = CEIL_DIV(m, pipeline->wg_denoms[0]) * CEIL_DIV(n, pipeline->wg_denoms[1]);
         if (tiles < 4 * ctx->device->shader_core_count) {
             split_k = std::min(8u, CEIL_DIV(8 * ctx->device->shader_core_count, tiles));
         }
     }
-    if (!narrow_n && ctx->device->shader_core_count != 0 && n >= pipeline->wg_denoms[1]) {
+    // On RDNA, also split when n <= 64 only partly fills one tile column.
+    if (!narrow_n && split_k == 1 && ctx->device->shader_core_count != 0 && (n >= pipeline->wg_denoms[1] || (rdna && n <= 64))) {
         // If k is 'large' and the SMs will fill less than halfway, use split_k.
         uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
         uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);

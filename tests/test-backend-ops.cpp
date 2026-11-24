@@ -17949,6 +17949,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Narrow matmuls with a long k, which the Vulkan backend splits along k on RDNA3 and RDNA4.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 2,   4,  2304, { 1, 1 }, { 4, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 16, 4096, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 64,  48, 2048, { 1, 1 }, { 1, 1 }));
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
