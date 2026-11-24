@@ -627,6 +627,25 @@ static constexpr std::initializer_list<std::array<int, 3>> hc_post_gate_edges {
     { 3, 2, 2 }, // hc_post->src[2] == scale (post)
 };
 
+// situ(gate, up) = s1*tanh(s0*gate)*sigmoid(gate) * s3*tanh(s2*up), the MoE activation when gate and up
+// are views of one merged gate_up matmul (Inkling 2)
+static constexpr std::initializer_list<ggml_op> situ_pattern {
+    GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL,
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> situ_edges {
+    { 1, 0, 0 }, // tanh->src[0]  == scale
+    { 2, 0, 1 }, // scale->src[0] == tanh
+    { 4, 0, 2 }, // mul->src[0]   == scale
+    { 4, 1, 3 }, // mul->src[1]   == sigmoid
+    { 6, 0, 5 }, // scale->src[0] == up view
+    { 7, 0, 6 }, // tanh->src[0]  == scale
+    { 8, 0, 7 }, // scale->src[0] == tanh
+    { 9, 0, 4 }, // mul->src[0]   == gate product
+    { 9, 1, 8 }, // mul->src[1]   == up product
+};
+
 static constexpr std::initializer_list<std::array<int, 3>> topk_moe_early_softmax_norm_edges {
     { 1, 0, 0 }, // reshape->src[0]  == softmax
     { 2, 0, 0 }, // argsort->src[0]  == softmax
@@ -1107,6 +1126,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
+    vk_pipeline pipeline_situ_f32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1728,6 +1748,7 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_situ {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
     struct ssm_conv_direct_match {
