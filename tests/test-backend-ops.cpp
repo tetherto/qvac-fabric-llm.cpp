@@ -12972,7 +12972,7 @@ struct test_rms_norm_rope : public test_case {
 };
 
 // SWIGLU(split) feeding a MUL_MAT; f16_b asks for F16 precision of the GLU operand, so it is not quantized.
-// fuses: the Vulkan backend runs the pair as one GLU_MUL_MAT group, unless it reports the shape's MUL_MAT on the XL f16-B tile.
+// fuses: the Vulkan backend runs the pair as one GLU_MUL_MAT group.
 struct test_swiglu_mul_mat : public test_case {
     const ggml_type type_a;
     const int64_t m;
@@ -12983,7 +12983,6 @@ struct test_swiglu_mul_mat : public test_case {
     const bool fuses;
     mutable bool has_fusion_counter = false;
     mutable bool supported = false;
-    mutable bool unfused_xl = false;
 
     std::string vars() override {
         return VARS_TO_STR6(type_a, m, n, k, f16_b, tail);
@@ -13010,19 +13009,16 @@ struct test_swiglu_mul_mat : public test_case {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         using counter_fn = uint64_t (*)(ggml_backend_t);
         using supported_fn = bool (*)(ggml_backend_t, ggml_type);
-        using unfused_xl_fn = bool (*)(ggml_backend_t, ggml_type, int64_t, int64_t, int64_t);
         auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_glu_mul_mat_fusion_count");
         auto support = (supported_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_glu_mul_mat_supported");
-        auto xl = (unfused_xl_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_glu_mul_mat_unfused_xl");
         has_fusion_counter = counter != nullptr;
         supported = support != nullptr && support(backend, type_a);
-        unfused_xl = xl != nullptr && xl(backend, type_a, m, n, k);
         return counter != nullptr ? counter(backend) : 0;
     }
 
-    bool expect_fusion() override { return fuses && has_fusion_counter && supported && !unfused_xl; }
+    bool expect_fusion() override { return fuses && has_fusion_counter && supported; }
 
-    bool expect_no_fusion() override { return (!fuses || unfused_xl) && has_fusion_counter; }
+    bool expect_no_fusion() override { return !fuses && has_fusion_counter; }
 
     test_swiglu_mul_mat(ggml_type type_a, int64_t m, int64_t n, int64_t k, bool f16_b, bool tail, bool fuses)
         : type_a(type_a), m(m), n(n), k(k), f16_b(f16_b), tail(tail), fuses(fuses) {}
@@ -17994,8 +17990,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q4_0, 300, 33, 2048, false, true, true));
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q4_K, 256, 64, 1024, false, true, true));
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 9, 1024, false, true, true));
-    // An XL-shaped down projection: on RADV RDNA3 the GLU runs alone and the MUL_MAT takes the XL f16-B tile.
+    // XL-shaped down projections: on RADV RDNA3 the GLU stores the f16 B of the XL matmul (a short K and a 17408-wide GLU).
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q5_K, 5120, 512, 1024, false, true, true));
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q5_K, 5120, 512, 17408, false, true, true));
     // No fusion: F16 B precision, a mat-vec batch, F16 weights, and the MUL_MAT as the last computed node (an eval callback may read the GLU).
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 64, 1024, true, true, false));
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 8, 1024, false, true, false));

@@ -2304,13 +2304,21 @@ static vk_pipeline ggml_vk_mm_xl_pipeline(const vk_device & device, ggml_type ty
     return pipeline;
 }
 
-// gfx1151 us per call (int8 MMQ / f16 L / f16 XL): XL wins for every type (q5_K 5120x6144: 1382 / 1342 / 1020), L only for
-// q4_K (10240x5120: 2226 / 2010; q6_K: 1462 / 1587). A fused GLU_MUL_MAT pair leaves int8 only for XL (3937 vs 463 + 2814).
+// The GEMMs whose 128x128 f16-B tile beats int8 MMQ: q4_K so far; a per-shape limit goes here.
+static bool ggml_vk_dense_f16coopmat_l_tile(ggml_type type, uint32_t m, uint32_t n, uint32_t k) {
+    GGML_UNUSED(m);
+    GGML_UNUSED(n);
+    GGML_UNUSED(k);
+    return type == GGML_TYPE_Q4_K;
+}
+
+// gfx1151 us per call: XL beats int8 MMQ (q5_K 5120x6144 1357 -> 1180, q4_K 10240x5120 2195 -> 1900). A GLU_MUL_MAT pair
+// (glu_pair) moves only to XL and stays fused, the GLU stored as f16 B (q5_K 5120x17408 down: 2980).
 static bool ggml_vk_dense_f16coopmat_route(const vk_device & device, ggml_type type, uint32_t m, uint32_t n, uint32_t k, bool glu_pair) {
     if (!ggml_vk_dense_f16coopmat_enabled(device) || !ggml_vk_dense_f16coopmat_shape(type, k, n)) {
         return false;
     }
-    return (type == GGML_TYPE_Q4_K && !glu_pair) || ggml_vk_mm_xl_pipeline(device, type, m, n, k) != nullptr;
+    return (!glu_pair && ggml_vk_dense_f16coopmat_l_tile(type, m, n, k)) || ggml_vk_mm_xl_pipeline(device, type, m, n, k) != nullptr;
 }
 
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -4860,6 +4868,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_GLU(geglu_quick)
     CREATE_GLU(siglu)
 #undef CREATE_GLU
+    if (ggml_vk_dense_f16coopmat_device(device)) {
+        ggml_vk_create_pipeline(device, device->pipeline_swiglu_f32_f16, "swiglu_f32_f16", swiglu_f32_f16_len, swiglu_f32_f16_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_silu_back_f32, "silu_back_f32", silu_back_f32_len, silu_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_gelu_back_f32, "gelu_back_f32", gelu_back_f32_len, gelu_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -8376,6 +8387,40 @@ static void ggml_vk_swiglu_quantize_q8_1(ggml_backend_vk_context * ctx, vk_conte
     ggml_vk_dispatch_quantize_q8_1(ctx, subctx, ctx->device->pipeline_swiglu_quantize_q8_1_x4, { gate, up, out }, ne);
 }
 
+// swiglu(gate, up) stored as the f16 B of the XL matmul, in the layout of ggml_vk_cpy_to_contiguous; the f32 GLU tensor is never
+// written. gate, up and the GLU are contiguous and of one shape (ggml_vk_glu_mul_mat_pair_ok), so they share element strides.
+static void ggml_vk_swiglu_store_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * glu, const vk_subbuffer & out) {
+    static constexpr uint32_t glu_mode_split = 2;
+    const float * op_params_f = (const float *) glu->op_params;
+    const uint32_t ne  = (uint32_t) ggml_nelements(glu);
+    const uint32_t nb1 = (uint32_t) glu->ne[0];
+    const uint32_t nb2 = nb1 * (uint32_t) glu->ne[1];
+    const uint32_t nb3 = nb2 * (uint32_t) glu->ne[2];
+    vk_op_glu_push_constants pc = {
+        ne, (uint32_t) glu->src[0]->ne[0], (uint32_t) glu->ne[0], glu_mode_split, op_params_f[2], op_params_f[3],
+        1, nb1, nb2, nb3,
+        1, nb1, nb2, nb3,
+        1, nb1, nb2, nb3,
+        (uint32_t) glu->ne[1], (uint32_t) glu->ne[2],
+        0,
+        0, 0, 0, 0, 0, 0,
+    };
+    init_pushconst_fastdiv(pc);
+
+    std::array<uint32_t, 3> elements;
+    if (ne > 262144) {
+        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+    } else if (ne > 512) {
+        elements = { 512, CEIL_DIV(ne, 512), 1 };
+    } else {
+        elements = { ne, 1, 1 };
+    }
+    const vk_subbuffer gate = ggml_vk_tensor_subbuffer(ctx, glu->src[0]);
+    const vk_subbuffer up   = ggml_vk_tensor_subbuffer(ctx, glu->src[1]);
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_swiglu_f32_f16, { gate, up, out }, pc, elements);
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
 static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * ctx, vk_pipeline &pipeline) {
     GGML_UNUSED(ctx);
 #if defined(VK_EXT_shader_64bit_indexing)
@@ -8734,7 +8779,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const ggml_type x_reformat_type = full_f32 ? GGML_TYPE_F32 : f16_type;
 
     const bool is_coopmat = ctx->device->coopmat_support || ctx->device->coopmat2;
-    // GLU_MUL_MAT: src1 was not computed; it is quantized from the GLU inputs, or the GLU runs here first
+    // GLU_MUL_MAT: src1 was not computed; this call writes B from the GLU inputs (q8_1 for int8 MMQ, f16 for the XL tile)
     ggml_tensor * fused_glu = ctx->fused_glu_q8_1 == src1 ? ctx->fused_glu_q8_1 : nullptr;
     const bool f16coopmat_route = ggml_vk_dense_f16coopmat_route(ctx->device, src0->type, ne01, ne11, ne10, fused_glu != nullptr);
     const bool can_quantize_y = ggml_vk_can_quantize_y(ctx, src1, dst, x_non_contig) && !f16coopmat_route;
@@ -8842,7 +8887,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx, src0->type);
     }
     if (y_needs_reformat) {
-        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, y_kernel_type);
+        // a fused GLU stores its result as the f16 B itself
+        to_fp16_vk_1 = fused_glu != nullptr ? ctx->device->pipeline_swiglu_f32_f16 : ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, y_kernel_type);
     } else {
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
     }
@@ -8978,8 +9024,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         GGML_ASSERT(qy_sz == y_sz);
     }
 
-    // ggml_vk_can_fuse_glu_mul_mat admits only pairs whose B is quantized here
-    GGML_ASSERT(fused_glu == nullptr || quantize_y);
+    // ggml_vk_can_fuse_glu_mul_mat admits only pairs whose B is quantized here or stored as f16 for the XL tile
+    GGML_ASSERT(fused_glu == nullptr || quantize_y || (y_needs_reformat && xl_pipeline != nullptr));
 
     if (x_non_contig || qx_needs_dequant) {
         if (ctx->prealloc_x_need_sync) {
@@ -9001,7 +9047,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0));
+            if (fused_glu != nullptr) {
+                ggml_vk_swiglu_store_f16(ctx, subctx, fused_glu, ggml_vk_subbuffer(ctx, d_Y, 0));
+            } else {
+                ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0));
+            }
             ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_k_padded = false;
@@ -18882,7 +18932,7 @@ static bool ggml_vk_can_fuse_situ(const ggml_backend_vk_context * ctx, const str
            ggml_vk_situ_nodes_f32_same_shape(nodes, gate);
 }
 
-// GGML_VK_FUSE_GLU_Q8_1=0 keeps the SWIGLU and the quantize of its result as separate passes.
+// GGML_VK_FUSE_GLU_Q8_1=0 keeps the SWIGLU apart from the pass that turns its result into B (q8_1, or f16 for the XL tile).
 static bool ggml_vk_fuse_glu_q8_1_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_VK_FUSE_GLU_Q8_1");
@@ -18933,7 +18983,7 @@ static bool ggml_vk_has_compute_node_after(const struct ggml_cgraph * cgraph, in
     return false;
 }
 
-// SWIGLU(split)+MUL_MAT that reaches the Q8_1 B path of ggml_vk_mul_mat_q_f16 (no M split, FWHT, mat-vec or XL f16-B tile); the GLU tensor is never written.
+// SWIGLU(split)+MUL_MAT that reaches the Q8_1 B or XL f16-B path of ggml_vk_mul_mat_q_f16 (no M split, FWHT or mat-vec); the GLU tensor is never written.
 // The MUL_MAT must not be the last computed node: a caller that splits the graph there may read its srcs (the llama-imatrix eval callback).
 static bool ggml_vk_can_fuse_glu_mul_mat(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (!ggml_vk_glu_mul_mat_pair_ok(ctx, cgraph, node_idx) || !ggml_vk_has_compute_node_after(cgraph, node_idx + 1)) {
@@ -18942,10 +18992,10 @@ static bool ggml_vk_can_fuse_glu_mul_mat(const ggml_backend_vk_context * ctx, co
     const ggml_tensor * glu = cgraph->nodes[node_idx];
     const ggml_tensor * mm  = cgraph->nodes[node_idx + 1];
     const ggml_tensor * w   = mm->src[0];
-    return mm->ne[1] > mul_mat_vec_max_cols && ggml_vk_can_quantize_y(ctx, glu, mm, false) &&
-           get_misalign_bytes(ctx, glu->src[0]) == 0 && get_misalign_bytes(ctx, glu->src[1]) == 0 &&
-           !ggml_vk_can_use_fwht(ctx, glu, mm) &&
-           !ggml_vk_dense_f16coopmat_route(ctx->device, w->type, w->ne[1], mm->ne[1], w->ne[0], true);
+    return mm->ne[1] > mul_mat_vec_max_cols && get_misalign_bytes(ctx, glu->src[0]) == 0 &&
+           get_misalign_bytes(ctx, glu->src[1]) == 0 && !ggml_vk_can_use_fwht(ctx, glu, mm) &&
+           (ggml_vk_dense_f16coopmat_route(ctx->device, w->type, w->ne[1], mm->ne[1], w->ne[0], true) ||
+            ggml_vk_can_quantize_y(ctx, glu, mm, false));
 }
 
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
@@ -22724,13 +22774,6 @@ static bool ggml_backend_vk_glu_mul_mat_supported(ggml_backend_t backend, ggml_t
     return ggml_vk_glu_mul_mat_device_ok((ggml_backend_vk_context *) backend->context, w_type, GGML_PREC_DEFAULT);
 }
 
-// A GLU_MUL_MAT pair of this down projection shape runs unfused, its MUL_MAT on the XL f16-B tile.
-static bool ggml_backend_vk_glu_mul_mat_unfused_xl(ggml_backend_t backend, ggml_type w_type, int64_t m, int64_t n, int64_t k) {
-    GGML_ASSERT(ggml_backend_is_vk(backend));
-    const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
-    return ggml_vk_dense_f16coopmat_route(ctx->device, w_type, (uint32_t) m, (uint32_t) n, (uint32_t) k, true);
-}
-
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_get_buffer_capacity") == 0) {
@@ -22747,9 +22790,6 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_glu_mul_mat_supported") == 0) {
         return (void *) ggml_backend_vk_glu_mul_mat_supported;
-    }
-    if (strcmp(name, "ggml_backend_vk_glu_mul_mat_unfused_xl") == 0) {
-        return (void *) ggml_backend_vk_glu_mul_mat_unfused_xl;
     }
     return NULL;
 }

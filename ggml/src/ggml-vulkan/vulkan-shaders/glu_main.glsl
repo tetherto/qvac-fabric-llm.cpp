@@ -1,3 +1,11 @@
+#if defined(GLU_STORE_ROUNDED_F32)
+// An opaque no-op (p.mode >> 31 is 0) keeps the f32 result: ACO folds a last multiply into an f16 store as v_fma_mixlo_f16,
+// rounding once, where a stored f32 GLU converted by the cpy shader rounds twice. B then matches that path bit for bit.
+#define GLU_STORE(v) D_TYPE(uintBitsToFloat(floatBitsToUint(v) | (p.mode >> 31)))
+#else
+#define GLU_STORE(v) D_TYPE(v)
+#endif
+
 void main() {
     const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
 
@@ -21,15 +29,15 @@ void main() {
         const uint offset = (p.ne00 / 2) * p.nb00;
         const uint idx = src_idx_a;
 
-        data_d[dst_idx] = D_TYPE(op(float(data_a[idx]), float(data_a[idx + offset])));
+        data_d[dst_idx] = GLU_STORE(op(float(data_a[idx]), float(data_a[idx + offset])));
     } else if (p.mode == 1) {
         // Swapped
         const uint offset = (p.ne00 / 2) * p.nb00;
         const uint idx = src_idx_a;
 
-        data_d[dst_idx] = D_TYPE(op(float(data_a[idx + offset]), float(data_a[idx])));
+        data_d[dst_idx] = GLU_STORE(op(float(data_a[idx + offset]), float(data_a[idx])));
     } else {
         // Split
-        data_d[dst_idx] = D_TYPE(op(float(data_a[src_idx_a]), float(data_b[src_idx_b])));
+        data_d[dst_idx] = GLU_STORE(op(float(data_a[src_idx_a]), float(data_b[src_idx_b])));
     }
 }

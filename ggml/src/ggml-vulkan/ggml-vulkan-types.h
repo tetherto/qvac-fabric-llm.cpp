@@ -1036,6 +1036,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_geglu[2];
     vk_pipeline pipeline_reglu[2];
     vk_pipeline pipeline_swiglu[2];
+    vk_pipeline pipeline_swiglu_f32_f16;  // GLU_MUL_MAT f16 B of the XL tile
     vk_pipeline pipeline_swiglu_oai[2];
     vk_pipeline pipeline_swiglu_clamp[2];
     vk_pipeline pipeline_geglu_erf[2];
@@ -1718,7 +1719,7 @@ struct ggml_backend_vk_context {
     // set while the current node is a direct conv: srcs read outside node->src (x, state) for the sync tracking
     const ggml_tensor * fused_extra_srcs[2] {};
     bool fused_fwht_signed {};
-    // GLU whose result the next MMQ quantizes directly from the GLU inputs (GLU_MUL_MAT fusion)
+    // GLU whose result the next MUL_MAT writes as its B straight from the GLU inputs (GLU_MUL_MAT: q8_1, or f16 for XL)
     ggml_tensor * fused_glu_q8_1 {};
     std::atomic<uint64_t> fwht_fusion_count {};
     std::atomic<uint64_t> glu_mul_mat_fusion_count {};
