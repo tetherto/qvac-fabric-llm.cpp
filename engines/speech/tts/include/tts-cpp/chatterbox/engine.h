@@ -1,0 +1,455 @@
+#pragma once
+
+// Persistent Chatterbox engine.
+//
+// Loads the T3 GGUF once, preloads the S3Gen GGUF, optionally bakes a
+// voice-cloning profile from a reference wav (or loads a pre-baked one
+// from a --ref-dir directory), and keeps all of that resident so that
+// subsequent calls to `synthesize()` pay only the T3 autoregressive
+// decode + S3Gen + HiFT synthesis cost.
+//
+// Usage:
+//
+//     using tts_cpp::chatterbox::Engine;
+//     using tts_cpp::chatterbox::EngineOptions;
+//
+//     EngineOptions opts;
+//     opts.t3_gguf_path    = "models/chatterbox-t3-turbo.gguf";
+//     opts.s3gen_gguf_path = "models/chatterbox-s3gen.gguf";
+//     opts.n_gpu_layers    = 99;                          // Metal/CUDA/Vulkan/OpenCL
+//     opts.reference_audio = "voices/alice.wav";          // optional
+//
+//     Engine engine(opts);
+//     for (const auto & line : lines) {
+//         auto result = engine.synthesize(line);
+//         write_wav(result.pcm, result.sample_rate);
+//     }
+//
+// Threading model:
+//   - `synthesize()` on the same `Engine` instance is **not** safe to
+//     call concurrently — the T3 KV cache, gallocr, and CFM rng are
+//     per-instance shared state.
+//   - `synthesize()` on **different** `Engine` instances from
+//     different threads is safe.  Internal scratch buffers used by the
+//     T3 graph builders are `thread_local`, so two threads do not race
+//     on a shared graph workspace.
+//   - `cancel()` is safe to call from any thread.
+//
+// Core ML (Apple, TTS_CPP_COREML builds): when the S3Gen sidecars sit next
+// to the S3Gen GGUF (`chatterbox-s3gen-q8_0.gguf` ->
+// `chatterbox-s3gen-{encoder,cfm,hift}.mlmodelc`, the quant tag dropped), the
+// S3Gen encoder, CFM estimator and HiFT decoder run on them (the Neural Engine
+// by default) whatever the `backend` option, once loaded; T3, the voice
+// frontend and the rest of S3Gen stay on ggml. Loading never blocks
+// construction or synthesis by default: the functions load in the
+// background, and each sentence runs on ggml until the ones it needs are
+// ready. See `EngineOptions::coreml` and docs/chatterbox.md "Core ML
+// sidecars".
+//
+// Implemented in src/chatterbox_engine.cpp on top of the library-internal
+// helpers in src/chatterbox_t3_internal.h.
+
+#include "tts-cpp/backend.h"
+#include "tts-cpp/coreml_options.h"
+#include "tts-cpp/export.h"
+
+#include <cstdint>
+#include <cstddef>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace tts_cpp::chatterbox {
+
+struct EngineOptions {
+    // Required: T3 GGUF and S3Gen GGUF paths (as produced by the Python
+    // converters under scripts/).
+    std::string t3_gguf_path;
+    std::string s3gen_gguf_path;
+
+    // Optional voice cloning.  Either (or both) of these two paths may be
+    // set; if both are empty the engine uses the built-in reference voice
+    // embedded in the S3Gen GGUF.
+    //
+    //   reference_audio: path to a mono wav >= 5 s.  The engine computes
+    //                    speaker_emb + prompt_feat + prompt_token +
+    //                    embedding + cond_prompt_speech_tokens in C++
+    //                    once (at construction) and reuses them across
+    //                    every synthesize() call.
+    //
+    //   voice_dir:       path to a directory of pre-baked .npy tensors
+    //                    (the layout produced by `tts-cli --save-voice`).
+    //                    Faster to load than reference_audio.  When both
+    //                    are provided, reference_audio takes precedence for
+    //                    any tensor missing from voice_dir.
+    std::string reference_audio;
+    std::string voice_dir;
+
+    // Backend selection.  n_gpu_layers > 0 enables the first available
+    // GPU backend via the Adreno-tier policy: Adreno 700+ -> OpenCL,
+    // every other GPU (Vulkan on non-Adreno Android, Metal on Apple,
+    // CUDA on Linux/Windows desktop, Mali iGPU via Vulkan, ...) -> the
+    // non-OpenCL preference. Adreno 6xx OpenCL is force-skipped (broken
+    // kernels) unless `TTS_CPP_ALLOW_ADRENO_6XX=1` is set in the env.
+    // Falls back to the CPU backend when no GPU was requested, none is
+    // registered, or every candidate refused init.
+    // The exact per-layer split is not used today; any positive value
+    // moves the whole model to the GPU.
+    int n_gpu_layers = 0;
+
+    // Directory to scan for dynamically-loaded ggml backends
+    // (`libspeech-ggml-vulkan.so`, `libspeech-ggml-opencl.so`,
+    // `libspeech-ggml-cpu-android_armv8.2_1.so`, ...). Forwarded to
+    // `ggml_backend_load_all_from_path()` on the first Engine
+    // construction in the process; subsequent constructions reuse the
+    // already-populated registry.
+    //
+    // Leave empty to fall back to ggml's default search path
+    // (`ggml_backend_load_all()`), which walks compile-time defaults
+    // (`$EXE_DIR`, `LD_LIBRARY_PATH`, ...). Embedded host applications
+    // built with `GGML_BACKEND_DL=ON` (the Android / Linux non-Apple
+    // default; see CMakeLists.txt) should pass an explicit dir
+    // because the .so files ship next to the host's binary in a
+    // platform-specific subfolder rather than on the system loader's
+    // path.
+    //
+    // No-op on builds where ggml is statically linked
+    // (`GGML_BACKEND_DL=OFF`, e.g. desktop dev cmake builds and the
+    // Apple xcframework). On those, every backend is registered at
+    // constructor time from inside libggml and no filesystem scan
+    // takes place.
+    std::string backends_dir;
+
+    // Sets `$GGML_OPENCL_CACHE_DIR` before the first backend init so
+    // ggml-opencl persists `clCreateProgramWithBinary` blobs across
+    // process restarts (see the program-binary-cache commit in the
+    // fabric ggml). Strongly recommended on Android where
+    // the cold `clBuildProgram` cost dominates first-utterance
+    // latency; pass a writable per-app directory (typically the
+    // app's `cacheDir` from the host platform).
+    //
+    // Honoured only on `__ANDROID__` builds; ignored elsewhere
+    // (desktop OpenCL platforms don't ship the binary-cache patch
+    // and would otherwise pollute the user's tmpdir).
+    //
+    // Leave empty to keep the existing `$GGML_OPENCL_CACHE_DIR` env
+    // value (or no cache at all). Wrapper scripts that already
+    // export the env take precedence.
+    std::string opencl_cache_dir;
+
+    // 0 = std::thread::hardware_concurrency() (capped at 4 by default).
+    int n_threads = 0;
+
+    // RNG seed for T3 sampling + CFM initial noise.  A fixed seed gives
+    // reproducible output across runs of the same text; bump it to get a
+    // different "take" of the same line.
+    int seed = 42;
+
+    // Maximum speech tokens to decode per synthesize() call.
+    int n_predict = 1000;
+
+    // Optional T3 context-size cap (0 = use the GGUF's value).
+    int n_ctx = 0;
+
+    // T3 KV-cache storage type: "f32" (default), "f16", or "q8_0".
+    // The cache is allocated up-front at n_ctx, so the dtype directly
+    // scales resident memory: f16 halves it, q8_0 cuts it to ~27% of
+    // f32 (one fp16 scale per 32 values).  Both attention paths read
+    // K/V through ggml_flash_attn_ext, which consumes f16/q8_0 K/V
+    // natively on CPU and Metal; the per-step cache append quantises
+    // on write.  q8_0 is lossy — validate audio parity for a new model
+    // before defaulting to it.  Empty/unknown strings fall back to f32.
+    std::string kv_cache_type;
+
+    // Sampling knobs (mirrors the CLI defaults, which match Python's
+    // ChatterboxTurboTTS.generate()).
+    int   top_k          = 1000;
+    float top_p          = 0.95f;
+    float temperature    = 0.8f;
+    float repeat_penalty = 1.2f;
+
+    // ---------------- Multilingual variant only ---------------------
+    //
+    // Honoured when the loaded T3 GGUF reports
+    // `chatterbox.variant = "t3_mtl"`; ignored on Turbo.  The engine
+    // dispatches automatically based on the variant metadata - callers
+    // don't need to look at the GGUF to know which set of fields apply.
+    //
+    //   language     ISO 639-1 code (e.g. "en", "es", "fr"); the
+    //                multilingual tokenizer wraps the input text in a
+    //                <lang>...</lang> prefix per the language.  Must
+    //                be one of mtl_tokenizer::supported_languages();
+    //                the engine throws on unsupported inputs.
+    //
+    //   exaggeration Per-utterance prosody knob; >0 = more expressive,
+    //                <0 = flatter.  Default 0.5 matches Python's
+    //                ChatterboxMultilingualTTS.generate().
+    //
+    //   cfg_weight   Classifier-free guidance scale.  0 disables CFG
+    //                (single forward pass per token).  >0 enables CFG
+    //                (cond+uncond batched into one B=2 forward).
+    //                Default 0.5 (matches the Python reference).
+    //
+    //   min_p        Min-p sampling threshold; 0 disables, ~0.05 is a
+    //                reasonable starting point for tighter sampling
+    //                without sacrificing diversity.
+    std::string language     = "en";
+    float       exaggeration = 0.5f;
+    float       cfg_weight   = 0.5f;
+    float       min_p        = 0.0f;
+
+    std::string mecab_dict_path;
+    std::string cangjie_tsv_path;
+
+    // S3Gen side.  0 = library default (2-step meanflow).
+    int cfm_steps = 0;
+
+    float s3gen_cfg_rate = -1.0f;
+
+    // desired output sample rate in Hz. The Chatterbox pipeline
+    // natively emits 24 kHz mono float32; when this is a positive rate other
+    // than 24000 the engine resamples the final PCM (Kaiser-windowed sinc, the
+    // same primitive used for reference-audio preprocessing) to the requested
+    // rate and reports it on SynthesisResult::sample_rate.  In streaming mode
+    // every chunk is fed through one utterance-spanning resampler that emits an
+    // output sample only once its sinc window is fully covered by the audio seen
+    // so far, so the delivered chunks concatenate to exactly the same PCM as
+    // resampling the whole utterance once — no per-chunk seam artifacts — and
+    // the documented `result.pcm == concat(chunks)` invariant still holds.
+    // 0 keeps the native 24 kHz (default; zero behaviour change).  Validated at
+    // construction to 0 or [8000, 192000] Hz.
+    int output_sample_rate = 0;
+
+    // ---------------- Streaming synthesis ----------------------------
+    //
+    // When `stream_chunk_tokens > 0` AND the caller passes a non-empty
+    // chunk callback to `synthesize()`, the engine runs the chunked
+    // S3Gen+HiFT loop and invokes the callback with each chunk's 24 kHz
+    // float32 PCM as it's produced.  The callback is called synchronously
+    // from the same thread as `synthesize()`.
+    //
+    //   stream_chunk_tokens        Number of T3 speech tokens per chunk
+    //                              (25 ~= 1 s of audio, 50 ~= 2 s).
+    //                              0 = non-streaming (batch).
+    //
+    //   stream_first_chunk_tokens  Override for the *first* chunk so first
+    //                              audio lands early while later chunks
+    //                              stay large and keep overall RTF low.
+    //                              0 = same as stream_chunk_tokens.
+    //
+    //   stream_cfm_steps           CFM Euler step count for streaming
+    //                              chunks.  0 = library default (2).
+    //                              Setting 1 halves CFM cost with a small
+    //                              quality penalty on Turbo's meanflow
+    //                              sampler.
+    int stream_chunk_tokens       = 0;
+    int stream_first_chunk_tokens = 0;
+    int stream_cfm_steps          = 0;
+
+    // Sliding-window S3Gen: retain only this many already-emitted speech
+    // tokens of left context per chunk instead of re-synthesizing the whole
+    // cumulative prefix.  Bounds per-chunk encoder+CFM cost — the cumulative
+    // prefix otherwise makes per-chunk cost grow with elapsed output (~O(N^2)
+    // over a long utterance / paragraph).  0 = disabled (legacy cumulative
+    // behaviour).  Typical: 25-50 (one or two chunks of context).
+    int stream_left_context_tokens = 0;
+
+    // Sentence-level auto-split (parity with the CLI's --max-sentence-chars).
+    // When > 0, synthesize() splits `text` into segments of at most this many
+    // bytes and runs T3 + S3Gen independently per sentence, bounding the T3
+    // sequence length (prosody + O(N^2) decode cost) and letting first audio
+    // start after the first sentence instead of the whole paragraph.  Adopted
+    // only when it yields >1 segment (else the whole text is one segment).
+    // 0 = disabled: a single pass over the whole text == legacy behaviour.
+    // The CLI uses 180.
+    int max_sentence_chars = 0;
+    // Raised-cosine crossfade (ms) applied between sentence segments on the
+    // non-streaming (batch) path to mask seams.  Only consulted when
+    // max_sentence_chars actually splits into >1 segment.  Ignored on the
+    // streaming-callback path, which stays gapless so the documented
+    // `result.pcm == concat(callback chunks)` invariant holds.
+    int crossfade_ms = 30;
+
+    // Pass-through of the CLI's --verbose behaviour: per-stage wall times
+    // on stderr.  Errors always go through regardless of this flag.
+    bool verbose = false;
+
+    // Explicit device for T3 and S3Gen: "cpu", "opencl", "hexagon" (the
+    // Snapdragon HTP0 NPU) or an exact ggml device name.  Overrides
+    // n_gpu_layers with no fallback, so the constructor throws when the device
+    // is missing; the automatic walk never picks Hexagon.  Reference-audio
+    // conditioning stays on the CPU under Hexagon.  Empty or "auto" keeps the
+    // n_gpu_layers walk.  Kept last so existing positional initializers stay
+    // valid.
+    std::string backend;
+
+    // Legacy aliases of `coreml` below: each fills the matching field when
+    // that is unset. coreml_compute_units -> coreml.compute_units (all,
+    // cpu_and_ane, cpu_and_gpu or cpu_only; invalid values throw even in builds
+    // without Core ML); coreml_strict true -> coreml.use = require, false ->
+    // automatic (so CHATTERBOX_COREML_STRICT is ignored).
+    std::string coreml_compute_units;
+    std::optional<bool> coreml_strict;
+
+    // Core ML options (tts-cpp/coreml_options.h), resolved once at
+    // construction without modifying process environment variables.
+    // CHATTERBOX_COREML_DISABLE keeps every stage on ggml. With the defaults
+    // the constructor requests HiFT plus the widths this host loaded most
+    // recently and never waits; each synthesize() requests the widths its
+    // sentences need and runs each sentence's stages on Core ML only when their
+    // functions are ready at the start of that sentence.
+    CoremlOptions coreml;
+};
+
+// Per-chunk PCM callback.  Receives a pointer to `samples` consecutive
+// 24 kHz float32 mono samples.  The buffer is owned by the engine and
+// must not be retained past the callback; copy out if you need the data.
+//   `chunk_index`  0-based; increments by exactly 1 per chunk across the whole
+//                  synthesize() call.  With max_sentence_chars auto-split it
+//                  keeps counting across sentence segments (it does NOT reset
+//                  per sentence); with auto-split off there is one segment, so
+//                  it is the plain per-utterance index as before.  No synthetic
+//                  silence chunk is ever emitted between segments.
+//   `is_last`      true only on the final chunk of the final segment (after
+//                  which synthesize() returns).
+// Throwing from this callback aborts synthesis (the exception propagates
+// out of synthesize()).
+using StreamCallback = std::function<void(
+    const float * pcm, std::size_t samples, int chunk_index, bool is_last)>;
+
+struct SynthesisResult {
+    // 24 kHz mono PCM, float32 in [-1, 1].
+    std::vector<float> pcm;
+    int sample_rate = 24000;
+
+    // Stats, for parity with the CLI's `BENCH:` lines.
+    double t3_ms         = 0.0;
+    double s3gen_ms      = 0.0;
+    int    t3_tokens     = 0;
+    int    audio_samples = 0;
+
+    // Where this call's S3Gen encoder, CFM and HiFT ran: "ggml" (on
+    // backend_name()), the Core ML sidecar label ("coreml-ane", "coreml-all",
+    // ...) when every stage of every segment and chunk ran on Core ML, or
+    // "mixed". A sidecar that fails a prediction is retired and ggml takes over.
+    std::string s3gen_backend = "ggml";
+
+    // True when some stage ran on ggml only because its Core ML function was
+    // still loading (it will serve a later call).
+    bool coreml_pending = false;
+};
+
+class TTS_CPP_API Engine {
+public:
+    // Loads T3, kicks off the S3Gen preload, bakes voice conditioning if
+    // reference_audio / voice_dir is set.  Throws std::runtime_error on
+    // any hard failure (GGUF not found, GGUF malformed, reference wav
+    // invalid, voice dir missing tensors, etc.).
+    explicit Engine(const EngineOptions & opts);
+
+    // Frees the backend + all ggml contexts.
+    ~Engine();
+
+    Engine(const Engine &)            = delete;
+    Engine & operator=(const Engine &) = delete;
+
+    Engine(Engine &&) noexcept;
+    Engine & operator=(Engine &&) noexcept;
+
+    // Synthesize `text` into PCM.  Returns a non-empty `pcm` on success;
+    // throws std::runtime_error on failure.  Empty `text` is rejected.
+    //
+    // Not safe to call concurrently on the same Engine instance.
+    SynthesisResult synthesize(const std::string & text);
+
+    // Same as above, but when `options().stream_chunk_tokens > 0` and
+    // `on_chunk` is non-empty, runs the chunked S3Gen+HiFT loop and
+    // invokes `on_chunk` with each chunk's PCM in order.  The returned
+    // SynthesisResult.pcm still contains the concatenated audio (the
+    // callback is an *addition*, not a replacement).  Falls through to
+    // the batch path when streaming is disabled.
+    SynthesisResult synthesize(const std::string & text,
+                               const StreamCallback & on_chunk);
+
+    // Best-effort cancel of an in-flight synthesize() call on another
+    // thread.  Safe to call concurrently with synthesize() or from any
+    // thread.  Setting the flag is all this does; actual termination
+    // happens at the next cancellation checkpoint inside the pipeline:
+    //
+    //   - between iterations of the T3 decode loop (every token);
+    //   - immediately before run_encoder;
+    //   - between CFM steps (top of each iteration of the loop in
+    //     s3gen_synthesize_to_wav);
+    //   - between run_stft and run_hift_decode;
+    //   - immediately before run_hift_decode.
+    //
+    // ggml_backend_graph_compute calls cannot be preempted, so the
+    // worst-case cancel latency is one in-flight graph submission -
+    // bounded by the longest single graph among encoder, CFM step,
+    // STFT, and HiFT decode.  For chatterbox today, HiFT decode is
+    // the dominant one (a few hundred ms on M3 Ultra Metal at
+    // HiFT-realistic shapes; longer on CPU).  CFM steps are ~80 ms
+    // each on Metal but can dominate on CPU when many are queued.
+    // Streaming-mode cancels apply at the same checkpoints inside
+    // each chunk.
+    void cancel();
+
+    // Return the options the engine was constructed with (convenience for
+    // callers that want to introspect the resolved n_gpu_layers / n_ctx).
+    const EngineOptions & options() const;
+
+    // Return the registered name of the backend the engine actually
+    // resolved to during construction (e.g. "Metal", "Vulkan", "CUDA0",
+    // "CPU").  Useful for telemetry / debug logs after the load-time
+    // backend cascade picks one of the candidates compiled in.  Returns
+    // "(unknown)" when the backend is unset (e.g. a partial construction
+    // path that hasn't run init_backend yet).
+    std::string backend_name() const;
+
+    // Resolved compute device for this engine.  CPU when the build has
+    // no GPU backend compiled in, when no GPU was requested
+    // (n_gpu_layers <= 0), or when the requested GPU backend refused
+    // to initialise.  GPU otherwise (covers Metal, CUDA, Vulkan, OpenCL
+    // and any other ggml ACCEL/GPU device).  Stable for the lifetime
+    // of the Engine.
+    BackendDevice backend_device() const;
+
+    // True iff a GPU was present but declined by policy (vendor off the validated
+    // allowlist, e.g. Mali), so we fell back to CPU. Distinguishes this from a GPU-less host.
+    bool gpu_unsupported() const;
+
+    // Core ML sidecar status as JSON: per function its state ("queued",
+    // "loading", "ready", "failed", ...), route, compute units, label, warm
+    // hint and load timings, and the construction group's result as
+    // "construction" (see coreml_construction()). Without a sidecar in use,
+    // only that (empty) construction result.
+    std::string coreml_status() const;
+
+    // The construction group's result as JSON (the functions requested at
+    // construction, each with its final state; "success"; and
+    // "nothing_to_prepare", true when the group was empty, e.g. no sidecar
+    // in use). wait = construct returns from the constructor once it
+    // finished; a sidecar that lists no usable function makes it fail.
+    std::string coreml_construction() const;
+
+    // Waits until the construction group (the functions requested at
+    // construction) finished; timeout_ms < 0 waits without limit. True when
+    // every one of them is ready, and at once when the group is empty (no
+    // sidecar in use, Core ML off or not built: nothing to prepare).
+    // Engine::cancel() interrupts it.
+    bool coreml_wait(int64_t timeout_ms = -1);
+
+    // Requests another group of functions (scope minimal or predicted: the
+    // minimal set; all: every function) and, with `wait`, blocks until it
+    // finished. Returns the group's result as JSON; without a sidecar in use
+    // an empty group that succeeded with "nothing_to_prepare": true.
+    std::string coreml_prewarm(CoremlOptions::Prewarm scope, bool wait);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> pimpl_;
+};
+
+} // namespace tts_cpp::chatterbox

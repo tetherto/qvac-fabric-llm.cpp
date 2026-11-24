@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(ggml CONFIG)
+find_dependency(Threads)
+@TTS_CPP_OPTIONAL_DEPS@
+
+include("${CMAKE_CURRENT_LIST_DIR}/tts-cppTargets.cmake")
+
+# Consumers can require Pocket explicitly instead of discovering an older
+# registry package only when its headers fail to compile.
+set(tts-cpp_pocket_FOUND TRUE)
+check_required_components(tts-cpp)

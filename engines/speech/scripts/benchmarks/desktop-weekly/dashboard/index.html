@@ -1,0 +1,186 @@
+<meta name="dash-one-writer">
+<link rel="stylesheet" href="app.css">
+<div class="fsb">
+  <header class="top" id="top">
+    <div class="eyebrow">QVAC speech · <a href="https://claude.ai/artifact/MAF5hDfMrpqbQ7Dsqmc8gY" target="_blank" rel="noopener">Speech Bench</a> · weekly run finished <span data-draw="fact" data-key="snapshot_utc" data-source="machine" data-field="snapshot_utc">—</span></div>
+    <h1 data-draw="fact" data-key="machine" data-source="machine" data-field="machine">—</h1>
+    <p class="lede">Every Sunday from 11:00 CET this machine builds the engine master head with the ggml commit it pins and runs the weekly matrix: Parakeet TDT and Unified, TranscribePsy and Nemotron for ASR; Supertonic 3, the Audio8 LM and codec cuts with voice cloning, and MOSS-TTS with cloning for TTS; the ACE-Step Turbo, SFT and Base DiTs for music. Where the speech engines campaign measured this machine, its rows against audio.cpp, transcribe.cpp, LocalAI parakeet.cpp and acestep.cpp sit in their own charts with their own build and date.</p>
+    <p class="small muted" data-draw="fact" data-key="hardware" data-source="machine" data-field="hardware">—</p>
+  </header>
+
+  <nav class="tabs" role="tablist" aria-label="Report sections">
+    <button type="button" role="tab" data-tab="overview" id="tab-overview">Overview</button>
+    <button type="button" role="tab" data-tab="asr" id="tab-asr">ASR</button>
+    <button type="button" role="tab" data-tab="tts" id="tab-tts">TTS and voice cloning</button>
+    <button type="button" role="tab" data-tab="music" id="tab-music">Music generation</button>
+    <button type="button" role="tab" data-tab="runs" id="tab-runs">Runs and coverage</button>
+  </nav>
+
+  <section class="page" id="overview" data-page="overview">
+    <div class="two">
+      <div class="card" id="status">
+        <h2>Status</h2>
+        <div data-draw="mstatus" data-source="machine">—</div>
+      </div>
+      <div class="card" id="summary">
+        <h2>On this machine</h2>
+        <div data-draw="notes" data-task="summary" data-source="commentary">—</div>
+      </div>
+    </div>
+
+    <div class="card" id="quality-flags">
+      <h3>Quality problems that performance bars do not show</h3>
+      <p class="small muted">TTS rows on this machine with intelligibility WER at or above the flag threshold.</p>
+      <div data-draw="qflags" data-source="runs">—</div>
+    </div>
+
+    <div class="card qa" id="q-matrix">
+      <h3>Which models ran on which backend</h3>
+      <p class="small">A dot is an accepted measurement, colored by engine; hover or tap it for the inputs and timing scopes. A red cross is a failed run. A labelled gap carries the recorded reason. An empty cell means no row exists, which says nothing about support.</p>
+      <div class="legend" data-draw="legend" data-source="runs">—</div>
+      <div class="scroll" data-draw="matrix" data-source="runs coverage">—</div>
+    </div>
+
+    <div class="two">
+      <div class="card" id="gaps">
+        <h3>Not measured here, and why</h3>
+        <div data-draw="gaps" data-source="coverage">—</div>
+      </div>
+      <div class="card qa" id="q-nx">
+        <h3>Reading the numbers</h3>
+        <div class="defs">
+          <span><strong>Speed × real time</strong> = audio duration / processing time; higher is better.</span>
+          <span><strong>RTF</strong> = processing time / audio duration; lower is better.</span>
+          <span><strong>Competitor ÷ QVAC time</strong> is the competitor's time divided by QVAC's time on the same setup. Above 1 means QVAC took less time.</span>
+        </div>
+        <p class="small muted">ASR, Supertonic and Nemotron rows time inference only. Audio8, MOSS-TTS and ACE-Step rows are whole fresh processes including model load, so their speed is a throughput figure, not a latency. Variants generate audio of slightly different length for the same prompt, so each comparison shows latency, generated duration and speed together.</p>
+      </div>
+    </div>
+
+    <div class="card qa" id="engines-here">
+      <h3>Engines on this machine</h3>
+      <p class="small muted">Engines with rows here, then the other engines of the comparison with where they were measured instead.</p>
+      <div class="scroll"><table class="ctable" data-source="engines" data-row-key="engine"><thead><tr><th data-field="engine">Engine</th><th data-field="role">Role</th><th data-field="measured_on">Measured on</th><th data-field="details">Scope and caveats</th></tr></thead><tbody data-draw="engines-here"></tbody></table></div>
+    </div>
+
+    <div class="card" id="general-notes">
+      <h3>Comments and comparison rules</h3>
+      <div data-draw="notes" data-task="all" data-source="commentary">—</div>
+    </div>
+    <p class="small muted">Other machines and the weekly schedule: <a href="https://claude.ai/artifact/MAF5hDfMrpqbQ7Dsqmc8gY" target="_blank" rel="noopener">Speech Bench</a>.</p>
+  </section>
+
+  <section class="page" id="asr" data-page="asr" data-task="asr" hidden>
+    <div class="card">
+      <h2>ASR</h2>
+      <p>Speech to text on the 11 s JFK clip with its reference transcript: Parakeet TDT 0.6B v3 and Parakeet Unified English 0.6B at Q8_0, TranscribePsy-250M-EU-sub at Q8_0 and Nemotron 3.5 ASR Streaming 0.6B at F16, each timed as inference only with the model loaded. The campaign charts compare QVAC with transcribe.cpp, audio.cpp and LocalAI parakeet.cpp on Parakeet TDT, at the campaign's build, on its 11.0 s and 98.49 s clips.</p>
+    </div>
+    <div data-draw="models" data-source="runs ratios coverage">—</div>
+    <div class="card" id="trend-asr">
+      <h3>Week over week</h3>
+      <p class="small muted">One line per backend across every stored run of this machine. A move with unchanged engine and ggml commits points at load from another user that night; a changed commit names what to look at.</p>
+      <div class="ctl">
+        <label>Model<select data-draw="trend-model" data-source="history" aria-label="Model"></select></label>
+        <label>Metric<span class="seg" role="group" aria-label="Metric"><button type="button" data-metric="speed">Speed ×</button><button type="button" data-metric="latency">Latency</button><button type="button" data-metric="rtf">RTF</button><button type="button" data-metric="rss">Host RSS</button><button type="button" data-metric="gpu">Device memory</button><button type="button" data-metric="wer">WER</button></span></label>
+      </div>
+      <div data-draw="trend" data-source="history">—</div>
+    </div>
+    <details class="card tnotes"><summary>About these measurements and interpretation notes</summary>
+      <p class="small muted">ASR WER is ground truth against the JFK transcript, a single-clip smoke check, not a corpus benchmark. Weekly rows and campaign rows are never in one chart.</p>
+      <div data-draw="notes" data-source="commentary">—</div>
+    </details>
+  </section>
+
+  <section class="page" id="tts" data-page="tts" data-task="tts" hidden>
+    <div class="card">
+      <h2>TTS and voice cloning</h2>
+      <p>Speech synthesis from one fixed English prompt and voice cloning from the JFK clip. Supertonic 3 at Q8_0 is timed as inference only. The Audio8 TTS Preview 0.6B grid of LM F16, Q8_0 and Q4_0 by codec decoder F16 and Q8_0, Audio8 cloning with the F16 and Q8_0 encoders, MOSS-TTS v1.5 8.5B at F16 and with Q8_0 transformer blocks, and MOSS-TTS cloning run as fresh processes including model load. The campaign charts compare QVAC with audio.cpp on Supertonic 3 and the Audio8 LM cuts, on a 9-word and a 76-word prompt.</p>
+    </div>
+    <div data-draw="models" data-source="runs ratios coverage">—</div>
+    <div class="card" id="trend-tts">
+      <h3>Week over week</h3>
+      <p class="small muted">One line per backend across every stored run of this machine.</p>
+      <div class="ctl">
+        <label>Model<select data-draw="trend-model" data-source="history" aria-label="Model"></select></label>
+        <label>Metric<span class="seg" role="group" aria-label="Metric"><button type="button" data-metric="speed">Speed ×</button><button type="button" data-metric="latency">Latency</button><button type="button" data-metric="rtf">RTF</button><button type="button" data-metric="rss">Host RSS</button><button type="button" data-metric="gpu">Device memory</button><button type="button" data-metric="wer">WER</button></span></label>
+      </div>
+      <div data-draw="trend" data-source="history">—</div>
+    </div>
+    <details class="card tnotes"><summary>About these measurements and interpretation notes</summary>
+      <p class="small muted">TTS WER is intelligibility: pinned Whisper tiny transcribes the generated clip outside the timed region. It includes scorer errors and does not measure naturalness or speaker similarity. Fresh-process timings include model loading from a warm filesystem cache; they are not cold-disk startup times. MOSS-TTS Q8_0 is the F16 backbone with its transformer blocks requantized on the machine, because the registry has no Q8_0 cut.</p>
+      <div data-draw="notes" data-source="commentary">—</div>
+    </details>
+  </section>
+
+  <section class="page" id="music" data-page="music" data-task="music" hidden>
+    <div class="card">
+      <h2>Music generation</h2>
+      <p>A 30 s instrumental render at seed 42 as a fresh process including the load of all four stages: ACE-Step 1.5 Turbo with the DiT at Q8_0 and at Q4_K_M, SFT at Q8_0 and Base at Q4_K_M, each with the Qwen3-Embedding-0.6B Q8_0, the 5Hz LM 0.6B Q8_0 and the BF16 VAE. The campaign charts compare QVAC with acestep.cpp on ACE-Step Turbo over the campaign's ten prompts.</p>
+    </div>
+    <div data-draw="models" data-source="runs ratios coverage">—</div>
+    <div class="card" id="trend-music">
+      <h3>Week over week</h3>
+      <p class="small muted">One line per backend across every stored run of this machine.</p>
+      <div class="ctl">
+        <label>Model<select data-draw="trend-model" data-source="history" aria-label="Model"></select></label>
+        <label>Metric<span class="seg" role="group" aria-label="Metric"><button type="button" data-metric="speed">Speed ×</button><button type="button" data-metric="latency">Latency</button><button type="button" data-metric="rtf">RTF</button><button type="button" data-metric="rss">Host RSS</button><button type="button" data-metric="gpu">Device memory</button></span></label>
+      </div>
+      <div data-draw="trend" data-source="history">—</div>
+    </div>
+    <details class="card tnotes"><summary>About these measurements and interpretation notes</summary>
+      <p class="small muted">Music quality is unmeasured: there is no scorer and no listening protocol. ACE-Step Base runs at Q4_K_M because the registry has no Q8_0 Base cut.</p>
+      <div data-draw="notes" data-source="commentary">—</div>
+    </details>
+  </section>
+
+  <section class="page" id="runs" data-page="runs" hidden>
+    <div class="card" id="run-table">
+      <h2>All rows</h2>
+      <p class="small muted">Every weekly cell of the newest result and every campaign row of this machine. Search any text (model, engine, hash, caveat) and click a row to see its full provenance. Click a column heading to sort.</p>
+      <div class="ctl">
+        <label>Search<input type="search" id="runs-q" class="runs-q" placeholder="e.g. Supertonic, vulkan, failed" aria-label="Search runs"></label>
+        <label>Status<select id="runs-status" class="runs-status" aria-label="Status"><option value="">All</option><option value="measured">Measured</option><option value="failed">Failed</option></select></label>
+      </div>
+      <div class="scroll tall"><table class="ctable runs-table" data-source="runs" data-row-key="id"><thead><tr>
+        <th data-field="id"><button type="button" class="sort" data-sort="id">Row</button></th>
+        <th data-field="machine"><button type="button" class="sort" data-sort="machine">Machine</button></th>
+        <th data-field="backend"><button type="button" class="sort" data-sort="backend">Backend</button></th>
+        <th data-field="task"><button type="button" class="sort" data-sort="task">Task</button></th>
+        <th data-field="model"><button type="button" class="sort" data-sort="model">Model</button></th>
+        <th data-field="engine"><button type="button" class="sort" data-sort="engine">Engine</button></th>
+        <th data-field="variant"><button type="button" class="sort" data-sort="variant">Variant</button></th>
+        <th data-field="scenario_label">Input</th>
+        <th data-field="timing_label">Timing scope</th>
+        <th data-field="status"><button type="button" class="sort" data-sort="status">Status</button></th>
+        <th data-field="latency_ms" class="r"><button type="button" class="sort" data-sort="latency_ms">Latency</button></th>
+        <th data-field="audio_s" class="r"><button type="button" class="sort" data-sort="audio_s">Audio s</button></th>
+        <th data-field="speed_x" class="r"><button type="button" class="sort" data-sort="speed_x">Speed ×</button></th>
+        <th data-field="rtf" class="r"><button type="button" class="sort" data-sort="rtf">RTF</button></th>
+        <th data-field="rss_mib" class="r"><button type="button" class="sort" data-sort="rss_mib">RSS MiB</button></th>
+        <th data-field="gpu_mib" class="r"><button type="button" class="sort" data-sort="gpu_mib">Device MiB</button></th>
+        <th data-field="wer_pct" class="r"><button type="button" class="sort" data-sort="wer_pct">WER %</button></th>
+        <th data-field="runs" class="r">Runs</th>
+        <th data-field="warmups" class="r">Warmups</th>
+        <th data-field="date">Date</th>
+      </tr></thead><tbody data-draw="runs-table"></tbody></table></div>
+      <div data-draw="run-detail" data-source="runs">—</div>
+    </div>
+
+    <div class="card" id="coverage">
+      <h2>Coverage</h2>
+      <p class="small muted">Measured, failed and skipped cells of the matrix on this machine, plus the campaign cells, each with its recorded reason.</p>
+      <div class="ctl">
+        <label>Status
+          <span class="seg" role="group" aria-label="Coverage status">
+            <button type="button" data-cov="">All</button>
+            <button type="button" data-cov="measured">Measured</button>
+            <button type="button" data-cov="failed">Failed</button>
+            <button type="button" data-cov="not attempted">Not attempted</button>
+          </span>
+        </label>
+      </div>
+      <div class="scroll tall"><table class="ctable" data-source="coverage" data-row-key="id"><thead><tr><th data-field="id">Cell</th><th data-field="machine">Machine</th><th data-field="backend">Backend</th><th data-field="task">Task</th><th data-field="model">Model</th><th data-field="engine">Engine</th><th data-field="status">Status</th><th data-field="rows" class="r">Rows</th><th data-field="scenario">Input</th><th data-field="reason">Recorded reason</th><th data-field="source">Source</th></tr></thead><tbody data-draw="coverage-table"></tbody></table></div>
+    </div>
+  </section>
+</div>
+<script src="app.js"></script>

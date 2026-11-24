@@ -1,0 +1,257 @@
+{
+  "_schema": {
+    "description": "Engines shown on the dashboards: the QVAC engine, the competitors of the campaign in comparisons.json and the engines of the comparison report imported by import-report.py. measured_on is filled by build-dashboard-data.py from the rows; details and source are the campaign's or the report's own words.",
+    "fields": {
+      "engine": "Engine name exactly as comparisons.json or report-rows.json spells it.",
+      "role": "QVAC engine, prior-report competitor or new competitor, measured.",
+      "ggml": "ggml-based or not, as a short phrase.",
+      "details": "Scope and caveats of the engine's rows.",
+      "source": "Where the rows come from.",
+      "not_measured": "Optional list of {host, backend, task, model, reason}: models of the weekly matrix this engine cannot measure on that host; build-dashboard-data.py turns them into coverage cells of the host (status not attempted)."
+    }
+  },
+  "rows": [
+    {
+      "engine": "qvac-fabric-speech.cpp",
+      "role": "QVAC engine",
+      "ggml": "ggml-based",
+      "details": "Weekly rows from the Sunday run of the engine master and ggml speech heads on every shared machine; campaign rows from the dated comparison at the build the campaign measured.",
+      "source": "scripts/benchmarks/desktop-weekly (weekly.sh) and comparisons.json"
+    },
+    {
+      "engine": "transcribe.cpp",
+      "role": "prior-report competitor",
+      "ggml": "ggml-based",
+      "details": "handy-computer/transcribe.cpp on Parakeet TDT 0.6B v3 Q8_0, the same 11.0 s and 98.49 s clips as QVAC.",
+      "source": "QVAC speech engines report (Gustavo Araujo, 2026-10-01 edition)"
+    },
+    {
+      "engine": "audio.cpp",
+      "role": "prior-report competitor",
+      "ggml": "ggml-based",
+      "details": "Parakeet TDT 0.6B v3 Q8_0 for ASR; Supertonic 3 Q8_0 and the Audio8 TTS Preview LM F16, Q8_0 and Q4_0 cuts for TTS, end-to-end process wall including model load on the same prompts as QVAC.",
+      "source": "QVAC speech engines report (Gustavo Araujo, 2026-10-01 edition)"
+    },
+    {
+      "engine": "LocalAI / parakeet.cpp",
+      "role": "prior-report competitor",
+      "ggml": "ggml-based",
+      "details": "Parakeet TDT 0.6B v3 Q8_0 on the same clips as QVAC.",
+      "source": "QVAC speech engines report (Gustavo Araujo, 2026-10-01 edition)"
+    },
+    {
+      "engine": "acestep.cpp",
+      "role": "prior-report competitor",
+      "ggml": "ggml-based",
+      "details": "ACE-Step 1.5 Turbo with the same four model files as QVAC over ten fixed prompts; one prompt-set RTF and generation-time ratio per device.",
+      "source": "QVAC speech engines report (Gustavo Araujo, 2026-10-01 edition)"
+    },
+    {
+      "engine": "QVAC bundled whisper.cpp",
+      "role": "QVAC engine",
+      "ggml": "ggml-based",
+      "details": "The whisper.cpp bundled in the QVAC engine, driven through its resident C API and through whisper-server over HTTP in the report's Whisper small rows.",
+      "source": "Speech Bench comparison report of 2026-11-04 (Gustavo Araujo), copied by import-report.py"
+    },
+    {
+      "engine": "NeMo-Speech.cpp",
+      "role": "new competitor, measured",
+      "ggml": "ggml-based",
+      "details": "Parakeet TDT and Nemotron rows of the report on Strix Halo and the RTX 5090 box; its Nemotron rows run a 160 ms streaming policy that the report keeps in its own chart.",
+      "source": "Speech Bench comparison report of 2026-11-04 (Gustavo Araujo), copied by import-report.py"
+    },
+    {
+      "engine": "whisper.cpp (upstream)",
+      "role": "new competitor, measured",
+      "ggml": "ggml-based",
+      "details": "Upstream whisper-cli on Whisper small (Whisper tiny on Jetson Orin) in the report's resident-API rows.",
+      "source": "Speech Bench comparison report of 2026-11-04 (Gustavo Araujo), copied by import-report.py"
+    },
+    {
+      "engine": "cosyvoice.cpp",
+      "role": "prior-report competitor",
+      "ggml": "ggml-based",
+      "details": "CosyVoice3 0.5B cloning from the b.wav reference in the report; its own frontend ONNX models, Q8_0 GGUF.",
+      "source": "Speech Bench comparison report of 2026-11-04 (Gustavo Araujo), copied by import-report.py"
+    },
+    {
+      "engine": "TTS.cpp",
+      "role": "prior-report competitor",
+      "ggml": "ggml-based",
+      "details": "Parler-TTS mini v1 on Strix Halo CPU in the report; the external T5 path failed its warmup.",
+      "source": "Speech Bench comparison report of 2026-11-04 (Gustavo Araujo), copied by import-report.py"
+    },
+    {
+      "engine": "minimaxmusic.cpp",
+      "role": "prior-report competitor",
+      "ggml": "ggml-based",
+      "details": "MiniMax Music3 10 s requests in the report, with a Flow-VAE codec unlike QVAC's DAC-style codec, so the ratio is a configured-deployment comparison.",
+      "source": "Speech Bench comparison report of 2026-11-04 (Gustavo Araujo), copied by import-report.py"
+    },
+    {
+      "engine": "faster-whisper (CTranslate2)",
+      "role": "new competitor, measured",
+      "ggml": "Not ggml-based",
+      "details": "Whisper small on DGX Spark CUDA in the report.",
+      "source": "Speech Bench comparison report of 2026-11-04 (Gustavo Araujo), copied by import-report.py"
+    },
+    {
+      "engine": "vLLM",
+      "role": "new competitor, measured",
+      "ggml": "Not ggml-based",
+      "details": "Whisper small over HTTP and the Nemotron plugin (offline API and HTTP) on DGX Spark in the report.",
+      "source": "Speech Bench comparison report of 2026-11-04 (Gustavo Araujo), copied by import-report.py"
+    },
+    {
+      "engine": "SGLang-Omni",
+      "role": "new competitor, measured",
+      "ggml": "Not ggml-based",
+      "details": "Nemotron through the offline runner on the RTX 5090 box in the report; its ARM64 install failed on DGX Spark.",
+      "source": "Speech Bench comparison report of 2026-11-04 (Gustavo Araujo), copied by import-report.py"
+    },
+    {
+      "engine": "OpenMOSS PyTorch reference",
+      "role": "new competitor, measured",
+      "ggml": "Not ggml-based",
+      "details": "The official MOSS-TTS v1.5 reference as a resident API on DGX Spark (CPU, CUDA F32 and configured pairs) and Strix Halo CPU in the report.",
+      "source": "Speech Bench comparison report of 2026-11-04 (Gustavo Araujo), copied by import-report.py"
+    },
+    {
+      "engine": "parakeet-mlx",
+      "role": "new competitor, measured",
+      "ggml": "Not ggml-based (MLX)",
+      "details": "senstella/parakeet-mlx on the mlx-community Parakeet TDT 0.6B v3 conversion (bf16), Metal GPU through MLX, driven by the weekly run on the Mac Studio with the model loaded once and the clip's log-mel, encoder and decoder timed in process, the same scope as the QVAC native rows.",
+      "source": "scripts/benchmarks/desktop-weekly (families parakeet-mlx and parakeet-mlx-abcba through mlx-bench.py)"
+    },
+    {
+      "engine": "mlx-whisper",
+      "role": "new competitor, measured",
+      "ggml": "Not ggml-based (MLX)",
+      "details": "ml-explore mlx-whisper on the mlx-community Whisper small conversion (f16), Metal GPU through MLX, driven by the weekly run on the Mac Studio with the model loaded once and greedy English decoding timed in process; the QVAC whisper-small rows are fresh-process timings, so the two stay in separate charts.",
+      "source": "scripts/benchmarks/desktop-weekly (families mlx-whisper and mlx-whisper-abcba through mlx-bench.py)"
+    },
+    {
+      "engine": "mlx-audio",
+      "role": "new competitor, measured",
+      "ggml": "Not ggml-based (MLX)",
+      "details": "Blaizzy/mlx-audio 0.6.4 on the mlx-community conversions (and the original MOSS-TTS v1.5 checkpoint), Metal GPU through MLX, driven by the weekly run on the Mac Studio: Nemotron 3.5 ASR Streaming 0.6B (bf16) decoded offline with the model loaded once, the same scope as the QVAC native rows; Chatterbox Turbo (f16, built-in voice), Audio8 TTS Preview 0.6B (bf16, synthesis and JFK cloning) and MOSS-TTS v1.5 (bf16) as fresh processes including model load like the matching QVAC rows; MiniMax Music3 (8-bit conversion) rendering the 30 s instrumental request of the ACE-Step rows beside the QVAC minimax-music3-q8_0 row.",
+      "source": "scripts/benchmarks/desktop-weekly (the mlx-audio families of families.json through mlx-bench.py)",
+      "not_measured": [
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "TTS",
+          "model": "Supertonic 3",
+          "reason": "no MLX path: mlx-community/supertonic-3-mlx is an ONNX Runtime package, not an mlx-audio model"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "TTS cloning",
+          "model": "CosyVoice3 0.5B",
+          "reason": "mlx-community/Fun-CosyVoice3-0.5B-2512 is converted for the mlx-audio-plus fork; mlx-audio 0.6.4 has no CosyVoice3 loader"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "TTS",
+          "model": "Parler-TTS mini v1",
+          "reason": "mlx-community/parler-tts-mini exists but mlx-audio 0.6.4 has no parler loader"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "TTS",
+          "model": "Indic Parler-TTS",
+          "reason": "no MLX conversion and no mlx-audio loader"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "TTS cloning",
+          "model": "Chatterbox Multilingual 0.5B",
+          "reason": "mlx-community/chatterbox-multilingual-v3 exists; its support in the mlx-audio chatterbox loader is not verified, so it stays out until checked"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "ASR",
+          "model": "Parakeet Unified English 0.6B",
+          "reason": "the only MLX conversion (littlebearlabs/parakeet-unified-en-0.6b-mlx) ships no config.json, so neither parakeet-mlx nor mlx-audio loads it; FluidAudio covers this model on the ANE instead"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "ASR",
+          "model": "Parakeet Realtime EOU 120M",
+          "reason": "no MLX conversion (only ONNX and Core ML ones)"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "ASR",
+          "model": "TranscribePsy-250M-EU-sub",
+          "reason": "no MLX conversion"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "Music",
+          "model": "ACE-Step 1.5 Turbo",
+          "reason": "no MLX port of ACE-Step (only its 5 Hz language-model half exists as an MLX conversion)"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "Music",
+          "model": "ACE-Step 1.5 SFT",
+          "reason": "no MLX port of ACE-Step"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "Music",
+          "model": "ACE-Step 1.5 Base",
+          "reason": "no MLX port of ACE-Step"
+        }
+      ]
+    },
+    {
+      "engine": "FluidAudio",
+      "role": "new competitor, measured",
+      "ggml": "Not ggml-based (Core ML)",
+      "details": "FluidInference/FluidAudio (Swift) on its own Core ML conversions with the encoder on the Apple Neural Engine (int8 encoder, decoder and joint on the ANE as well), driven by the weekly run on the Mac Studio through the bench package of scripts/benchmarks/desktop-weekly/fluidaudio-bench: Parakeet TDT 0.6B v3 and Parakeet Unified English 0.6B, model loaded once and each clip timed in process, the same scope as the QVAC native rows. The rows sit in the Metal lane of the run (the only GPU lane of the machine) and say Core ML, ANE in their variant; QVAC's own Core ML sidecars are a separate topic.",
+      "source": "scripts/benchmarks/desktop-weekly (families parakeet-fluidaudio, parakeet-fluidaudio-abcba, parakeet-unified-fluidaudio, parakeet-unified-fluidaudio-abcba)",
+      "not_measured": [
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "ASR",
+          "model": "Nemotron 3.5 ASR Streaming 0.6B",
+          "reason": "FluidAudio runs Nemotron only through its cache-aware streaming manager (chunked, 560 to 2240 ms tiers), not as the offline decode of the QVAC rows; a streaming-policy row is a follow-up"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "ASR",
+          "model": "Parakeet Realtime EOU 120M",
+          "reason": "FluidAudio has the Core ML conversion but exposes it only through its streaming end-of-utterance manager; an offline bench of it is a follow-up"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "ASR",
+          "model": "Whisper small multilingual",
+          "reason": "FluidAudio ships no Whisper (WhisperKit is the Core ML Whisper engine)"
+        },
+        {
+          "host": "qvac-dev-mac-arm64",
+          "backend": "metal",
+          "task": "TTS",
+          "model": "Supertonic 3",
+          "reason": "FluidAudio's TTS engines are Kokoro and Lux, none of the models of the weekly matrix"
+        }
+      ]
+    }
+  ]
+}

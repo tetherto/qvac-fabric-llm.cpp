@@ -1,0 +1,4 @@
+# Shared, patched CLAP environment: Python 3.12, Linux x86_64 or macOS arm64.
+# Wheel-only hashes prevent source-build fallback; comparison and desktop scoring
+# use the same resolved versions.
+-r ../../../../scripts/benchmarks/requirements-music-alignment.txt

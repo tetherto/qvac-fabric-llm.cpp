@@ -1,0 +1,68 @@
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+#include <vector>
+
+namespace parakeet {
+
+// Reject NaN and infinities without floating-point comparisons or fast-math assumptions.
+bool coreml_features_are_finite(const float * values, size_t count);
+bool coreml_eu_loads_fixed_auxiliaries(const char * compute_units);
+bool coreml_eu_requires_cpu_precision(const char * compute_units);
+bool coreml_eu_allows_gpu_precision(const char * compute_units, bool mobile = false);
+
+// Result of matching the trailing two dims of a Core ML tensor shape against an
+// unordered (rows, cols) pair. `transpose` is false for a [.., rows, cols] layout
+// and true for [.., cols, rows]; `matched` is false when neither order fits.
+struct CoremlTrailingMatch {
+    bool matched;
+    bool transpose;
+};
+
+CoremlTrailingMatch coreml_match_trailing_dims(const std::vector<int64_t> & dims,
+                                               int64_t rows, int64_t cols);
+
+// Match a tensor whose row/time dimension may be larger than `required_rows`.
+// Leading dimensions are ignored, matching coreml_match_trailing_dims.
+// `transpose` is false for [.., capacity_rows, cols] and true for
+// [.., cols, capacity_rows].
+CoremlTrailingMatch coreml_match_trailing_capacity(
+        const std::vector<int64_t> & dims,
+        int64_t required_rows,
+        int64_t cols);
+
+// Concrete Core ML input dims to allocate, plus whether the row-major
+// (n_mel_frames, n_mels) mel must be transposed to features-major on copy.
+struct CoremlInputDims {
+    std::vector<int64_t> dims;
+    bool                 transpose;
+};
+
+// Resolves the input shape the wrapper feeds a Core ML encoder from the model's
+// declared input dims (empty or non-concrete when unknown/flexible) and the target
+// (n_mel_frames, n_mels). A concrete model already sized to this input is honoured
+// verbatim; otherwise the shape is rebuilt at the requested mel length in the
+// model's declared orientation so a flexible export serves variable-length
+// utterances; with no usable concrete shape it defaults to the NeMo-natural
+// features-major [1, n_mels, n_mel_frames].
+CoremlInputDims coreml_resolve_input_dims(const std::vector<int64_t> & declared,
+                                          int64_t n_mel_frames, int64_t n_mels);
+
+// Encoder frames the offline FastConformer subsampling (three stride-2,
+// kernel-3, pad-1 convolutions) produces for `mel_frames` mel frames.
+int64_t coreml_offline_encoder_frames(int64_t mel_frames);
+
+// Lengths the fixed-window export's masks must mark valid for a slab of
+// `n_mel_frames` whose frames from `n_mel_valid` on are the mel front-end's
+// zeroed padding (`n_mel_valid <= 0` or beyond the slab: every frame holds
+// audio). `enc_frames` never exceeds the `n_enc_frames` the caller sized.
+struct CoremlAneValidity {
+    int64_t mel_frames;
+    int64_t enc_frames;
+};
+
+CoremlAneValidity coreml_ane_valid_lengths(int64_t n_mel_frames, int64_t n_mel_valid,
+                                           int64_t n_enc_frames);
+
+}  // namespace parakeet

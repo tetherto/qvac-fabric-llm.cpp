@@ -1,0 +1,180 @@
+{
+  "schema": 1,
+  "id": "sortformer-diar-f410",
+  "family": "sortformer-diarization",
+  "stage": "diarizer-410",
+  "exporter": {
+    "path": "parakeet/scripts/export-sortformer-diarizer-coreml.py",
+    "sha256": "b56206f7fe5213b351f3b01cd78a9bf5eba475f90032c0ac054b13420ba15f39",
+    "args": [
+      "--gguf",
+      "{gguf}",
+      "--frames",
+      "410",
+      "--out-dir",
+      "{out}"
+    ]
+  },
+  "min_os": {
+    "macos": "15.0"
+  },
+  "multifunction_ane": false,
+  "default_compute_units": "cpu_and_ane",
+  "export_kind": "sortformer-diarizer-v1",
+  "pad_safe": false,
+  "match": {
+    "architecture": "parakeet-ctc",
+    "metadata": {
+      "parakeet.model.type": "sortformer",
+      "parakeet.model_variant": "sortformer-streaming-v2.1-aosc",
+      "parakeet.encoder.d_model": 512,
+      "parakeet.encoder.n_layers": 17,
+      "parakeet.encoder.n_heads": 8,
+      "parakeet.encoder.ff_dim": 2048,
+      "parakeet.encoder.conv_kernel": 9,
+      "parakeet.encoder.xscaling": true,
+      "parakeet.encoder.use_bias": true,
+      "parakeet.encoder.untie_biases": true,
+      "parakeet.encoder.conv_norm_type": "batch_norm",
+      "parakeet.encoder.conv_context_size": "None",
+      "parakeet.encoder.conv_context_style": "regular",
+      "parakeet.encoder.causal_downsampling": false,
+      "parakeet.encoder.subsampling_factor": 8,
+      "parakeet.encoder.att_context_style": "regular",
+      "parakeet.encoder.att_context_size_left": -1,
+      "parakeet.encoder.att_context_size_right": -1,
+      "parakeet.sortformer.num_spks": 4,
+      "parakeet.sortformer.fc_d_model": 512,
+      "parakeet.sortformer.tf_d_model": 192,
+      "parakeet.sortformer.tf_n_layers": 18,
+      "parakeet.sortformer.tf_n_heads": 8,
+      "parakeet.sortformer.tf_inner_size": 768,
+      "parakeet.sortformer.tf_pre_ln": false,
+      "parakeet.sortformer.tf_hidden_act": "relu"
+    }
+  },
+  "literals": [
+    {
+      "id": "phase_sine",
+      "dtype": "fp16",
+      "shape": [
+        1,
+        256,
+        1,
+        410
+      ],
+      "exporter_blob": 5850368,
+      "offset": 0
+    },
+    {
+      "id": "phase_cosine",
+      "dtype": "fp16",
+      "shape": [
+        1,
+        256,
+        1,
+        410
+      ],
+      "exporter_blob": 6060352,
+      "offset": 209920
+    },
+    {
+      "id": "phase_keys",
+      "dtype": "fp16",
+      "shape": [
+        410,
+        512,
+        1,
+        1
+      ],
+      "exporter_blob": 6270336,
+      "offset": 419840
+    }
+  ],
+  "shareable": true,
+  "state_bytes": 0,
+  "expected_warm_load_ms": {
+    "main": 0
+  },
+  "memory": {
+    "runtime_weight_bytes": 141959152,
+    "workspace_bytes": 0,
+    "compile_peak_bytes": 110100476,
+    "ane_compile_reserve_bytes": 883949568,
+    "load_peak_bytes": {
+      "cpu_and_ane": 118489088,
+      "all": null,
+      "cpu_and_gpu": null,
+      "cpu_only": null
+    },
+    "margin": 1.0,
+    "coreml_bound": "measured",
+    "validated_for": [
+      {
+        "units": "cpu_and_ane",
+        "os": "27.2.1",
+        "chip": "M2"
+      },
+      {
+        "units": "cpu_and_ane",
+        "os": "26.7.2",
+        "chip": "M4 Max"
+      }
+    ],
+    "measured": {
+      "margin": 1.25,
+      "runs": 32,
+      "resident_bytes": 143654912,
+      "basis": "Each constant is 1.25 x the largest value measured over every overlapped generated-schedule run on the validated_for hosts, rounded up to 1 MiB, so the envelope's own margin is 1.0: the prepare charge (generation_peak_bytes + 8 MiB + compile_peak_bytes) covers the prepare from the start of the capacity's generation to the end of its compile; load_peak_bytes.cpu_and_ane the load and warm increment; the resident part (runtime_weight_bytes + 2 x I/O + workspace_bytes, with workspace_bytes 0) the step in the process's settled footprint when the capacity becomes ready, which on cpu_and_ane holds no copy of the fp16 weights (the Neural Engine keeps them outside the process); and ane_compile_reserve_bytes ANECompilerService's growth during the load over its size before it"
+    }
+  },
+  "prefer_ggml_on": [],
+  "provided": [],
+  "toolchain": {
+    "coremltools": "9.0",
+    "torch": "2.7.0",
+    "numpy": "1.26.4"
+  },
+  "functions": [
+    {
+      "name": "main",
+      "inputs": [
+        {
+          "name": "pre_encode",
+          "dtype": "fp32",
+          "shape": [
+            410,
+            512
+          ]
+        },
+        {
+          "name": "valid_mask",
+          "dtype": "fp32",
+          "shape": [
+            410
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "probabilities",
+          "dtype": "fp32",
+          "shape": [
+            410,
+            4
+          ]
+        }
+      ]
+    }
+  ],
+  "stateful": false,
+  "weight_bin_size": 231783616,
+  "patches": [
+    {
+      "spec_offset": 2166378,
+      "len": 8,
+      "sentinel_hex": "825e86682d853504"
+    }
+  ],
+  "generation_peak_bytes": 8388612
+}

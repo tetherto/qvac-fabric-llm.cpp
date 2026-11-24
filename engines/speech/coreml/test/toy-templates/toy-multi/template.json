@@ -1,0 +1,112 @@
+{
+  "schema": 1,
+  "id": "toy-multi",
+  "family": "qvac-toy",
+  "stage": "multi",
+  "export_kind": "qvac-toy-multi-v1",
+  "exporter": {
+    "path": "coreml/test/toy/export_toy.py",
+    "sha256": "4c2e739f9c0e6837776b9b1e13286b9d46e3e0f12047a3ea3a7aad3e343aef57",
+    "args": [
+      "--kind",
+      "multi",
+      "--gguf",
+      "{gguf}",
+      "--output",
+      "{out}"
+    ]
+  },
+  "min_os": {
+    "macos": "15.0"
+  },
+  "default_compute_units": "all",
+  "toolchain": {
+    "coremltools": "9.0",
+    "torch": "2.7.0",
+    "numpy": "1.26.4"
+  },
+  "functions": [
+    {
+      "name": "main",
+      "inputs": [
+        {
+          "name": "x",
+          "dtype": "fp32",
+          "shape": [
+            1,
+            8
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "dtype": "fp32",
+          "shape": [
+            1,
+            32
+          ]
+        }
+      ]
+    },
+    {
+      "name": "alt",
+      "inputs": [
+        {
+          "name": "x",
+          "dtype": "fp32",
+          "shape": [
+            1,
+            8
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "dtype": "fp32",
+          "shape": [
+            1,
+            32
+          ]
+        }
+      ]
+    }
+  ],
+  "stateful": false,
+  "weight_bin_size": 896,
+  "multifunction_ane": false,
+  "shareable": true,
+  "pad_safe": false,
+  "state_bytes": 0,
+  "expected_warm_load_ms": {
+    "main": 0,
+    "alt": 0
+  },
+  "memory": {
+    "runtime_weight_bytes": 896,
+    "workspace_bytes": 0,
+    "compile_peak_bytes": null,
+    "ane_compile_reserve_bytes": null,
+    "load_peak_bytes": {
+      "cpu_and_ane": null,
+      "all": null,
+      "cpu_and_gpu": null,
+      "cpu_only": null
+    },
+    "margin": 1.25,
+    "coreml_bound": "conservative",
+    "validated_for": []
+  },
+  "patches": [],
+  "prefer_ggml_on": [],
+  "match": {
+    "architecture": "qvac-toy",
+    "metadata": {
+      "qvac_toy.kind": "multi"
+    }
+  },
+  "literals": [],
+  "provided": [],
+  "generation_peak_bytes": 1536
+}

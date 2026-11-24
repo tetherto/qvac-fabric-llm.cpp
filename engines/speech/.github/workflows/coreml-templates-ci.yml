@@ -1,0 +1,177 @@
+# Core ML generation templates: the extraction and cross-seed gates and
+# the generator tripwire, on the self-hosted Apple-silicon
+# lane with the coremltools venv pinned by
+# parakeet/scripts/requirements-coreml.txt.
+#
+# For every */coreml-templates/<id>/ in the tree,
+# coreml/python/coreml_template.py report runs the template's
+# unchanged exporter on random production-geometry twins (A and B in f32,
+# Q quantised and dequantised by ggml for the exporter) and compares the
+# exporter's weight.bin, blob by blob, with the one the C++ generator writes
+# from the same twin (qvac-coreml-tool verify), and the exporter's spec with
+# the generated one (patches applied). golden.py check regenerates each template's weight.bin from
+# twin A and compares it with coreml/test/golden.txt.
+#
+# Path-filtered: the exporters, the templates, the shared runtime and the venv
+# pin. Some exporters (Chatterbox CFM) take minutes per conversion.
+name: Core ML templates CI
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'coreml/**'
+      - '*/coreml-templates/**'
+      - '*/scripts/export-*-coreml.py'
+      - '*/scripts/**/export-*-coreml.py'
+      - 'parakeet/scripts/requirements-coreml.txt'
+      - '.github/workflows/coreml-templates-ci.yml'
+  pull_request:
+    paths:
+      - 'coreml/**'
+      - '*/coreml-templates/**'
+      - '*/scripts/export-*-coreml.py'
+      - '*/scripts/**/export-*-coreml.py'
+      - 'parakeet/scripts/requirements-coreml.txt'
+      - '.github/workflows/coreml-templates-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coreml-templates-ci-${{ (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GGML_REPO: https://github.com/tetherto/qvac-fabric-llm.cpp.git
+  GGML_REF: 3cefcca8107194a372f015b13f27cd1aac301b67 # the fabric ggml pin (qvac-fabric-llm.cpp, ggml/); one pin shared by every lane
+
+jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
+  authorize:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
+  gates:
+    name: template gates
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: ${{ needs.runner_names.outputs.macos_arm64_gpu }}
+    timeout-minutes: 90
+    steps:
+      - name: Manual Workspace Cleanup
+        run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+        shell: bash
+        working-directory: .
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+        id: ggml
+        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+
+      # Same install and key as tts-ci.yml build-test-macos.
+      - name: Cache ggml install
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: ggml-install
+          key: ggml-install-metal-macos-26-${{ steps.ggml.outputs.sha }}
+
+      - name: Build ggml (system ggml, qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          git init -q ggml-src
+          git -C ggml-src remote add origin "$GGML_REPO"
+          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
+          git -C ggml-src checkout -q FETCH_HEAD
+          cmake -S ggml-src/ggml -B ggml-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_LLAMAFILE=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j4
+          cmake --install ggml-src/build
+
+      - name: Build qvac-coreml-tool
+        run: |
+          cmake -S coreml -B build-coreml -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
+          cmake --build build-coreml --target qvac-coreml-tool -j4
+          echo "QVAC_COREML_TOOL=$PWD/build-coreml/qvac-coreml-tool" >> "$GITHUB_ENV"
+
+      - name: Install the pinned coremltools venv
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          sw_vers
+          coreml_python="$(command -v python3.11 || command -v python3)"
+          "$coreml_python" -m venv .venv-coreml-templates
+          .venv-coreml-templates/bin/python -m pip install -r parakeet/scripts/requirements-coreml.txt
+
+      # coreml_template.py's own checks, including `suggest` on the toy
+      # exporter. QVAC_COREML_REQUIRE_COREMLTOOLS turns a missing requirement
+      # into a failure instead of a skip.
+      - name: coreml_template.py unit checks
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          QVAC_COREML_REQUIRE_COREMLTOOLS: '1'
+        run: |
+          set -o pipefail
+          .venv-coreml-templates/bin/python -B coreml/python/test_coreml_template.py 2>&1 | tee template-py.log
+          if grep -q "skipped" template-py.log; then
+            echo "::error::a coreml_template.py check was skipped"
+            exit 1
+          fi
+
+      # The harness on the test-only toy templates (routing fixtures, not a
+      # gate on any model): extract reproduced, exporter and generator agree.
+      - name: Harness self-check (toy templates)
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          .venv-coreml-templates/bin/python -B coreml/python/coreml_template.py report \
+            --template-dir coreml/test/toy-templates/toy-stateless \
+            --template-dir coreml/test/toy-templates/toy-multi \
+            --template-dir coreml/test/toy-templates/toy-state
+
+      - name: Extraction and cross-seed gates (every template in the tree)
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          .venv-coreml-templates/bin/python -B coreml/python/coreml_template.py report \
+            --all --allow-empty --json template-gates.json
+
+      # Twin Q in q8_0 plus another block type the model ships: Sortformer
+      # v2.1 ships q8_0 and q4_0, so its twin Q mixes both (the step above
+      # covers q8_0 alone).
+      - name: Cross-seed gate, Sortformer v2.1 twin Q in q8_0 and q4_0
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          .venv-coreml-templates/bin/python -B coreml/python/coreml_template.py report \
+            --template-dir parakeet/coreml-templates/sortformer-diar-f410 \
+            --quant-types q8_0,q4_0 --json template-gates-sortformer.json
+
+      - name: Generator tripwire (golden.txt)
+        run: python3 -B coreml/python/golden.py check --tool "$QVAC_COREML_TOOL"
+
+      - name: Upload gate results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coreml-template-gates
+          path: |
+            template-gates.json
+            template-gates-sortformer.json
+            template-py.log
+          if-no-files-found: ignore

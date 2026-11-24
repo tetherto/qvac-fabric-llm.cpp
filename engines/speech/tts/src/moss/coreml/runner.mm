@@ -1,0 +1,598 @@
+#if !defined(__APPLE__)
+#error "runner.mm is Apple-only; compile it solely under TTS_CPP_USE_COREML"
+#endif
+
+#import <CoreML/CoreML.h>
+#import <Foundation/Foundation.h>
+
+#include "moss/coreml/runner.h"
+
+#include <algorithm>
+#include <cstring>
+#include <cstdio>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#if (defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000) || \
+    (defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000)
+#define MOSS_COREML_STATE_SDK 1
+#else
+#define MOSS_COREML_STATE_SDK 0
+#endif
+
+namespace {
+
+struct placement {
+    MLComputeUnits units;
+    const char *   label;
+};
+
+constexpr placement CPU_PLACEMENT = {MLComputeUnitsCPUOnly, "coreml-cpu"};
+constexpr placement GPU_PLACEMENT = {MLComputeUnitsCPUAndGPU, "coreml-gpu"};
+constexpr placement ANE_PLACEMENT = {MLComputeUnitsCPUAndNeuralEngine, "coreml-ane"};
+constexpr placement ALL_PLACEMENT = {MLComputeUnitsAll, "coreml-all"};
+
+struct Feature {
+    std::string          name;
+    std::vector<int64_t> dims;
+    const void *         array = nullptr;
+};
+
+struct View {
+    void *               base = nullptr;
+    std::vector<int64_t> shape;
+    std::vector<int64_t> strides;
+    bool                 f32 = true;
+};
+
+float decode_float16(uint16_t h) {
+    __fp16 v;
+    std::memcpy(&v, &h, sizeof(v));
+    return (float) v;
+}
+
+uint16_t encode_float16(float f) {
+    __fp16 v = (__fp16) f;
+    uint16_t out;
+    std::memcpy(&out, &v, sizeof(out));
+    return out;
+}
+
+placement placement_named(const char * compute_units) {
+    const std::string requested = compute_units != nullptr ? compute_units : "";
+    if (requested == "cpu_only") return CPU_PLACEMENT;
+    if (requested == "cpu_and_gpu") return GPU_PLACEMENT;
+    if (requested == "cpu_and_ane") return ANE_PLACEMENT;
+    return ALL_PLACEMENT;
+}
+
+MLModel * load_model(const char * path_mlmodelc, const placement & where, const char * function_name = nullptr) {
+    NSString * path = [[NSString alloc] initWithUTF8String:path_mlmodelc];
+    if (path == nil) return nil;
+    MLModelConfiguration * config = [[MLModelConfiguration alloc] init];
+    config.computeUnits = where.units;
+    if (function_name != nullptr) {
+#if MOSS_COREML_STATE_SDK
+        if (@available(macOS 15.0, iOS 18.0, *)) {
+            config.functionName = [NSString stringWithUTF8String:function_name];
+        } else {
+            return nil;
+        }
+#else
+        return nil;
+#endif
+    }
+    NSError * err   = nil;
+    MLModel * model = [MLModel modelWithContentsOfURL:[NSURL fileURLWithPath:path]
+                                        configuration:config
+                                                error:&err];
+    if (model == nil && err != nil) std::fprintf(stderr, "Core ML: %s\n", err.localizedDescription.UTF8String);
+    return (model == nil || err != nil) ? nil : model;
+}
+
+std::vector<int64_t> dims_of(NSArray<NSNumber *> * shape) {
+    std::vector<int64_t> dims;
+    for (NSNumber * n in shape) dims.push_back(n.longLongValue);
+    return dims;
+}
+
+int64_t element_count(const std::vector<int64_t> & dims) {
+    int64_t count = dims.empty() ? 0 : 1;
+    for (int64_t d : dims) count = d > 0 ? count * d : 0;
+    return count;
+}
+
+bool supported_data_type(MLMultiArrayDataType dt) {
+    return dt == MLMultiArrayDataTypeFloat32 || dt == MLMultiArrayDataTypeFloat16;
+}
+
+bool describe_feature(NSString * name, MLFeatureDescription * description, Feature * feature) {
+    if (description.type != MLFeatureTypeMultiArray) return false;
+    MLMultiArrayConstraint * constraint = description.multiArrayConstraint;
+    if (constraint == nil || !supported_data_type(constraint.dataType)) return false;
+    feature->name = name.UTF8String;
+    feature->dims = dims_of(constraint.shape);
+    if (element_count(feature->dims) <= 0) return false;
+    NSError *      err   = nil;
+    MLMultiArray * array = [[MLMultiArray alloc] initWithShape:constraint.shape
+                                                      dataType:constraint.dataType
+                                                         error:&err];
+    if (array == nil || err != nil) return false;
+    feature->array = CFBridgingRetain(array);
+    return true;
+}
+
+bool describe_features(NSDictionary<NSString *, MLFeatureDescription *> * descriptions,
+                       std::vector<Feature> * features) {
+    for (NSString * name in descriptions) {
+        Feature feature;
+        const bool described = describe_feature(name, descriptions[name], &feature);
+        features->push_back(feature);
+        if (!described) return false;
+    }
+    return !features->empty();
+}
+
+void release_features(std::vector<Feature> * features) {
+    for (Feature & feature : *features) {
+        if (feature.array != nullptr) CFRelease(feature.array);
+        feature.array = nullptr;
+    }
+}
+
+const Feature * find_feature(const std::vector<Feature> & features, const char * name) {
+    for (const Feature & feature : features) {
+        if (name != nullptr && feature.name == name) return &feature;
+    }
+    return nullptr;
+}
+
+NSDictionary<NSString *, id> * feature_dictionary(const std::vector<Feature> & features) {
+    NSMutableDictionary<NSString *, id> * dict = [NSMutableDictionary dictionaryWithCapacity:features.size()];
+    for (const Feature & feature : features) {
+        dict[[NSString stringWithUTF8String:feature.name.c_str()]] = (__bridge MLMultiArray *) feature.array;
+    }
+    return dict;
+}
+
+View view_of(MLMultiArray * array) {
+    View view;
+    view.base    = array.dataPointer;
+    view.shape   = dims_of(array.shape);
+    view.strides = dims_of(array.strides);
+    view.f32     = array.dataType == MLMultiArrayDataTypeFloat32;
+    return view;
+}
+
+int64_t row_offset(const View & view, int64_t row) {
+    int64_t offset = 0;
+    for (int d = (int) view.shape.size() - 2; d >= 0; --d) {
+        offset += (row % view.shape[(size_t) d]) * view.strides[(size_t) d];
+        row /= view.shape[(size_t) d];
+    }
+    return offset;
+}
+
+void write_row_f32(float * dst, int64_t stride, const float * src, int64_t width) {
+    for (int64_t i = 0; i < width; ++i) dst[i * stride] = src[i];
+}
+
+void write_row_f16(uint16_t * dst, int64_t stride, const float * src, int64_t width) {
+    for (int64_t i = 0; i < width; ++i) dst[i * stride] = encode_float16(src[i]);
+}
+
+void read_row_f32(const float * src, int64_t stride, float * dst, int64_t width) {
+    for (int64_t i = 0; i < width; ++i) dst[i] = src[i * stride];
+}
+
+void read_row_f16(const uint16_t * src, int64_t stride, float * dst, int64_t width) {
+    for (int64_t i = 0; i < width; ++i) dst[i] = decode_float16(src[i * stride]);
+}
+
+void write_view(const View & view, const float * data) {
+    const int64_t width = view.shape.back();
+    const int64_t rows  = element_count(view.shape) / width;
+    const int64_t inner = view.strides.back();
+    for (int64_t row = 0; row < rows; ++row) {
+        const int64_t offset = row_offset(view, row);
+        if (view.f32) write_row_f32((float *) view.base + offset, inner, data + row * width, width);
+        else write_row_f16((uint16_t *) view.base + offset, inner, data + row * width, width);
+    }
+}
+
+void read_view(const View & view, float * data) {
+    const int64_t width = view.shape.back();
+    const int64_t rows  = element_count(view.shape) / width;
+    const int64_t inner = view.strides.back();
+    for (int64_t row = 0; row < rows; ++row) {
+        const int64_t offset = row_offset(view, row);
+        if (view.f32) read_row_f32((const float *) view.base + offset, inner, data + row * width, width);
+        else read_row_f16((const uint16_t *) view.base + offset, inner, data + row * width, width);
+    }
+}
+
+bool model_declares_state(MLModel * model) {
+#if MOSS_COREML_STATE_SDK
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        return model.modelDescription.stateDescriptionsByName.count > 0;
+    }
+#endif
+    (void) model;
+    return false;
+}
+
+#if MOSS_COREML_STATE_SDK
+API_AVAILABLE(macos(15.0), ios(18.0))
+void zero_state(MLModel * model, MLState * state) {
+    for (NSString * name in model.modelDescription.stateDescriptionsByName) {
+        [state getMultiArrayForStateNamed:name
+                                  handler:^(MLMultiArray * buffer) {
+                                      [buffer getMutableBytesWithHandler:^(void * bytes, NSInteger size,
+                                                                           NSArray<NSNumber *> * strides) {
+                                          (void) strides;
+                                          std::memset(bytes, 0, (size_t) size);
+                                      }];
+                                  }];
+    }
+}
+#endif
+
+#if MOSS_COREML_STATE_SDK
+// Records the shape of every float32/float16 state buffer (others stay
+// unwritable from the host; the model still loads).
+API_AVAILABLE(macos(15.0), ios(18.0))
+void describe_states(MLModel * model, std::vector<Feature> * states) {
+    NSDictionary<NSString *, MLFeatureDescription *> * descriptions = model.modelDescription.stateDescriptionsByName;
+    for (NSString * name in descriptions) {
+        MLStateConstraint * constraint = descriptions[name].stateConstraint;
+        if (constraint == nil || !supported_data_type(constraint.dataType)) continue;
+        Feature feature;
+        feature.name = name.UTF8String;
+        feature.dims = dims_of(constraint.bufferShape);
+        if (element_count(feature.dims) > 0) states->push_back(feature);
+    }
+}
+#endif
+
+const void * fresh_state(MLModel * model) {
+#if MOSS_COREML_STATE_SDK
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        MLState * state = [model newState];
+        if (state == nil) return nullptr;
+        zero_state(model, state);
+        return CFBridgingRetain(state);
+    }
+#endif
+    (void) model;
+    return nullptr;
+}
+
+}  // namespace
+
+struct moss_coreml_model {
+    const void *         model    = nullptr;
+    const void *         provider = nullptr;
+    const void *         options  = nullptr;
+    const void *         state    = nullptr;
+    bool                 stateful = false;
+    std::vector<Feature> inputs;
+    std::vector<Feature> outputs;
+    std::vector<Feature> states;  // shapes only; the buffers live in `state`
+    std::string          label;
+    std::mutex           mutex;
+};
+
+namespace {
+
+void release_model(moss_coreml_model * model) {
+    release_features(&model->inputs);
+    release_features(&model->outputs);
+    if (model->state != nullptr) CFRelease(model->state);
+    if (model->options != nullptr) CFRelease(model->options);
+    if (model->provider != nullptr) CFRelease(model->provider);
+    if (model->model != nullptr) CFRelease(model->model);
+    delete model;
+}
+
+bool bind_io(moss_coreml_model * model, MLModel * mlmodel) {
+    if (!describe_features(mlmodel.modelDescription.inputDescriptionsByName, &model->inputs)) return false;
+    if (!describe_features(mlmodel.modelDescription.outputDescriptionsByName, &model->outputs)) return false;
+    NSError * err = nil;
+    MLDictionaryFeatureProvider * provider =
+        [[MLDictionaryFeatureProvider alloc] initWithDictionary:feature_dictionary(model->inputs) error:&err];
+    if (provider == nil || err != nil) return false;
+    MLPredictionOptions * options = [[MLPredictionOptions alloc] init];
+    options.outputBackings = feature_dictionary(model->outputs);
+    model->provider = CFBridgingRetain(provider);
+    model->options  = CFBridgingRetain(options);
+    return true;
+}
+
+bool bind_state(moss_coreml_model * model, MLModel * mlmodel) {
+    model->stateful = model_declares_state(mlmodel);
+    if (!model->stateful) return true;
+#if MOSS_COREML_STATE_SDK
+    if (@available(macOS 15.0, iOS 18.0, *)) describe_states(mlmodel, &model->states);
+#endif
+    model->state = fresh_state(mlmodel);
+    return model->state != nullptr;
+}
+
+bool write_inputs(moss_coreml_model * model, const char * const * names, const float * const * data, int count) {
+    if (count != (int) model->inputs.size()) return false;
+    for (int i = 0; i < count; ++i) {
+        const Feature * feature = find_feature(model->inputs, names[i]);
+        if (feature == nullptr || data[i] == nullptr) return false;
+        write_view(view_of((__bridge MLMultiArray *) feature->array), data[i]);
+    }
+    return true;
+}
+
+bool read_outputs(moss_coreml_model * model, id<MLFeatureProvider> result, const char * const * names,
+                  float * const * data, int count) {
+    for (int i = 0; i < count; ++i) {
+        const Feature * feature = find_feature(model->outputs, names[i]);
+        if (feature == nullptr || data[i] == nullptr) return false;
+        MLMultiArray * array = [result featureValueForName:[NSString stringWithUTF8String:names[i]]].multiArrayValue;
+        if (array == nil || element_count(dims_of(array.shape)) != element_count(feature->dims)) return false;
+        read_view(view_of(array), data[i]);
+    }
+    return true;
+}
+
+id<MLFeatureProvider> run_prediction(moss_coreml_model * model, NSError ** err) {
+    MLModel *                     mlmodel  = (__bridge MLModel *) model->model;
+    MLDictionaryFeatureProvider * provider = (__bridge MLDictionaryFeatureProvider *) model->provider;
+    MLPredictionOptions *         options  = (__bridge MLPredictionOptions *) model->options;
+#if MOSS_COREML_STATE_SDK
+    if (model->stateful) {
+        if (@available(macOS 15.0, iOS 18.0, *)) {
+            return [mlmodel predictionFromFeatures:provider
+                                        usingState:(__bridge MLState *) model->state
+                                           options:options
+                                             error:err];
+        }
+        return nil;
+    }
+#endif
+    return [mlmodel predictionFromFeatures:provider options:options error:err];
+}
+
+MLDictionaryFeatureProvider * batch_item(moss_coreml_model * model, const char * const * names,
+                                         const float * const * data, int count, int index) {
+    NSMutableDictionary<NSString *, id> * values = [NSMutableDictionary dictionaryWithCapacity:count];
+    for (int i = 0; i < count; ++i) {
+        const Feature * feature = find_feature(model->inputs, names[i]);
+        if (feature == nullptr || data[i] == nullptr) return nil;
+        MLMultiArray * prototype = (__bridge MLMultiArray *) feature->array;
+        NSError * error = nil;
+        MLMultiArray * buffer = [[MLMultiArray alloc] initWithShape:prototype.shape
+                                                         dataType:prototype.dataType error:&error];
+        if (buffer == nil || error != nil) return nil;
+        const size_t offset = static_cast<size_t>(index) * element_count(feature->dims);
+        write_view(view_of(buffer), data[i] + offset);
+        values[[NSString stringWithUTF8String:names[i]]] = buffer;
+    }
+    NSError * error = nil;
+    MLDictionaryFeatureProvider * provider = [[MLDictionaryFeatureProvider alloc] initWithDictionary:values error:&error];
+    return error == nil ? provider : nil;
+}
+
+MLArrayBatchProvider * make_batch(moss_coreml_model * model, const char * const * names,
+                                  const float * const * data, int count, int batch_size) {
+    NSMutableArray<id<MLFeatureProvider>> * items = [NSMutableArray arrayWithCapacity:batch_size];
+    for (int index = 0; index < batch_size; ++index) {
+        MLDictionaryFeatureProvider * item = batch_item(model, names, data, count, index);
+        if (item == nil) return nil;
+        [items addObject:item];
+    }
+    return [[MLArrayBatchProvider alloc] initWithFeatureProviderArray:items];
+}
+
+bool read_batch_outputs(moss_coreml_model * model, id<MLBatchProvider> result,
+                         const char * const * names, float * const * data, int count, int batch_size) {
+    std::vector<float *> item_outputs(count);
+    for (int index = 0; index < batch_size; ++index) {
+        for (int i = 0; i < count; ++i) {
+            const Feature * feature = find_feature(model->outputs, names[i]);
+            if (feature == nullptr || data[i] == nullptr) return false;
+            item_outputs[i] = data[i] + static_cast<size_t>(index) * element_count(feature->dims);
+        }
+        if (!read_outputs(model, [result featuresAtIndex:index], names, item_outputs.data(), count)) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+struct moss_coreml_model * moss_coreml_load(const char * path_mlmodelc, const char * compute_units) {
+    return moss_coreml_load_function(path_mlmodelc, compute_units, nullptr);
+}
+
+struct moss_coreml_model * moss_coreml_load_function(const char * path_mlmodelc, const char * compute_units,
+                                                     const char * function_name) {
+    if (path_mlmodelc == nullptr) return nullptr;
+    @autoreleasepool {
+        const placement where   = placement_named(compute_units);
+        MLModel *       mlmodel = load_model(path_mlmodelc, where, function_name);
+        if (mlmodel == nil) return nullptr;
+        auto * model  = new moss_coreml_model();
+        model->model  = CFBridgingRetain(mlmodel);
+        model->label  = where.label;
+        if (!bind_io(model, mlmodel) || !bind_state(model, mlmodel)) {
+            std::fprintf(stderr, "Core ML: cannot bind model inputs, outputs or state (%s)\n", path_mlmodelc);
+            release_model(model);
+            return nullptr;
+        }
+        return model;
+    }
+}
+
+int moss_coreml_function_names(const char * path_mlmodelc, char * names, int capacity) {
+    if (path_mlmodelc == nullptr || names == nullptr || capacity <= 0) return -1;
+#if MOSS_COREML_STATE_SDK
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        @autoreleasepool {
+            NSError *      err   = nil;
+            NSURL *        url   = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path_mlmodelc]];
+            MLModelAsset * asset = [MLModelAsset modelAssetWithURL:url error:&err];
+            if (asset == nil || err != nil) return -1;
+            __block NSArray<NSString *> * listed = nil;
+            dispatch_semaphore_t          done   = dispatch_semaphore_create(0);
+            [asset functionNamesWithCompletionHandler:^(NSArray<NSString *> * functions, NSError * error) {
+                if (error == nil) listed = functions;
+                dispatch_semaphore_signal(done);
+            }];
+            dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+            if (listed == nil) return -1;
+            const std::string joined = [listed componentsJoinedByString:@","].UTF8String;
+            if ((int) joined.size() >= capacity) return -1;
+            std::memcpy(names, joined.c_str(), joined.size() + 1);
+            return (int) listed.count;
+        }
+    }
+#endif
+    return -1;
+}
+
+void moss_coreml_free(struct moss_coreml_model * model) {
+    if (model != nullptr) release_model(model);
+}
+
+int moss_coreml_feature_dims(const struct moss_coreml_model * model, const char * name, int64_t * dims,
+                             int max_dims) {
+    if (model == nullptr || dims == nullptr) return 0;
+    const Feature * feature = find_feature(model->inputs, name);
+    if (feature == nullptr) feature = find_feature(model->outputs, name);
+    if (feature == nullptr || (int) feature->dims.size() > max_dims) return 0;
+    std::copy(feature->dims.begin(), feature->dims.end(), dims);
+    return (int) feature->dims.size();
+}
+
+int moss_coreml_has_state(const struct moss_coreml_model * model) {
+    return model != nullptr && model->stateful ? 1 : 0;
+}
+
+int moss_coreml_reset_state(struct moss_coreml_model * model) {
+    if (model == nullptr || !model->stateful) return 1;
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(model->mutex);
+        const void * state = fresh_state((__bridge MLModel *) model->model);
+        if (state == nullptr) return 2;
+        CFRelease(model->state);
+        model->state = state;
+        return 0;
+    }
+}
+
+int moss_coreml_predict(struct moss_coreml_model * model,
+                        const char * const * input_names, const float * const * inputs, int n_inputs,
+                        const char * const * output_names, float * const * outputs, int n_outputs) {
+    if (model == nullptr || input_names == nullptr || inputs == nullptr || output_names == nullptr ||
+        outputs == nullptr) return 1;
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(model->mutex);
+        if (!write_inputs(model, input_names, inputs, n_inputs)) return 2;
+        NSError *             err    = nil;
+        id<MLFeatureProvider> result = run_prediction(model, &err);
+        if (result == nil || err != nil) return 3;
+        return read_outputs(model, result, output_names, outputs, n_outputs) ? 0 : 4;
+    }
+}
+
+int moss_coreml_predict_batch(struct moss_coreml_model * model,
+                              const char * const * input_names, const float * const * inputs, int n_inputs,
+                              const char * const * output_names, float * const * outputs, int n_outputs,
+                              int batch_size) {
+    if (model == nullptr || input_names == nullptr || inputs == nullptr || output_names == nullptr ||
+        outputs == nullptr || batch_size <= 0 || n_inputs <= 0 || n_outputs <= 0) return 1;
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(model->mutex);
+        if (model->stateful || n_inputs != static_cast<int>(model->inputs.size())) return 2;
+        MLArrayBatchProvider * batch = make_batch(model, input_names, inputs, n_inputs, batch_size);
+        if (batch == nil) return 2;
+        MLModel * mlmodel = (__bridge MLModel *) model->model;
+        NSError * error = nil;
+        id<MLBatchProvider> result = [mlmodel predictionsFromBatch:batch
+                                                         options:[[MLPredictionOptions alloc] init] error:&error];
+        if (result == nil || error != nil || result.count != batch_size) return 3;
+        return read_batch_outputs(model, result, output_names, outputs, n_outputs, batch_size) ? 0 : 4;
+    }
+}
+
+int moss_coreml_state_dims(const struct moss_coreml_model * model, const char * name, int64_t * dims, int max_dims) {
+    if (model == nullptr || dims == nullptr) return 0;
+    const Feature * feature = find_feature(model->states, name);
+    if (feature == nullptr || (int) feature->dims.size() > max_dims) return 0;
+    std::copy(feature->dims.begin(), feature->dims.end(), dims);
+    return (int) feature->dims.size();
+}
+
+int moss_coreml_write_state(struct moss_coreml_model * model, const char * name, const float * data,
+                            const int64_t * start, const int64_t * count, int rank) {
+    if (model == nullptr || name == nullptr || data == nullptr || start == nullptr || count == nullptr) return 1;
+    const Feature * feature = find_feature(model->states, name);
+    if (!model->stateful || feature == nullptr || rank != (int) feature->dims.size()) return 2;
+    for (int d = 0; d < rank; ++d) {
+        if (start[d] < 0 || count[d] <= 0 || start[d] > feature->dims[(size_t) d] - count[d]) return 3;
+    }
+#if MOSS_COREML_STATE_SDK
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        @autoreleasepool {
+            std::lock_guard<std::mutex> lock(model->mutex);
+            const std::vector<int64_t> declared = feature->dims;
+            const std::vector<int64_t> origin(start, start + rank), box(count, count + rank);
+            __block bool written = false;
+            MLState * state = (__bridge MLState *) model->state;
+            [state getMultiArrayForStateNamed:[NSString stringWithUTF8String:name]
+                                      handler:^(MLMultiArray * buffer) {
+                if (dims_of(buffer.shape) != declared || !supported_data_type(buffer.dataType)) return;
+                const bool f32 = buffer.dataType == MLMultiArrayDataTypeFloat32;
+                [buffer getMutableBytesWithHandler:^(void * bytes, NSInteger size, NSArray<NSNumber *> * strides) {
+                    const std::vector<int64_t> step = dims_of(strides);
+                    const int64_t capacity = size / (f32 ? (int64_t) sizeof(float) : (int64_t) sizeof(uint16_t));
+                    const int64_t width = box.back();
+                    const int64_t rows = element_count(box) / width;
+                    std::vector<int64_t> offsets((size_t) rows);
+                    for (int64_t row = 0; row < rows; ++row) {
+                        int64_t offset = origin.back() * step.back(), rest = row;
+                        for (int d = rank - 2; d >= 0; --d) {
+                            offset += (origin[(size_t) d] + rest % box[(size_t) d]) * step[(size_t) d];
+                            rest /= box[(size_t) d];
+                        }
+                        if (offset < 0 || offset + (width - 1) * step.back() >= capacity) return;
+                        offsets[(size_t) row] = offset;
+                    }
+                    for (int64_t row = 0; row < rows; ++row) {
+                        const float * src = data + row * width;
+                        if (f32) write_row_f32((float *) bytes + offsets[(size_t) row], step.back(), src, width);
+                        else write_row_f16((uint16_t *) bytes + offsets[(size_t) row], step.back(), src, width);
+                    }
+                    written = true;
+                }];
+            }];
+            return written ? 0 : 4;
+        }
+    }
+#endif
+    return 2;
+}
+
+int moss_coreml_metadata(const struct moss_coreml_model * model, const char * key, char * value, int capacity) {
+    if (model == nullptr || key == nullptr || value == nullptr || capacity <= 0) return -1;
+    @autoreleasepool {
+        MLModel *      mlmodel = (__bridge MLModel *) model->model;
+        NSDictionary * user    = mlmodel.modelDescription.metadata[MLModelCreatorDefinedKey];
+        id found = [user isKindOfClass:[NSDictionary class]] ? user[[NSString stringWithUTF8String:key]] : nil;
+        if (![found isKindOfClass:[NSString class]]) return -1;
+        const std::string text = [(NSString *) found UTF8String];
+        if ((int) text.size() >= capacity) return -1;
+        std::memcpy(value, text.c_str(), text.size() + 1);
+        return (int) text.size();
+    }
+}
+
+const char * moss_coreml_label(const struct moss_coreml_model * model) {
+    return model != nullptr ? model->label.c_str() : "coreml";
+}

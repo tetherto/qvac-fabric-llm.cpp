@@ -1,0 +1,143 @@
+parakeet.cpp
+Copyright 2026 QVAC contributors
+
+This product includes third-party components under their respective
+licenses. parakeet.cpp itself is licensed under Apache-2.0; bundled
+dependencies are governed by the licenses listed below. Python packages
+listed under Python Dependencies are optional and apply only to scripts/
+(conversion and offline reference tooling), not to C++ inference binaries.
+
+=========================================================================
+C++ Dependencies
+=========================================================================
+
+--- mit (MIT License) ---
+
+  ggml
+    https://github.com/ggml-org/ggml
+
+--- dual-license (Unlicense or MIT-0; recipient may choose either; see file) ---
+
+  dr_wav (dr_libs)
+    src/dr_wav.h
+    https://github.com/mackron/dr_libs
+
+  miniaudio
+    examples/miniaudio.h
+    https://github.com/mackron/miniaudio
+    https://miniaud.io/
+
+--- apache-2.0-with-llvm-exception ---
+
+  libc++ (LLVM C++ Standard Library), when linked (e.g. some Linux toolchains)
+    https://github.com/llvm/llvm-project
+
+=========================================================================
+Model implementations
+=========================================================================
+
+--- apache-2.0 (Apache License 2.0) ---
+
+  MOSS-Transcribe-Diarize
+    https://github.com/OpenMOSS/MOSS-Transcribe-Diarize
+    https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize
+    The canonical repository identifies the code as Apache-2.0. The native
+    implementation covers the Whisper log-mel front end, the audio encoder,
+    the temporal-merge adaptor, the Qwen3 decoder and its byte-level BPE
+    tokenizer, the prompt layout, and the transcript parser.
+
+=========================================================================
+Python Dependencies
+=========================================================================
+
+--- apache-2.0 (Apache License 2.0) ---
+
+  nemo_toolkit (NeMo)
+    https://github.com/NVIDIA/NeMo
+  sentencepiece
+    https://github.com/google/sentencepiece
+
+--- bsd-2-clause ---
+
+  soundfile (PySoundFile)
+    https://python-soundfile.readthedocs.io/
+
+--- bsd-3-clause ---
+
+  numpy
+    https://numpy.org/
+  torch (PyTorch)
+    https://pytorch.org/
+
+--- isc ---
+
+  librosa
+    https://librosa.org/
+
+--- lgpl-2.1-or-later ---
+
+  libsndfile (used via soundfile)
+    http://www.mega-nerd.com/libsndfile/
+
+--- mit (MIT License) ---
+
+  gguf
+    https://pypi.org/project/gguf/
+  PyYAML
+    https://github.com/yaml/pyyaml
+
+=========================================================================
+Model weights and additional reference implementations
+=========================================================================
+
+CC-BY-4.0 model weights
+
+  NVIDIA Parakeet CTC, Unified RNN-T, TDT and Sortformer v1/v2/v2.1
+    https://huggingface.co/nvidia/parakeet-ctc-0.6b
+    https://huggingface.co/nvidia/parakeet-ctc-1.1b
+    https://huggingface.co/nvidia/parakeet-unified-en-0.6b
+    https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+    https://huggingface.co/nvidia/parakeet-tdt-1.1b
+    https://huggingface.co/nvidia/diar_sortformer_4spk-v1
+    https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2
+    https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2.1
+
+NVIDIA Open Model License model weights
+
+  Parakeet realtime EOU 120M
+    https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1
+
+MIT model weights
+
+  AI4Bharat IndicConformer 600M multilingual
+    https://huggingface.co/ai4bharat/indic-conformer-600m-multilingual
+    The model card identifies the weights as MIT, separately from this
+    engine's Apache-2.0 code license.
+
+OpenMDW-1.1 model weights
+
+  NVIDIA Nemotron 3.5 ASR Streaming 0.6B and Nemotron 3 Diarization
+    https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b
+    https://huggingface.co/nvidia/Nemotron-3-Diarization
+    https://openmdw.ai/license/1-1/
+    Redistribution must retain the license and applicable origin notices.
+
+Apache-2.0 reference implementation
+
+  NVIDIA NeMo-Speech.cpp
+    https://github.com/NVIDIA/NeMo-Speech.cpp
+    The Nemotron diarization converter and numerical reference tooling use
+    a pinned checkout; its license is distinct from the model-weight terms.
+
+Apache-2.0 model weights
+
+  MOSS-Transcribe-Diarize
+    https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize
+
+  QVAC TranscribePsy-250M-EU-sub (FastConformer-TDT distilled from
+  NVIDIA Parakeet-TDT-0.6B-v3), with its GGUF and Core ML builds
+    https://huggingface.co/qvac/TranscribePsy-250M-EU-sub
+    https://huggingface.co/qvac/TranscribePsy-250M-EU-sub-gguf
+    https://huggingface.co/qvac/TranscribePsy-250M-EU-sub-coreml
+
+Model weights are downloaded separately and are not distributed in this source tree.

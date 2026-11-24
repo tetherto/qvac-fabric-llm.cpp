@@ -1,0 +1,1955 @@
+#include "supertonic_internal.h"
+
+#include "ggml-alloc.h"
+
+#ifdef TTS_CPP_USE_COREML
+#include "supertonic_coreml_encoder.h"
+#endif
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace tts_cpp::supertonic::detail {
+namespace {
+
+// See `release_text_encoder_thread_local_caches` below for the
+// contract.  Mirrors the registry in supertonic_vector_estimator.cpp.
+thread_local std::vector<std::function<void()>> g_tl_release_thunks;
+
+inline void supertonic_register_tl_cache(std::function<void()> fn) {
+    g_tl_release_thunks.push_back(std::move(fn));
+}
+
+struct tl_register_once {
+    template <typename F>
+    explicit tl_register_once(F && f) { supertonic_register_tl_cache(std::forward<F>(f)); }
+};
+
+#define SUPERTONIC_REGISTER_TL_CACHE(cache_var, free_fn) \
+    thread_local tl_register_once _tl_reg_##cache_var( \
+        [&]() { free_fn(cache_var); })
+
+// Array-valued caches register one thunk per slot — `caches[0..N-1]`
+// are independent thread_local instances; freeing only the first
+// would leak the rest.
+#define SUPERTONIC_REGISTER_TL_CACHE_ARRAY(arr_var, N, free_fn) \
+    thread_local tl_register_once _tl_reg_##arr_var([&]() { \
+        for (int _i = 0; _i < (N); ++_i) free_fn((arr_var)[_i]); \
+    })
+
+struct f32_tensor {
+    std::vector<float> data;
+    int64_t ne[4] = {1, 1, 1, 1};
+};
+
+f32_tensor read_f32(const supertonic_model & m, const std::string & source_name) {
+    ggml_tensor * t = require_source_tensor(m, source_name);
+    f32_tensor out;
+    for (int i = 0; i < 4; ++i) out.ne[i] = t->ne[i];
+    out.data.resize((size_t) ggml_nelements(t));
+    ggml_backend_tensor_get(t, out.data.data(), 0, ggml_nbytes(t));
+    return out;
+}
+
+inline float gelu(float x) { return 0.5f * x * (1.0f + std::erff(x * 0.7071067811865475f)); }
+inline float relu(float x) { return x > 0.0f ? x : 0.0f; }
+
+bool text_profile_enabled() {
+    static const bool enabled = std::getenv("SUPERTONIC_TEXT_PROFILE") != nullptr;
+    return enabled;
+}
+
+struct text_profile_state {
+    std::chrono::steady_clock::time_point start{};
+    std::chrono::steady_clock::time_point last{};
+};
+
+text_profile_state & text_profile() {
+    thread_local text_profile_state state;
+    return state;
+}
+
+void profile_text_begin() {
+    if (!text_profile_enabled()) return;
+    auto & state = text_profile();
+    state.start = std::chrono::steady_clock::now();
+    state.last = state.start;
+}
+
+void profile_text_compute(const supertonic_model & model, ggml_cgraph * graph, const char * island) {
+    const bool stderr_on = text_profile_enabled();
+    const bool csv_on    = supertonic_profile_csv_enabled();
+    if (!stderr_on && !csv_on) {
+        supertonic_graph_compute(model, graph);
+        return;
+    }
+    auto & state = text_profile();
+    const auto t0 = std::chrono::steady_clock::now();
+    const double pre_ms = std::chrono::duration<double, std::milli>(t0 - state.last).count();
+    supertonic_graph_compute(model, graph);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double compute_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    state.last = t1;
+    if (stderr_on) {
+        std::fprintf(stderr, "supertonic_text_profile island=%s pre_ms=%.3f compute_ms=%.3f\n",
+                     island, pre_ms, compute_ms);
+    }
+    // Phase 2D: text encoder doesn't have a denoise step concept;
+    // pass -1 sentinel.  Use the negative step value to filter
+    // text-stage rows out of vector-stage analyses in the
+    // analysis script.
+    if (csv_on) {
+        supertonic_profile_csv_record("text", island, /*step=*/-1, compute_ms);
+    }
+}
+
+void profile_text_checkpoint(const char * island) {
+    if (!text_profile_enabled()) return;
+    auto & state = text_profile();
+    const auto now = std::chrono::steady_clock::now();
+    const double host_ms = std::chrono::duration<double, std::milli>(now - state.last).count();
+    state.last = now;
+    std::fprintf(stderr, "supertonic_text_profile island=%s host_ms=%.3f\n", island, host_ms);
+}
+
+void profile_text_end() {
+    if (!text_profile_enabled()) return;
+    auto & state = text_profile();
+    const auto now = std::chrono::steady_clock::now();
+    const double total_ms = std::chrono::duration<double, std::milli>(now - state.start).count();
+    std::fprintf(stderr, "supertonic_text_profile island=total total_ms=%.3f\n", total_ms);
+}
+
+void linear1x1(const std::vector<float> & x, int L, int IC,
+               const f32_tensor & w, const f32_tensor * b,
+               int OC, std::vector<float> & y) {
+    y.assign((size_t) L * OC, 0.0f);
+    for (int t = 0; t < L; ++t) {
+        for (int oc = 0; oc < OC; ++oc) {
+            float sum = b ? b->data[oc] : 0.0f;
+            const size_t woff = (size_t) oc * IC;
+            for (int ic = 0; ic < IC; ++ic) sum += w.data[woff + ic] * x[(size_t) t * IC + ic];
+            y[(size_t) t * OC + oc] = sum;
+        }
+    }
+}
+
+ggml_tensor * repeat_like(ggml_context * ctx, ggml_tensor * v, ggml_tensor * like) {
+    if (ggml_n_dims(v) == 1 && ggml_n_dims(like) >= 2) {
+        if (like->ne[0] == v->ne[0]) v = ggml_reshape_2d(ctx, v, v->ne[0], 1);
+        else if (like->ne[1] == v->ne[0]) v = ggml_reshape_2d(ctx, v, 1, v->ne[0]);
+    }
+    if (!ggml_can_repeat(v, like)) throw std::runtime_error("cannot repeat tensor in text encoder graph");
+    // Every caller feeds this into ggml_add/ggml_mul which broadcast natively;
+    // skip the explicit ggml_repeat dispatch.
+    static const bool force_explicit_repeat =
+        std::getenv("SUPERTONIC_FORCE_EXPLICIT_REPEAT") != nullptr;
+    if (force_explicit_repeat) {
+        return ggml_repeat(ctx, v, like);
+    }
+    return v;
+}
+
+ggml_tensor * conv1d_f32(ggml_context * ctx,
+                         ggml_tensor * kernel,
+                         ggml_tensor * input,
+                         int stride,
+                         int padding,
+                         int dilation) {
+    // text_encoder uses the pure-graph path unconditionally; no CPU fast path
+    // here so no use_cpu_fastpath plumbing.
+    ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
+    ggml_tensor * result = st_mul_mat(ctx,
+        ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
+        ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]));
+    return ggml_reshape_3d(ctx, result, im2col->ne[1], kernel->ne[2], im2col->ne[2]);
+}
+
+ggml_tensor * edge_clamp_pad_1d(ggml_context * ctx, ggml_tensor * x, int pad_left, int pad_right) {
+    if (pad_left == 0 && pad_right == 0) return x;
+    static const bool disable_fused_edge_pad =
+        std::getenv("SUPERTONIC_DISABLE_FUSED_EDGE_PAD") != nullptr;
+    if (!disable_fused_edge_pad && supertonic_use_fused_supertonic_ops() &&
+        x->type == GGML_TYPE_F32 &&
+        x->ne[2] == 1 && x->ne[3] == 1 &&
+        ggml_is_contiguous(x)) {
+        return ggml_pad_replicate_1d(ctx, x, pad_left, pad_right);
+    }
+    const int64_t L = x->ne[0], C = x->ne[1];
+    ggml_tensor * out = x;
+    if (pad_left > 0) {
+        ggml_tensor * first = ggml_view_2d(ctx, x, 1, C, x->nb[1], 0);
+        out = ggml_concat(ctx, ggml_repeat_4d(ctx, first, pad_left, C, 1, 1), out, 0);
+    }
+    if (pad_right > 0) {
+        ggml_tensor * last = ggml_view_2d(ctx, x, 1, C, x->nb[1], (size_t)(L - 1) * x->nb[0]);
+        out = ggml_concat(ctx, out, ggml_repeat_4d(ctx, last, pad_right, C, 1, 1), 0);
+    }
+    return out;
+}
+
+ggml_tensor * depthwise_same_ggml(ggml_context * ctx,
+                                  ggml_tensor * x,
+                                  ggml_tensor * w,
+                                  ggml_tensor * b,
+                                  int dilation) {
+    const int K = (int)w->ne[0];
+    static const bool disable_fused =
+        std::getenv("SUPERTONIC_DISABLE_FUSED_DEPTHWISE") != nullptr;
+    if (!disable_fused && supertonic_use_fused_supertonic_ops() && (K == 3 || K == 5) &&
+        x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+        b->type == GGML_TYPE_F32 &&
+        x->ne[2] == 1 && x->ne[3] == 1 && w->ne[1] == 1 && w->ne[3] == 1 &&
+        w->ne[2] == x->ne[1] && b->ne[0] == x->ne[1] &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(w) && ggml_is_contiguous(b)) {
+        return ggml_conv_1d_dw_direct(ctx, x, w, b, dilation);
+    }
+    // "Same" padding under dilation: effective kernel span is (K-1)*dilation+1.
+    const int total_pad = (K - 1) * dilation;
+    const int pad_left = total_pad / 2;
+    const int pad_right = total_pad - pad_left;
+    ggml_tensor * padded = edge_clamp_pad_1d(ctx, x, pad_left, pad_right);
+    ggml_tensor * new_b = ggml_reshape_4d(ctx, padded, padded->ne[0], 1, padded->ne[1], padded->ne[2]);
+    ggml_tensor * im2col = ggml_im2col(ctx, w, new_b, 1, 0, 0, 0, dilation, 0, false, GGML_TYPE_F32);
+    ggml_tensor * y = st_mul_mat(ctx, im2col, w);
+    y = ggml_reshape_3d(ctx, y, y->ne[0], y->ne[2], 1);
+    return ggml_add(ctx, y, repeat_like(ctx, b, y));
+}
+
+ggml_tensor * layer_norm_ggml(ggml_context * ctx, ggml_tensor * x, ggml_tensor * g, ggml_tensor * b) {
+    static const bool disable_fused_layer_norm =
+        std::getenv("SUPERTONIC_DISABLE_FUSED_LAYER_NORM") != nullptr;
+    if (!disable_fused_layer_norm && supertonic_use_fused_layer_norm() &&
+        x->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+        x->ne[2] == 1 && x->ne[3] == 1 &&
+        g->ne[0] == x->ne[1] && b->ne[0] == x->ne[1] &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(g) && ggml_is_contiguous(b)) {
+        return ggml_norm_channel(ctx, x, g, b, 1e-6f);
+    }
+    ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
+    xt = ggml_norm(ctx, xt, 1e-6f);
+    xt = ggml_mul(ctx, xt, repeat_like(ctx, g, xt));
+    xt = ggml_add(ctx, xt, repeat_like(ctx, b, xt));
+    return ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
+}
+
+ggml_tensor * dense_matmul_time_ggml(ggml_context * ctx,
+                                     ggml_tensor * x,
+                                     ggml_tensor * w,
+                                     ggml_tensor * b) {
+    ggml_tensor * wt = ggml_cont(ctx, ggml_transpose(ctx, w));
+    ggml_tensor * kernel = ggml_reshape_3d(ctx, wt, 1, w->ne[1], w->ne[0]);
+    ggml_tensor * y = conv1d_f32(ctx, kernel, x, 1, 0, 1);
+    if (b) y = ggml_add(ctx, y, repeat_like(ctx, b, y));
+    return y;
+}
+
+// K=1 convolution of an activation already in [C, L] layout (mul_mat plus bias).
+ggml_tensor * pointwise_channel_time_ggml(ggml_context * ctx,
+                                          ggml_tensor * kernel,
+                                          ggml_tensor * x_cl,
+                                          ggml_tensor * bias) {
+    ggml_tensor * w2d = ggml_reshape_2d(ctx, kernel, kernel->ne[1], kernel->ne[2]);
+    ggml_tensor * y = st_mul_mat(ctx, w2d, x_cl);
+    if (bias) y = ggml_add(ctx, y, repeat_like(ctx, bias, y));
+    return y;
+}
+
+ggml_tensor * text_convnext_ggml(ggml_context * ctx,
+                                const supertonic_model & model,
+                                const std::string & p,
+                                ggml_tensor * x,
+                                int dilation) {
+    ggml_tensor * residual = x;
+    ggml_tensor * y = depthwise_same_ggml(ctx, x,
+        require_source_tensor(model, p + ".dwconv.weight"),
+        require_source_tensor(model, p + ".dwconv.bias"),
+        dilation);
+    y = layer_norm_ggml(ctx, y,
+        require_source_tensor(model, p + ".norm.norm.weight"),
+        require_source_tensor(model, p + ".norm.norm.bias"));
+    y = conv1d_f32(ctx, require_source_tensor(model, p + ".pwconv1.weight"), y, 1, 0, 1);
+    y = ggml_add(ctx, y, repeat_like(ctx, require_source_tensor(model, p + ".pwconv1.bias"), y));
+    y = ggml_gelu_erf(ctx, y);
+    y = conv1d_f32(ctx, require_source_tensor(model, p + ".pwconv2.weight"), y, 1, 0, 1);
+    y = ggml_add(ctx, y, repeat_like(ctx, require_source_tensor(model, p + ".pwconv2.bias"), y));
+    y = ggml_mul(ctx, y, repeat_like(ctx, require_source_tensor(model, p + ".gamma"), y));
+    return ggml_add(ctx, residual, y);
+}
+
+std::vector<float> tensor_to_time_channel(ggml_tensor * t) {
+    const int L = (int)t->ne[0], C = (int)t->ne[1];
+    std::vector<float> raw((size_t)ggml_nelements(t));
+    ggml_backend_tensor_get(t, raw.data(), 0, ggml_nbytes(t));
+    std::vector<float> out((size_t)L*C);
+    for (int c = 0; c < C; ++c) for (int i = 0; i < L; ++i) out[(size_t)i*C+c] = raw[(size_t)c*L+i];
+    return out;
+}
+
+std::vector<float> pack_time_channel_for_ggml(const std::vector<float> & x, int L, int C) {
+    std::vector<float> out((size_t)L*C);
+    for (int t = 0; t < L; ++t) for (int c = 0; c < C; ++c) out[(size_t)c*L+t] = x[(size_t)t*C+c];
+    return out;
+}
+
+void push_trace(std::vector<supertonic_trace_tensor> & trace,
+                const std::string & name,
+                int L,
+                int C,
+                const std::vector<float> & data) {
+    trace.push_back({name, {L, C}, data});
+}
+
+void dense_time(const std::vector<float> & x, int L, int IC,
+                const f32_tensor & w, const f32_tensor & b,
+                int OC, std::vector<float> & y) {
+    y.assign((size_t) L * OC, 0.0f);
+    for (int t = 0; t < L; ++t) {
+        for (int oc = 0; oc < OC; ++oc) {
+            float sum = b.data[oc];
+            for (int ic = 0; ic < IC; ++ic) sum += w.data[(size_t) oc * IC + ic] * x[(size_t) t * IC + ic];
+            y[(size_t) t * OC + oc] = sum;
+        }
+    }
+}
+
+void dense_time_matmul(const std::vector<float> & x, int L, int IC,
+                       const f32_tensor & w, const f32_tensor & b,
+                       int OC, std::vector<float> & y) {
+    y.assign((size_t) L * OC, 0.0f);
+    // ONNX MatMul constants are row-major [IC, OC]; PyTorch Linear weights
+    // transposed these at load time, but here we consume the raw ONNX tensor.
+    for (int t = 0; t < L; ++t) {
+        for (int oc = 0; oc < OC; ++oc) {
+            float sum = b.data[oc];
+            for (int ic = 0; ic < IC; ++ic) sum += x[(size_t) t * IC + ic] * w.data[(size_t) ic * OC + oc];
+            y[(size_t) t * OC + oc] = sum;
+        }
+    }
+}
+
+void depthwise_conv1d_same(const std::vector<float> & x, int L, int C,
+                           const f32_tensor & w, const f32_tensor & b,
+                           int K, int dilation, std::vector<float> & y) {
+    y.assign((size_t) L * C, 0.0f);
+    const int total_pad = (K - 1) * dilation;
+    const int pad_left = total_pad / 2;
+    for (int t = 0; t < L; ++t) {
+        for (int c = 0; c < C; ++c) {
+            float sum = b.data[c];
+            const size_t wbase = (size_t) c * K;
+            for (int k = 0; k < K; ++k) {
+                int src_t = t + k * dilation - pad_left;
+                src_t = std::max(0, std::min(L - 1, src_t));
+                sum += w.data[wbase + k] * x[(size_t) src_t * C + c];
+            }
+            y[(size_t) t * C + c] = sum;
+        }
+    }
+}
+
+void layer_norm_channel(std::vector<float> & x, int L, int C,
+                        const f32_tensor & gamma, const f32_tensor & beta,
+                        float eps = 1e-6f) {
+    for (int t = 0; t < L; ++t) {
+        float mean = 0.0f;
+        for (int c = 0; c < C; ++c) mean += x[(size_t) t * C + c];
+        mean /= (float) C;
+        float var = 0.0f;
+        for (int c = 0; c < C; ++c) {
+            float d = x[(size_t) t * C + c] - mean;
+            var += d * d;
+        }
+        float inv = 1.0f / std::sqrt(var / (float) C + eps);
+        for (int c = 0; c < C; ++c) {
+            float v = (x[(size_t) t * C + c] - mean) * inv;
+            x[(size_t) t * C + c] = v * gamma.data[c] + beta.data[c];
+        }
+    }
+}
+
+void convnext_block(const supertonic_model & m, const std::string & p,
+                    std::vector<float> & x, int L, int C, int dilation) {
+    f32_tensor dw_w = read_f32(m, p + ".dwconv.weight");
+    f32_tensor dw_b = read_f32(m, p + ".dwconv.bias");
+    f32_tensor ln_g = read_f32(m, p + ".norm.norm.weight");
+    f32_tensor ln_b = read_f32(m, p + ".norm.norm.bias");
+    f32_tensor pw1_w = read_f32(m, p + ".pwconv1.weight");
+    f32_tensor pw1_b = read_f32(m, p + ".pwconv1.bias");
+    f32_tensor pw2_w = read_f32(m, p + ".pwconv2.weight");
+    f32_tensor pw2_b = read_f32(m, p + ".pwconv2.bias");
+    f32_tensor gamma = read_f32(m, p + ".gamma");
+    std::vector<float> residual = x;
+    std::vector<float> y, z;
+    depthwise_conv1d_same(x, L, C, dw_w, dw_b, (int) dw_w.ne[0], dilation, y);
+    layer_norm_channel(y, L, C, ln_g, ln_b);
+    linear1x1(y, L, C, pw1_w, &pw1_b, (int) pw1_w.ne[2], z);
+    for (float & v : z) v = gelu(v);
+    linear1x1(z, L, (int) pw1_w.ne[2], pw2_w, &pw2_b, C, y);
+    for (size_t i = 0; i < x.size(); ++i) {
+        int c = (int) (i % C);
+        x[i] = residual[i] + gamma.data[c] * y[i];
+    }
+}
+
+void relpos_attention(const supertonic_model & m, int idx, std::vector<float> & x, int L, int C) {
+    const int H = 4;
+    const int D = C / H;
+    const float scale = 1.0f / std::sqrt((float) D);
+    const std::string p = "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers." + std::to_string(idx);
+    f32_tensor q_w = read_f32(m, p + ".conv_q.weight");
+    f32_tensor q_b = read_f32(m, p + ".conv_q.bias");
+    f32_tensor k_w = read_f32(m, p + ".conv_k.weight");
+    f32_tensor k_b = read_f32(m, p + ".conv_k.bias");
+    f32_tensor v_w = read_f32(m, p + ".conv_v.weight");
+    f32_tensor v_b = read_f32(m, p + ".conv_v.bias");
+    f32_tensor o_w = read_f32(m, p + ".conv_o.weight");
+    f32_tensor o_b = read_f32(m, p + ".conv_o.bias");
+    f32_tensor rel_k = read_f32(m, p + ".emb_rel_k");
+    f32_tensor rel_v = read_f32(m, p + ".emb_rel_v");
+    std::vector<float> q, k, v;
+    linear1x1(x, L, C, q_w, &q_b, C, q);
+    linear1x1(x, L, C, k_w, &k_b, C, k);
+    linear1x1(x, L, C, v_w, &v_b, C, v);
+    std::vector<float> out((size_t) L * C, 0.0f);
+    std::vector<float> scores(L), probs(L);
+    const int half_window = 4;
+    for (int h = 0; h < H; ++h) {
+        for (int qi = 0; qi < L; ++qi) {
+            float max_score = -INFINITY;
+            for (int kj = 0; kj < L; ++kj) {
+                float s = 0.0f;
+                for (int d = 0; d < D; ++d) {
+                    s += q[(size_t) qi * C + h * D + d] * scale * k[(size_t) kj * C + h * D + d];
+                }
+                int rel_pos = kj - qi;
+                if (rel_pos >= -half_window && rel_pos <= half_window) {
+                    int ridx = rel_pos + half_window;
+                    for (int d = 0; d < D; ++d) {
+                        s += q[(size_t) qi * C + h * D + d] * scale * rel_k.data[(size_t) ridx * D + d];
+                    }
+                }
+                scores[kj] = s;
+                max_score = std::max(max_score, s);
+            }
+            float denom = 0.0f;
+            for (int kj = 0; kj < L; ++kj) {
+                probs[kj] = std::exp(scores[kj] - max_score);
+                denom += probs[kj];
+            }
+            for (int kj = 0; kj < L; ++kj) probs[kj] /= denom;
+            for (int d = 0; d < D; ++d) {
+                float sum = 0.0f;
+                for (int kj = 0; kj < L; ++kj) {
+                    sum += probs[kj] * v[(size_t) kj * C + h * D + d];
+                    int rel_pos = kj - qi;
+                    if (rel_pos >= -half_window && rel_pos <= half_window) {
+                        int ridx = rel_pos + half_window;
+                        sum += probs[kj] * rel_v.data[(size_t) ridx * D + d];
+                    }
+                }
+                out[(size_t) qi * C + h * D + d] = sum;
+            }
+        }
+    }
+    std::vector<float> proj;
+    linear1x1(out, L, C, o_w, &o_b, C, proj);
+    x.swap(proj);
+}
+
+constexpr int kTextChannels = 256;
+constexpr int kTextHeads = 4;
+constexpr int kRelPositions = 9;
+constexpr int kRelMaxDistance = kRelPositions / 2;
+constexpr int kStyleLen = 50;
+constexpr int kSpeechHeads = 2;
+constexpr float kSpeechAttnScale = 1.0f / 16.0f;
+constexpr int kTextConvnextBlocks = 6;
+constexpr int kTextAttnLayers = 4;
+constexpr int kSpeechAttnLayers = 2;
+
+std::string relpos_layer_prefix(int idx) {
+    return "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers." + std::to_string(idx);
+}
+
+struct relpos_heads {
+    ggml_tensor * q = nullptr;
+    ggml_tensor * k = nullptr;
+    ggml_tensor * v = nullptr;
+};
+
+// Q/K/V projections of x_lc [L, C], each viewed as [D, L, H] heads.
+relpos_heads relpos_project_heads_ggml(ggml_context * ctx,
+                                       const supertonic_model & m,
+                                       const std::string & p,
+                                       ggml_tensor * x_lc,
+                                       int L,
+                                       int C,
+                                       int H) {
+    const int D = C / H;
+    ggml_tensor * x_cl = ggml_cont(ctx, ggml_transpose(ctx, x_lc));
+    auto project = [&](const char * name) {
+        const std::string conv = p + ".conv_" + name;
+        ggml_tensor * y = pointwise_channel_time_ggml(ctx,
+            require_source_tensor(m, conv + ".weight"), x_cl,
+            require_source_tensor(m, conv + ".bias"));
+        return ggml_view_3d(ctx, y, D, L, H, (size_t) C * sizeof(float), (size_t) D * sizeof(float), 0);
+    };
+    return { project("q"), project("k"), project("v") };
+}
+
+// Merge the [D, L, H] context back to [L, C] and apply the output convolution.
+ggml_tensor * relpos_output_projection_ggml(ggml_context * ctx,
+                                            const supertonic_model & m,
+                                            const std::string & p,
+                                            ggml_tensor * out_dlh,
+                                            int L,
+                                            int C) {
+    ggml_tensor * out_lc = ggml_cont(ctx, ggml_permute(ctx, out_dlh, 1, 0, 2, 3));
+    out_lc = ggml_reshape_2d(ctx, out_lc, L, C);
+    out_lc = conv1d_f32(ctx, require_source_tensor(m, p + ".conv_o.weight"), out_lc, 1, 0, 1);
+    return ggml_add(ctx, out_lc, repeat_like(ctx, require_source_tensor(m, p + ".conv_o.bias"), out_lc));
+}
+
+struct text_relpos_graph_cache {
+    const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
+    int idx = -1;
+    int L = 0;
+    int C = 0;
+    std::vector<uint8_t> buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    ggml_tensor * x_in = nullptr;
+    ggml_tensor * masks[9] = {};
+};
+
+void free_relpos_cache(text_relpos_graph_cache & cache) {
+    supertonic_safe_gallocr_free(cache.allocr, cache.generation_id);
+    if (cache.ctx) ggml_free(cache.ctx);
+    cache = {};
+}
+
+void build_relpos_cache(text_relpos_graph_cache & cache,
+                        const supertonic_model & m,
+                        int idx,
+                        int L,
+                        int C) {
+    free_relpos_cache(cache);
+    cache.model = &m;
+    cache.generation_id = m.generation_id;
+    cache.idx = idx;
+    cache.L = L;
+    cache.C = C;
+    const int H = 4;
+    const int D = C / H;
+    const float scale = 1.0f / std::sqrt((float)D);
+    const std::string p = relpos_layer_prefix(idx);
+    constexpr int N_MASKS = 9;
+    constexpr int MAX_NODES = 768;
+    const size_t buf_size = ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
+    cache.buf.assign(buf_size, 0);
+    ggml_init_params gp = { buf_size, cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf = ggml_new_graph_custom(cache.ctx, MAX_NODES, false);
+
+    cache.x_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, L, C);
+    ggml_set_name(cache.x_in, "relpos_x"); ggml_set_input(cache.x_in);
+    for (int i = 0; i < N_MASKS; ++i) {
+        cache.masks[i] = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, L, L, 1);
+        const std::string name = "relpos_mask_" + std::to_string(i);
+        ggml_set_name(cache.masks[i], name.c_str());
+        ggml_set_input(cache.masks[i]);
+        // gallocr frees leaf inputs once their last consumer in the graph
+        // runs, which makes the buffer available for intermediate reuse on
+        // subsequent compute passes — by the next run the mask data is
+        // overwritten.  Mark as OUTPUT too so gallocr keeps the buffer
+        // alive across compute passes; the data is then uploaded once in
+        // build_relpos_cache and stable for the cache's lifetime.
+        ggml_set_output(cache.masks[i]);
+    }
+
+    const relpos_heads heads = relpos_project_heads_ggml(cache.ctx, m, p, cache.x_in, L, C, H);
+    ggml_tensor * q_dlh = heads.q;
+    ggml_tensor * k_dlh = heads.k;
+    ggml_tensor * v_dlh = heads.v;
+
+    ggml_tensor * scores = ggml_scale(cache.ctx, st_mul_mat(cache.ctx, k_dlh, q_dlh), scale);
+    ggml_tensor * rel_k = require_source_tensor(m, p + ".emb_rel_k");
+    ggml_tensor * rel_scores = st_mul_mat(cache.ctx, rel_k, q_dlh);
+    for (int ri = 0; ri < N_MASKS; ++ri) {
+        ggml_tensor * rel_delta = ggml_view_3d(cache.ctx, rel_scores, 1, L, H,
+                                               rel_scores->nb[1], rel_scores->nb[2],
+                                               (size_t)ri * rel_scores->nb[0]);
+        rel_delta = ggml_repeat(cache.ctx, rel_delta, scores);
+        ggml_tensor * mask = ggml_repeat(cache.ctx, cache.masks[ri], scores);
+        scores = ggml_add(cache.ctx, scores, ggml_mul(cache.ctx, ggml_scale(cache.ctx, rel_delta, scale), mask));
+    }
+
+    ggml_tensor * attn = ggml_soft_max(cache.ctx, scores);
+    ggml_tensor * v_for_mm = ggml_cont(cache.ctx, ggml_permute(cache.ctx, v_dlh, 1, 0, 2, 3));
+    ggml_tensor * out = st_mul_mat(cache.ctx, v_for_mm, attn);
+
+    ggml_tensor * rel_v = require_source_tensor(m, p + ".emb_rel_v");
+    ggml_tensor * rel_out = ggml_scale(cache.ctx, out, 0.0f);
+    for (int ri = 0; ri < N_MASKS; ++ri) {
+        ggml_tensor * mask = ggml_repeat(cache.ctx, cache.masks[ri], attn);
+        ggml_tensor * p_delta = ggml_sum_rows(cache.ctx, ggml_mul(cache.ctx, attn, mask));
+        p_delta = ggml_repeat(cache.ctx, p_delta, out);
+        ggml_tensor * rv_delta = ggml_view_3d(cache.ctx, rel_v, D, 1, 1,
+                                              rel_v->nb[1], rel_v->nb[2],
+                                              (size_t)ri * rel_v->nb[1]);
+        rv_delta = ggml_repeat(cache.ctx, rv_delta, out);
+        rel_out = ggml_add(cache.ctx, rel_out, ggml_mul(cache.ctx, p_delta, rv_delta));
+    }
+    out = ggml_add(cache.ctx, out, rel_out);
+
+    ggml_tensor * out_lc_t = relpos_output_projection_ggml(cache.ctx, m, p, out, L, C);
+    ggml_set_name(out_lc_t, "relpos_out"); ggml_set_output(out_lc_t);
+    ggml_build_forward_expand(cache.gf, out_lc_t);
+
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new text relpos failed");
+    if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+        throw std::runtime_error("ggml_gallocr_reserve text relpos failed");
+    }
+    ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+    for (int ri = 0; ri < N_MASKS; ++ri) {
+        const int delta = ri - 4;
+        std::vector<float> mask((size_t)L * L, 0.0f);
+        for (int qi = 0; qi < L; ++qi) {
+            const int kj = qi + delta;
+            if (kj >= 0 && kj < L) mask[(size_t)kj + (size_t)L*qi] = 1.0f;
+        }
+        ggml_backend_tensor_set(cache.masks[ri], mask.data(), 0, mask.size()*sizeof(float));
+    }
+}
+
+void relpos_attention_ggml(const supertonic_model & m, int idx,
+                           const std::vector<float> & x_lc,
+                           int L,
+                           int C,
+                           std::vector<float> & out_lc) {
+    if (idx < 0 || idx >= 4) throw std::runtime_error("invalid text relpos layer index");
+    thread_local text_relpos_graph_cache caches[4];
+    SUPERTONIC_REGISTER_TL_CACHE_ARRAY(caches, 4, free_relpos_cache);
+    text_relpos_graph_cache & cache = caches[idx];
+    if (cache.model != &m || cache.generation_id != m.generation_id ||
+        cache.idx != idx || cache.L != L || cache.C != C) {
+        build_relpos_cache(cache, m, idx, L, C);
+    }
+    std::vector<float> x_raw = pack_time_channel_for_ggml(x_lc, L, C);
+    ggml_backend_tensor_set(cache.x_in, x_raw.data(), 0, x_raw.size()*sizeof(float));
+    std::string island = "relpos" + std::to_string(idx);
+    profile_text_compute(m, cache.gf, island.c_str());
+    out_lc = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, "relpos_out"));
+}
+
+void ffn_block(const supertonic_model & m, int idx, std::vector<float> & x, int L, int C) {
+    const std::string p = "text_encoder:tts.ttl.text_encoder.attn_encoder.ffn_layers." + std::to_string(idx);
+    f32_tensor w1 = read_f32(m, p + ".conv_1.weight");
+    f32_tensor b1 = read_f32(m, p + ".conv_1.bias");
+    f32_tensor w2 = read_f32(m, p + ".conv_2.weight");
+    f32_tensor b2 = read_f32(m, p + ".conv_2.bias");
+    std::vector<float> y;
+    linear1x1(x, L, C, w1, &b1, (int) w1.ne[2], y);
+    for (float & v : y) v = relu(v);
+    linear1x1(y, L, (int) w1.ne[2], w2, &b2, C, x);
+}
+
+std::string ffn_layer_prefix(int idx) {
+    return "text_encoder:tts.ttl.text_encoder.attn_encoder.ffn_layers." + std::to_string(idx);
+}
+
+ggml_tensor * ffn_block_graph_ggml(ggml_context * ctx, const supertonic_model & m, int idx, ggml_tensor * x) {
+    const std::string p = ffn_layer_prefix(idx);
+    ggml_tensor * y = conv1d_f32(ctx, require_source_tensor(m, p + ".conv_1.weight"), x, 1, 0, 1);
+    y = ggml_add(ctx, y, repeat_like(ctx, require_source_tensor(m, p + ".conv_1.bias"), y));
+    y = ggml_relu(ctx, y);
+    y = conv1d_f32(ctx, require_source_tensor(m, p + ".conv_2.weight"), y, 1, 0, 1);
+    return ggml_add(ctx, y, repeat_like(ctx, require_source_tensor(m, p + ".conv_2.bias"), y));
+}
+
+struct text_ffn_graph_cache {
+    const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
+    int idx = -1;
+    int L = 0;
+    int C = 0;
+    std::vector<uint8_t> buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    ggml_tensor * x_in = nullptr;
+};
+
+void free_ffn_cache(text_ffn_graph_cache & cache) {
+    supertonic_safe_gallocr_free(cache.allocr, cache.generation_id);
+    if (cache.ctx) ggml_free(cache.ctx);
+    cache = {};
+}
+
+void build_ffn_cache(text_ffn_graph_cache & cache,
+                     const supertonic_model & m,
+                     int idx,
+                     int L,
+                     int C) {
+    free_ffn_cache(cache);
+    cache.model = &m;
+    cache.generation_id = m.generation_id;
+    cache.idx = idx;
+    cache.L = L;
+    cache.C = C;
+    constexpr int MAX_NODES = 256;
+    const size_t buf_size = ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
+    cache.buf.assign(buf_size, 0);
+    ggml_init_params gp = { buf_size, cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf = ggml_new_graph_custom(cache.ctx, MAX_NODES, false);
+    cache.x_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, L, C);
+    ggml_set_name(cache.x_in, "text_ffn_in"); ggml_set_input(cache.x_in);
+
+    ggml_tensor * y = ffn_block_graph_ggml(cache.ctx, m, idx, cache.x_in);
+    ggml_set_name(y, "text_ffn_out"); ggml_set_output(y);
+    ggml_build_forward_expand(cache.gf, y);
+
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new text ffn failed");
+    if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+        throw std::runtime_error("ggml_gallocr_reserve text ffn failed");
+    }
+    ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+}
+
+void ffn_block_ggml(const supertonic_model & m, int idx, std::vector<float> & x, int L, int C) {
+    if (idx < 0 || idx >= 4) throw std::runtime_error("invalid text ffn layer index");
+    thread_local text_ffn_graph_cache caches[4];
+    SUPERTONIC_REGISTER_TL_CACHE_ARRAY(caches, 4, free_ffn_cache);
+    text_ffn_graph_cache & cache = caches[idx];
+    if (cache.model != &m || cache.generation_id != m.generation_id ||
+        cache.idx != idx || cache.L != L || cache.C != C) {
+        build_ffn_cache(cache, m, idx, L, C);
+    }
+    std::vector<float> raw = pack_time_channel_for_ggml(x, L, C);
+    ggml_backend_tensor_set(cache.x_in, raw.data(), 0, raw.size()*sizeof(float));
+    std::string island = "ffn" + std::to_string(idx);
+    profile_text_compute(m, cache.gf, island.c_str());
+    x = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, "text_ffn_out"));
+}
+
+void speech_prompted_attention(const supertonic_model & m, int idx,
+                               std::vector<float> & x_lc, int L,
+                               const float * style_ttl,
+                               std::vector<float> & out_lc) {
+    const int C = 256;
+    const int half = 128;
+    const int Lctx = 50;
+    const float scale = 1.0f / 16.0f;
+    const int attn_num = idx + 1;
+    const std::string p = "text_encoder:tts.ttl.speech_prompted_text_encoder.attention" + std::to_string(attn_num);
+    f32_tensor q_w = read_f32(m, p + ".W_query.linear.weight");
+    f32_tensor q_b = read_f32(m, p + ".W_query.linear.bias");
+    f32_tensor kv_w = read_f32(m, p + ".W_value.linear.weight");
+    f32_tensor kv_b = read_f32(m, p + ".W_value.linear.bias");
+    f32_tensor out_w = read_f32(m, p + ".out_fc.linear.weight");
+    f32_tensor out_b = read_f32(m, p + ".out_fc.linear.bias");
+    f32_tensor tanh_k = read_f32(m, "text_encoder:/speech_prompted_text_encoder/attention" + std::to_string(attn_num) + "/tanh/Tanh_output_0");
+
+    std::vector<float> q;
+    dense_time_matmul(x_lc, L, C, q_w, q_b, C, q);
+
+    std::vector<float> style((size_t) Lctx * C);
+    // style_ttl is NumPy row-major [1, 50, 256].
+    for (int t = 0; t < Lctx; ++t) {
+        for (int c = 0; c < C; ++c) style[(size_t) t * C + c] = style_ttl[(size_t) t * C + c];
+    }
+    std::vector<float> kv;
+    dense_time_matmul(style, Lctx, C, kv_w, kv_b, C, kv);
+
+    std::vector<float> attn((size_t) 2 * L * Lctx);
+    std::vector<float> scores(Lctx);
+    for (int part = 0; part < 2; ++part) {
+        for (int t = 0; t < L; ++t) {
+            float max_score = -INFINITY;
+            for (int j = 0; j < Lctx; ++j) {
+                float s = 0.0f;
+                for (int d = 0; d < half; ++d) {
+                    // tanh_k shape [2, 1, 128, 50] row-major.
+                    float k = tanh_k.data[((size_t) part * half + d) * Lctx + j];
+                    s += q[(size_t) t * C + part * half + d] * k * scale;
+                }
+                scores[j] = s;
+                max_score = std::max(max_score, s);
+            }
+            float denom = 0.0f;
+            for (int j = 0; j < Lctx; ++j) {
+                scores[j] = std::exp(scores[j] - max_score);
+                denom += scores[j];
+            }
+            for (int j = 0; j < Lctx; ++j) attn[((size_t) part * L + t) * Lctx + j] = scores[j] / denom;
+        }
+    }
+
+    std::vector<float> merged((size_t) L * C, 0.0f);
+    for (int part = 0; part < 2; ++part) {
+        for (int t = 0; t < L; ++t) {
+            for (int d = 0; d < half; ++d) {
+                float sum = 0.0f;
+                for (int j = 0; j < Lctx; ++j) {
+                    // kv_stacked = [k, v]; part 0 uses k split, part 1 uses v split.
+                    sum += attn[((size_t) part * L + t) * Lctx + j] * kv[(size_t) j * C + part * half + d];
+                }
+                merged[(size_t) t * C + part * half + d] = sum;
+            }
+        }
+    }
+    dense_time_matmul(merged, L, C, out_w, out_b, C, out_lc);
+}
+
+// `speech_attention_cache` + `build_speech_attention_cache` own the
+// second-of-two graph caches `speech_prompted_attention_ggml` runs
+// (flash-attn + out-proj after host-side q/k/v_pack work).
+struct speech_attention_cache {
+    const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
+    int idx = -1;
+    int L = 0;
+    int Lctx = 0;
+    std::string out_w_source;
+    std::string out_b_source;
+    std::vector<uint8_t> buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    ggml_tensor * q = nullptr;
+    ggml_tensor * k = nullptr;
+    ggml_tensor * v = nullptr;
+};
+
+inline void free_speech_attention_cache(speech_attention_cache & cache) {
+    supertonic_safe_gallocr_free(cache.allocr, cache.generation_id);
+    if (cache.ctx) ggml_free(cache.ctx);
+    cache = {};
+}
+
+inline void build_speech_attention_cache(speech_attention_cache & cache,
+                                         const supertonic_model & m,
+                                         int idx,
+                                         int L,
+                                         int Lctx,
+                                         const std::string & out_w_source,
+                                         const std::string & out_b_source) {
+    free_speech_attention_cache(cache);
+    cache.model = &m;
+    cache.generation_id = m.generation_id;
+    cache.idx = idx;
+    cache.L = L;
+    cache.Lctx = Lctx;
+    cache.out_w_source = out_w_source;
+    cache.out_b_source = out_b_source;
+    constexpr int NODES = 256;
+    const size_t buf_size = ggml_tensor_overhead() * NODES + ggml_graph_overhead_custom(NODES, false);
+    cache.buf.assign(buf_size, 0);
+    ggml_init_params gp = { buf_size, cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf = ggml_new_graph_custom(cache.ctx, NODES, false);
+    cache.q = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, 128, L, 2);
+    ggml_set_name(cache.q, "speech_attn_q_dlh"); ggml_set_input(cache.q);
+    cache.k = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, 128, Lctx, 2);
+    ggml_set_name(cache.k, "speech_attn_k_dlh"); ggml_set_input(cache.k);
+    cache.v = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, 128, Lctx, 2);
+    ggml_set_name(cache.v, "speech_attn_v_dlh"); ggml_set_input(cache.v);
+    ggml_tensor * attn = ggml_flash_attn_ext(cache.ctx, cache.q, cache.k, cache.v, nullptr, 1.0f / 16.0f, 0.0f, 0.0f);
+    attn = ggml_reshape_2d(cache.ctx, attn, 256, L);
+    ggml_tensor * ctx_tc = ggml_cont(cache.ctx, ggml_transpose(cache.ctx, attn));
+    ggml_tensor * out = dense_matmul_time_ggml(cache.ctx, ctx_tc,
+        require_source_tensor(m, out_w_source),
+        require_source_tensor(m, out_b_source));
+    ggml_set_name(out, "speech_attn_out"); ggml_set_output(out); ggml_build_forward_expand(cache.gf, out);
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new speech attention cache failed");
+    if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+        throw std::runtime_error("ggml_gallocr_reserve speech attention cache failed");
+    }
+    if (!ggml_gallocr_alloc_graph(cache.allocr, cache.gf)) {
+        throw std::runtime_error("ggml_gallocr_alloc_graph text-encoder one-graph failed");
+    }
+}
+
+// View over a zero-padded copy of rel [P, L, H] whose element (kj, qi, h) reads
+// rel (kj - qi + kRelMaxDistance, qi, h); out-of-band elements are garbage the band mask zeroes.
+ggml_tensor * skew_relative_to_keys_ggml(ggml_context * ctx, ggml_tensor * rel, int L) {
+    const int stride = std::max(L + 1, kRelPositions);
+    ggml_tensor * padded = ggml_pad(ctx, rel, stride - kRelPositions, 0, 0, 0);
+    return ggml_view_3d(ctx, padded, L, L, rel->ne[2],
+                        (size_t) (stride - 1) * sizeof(float), padded->nb[2],
+                        (size_t) kRelMaxDistance * sizeof(float));
+}
+
+// View gathering attn (qi + ri - kRelMaxDistance, qi, h) into [P, L, H]; every
+// out-of-band read lands on the zero padding.
+ggml_tensor * skew_keys_to_relative_ggml(ggml_context * ctx, ggml_tensor * attn, int L) {
+    ggml_tensor * padded = ggml_pad_ext(ctx, attn, kRelMaxDistance, 0, 0, 1, 0, 0, 0, 0);
+    return ggml_view_3d(ctx, padded, kRelPositions, L, attn->ne[2],
+                        (size_t) (L + kRelMaxDistance + 1) * sizeof(float), padded->nb[2], 0);
+}
+
+} // namespace (close anonymous; below symbols are detail-namespace
+  // scope so the round-12 #6 test can link against them)
+
+void fill_rel_band_row(std::vector<float> & band, int L, int qi, float scale) {
+    const int lo = std::max(0, qi - kRelMaxDistance);
+    const int hi = std::min(L - 1, qi + kRelMaxDistance);
+    for (int kj = lo; kj <= hi; ++kj) band[(size_t) qi * L + kj] = scale;
+}
+
+std::vector<float> make_rel_band(int L, float scale) {
+    std::vector<float> band((size_t) L * L, 0.0f);
+    for (int qi = 0; qi < L; ++qi) fill_rel_band_row(band, L, qi, scale);
+    return band;
+}
+
+ggml_tensor * relpos_attention_graph_ggml(ggml_context * ctx,
+                                          const supertonic_model & m,
+                                          const std::string & p,
+                                          ggml_tensor * x,
+                                          ggml_tensor * rel_band,
+                                          int L,
+                                          int C,
+                                          int H) {
+    const int D = C / H;
+    const float scale = 1.0f / std::sqrt((float) D);
+    const relpos_heads heads = relpos_project_heads_ggml(ctx, m, p, x, L, C, H);
+    ggml_tensor * scores = ggml_scale(ctx, st_mul_mat(ctx, heads.k, heads.q), scale);
+    ggml_tensor * rel_scores = st_mul_mat(ctx, require_source_tensor(m, p + ".emb_rel_k"), heads.q);
+    scores = ggml_add(ctx, scores, ggml_mul(ctx, skew_relative_to_keys_ggml(ctx, rel_scores, L), rel_band));
+    ggml_tensor * attn = ggml_soft_max(ctx, scores);
+    ggml_tensor * v_for_mm = ggml_cont(ctx, ggml_permute(ctx, heads.v, 1, 0, 2, 3));
+    ggml_tensor * out = st_mul_mat(ctx, v_for_mm, attn);
+    ggml_tensor * rel_probs = ggml_cont(ctx, skew_keys_to_relative_ggml(ctx, attn, L));
+    ggml_tensor * rel_v = ggml_reshape_2d(ctx, require_source_tensor(m, p + ".emb_rel_v"), D, kRelPositions);
+    ggml_tensor * rel_v_t = ggml_cont(ctx, ggml_transpose(ctx, rel_v));
+    out = ggml_add(ctx, out, st_mul_mat(ctx, rel_v_t, rel_probs));
+    return relpos_output_projection_ggml(ctx, m, p, out, L, C);
+}
+
+// Phase A4 / round-12 #6: speech_prompted_attention as ONE merged
+// ggml graph.  Master's Metal-port branch built the cache + builder
+// but never wired the run path; round 12 adds
+// `run_speech_prompted_merged_cache` and the dispatch in
+// `speech_prompted_attention_ggml` below.
+//
+// Pre-A4 this function built two separate graphs (QKV proj, then
+// flash-attn+out-proj) with host-side q_pack/v_pack/k_pack head-split
+// work between them.  The merged version does the head-split in-graph
+// via reshape + permute + cont (or relies on ggml's view semantics
+// where it's free), feeds straight into flash_attn, and runs the out
+// projection — all in one `ggml_backend_graph_compute` call.
+//
+// Per call savings (vs. legacy two-cache path):
+//   - 2 GPU→host downloads (q_out, v_out) → 0
+//   - 3 host→GPU uploads (q_pack, k_pack, v_pack) → 0
+//   - 1 fewer graph dispatch (one fewer command buffer)
+//   - host-side pack work eliminated entirely.
+// = 5 sync points saved per call × 2 layers = 10 sync points / synth.
+//
+// Struct + free + build are at detail-namespace scope (not
+// anonymous) so the round-12 CPU-only unit test can SFINAE-pin
+// the field contract.  Forward-declared in supertonic_internal.h.
+
+speech_prompted_sources speech_prompted_sources_for(int idx) {
+    const std::string attn = "attention" + std::to_string(idx + 1);
+    const std::string p = "text_encoder:tts.ttl.speech_prompted_text_encoder." + attn;
+    speech_prompted_sources s;
+    s.q_w = p + ".W_query.linear.weight";
+    s.q_b = p + ".W_query.linear.bias";
+    s.v_w = p + ".W_value.linear.weight";
+    s.v_b = p + ".W_value.linear.bias";
+    s.out_w = p + ".out_fc.linear.weight";
+    s.out_b = p + ".out_fc.linear.bias";
+    s.tanh_k = "text_encoder:/speech_prompted_text_encoder/" + attn + "/tanh/Tanh_output_0";
+    return s;
+}
+
+// Speech-prompted attention of x_in [L, C] over style_in [Lctx, C]: Q/V projections,
+// head split, flash attention against the precomputed tanh K, output projection.
+ggml_tensor * speech_prompted_attention_graph_ggml(ggml_context * ctx,
+                                                   const supertonic_model & m,
+                                                   const speech_prompted_sources & s,
+                                                   ggml_tensor * x_in,
+                                                   ggml_tensor * style_in,
+                                                   int L,
+                                                   int Lctx) {
+    const int C = kTextChannels;
+    const int half = C / kSpeechHeads;
+    ggml_tensor * q_tc = dense_matmul_time_ggml(ctx, x_in,
+        require_source_tensor(m, s.q_w), require_source_tensor(m, s.q_b));
+    ggml_tensor * q_dlh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, q_tc, L, half, kSpeechHeads), 1, 0, 2, 3));
+    ggml_tensor * v_tc = dense_matmul_time_ggml(ctx, style_in,
+        require_source_tensor(m, s.v_w), require_source_tensor(m, s.v_b));
+    ggml_tensor * v_dlh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, v_tc, Lctx, half, kSpeechHeads), 1, 0, 2, 3));
+    ggml_tensor * k_3d = ggml_reshape_3d(ctx, require_source_tensor(m, s.tanh_k), Lctx, half, kSpeechHeads);
+    ggml_tensor * k_dlh = ggml_cont(ctx, ggml_permute(ctx, k_3d, 1, 0, 2, 3));
+    ggml_tensor * attn = ggml_flash_attn_ext(ctx, q_dlh, k_dlh, v_dlh, nullptr, kSpeechAttnScale, 0.0f, 0.0f);
+    attn = ggml_reshape_2d(ctx, attn, C, L);
+    ggml_tensor * ctx_tc = ggml_cont(ctx, ggml_transpose(ctx, attn));
+    return dense_matmul_time_ggml(ctx, ctx_tc,
+        require_source_tensor(m, s.out_w), require_source_tensor(m, s.out_b));
+}
+
+void free_speech_prompted_merged_cache(speech_prompted_merged_cache & cache) {
+    supertonic_safe_gallocr_free(cache.allocr, cache.generation_id);
+    if (cache.ctx) ggml_free(cache.ctx);
+    cache = {};
+}
+
+void build_speech_prompted_merged_cache(speech_prompted_merged_cache & cache,
+                                        const supertonic_model & m,
+                                        int idx,
+                                        int L,
+                                        int Lctx,
+                                        const std::string & q_w_source,
+                                        const std::string & v_w_source,
+                                        const std::string & out_w_source,
+                                        const std::string & out_b_source,
+                                        const std::string & tanh_k_source,
+                                        const std::string & q_b_source,
+                                        const std::string & v_b_source) {
+    const int C = kTextChannels;
+    free_speech_prompted_merged_cache(cache);
+    cache.model = &m;
+    cache.generation_id = m.generation_id;
+    cache.idx = idx;
+    cache.L = L;
+    cache.Lctx = Lctx;
+    cache.out_w_source = out_w_source;
+    cache.out_b_source = out_b_source;
+
+    constexpr int NODES = 512;
+    const size_t buf_size = ggml_tensor_overhead() * NODES + ggml_graph_overhead_custom(NODES, false);
+    cache.buf.assign(buf_size, 0);
+    ggml_init_params gp = { buf_size, cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf = ggml_new_graph_custom(cache.ctx, NODES, false);
+
+    cache.x_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, L, C);
+    ggml_set_name(cache.x_in, "spm_x_in"); ggml_set_input(cache.x_in);
+    cache.style_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, Lctx, C);
+    ggml_set_name(cache.style_in, "spm_style_in"); ggml_set_input(cache.style_in);
+
+    speech_prompted_sources sources;
+    sources.q_w = q_w_source;
+    sources.q_b = q_b_source;
+    sources.v_w = v_w_source;
+    sources.v_b = v_b_source;
+    sources.out_w = out_w_source;
+    sources.out_b = out_b_source;
+    sources.tanh_k = tanh_k_source;
+    cache.out = speech_prompted_attention_graph_ggml(cache.ctx, m, sources,
+                                                     cache.x_in, cache.style_in, L, Lctx);
+    ggml_set_name(cache.out, "spm_out"); ggml_set_output(cache.out);
+    ggml_build_forward_expand(cache.gf, cache.out);
+
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new speech_prompted_merged failed");
+    if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+        throw std::runtime_error("ggml_gallocr_reserve speech_prompted_merged failed");
+    }
+    ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+}
+
+// round 12 #6 — run path for the merged graph.
+//
+// Drop-in replacement for the legacy two-cache code path inside
+// `speech_prompted_attention_ggml`.  Caller is responsible for
+// keying the cache against `(model, idx, L, Lctx)` and rebuilding
+// on miss; this function assumes the cache is built + bound to
+// the backend in `m.backend`.
+//
+// Upload contract (matches `pack_time_channel_for_ggml`'s output):
+//   - `x_lc` is time-major-flat `x_lc[t*C + c]`.  We pack it once
+//     into channel-major-flat memory (`out[c*L + t]`) before
+//     uploading to `cache.x_in` (ne=[L, C], natural strides).
+//   - `style_ttl` is also time-major-flat; same packing.
+//
+// Download contract:
+//   - `cache.out` is ne=[L, C] channel-major-flat memory (matches
+//     master's `dense_matmul_time_ggml` output convention).
+//     `tensor_to_time_channel` flattens to time-major-flat
+//     `out_lc[t*C + c]` — same layout the caller in
+//     `supertonic_text_encoder_forward_ggml` expects from the
+//     pre-round-12 path.
+//
+// Compute cost (vs. legacy two-cache):
+//   + 1 cache-rebuild check (free) - already amortised once / synth.
+//   + 1 host pack of x_lc → x_raw (free; same memcpy size as legacy
+//     speech_prompted_attention_ggml does for its own QKV cache
+//     upload at line 1003).
+//   + 1 host pack of style_tc → style_raw (free; same as legacy).
+//   + 1 host→GPU upload each for x_in / style_in (same as legacy).
+//   + 1 graph dispatch.
+//   + 1 GPU→host download of cache.out.
+//   - 2 fewer host→GPU uploads (no q_pack / v_pack / k_pack since
+//     they're computed in-graph).
+//   - 2 fewer GPU→host downloads (no q_out / v_out).
+//   - 1 fewer graph dispatch (one merged graph instead of two
+//     separate qkv + flash-attn graphs).
+//   - All host pack work for q_pack / k_pack / v_pack eliminated
+//     (which scaled with L × head_dim × n_heads — the worst
+//     offender on long prompts).
+void run_speech_prompted_merged_cache(speech_prompted_merged_cache & cache,
+                                       const supertonic_model & m,
+                                       const std::vector<float> & x_lc,
+                                       int L,
+                                       const float * style_ttl,
+                                       std::vector<float> & out_lc) {
+    (void) m; // referenced via cache.model invariant; kept in the
+              // signature to match the legacy
+              // `speech_prompted_attention_ggml(...)` shape.
+    const int C = 256;
+    const int Lctx = 50;
+    if (cache.ctx == nullptr || cache.gf == nullptr ||
+        cache.x_in == nullptr || cache.style_in == nullptr ||
+        cache.out == nullptr) {
+        throw std::runtime_error(
+            "run_speech_prompted_merged_cache: cache not built");
+    }
+    if (cache.L != L || cache.Lctx != Lctx) {
+        throw std::runtime_error(
+            "run_speech_prompted_merged_cache: cache key mismatch "
+            "(L/Lctx don't match the built graph)");
+    }
+    std::vector<float> x_raw = pack_time_channel_for_ggml(x_lc, L, C);
+    std::vector<float> style_tc((size_t) Lctx * C);
+    for (int t = 0; t < Lctx; ++t) {
+        for (int c = 0; c < C; ++c) {
+            style_tc[(size_t) t * C + c] = style_ttl[(size_t) t * C + c];
+        }
+    }
+    std::vector<float> style_raw = pack_time_channel_for_ggml(style_tc, Lctx, C);
+    ggml_backend_tensor_set(cache.x_in,     x_raw.data(),     0, x_raw.size()     * sizeof(float));
+    ggml_backend_tensor_set(cache.style_in, style_raw.data(), 0, style_raw.size() * sizeof(float));
+    std::string island = "speech" + std::to_string(cache.idx) + "_merged";
+    profile_text_compute(*cache.model, cache.gf, island.c_str());
+    out_lc = tensor_to_time_channel(cache.out);
+}
+
+namespace { // re-open anonymous namespace for the rest of the TU
+
+// F14 — cached speech-prompted attention QKV graph.
+//
+// Pre-audit, `speech_prompted_attention_ggml` allocated a fresh
+// `ggml_context` + `ggml_gallocr_t` every call.  The graph shape
+// depends only on `(L, idx)`; for the typical synth flow
+// (one text encoder call → 2 layers) that's 2 cold misses on the
+// first synth, then steady-state zero rebuilds.  Same pattern as
+// the F8 / F11 caches.
+struct speech_qkv_graph_cache {
+    const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
+    int idx = -1;
+    int L = 0;
+    std::vector<uint8_t> buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    ggml_tensor * x_in = nullptr;
+    ggml_tensor * style_in = nullptr;
+};
+
+inline void free_speech_qkv_cache(speech_qkv_graph_cache & cache) {
+    supertonic_safe_gallocr_free(cache.allocr, cache.generation_id);
+    if (cache.ctx) ggml_free(cache.ctx);
+    cache = {};
+}
+
+void speech_prompted_attention_ggml(const supertonic_model & m, int idx,
+                                    const std::vector<float> & x_lc, int L,
+                                    const float * style_ttl,
+                                    std::vector<float> & out_lc) {
+    const int C = 256;
+    const int half = 128;
+    const int Lctx = 50;
+    if (idx < 0 || idx >= 2) throw std::runtime_error("invalid speech attention idx");
+    const int attn_num = idx + 1;
+    const std::string p = "text_encoder:tts.ttl.speech_prompted_text_encoder.attention" + std::to_string(attn_num);
+    const std::string q_w = p + ".W_query.linear.weight";
+    const std::string v_w = p + ".W_value.linear.weight";
+    const std::string o_w = p + ".out_fc.linear.weight";
+    const std::string tanh_k_src = "text_encoder:/speech_prompted_text_encoder/attention" + std::to_string(attn_num) + "/tanh/Tanh_output_0";
+
+    // round 12 #6 — merged-cache fast path on non-CPU
+    // backends.  Eliminates 5 sync points (2 GPU→host downloads +
+    // 3 host→GPU uploads) and all host-side Q/V/K head-split pack
+    // work per call.  Two layers per synth = 10 sync points / synth
+    // saved at the text encoder.
+    //
+    // CPU stays on the legacy two-cache path: master's
+    // `dense_matmul_time_ggml` CPU fast path uses cblas via the
+    // custom-op dispatch, and the host-side head-split is a free
+    // memcpy.  Switching CPU to the merged path would pull the
+    // matmul through the ggml conv1d fallback (slower on x86) and
+    // gain nothing — sync points don't exist on CPU.
+    if (!model_prefers_cpu_kernels(m)) {
+        thread_local speech_prompted_merged_cache merged_caches[2];
+        SUPERTONIC_REGISTER_TL_CACHE_ARRAY(merged_caches, 2, free_speech_prompted_merged_cache);
+        speech_prompted_merged_cache & merged = merged_caches[idx];
+        if (merged.model != &m || merged.generation_id != m.generation_id ||
+            merged.idx != idx || merged.L != L || merged.Lctx != Lctx ||
+            merged.out_w_source != o_w) {
+            build_speech_prompted_merged_cache(merged, m, idx, L, Lctx,
+                                                /*q_w_source=*/q_w,
+                                                /*v_w_source=*/v_w,
+                                                /*out_w_source=*/o_w,
+                                                /*out_b_source=*/p + ".out_fc.linear.bias",
+                                                /*tanh_k_source=*/tanh_k_src,
+                                                /*q_b_source=*/p + ".W_query.linear.bias",
+                                                /*v_b_source=*/p + ".W_value.linear.bias");
+        }
+        run_speech_prompted_merged_cache(merged, m, x_lc, L, style_ttl, out_lc);
+        return;
+    }
+
+    (void) tanh_k_src; // master's path uses model.speech_tanh_k_cache; tanh_k_src kept for symbolic parity with read_f32 fallback below.
+
+    // F14: per-(model, idx, L) cached QKV graph.  Two thread-local
+    // slots so the two speech-prompted layers don't fight over a
+    // shared cache key.  The inner flash-attention graph is still
+    // cached separately in `speech_attention_cache` below.
+    thread_local speech_qkv_graph_cache qkv_caches[2];
+    SUPERTONIC_REGISTER_TL_CACHE_ARRAY(qkv_caches, 2, free_speech_qkv_cache);
+    // idx already range-checked at the top of the function (round-12
+    // dispatch needed it for the merged-cache thread_local array).
+    speech_qkv_graph_cache & qkv_cache = qkv_caches[idx];
+    if (qkv_cache.model != &m || qkv_cache.generation_id != m.generation_id ||
+        qkv_cache.idx != idx || qkv_cache.L != L) {
+        free_speech_qkv_cache(qkv_cache);
+        qkv_cache.model = &m;
+        qkv_cache.generation_id = m.generation_id;
+        qkv_cache.idx = idx;
+        qkv_cache.L = L;
+
+        constexpr int MAX_NODES = 256;
+        const size_t buf_size = ggml_tensor_overhead() * MAX_NODES +
+                                ggml_graph_overhead_custom(MAX_NODES, false);
+        qkv_cache.buf.assign(buf_size, 0);
+        ggml_init_params gp = { buf_size, qkv_cache.buf.data(), true };
+        qkv_cache.ctx = ggml_init(gp);
+        qkv_cache.gf = ggml_new_graph_custom(qkv_cache.ctx, MAX_NODES, false);
+
+        qkv_cache.x_in = ggml_new_tensor_2d(qkv_cache.ctx, GGML_TYPE_F32, L, C);
+        ggml_set_name(qkv_cache.x_in, "speech_attn_x"); ggml_set_input(qkv_cache.x_in);
+        qkv_cache.style_in = ggml_new_tensor_2d(qkv_cache.ctx, GGML_TYPE_F32, Lctx, C);
+        ggml_set_name(qkv_cache.style_in, "speech_attn_style"); ggml_set_input(qkv_cache.style_in);
+        ggml_tensor * q = dense_matmul_time_ggml(qkv_cache.ctx, qkv_cache.x_in,
+            require_source_tensor(m, q_w),
+            require_source_tensor(m, p + ".W_query.linear.bias"));
+        ggml_set_name(q, "speech_attn_q"); ggml_set_output(q);
+        ggml_build_forward_expand(qkv_cache.gf, q);
+        ggml_tensor * v_t = dense_matmul_time_ggml(qkv_cache.ctx, qkv_cache.style_in,
+            require_source_tensor(m, v_w),
+            require_source_tensor(m, p + ".W_value.linear.bias"));
+        ggml_set_name(v_t, "speech_attn_v"); ggml_set_output(v_t);
+        ggml_build_forward_expand(qkv_cache.gf, v_t);
+
+        qkv_cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+        if (!qkv_cache.allocr) {
+            ggml_free(qkv_cache.ctx);
+            qkv_cache = {};
+            throw std::runtime_error("ggml_gallocr_new speech text attention failed");
+        }
+        if (!ggml_gallocr_reserve(qkv_cache.allocr, qkv_cache.gf)) {
+            ggml_gallocr_free(qkv_cache.allocr);
+            ggml_free(qkv_cache.ctx);
+            qkv_cache = {};
+            throw std::runtime_error("ggml_gallocr_reserve speech text attention failed");
+        }
+        ggml_gallocr_alloc_graph(qkv_cache.allocr, qkv_cache.gf);
+    }
+
+    std::vector<float> x_raw = pack_time_channel_for_ggml(x_lc, L, C);
+    std::vector<float> style_tc((size_t)Lctx*C);
+    for (int t = 0; t < Lctx; ++t) for (int c = 0; c < C; ++c) style_tc[(size_t)t*C+c] = style_ttl[(size_t)t*C+c];
+    std::vector<float> style_raw = pack_time_channel_for_ggml(style_tc, Lctx, C);
+    ggml_backend_tensor_set(qkv_cache.x_in, x_raw.data(), 0, x_raw.size()*sizeof(float));
+    ggml_backend_tensor_set(qkv_cache.style_in, style_raw.data(), 0, style_raw.size()*sizeof(float));
+    std::string qkv_island = "speech" + std::to_string(idx) + "_qkv";
+    profile_text_compute(m, qkv_cache.gf, qkv_island.c_str());
+
+    std::vector<float> q_out = tensor_to_time_channel(ggml_graph_get_tensor(qkv_cache.gf, "speech_attn_q"));
+    std::vector<float> v_out = tensor_to_time_channel(ggml_graph_get_tensor(qkv_cache.gf, "speech_attn_v"));
+    // F16: pre-cached at load (`m.speech_tanh_k_cache[idx]`).  Falls
+    // back to the per-call `read_f32` only when the GGUF didn't
+    // carry the rostered name (legacy + future-compat).
+    const float * tanh_k_data = nullptr;
+    f32_tensor tanh_k_fallback;
+    if (idx >= 0 && idx < 2 && !m.speech_tanh_k_cache[idx].empty()) {
+        tanh_k_data = m.speech_tanh_k_cache[idx].data();
+    } else {
+        tanh_k_fallback = read_f32(m, "text_encoder:/speech_prompted_text_encoder/attention" + std::to_string(attn_num) + "/tanh/Tanh_output_0");
+        tanh_k_data = tanh_k_fallback.data.data();
+    }
+    std::vector<float> q_pack((size_t)half*L*2), k_pack((size_t)half*Lctx*2), v_pack((size_t)half*Lctx*2);
+    for (int h = 0; h < 2; ++h) {
+        for (int t = 0; t < L; ++t) {
+            for (int d = 0; d < half; ++d) q_pack[(size_t)d + (size_t)half*((size_t)t + (size_t)L*h)] = q_out[(size_t)t*C + h*half + d];
+        }
+        for (int t = 0; t < Lctx; ++t) {
+            for (int d = 0; d < half; ++d) {
+                k_pack[(size_t)d + (size_t)half*((size_t)t + (size_t)Lctx*h)] = tanh_k_data[((size_t)h*half + d)*Lctx + t];
+                v_pack[(size_t)d + (size_t)half*((size_t)t + (size_t)Lctx*h)] = v_out[(size_t)t*C + h*half + d];
+            }
+        }
+    }
+    thread_local speech_attention_cache caches[2];
+    SUPERTONIC_REGISTER_TL_CACHE_ARRAY(caches, 2, free_speech_attention_cache);
+    speech_attention_cache & cache = caches[idx];
+    if (cache.model != &m || cache.generation_id != m.generation_id ||
+        cache.idx != idx || cache.L != L || cache.Lctx != Lctx ||
+        cache.out_w_source != o_w) {
+        build_speech_attention_cache(cache, m, idx, L, Lctx, o_w,
+                                      p + ".out_fc.linear.bias");
+    }
+    ggml_backend_tensor_set(cache.q, q_pack.data(), 0, q_pack.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.k, k_pack.data(), 0, k_pack.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.v, v_pack.data(), 0, v_pack.size()*sizeof(float));
+    std::string flash_island = "speech" + std::to_string(idx) + "_flash";
+    profile_text_compute(m, cache.gf, flash_island.c_str());
+    out_lc = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, "speech_attn_out"));
+    // F14: outer QKV graph lives in `qkv_cache` (above) and
+    // survives across synths.
+}
+
+// One-graph text encoder: every island, residual add and layer norm of the
+// per-island path in a single graph compute, for non-CPU backends.
+
+struct text_encoder_one_graph_cache {
+    const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
+    int L = 0;
+    std::vector<uint8_t> buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    ggml_tensor * ids_in = nullptr;
+    ggml_tensor * style_in = nullptr;
+    ggml_tensor * rel_band = nullptr;
+    ggml_tensor * out = nullptr;
+};
+
+void free_text_encoder_one_graph_cache(text_encoder_one_graph_cache & cache) {
+    supertonic_safe_gallocr_free(cache.allocr, cache.generation_id);
+    if (cache.ctx) ggml_free(cache.ctx);
+    cache = {};
+}
+
+ggml_tensor * text_layer_norm_ggml(ggml_context * ctx,
+                                   const supertonic_model & m,
+                                   ggml_tensor * x,
+                                   const std::string & norm) {
+    return layer_norm_ggml(ctx, x, require_source_tensor(m, norm + ".weight"), require_source_tensor(m, norm + ".bias"));
+}
+
+ggml_tensor * attn_encoder_layer_graph_ggml(ggml_context * ctx,
+                                            const supertonic_model & m,
+                                            int idx,
+                                            ggml_tensor * x,
+                                            ggml_tensor * rel_band,
+                                            int L) {
+    const std::string norms = "text_encoder:tts.ttl.text_encoder.attn_encoder.norm_layers_";
+    const std::string layer = std::to_string(idx) + ".norm";
+    x = ggml_add(ctx, x, relpos_attention_graph_ggml(ctx, m, relpos_layer_prefix(idx), x, rel_band, L,
+                                                     kTextChannels, kTextHeads));
+    x = text_layer_norm_ggml(ctx, m, x, norms + "1." + layer);
+    x = ggml_add(ctx, x, ffn_block_graph_ggml(ctx, m, idx, x));
+    return text_layer_norm_ggml(ctx, m, x, norms + "2." + layer);
+}
+
+ggml_tensor * text_convnext_chain_ggml(ggml_context * ctx, const supertonic_model & m, ggml_tensor * x) {
+    for (int i = 0; i < kTextConvnextBlocks; ++i) {
+        x = text_convnext_ggml(ctx, m,
+            "text_encoder:tts.ttl.text_encoder.convnext.convnext." + std::to_string(i), x,
+            m.hparams.text_convnext_dilation((size_t) i));
+    }
+    return x;
+}
+
+ggml_tensor * attn_encoder_graph_ggml(ggml_context * ctx,
+                                      const supertonic_model & m,
+                                      ggml_tensor * x,
+                                      ggml_tensor * rel_band,
+                                      int L) {
+    for (int i = 0; i < kTextAttnLayers; ++i) x = attn_encoder_layer_graph_ggml(ctx, m, i, x, rel_band, L);
+    return x;
+}
+
+ggml_tensor * speech_prompted_tail_graph_ggml(ggml_context * ctx,
+                                              const supertonic_model & m,
+                                              ggml_tensor * x,
+                                              ggml_tensor * style_in,
+                                              int L) {
+    ggml_tensor * residual = x;
+    for (int i = 0; i < kSpeechAttnLayers; ++i) {
+        ggml_tensor * attn = speech_prompted_attention_graph_ggml(ctx, m, speech_prompted_sources_for(i),
+                                                                  x, style_in, L, kStyleLen);
+        x = ggml_add(ctx, residual, attn);
+    }
+    return text_layer_norm_ggml(ctx, m, x, "text_encoder:tts.ttl.speech_prompted_text_encoder.norm.norm");
+}
+
+// When `measure` is non-null the graph is built identically but the arena is
+// sized (ggml_gallocr_reserve_n_size) instead of allocated, and nothing is
+// uploaded — the memory-fit share point (supertonic_fit_measure_text_encoder)
+// so the priced graph is the executed graph by construction.
+void build_text_encoder_one_graph(text_encoder_one_graph_cache & cache, const supertonic_model & m, int L,
+                                  size_t * measure = nullptr) {
+    free_text_encoder_one_graph_cache(cache);
+    cache.model = &m;
+    cache.generation_id = m.generation_id;
+    cache.L = L;
+    constexpr int MAX_NODES = 2048;
+    const size_t buf_size = ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
+    cache.buf.assign(buf_size, 0);
+    ggml_init_params gp = { buf_size, cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf = ggml_new_graph_custom(cache.ctx, MAX_NODES, false);
+
+    cache.ids_in = ggml_new_tensor_1d(cache.ctx, GGML_TYPE_I32, L);
+    ggml_set_name(cache.ids_in, "text_encoder_ids"); ggml_set_input(cache.ids_in);
+    cache.style_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, kStyleLen, kTextChannels);
+    ggml_set_name(cache.style_in, "text_encoder_style"); ggml_set_input(cache.style_in);
+    cache.rel_band = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, L, L);
+    ggml_set_name(cache.rel_band, "text_encoder_rel_band");
+    // Input and output so gallocr keeps the constant band alive across computes.
+    ggml_set_input(cache.rel_band); ggml_set_output(cache.rel_band);
+
+    ggml_tensor * emb_table = require_source_tensor(m,
+        "text_encoder:tts.ttl.text_encoder.text_embedder.char_embedder.weight");
+    ggml_tensor * embedded = ggml_get_rows(cache.ctx, emb_table, cache.ids_in);
+    ggml_tensor * x = ggml_cont(cache.ctx, ggml_transpose(cache.ctx, embedded));
+    ggml_tensor * skip = text_convnext_chain_ggml(cache.ctx, m, x);
+    x = ggml_add(cache.ctx, attn_encoder_graph_ggml(cache.ctx, m, skip, cache.rel_band, L), skip);
+    cache.out = speech_prompted_tail_graph_ggml(cache.ctx, m, x, cache.style_in, L);
+    ggml_set_name(cache.out, "text_encoder_out"); ggml_set_output(cache.out);
+    ggml_build_forward_expand(cache.gf, cache.out);
+
+    if (measure) {
+        ggml_gallocr_t pricer = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+        if (!pricer) throw std::runtime_error("ggml_gallocr_new text encoder one-graph (measure) failed");
+        size_t sz = 0;
+        ggml_gallocr_reserve_n_size(pricer, cache.gf, nullptr, nullptr, &sz);
+        ggml_gallocr_free(pricer);
+        *measure = sz;
+        return;
+    }
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new text encoder one-graph failed");
+    if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+        throw std::runtime_error("ggml_gallocr_reserve text encoder one-graph failed");
+    }
+    ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+    const std::vector<float> band = make_rel_band(L, 1.0f / std::sqrt((float) (kTextChannels / kTextHeads)));
+    ggml_backend_tensor_set(cache.rel_band, band.data(), 0, band.size() * sizeof(float));
+}
+
+void run_text_encoder_one_graph(text_encoder_one_graph_cache & cache,
+                                const supertonic_model & m,
+                                const std::vector<int32_t> & ids,
+                                const float * style_ttl,
+                                std::vector<float> & text_emb_out) {
+    ggml_backend_tensor_set(cache.ids_in, ids.data(), 0, ids.size() * sizeof(int32_t));
+    const std::vector<float> style_tc(style_ttl, style_ttl + (size_t) kStyleLen * kTextChannels);
+    const std::vector<float> style_raw = pack_time_channel_for_ggml(style_tc, kStyleLen, kTextChannels);
+    ggml_backend_tensor_set(cache.style_in, style_raw.data(), 0, style_raw.size() * sizeof(float));
+    profile_text_compute(m, cache.gf, "one_graph");
+    text_emb_out.resize((size_t) ggml_nelements(cache.out));
+    ggml_backend_tensor_get(cache.out, text_emb_out.data(), 0, ggml_nbytes(cache.out));
+}
+
+bool use_text_encoder_one_graph(const supertonic_model & model) {
+    static const bool disabled = std::getenv("SUPERTONIC_DISABLE_TEXT_ONE_GRAPH") != nullptr;
+    return !disabled && !model_prefers_cpu_kernels(model);
+}
+
+} // namespace
+
+bool supertonic_text_encoder_forward_cpu(const supertonic_model & model,
+                                         const int64_t * text_ids,
+                                         int text_len,
+                                         const float * style_ttl,
+                                         std::vector<float> & text_emb_out,
+                                         std::string * error) {
+    try {
+        const int C = 256;
+        const int L = text_len;
+        f32_tensor emb = read_f32(model, "text_encoder:tts.ttl.text_encoder.text_embedder.char_embedder.weight");
+        std::vector<float> x((size_t) L * C);
+        for (int t = 0; t < L; ++t) {
+            int64_t id = text_ids[t];
+            if (id < 0 || id >= emb.ne[1]) throw std::runtime_error("text id out of range");
+            for (int c = 0; c < C; ++c) x[(size_t) t * C + c] = emb.data[(size_t) id * C + c];
+        }
+
+        for (int i = 0; i < 6; ++i) {
+            convnext_block(model, "text_encoder:tts.ttl.text_encoder.convnext.convnext." + std::to_string(i),
+                           x, L, C, model.hparams.text_convnext_dilation((size_t) i));
+        }
+        std::vector<float> convnext_out = x;
+
+        for (int i = 0; i < 4; ++i) {
+            std::vector<float> residual = x;
+            relpos_attention(model, i, x, L, C);
+            for (size_t j = 0; j < x.size(); ++j) x[j] += residual[j];
+            layer_norm_channel(
+                x, L, C,
+                read_f32(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.norm_layers_1." + std::to_string(i) + ".norm.weight"),
+                read_f32(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.norm_layers_1." + std::to_string(i) + ".norm.bias"));
+            residual = x;
+            ffn_block(model, i, x, L, C);
+            for (size_t j = 0; j < x.size(); ++j) x[j] += residual[j];
+            layer_norm_channel(
+                x, L, C,
+                read_f32(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.norm_layers_2." + std::to_string(i) + ".norm.weight"),
+                read_f32(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.norm_layers_2." + std::to_string(i) + ".norm.bias"));
+        }
+        for (size_t i = 0; i < x.size(); ++i) x[i] += convnext_out[i];
+
+        std::vector<float> shared_residual = x; // [L, C]
+        std::vector<float> attn_out;
+        speech_prompted_attention(model, 0, x, L, style_ttl, attn_out);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = shared_residual[i] + attn_out[i];
+        speech_prompted_attention(model, 1, x, L, style_ttl, attn_out);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = shared_residual[i] + attn_out[i];
+
+        layer_norm_channel(
+            x, L, C,
+            read_f32(model, "text_encoder:tts.ttl.speech_prompted_text_encoder.norm.norm.weight"),
+            read_f32(model, "text_encoder:tts.ttl.speech_prompted_text_encoder.norm.norm.bias"));
+
+        // Return in ONNX/PyTorch shape [1, 256, L] row-major.
+        text_emb_out.assign((size_t) C * L, 0.0f);
+        for (int c = 0; c < C; ++c) {
+            for (int t = 0; t < L; ++t) text_emb_out[(size_t) c * L + t] = x[(size_t) t * C + c];
+        }
+        if (error) error->clear();
+        return true;
+    } catch (const std::exception & e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+bool supertonic_text_encoder_forward_one_graph_ggml(const supertonic_model & model,
+                                                    const int64_t * text_ids,
+                                                    int text_len,
+                                                    const float * style_ttl,
+                                                    std::vector<float> & text_emb_out,
+                                                    std::string * error) {
+    supertonic_op_dispatch_scope dispatch(model);
+    try {
+        profile_text_begin();
+        ggml_tensor * emb_table = require_source_tensor(model,
+            "text_encoder:tts.ttl.text_encoder.text_embedder.char_embedder.weight");
+        const std::vector<int32_t> ids = text_ids_as_i32(emb_table, text_ids, text_len);
+        thread_local text_encoder_one_graph_cache cache;
+        SUPERTONIC_REGISTER_TL_CACHE(cache, free_text_encoder_one_graph_cache);
+        if (cache.model != &model || cache.generation_id != model.generation_id || cache.L != text_len) {
+            build_text_encoder_one_graph(cache, model, text_len);
+        }
+        run_text_encoder_one_graph(cache, model, ids, style_ttl, text_emb_out);
+        profile_text_end();
+        if (error) error->clear();
+        return true;
+    } catch (const std::exception & e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+bool supertonic_text_encoder_forward_ggml(const supertonic_model & model,
+                                          const int64_t * text_ids,
+                                          int text_len,
+                                          const float * style_ttl,
+                                          std::vector<float> & text_emb_out,
+                                          std::string * error,
+                                          std::string * backend_used) {
+    if (backend_used) *backend_used = "ggml";
+#ifdef TTS_CPP_USE_COREML
+    if (model.coreml_encoder) {
+        const auto start = std::chrono::steady_clock::now();
+        if (supertonic_coreml_encoder_encode(model.coreml_encoder, text_ids, text_len, style_ttl, text_emb_out)) {
+            if (backend_used) *backend_used = supertonic_coreml_encoder_backend_label(model.coreml_encoder);
+            if (error) error->clear();
+            if (supertonic_profile_csv_enabled()) supertonic_profile_csv_record("text", "coreml", -1,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+            return true;
+        }
+    }
+    if (std::getenv("SUPERTONIC_COREML_ENCODER_STRICT")) {
+        if (error) *error = "Core ML text encoder unavailable, input exceeds capacity, or prediction failed";
+        return false;
+    }
+#endif
+    if (use_text_encoder_one_graph(model)) {
+        return supertonic_text_encoder_forward_one_graph_ggml(model, text_ids, text_len, style_ttl, text_emb_out, error);
+    }
+    return supertonic_text_encoder_forward_islands_ggml(model, text_ids, text_len, style_ttl, text_emb_out, error);
+}
+
+bool supertonic_text_encoder_forward_islands_ggml(const supertonic_model & model,
+                                                  const int64_t * text_ids,
+                                                  int text_len,
+                                                  const float * style_ttl,
+                                                  std::vector<float> & text_emb_out,
+                                                  std::string * error) {
+    supertonic_op_dispatch_scope dispatch(model);
+    try {
+        profile_text_begin();
+        const int C = 256;
+        const int L = text_len;
+
+        // F10 — embedding lookup runs as `ggml_get_rows` on the
+        // device.  The pre-audit code downloaded the entire
+        // embedding table (~2 MB for the default vocab × C=256
+        // model) and CPU-gathered one row per token; this hook
+        // uploads `L` int32 ids instead and produces the gathered
+        // matrix directly on the backend.  `get_rows` output is
+        // time-major (ne=[C, L]), so we follow with
+        // `ggml_transpose + ggml_cont` to land in the channel-major
+        // ne=[L, C] layout the convnext blocks expect.  Bounds
+        // check still runs host-side against the (host-known) vocab
+        // size of the embedding tensor.
+        ggml_tensor * emb_table = require_source_tensor(model,
+            "text_encoder:tts.ttl.text_encoder.text_embedder.char_embedder.weight");
+        const std::vector<int32_t> ids = text_ids_as_i32(emb_table, text_ids, L);
+
+        // F18 — text-encoder convnext-front graph cache.  Same
+        // pattern as F8 / F11 / F14: build once per (model, L),
+        // survive across synths; the per-synth path becomes
+        // `tensor_set(ids) → compute → tensor_get(output)`.
+        struct text_convnext_front_cache {
+            const supertonic_model * model = nullptr;
+            uint64_t generation_id = 0;
+            int L = 0;
+            std::vector<uint8_t> buf;
+            ggml_context * ctx = nullptr;
+            ggml_cgraph * gf = nullptr;
+            ggml_gallocr_t allocr = nullptr;
+            ggml_tensor * ids_in = nullptr;
+        };
+        thread_local text_convnext_front_cache convnext_cache;
+        thread_local tl_register_once _tl_reg_convnext_cache([&]() {
+            supertonic_safe_gallocr_free(convnext_cache.allocr, convnext_cache.generation_id);
+            if (convnext_cache.ctx) ggml_free(convnext_cache.ctx);
+            convnext_cache = {};
+        });
+        if (convnext_cache.model != &model ||
+            convnext_cache.generation_id != model.generation_id ||
+            convnext_cache.L != L) {
+            // Tear down stale state.
+            supertonic_safe_gallocr_free(convnext_cache.allocr, convnext_cache.generation_id);
+            if (convnext_cache.ctx) ggml_free(convnext_cache.ctx);
+            convnext_cache = {};
+            convnext_cache.model = &model;
+            convnext_cache.generation_id = model.generation_id;
+            convnext_cache.L = L;
+
+            constexpr int MAX_NODES = 640;
+            const size_t buf_size = ggml_tensor_overhead() * MAX_NODES +
+                                    ggml_graph_overhead_custom(MAX_NODES, false);
+            convnext_cache.buf.assign(buf_size, 0);
+            ggml_init_params gp = { buf_size, convnext_cache.buf.data(), true };
+            convnext_cache.ctx = ggml_init(gp);
+            convnext_cache.gf  = ggml_new_graph_custom(convnext_cache.ctx, MAX_NODES, false);
+
+            // F10: i32 token-id input, gather → permute → cont →
+            // convnext stack.  Same op sequence as pre-F18; only
+            // the lifetime around it changed.
+            convnext_cache.ids_in = ggml_new_tensor_1d(convnext_cache.ctx, GGML_TYPE_I32, L);
+            ggml_set_name(convnext_cache.ids_in, "text_encoder_ids");
+            ggml_set_input(convnext_cache.ids_in);
+            ggml_tensor * gathered = ggml_get_rows(convnext_cache.ctx, emb_table, convnext_cache.ids_in);
+            ggml_tensor * in_t = ggml_cont(convnext_cache.ctx, ggml_transpose(convnext_cache.ctx, gathered));
+            ggml_set_name(in_t, "text_encoder_embed");
+            ggml_tensor * y_t = in_t;
+            for (int i = 0; i < 6; ++i) {
+                y_t = text_convnext_ggml(convnext_cache.ctx, model,
+                    "text_encoder:tts.ttl.text_encoder.convnext.convnext." + std::to_string(i), y_t,
+                    model.hparams.text_convnext_dilation((size_t) i));
+            }
+            ggml_set_name(y_t, "text_encoder_convnext5");
+            ggml_set_output(y_t);
+            ggml_build_forward_expand(convnext_cache.gf, y_t);
+
+            convnext_cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+            if (!convnext_cache.allocr) {
+                ggml_free(convnext_cache.ctx);
+                convnext_cache = {};
+                throw std::runtime_error("ggml_gallocr_new text encoder failed");
+            }
+            if (!ggml_gallocr_reserve(convnext_cache.allocr, convnext_cache.gf)) {
+                ggml_gallocr_free(convnext_cache.allocr);
+                ggml_free(convnext_cache.ctx);
+                convnext_cache = {};
+                throw std::runtime_error("ggml_gallocr_reserve text encoder failed");
+            }
+            ggml_gallocr_alloc_graph(convnext_cache.allocr, convnext_cache.gf);
+        }
+        ggml_backend_tensor_set(convnext_cache.ids_in, ids.data(), 0, ids.size() * sizeof(int32_t));
+        profile_text_compute(model, convnext_cache.gf, "convnext_front");
+        std::vector<float> x = tensor_to_time_channel(
+            ggml_graph_get_tensor(convnext_cache.gf, "text_encoder_convnext5"));
+        profile_text_checkpoint("convnext_readback");
+
+        // The text encoder's relative-position and speech-prompted attention
+        // layers are custom scalar continuations for now; the ConvNeXt front
+        // half above is already run as a GGML graph.
+        std::vector<float> convnext_out = x;
+        // F13: layer-norm weights are pre-downloaded into
+        // `model.text_encoder_ln_weights` at load time; the helper
+        // below wraps the lookup with a `read_f32` fallback so a
+        // GGUF that's missing one of the rostered names degrades
+        // gracefully to the legacy behaviour.
+        auto ln_cached = [&](const std::string & name) -> f32_tensor {
+            auto it = model.text_encoder_ln_weights.find(name);
+            if (it != model.text_encoder_ln_weights.end() && !it->second.empty()) {
+                f32_tensor t;
+                t.data = it->second;
+                t.ne[0] = (int64_t) it->second.size();
+                t.ne[1] = 1; t.ne[2] = 1; t.ne[3] = 1;
+                return t;
+            }
+            return read_f32(model, name);
+        };
+        for (int i = 0; i < 4; ++i) {
+            std::vector<float> residual = x;
+            relpos_attention_ggml(model, i, x, L, C, x);
+            for (size_t j = 0; j < x.size(); ++j) x[j] += residual[j];
+            layer_norm_channel(
+                x, L, C,
+                ln_cached("text_encoder:tts.ttl.text_encoder.attn_encoder.norm_layers_1." + std::to_string(i) + ".norm.weight"),
+                ln_cached("text_encoder:tts.ttl.text_encoder.attn_encoder.norm_layers_1." + std::to_string(i) + ".norm.bias"));
+            std::string attn_post = "relpos" + std::to_string(i) + "_res_norm";
+            profile_text_checkpoint(attn_post.c_str());
+            residual = x;
+            ffn_block_ggml(model, i, x, L, C);
+            for (size_t j = 0; j < x.size(); ++j) x[j] += residual[j];
+            layer_norm_channel(
+                x, L, C,
+                ln_cached("text_encoder:tts.ttl.text_encoder.attn_encoder.norm_layers_2." + std::to_string(i) + ".norm.weight"),
+                ln_cached("text_encoder:tts.ttl.text_encoder.attn_encoder.norm_layers_2." + std::to_string(i) + ".norm.bias"));
+            std::string ffn_post = "ffn" + std::to_string(i) + "_res_norm";
+            profile_text_checkpoint(ffn_post.c_str());
+        }
+        for (size_t i = 0; i < x.size(); ++i) x[i] += convnext_out[i];
+        profile_text_checkpoint("convnext_skip_add");
+
+        std::vector<float> shared_residual = x;
+        std::vector<float> attn_out;
+        speech_prompted_attention_ggml(model, 0, x, L, style_ttl, attn_out);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = shared_residual[i] + attn_out[i];
+        profile_text_checkpoint("speech0_residual");
+        speech_prompted_attention_ggml(model, 1, x, L, style_ttl, attn_out);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = shared_residual[i] + attn_out[i];
+        profile_text_checkpoint("speech1_residual");
+        // F13: final speech-prompted layer norm pair lives in the
+        // same host-side cache.
+        layer_norm_channel(
+            x, L, C,
+            ln_cached("text_encoder:tts.ttl.speech_prompted_text_encoder.norm.norm.weight"),
+            ln_cached("text_encoder:tts.ttl.speech_prompted_text_encoder.norm.norm.bias"));
+        profile_text_checkpoint("speech_norm");
+
+        text_emb_out.assign((size_t) C * L, 0.0f);
+        for (int c = 0; c < C; ++c) {
+            for (int t = 0; t < L; ++t) text_emb_out[(size_t)c*L+t] = x[(size_t)t*C+c];
+        }
+        profile_text_end();
+        if (error) error->clear();
+        return true;
+    } catch (const std::exception & e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+bool supertonic_text_encoder_trace_ggml(const supertonic_model & model,
+                                        const int64_t * text_ids,
+                                        int text_len,
+                                        std::vector<supertonic_trace_tensor> & scalar_trace,
+                                        std::vector<supertonic_trace_tensor> & ggml_trace,
+                                        std::string * error) {
+    supertonic_op_dispatch_scope dispatch(model);
+    try {
+        scalar_trace.clear();
+        ggml_trace.clear();
+        const int C = 256;
+        const int L = text_len;
+        f32_tensor emb = read_f32(model, "text_encoder:tts.ttl.text_encoder.text_embedder.char_embedder.weight");
+        std::vector<float> x((size_t)L*C);
+        for (int t = 0; t < L; ++t) {
+            int64_t id = text_ids[t];
+            if (id < 0 || id >= emb.ne[1]) throw std::runtime_error("text id out of range");
+            for (int c = 0; c < C; ++c) x[(size_t)t*C+c] = emb.data[(size_t)id*C+c];
+        }
+        push_trace(scalar_trace, "text_encoder_embed", L, C, x);
+        std::vector<float> cur = x;
+        for (int i = 0; i < 6; ++i) {
+            convnext_block(model, "text_encoder:tts.ttl.text_encoder.convnext.convnext." + std::to_string(i),
+                           cur, L, C, model.hparams.text_convnext_dilation((size_t) i));
+            push_trace(scalar_trace, "text_encoder_convnext" + std::to_string(i), L, C, cur);
+        }
+        std::vector<float> q0, k0, v0;
+        f32_tensor q_w = read_f32(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_q.weight");
+        f32_tensor q_b = read_f32(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_q.bias");
+        f32_tensor k_w = read_f32(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_k.weight");
+        f32_tensor k_b = read_f32(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_k.bias");
+        f32_tensor v_w = read_f32(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_v.weight");
+        f32_tensor v_b = read_f32(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_v.bias");
+        linear1x1(cur, L, C, q_w, &q_b, C, q0);
+        linear1x1(cur, L, C, k_w, &k_b, C, k0);
+        linear1x1(cur, L, C, v_w, &v_b, C, v0);
+        push_trace(scalar_trace, "text_encoder_attn0_q", L, C, q0);
+        push_trace(scalar_trace, "text_encoder_attn0_k", L, C, k0);
+        push_trace(scalar_trace, "text_encoder_attn0_v", L, C, v0);
+
+        constexpr int MAX_NODES = 768;
+        static size_t buf_size = ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
+        thread_local std::vector<uint8_t> buf(buf_size);
+        ggml_init_params gp = { buf_size, buf.data(), true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+        ggml_tensor * in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, L, C);
+        ggml_set_name(in, "text_encoder_embed"); ggml_set_input(in);
+        ggml_tensor * y = in;
+        for (int i = 0; i < 6; ++i) {
+            y = text_convnext_ggml(ctx, model, "text_encoder:tts.ttl.text_encoder.convnext.convnext." + std::to_string(i), y,
+                                   model.hparams.text_convnext_dilation((size_t) i));
+            const std::string name = "text_encoder_convnext" + std::to_string(i);
+            ggml_set_name(y, name.c_str()); ggml_set_output(y);
+            ggml_build_forward_expand(gf, y);
+        }
+        ggml_tensor * q = conv1d_f32(ctx, require_source_tensor(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_q.weight"), y, 1, 0, 1);
+        q = ggml_add(ctx, q, repeat_like(ctx, require_source_tensor(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_q.bias"), q));
+        ggml_set_name(q, "text_encoder_attn0_q"); ggml_set_output(q); ggml_build_forward_expand(gf, q);
+        ggml_tensor * k = conv1d_f32(ctx, require_source_tensor(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_k.weight"), y, 1, 0, 1);
+        k = ggml_add(ctx, k, repeat_like(ctx, require_source_tensor(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_k.bias"), k));
+        ggml_set_name(k, "text_encoder_attn0_k"); ggml_set_output(k); ggml_build_forward_expand(gf, k);
+        ggml_tensor * v = conv1d_f32(ctx, require_source_tensor(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_v.weight"), y, 1, 0, 1);
+        v = ggml_add(ctx, v, repeat_like(ctx, require_source_tensor(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_v.bias"), v));
+        ggml_set_name(v, "text_encoder_attn0_v"); ggml_set_output(v); ggml_build_forward_expand(gf, v);
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!allocr) {
+            ggml_free(ctx);
+            throw std::runtime_error("ggml_gallocr_new text encoder failed");
+        }
+        if (!ggml_gallocr_reserve(allocr, gf)) {
+            ggml_gallocr_free(allocr);
+            ggml_free(ctx);
+            throw std::runtime_error("ggml_gallocr_reserve text encoder failed");
+        }
+        ggml_gallocr_alloc_graph(allocr, gf);
+        std::vector<float> raw = pack_time_channel_for_ggml(x, L, C);
+        ggml_backend_tensor_set(in, raw.data(), 0, raw.size()*sizeof(float));
+        supertonic_graph_compute(model, gf);
+        ggml_trace.push_back({"text_encoder_embed", {L, C}, x});
+        for (int i = 0; i < 6; ++i) {
+            const std::string name = "text_encoder_convnext" + std::to_string(i);
+            ggml_trace.push_back({name, {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, name.c_str()))});
+        }
+        ggml_trace.push_back({"text_encoder_attn0_q", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "text_encoder_attn0_q"))});
+        ggml_trace.push_back({"text_encoder_attn0_k", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "text_encoder_attn0_k"))});
+        ggml_trace.push_back({"text_encoder_attn0_v", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "text_encoder_attn0_v"))});
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx);
+        auto vit = model.voices.find(model.hparams.default_voice);
+        if (vit != model.voices.end()) {
+            std::vector<float> style_ttl((size_t)ggml_nelements(vit->second.ttl));
+            ggml_backend_tensor_get(vit->second.ttl, style_ttl.data(), 0, ggml_nbytes(vit->second.ttl));
+            std::vector<float> scalar_final, ggml_final;
+            std::string nested_error;
+            if (supertonic_text_encoder_forward_cpu(model, text_ids, text_len, style_ttl.data(), scalar_final, &nested_error) &&
+                supertonic_text_encoder_forward_ggml(model, text_ids, text_len, style_ttl.data(), ggml_final, &nested_error) &&
+                scalar_final.size() == (size_t)C*L && ggml_final.size() == (size_t)C*L) {
+                std::vector<float> scalar_lc((size_t)L*C), ggml_lc((size_t)L*C);
+                for (int c = 0; c < C; ++c) {
+                    for (int t = 0; t < L; ++t) {
+                        scalar_lc[(size_t)t*C+c] = scalar_final[(size_t)c*L+t];
+                        ggml_lc[(size_t)t*C+c] = ggml_final[(size_t)c*L+t];
+                    }
+                }
+                scalar_trace.push_back({"text_encoder_final", {L, C}, scalar_lc});
+                ggml_trace.push_back({"text_encoder_final", {L, C}, ggml_lc});
+            }
+        }
+        if (error) error->clear();
+        return true;
+    } catch (const std::exception & e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+void release_text_encoder_thread_local_caches() {
+    // See `release_vector_estimator_thread_local_caches` for the contract.
+    for (auto & fn : g_tl_release_thunks) {
+        if (fn) fn();
+    }
+}
+
+// ---- memory-fit measure (supertonic_internal.h) -----------------------------
+// Sizes the text encoder's resident thread_local arena at text length L on the
+// non-CPU dispatch path -- the ONE-GRAPH encoder (embedding + convnext chain +
+// relpos attn/ffn stack + speech-prompted tail in a single graph compute),
+// through the exact builder the runtime uses
+// (supertonic_text_encoder_forward_one_graph_ggml), so the priced graph is the
+// executed graph by construction.  In measure mode (real_alloc=false, the fit
+// path) nothing is allocated and nothing runs; the parity probe
+// (real_alloc=true, test-only) builds + allocates the same graph for real to
+// anchor the size.  The per-island fallback (one-graph disabled by env) is not
+// modelled; the caller must refuse it rather than misprice it.
+static bool text_encoder_fit_impl(const supertonic_model & m, int L,
+                                  uint64_t & bytes, std::string * error,
+                                  bool real_alloc) {
+    bytes = 0;
+    if (std::getenv("SUPERTONIC_DISABLE_TEXT_ONE_GRAPH") != nullptr) {
+        if (error) {
+            *error = "text-encoder dispatch path not modelled "
+                     "(one-graph disabled by env)";
+        }
+        return false;
+    }
+    try {
+        supertonic_op_dispatch_scope dispatch(m);
+        text_encoder_one_graph_cache cache;
+        size_t sz = 0;
+        build_text_encoder_one_graph(cache, m, L, real_alloc ? nullptr : &sz);
+        if (real_alloc && cache.allocr) sz = ggml_gallocr_get_buffer_size(cache.allocr, 0);
+        free_text_encoder_one_graph_cache(cache);
+        bytes = sz;
+        return true;
+    } catch (const std::exception & e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+bool supertonic_fit_measure_text_encoder(const supertonic_model & m, int L,
+                                         uint64_t & bytes, std::string * error) {
+    return text_encoder_fit_impl(m, L, bytes, error, /*real_alloc=*/false);
+}
+
+bool supertonic_fit_parity_probe_text_encoder(const supertonic_model & m, int L,
+                                              uint64_t & bytes, std::string * error) {
+    return text_encoder_fit_impl(m, L, bytes, error, /*real_alloc=*/true);
+}
+
+} // namespace tts_cpp::supertonic::detail

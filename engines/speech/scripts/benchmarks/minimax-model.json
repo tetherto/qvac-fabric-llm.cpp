@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "model_id": "Comfy-Org/MiniMax-Music-3",
+  "revision": "6baad88896848433857c170ba4f05d2ea9d5f218",
+  "license": {
+    "name": "MiniMax-Music3 Community License",
+    "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/blob/fbdf52fbaaca799592917417eb05f1899f1255ec/LICENSE",
+    "note": "The upstream model license applies to these repacked weights. Retain the license with prepared artifacts."
+  },
+  "tokenizer": {
+    "source": "embedded tokenizer_json tensor in the pinned LM safetensors",
+    "size": 11423806
+  },
+  "resource_requirements": {
+    "min_memory_bytes": 68719476736,
+    "conversion_free_disk_bytes": 53687091200,
+    "note": "Conservative 64 GiB RAM and 50 GiB conversion workspace, plus missing source downloads (about 22 GiB). Linux checks available memory including common cgroup limits; macOS checks physical RAM. These are provisioning requirements, not inference requirements."
+  },
+  "files": [
+    {
+      "role": "lm",
+      "path": "text_encoders/minimax_music3_text_encoder_bf16.safetensors",
+      "size": 18472478038,
+      "sha256": "9805d045978ce917cd1e6327b5cd8b85df1a46e4c69b61c9acf3eb29891c3958"
+    },
+    {
+      "role": "dit",
+      "path": "diffusion_models/minimax_music3_dit_fp16.safetensors",
+      "size": 4914197682,
+      "sha256": "45494a2b6b69af115902ff28eaf54118d19067aa54da01000f3e3efce7ba0e34"
+    },
+    {
+      "role": "vocoder",
+      "path": "vae/minimax_music3_dav.safetensors",
+      "size": 216696128,
+      "sha256": "2a32155b769be01445fcc2a8663b910fc9e1751e18dc1c3ec528064512d9ef0c"
+    },
+    {
+      "role": "license",
+      "model_id": "MiniMaxAI/MiniMax-Music3",
+      "revision": "fbdf52fbaaca799592917417eb05f1899f1255ec",
+      "path": "LICENSE",
+      "size": 7373,
+      "sha256": "b21d12df2adae59dad3fcf80c1d81492654c662342f497d9a9770198c9317e58"
+    }
+  ]
+}

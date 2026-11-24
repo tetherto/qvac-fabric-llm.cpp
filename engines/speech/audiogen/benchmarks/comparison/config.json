@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "comparisonClass": "implementation-level",
+  "variant": "turbo-q8-lm0.6b",
+  "precision": "q8_0",
+  "vaePrecision": "bf16",
+  "threads": 4,
+  "warmups": 1,
+  "runs": 3,
+  "cooldownMs": 5000,
+  "order": "alternate",
+  "keepStages": false,
+  "failOnGpuFallback": true,
+  "promptIds": [],
+  "parameters": {
+    "inference_steps": 8,
+    "shift": 3.0,
+    "guidance_scale": 1.0,
+    "solver": "euler",
+    "lm_temperature": 0.85,
+    "lm_top_p": 0.9,
+    "lm_top_k": 0,
+    "lm_cfg_scale": 2.0,
+    "dcw_enabled": true,
+    "dcw_mode": "double",
+    "dcw_scaler": 0.05,
+    "dcw_high_scaler": 0.02,
+    "use_cot_caption": false,
+    "peak_clip": 0,
+    "output_format": "wav16",
+    "task_type": "text2music"
+  },
+  "models": {
+    "text": "Qwen3-Embedding-0.6B-Q8_0.gguf",
+    "lm": "acestep-5Hz-lm-0.6B-Q8_0.gguf",
+    "dit": "acestep-v15-turbo-Q8_0.gguf",
+    "vae": "vae-BF16.gguf"
+  },
+  "clap": {
+    "model": "laion/larger_clap_music_and_speech",
+    "revision": null,
+    "textPolicy": "caption",
+    "device": "cpu"
+  }
+}

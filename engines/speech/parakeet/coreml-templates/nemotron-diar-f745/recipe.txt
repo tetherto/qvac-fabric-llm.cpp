@@ -1,0 +1,785 @@
+mlrecipe 1
+template nemotron-diar-f745
+spec_sha256 219e435a6fd96b3b29946f3bbeeafa7c1e69f47e3279a82bbfa107895344929f
+weight_bin_size 200068288
+blobs 358
+source "encoder.pre_encode.proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,1024]
+source "encoder.embed_norm.weight" f32 [512]
+source "encoder.embed_norm.bias" f32 [512]
+source "encoder.layers.0.norm1.weight" f32 [512]
+source "encoder.layers.0.norm1.bias" f32 [512]
+source "encoder.layers.0.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.0.attn.out_proj.bias" f32 [512]
+source "encoder.layers.0.norm2.weight" f32 [512]
+source "encoder.layers.0.norm2.bias" f32 [512]
+source "encoder.layers.0.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.0.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.0.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.0.ffn.net.3.bias" f32 [512]
+source "encoder.layers.1.norm1.weight" f32 [512]
+source "encoder.layers.1.norm1.bias" f32 [512]
+source "encoder.layers.1.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.1.attn.out_proj.bias" f32 [512]
+source "encoder.layers.1.norm2.weight" f32 [512]
+source "encoder.layers.1.norm2.bias" f32 [512]
+source "encoder.layers.1.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.1.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.1.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.1.ffn.net.3.bias" f32 [512]
+source "encoder.layers.2.norm1.weight" f32 [512]
+source "encoder.layers.2.norm1.bias" f32 [512]
+source "encoder.layers.2.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.2.attn.out_proj.bias" f32 [512]
+source "encoder.layers.2.norm2.weight" f32 [512]
+source "encoder.layers.2.norm2.bias" f32 [512]
+source "encoder.layers.2.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.2.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.2.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.2.ffn.net.3.bias" f32 [512]
+source "encoder.layers.3.norm1.weight" f32 [512]
+source "encoder.layers.3.norm1.bias" f32 [512]
+source "encoder.layers.3.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.3.attn.out_proj.bias" f32 [512]
+source "encoder.layers.3.norm2.weight" f32 [512]
+source "encoder.layers.3.norm2.bias" f32 [512]
+source "encoder.layers.3.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.3.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.3.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.3.ffn.net.3.bias" f32 [512]
+source "encoder.layers.4.norm1.weight" f32 [512]
+source "encoder.layers.4.norm1.bias" f32 [512]
+source "encoder.layers.4.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.4.attn.out_proj.bias" f32 [512]
+source "encoder.layers.4.norm2.weight" f32 [512]
+source "encoder.layers.4.norm2.bias" f32 [512]
+source "encoder.layers.4.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.4.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.4.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.4.ffn.net.3.bias" f32 [512]
+source "encoder.layers.5.norm1.weight" f32 [512]
+source "encoder.layers.5.norm1.bias" f32 [512]
+source "encoder.layers.5.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.5.attn.out_proj.bias" f32 [512]
+source "encoder.layers.5.norm2.weight" f32 [512]
+source "encoder.layers.5.norm2.bias" f32 [512]
+source "encoder.layers.5.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.5.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.5.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.5.ffn.net.3.bias" f32 [512]
+source "encoder.layers.6.norm1.weight" f32 [512]
+source "encoder.layers.6.norm1.bias" f32 [512]
+source "encoder.layers.6.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.6.attn.out_proj.bias" f32 [512]
+source "encoder.layers.6.norm2.weight" f32 [512]
+source "encoder.layers.6.norm2.bias" f32 [512]
+source "encoder.layers.6.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.6.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.6.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.6.ffn.net.3.bias" f32 [512]
+source "encoder.layers.7.norm1.weight" f32 [512]
+source "encoder.layers.7.norm1.bias" f32 [512]
+source "encoder.layers.7.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.7.attn.out_proj.bias" f32 [512]
+source "encoder.layers.7.norm2.weight" f32 [512]
+source "encoder.layers.7.norm2.bias" f32 [512]
+source "encoder.layers.7.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.7.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.7.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.7.ffn.net.3.bias" f32 [512]
+source "encoder.layers.8.norm1.weight" f32 [512]
+source "encoder.layers.8.norm1.bias" f32 [512]
+source "encoder.layers.8.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.8.attn.out_proj.bias" f32 [512]
+source "encoder.layers.8.norm2.weight" f32 [512]
+source "encoder.layers.8.norm2.bias" f32 [512]
+source "encoder.layers.8.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.8.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.8.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.8.ffn.net.3.bias" f32 [512]
+source "encoder.layers.9.norm1.weight" f32 [512]
+source "encoder.layers.9.norm1.bias" f32 [512]
+source "encoder.layers.9.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.9.attn.out_proj.bias" f32 [512]
+source "encoder.layers.9.norm2.weight" f32 [512]
+source "encoder.layers.9.norm2.bias" f32 [512]
+source "encoder.layers.9.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.9.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.9.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.9.ffn.net.3.bias" f32 [512]
+source "encoder.layers.10.norm1.weight" f32 [512]
+source "encoder.layers.10.norm1.bias" f32 [512]
+source "encoder.layers.10.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.10.attn.out_proj.bias" f32 [512]
+source "encoder.layers.10.norm2.weight" f32 [512]
+source "encoder.layers.10.norm2.bias" f32 [512]
+source "encoder.layers.10.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.10.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.10.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.10.ffn.net.3.bias" f32 [512]
+source "encoder.layers.11.norm1.weight" f32 [512]
+source "encoder.layers.11.norm1.bias" f32 [512]
+source "encoder.layers.11.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.11.attn.out_proj.bias" f32 [512]
+source "encoder.layers.11.norm2.weight" f32 [512]
+source "encoder.layers.11.norm2.bias" f32 [512]
+source "encoder.layers.11.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.11.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.11.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.11.ffn.net.3.bias" f32 [512]
+source "encoder.layers.12.norm1.weight" f32 [512]
+source "encoder.layers.12.norm1.bias" f32 [512]
+source "encoder.layers.12.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.12.attn.out_proj.bias" f32 [512]
+source "encoder.layers.12.norm2.weight" f32 [512]
+source "encoder.layers.12.norm2.bias" f32 [512]
+source "encoder.layers.12.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.12.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.12.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.12.ffn.net.3.bias" f32 [512]
+source "encoder.layers.13.norm1.weight" f32 [512]
+source "encoder.layers.13.norm1.bias" f32 [512]
+source "encoder.layers.13.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.13.attn.out_proj.bias" f32 [512]
+source "encoder.layers.13.norm2.weight" f32 [512]
+source "encoder.layers.13.norm2.bias" f32 [512]
+source "encoder.layers.13.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.13.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.13.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.13.ffn.net.3.bias" f32 [512]
+source "encoder.layers.14.norm1.weight" f32 [512]
+source "encoder.layers.14.norm1.bias" f32 [512]
+source "encoder.layers.14.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.14.attn.out_proj.bias" f32 [512]
+source "encoder.layers.14.norm2.weight" f32 [512]
+source "encoder.layers.14.norm2.bias" f32 [512]
+source "encoder.layers.14.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.14.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.14.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.14.ffn.net.3.bias" f32 [512]
+source "encoder.layers.15.norm1.weight" f32 [512]
+source "encoder.layers.15.norm1.bias" f32 [512]
+source "encoder.layers.15.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.15.attn.out_proj.bias" f32 [512]
+source "encoder.layers.15.norm2.weight" f32 [512]
+source "encoder.layers.15.norm2.bias" f32 [512]
+source "encoder.layers.15.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.15.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.15.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.15.ffn.net.3.bias" f32 [512]
+source "encoder.layers.16.norm1.weight" f32 [512]
+source "encoder.layers.16.norm1.bias" f32 [512]
+source "encoder.layers.16.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.16.attn.out_proj.bias" f32 [512]
+source "encoder.layers.16.norm2.weight" f32 [512]
+source "encoder.layers.16.norm2.bias" f32 [512]
+source "encoder.layers.16.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.16.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.16.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.16.ffn.net.3.bias" f32 [512]
+source "encoder.layers.17.norm1.weight" f32 [512]
+source "encoder.layers.17.norm1.bias" f32 [512]
+source "encoder.layers.17.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.17.attn.out_proj.bias" f32 [512]
+source "encoder.layers.17.norm2.weight" f32 [512]
+source "encoder.layers.17.norm2.bias" f32 [512]
+source "encoder.layers.17.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.17.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.17.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.17.ffn.net.3.bias" f32 [512]
+source "encoder.layers.18.norm1.weight" f32 [512]
+source "encoder.layers.18.norm1.bias" f32 [512]
+source "encoder.layers.18.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.18.attn.out_proj.bias" f32 [512]
+source "encoder.layers.18.norm2.weight" f32 [512]
+source "encoder.layers.18.norm2.bias" f32 [512]
+source "encoder.layers.18.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.18.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.18.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.18.ffn.net.3.bias" f32 [512]
+source "encoder.layers.19.norm1.weight" f32 [512]
+source "encoder.layers.19.norm1.bias" f32 [512]
+source "encoder.layers.19.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.19.attn.out_proj.bias" f32 [512]
+source "encoder.layers.19.norm2.weight" f32 [512]
+source "encoder.layers.19.norm2.bias" f32 [512]
+source "encoder.layers.19.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.19.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.19.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.19.ffn.net.3.bias" f32 [512]
+source "encoder.layers.20.norm1.weight" f32 [512]
+source "encoder.layers.20.norm1.bias" f32 [512]
+source "encoder.layers.20.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.20.attn.out_proj.bias" f32 [512]
+source "encoder.layers.20.norm2.weight" f32 [512]
+source "encoder.layers.20.norm2.bias" f32 [512]
+source "encoder.layers.20.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.20.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.20.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.20.ffn.net.3.bias" f32 [512]
+source "encoder.layers.21.norm1.weight" f32 [512]
+source "encoder.layers.21.norm1.bias" f32 [512]
+source "encoder.layers.21.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.21.attn.out_proj.bias" f32 [512]
+source "encoder.layers.21.norm2.weight" f32 [512]
+source "encoder.layers.21.norm2.bias" f32 [512]
+source "encoder.layers.21.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.21.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.21.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.21.ffn.net.3.bias" f32 [512]
+source "encoder.layers.22.norm1.weight" f32 [512]
+source "encoder.layers.22.norm1.bias" f32 [512]
+source "encoder.layers.22.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.22.attn.out_proj.bias" f32 [512]
+source "encoder.layers.22.norm2.weight" f32 [512]
+source "encoder.layers.22.norm2.bias" f32 [512]
+source "encoder.layers.22.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.22.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.22.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.22.ffn.net.3.bias" f32 [512]
+source "encoder.layers.23.norm1.weight" f32 [512]
+source "encoder.layers.23.norm1.bias" f32 [512]
+source "encoder.layers.23.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.23.attn.out_proj.bias" f32 [512]
+source "encoder.layers.23.norm2.weight" f32 [512]
+source "encoder.layers.23.norm2.bias" f32 [512]
+source "encoder.layers.23.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.23.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.23.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.23.ffn.net.3.bias" f32 [512]
+source "encoder.layers.24.norm1.weight" f32 [512]
+source "encoder.layers.24.norm1.bias" f32 [512]
+source "encoder.layers.24.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.24.attn.out_proj.bias" f32 [512]
+source "encoder.layers.24.norm2.weight" f32 [512]
+source "encoder.layers.24.norm2.bias" f32 [512]
+source "encoder.layers.24.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.24.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.24.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.24.ffn.net.3.bias" f32 [512]
+source "encoder.layers.25.norm1.weight" f32 [512]
+source "encoder.layers.25.norm1.bias" f32 [512]
+source "encoder.layers.25.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.25.attn.out_proj.bias" f32 [512]
+source "encoder.layers.25.norm2.weight" f32 [512]
+source "encoder.layers.25.norm2.bias" f32 [512]
+source "encoder.layers.25.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.25.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.25.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.25.ffn.net.3.bias" f32 [512]
+source "encoder.layers.26.norm1.weight" f32 [512]
+source "encoder.layers.26.norm1.bias" f32 [512]
+source "encoder.layers.26.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.26.attn.out_proj.bias" f32 [512]
+source "encoder.layers.26.norm2.weight" f32 [512]
+source "encoder.layers.26.norm2.bias" f32 [512]
+source "encoder.layers.26.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.26.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.26.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.26.ffn.net.3.bias" f32 [512]
+source "encoder.layers.27.norm1.weight" f32 [512]
+source "encoder.layers.27.norm1.bias" f32 [512]
+source "encoder.layers.27.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.27.attn.out_proj.bias" f32 [512]
+source "encoder.layers.27.norm2.weight" f32 [512]
+source "encoder.layers.27.norm2.bias" f32 [512]
+source "encoder.layers.27.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.27.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.27.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.27.ffn.net.3.bias" f32 [512]
+source "encoder.layers.28.norm1.weight" f32 [512]
+source "encoder.layers.28.norm1.bias" f32 [512]
+source "encoder.layers.28.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.28.attn.out_proj.bias" f32 [512]
+source "encoder.layers.28.norm2.weight" f32 [512]
+source "encoder.layers.28.norm2.bias" f32 [512]
+source "encoder.layers.28.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.28.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.28.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.28.ffn.net.3.bias" f32 [512]
+source "encoder.layers.29.norm1.weight" f32 [512]
+source "encoder.layers.29.norm1.bias" f32 [512]
+source "encoder.layers.29.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.29.attn.out_proj.bias" f32 [512]
+source "encoder.layers.29.norm2.weight" f32 [512]
+source "encoder.layers.29.norm2.bias" f32 [512]
+source "encoder.layers.29.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.29.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.29.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.29.ffn.net.3.bias" f32 [512]
+source "encoder.layers.30.norm1.weight" f32 [512]
+source "encoder.layers.30.norm1.bias" f32 [512]
+source "encoder.layers.30.attn.out_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,512]
+source "encoder.layers.30.attn.out_proj.bias" f32 [512]
+source "encoder.layers.30.norm2.weight" f32 [512]
+source "encoder.layers.30.norm2.bias" f32 [512]
+source "encoder.layers.30.ffn.net.0.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [2048,512]
+source "encoder.layers.30.ffn.net.0.bias" f32 [2048]
+source "encoder.layers.30.ffn.net.3.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [512,2048]
+source "encoder.layers.30.ffn.net.3.bias" f32 [512]
+source "encoder.final_norm.weight" f32 [512]
+source "encoder.final_norm.bias" f32 [512]
+source "encoder_proj.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [192,512]
+source "encoder_proj.bias" f32 [192]
+source "subpixel_upsample.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,192,3]
+source "subpixel_upsample.bias" f32 [1536]
+source "head.first_hidden_to_hidden.weight" f32 [192,192]
+source "head.first_hidden_to_hidden.bias" f32 [192]
+source "head.single_hidden_to_spks.weight" f32 [8,192]
+source "encoder.layers.0.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.1.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.2.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.3.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.4.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.5.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.6.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.7.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.8.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.9.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.10.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.11.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.12.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.13.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.14.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.15.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.16.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.17.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.18.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.19.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.20.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.21.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.22.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.23.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.24.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.25.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.26.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.27.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.28.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.29.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "encoder.layers.30.attn.w_qkv.weight" f32,f16,bf16,q8_0,q6_k,q5_k,q4_k [1536,512]
+source "head.single_hidden_to_spks.bias" f32 [8]
+blob 64 fp16 524288 f16(t("encoder.pre_encode.proj.weight"))
+blob 1048704 fp16 512 f16(zeros([512]))
+blob 1049792 fp16 512 f16(ones([512]))
+blob 1050880 fp16 512 f16(t("encoder.embed_norm.weight"))
+blob 1051968 fp16 512 f16(t("encoder.embed_norm.bias"))
+blob 1053056 fp16 512 f16(t("encoder.layers.0.norm1.weight"))
+blob 1054144 fp16 512 f16(t("encoder.layers.0.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv0 = t("encoder.layers.0.attn.w_qkv.weight")
+blob 1055232 fp16 786432 f16(concat(0, mul(slice(qkv0, 0, 0, 512), 0.125), slice(qkv0, 0, 512, 1536)))
+# the rotate-half matrix of every head (weight-independent)
+blob 2628160 fp16 32768 f16(lit("rotate_half"))
+# RoPE cos table at this capacity (weight-independent)
+blob 2693760 fp16 381440 f16(lit("rope_cos"))
+# RoPE sin table at this capacity (weight-independent)
+blob 3456704 fp16 381440 f16(lit("rope_sin"))
+blob 4219648 fp16 262144 f16(t("encoder.layers.0.attn.out_proj.weight"))
+blob 4744000 fp16 512 f16(t("encoder.layers.0.attn.out_proj.bias"))
+blob 4745088 fp16 512 f16(t("encoder.layers.0.norm2.weight"))
+blob 4746176 fp16 512 f16(t("encoder.layers.0.norm2.bias"))
+blob 4747264 fp16 1048576 f16(t("encoder.layers.0.ffn.net.0.weight"))
+blob 6844480 fp16 2048 f16(t("encoder.layers.0.ffn.net.0.bias"))
+blob 6848640 fp16 1048576 f16(t("encoder.layers.0.ffn.net.3.weight"))
+blob 8945856 fp16 512 f16(t("encoder.layers.0.ffn.net.3.bias"))
+blob 8946944 fp16 512 f16(t("encoder.layers.1.norm1.weight"))
+blob 8948032 fp16 512 f16(t("encoder.layers.1.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv1 = t("encoder.layers.1.attn.w_qkv.weight")
+blob 8949120 fp16 786432 f16(concat(0, mul(slice(qkv1, 0, 0, 512), 0.125), slice(qkv1, 0, 512, 1536)))
+blob 10522048 fp16 262144 f16(t("encoder.layers.1.attn.out_proj.weight"))
+blob 11046400 fp16 512 f16(t("encoder.layers.1.attn.out_proj.bias"))
+blob 11047488 fp16 512 f16(t("encoder.layers.1.norm2.weight"))
+blob 11048576 fp16 512 f16(t("encoder.layers.1.norm2.bias"))
+blob 11049664 fp16 1048576 f16(t("encoder.layers.1.ffn.net.0.weight"))
+blob 13146880 fp16 2048 f16(t("encoder.layers.1.ffn.net.0.bias"))
+blob 13151040 fp16 1048576 f16(t("encoder.layers.1.ffn.net.3.weight"))
+blob 15248256 fp16 512 f16(t("encoder.layers.1.ffn.net.3.bias"))
+blob 15249344 fp16 512 f16(t("encoder.layers.2.norm1.weight"))
+blob 15250432 fp16 512 f16(t("encoder.layers.2.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv2 = t("encoder.layers.2.attn.w_qkv.weight")
+blob 15251520 fp16 786432 f16(concat(0, mul(slice(qkv2, 0, 0, 512), 0.125), slice(qkv2, 0, 512, 1536)))
+blob 16824448 fp16 262144 f16(t("encoder.layers.2.attn.out_proj.weight"))
+blob 17348800 fp16 512 f16(t("encoder.layers.2.attn.out_proj.bias"))
+blob 17349888 fp16 512 f16(t("encoder.layers.2.norm2.weight"))
+blob 17350976 fp16 512 f16(t("encoder.layers.2.norm2.bias"))
+blob 17352064 fp16 1048576 f16(t("encoder.layers.2.ffn.net.0.weight"))
+blob 19449280 fp16 2048 f16(t("encoder.layers.2.ffn.net.0.bias"))
+blob 19453440 fp16 1048576 f16(t("encoder.layers.2.ffn.net.3.weight"))
+blob 21550656 fp16 512 f16(t("encoder.layers.2.ffn.net.3.bias"))
+blob 21551744 fp16 512 f16(t("encoder.layers.3.norm1.weight"))
+blob 21552832 fp16 512 f16(t("encoder.layers.3.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv3 = t("encoder.layers.3.attn.w_qkv.weight")
+blob 21553920 fp16 786432 f16(concat(0, mul(slice(qkv3, 0, 0, 512), 0.125), slice(qkv3, 0, 512, 1536)))
+blob 23126848 fp16 262144 f16(t("encoder.layers.3.attn.out_proj.weight"))
+blob 23651200 fp16 512 f16(t("encoder.layers.3.attn.out_proj.bias"))
+blob 23652288 fp16 512 f16(t("encoder.layers.3.norm2.weight"))
+blob 23653376 fp16 512 f16(t("encoder.layers.3.norm2.bias"))
+blob 23654464 fp16 1048576 f16(t("encoder.layers.3.ffn.net.0.weight"))
+blob 25751680 fp16 2048 f16(t("encoder.layers.3.ffn.net.0.bias"))
+blob 25755840 fp16 1048576 f16(t("encoder.layers.3.ffn.net.3.weight"))
+blob 27853056 fp16 512 f16(t("encoder.layers.3.ffn.net.3.bias"))
+blob 27854144 fp16 512 f16(t("encoder.layers.4.norm1.weight"))
+blob 27855232 fp16 512 f16(t("encoder.layers.4.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv4 = t("encoder.layers.4.attn.w_qkv.weight")
+blob 27856320 fp16 786432 f16(concat(0, mul(slice(qkv4, 0, 0, 512), 0.125), slice(qkv4, 0, 512, 1536)))
+blob 29429248 fp16 262144 f16(t("encoder.layers.4.attn.out_proj.weight"))
+blob 29953600 fp16 512 f16(t("encoder.layers.4.attn.out_proj.bias"))
+blob 29954688 fp16 512 f16(t("encoder.layers.4.norm2.weight"))
+blob 29955776 fp16 512 f16(t("encoder.layers.4.norm2.bias"))
+blob 29956864 fp16 1048576 f16(t("encoder.layers.4.ffn.net.0.weight"))
+blob 32054080 fp16 2048 f16(t("encoder.layers.4.ffn.net.0.bias"))
+blob 32058240 fp16 1048576 f16(t("encoder.layers.4.ffn.net.3.weight"))
+blob 34155456 fp16 512 f16(t("encoder.layers.4.ffn.net.3.bias"))
+blob 34156544 fp16 512 f16(t("encoder.layers.5.norm1.weight"))
+blob 34157632 fp16 512 f16(t("encoder.layers.5.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv5 = t("encoder.layers.5.attn.w_qkv.weight")
+blob 34158720 fp16 786432 f16(concat(0, mul(slice(qkv5, 0, 0, 512), 0.125), slice(qkv5, 0, 512, 1536)))
+blob 35731648 fp16 262144 f16(t("encoder.layers.5.attn.out_proj.weight"))
+blob 36256000 fp16 512 f16(t("encoder.layers.5.attn.out_proj.bias"))
+blob 36257088 fp16 512 f16(t("encoder.layers.5.norm2.weight"))
+blob 36258176 fp16 512 f16(t("encoder.layers.5.norm2.bias"))
+blob 36259264 fp16 1048576 f16(t("encoder.layers.5.ffn.net.0.weight"))
+blob 38356480 fp16 2048 f16(t("encoder.layers.5.ffn.net.0.bias"))
+blob 38360640 fp16 1048576 f16(t("encoder.layers.5.ffn.net.3.weight"))
+blob 40457856 fp16 512 f16(t("encoder.layers.5.ffn.net.3.bias"))
+blob 40458944 fp16 512 f16(t("encoder.layers.6.norm1.weight"))
+blob 40460032 fp16 512 f16(t("encoder.layers.6.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv6 = t("encoder.layers.6.attn.w_qkv.weight")
+blob 40461120 fp16 786432 f16(concat(0, mul(slice(qkv6, 0, 0, 512), 0.125), slice(qkv6, 0, 512, 1536)))
+blob 42034048 fp16 262144 f16(t("encoder.layers.6.attn.out_proj.weight"))
+blob 42558400 fp16 512 f16(t("encoder.layers.6.attn.out_proj.bias"))
+blob 42559488 fp16 512 f16(t("encoder.layers.6.norm2.weight"))
+blob 42560576 fp16 512 f16(t("encoder.layers.6.norm2.bias"))
+blob 42561664 fp16 1048576 f16(t("encoder.layers.6.ffn.net.0.weight"))
+blob 44658880 fp16 2048 f16(t("encoder.layers.6.ffn.net.0.bias"))
+blob 44663040 fp16 1048576 f16(t("encoder.layers.6.ffn.net.3.weight"))
+blob 46760256 fp16 512 f16(t("encoder.layers.6.ffn.net.3.bias"))
+blob 46761344 fp16 512 f16(t("encoder.layers.7.norm1.weight"))
+blob 46762432 fp16 512 f16(t("encoder.layers.7.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv7 = t("encoder.layers.7.attn.w_qkv.weight")
+blob 46763520 fp16 786432 f16(concat(0, mul(slice(qkv7, 0, 0, 512), 0.125), slice(qkv7, 0, 512, 1536)))
+blob 48336448 fp16 262144 f16(t("encoder.layers.7.attn.out_proj.weight"))
+blob 48860800 fp16 512 f16(t("encoder.layers.7.attn.out_proj.bias"))
+blob 48861888 fp16 512 f16(t("encoder.layers.7.norm2.weight"))
+blob 48862976 fp16 512 f16(t("encoder.layers.7.norm2.bias"))
+blob 48864064 fp16 1048576 f16(t("encoder.layers.7.ffn.net.0.weight"))
+blob 50961280 fp16 2048 f16(t("encoder.layers.7.ffn.net.0.bias"))
+blob 50965440 fp16 1048576 f16(t("encoder.layers.7.ffn.net.3.weight"))
+blob 53062656 fp16 512 f16(t("encoder.layers.7.ffn.net.3.bias"))
+blob 53063744 fp16 512 f16(t("encoder.layers.8.norm1.weight"))
+blob 53064832 fp16 512 f16(t("encoder.layers.8.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv8 = t("encoder.layers.8.attn.w_qkv.weight")
+blob 53065920 fp16 786432 f16(concat(0, mul(slice(qkv8, 0, 0, 512), 0.125), slice(qkv8, 0, 512, 1536)))
+blob 54638848 fp16 262144 f16(t("encoder.layers.8.attn.out_proj.weight"))
+blob 55163200 fp16 512 f16(t("encoder.layers.8.attn.out_proj.bias"))
+blob 55164288 fp16 512 f16(t("encoder.layers.8.norm2.weight"))
+blob 55165376 fp16 512 f16(t("encoder.layers.8.norm2.bias"))
+blob 55166464 fp16 1048576 f16(t("encoder.layers.8.ffn.net.0.weight"))
+blob 57263680 fp16 2048 f16(t("encoder.layers.8.ffn.net.0.bias"))
+blob 57267840 fp16 1048576 f16(t("encoder.layers.8.ffn.net.3.weight"))
+blob 59365056 fp16 512 f16(t("encoder.layers.8.ffn.net.3.bias"))
+blob 59366144 fp16 512 f16(t("encoder.layers.9.norm1.weight"))
+blob 59367232 fp16 512 f16(t("encoder.layers.9.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv9 = t("encoder.layers.9.attn.w_qkv.weight")
+blob 59368320 fp16 786432 f16(concat(0, mul(slice(qkv9, 0, 0, 512), 0.125), slice(qkv9, 0, 512, 1536)))
+blob 60941248 fp16 262144 f16(t("encoder.layers.9.attn.out_proj.weight"))
+blob 61465600 fp16 512 f16(t("encoder.layers.9.attn.out_proj.bias"))
+blob 61466688 fp16 512 f16(t("encoder.layers.9.norm2.weight"))
+blob 61467776 fp16 512 f16(t("encoder.layers.9.norm2.bias"))
+blob 61468864 fp16 1048576 f16(t("encoder.layers.9.ffn.net.0.weight"))
+blob 63566080 fp16 2048 f16(t("encoder.layers.9.ffn.net.0.bias"))
+blob 63570240 fp16 1048576 f16(t("encoder.layers.9.ffn.net.3.weight"))
+blob 65667456 fp16 512 f16(t("encoder.layers.9.ffn.net.3.bias"))
+blob 65668544 fp16 512 f16(t("encoder.layers.10.norm1.weight"))
+blob 65669632 fp16 512 f16(t("encoder.layers.10.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv10 = t("encoder.layers.10.attn.w_qkv.weight")
+blob 65670720 fp16 786432 f16(concat(0, mul(slice(qkv10, 0, 0, 512), 0.125), slice(qkv10, 0, 512, 1536)))
+blob 67243648 fp16 262144 f16(t("encoder.layers.10.attn.out_proj.weight"))
+blob 67768000 fp16 512 f16(t("encoder.layers.10.attn.out_proj.bias"))
+blob 67769088 fp16 512 f16(t("encoder.layers.10.norm2.weight"))
+blob 67770176 fp16 512 f16(t("encoder.layers.10.norm2.bias"))
+blob 67771264 fp16 1048576 f16(t("encoder.layers.10.ffn.net.0.weight"))
+blob 69868480 fp16 2048 f16(t("encoder.layers.10.ffn.net.0.bias"))
+blob 69872640 fp16 1048576 f16(t("encoder.layers.10.ffn.net.3.weight"))
+blob 71969856 fp16 512 f16(t("encoder.layers.10.ffn.net.3.bias"))
+blob 71970944 fp16 512 f16(t("encoder.layers.11.norm1.weight"))
+blob 71972032 fp16 512 f16(t("encoder.layers.11.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv11 = t("encoder.layers.11.attn.w_qkv.weight")
+blob 71973120 fp16 786432 f16(concat(0, mul(slice(qkv11, 0, 0, 512), 0.125), slice(qkv11, 0, 512, 1536)))
+blob 73546048 fp16 262144 f16(t("encoder.layers.11.attn.out_proj.weight"))
+blob 74070400 fp16 512 f16(t("encoder.layers.11.attn.out_proj.bias"))
+blob 74071488 fp16 512 f16(t("encoder.layers.11.norm2.weight"))
+blob 74072576 fp16 512 f16(t("encoder.layers.11.norm2.bias"))
+blob 74073664 fp16 1048576 f16(t("encoder.layers.11.ffn.net.0.weight"))
+blob 76170880 fp16 2048 f16(t("encoder.layers.11.ffn.net.0.bias"))
+blob 76175040 fp16 1048576 f16(t("encoder.layers.11.ffn.net.3.weight"))
+blob 78272256 fp16 512 f16(t("encoder.layers.11.ffn.net.3.bias"))
+blob 78273344 fp16 512 f16(t("encoder.layers.12.norm1.weight"))
+blob 78274432 fp16 512 f16(t("encoder.layers.12.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv12 = t("encoder.layers.12.attn.w_qkv.weight")
+blob 78275520 fp16 786432 f16(concat(0, mul(slice(qkv12, 0, 0, 512), 0.125), slice(qkv12, 0, 512, 1536)))
+blob 79848448 fp16 262144 f16(t("encoder.layers.12.attn.out_proj.weight"))
+blob 80372800 fp16 512 f16(t("encoder.layers.12.attn.out_proj.bias"))
+blob 80373888 fp16 512 f16(t("encoder.layers.12.norm2.weight"))
+blob 80374976 fp16 512 f16(t("encoder.layers.12.norm2.bias"))
+blob 80376064 fp16 1048576 f16(t("encoder.layers.12.ffn.net.0.weight"))
+blob 82473280 fp16 2048 f16(t("encoder.layers.12.ffn.net.0.bias"))
+blob 82477440 fp16 1048576 f16(t("encoder.layers.12.ffn.net.3.weight"))
+blob 84574656 fp16 512 f16(t("encoder.layers.12.ffn.net.3.bias"))
+blob 84575744 fp16 512 f16(t("encoder.layers.13.norm1.weight"))
+blob 84576832 fp16 512 f16(t("encoder.layers.13.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv13 = t("encoder.layers.13.attn.w_qkv.weight")
+blob 84577920 fp16 786432 f16(concat(0, mul(slice(qkv13, 0, 0, 512), 0.125), slice(qkv13, 0, 512, 1536)))
+blob 86150848 fp16 262144 f16(t("encoder.layers.13.attn.out_proj.weight"))
+blob 86675200 fp16 512 f16(t("encoder.layers.13.attn.out_proj.bias"))
+blob 86676288 fp16 512 f16(t("encoder.layers.13.norm2.weight"))
+blob 86677376 fp16 512 f16(t("encoder.layers.13.norm2.bias"))
+blob 86678464 fp16 1048576 f16(t("encoder.layers.13.ffn.net.0.weight"))
+blob 88775680 fp16 2048 f16(t("encoder.layers.13.ffn.net.0.bias"))
+blob 88779840 fp16 1048576 f16(t("encoder.layers.13.ffn.net.3.weight"))
+blob 90877056 fp16 512 f16(t("encoder.layers.13.ffn.net.3.bias"))
+blob 90878144 fp16 512 f16(t("encoder.layers.14.norm1.weight"))
+blob 90879232 fp16 512 f16(t("encoder.layers.14.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv14 = t("encoder.layers.14.attn.w_qkv.weight")
+blob 90880320 fp16 786432 f16(concat(0, mul(slice(qkv14, 0, 0, 512), 0.125), slice(qkv14, 0, 512, 1536)))
+blob 92453248 fp16 262144 f16(t("encoder.layers.14.attn.out_proj.weight"))
+blob 92977600 fp16 512 f16(t("encoder.layers.14.attn.out_proj.bias"))
+blob 92978688 fp16 512 f16(t("encoder.layers.14.norm2.weight"))
+blob 92979776 fp16 512 f16(t("encoder.layers.14.norm2.bias"))
+blob 92980864 fp16 1048576 f16(t("encoder.layers.14.ffn.net.0.weight"))
+blob 95078080 fp16 2048 f16(t("encoder.layers.14.ffn.net.0.bias"))
+blob 95082240 fp16 1048576 f16(t("encoder.layers.14.ffn.net.3.weight"))
+blob 97179456 fp16 512 f16(t("encoder.layers.14.ffn.net.3.bias"))
+blob 97180544 fp16 512 f16(t("encoder.layers.15.norm1.weight"))
+blob 97181632 fp16 512 f16(t("encoder.layers.15.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv15 = t("encoder.layers.15.attn.w_qkv.weight")
+blob 97182720 fp16 786432 f16(concat(0, mul(slice(qkv15, 0, 0, 512), 0.125), slice(qkv15, 0, 512, 1536)))
+blob 98755648 fp16 262144 f16(t("encoder.layers.15.attn.out_proj.weight"))
+blob 99280000 fp16 512 f16(t("encoder.layers.15.attn.out_proj.bias"))
+blob 99281088 fp16 512 f16(t("encoder.layers.15.norm2.weight"))
+blob 99282176 fp16 512 f16(t("encoder.layers.15.norm2.bias"))
+blob 99283264 fp16 1048576 f16(t("encoder.layers.15.ffn.net.0.weight"))
+blob 101380480 fp16 2048 f16(t("encoder.layers.15.ffn.net.0.bias"))
+blob 101384640 fp16 1048576 f16(t("encoder.layers.15.ffn.net.3.weight"))
+blob 103481856 fp16 512 f16(t("encoder.layers.15.ffn.net.3.bias"))
+blob 103482944 fp16 512 f16(t("encoder.layers.16.norm1.weight"))
+blob 103484032 fp16 512 f16(t("encoder.layers.16.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv16 = t("encoder.layers.16.attn.w_qkv.weight")
+blob 103485120 fp16 786432 f16(concat(0, mul(slice(qkv16, 0, 0, 512), 0.125), slice(qkv16, 0, 512, 1536)))
+blob 105058048 fp16 262144 f16(t("encoder.layers.16.attn.out_proj.weight"))
+blob 105582400 fp16 512 f16(t("encoder.layers.16.attn.out_proj.bias"))
+blob 105583488 fp16 512 f16(t("encoder.layers.16.norm2.weight"))
+blob 105584576 fp16 512 f16(t("encoder.layers.16.norm2.bias"))
+blob 105585664 fp16 1048576 f16(t("encoder.layers.16.ffn.net.0.weight"))
+blob 107682880 fp16 2048 f16(t("encoder.layers.16.ffn.net.0.bias"))
+blob 107687040 fp16 1048576 f16(t("encoder.layers.16.ffn.net.3.weight"))
+blob 109784256 fp16 512 f16(t("encoder.layers.16.ffn.net.3.bias"))
+blob 109785344 fp16 512 f16(t("encoder.layers.17.norm1.weight"))
+blob 109786432 fp16 512 f16(t("encoder.layers.17.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv17 = t("encoder.layers.17.attn.w_qkv.weight")
+blob 109787520 fp16 786432 f16(concat(0, mul(slice(qkv17, 0, 0, 512), 0.125), slice(qkv17, 0, 512, 1536)))
+blob 111360448 fp16 262144 f16(t("encoder.layers.17.attn.out_proj.weight"))
+blob 111884800 fp16 512 f16(t("encoder.layers.17.attn.out_proj.bias"))
+blob 111885888 fp16 512 f16(t("encoder.layers.17.norm2.weight"))
+blob 111886976 fp16 512 f16(t("encoder.layers.17.norm2.bias"))
+blob 111888064 fp16 1048576 f16(t("encoder.layers.17.ffn.net.0.weight"))
+blob 113985280 fp16 2048 f16(t("encoder.layers.17.ffn.net.0.bias"))
+blob 113989440 fp16 1048576 f16(t("encoder.layers.17.ffn.net.3.weight"))
+blob 116086656 fp16 512 f16(t("encoder.layers.17.ffn.net.3.bias"))
+blob 116087744 fp16 512 f16(t("encoder.layers.18.norm1.weight"))
+blob 116088832 fp16 512 f16(t("encoder.layers.18.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv18 = t("encoder.layers.18.attn.w_qkv.weight")
+blob 116089920 fp16 786432 f16(concat(0, mul(slice(qkv18, 0, 0, 512), 0.125), slice(qkv18, 0, 512, 1536)))
+blob 117662848 fp16 262144 f16(t("encoder.layers.18.attn.out_proj.weight"))
+blob 118187200 fp16 512 f16(t("encoder.layers.18.attn.out_proj.bias"))
+blob 118188288 fp16 512 f16(t("encoder.layers.18.norm2.weight"))
+blob 118189376 fp16 512 f16(t("encoder.layers.18.norm2.bias"))
+blob 118190464 fp16 1048576 f16(t("encoder.layers.18.ffn.net.0.weight"))
+blob 120287680 fp16 2048 f16(t("encoder.layers.18.ffn.net.0.bias"))
+blob 120291840 fp16 1048576 f16(t("encoder.layers.18.ffn.net.3.weight"))
+blob 122389056 fp16 512 f16(t("encoder.layers.18.ffn.net.3.bias"))
+blob 122390144 fp16 512 f16(t("encoder.layers.19.norm1.weight"))
+blob 122391232 fp16 512 f16(t("encoder.layers.19.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv19 = t("encoder.layers.19.attn.w_qkv.weight")
+blob 122392320 fp16 786432 f16(concat(0, mul(slice(qkv19, 0, 0, 512), 0.125), slice(qkv19, 0, 512, 1536)))
+blob 123965248 fp16 262144 f16(t("encoder.layers.19.attn.out_proj.weight"))
+blob 124489600 fp16 512 f16(t("encoder.layers.19.attn.out_proj.bias"))
+blob 124490688 fp16 512 f16(t("encoder.layers.19.norm2.weight"))
+blob 124491776 fp16 512 f16(t("encoder.layers.19.norm2.bias"))
+blob 124492864 fp16 1048576 f16(t("encoder.layers.19.ffn.net.0.weight"))
+blob 126590080 fp16 2048 f16(t("encoder.layers.19.ffn.net.0.bias"))
+blob 126594240 fp16 1048576 f16(t("encoder.layers.19.ffn.net.3.weight"))
+blob 128691456 fp16 512 f16(t("encoder.layers.19.ffn.net.3.bias"))
+blob 128692544 fp16 512 f16(t("encoder.layers.20.norm1.weight"))
+blob 128693632 fp16 512 f16(t("encoder.layers.20.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv20 = t("encoder.layers.20.attn.w_qkv.weight")
+blob 128694720 fp16 786432 f16(concat(0, mul(slice(qkv20, 0, 0, 512), 0.125), slice(qkv20, 0, 512, 1536)))
+blob 130267648 fp16 262144 f16(t("encoder.layers.20.attn.out_proj.weight"))
+blob 130792000 fp16 512 f16(t("encoder.layers.20.attn.out_proj.bias"))
+blob 130793088 fp16 512 f16(t("encoder.layers.20.norm2.weight"))
+blob 130794176 fp16 512 f16(t("encoder.layers.20.norm2.bias"))
+blob 130795264 fp16 1048576 f16(t("encoder.layers.20.ffn.net.0.weight"))
+blob 132892480 fp16 2048 f16(t("encoder.layers.20.ffn.net.0.bias"))
+blob 132896640 fp16 1048576 f16(t("encoder.layers.20.ffn.net.3.weight"))
+blob 134993856 fp16 512 f16(t("encoder.layers.20.ffn.net.3.bias"))
+blob 134994944 fp16 512 f16(t("encoder.layers.21.norm1.weight"))
+blob 134996032 fp16 512 f16(t("encoder.layers.21.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv21 = t("encoder.layers.21.attn.w_qkv.weight")
+blob 134997120 fp16 786432 f16(concat(0, mul(slice(qkv21, 0, 0, 512), 0.125), slice(qkv21, 0, 512, 1536)))
+blob 136570048 fp16 262144 f16(t("encoder.layers.21.attn.out_proj.weight"))
+blob 137094400 fp16 512 f16(t("encoder.layers.21.attn.out_proj.bias"))
+blob 137095488 fp16 512 f16(t("encoder.layers.21.norm2.weight"))
+blob 137096576 fp16 512 f16(t("encoder.layers.21.norm2.bias"))
+blob 137097664 fp16 1048576 f16(t("encoder.layers.21.ffn.net.0.weight"))
+blob 139194880 fp16 2048 f16(t("encoder.layers.21.ffn.net.0.bias"))
+blob 139199040 fp16 1048576 f16(t("encoder.layers.21.ffn.net.3.weight"))
+blob 141296256 fp16 512 f16(t("encoder.layers.21.ffn.net.3.bias"))
+blob 141297344 fp16 512 f16(t("encoder.layers.22.norm1.weight"))
+blob 141298432 fp16 512 f16(t("encoder.layers.22.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv22 = t("encoder.layers.22.attn.w_qkv.weight")
+blob 141299520 fp16 786432 f16(concat(0, mul(slice(qkv22, 0, 0, 512), 0.125), slice(qkv22, 0, 512, 1536)))
+blob 142872448 fp16 262144 f16(t("encoder.layers.22.attn.out_proj.weight"))
+blob 143396800 fp16 512 f16(t("encoder.layers.22.attn.out_proj.bias"))
+blob 143397888 fp16 512 f16(t("encoder.layers.22.norm2.weight"))
+blob 143398976 fp16 512 f16(t("encoder.layers.22.norm2.bias"))
+blob 143400064 fp16 1048576 f16(t("encoder.layers.22.ffn.net.0.weight"))
+blob 145497280 fp16 2048 f16(t("encoder.layers.22.ffn.net.0.bias"))
+blob 145501440 fp16 1048576 f16(t("encoder.layers.22.ffn.net.3.weight"))
+blob 147598656 fp16 512 f16(t("encoder.layers.22.ffn.net.3.bias"))
+blob 147599744 fp16 512 f16(t("encoder.layers.23.norm1.weight"))
+blob 147600832 fp16 512 f16(t("encoder.layers.23.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv23 = t("encoder.layers.23.attn.w_qkv.weight")
+blob 147601920 fp16 786432 f16(concat(0, mul(slice(qkv23, 0, 0, 512), 0.125), slice(qkv23, 0, 512, 1536)))
+blob 149174848 fp16 262144 f16(t("encoder.layers.23.attn.out_proj.weight"))
+blob 149699200 fp16 512 f16(t("encoder.layers.23.attn.out_proj.bias"))
+blob 149700288 fp16 512 f16(t("encoder.layers.23.norm2.weight"))
+blob 149701376 fp16 512 f16(t("encoder.layers.23.norm2.bias"))
+blob 149702464 fp16 1048576 f16(t("encoder.layers.23.ffn.net.0.weight"))
+blob 151799680 fp16 2048 f16(t("encoder.layers.23.ffn.net.0.bias"))
+blob 151803840 fp16 1048576 f16(t("encoder.layers.23.ffn.net.3.weight"))
+blob 153901056 fp16 512 f16(t("encoder.layers.23.ffn.net.3.bias"))
+blob 153902144 fp16 512 f16(t("encoder.layers.24.norm1.weight"))
+blob 153903232 fp16 512 f16(t("encoder.layers.24.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv24 = t("encoder.layers.24.attn.w_qkv.weight")
+blob 153904320 fp16 786432 f16(concat(0, mul(slice(qkv24, 0, 0, 512), 0.125), slice(qkv24, 0, 512, 1536)))
+blob 155477248 fp16 262144 f16(t("encoder.layers.24.attn.out_proj.weight"))
+blob 156001600 fp16 512 f16(t("encoder.layers.24.attn.out_proj.bias"))
+blob 156002688 fp16 512 f16(t("encoder.layers.24.norm2.weight"))
+blob 156003776 fp16 512 f16(t("encoder.layers.24.norm2.bias"))
+blob 156004864 fp16 1048576 f16(t("encoder.layers.24.ffn.net.0.weight"))
+blob 158102080 fp16 2048 f16(t("encoder.layers.24.ffn.net.0.bias"))
+blob 158106240 fp16 1048576 f16(t("encoder.layers.24.ffn.net.3.weight"))
+blob 160203456 fp16 512 f16(t("encoder.layers.24.ffn.net.3.bias"))
+blob 160204544 fp16 512 f16(t("encoder.layers.25.norm1.weight"))
+blob 160205632 fp16 512 f16(t("encoder.layers.25.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv25 = t("encoder.layers.25.attn.w_qkv.weight")
+blob 160206720 fp16 786432 f16(concat(0, mul(slice(qkv25, 0, 0, 512), 0.125), slice(qkv25, 0, 512, 1536)))
+blob 161779648 fp16 262144 f16(t("encoder.layers.25.attn.out_proj.weight"))
+blob 162304000 fp16 512 f16(t("encoder.layers.25.attn.out_proj.bias"))
+blob 162305088 fp16 512 f16(t("encoder.layers.25.norm2.weight"))
+blob 162306176 fp16 512 f16(t("encoder.layers.25.norm2.bias"))
+blob 162307264 fp16 1048576 f16(t("encoder.layers.25.ffn.net.0.weight"))
+blob 164404480 fp16 2048 f16(t("encoder.layers.25.ffn.net.0.bias"))
+blob 164408640 fp16 1048576 f16(t("encoder.layers.25.ffn.net.3.weight"))
+blob 166505856 fp16 512 f16(t("encoder.layers.25.ffn.net.3.bias"))
+blob 166506944 fp16 512 f16(t("encoder.layers.26.norm1.weight"))
+blob 166508032 fp16 512 f16(t("encoder.layers.26.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv26 = t("encoder.layers.26.attn.w_qkv.weight")
+blob 166509120 fp16 786432 f16(concat(0, mul(slice(qkv26, 0, 0, 512), 0.125), slice(qkv26, 0, 512, 1536)))
+blob 168082048 fp16 262144 f16(t("encoder.layers.26.attn.out_proj.weight"))
+blob 168606400 fp16 512 f16(t("encoder.layers.26.attn.out_proj.bias"))
+blob 168607488 fp16 512 f16(t("encoder.layers.26.norm2.weight"))
+blob 168608576 fp16 512 f16(t("encoder.layers.26.norm2.bias"))
+blob 168609664 fp16 1048576 f16(t("encoder.layers.26.ffn.net.0.weight"))
+blob 170706880 fp16 2048 f16(t("encoder.layers.26.ffn.net.0.bias"))
+blob 170711040 fp16 1048576 f16(t("encoder.layers.26.ffn.net.3.weight"))
+blob 172808256 fp16 512 f16(t("encoder.layers.26.ffn.net.3.bias"))
+blob 172809344 fp16 512 f16(t("encoder.layers.27.norm1.weight"))
+blob 172810432 fp16 512 f16(t("encoder.layers.27.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv27 = t("encoder.layers.27.attn.w_qkv.weight")
+blob 172811520 fp16 786432 f16(concat(0, mul(slice(qkv27, 0, 0, 512), 0.125), slice(qkv27, 0, 512, 1536)))
+blob 174384448 fp16 262144 f16(t("encoder.layers.27.attn.out_proj.weight"))
+blob 174908800 fp16 512 f16(t("encoder.layers.27.attn.out_proj.bias"))
+blob 174909888 fp16 512 f16(t("encoder.layers.27.norm2.weight"))
+blob 174910976 fp16 512 f16(t("encoder.layers.27.norm2.bias"))
+blob 174912064 fp16 1048576 f16(t("encoder.layers.27.ffn.net.0.weight"))
+blob 177009280 fp16 2048 f16(t("encoder.layers.27.ffn.net.0.bias"))
+blob 177013440 fp16 1048576 f16(t("encoder.layers.27.ffn.net.3.weight"))
+blob 179110656 fp16 512 f16(t("encoder.layers.27.ffn.net.3.bias"))
+blob 179111744 fp16 512 f16(t("encoder.layers.28.norm1.weight"))
+blob 179112832 fp16 512 f16(t("encoder.layers.28.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv28 = t("encoder.layers.28.attn.w_qkv.weight")
+blob 179113920 fp16 786432 f16(concat(0, mul(slice(qkv28, 0, 0, 512), 0.125), slice(qkv28, 0, 512, 1536)))
+blob 180686848 fp16 262144 f16(t("encoder.layers.28.attn.out_proj.weight"))
+blob 181211200 fp16 512 f16(t("encoder.layers.28.attn.out_proj.bias"))
+blob 181212288 fp16 512 f16(t("encoder.layers.28.norm2.weight"))
+blob 181213376 fp16 512 f16(t("encoder.layers.28.norm2.bias"))
+blob 181214464 fp16 1048576 f16(t("encoder.layers.28.ffn.net.0.weight"))
+blob 183311680 fp16 2048 f16(t("encoder.layers.28.ffn.net.0.bias"))
+blob 183315840 fp16 1048576 f16(t("encoder.layers.28.ffn.net.3.weight"))
+blob 185413056 fp16 512 f16(t("encoder.layers.28.ffn.net.3.bias"))
+blob 185414144 fp16 512 f16(t("encoder.layers.29.norm1.weight"))
+blob 185415232 fp16 512 f16(t("encoder.layers.29.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv29 = t("encoder.layers.29.attn.w_qkv.weight")
+blob 185416320 fp16 786432 f16(concat(0, mul(slice(qkv29, 0, 0, 512), 0.125), slice(qkv29, 0, 512, 1536)))
+blob 186989248 fp16 262144 f16(t("encoder.layers.29.attn.out_proj.weight"))
+blob 187513600 fp16 512 f16(t("encoder.layers.29.attn.out_proj.bias"))
+blob 187514688 fp16 512 f16(t("encoder.layers.29.norm2.weight"))
+blob 187515776 fp16 512 f16(t("encoder.layers.29.norm2.bias"))
+blob 187516864 fp16 1048576 f16(t("encoder.layers.29.ffn.net.0.weight"))
+blob 189614080 fp16 2048 f16(t("encoder.layers.29.ffn.net.0.bias"))
+blob 189618240 fp16 1048576 f16(t("encoder.layers.29.ffn.net.3.weight"))
+blob 191715456 fp16 512 f16(t("encoder.layers.29.ffn.net.3.bias"))
+blob 191716544 fp16 512 f16(t("encoder.layers.30.norm1.weight"))
+blob 191717632 fp16 512 f16(t("encoder.layers.30.norm1.bias"))
+# w_qkv with its query rows scaled by 1/sqrt(head_width) (exporter scaled_qkv)
+let qkv30 = t("encoder.layers.30.attn.w_qkv.weight")
+blob 191718720 fp16 786432 f16(concat(0, mul(slice(qkv30, 0, 0, 512), 0.125), slice(qkv30, 0, 512, 1536)))
+blob 193291648 fp16 262144 f16(t("encoder.layers.30.attn.out_proj.weight"))
+blob 193816000 fp16 512 f16(t("encoder.layers.30.attn.out_proj.bias"))
+blob 193817088 fp16 512 f16(t("encoder.layers.30.norm2.weight"))
+blob 193818176 fp16 512 f16(t("encoder.layers.30.norm2.bias"))
+blob 193819264 fp16 1048576 f16(t("encoder.layers.30.ffn.net.0.weight"))
+blob 195916480 fp16 2048 f16(t("encoder.layers.30.ffn.net.0.bias"))
+blob 195920640 fp16 1048576 f16(t("encoder.layers.30.ffn.net.3.weight"))
+blob 198017856 fp16 512 f16(t("encoder.layers.30.ffn.net.3.bias"))
+blob 198018944 fp16 512 f16(t("encoder.final_norm.weight"))
+blob 198020032 fp16 512 f16(t("encoder.final_norm.bias"))
+blob 198021120 fp16 98304 f16(t("encoder_proj.weight"))
+blob 198217792 fp16 192 f16(t("encoder_proj.bias"))
+blob 198218240 fp16 884736 f16(t("subpixel_upsample.weight"))
+blob 199987776 fp16 1536 f16(t("subpixel_upsample.bias"))
+blob 199990912 fp16 36864 f16(t("head.first_hidden_to_hidden.weight"))
+blob 200064704 fp16 192 f16(t("head.first_hidden_to_hidden.bias"))
+blob 200065152 fp16 1536 f16(neg(t("head.single_hidden_to_spks.weight")))
+# the speaker-head bias, negated for 1 / (1 + exp(-x)), is an inline constant of the spec
+patch 1146286 fp16 8 f16(neg(t("head.single_hidden_to_spks.bias")))
+end

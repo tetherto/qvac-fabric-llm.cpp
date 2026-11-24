@@ -63,6 +63,7 @@ endif()
 
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
 option(BUILD_LLAMA "Build, install LLAMA package artifacts as well." ON)
+option(FABRIC_BUILD_SPEECH "fabric: build the speech engines (engines/speech/) against the in-tree ggml" OFF)
 
 option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)
 
@@ -243,6 +244,13 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     set(GGML_BUILD_COMMIT ${LLAMA_BUILD_COMMIT})
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
+endif()
+
+if (FABRIC_BUILD_SPEECH)
+    if (SPEECH_BUILD_TESTS)
+        enable_testing()
+    endif()
+    add_subdirectory(engines/speech)
 endif()
 
 #

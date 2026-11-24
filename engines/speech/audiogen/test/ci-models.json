@@ -1,0 +1,35 @@
+{
+  "acestep": {
+    "repository": "Serveurperso/ACE-Step-1.5-GGUF",
+    "revision": "666ac70204440867d8c01ba4b119cc79c95b370a",
+    "files": {
+      "Qwen3-Embedding-0.6B-Q8_0.gguf": "972f23255e46adfe744a0eb9a0039f3c63988f65753b0968d776e8b27168c321",
+      "acestep-5Hz-lm-0.6B-Q8_0.gguf": "bdaf9e292d4470f31c19cafeaca1b74936a114667e3a85e5d33b65247e9908ec",
+      "acestep-v15-turbo-Q8_0.gguf": "288f708a61cfc241013a98a62f98ba331f83fe34d0d3559acdd9b0f6a2f7cd6b",
+      "vae-BF16.gguf": "0599862ac5d15cd308e1d2e368373aea6c02e25ebd1737ad4a4562a0901b0ef8"
+    }
+  },
+  "acestep-base": {
+    "repository": "Serveurperso/ACE-Step-1.5-GGUF",
+    "revision": "666ac70204440867d8c01ba4b119cc79c95b370a",
+    "files": {
+      "acestep-v15-base-Q8_0.gguf": "10329f321010cedc3571c24b6371d002ce49238f48be47def4a1c76bf27ee150"
+    }
+  },
+  "minimax-source": {
+    "repository": "Comfy-Org/MiniMax-Music-3",
+    "revision": "9e364ccd290a401561091fb441ed19cd7de92550",
+    "files": {
+      "diffusion_models/minimax_music3_dit_fp16.safetensors": "45494a2b6b69af115902ff28eaf54118d19067aa54da01000f3e3efce7ba0e34",
+      "text_encoders/minimax_music3_text_encoder_bf16.safetensors": "9805d045978ce917cd1e6327b5cd8b85df1a46e4c69b61c9acf3eb29891c3958",
+      "vae/minimax_music3_dav.safetensors": "2a32155b769be01445fcc2a8663b910fc9e1751e18dc1c3ec528064512d9ef0c"
+    }
+  },
+  "minimax-tokenizer": {
+    "repository": "MiniMaxAI/MiniMax-Music3",
+    "revision": "1b525ccb685ae809f33027c51c351eeb5833cf72",
+    "files": {
+      "qwen_7B/qwen3-8B-tokenizer-music/tokenizer.json": "bc63169ebf49c476995ced3f3dbae68f93ed9cf2a2997d3658863672f2f05f0f"
+    }
+  }
+}

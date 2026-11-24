@@ -1,0 +1,512 @@
+#pragma once
+
+// Library-internal declarations for the T3 (GPT-2 Medium autoregressive
+// text -> speech tokens) front-half of the Chatterbox pipeline.  Shared
+// between src/main.cpp (CLI) and src/chatterbox_engine.cpp (public engine
+// API under include/tts-cpp/chatterbox/engine.h).
+//
+// This header is NOT installed with the library (see CMakeLists.txt
+// install rules) — it's part of the implementation, not the public
+// surface.  Public consumers should use <tts-cpp/chatterbox/engine.h>.
+//
+// Everything lives in `tts_cpp::chatterbox::detail` so the library's
+// compiled object files do not export generic names like
+// `load_model_gguf` / `eval_prompt` / `g_log_verbose` into the global
+// linker namespace where they would collide with sibling ML libraries
+// (llama.cpp, whisper.cpp, stable-diffusion.cpp).
+
+#include <cstdint>
+#include <map>
+#include <random>
+#include <string>
+#include <vector>
+
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml.h"
+
+#include "sched_dispatch.h"
+
+struct gguf_context;
+
+namespace tts_cpp::chatterbox::detail {
+
+constexpr int CHBX_MAX_NODES = 8192;
+
+constexpr const char * KEY_VARIANT           = "chatterbox.variant";
+constexpr const char * KEY_TEXT_VOCAB_SIZE   = "chatterbox.text_vocab_size";
+constexpr const char * KEY_SPEECH_VOCAB_SIZE = "chatterbox.speech_vocab_size";
+constexpr const char * KEY_START_SPEECH      = "chatterbox.start_speech_token";
+constexpr const char * KEY_STOP_SPEECH       = "chatterbox.stop_speech_token";
+constexpr const char * KEY_SPEAKER_EMBED     = "chatterbox.speaker_embed_size";
+constexpr const char * KEY_LAYER_NORM_EPS    = "chatterbox.layer_norm_eps";
+constexpr const char * KEY_COND_PROMPT_LEN   = "chatterbox.cond_prompt_length";
+constexpr const char * KEY_N_CTX             = "chatterbox.n_ctx";
+constexpr const char * KEY_N_EMBD            = "chatterbox.n_embd";
+constexpr const char * KEY_N_HEAD            = "chatterbox.n_head";
+constexpr const char * KEY_N_LAYER           = "chatterbox.n_layer";
+
+constexpr const char * KEY_N_KV_HEAD         = "chatterbox.n_kv_head";
+constexpr const char * KEY_HEAD_DIM          = "chatterbox.head_dim";
+constexpr const char * KEY_INTERMEDIATE_SIZE = "chatterbox.intermediate_size";
+constexpr const char * KEY_RMS_EPS           = "chatterbox.rms_norm_eps";
+constexpr const char * KEY_ROPE_THETA        = "chatterbox.rope_theta";
+constexpr const char * KEY_ROPE_SCALING_TYPE = "chatterbox.rope.scaling_type";
+constexpr const char * KEY_ROPE_SCALING_FACTOR = "chatterbox.rope.scaling_factor";
+constexpr const char * KEY_ROPE_LOW_FREQ     = "chatterbox.rope.low_freq_factor";
+constexpr const char * KEY_ROPE_HIGH_FREQ    = "chatterbox.rope.high_freq_factor";
+constexpr const char * KEY_ROPE_ORIG_MAX_POS = "chatterbox.rope.original_max_position";
+constexpr const char * KEY_MAX_TEXT_TOKENS   = "chatterbox.max_text_tokens";
+constexpr const char * KEY_MAX_SPEECH_TOKENS = "chatterbox.max_speech_tokens";
+constexpr const char * KEY_SPEECH_COND_LEN   = "chatterbox.speech_cond_prompt_len";
+constexpr const char * KEY_PERCEIVER_QUERIES = "chatterbox.perceiver_query_tokens";
+constexpr const char * KEY_PERCEIVER_HEADS   = "chatterbox.perceiver_num_heads";
+constexpr const char * KEY_EMOTION_ADV       = "chatterbox.emotion_adv";
+constexpr const char * KEY_START_TEXT        = "chatterbox.start_text_token";
+constexpr const char * KEY_STOP_TEXT         = "chatterbox.stop_text_token";
+
+enum chatterbox_variant {
+    CHBX_VARIANT_TURBO = 0,
+    CHBX_VARIANT_MTL   = 1,
+};
+
+struct chatterbox_hparams {
+    chatterbox_variant variant = CHBX_VARIANT_TURBO;
+
+    int32_t n_text_vocab       = 0;
+    int32_t n_speech_vocab     = 0;
+    int32_t start_speech_token = 0;
+    int32_t stop_speech_token  = 0;
+    int32_t start_text_token   = 0;
+    int32_t stop_text_token    = 0;
+    int32_t n_ctx              = 0;
+    int32_t n_embd             = 0;
+    int32_t n_head             = 0;
+    int32_t n_kv_head          = 0;
+    int32_t head_dim           = 0;
+    int32_t intermediate_size  = 0;
+    int32_t n_layer            = 0;
+    int32_t speaker_embed_size = 0;
+    int32_t cond_prompt_len    = 0;
+    int32_t max_text_tokens    = 0;
+    int32_t max_speech_tokens  = 0;
+    int32_t speech_cond_prompt_len = 0;
+    int32_t perceiver_queries  = 0;
+    int32_t perceiver_heads    = 0;
+    bool    emotion_adv        = false;
+
+    float   eps                = 1e-5f;
+    float   rope_theta         = 10000.0f;
+    float   rope_scale_factor  = 1.0f;
+    float   rope_low_freq      = 1.0f;
+    float   rope_high_freq     = 4.0f;
+    int32_t rope_orig_max_pos  = 8192;
+
+    // KV-cache storage type (host-selected, not a GGUF property).  The
+    // cache slab uses a token-major layout — one ggml_row_size(kv_type,
+    // head_dim * n_kv_head) row per cached position — so the per-step
+    // append is a CONTIGUOUS view and ggml_cpy can quantise on write
+    // (ggml-cpu's dup→quantized path aborts on non-contiguous dst).
+    // ggml_flash_attn_ext reads f16/q8_0 K/V natively on CPU + Metal.
+    ggml_type kv_type = GGML_TYPE_F32;
+};
+
+// Map an EngineOptions/CLI kv-cache-type string to a ggml type.
+// Accepts "f32" (or empty), "f16", "q8_0"; anything else falls back to
+// F32 with a warning so a typo can't silently change numerics.
+ggml_type chatterbox_kv_type_from_str(const std::string & s);
+
+// Resolve the effective KV-cache dtype for `backend`: returns `requested`
+// when the backend's flash-attention accepts K/V of that type at the given
+// head geometry, else falls back to GGML_TYPE_F32 with a stderr warning
+// (so an f16/q8_0 request can't assert deep inside an unsupporting backend).
+ggml_type chatterbox_resolve_kv_type(ggml_backend_t backend, ggml_type requested,
+                                     int head_dim, int n_head, int n_kv_head);
+
+// MTL-variant resolve: chatterbox_resolve_kv_type plus a probe of the extra
+// quantized-cache op the multilingual decode graph emits — the alignment
+// probe's dequantizing cast of a strided q8 K-cache view to f32
+// (build_llama_block).  Returns f32 when the backend can't encode that cast, so
+// q8 KV stays enabled on backends that support it (Metal) and safely degrades on
+// those that don't, without the single-backend MTL graph SIGABRT'ing at compute.
+ggml_type chatterbox_mtl_resolve_kv_type(ggml_backend_t backend, ggml_type requested,
+                                         int head_dim, int n_head, int n_kv_head);
+
+// Pure decision behind chatterbox_mtl_resolve_kv_type's cross-backend safety net,
+// exposed for unit testing: returns GGML_TYPE_F32 when `resolved` is quantized
+// and the backend cannot encode the align-probe's strided q8->f32 cast, else
+// returns `resolved` unchanged.
+ggml_type chatterbox_mtl_kv_type_for_cast_support(ggml_type resolved, bool cast_supported);
+
+struct gpt2_layer {
+    ggml_tensor * ln_1_g = nullptr;
+    ggml_tensor * ln_1_b = nullptr;
+    ggml_tensor * ln_2_g = nullptr;
+    ggml_tensor * ln_2_b = nullptr;
+
+    ggml_tensor * c_attn_attn_w = nullptr;
+    ggml_tensor * c_attn_attn_b = nullptr;
+    ggml_tensor * c_attn_proj_w = nullptr;
+    ggml_tensor * c_attn_proj_b = nullptr;
+
+    ggml_tensor * c_mlp_fc_w   = nullptr;
+    ggml_tensor * c_mlp_fc_b   = nullptr;
+    ggml_tensor * c_mlp_proj_w = nullptr;
+    ggml_tensor * c_mlp_proj_b = nullptr;
+};
+
+struct llama_layer {
+    ggml_tensor * ln_attn_g = nullptr;
+    ggml_tensor * ln_mlp_g  = nullptr;
+
+    ggml_tensor * wq = nullptr;
+    ggml_tensor * wk = nullptr;
+    ggml_tensor * wv = nullptr;
+    ggml_tensor * wo = nullptr;
+
+    ggml_tensor * mlp_gate = nullptr;
+    ggml_tensor * mlp_up   = nullptr;
+    ggml_tensor * mlp_down = nullptr;
+
+    // Phase 15 fused-matmul stack for the Metal hot path. Allocated in
+    // a dedicated persistent buffer at load time; data is memcpy'd in
+    // from the per-tensor wq / wk / wv GGUF tensors which keep their
+    // own backing storage in the weights buffer.
+    //
+    //   wqkv : shape [n_embd, 3 * n_embd]   (Q rows ‖ K rows ‖ V rows)
+    //
+    // Stacking lets each Llama block run ONE Q4_0 mat-mul where it
+    // previously ran three. On a 30-layer × 84-token T3 step pass
+    // that's 30 * 84 * 2 ≈ 5k fewer kernel launches per call inside
+    // each command-buffer commit; the combined mat-mul is also a
+    // wider M dim (3072 vs 1024) which lets ggml-metal's mul_mm tile
+    // (NR0 = 64 row, NR1 = 32 col) saturate better on the tile loop.
+    //
+    // gate / up are NOT stacked: the multilingual T3 GGUF ships
+    // mlp_gate as F16 and mlp_up as Q4_0, and a single ggml_tensor
+    // can't hold mixed element widths.
+    ggml_tensor * wqkv = nullptr;
+};
+
+struct perceiver_weights {
+    ggml_tensor * pre_attention_query = nullptr;
+    ggml_tensor * norm_g = nullptr;
+    ggml_tensor * norm_b = nullptr;
+    ggml_tensor * to_q_w = nullptr;
+    ggml_tensor * to_q_b = nullptr;
+    ggml_tensor * to_k_w = nullptr;
+    ggml_tensor * to_k_b = nullptr;
+    ggml_tensor * to_v_w = nullptr;
+    ggml_tensor * to_v_b = nullptr;
+    ggml_tensor * proj_out_w = nullptr;
+    ggml_tensor * proj_out_b = nullptr;
+};
+
+struct chatterbox_model {
+    chatterbox_hparams hparams;
+
+    // GPU present but declined by policy (vendor outside validated allowlist, e.g. Mali),
+    // so we fell back to CPU. Set via init_backend() out-param; read by Engine::gpu_unsupported().
+    bool gpu_unsupported = false;
+
+    ggml_tensor * wpe              = nullptr;
+    ggml_tensor * ln_f_g           = nullptr;
+    ggml_tensor * ln_f_b           = nullptr;
+    ggml_tensor * text_emb         = nullptr;
+    ggml_tensor * speech_emb       = nullptr;
+    ggml_tensor * speech_head      = nullptr;
+    ggml_tensor * speech_head_bias = nullptr;
+    ggml_tensor * cond_spkr_w      = nullptr;
+    ggml_tensor * cond_spkr_b      = nullptr;
+
+    ggml_tensor * text_pos_emb     = nullptr;
+    ggml_tensor * speech_pos_emb   = nullptr;
+    ggml_tensor * text_head        = nullptr;
+    ggml_tensor * norm_g           = nullptr;
+    ggml_tensor * emotion_adv_w    = nullptr;
+    ggml_tensor * rope_freq_factors = nullptr;
+
+    perceiver_weights perceiver;
+
+    ggml_tensor * builtin_speaker_emb        = nullptr;
+    ggml_tensor * builtin_cond_prompt_tokens = nullptr;
+
+    std::vector<gpt2_layer>  layers;
+    std::vector<llama_layer> layers_mtl;
+
+    // KV cache.
+    //
+    // Turbo (GPT-2 Medium) variant: memory_k / memory_v are sized
+    // `head_dim * n_kv_head * n_ctx * n_layer` (single batch).
+    //
+    // Multilingual (Llama-520M) variant: memory_k / memory_v hold the
+    // CFG cond+uncond pair packed into a single backing buffer, size
+    // `2 * head_dim * n_kv_head * n_ctx * n_layer` (B=2). The two halves
+    // are interleaved per-layer so each Llama block reads from one
+    // contiguous 2*kv_layer_elems region: layout per layer is
+    //   [cond:  head_dim, n_ctx, n_kv_head] [uncond: head_dim, n_ctx, n_kv_head]
+    // Layer-offset stride is therefore `2 * kv_layer_elems * sizeof(F)`.
+    // Picking the cond half is `b_offset_elems = 0`; uncond is
+    // `b_offset_elems = kv_layer_elems` (one batch's worth, applied as a
+    // per-layer offset). The B=2 batched step+prompt graphs pack both
+    // batches into the same view via ne[3]=2 + per-batch stride.
+    //
+    // The unified buffer means the existing two-call (B=1) cond/uncond
+    // CPU path keeps using memory_k/memory_v unchanged; it just selects
+    // the right half via `b_offset_elems`. memory_k_uncond / memory_v_uncond
+    // are no longer separate allocations; kept here as nullable view aliases
+    // for legacy call-sites that haven't been migrated.
+    ggml_tensor * memory_k = nullptr;
+    ggml_tensor * memory_v = nullptr;
+
+    ggml_tensor * memory_k_uncond = nullptr;
+    ggml_tensor * memory_v_uncond = nullptr;
+
+    ggml_context * ctx_w  = nullptr;
+    ggml_context * ctx_kv = nullptr;
+
+    ggml_backend_t backend = nullptr;
+
+    ggml_backend_buffer_t buffer_w  = nullptr;
+    ggml_backend_buffer_t buffer_kv = nullptr;
+
+    // Phase 15 stacked fused-matmul weights (wqkv per layer) live in
+    // their own backend buffer. Empty on the CPU backend; the CPU path
+    // uses the original wq/wk/wv directly.
+    //
+    // The buffer is registered in a process-wide t3_stack_registry
+    // (see src/t3_mtl.cpp) so an atexit hook can free it before
+    // Metal's static device destructors run, which otherwise asserts
+    // on `[rsets->data count] == 0` because residency sets stay
+    // referenced through buffer_stack. main()'s explicit free_t3()
+    // calls t3_stack_unregister() before freeing the backend so
+    // error-path early-returns don't double-free at exit.
+    ggml_context *        ctx_stack    = nullptr;
+    ggml_backend_buffer_t buffer_stack = nullptr;
+
+    ggml_context *        ctx_override    = nullptr;
+    ggml_backend_buffer_t buffer_override = nullptr;
+
+    std::map<std::string, ggml_tensor *> tensors;
+
+    std::vector<std::string> tok_tokens;
+    std::vector<std::string> tok_merges;
+
+    std::string mtl_tokenizer_json;
+    std::vector<std::string> mtl_languages;
+
+    // Lazily-created [backend, CPU-last] scheduler used by the eval
+    // functions when the primary backend cannot run every op of a graph
+    // (per-op CPU fallback instead of a backend assert).  `mutable`
+    // because the eval functions take `const chatterbox_model &` — the
+    // exact precedent of S3Gen's model_ctx::{cpu_backend, sched}.
+    // Freed via sched_fallback_free BEFORE ggml_backend_free(backend)
+    // at every teardown site (same ordering contract as t3_release_caches).
+    mutable tts_cpp::detail::sched_fallback sched_fb;
+};
+
+struct chatterbox_sampling_params {
+    int32_t top_k          = 1000;
+    float   top_p          = 0.95f;
+    float   temp           = 0.8f;
+    float   repeat_penalty = 1.2f;
+    float   min_p          = 0.0f;
+    float   cfg_weight     = 0.0f;
+};
+
+// `backend` names an explicit device ("cpu", "opencl", "hexagon" or an exact
+// ggml device name); it overrides n_gpu_layers and throws when unavailable.
+// Empty or "auto" keeps the n_gpu_layers walk.
+ggml_backend_t init_backend(int n_gpu_layers, bool * out_gpu_unsupported = nullptr,
+                            const std::string & backend = {});
+
+// Throws when `model.backend` is Hexagon and the T3 GGUF holds a weight type
+// HTP cannot multiply (see tts_cpp::detail::hexagon_runs_weight_type), freeing
+// that backend first.
+void t3_require_hexagon_weight_types(chatterbox_model & model, const gguf_context * g,
+                                     const std::string & path);
+
+// Dual-path dispatch shared by the Turbo (main.cpp) and MTL (t3_mtl.cpp)
+// eval functions; implemented in main.cpp on top of src/sched_dispatch.h.
+//
+// t3_use_sched: read-only decision — true when the primary backend cannot
+// run every op of `gf` (or TTS_CPP_FORCE_SCHED is set).  Safe to probe
+// cached graphs.  NOTE: a cached graph must NOT be fed to the sched path
+// (ggml_backend_sched_alloc_graph rewrites node->src[] in place); when this
+// returns true for a cached graph, rebuild the graph fresh first.
+bool t3_use_sched(const chatterbox_model & model, const ggml_cgraph * gf);
+
+// t3_sched_prepare: guard + lazy sched creation + reset/alloc for the sched
+// path.  Logs and returns false on failure (callers return false in turn).
+// Callers set input data AFTER this, as on the gallocr path.
+bool t3_sched_prepare(const chatterbox_model & model, ggml_cgraph * gf,
+                      const char * caller);
+
+// t3_dispatch_compute: run `gf` on the path chosen above, check the
+// backend's ggml_status and log a "<caller>: graph compute failed" line on
+// failure (with n_past when >= 0, for the per-step sites).  Returns false
+// on any non-SUCCESS status so call sites reduce to a single early return.
+bool t3_dispatch_compute(const chatterbox_model & model, ggml_cgraph * gf,
+                         int n_threads, bool use_sched,
+                         const char * caller, int n_past = -1);
+
+// ── Memory-fit measurement (include/tts-cpp/chatterbox/fit.h) ──────────────
+// When a t3_load_measure pointer is passed to the loaders, the load is
+// metadata-only: same variant peek, hparam reads, backend + KV-type
+// resolution and tensor wiring, but every allocation the real path makes is
+// SIZED into the measure struct instead of performed and no tensor data is
+// read.  Weight / KV / wqkv-stack tensors come back marked externally
+// allocated (dummy non-null data, the same trick ggml's own measure paths
+// use) so graph pricing excludes them; a model loaded this way must never
+// have tensor data read or written, and must only be used to build graphs
+// for size-only pricing.
+struct t3_load_measure {
+    size_t weights_bytes = 0;  // buffer_w (MTL: incl. the local rope_freq_factors)
+    size_t kv_bytes      = 0;  // buffer_kv at the resolved kv_type / n_ctx
+    size_t stack_bytes   = 0;  // MTL fused wqkv stack (non-CPU backends only)
+};
+
+// Mark every unallocated tensor in `ctx` externally allocated (dummy non-null
+// data) so graph pricing over a metadata-only model excludes it; defined in
+// main.cpp, shared with t3_mtl.cpp.
+void t3_mark_externally_allocated(ggml_context * ctx);
+
+bool load_model_gguf(
+    const std::string & path,
+    chatterbox_model &  model,
+    int                 requested_ctx,
+    int                 n_gpu_layers,
+    ggml_type           kv_type = GGML_TYPE_F32,
+    t3_load_measure *   measure = nullptr,
+    const std::string & backend = {});
+
+// Price the T3 compute arena for one synthesis: the prompt graph at
+// n_text_tokens and the deepest decode-step graph at n_past, through the
+// same dual-path dispatch (Engine::Impl::allocr vs the [backend, CPU-last]
+// scheduler) eval_prompt/eval_step allocate with.  The two graphs share one
+// allocator, so the resident figure is the max of the two on each side.
+// Variant-dispatching (Turbo B=1 / MTL B=2 on GPU / MTL B=1 on CPU).
+// Returns false on a pricing failure.
+bool t3_measure_compute(const chatterbox_model & model, int n_text_tokens, int n_past,
+                        uint64_t & device_bytes, uint64_t & host_bytes);
+
+// MTL half of t3_measure_compute; implemented in t3_mtl.cpp next to the
+// graph builders it prices.
+bool t3_measure_compute_mtl(const chatterbox_model & model, int n_text_tokens, int n_past,
+                            uint64_t & device_bytes, uint64_t & host_bytes);
+
+bool eval_prompt(
+    const chatterbox_model &     model,
+    ggml_gallocr_t               allocr,
+    int                          n_threads,
+    const std::vector<int32_t> & text_tokens,
+    std::vector<float> &         logits_out,
+    int &                        prompt_len);
+
+bool eval_step(
+    const chatterbox_model & model,
+    ggml_gallocr_t           allocr,
+    int                      n_threads,
+    int                      n_past,
+    int32_t                  token,
+    std::vector<float> &     logits_out);
+
+int32_t sample_next_token_ex(
+    const std::vector<float> &          logits,
+    const std::vector<int32_t> &        generated,
+    const chatterbox_sampling_params &  params,
+    std::mt19937 &                      rng);
+
+void chatterbox_log_cb(ggml_log_level level, const char * text, void * ud);
+
+extern int g_log_verbose;
+
+bool compute_prompt_feat_native(
+    const std::string &  wav_path,
+    const std::string &  s3gen_gguf,
+    std::vector<float> & prompt_feat,
+    int &                prompt_feat_rows,
+    bool                 verbose);
+
+bool compute_embedding_native(
+    const std::string &  wav_path,
+    const std::string &  s3gen_gguf,
+    std::vector<float> & embedding,
+    ggml_backend_t       backend,
+    bool                 verbose);
+
+bool compute_speech_tokens_native(
+    const std::string &    wav_path,
+    const std::string &    s3gen_gguf,
+    int                    max_cond_tokens,
+    std::vector<int32_t> & prompt_token,
+    std::vector<int32_t> & cond_prompt_tokens,
+    int                    n_threads,
+    ggml_backend_t         backend,
+    bool                   verbose);
+
+bool validate_reference_audio(const std::string & path);
+
+// Backend for the reference-audio frontend (S3TokenizerV2, CAMPPlus): the T3
+// backend, except nullptr (their own CPU backend) when T3 runs on Hexagon,
+// whose graphs these one-time stages were never validated on.
+ggml_backend_t voice_frontend_backend(ggml_backend_t t3_backend);
+
+bool load_model_gguf_mtl(
+    const std::string & path,
+    chatterbox_model &  model,
+    int                 requested_ctx,
+    int                 n_gpu_layers,
+    ggml_type           kv_type = GGML_TYPE_F32,
+    t3_load_measure *   measure = nullptr,
+    const std::string & backend = {});
+
+bool eval_prompt_mtl(
+    const chatterbox_model &     model,
+    ggml_gallocr_t               allocr,
+    int                          n_threads,
+    const std::vector<int32_t> & text_tokens,
+    float                        exaggeration,
+    std::vector<float> &         logits_cond_out,
+    std::vector<float> &         logits_uncond_out,
+    int &                        prompt_len);
+
+bool eval_step_mtl(
+    const chatterbox_model & model,
+    ggml_gallocr_t           allocr,
+    int                      n_threads,
+    int                      n_past,
+    int32_t                  token,
+    std::vector<float> &     logits_cond_out,
+    std::vector<float> &     logits_uncond_out);
+
+// Release every persistent T3-side cache held in this translation
+// unit (currently the round-4 step-graph cache).  Idempotent.
+//
+// Production callers (CLI free_t3 lambda, Engine::Impl::free_model)
+// MUST call this BEFORE `ggml_backend_free(model.backend)` because
+// the cached gallocators carry backend references; freeing them
+// against a freed backend would assert inside ggml-metal /
+// ggml-vulkan / ggml-cuda dylib finalisers.
+void t3_release_caches();
+
+// On a degenerate logits distribution (everything -inf after the sampling
+// cascade), returns `stop_token` so the caller's stop check fires cleanly
+// instead of emitting a pseudo-random in-vocab id.  Pass
+// `model.hparams.stop_speech_token` from the speech-decode loop.
+// `suppress_stop_token` (Phase 2): when true, the stop token's
+// (CFG-combined) logit is forced to -inf before the sampling cascade so it
+// cannot be drawn this step.  The alignment analyzer sets this while the text
+// is still being spoken (alignment has not reached the end), preventing the
+// model from truncating the utterance early (the "dropped first/last word /
+// near-empty output" failure mode on out-of-distribution cloned voices).
+int32_t sample_next_token_mtl(
+    const std::vector<float> &         logits_cond,
+    const std::vector<float> &         logits_uncond,
+    const std::vector<int32_t> &       generated,
+    const chatterbox_sampling_params & params,
+    std::mt19937 &                     rng,
+    int32_t                            stop_token,
+    bool                               suppress_stop_token = false);
+
+} // namespace tts_cpp::chatterbox::detail

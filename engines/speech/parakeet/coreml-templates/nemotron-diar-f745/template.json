@@ -1,0 +1,180 @@
+{
+  "schema": 1,
+  "id": "nemotron-diar-f745",
+  "family": "nemotron-diarization",
+  "stage": "diarizer-745",
+  "exporter": {
+    "path": "parakeet/scripts/export-nemotron-diarization-coreml.py",
+    "sha256": "4680d0764a8870c719529901b054bce4d136a9fe35dca03d55334dc3e520a934",
+    "args": [
+      "--gguf",
+      "{gguf}",
+      "--frames",
+      "745",
+      "--out-dir",
+      "{out}"
+    ]
+  },
+  "min_os": {
+    "macos": "15.0"
+  },
+  "multifunction_ane": false,
+  "default_compute_units": "cpu_and_ane",
+  "export_kind": "nemotron-diarizer-v1",
+  "pad_safe": false,
+  "match": {
+    "architecture": "sortformer",
+    "metadata": {
+      "sortformer.version": "v3",
+      "sortformer.encoder.type": "transformer_rope",
+      "sortformer.encoder.subsampling_type": "feature_stacking",
+      "sortformer.encoder.rotary_fraction": 1.0,
+      "sortformer.encoder.rope_base": 10000.0,
+      "sortformer.encoder.d_model": 512,
+      "sortformer.encoder.n_heads": 8,
+      "sortformer.encoder.n_layers": 31,
+      "sortformer.encoder.subsampling_factor": 8,
+      "sortformer.preprocessor.features": 128,
+      "sortformer.transformer.hidden_size": 192,
+      "sortformer.num_speakers": 8
+    }
+  },
+  "literals": [
+    {
+      "id": "rotate_half",
+      "dtype": "fp16",
+      "shape": [
+        512,
+        64
+      ],
+      "exporter_blob": 2628160,
+      "offset": 0
+    },
+    {
+      "id": "rope_cos",
+      "dtype": "fp16",
+      "shape": [
+        1,
+        512,
+        1,
+        745
+      ],
+      "exporter_blob": 2693760,
+      "offset": 65536
+    },
+    {
+      "id": "rope_sin",
+      "dtype": "fp16",
+      "shape": [
+        1,
+        512,
+        1,
+        745
+      ],
+      "exporter_blob": 3456704,
+      "offset": 828416
+    }
+  ],
+  "toolchain": {
+    "coremltools": "9.0",
+    "torch": "2.7.0",
+    "numpy": "1.26.4"
+  },
+  "functions": [
+    {
+      "name": "main",
+      "inputs": [
+        {
+          "name": "features",
+          "dtype": "fp32",
+          "shape": [
+            745,
+            1024
+          ]
+        },
+        {
+          "name": "cache",
+          "dtype": "fp32",
+          "shape": [
+            745,
+            512
+          ]
+        },
+        {
+          "name": "valid_mask",
+          "dtype": "fp32",
+          "shape": [
+            745
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "probabilities",
+          "dtype": "fp32",
+          "shape": [
+            5960,
+            8
+          ]
+        },
+        {
+          "name": "embeddings",
+          "dtype": "fp32",
+          "shape": [
+            745,
+            512
+          ]
+        }
+      ]
+    }
+  ],
+  "stateful": false,
+  "weight_bin_size": 200068288,
+  "patches": [
+    {
+      "spec_offset": 1146286,
+      "len": 16,
+      "sentinel_hex": "9c2a579423dc63f38d22cf41d5a509f1"
+    }
+  ],
+  "shareable": true,
+  "state_bytes": 0,
+  "expected_warm_load_ms": {
+    "main": 0
+  },
+  "memory": {
+    "runtime_weight_bytes": 131061432,
+    "workspace_bytes": 0,
+    "compile_peak_bytes": 95420416,
+    "ane_compile_reserve_bytes": 824180736,
+    "load_peak_bytes": {
+      "cpu_and_ane": 126877696,
+      "all": null,
+      "cpu_and_gpu": null,
+      "cpu_only": null
+    },
+    "margin": 1.0,
+    "coreml_bound": "measured",
+    "validated_for": [
+      {
+        "units": "cpu_and_ane",
+        "os": "27.2.1",
+        "chip": "M2"
+      },
+      {
+        "units": "cpu_and_ane",
+        "os": "26.7.2",
+        "chip": "M4 Max"
+      }
+    ],
+    "measured": {
+      "margin": 1.25,
+      "runs": 34,
+      "resident_bytes": 143654912,
+      "basis": "Each constant is 1.25 x the largest value measured over every overlapped generated-schedule run on the validated_for hosts, rounded up to 1 MiB, so the envelope's own margin is 1.0: the prepare charge (generation_peak_bytes + 8 MiB + compile_peak_bytes) covers the prepare from the start of a capacity's generation to the end of its compile; load_peak_bytes.cpu_and_ane the load and warm increment; the resident part (runtime_weight_bytes + 2 x I/O + workspace_bytes, with workspace_bytes 0) the step in the process's settled footprint when a capacity becomes ready, which on cpu_and_ane holds no copy of the fp16 weights (the Neural Engine keeps them outside the process); and ane_compile_reserve_bytes ANECompilerService's growth during the loads over its size before them"
+    }
+  },
+  "prefer_ggml_on": [],
+  "provided": [],
+  "generation_peak_bytes": 9437184
+}

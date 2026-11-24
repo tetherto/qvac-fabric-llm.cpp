@@ -1,0 +1,295 @@
+#include "detok_ggml.h"
+
+#include "fit_measure.h"
+#include "qwen3_block.h"  // shared Qwen3 loaders + builders + DitGGUF IO
+
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-cpu.h"
+
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+// ACE-Step FSQ detokenizer. Port from acestep.cpp/src/fsq-detok.h.
+
+namespace tts_cpp::acestep {
+
+static constexpr int DETOK_H     = 2048;
+static constexpr int FSQ_NDIMS   = 6;
+static constexpr int POOL        = 5;  // each 5Hz token -> 5 frames @ 25Hz
+static const int     FSQ_LEVELS[FSQ_NDIMS] = { 8, 8, 8, 5, 5, 5 };
+
+// FSQ decode: integer index -> 6 normalized floats in [-1, 1].
+void fsq_decode_index(int index, float * out) {
+    int stride = 1;
+    for (int d = 0; d < FSQ_NDIMS; d++) {
+        int   L         = FSQ_LEVELS[d];
+        int   level_idx = (index / stride) % L;
+        float half_L    = (float) (L - 1) / 2.0f;
+        out[d]          = (float) level_idx / half_L - 1.0f;
+        stride *= L;
+    }
+}
+
+static Qwen3Config detok_config() {
+    Qwen3Config c;
+    c.hidden_size       = 2048;
+    c.intermediate_size = 6144;
+    c.n_heads           = 16;
+    c.n_kv_heads        = 8;
+    c.head_dim          = 128;
+    c.n_layers          = 2;
+    c.rope_theta        = 1000000.0f;
+    c.rms_norm_eps      = 1e-6f;
+    c.is_causal         = false;
+    return c;
+}
+
+struct DetokModel {
+    ggml_backend_t        backend    = nullptr;  // borrowed
+    ggml_context *        weight_ctx = nullptr;
+    ggml_backend_buffer_t weight_buf = nullptr;
+
+    Qwen3Config             cfg;
+    std::vector<Qwen3Layer> layers;
+
+    ggml_tensor * fsq_proj_w  = nullptr;  // [2048, 6]
+    ggml_tensor * fsq_proj_b  = nullptr;  // [2048] F32
+    ggml_tensor * embed_w     = nullptr;  // [2048, 2048]
+    ggml_tensor * embed_b     = nullptr;  // [2048] F32
+    ggml_tensor * special_tok = nullptr;  // [2048, 5]
+    ggml_tensor * norm        = nullptr;  // [2048] F32
+    ggml_tensor * proj_out_w  = nullptr;  // [64, 2048]
+    ggml_tensor * proj_out_b  = nullptr;  // [64] F32
+
+    // CPU map-in-place: verbatim weights backed by `gguf`'s mmap via `map_buf`.
+    DitGGUF               gguf;
+    ggml_backend_buffer_t map_buf = nullptr;
+    bool                  mapped  = false;
+    size_t                mapped_bytes = 0;  // sum of mmapped weight nbytes
+
+    bool   measuring          = false;  // metadata-only load: weights sized, never read
+    size_t last_compute_bytes = 0;      // gallocr buffer of the most recent real decode
+};
+
+// Shared body of detok_model_load and detok_model_load_metadata_only. When
+// `measure` is non-null the load is metadata-only: the weight allocation is
+// sized into `measure` instead of performed and no tensor data is read.
+static DetokModel * detok_model_load_impl(const std::string & path, ggml_backend_t backend, bool verbose,
+                                          AcestepStageMeasure * measure) {
+    DitGGUF g;
+    if (!dit_gguf_open(g, path)) {
+        fprintf(stderr, "[acestep-detok] failed to parse %s\n", path.c_str());
+        return nullptr;
+    }
+    dit_gguf_require_hexagon_weights(g, path, backend, "acestep-detok");
+
+    DetokModel * m = new DetokModel();
+    m->backend     = backend;
+    m->cfg         = detok_config();
+    m->layers.resize(m->cfg.n_layers);
+
+    // CPU backend: map the quantised weights straight off the mmap (no dirty RAM).
+    const bool            mapped  = dit_gguf_backend_maps_weights(backend);
+    ggml_backend_buffer_t map_buf = mapped ? dit_gguf_cpu_map_buffer(g) : nullptr;
+
+    const size_t n_tensors = (size_t) m->cfg.n_layers * 11 + 12;
+    ggml_init_params ip{ ggml_tensor_overhead() * n_tensors, nullptr, /*no_alloc=*/true };
+    m->weight_ctx      = ggml_init(ip);
+    ggml_context * ctx = m->weight_ctx;
+
+    // fsq_proj_w (BF16 [6,2048]) and special_tokens (quantised [2048,5]) are tiny
+    // auxiliary tensors, not GEMM weights. Materialising them as F32 at load costs
+    // ~64 KB, is exact (BF16 widening / the same dequantiser ggml_cast would run),
+    // and drops two element types no GPU backend is obliged to implement -- the
+    // graph's q3_as_f32 then folds away instead of re-dequantising every frame.
+    m->fsq_proj_w  = q3_create_f32_like(ctx, g, "tokenizer.quantizer.project_out.weight");
+    m->fsq_proj_b  = q3_create_f32_like(ctx, g, "tokenizer.quantizer.project_out.bias");
+    m->embed_w     = q3_create_like(ctx, g, "detokenizer.embed_tokens.weight", map_buf);
+    m->embed_b     = q3_create_f32_like(ctx, g, "detokenizer.embed_tokens.bias");
+    m->special_tok = q3_create_f32_like(ctx, g, "detokenizer.special_tokens");
+    m->norm        = q3_create_f32_like(ctx, g, "detokenizer.norm.weight");
+    m->proj_out_w  = q3_create_like(ctx, g, "detokenizer.proj_out.weight", map_buf);
+    m->proj_out_b  = q3_create_f32_like(ctx, g, "detokenizer.proj_out.bias");
+    for (int i = 0; i < m->cfg.n_layers; i++) {
+        q3_create_layer(ctx, g, "detokenizer.layers." + std::to_string(i), m->layers[i], map_buf);
+    }
+
+    if (measure) {
+        measure->weights_alloc_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            ctx, dit_gguf_weight_buffer_type(backend));
+        m->measuring = true;
+    } else {
+        m->weight_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, dit_gguf_weight_buffer_type(backend));
+        if (!m->weight_buf) {
+            fprintf(stderr, "[acestep-detok] failed to allocate weight buffer\n");
+            if (map_buf) ggml_backend_buffer_free(map_buf);
+            ggml_free(ctx);
+            dit_gguf_close(g);
+            delete m;
+            return nullptr;
+        }
+
+        q3_load_f32(m->fsq_proj_w, g, "tokenizer.quantizer.project_out.weight");
+        q3_load_f32(m->fsq_proj_b, g, "tokenizer.quantizer.project_out.bias");
+        q3_load_raw(m->embed_w, g, "detokenizer.embed_tokens.weight");
+        q3_load_f32(m->embed_b, g, "detokenizer.embed_tokens.bias");
+        q3_load_f32(m->special_tok, g, "detokenizer.special_tokens");
+        q3_load_f32(m->norm, g, "detokenizer.norm.weight");
+        q3_load_raw(m->proj_out_w, g, "detokenizer.proj_out.weight");
+        q3_load_f32(m->proj_out_b, g, "detokenizer.proj_out.bias");
+        for (int i = 0; i < m->cfg.n_layers; i++) {
+            q3_load_layer(g, "detokenizer.layers." + std::to_string(i), m->layers[i]);
+        }
+    }
+    m->mapped_bytes = mapped ? dit_gguf_mapped_bytes(ctx, g) : 0;
+    if (measure) {
+        measure->weights_mapped_bytes = m->mapped_bytes;
+        // Mark still-unallocated weights externally-allocated so graph sizing
+        // excludes them (see textenc_model_load_impl). No data is read after.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data && !t->view_src) {
+                t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+            }
+        }
+    }
+
+    if (verbose) {
+        fprintf(stderr, "[acestep-detok] loaded %s: %.1f MB, FSQ(6->2048) + %dL encoder(S=5, 2048->64)\n",
+                path.c_str(), detok_model_weight_bytes(m) / 1048576.0, m->cfg.n_layers);
+    }
+
+    if (mapped) {
+        m->mapped  = true;
+        m->map_buf = map_buf;
+        m->gguf    = g;  // keep the mmap alive; mapped weights point into it
+    } else {
+        dit_gguf_close(g);
+    }
+    return m;
+}
+
+DetokModel * detok_model_load(const std::string & path, ggml_backend_t backend, bool verbose) {
+    return detok_model_load_impl(path, backend, verbose, /*measure=*/nullptr);
+}
+
+DetokModel * detok_model_load_metadata_only(const std::string & path, ggml_backend_t backend,
+                                            bool verbose, AcestepStageMeasure & measure) {
+    measure = AcestepStageMeasure{};
+    return detok_model_load_impl(path, backend, verbose, &measure);
+}
+
+size_t detok_model_compute_buffer_bytes(const DetokModel * m) {
+    return m ? m->last_compute_bytes : 0;
+}
+
+void detok_model_free(DetokModel * m) {
+    if (!m) return;
+    if (m->weight_buf) ggml_backend_buffer_free(m->weight_buf);
+    if (m->weight_ctx) ggml_free(m->weight_ctx);
+    if (m->map_buf) ggml_backend_buffer_free(m->map_buf);
+    if (m->mapped) dit_gguf_close(m->gguf);
+    delete m;
+}
+
+size_t detok_model_weight_bytes(const DetokModel * m) {
+    if (!m) return 0;
+    const size_t alloc = m->weight_buf ? ggml_backend_buffer_get_size(m->weight_buf) : 0;
+    return alloc + m->mapped_bytes;  // allocated (F32) + mmapped weights
+}
+
+int detok_model_decode(DetokModel * m, const int * codes, int T_5Hz, float * context_out,
+                       size_t * measure_compute) {
+    if (T_5Hz <= 0) return 0;
+    const int H      = DETOK_H;
+    const int P      = POOL;
+    const int T_25Hz = T_5Hz * P;
+
+    // FSQ decode all indices on CPU -> [6, T_5Hz] (per-token 6 floats).
+    std::vector<float> fsq_decoded;
+    if (!measure_compute) {
+        fsq_decoded.resize((size_t) T_5Hz * FSQ_NDIMS);
+        for (int g = 0; g < T_5Hz; g++) {
+            fsq_decode_index(codes[g], fsq_decoded.data() + (size_t) g * FSQ_NDIMS);
+        }
+    }
+
+    // Build the per-token graph once (S = 5 fixed), reuse across tokens.
+    const size_t     nodes = 4096;
+    ggml_init_params gp{ ggml_tensor_overhead() * 512 + ggml_graph_overhead_custom(nodes, false), nullptr, true };
+    ggml_context *   ctx = ggml_init(gp);
+
+    ggml_tensor * fsq_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, FSQ_NDIMS);
+    ggml_set_input(fsq_in);
+
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, P);
+    ggml_set_input(positions);
+
+    // project_out: [6] -> [2048]; embed_tokens: [2048] -> [2048]
+    ggml_tensor * quantized = q3_linear_bias(ctx, m->fsq_proj_w, m->fsq_proj_b, fsq_in);
+    ggml_tensor * embedded  = q3_linear_bias(ctx, m->embed_w, m->embed_b, ggml_reshape_2d(ctx, quantized, H, 1));
+
+    // broadcast [2048,1] -> [2048,5], add special_tokens [2048,5]
+    ggml_tensor * special_2d  = ggml_reshape_2d(ctx, m->special_tok, H, P);
+    ggml_tensor * special_f32 = q3_as_f32(ctx, special_2d);
+    ggml_tensor * hidden      = ggml_add(ctx, ggml_repeat(ctx, embedded, special_f32), special_f32);
+
+    for (int i = 0; i < m->cfg.n_layers; i++) {
+        hidden = q3_build_layer(ctx, m->cfg, &m->layers[i], hidden, positions, nullptr, P);
+    }
+    hidden = q3_rms_norm_w(ctx, hidden, m->norm, m->cfg.rms_norm_eps);
+
+    // proj_out: [2048,5] -> [64,5]
+    ggml_tensor * output = q3_linear_bias(ctx, m->proj_out_w, m->proj_out_b, hidden);
+    ggml_set_output(output);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, nodes, false);
+    ggml_build_forward_expand(gf, output);
+
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
+    if (!ga) {
+        fprintf(stderr, "[acestep-detok] forward gallocr init failed\n");
+        ggml_free(ctx);
+        return -1;
+    }
+    if (measure_compute) {
+        // Size-only twin of the alloc below (the graph is shape-fixed at S=5
+        // and replayed per token, so one measurement covers the whole decode).
+        *measure_compute = 0;
+        ggml_gallocr_reserve_n_size(ga, gf, nullptr, nullptr, measure_compute);
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        return T_25Hz;
+    }
+    if (!ggml_gallocr_alloc_graph(ga, gf)) {
+        fprintf(stderr, "[acestep-detok] forward alloc failed\n");
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        return -1;
+    }
+    m->last_compute_bytes = ggml_gallocr_get_buffer_size(ga, 0);
+
+    int32_t pos_data[POOL] = { 0, 1, 2, 3, 4 };
+
+    for (int g = 0; g < T_5Hz; g++) {
+        // Positions can share buffers with intermediates; re-set every step.
+        ggml_backend_tensor_set(positions, pos_data, 0, P * sizeof(int32_t));
+        ggml_backend_tensor_set(fsq_in, fsq_decoded.data() + (size_t) g * FSQ_NDIMS, 0, FSQ_NDIMS * sizeof(float));
+        if (ggml_backend_graph_compute(m->backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "[acestep-detok] compute failed at token %d\n", g);
+            ggml_gallocr_free(ga);
+            ggml_free(ctx);
+            return -1;
+        }
+        // output [64,5] -> context_out frames [g*5 .. g*5+4], each 64 channels.
+        ggml_backend_tensor_get(output, context_out + (size_t) g * P * 64, 0, (size_t) P * 64 * sizeof(float));
+    }
+
+    ggml_gallocr_free(ga);
+    ggml_free(ctx);
+    return T_25Hz;
+}
+
+} // namespace tts_cpp::acestep

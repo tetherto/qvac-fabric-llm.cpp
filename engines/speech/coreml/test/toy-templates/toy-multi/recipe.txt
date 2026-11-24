@@ -1,0 +1,12 @@
+mlrecipe 1
+template toy-multi
+spec_sha256 2dcde2522c62cd7d08435ce518ed5d0d9025df73766a9c14d7c2c944251a4ad1
+weight_bin_size 896
+blobs 3
+source "toy.w1" f32 [32,8]
+source "toy.b1" f32 [32]
+source "toy.s" f32 [32]
+blob 64 fp16 256 f16(t("toy.w1"))
+blob 640 fp16 32 f16(t("toy.b1"))
+blob 768 fp16 32 f16(t("toy.s"))
+end

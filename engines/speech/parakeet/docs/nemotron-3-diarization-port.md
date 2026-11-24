@@ -1,0 +1,32 @@
+# Nemotron 3 Diarization native port
+
+Nemotron 3 Diarization is a separate diarization architecture from the four-speaker Sortformer checkpoints currently supported by the Parakeet engine. Its public checkpoint has eight speaker channels and 10 ms activity frames. The existing `sortformer_diarize_ggml` graph expects a FastConformer encoder, an 18-layer post-layer-normalization speaker transformer, and 80 ms output frames. Loading the new checkpoint through that graph would produce invalid results.
+
+## Source contract
+
+- Model: [nvidia/Nemotron-3-Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization), released September 23, 2026.
+- License: [OpenMDW 1.1](https://openmdw.ai/license/1-1/). Commercial use is permitted. Redistributed model materials must retain the license and applicable origin notices.
+- Reference implementation: [NVIDIA NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp), Apache 2.0.
+- Official checkpoint: `Nemotron-3-Diarization.q8_0.gguf` in the model repository. It uses `general.architecture=sortformer` and `sortformer.version=v3`, unlike this engine's `parakeet-ctc` GGUF format.
+
+The official GGUF declares a 128-bin mel frontend, 8x feature stacking, a 31-layer 512-wide RoPE encoder with eight attention heads, a 512-to-192 projection, an 8x subpixel Conv1D output head, and eight independent sigmoid speaker outputs. The model has 360 tensors. The learned silence embedding and model-specific AOSC scoring values are part of the checkpoint. The native prediction stride is 10 ms; speaker-cache embeddings remain on the 80 ms encoder grid.
+
+`scripts/download_nemotron_diarization.py` fetches the official GGUF at a pinned model revision and can also fetch the `.nemo` source with `--include-source`. `scripts/convert_nemotron_diarization.py` fetches the source and a pinned NeMo-Speech.cpp converter checkout, then produces a separate GGUF when conversion is needed. The default remains Q8; `--outtype` accepts `f32`, `f16`, `bf16`, `q8_0`, `q6_k`, `q5_k`, `q4_k`, `mxfp4`, and `nvfp4`. Default output names include the chosen precision, so a format sweep preserves earlier files. Convolution weights remain F16, and the silence embedding, normalization, and small speaker heads remain F32 according to the pinned converter policy. See [quantization validation](performance.md#nemotron-3-diarization-quantizations) for quality limits; conversion availability alone does not imply a recommended deployment format. NVIDIA's published GGUF is the default fixture and requires no conversion.
+
+## Current implementation
+
+The Parakeet engine loads the official GGUF as a separate model type. The loader validates its metadata and tensor shapes. Its native ggml graph implements feature stacking, the RoPE encoder, subpixel upsampling, and the eight-channel speaker head. The public offline API and CLI return 10 ms probabilities and segments; the existing attribution path accepts the model as its diarization input.
+
+The live API uses the existing Audio-Online Speaker Cache update and compression logic on 80 ms embeddings. It initializes the silence profile from the checkpoint, averages 10 ms probabilities to the cache grid, and returns native probabilities for committed frames. The default live geometry is 1040 ms chunks, 80 ms right context, 264 speaker-cache rows, 80 FIFO rows, and a 40-frame update period. Chunk and context durations must align to 80 ms encoder frames.
+
+The fixture test compares all offline per-frame probabilities on `diarization-sample-16k.wav` with the output of NVIDIA NeMo-Speech.cpp revision `97a15afa5caa9bce5baaa86c1184103877af4101`. The tracked binary contains 2731 frames and eight little-endian float32 probabilities per frame. The test also exercises cached live updates and cache compression with deliberately short buffers. Its GPU registration passes on CUDA and Vulkan with an RTX 5090, on Vulkan with an AMD Radeon RX 7600 XT, on Metal with an Apple M3 Ultra, and on OpenCL and Vulkan with the Adreno 830 of a Snapdragon 8 Elite, where the graph requests F32 matmul precision; the whole graph runs as one GPU split. Backends without fused flash attention for this graph, such as ggml-opencl on Adreno, use an unfused attention on the GPU; the test also checks that path against the reference. `EngineOptions::prewarm` runs one offline pass and one chunk at the default live geometry, and `fit_params` projects the offline graph and that live chunk, which share the model scheduler, and on Apple builds also charges the Core ML diarizer sidecars they can load. GPU timings and accuracy are recorded in [performance.md](performance.md#nemotron-3-diarization-on-gpu). The model weights are downloaded separately and are not tracked here.
+
+On Apple builds with `PARAKEET_COREML=ON`, optional
+[Core ML diarizer sidecars](backends.md#core-ml-diarizer-sidecars) run the whole
+network after mel stacking on the Neural Engine, for offline inputs, long-form
+blocks, and live chunks up to their capacity; `scripts/export-nemotron-diarization-coreml.py`
+exports them from the GGUF. The speaker-cache updates stay on the host, and
+`test-nemotron-diarization-coreml-parity` checks each sidecar against the ggml
+graph.
+
+Offline inputs past 90 s run through the same speaker-cache path in 30 s chunks; `test-nemotron-diarization-long-form-*` scores that path on the `abcba` and `abcdba` fixtures against their RTTMs. Default 1040 ms live streaming has been scored on those two fixtures across weight precisions; Q8 itself exceeds the 15% offline DER gate on `abcdba`, and Q6_K regresses on `abcba`. Q4_K and Q6_K also pass offline quality gates on M3 Ultra Metal and RTX 5090 Vulkan with one GPU graph split; both exceed the live `abcdba` DER gate on those backends. NVFP4 runs as one Vulkan GPU split, but Metal rejects its matmuls and the scheduler uses 252 CPU/Metal splits. See the precision-specific performance section for measurements and limits. Overlap and eight-speaker scenarios, additional-precision mobile validation, other Metal/Vulkan precisions and devices, Mali Vulkan, and the `qvac/` package integration workflow still need validation. The local repository rules require coordination with the developer before running the full `qvac/` end-to-end workflow.

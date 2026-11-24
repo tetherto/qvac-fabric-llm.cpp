@@ -1,0 +1,135 @@
+{
+  "schema": 1,
+  "id": "parler-dac-w128",
+  "family": "parler",
+  "stage": "dac",
+  "export_kind": "parler-dac-v1",
+  "exporter": {
+    "path": "tts/scripts/parler/export-dac-coreml.py",
+    "sha256": "02aab883a2d120ddf40f29c869a2cf172fb3d810c90cf652b11d04cee1b0cabc",
+    "args": [
+      "--gguf",
+      "{gguf}",
+      "--out",
+      "{out}/parler-dac.mlpackage",
+      "--window",
+      "128"
+    ]
+  },
+  "min_os": {
+    "macos": "15.0"
+  },
+  "multifunction_ane": false,
+  "default_compute_units": "all",
+  "shareable": true,
+  "pad_safe": false,
+  "state_bytes": 0,
+  "expected_warm_load_ms": {
+    "main": 0
+  },
+  "memory": {
+    "runtime_weight_bytes": 108316032,
+    "workspace_bytes": 319764608,
+    "compile_peak_bytes": 344981504,
+    "ane_compile_reserve_bytes": 1076887552,
+    "load_peak_bytes": {
+      "cpu_and_ane": null,
+      "all": 428867584,
+      "cpu_and_gpu": null,
+      "cpu_only": null
+    },
+    "margin": 1.0,
+    "coreml_bound": "measured",
+    "validated_for": [
+      {
+        "units": "all",
+        "os": "15.7.3",
+        "chip": "M2"
+      },
+      {
+        "units": "all",
+        "os": "27.2.1",
+        "chip": "M2"
+      },
+      {
+        "units": "all",
+        "os": "26.7.2",
+        "chip": "M4 Max"
+      }
+    ],
+    "measured": {
+      "margin": 1.25,
+      "runs": 82,
+      "resident_bytes": 428867584,
+      "basis": "Each constant is 1.25 x the largest value measured over every overlapped generated-schedule run on the validated_for hosts (82 run reports: 37 M2 on macOS 27.2.1, 45 M4 Max CI runs on macOS 26.7.2), rounded up to 1 MiB, so the envelope's own margin is 1.0: the prepare charge (generation_peak_bytes + 8 MiB + compile_peak_bytes) covers the prepare from the start of generation to the end of the compile (largest 442.0 MiB, M2); load_peak_bytes.all the load and warm-up increment (326.4 MiB, M4 Max); the resident part (runtime_weight_bytes + 2 x I/O + workspace_bytes, runtime_weight_bytes being weight.bin's size) the steady state over the footprint just before the load (326.7 MiB, M4 Max, where `all` holds the GPU's copy of the weights and its working memory); and ane_compile_reserve_bytes ANECompilerService's largest absolute size while loading on any host (821.2 MiB, M4 Max). No run could start the service clean (it runs as root under aned and does not exit when idle), so its growth over a service that already held memory understates a cold compile, and no isolated measurement compares the two placements; the absolute size, which on a shared CI runner includes other jobs' compiles, is the conservative basis. The four macOS 15.7.3 runs recorded only the whole-run peak and ANECompilerService's absolute size and move no constant"
+    }
+  },
+  "patches": [
+    {
+      "spec_offset": 170847,
+      "len": 2,
+      "sentinel_hex": "c7d1"
+    }
+  ],
+  "prefer_ggml_on": [],
+  "match": {
+    "architecture": "parler",
+    "metadata": {
+      "parler.dac.latent_dim": 1024,
+      "parler.dac.decoder_dim": 1536,
+      "parler.dac.rates": [
+        8,
+        8,
+        4,
+        2
+      ],
+      "parler.dac.hop": 512
+    }
+  },
+  "literals": [],
+  "provided": [],
+  "toolchain": {
+    "coremltools": "9.0",
+    "torch": "2.7.0",
+    "numpy": "1.26.4"
+  },
+  "functions": [
+    {
+      "name": "main",
+      "inputs": [
+        {
+          "name": "latent",
+          "dtype": "fp16",
+          "shape": [
+            1,
+            1024,
+            128
+          ]
+        },
+        {
+          "name": "valid",
+          "dtype": "fp16",
+          "shape": [
+            1,
+            1,
+            128
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "pcm",
+          "dtype": "fp16",
+          "shape": [
+            1,
+            1,
+            65536
+          ]
+        }
+      ]
+    }
+  ],
+  "stateful": false,
+  "weight_bin_size": 108316032,
+  "generation_peak_bytes": 226492416
+}

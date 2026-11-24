@@ -1,0 +1,37 @@
+# ggml is staged via scripts/setup-ggml.sh at a pinned commit (the fabric
+# clone plus the symlink to its ggml/ tree); don't track it.
+ggml-src/
+ggml/
+ggml
+
+# Python virtualenv for the converter + reference-dump scripts.
+venv/
+.venv/
+.venv-*/
+.pip-cache/
+__pycache__/
+*.pyc
+
+# CMake build trees.
+build/
+build-*/
+
+# Downloaded NeMo checkpoint + converted GGUF (large, not tracked).
+models/
+*.nemo
+*.gguf
+
+# Reference .npy dumps for per-stage validation (not tracked).
+artifacts/*
+*.npy
+
+# ...but we do want the benchmark JSON snapshots checked in so PROGRESS.md
+# can cite them for before/after optimization comparisons.
+!artifacts/bench/
+!artifacts/bench/**
+
+# IDE / editor / OS cruft.
+.DS_Store
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,57 @@
+{
+ "gguf_version": 3,
+ "metadata": [
+  {
+   "gguf_type": 8,
+   "key": "general.architecture",
+   "value": "qvac-toy"
+  },
+  {
+   "gguf_type": 8,
+   "key": "qvac_toy.kind",
+   "value": "state"
+  },
+  {
+   "gguf_type": 4,
+   "key": "qvac_toy.d_in",
+   "value": 8
+  }
+ ],
+ "schema": 1,
+ "tensors": [
+  {
+   "n_dims": 2,
+   "name": "toy.w1",
+   "ne": [
+    8,
+    32,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.73426353931427,
+    "mean": -0.001003627463887824,
+    "min": -0.6582582592964172,
+    "std": 0.2455095734644307
+   },
+   "type": "f32"
+  },
+  {
+   "n_dims": 1,
+   "name": "toy.b1",
+   "ne": [
+    32,
+    1,
+    1,
+    1
+   ],
+   "stats": {
+    "max": 0.3502245545387268,
+    "mean": -0.0390180581016466,
+    "min": -0.6622162461280823,
+    "std": 0.21673185458208882
+   },
+   "type": "f32"
+  }
+ ]
+}

@@ -1,0 +1,39 @@
+name: Runner names validate
+
+# Enforces the runner-label catalog: the generated reusable workflow stays in
+# sync with .github/runners.yaml, and no wired workflow hardcodes a catalog
+# runner target. See .github/RUNNERS.md.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/runners.yaml'
+      - '.github/workflows/**'
+      - '.github/scripts/**'
+  pull_request:
+    paths:
+      - '.github/runners.yaml'
+      - '.github/workflows/**'
+      - '.github/scripts/**'
+
+permissions:
+  contents: read
+
+# Dedupe per PR and per branch: a newer push supersedes the in-flight
+# validation (this workflow has no workflow_dispatch trigger). master is exempt
+# on purpose — pushes to the default branch must not cancel each other.
+concurrency:
+  group: runner-names-validate-${{ (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate runner-name catalog (in sync + no hardcoded labels)
+        run: node .github/scripts/validate-runner-names.mjs
+      - name: Unit tests
+        run: node --test .github/scripts/test/*.test.mjs

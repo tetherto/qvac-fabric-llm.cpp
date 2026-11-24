@@ -1,0 +1,392 @@
+#include "tts-cpp/parler/engine.h"
+#include "tts-cpp/parler/fit.h"
+
+#include "internal.h"
+#include "decoder_runtime.h"
+#include "tokenizer.h"
+#include "bpe_tokenizer.h"
+#include "text_norm.h"
+#include "delay.h"
+#include "sampler.h"
+#include "backend_selection.h"
+#include "backend_util.h"
+
+#include <atomic>
+#include <cstdio>
+#include <random>
+#include <stdexcept>
+#include <thread>
+
+namespace tts_cpp {
+namespace parler {
+
+using namespace ::tts_cpp::parler::detail;
+
+namespace {
+
+// EngineOptions::coreml, with the legacy per-instance fields as fallbacks for
+// its unset fields.
+CoremlOptions parler_merge_legacy_coreml(const EngineOptions & opts) {
+    CoremlOptions o = opts.coreml;
+    if (!o.compute_units && !opts.coreml_compute_units.empty()) o.compute_units = opts.coreml_compute_units;
+    if (o.use == CoremlOptions::Use::unset && opts.coreml_strict.has_value()) {
+        o.use = *opts.coreml_strict ? CoremlOptions::Use::require : CoremlOptions::Use::automatic;
+    }
+    return o;
+}
+
+} // namespace
+
+struct Engine::Impl {
+    EngineOptions        opts;
+    parler_model         model;
+    std::shared_ptr<parler_dac_coreml> dac_coreml;  // the DAC on the shared Core ML runtime
+    parler_decoder_runtime decoder{model};
+    parler_tokenizer     tokenizer;         // descriptions (and prompts when shared)
+    parler_bpe_tokenizer prompt_tokenizer;  // prompts, iff the GGUF ships one
+    ggml_gallocr_t       allocr = nullptr;
+    // Resolved once at construction (see Engine::Engine) -- opts stays as the
+    // caller wrote it so options() keeps reporting the request, not the repair.
+    parler_sampling_params sampling;
+    std::string        cached_description;
+    bool               has_cached_description = false;
+    std::atomic<bool>  cancel_requested{false};
+    // Counts Engine::cancel() calls. A blocking coreml_wait() ends when it
+    // moves past the value the wait started with: nothing clears it, so one
+    // wait never swallows a cancel meant for another, or for a synthesis.
+    std::atomic<uint64_t> wait_cancels{0};
+
+    ~Impl() {
+        if (allocr) ggml_gallocr_free(allocr);
+        parler_free_model(model);
+    }
+
+    int resolve_threads() const {
+        if (opts.n_threads > 0) return opts.n_threads;
+        const unsigned hw = std::thread::hardware_concurrency();
+        return (int) std::min(hw ? hw : PARLER_DEFAULT_THREADS, PARLER_DEFAULT_THREADS);
+    }
+
+    void check_cancel() const {
+        if (cancel_requested.load(std::memory_order_relaxed)) {
+            throw std::runtime_error("parler: synthesis cancelled");
+        }
+    }
+
+    SynthesisResult run(const std::string & prompt, const std::string & description,
+                        const StreamCallback * on_chunk = nullptr) {
+        if (prompt.empty()) {
+            throw std::runtime_error("parler: prompt must not be empty");
+        }
+        if (description.empty()) {
+            throw std::runtime_error("parler: description must not be empty");
+        }
+        cancel_requested.store(false, std::memory_order_relaxed);
+        const parler_hparams & hp = model.hparams;
+        if (opts.max_frames > 0 && opts.max_frames <= hp.n_codebooks) {
+            throw std::runtime_error("parler: max_frames must be 0 or > " +
+                                     std::to_string(hp.n_codebooks) +
+                                     " (fewer delayed steps cannot yield one audio frame)");
+        }
+        const int n_threads = resolve_threads();
+
+        const std::string spoken_prompt = !opts.normalize_numbers ? prompt
+            : model.has_prompt_tok ? normalize_numbers_indic(prompt)
+                                   : normalize_numbers_en(prompt);
+        const std::vector<int32_t> prompt_ids = model.has_prompt_tok
+            ? prompt_tokenizer.encode(spoken_prompt)
+            : tokenizer.encode(spoken_prompt);
+        if (prompt_ids.empty()) {
+            throw std::runtime_error("parler: prompt tokenized to zero tokens");
+        }
+
+        if (!has_cached_description || cached_description != description) {
+            const std::vector<int32_t> desc_ids = tokenizer.encode(description);
+            if (desc_ids.empty()) {
+                throw std::runtime_error("parler: description tokenized to zero tokens");
+            }
+            // re-encoding destroys the previous cross-KV state up front, so the
+            // cache must be invalidated even if the encode below fails
+            has_cached_description = false;
+            if (!parler_encode_description(model, desc_ids, n_threads, nullptr)) {
+                throw std::runtime_error("parler: description encoding failed");
+            }
+            cached_description = description;
+            has_cached_description = true;
+        }
+        check_cancel();
+
+        delay_config dcfg;
+        dcfg.n_codebooks = hp.n_codebooks;
+        dcfg.bos_id = hp.bos_id;
+        dcfg.eos_id = hp.eos_id;
+        dcfg.pad_id = hp.pad_id;
+        dcfg.max_length = hp.gen_max_length;
+        if (opts.max_frames > 0 && opts.max_frames < dcfg.max_length) {
+            dcfg.max_length = opts.max_frames;
+        }
+        dcfg.min_new_tokens = opts.min_new_tokens >= 0 ? opts.min_new_tokens
+                                                       : hp.gen_min_new_tokens;
+        delay_state st(dcfg);
+
+        const parler_sampling_params & sp = sampling;
+        std::mt19937 rng((uint32_t) opts.seed);
+        parler_sampler_scratch scratch;
+        std::vector<int32_t> frame;
+
+        parler_step_logits logits;
+        int n_past = 0;
+        if (!decoder.prefill(prompt_ids, st.input_frame(), allocr, n_threads,
+                                logits, n_past, dcfg.max_length)) {
+            throw std::runtime_error("parler: decoder prefill failed");
+        }
+
+        SynthesisResult res;
+        res.sample_rate = hp.dac_sample_rate;
+        std::string dac_label;
+        auto note_dac_backend = [&](const std::string & backend, bool pending) {
+            dac_label = parler_merge_dac_backend(dac_label, backend);
+            res.dac_backend = dac_label;
+            res.coreml_pending = res.coreml_pending || pending;
+        };
+
+        // Streaming re-decodes the growing code prefix every stream_chunk_frames
+        // steps and emits the newly-stable samples (holding back the DAC right
+        // receptive field so each chunk matches the whole-sequence decode).
+        const bool streaming = on_chunk != nullptr && opts.stream_chunk_frames > 0;
+        // hold back the DAC right receptive field so each chunk matches the
+        // whole-sequence decode exactly
+        const int rf_margin = parler_dac_rf_frames(model);
+        int emitted_frames = 0;
+        int chunk_index    = 0;
+        auto emit = [&](bool final_flush) {
+            int nf = 0;
+            const std::vector<int32_t> c = st.undelay(hp.dac_codebook_size, &nf);
+            const int emit_end = final_flush ? nf : nf - rf_margin;
+            if (emit_end <= emitted_frames) return;
+            // decode only the newly-stable frames; the frames outside the range
+            // are still consulted as convolution context, so each chunk is
+            // bit-identical to slicing a whole-sequence decode
+            std::vector<float> pcm;
+            std::string dac_err, dac_backend;
+            bool dac_pending = false;
+            if (!parler_dac_decode(model, c.data(), nf, n_threads, pcm, nullptr,
+                                   emitted_frames, emit_end, &dac_err, &dac_backend, &dac_pending,
+                                   &cancel_requested)) {
+                check_cancel();
+                throw std::runtime_error("parler: DAC decode failed: " + dac_err);
+            }
+            note_dac_backend(dac_backend, dac_pending);
+            (*on_chunk)(pcm.data(), pcm.size(), chunk_index++, final_flush);
+            res.pcm.insert(res.pcm.end(), pcm.begin(), pcm.end());
+            emitted_frames = emit_end;
+        };
+
+        int step = 0;
+        int next_emit_at = opts.stream_first_chunk_frames > 0
+                         ? opts.stream_first_chunk_frames : opts.stream_chunk_frames;
+        while (true) {
+            check_cancel();
+            st.process_logits(logits.view, hp.dec_vocab);
+            parler_sample_frame(logits.view, hp.n_codebooks, hp.dec_vocab, sp, rng, scratch,
+                                frame);
+            st.append(frame);
+            if (st.finished()) break;
+            if (!decoder.step(st.input_frame(), n_past, allocr, n_threads, logits)) {
+                check_cancel();
+                throw std::runtime_error("parler: decoder step failed");
+            }
+            n_past++;
+            if (streaming && ++step >= next_emit_at) {
+                emit(false);
+                next_emit_at = step + opts.stream_chunk_frames;
+            }
+        }
+
+        res.decoder_backend = decoder.backend();
+        int n_frames = 0;
+        const std::vector<int32_t> codes = st.undelay(hp.dac_codebook_size, &n_frames);
+        if (n_frames <= 0) {
+            throw std::runtime_error("parler: generation produced no audio frames");
+        }
+        check_cancel();
+
+        if (streaming) {
+            emit(true);
+            res.duration_s = res.pcm.empty() ? 0.0f
+                           : (float) res.pcm.size() / (float) hp.dac_sample_rate;
+            return res;
+        }
+
+        std::string dac_err, dac_backend;
+        bool dac_pending = false;
+        if (!parler_dac_decode(model, codes.data(), n_frames, n_threads, res.pcm,
+                               nullptr, 0, -1, &dac_err, &dac_backend, &dac_pending,
+                               &cancel_requested)) {
+            check_cancel();
+            throw std::runtime_error("parler: DAC decode failed: " + dac_err);
+        }
+        note_dac_backend(dac_backend, dac_pending);
+        res.duration_s  = res.pcm.empty() ? 0.0f
+                        : (float) res.pcm.size() / (float) hp.dac_sample_rate;
+        return res;
+    }
+};
+
+Engine::Engine(const EngineOptions & opts) : pimpl_(new Impl()) {
+    const auto coreml_policy = parler_resolve_coreml_policy(opts.coreml_compute_units, opts.coreml_strict);
+    pimpl_->opts = opts;
+    pimpl_->decoder.set_cancel_check([state = pimpl_.get()] {
+        return state->cancel_requested.load(std::memory_order_relaxed);
+    });
+    if (!opts.backends_dir.empty()) {
+        ::tts_cpp::detail::set_backends_directory(opts.backends_dir);
+    }
+#ifdef TTS_CPP_USE_COREML
+    // Fit's memory-degrade: with a budget, Core ML is dropped when only the
+    // ggml verdict fits. Decided before the weights load, so it reads the
+    // same free memory fit_params reports, for the workload and headroom the
+    // caller's fit assessed.
+    const CoremlOptions dac_options = parler_merge_legacy_coreml(opts);
+    bool degrade = false;
+    if (dac_options.memory_budget_bytes) {
+        FitOptions fit;
+        fit.model_gguf_path = opts.model_gguf_path;
+        fit.n_gpu_layers = opts.n_gpu_layers;
+        fit.backend = opts.backend;
+        fit.backends_dir = opts.backends_dir;
+        fit.max_frames = opts.max_frames;
+        fit.description_tokens = opts.fit_description_tokens;
+        fit.prompt_tokens = opts.fit_prompt_tokens;
+        fit.margin_bytes = opts.fit_margin_bytes;
+        fit.coreml = dac_options;
+        degrade = fit_params(fit).coreml.disabled_reason == "memory";
+    }
+#endif
+    std::string err;
+    if (!parler_load_gguf(opts.model_gguf_path, pimpl_->model, opts.n_gpu_layers, &err, opts.backend)) {
+        throw std::runtime_error("parler: " + err);
+    }
+    if (!pimpl_->tokenizer.load(pimpl_->model.tok_pieces, pimpl_->model.tok_scores,
+                                pimpl_->model.tok_charsmap, pimpl_->model.tok_unk_id,
+                                pimpl_->model.tok_eos_id, pimpl_->model.tok_add_eos)) {
+        throw std::runtime_error("parler: tokenizer load failed");
+    }
+    if (pimpl_->model.has_prompt_tok &&
+        !pimpl_->prompt_tokenizer.load(pimpl_->model.ptok_pieces, pimpl_->model.ptok_merges,
+                                       pimpl_->model.ptok_unk_id, pimpl_->model.ptok_bos_id,
+                                       pimpl_->model.ptok_add_bos)) {
+        throw std::runtime_error("parler: prompt tokenizer load failed");
+    }
+#ifdef TTS_CPP_USE_COREML
+    pimpl_->dac_coreml = parler_dac_coreml::create(pimpl_->model, opts.model_gguf_path, dac_options, degrade);
+#else
+    parler_dac_plan_route(opts.model_gguf_path, parler_merge_legacy_coreml(opts), 0);  // validates the options
+    parler_attach_dac_sidecar(pimpl_->model, opts.model_gguf_path, coreml_policy);
+#endif
+    if (opts.coreml_decoder && !coreml_policy.disabled) {
+        auto sidecar = parler_open_decoder_sidecar(pimpl_->model, opts.model_gguf_path, coreml_policy, err);
+        if (!sidecar) {
+            if (coreml_policy.strict) throw std::runtime_error("parler: " + err);
+            fprintf(stderr, "parler: %s; decoder stays on ggml\n", err.c_str());
+        } else {
+            pimpl_->decoder.attach(std::move(sidecar), coreml_policy.strict);
+        }
+    }
+    pimpl_->allocr = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(pimpl_->model.backend));
+    if (!pimpl_->allocr) {
+        throw std::runtime_error("parler: graph allocator creation failed");
+    }
+
+    const parler_hparams & hp = pimpl_->model.hparams;
+    parler_gen_defaults def;
+    def.do_sample   = hp.gen_do_sample;
+    def.temperature = hp.gen_temperature;
+    def.top_k       = hp.gen_top_k;
+    parler_sampling_request req;
+    req.greedy      = opts.greedy;
+    req.temperature = opts.temperature;
+    req.top_k       = opts.top_k;
+    req.top_p       = opts.top_p;
+
+    std::string repaired;
+    pimpl_->sampling = parler_resolve_sampling(req, def, &repaired);
+    if (!repaired.empty()) {
+        fprintf(stderr,
+            "parler: warning: %s selects argmax decoding, which this model family "
+            "cannot terminate (EOS is gated on codebook 0's argmax and the decoder "
+            "collapses to silence); falling back to sampling (temperature %.2f, "
+            "top-k %d). Use seed for reproducible output.\n",
+            repaired.c_str(), pimpl_->sampling.temperature, pimpl_->sampling.top_k);
+    }
+}
+
+Engine::~Engine() = default;
+Engine::Engine(Engine &&) noexcept = default;
+Engine & Engine::operator=(Engine &&) noexcept = default;
+
+SynthesisResult Engine::synthesize(const std::string & prompt) {
+    if (pimpl_->opts.default_description.empty()) {
+        throw std::runtime_error("parler: no default_description configured; "
+                                 "use synthesize(prompt, description)");
+    }
+    return pimpl_->run(prompt, pimpl_->opts.default_description);
+}
+
+SynthesisResult Engine::synthesize(const std::string & prompt,
+                                   const std::string & description) {
+    return pimpl_->run(prompt, description);
+}
+
+SynthesisResult Engine::synthesize(const std::string & prompt,
+                                   const std::string & description,
+                                   const StreamCallback & on_chunk) {
+    return pimpl_->run(prompt, description, &on_chunk);
+}
+
+void Engine::cancel() {
+    pimpl_->cancel_requested.store(true, std::memory_order_relaxed);
+    pimpl_->wait_cancels.fetch_add(1);
+}
+
+const EngineOptions & Engine::options() const { return pimpl_->opts; }
+
+std::string Engine::backend_name() const {
+    if (!pimpl_->model.backend) return "(unknown)";
+    return ggml_backend_name(pimpl_->model.backend);
+}
+
+bool Engine::dac_on_coreml() const {
+    return pimpl_->model.dac_sidecar != nullptr || (pimpl_->dac_coreml && pimpl_->dac_coreml->wait(0));
+}
+
+std::string Engine::coreml_status() const {
+    return pimpl_->dac_coreml ? pimpl_->dac_coreml->status_json() : std::string("{}");
+}
+
+bool Engine::coreml_wait(int64_t timeout_ms) const {
+    if (!pimpl_->dac_coreml) return false;
+    // A readiness poll has nothing to cancel and touches no flag.
+    if (timeout_ms == 0) return pimpl_->dac_coreml->wait(0);
+    // A blocking wait ends early on any Engine::cancel() made after it
+    // started; it clears nothing, so concurrent waits and a synthesis on
+    // another thread each keep the cancels meant for them.
+    return pimpl_->dac_coreml->wait(timeout_ms, &pimpl_->wait_cancels, pimpl_->wait_cancels.load());
+}
+
+bool Engine::decoder_on_coreml() const { return pimpl_->decoder.active(); }
+
+BackendDevice Engine::backend_device() const {
+    return ::tts_cpp::detail::backend_is_cpu(pimpl_->model.backend)
+        ? BackendDevice::CPU : BackendDevice::GPU;
+}
+
+SynthesisResult synthesize(const EngineOptions & opts, const std::string & prompt,
+                           const std::string & description) {
+    Engine engine(opts);
+    return engine.synthesize(prompt, description);
+}
+
+} // namespace parler
+} // namespace tts_cpp
