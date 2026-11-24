@@ -18497,7 +18497,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // f16-B register-prefetch coopmat matmul (Vulkan RADV RDNA3, K >= 1024 and N >= 32): whole tiles, ragged M and N tiles
     // (non-prefetch loop), a batch with an odd superblock count per row, and a narrow shape split along k. On 40 CUs the
-    // m >= 1536 rows take the 256x256 XL tile (m = 1536 split along k); the rest stay on smaller tiles (q4_K) or int8 MMQ.
+    // m >= 1536 rows with k >= 4096 take the 256x256 XL tile; the k < 4096 rows stay on smaller tiles (q4_K) or int8 MMQ.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS }) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 512, 1024, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4200, 500, 1024, { 1, 1 }, { 1, 1 }));
@@ -18507,6 +18507,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5000, 500, 1280, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 500, 1024, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1536, 1024, 2048, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 512, 4096, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4200, 500, 4096, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5000, 500, 4352, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1536, 1024, 4096, { 1, 1 }, { 1, 1 }));
     }
     // below XL, q5_K, q6_K and iq4_xs reach the prefetch matmul only with a B that cannot be quantized
     for (ggml_type type_a : { GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS }) {
@@ -18518,8 +18522,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q4_0, 300, 33, 2048, false, true, true));
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q4_K, 256, 64, 1024, false, true, true));
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 9, 1024, false, true, true));
-    // XL-shaped down projections: on RADV RDNA3 the GLU stores the f16 B of the XL matmul (a short K and a 17408-wide GLU).
-    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q5_K, 5120, 512, 1024, false, true, true));
+    // XL-shaped down projections: on RADV RDNA3 the GLU stores the f16 B of the XL matmul (the XL minimum K and a 17408-wide GLU).
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q5_K, 5120, 512, 4096, false, true, true));
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q5_K, 5120, 512, 17408, false, true, true));
     // No fusion: F16 B precision, a mat-vec batch, F16 weights, and the MUL_MAT as the last computed node (an eval callback may read the GLU).
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 64, 1024, true, true, false));

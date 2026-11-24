@@ -2493,7 +2493,7 @@ static constexpr uint32_t mm_xl_l_tile       = 128;  // BM = BN of the L tile it
 static constexpr uint32_t mm_xl_l_wgs_per_cu = 2;    // L workgroups resident per CU, against one XL workgroup
 static constexpr uint32_t mm_xl_wave_cost    = 2;    // an XL wave does the work of two L waves
 static constexpr uint32_t mm_xl_min_m        = 1024;
-static constexpr uint32_t mm_xl_min_k        = 1024;
+static constexpr uint32_t mm_xl_min_k        = 4096; // in-model on gfx1151, XL lost at k 2560 and won at k 4096 and up
 
 // XL pays off where its rounded-up wave count costs no more than the L tile's.
 static bool ggml_vk_mm_xl_ok(const vk_device & device, uint32_t m, uint32_t n, uint32_t k) {
