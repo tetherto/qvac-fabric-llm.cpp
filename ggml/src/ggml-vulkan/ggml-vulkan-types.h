@@ -1755,7 +1755,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_situ {};
-    // GATED_DELTA_NET + CPY: the recurrent cache view the gdn writes its state snapshots to
+    // GATED_DELTA_NET (or _DEFERRED) + CPY: the recurrent cache view the gdn writes its state to
     const ggml_tensor * fused_gdn_cache {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)

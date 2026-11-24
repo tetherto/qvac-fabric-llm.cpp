@@ -7366,6 +7366,22 @@ struct test_gated_delta_net_ragged : public test_case {
 };
 
 // GGML_OP_GATED_DELTA_NET_DEFERRED (optionally + GGML_OP_CPY of the new base into a cache view)
+// where the gdn of the cache fusion tests reads its state
+enum gdn_cache_state_src {
+    GDN_STATE_SEPARATE, // a tensor of its own
+    GDN_STATE_IN_PLACE, // the batch rows of cache slot 0, which the cpy rewrites (build_rs_ssm)
+    GDN_STATE_SHIFTED,  // cache rows next to the batch rows, which the cpy overwrites in part
+};
+
+static std::string var_to_str(gdn_cache_state_src src) {
+    switch (src) {
+        case GDN_STATE_SEPARATE: return "separate";
+        case GDN_STATE_IN_PLACE: return "in_place";
+        case GDN_STATE_SHIFTED:  return "shifted";
+    }
+    return "unknown";
+}
+
 struct test_gated_delta_net_deferred : public test_case {
     const ggml_type type;
 
@@ -7378,19 +7394,45 @@ struct test_gated_delta_net_deferred : public test_case {
     const int64_t K;
     const bool    fuse_cache;
     const bool    gates;
+    const gdn_cache_state_src state_src; // with fuse_cache: the state may be read from the cache
 
     ggml_tensor * cpy_node = nullptr;
+    ggml_tensor * out_node = nullptr;
+
+    mutable bool has_fusion_counter = false;
 
     std::string vars() override {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, kda, K, fuse_cache) +
-            (gates ? ",gates=1" : "");
+            (gates ? ",gates=1" : "") +
+            (state_src != GDN_STATE_SEPARATE ? ",state_src=" + var_to_str(state_src) : "");
     }
 
     test_gated_delta_net_deferred(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 2, int64_t head_size = 32, int64_t n_seq_tokens = 4, int64_t n_seqs = 1,
-            int v_repeat = 1, bool kda = false, int64_t K = 4, bool fuse_cache = false, bool gates = false)
+            int v_repeat = 1, bool kda = false, int64_t K = 4, bool fuse_cache = false, bool gates = false,
+            gdn_cache_state_src state_src = GDN_STATE_SEPARATE)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), kda(kda), K(K), fuse_cache(fuse_cache), gates(gates) {}
+          v_repeat(v_repeat), kda(kda), K(K), fuse_cache(fuse_cache), gates(gates), state_src(state_src) {
+        GGML_ASSERT(fuse_cache || state_src == GDN_STATE_SEPARATE);
+    }
+
+    // only the Vulkan match rejects a state that the cache write overlaps in part
+    bool skip_backend(ggml_backend_t backend) override {
+        const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
+        return state_src == GDN_STATE_SHIFTED && strcmp(name, "Vulkan") != 0;
+    }
+
+    // Vulkan exports the counter only while GGML_VK_FUSE_GDN_CACHE leaves the fusion on
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn = uint64_t (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_gdn_cache_fusion_count");
+        has_fusion_counter = counter != nullptr;
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion()    override { return has_fusion_counter && fuse_cache && state_src != GDN_STATE_SHIFTED; }
+    bool expect_no_fusion() override { return has_fusion_counter && fuse_cache && state_src == GDN_STATE_SHIFTED; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S   = head_size;
@@ -7419,8 +7461,23 @@ struct test_gated_delta_net_deferred : public test_case {
             ggml_set_name(g,    "g");
             ggml_set_name(beta, "beta");
         }
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, S, S, H, n_seqs);
-        ggml_set_name(state, "state");
+        const int64_t D      = S * S * H;
+        const int64_t n_attn = S * H * n_seq_tokens * n_seqs;
+
+        // the cpy writes rows 1..n_seqs; an in-place state is those rows, a shifted one starts at row 0
+        ggml_tensor * cache = nullptr;
+        ggml_tensor * state = nullptr;
+        if (fuse_cache) {
+            cache = ggml_new_tensor_2d(ctx, type, D, n_seqs + 1);
+            ggml_set_name(cache, "cache");
+        }
+        if (state_src == GDN_STATE_SEPARATE) {
+            state = ggml_new_tensor_4d(ctx, type, S, S, H, n_seqs);
+            ggml_set_name(state, "state");
+        } else {
+            const size_t first_row = state_src == GDN_STATE_IN_PLACE ? 1 : 0;
+            state = ggml_reshape_4d(ctx, ggml_view_2d(ctx, cache, D, n_seqs, cache->nb[1], first_row * cache->nb[1]), S, S, H, n_seqs);
+        }
 
         // two record rows per seq: read one, write the other
         ggml_tensor * rec = ggml_new_tensor_2d(ctx, type, ggml_gated_delta_net_rec_size(S, H_k, S, H, G, K), 2 * n_seqs);
@@ -7447,18 +7504,14 @@ struct test_gated_delta_net_deferred : public test_case {
             return out;
         }
 
-        const int64_t D      = S * S * H;
-        const int64_t n_attn = S * H * n_seq_tokens * n_seqs;
-
         ggml_tensor * base  = ggml_view_2d(ctx, out, D, n_seqs, ggml_row_size(out->type, D), ggml_row_size(out->type, n_attn));
-        ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, D, n_seqs + 1);
-        ggml_set_name(cache, "cache");
 
         ggml_tensor * cpy = ggml_cpy(ctx, base, ggml_view_2d(ctx, cache, D, n_seqs, cache->nb[1], cache->nb[1]));
         cpy_node = cpy;
 
         ggml_tensor * attn = ggml_view_1d(ctx, out, n_attn, 0);
-        return ggml_add(ctx, ggml_cont(ctx, ggml_view_1d(ctx, cpy, n_attn, 0)), attn);
+        out_node = ggml_add(ctx, ggml_cont(ctx, ggml_view_1d(ctx, cpy, n_attn, 0)), attn);
+        return out_node;
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7469,7 +7522,7 @@ struct test_gated_delta_net_deferred : public test_case {
     bool run_whole_graph() override { return fuse_cache; }
     std::vector<ggml_tensor *> fusion_test_nodes() override {
         if (cpy_node) {
-            return { cpy_node };
+            return { cpy_node, out_node };
         }
         return {};
     }
@@ -7684,22 +7737,6 @@ struct test_gdn_gates : public test_case {
         }
     }
 };
-
-// where the gdn of test_gated_delta_net_cache_fusion reads its state
-enum gdn_cache_state_src {
-    GDN_STATE_SEPARATE, // a tensor of its own
-    GDN_STATE_IN_PLACE, // the batch rows of cache slot 0, which the cpy rewrites (build_rs_ssm)
-    GDN_STATE_SHIFTED,  // the cache rows one past the batch, which the cpy overwrites in part
-};
-
-static std::string var_to_str(gdn_cache_state_src src) {
-    switch (src) {
-        case GDN_STATE_SEPARATE: return "separate";
-        case GDN_STATE_IN_PLACE: return "in_place";
-        case GDN_STATE_SHIFTED:  return "shifted";
-    }
-    return "unknown";
-}
 
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
@@ -20905,6 +20942,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_deferred(GGML_TYPE_F32, 2, 128, 3, 2, 3, false, 9, true));
     test_cases.emplace_back(new test_gated_delta_net_deferred(GGML_TYPE_F32, 2, 128, 9, 1, 3, false, 9, false, true));
     test_cases.emplace_back(new test_gated_delta_net_deferred(GGML_TYPE_F32, 2, 128, 3, 2, 3, false, 9, true,  true));
+    // the base read in place from the cache rows the cpy rewrites (LLAMA_GDN_DEFERRED=1), and the 27B spec-decode shape
+    test_cases.emplace_back(new test_gated_delta_net_deferred(GGML_TYPE_F32, 2, 128, 3, 2, 3, false, 9, true, true, GDN_STATE_IN_PLACE));
+    test_cases.emplace_back(new test_gated_delta_net_deferred(GGML_TYPE_F32, 16, 128, 4, 4, 3, false, 4, true, true, GDN_STATE_IN_PLACE));
+    // a base state that the cpy overwrites in part keeps the cpy
+    test_cases.emplace_back(new test_gated_delta_net_deferred(GGML_TYPE_F32, 2, 128, 3, 2, 3, false, 9, true, true, GDN_STATE_SHIFTED));
     test_cases.emplace_back(new test_gdn_conv_deferred(256, 32, 4, 1, 1, 4));
     test_cases.emplace_back(new test_gdn_conv_deferred(256, 32, 4, 4, 2, 4));
     test_cases.emplace_back(new test_gdn_conv_deferred(10240, 128, 32, 8, 1, 8));
