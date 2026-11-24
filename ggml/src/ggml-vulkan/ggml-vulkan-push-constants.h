@@ -882,7 +882,7 @@ struct vk_op_gated_delta_net_deferred_push_constants {
     uint32_t sb1, sb2, sb3;
     uint32_t ss1, ss2, ss3;
     uint32_t s_rec, rec_v, rec_g, rec_b;
-    uint32_t base_off;
+    uint32_t base_off; // element offset of the new base in the base output binding
     uint32_t gates;
     float    scale;
     uint32_t q_off, k_off, v_off, g_off, b_off, s_off;
