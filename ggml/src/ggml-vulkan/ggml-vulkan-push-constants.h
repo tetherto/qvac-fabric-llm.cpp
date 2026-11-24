@@ -545,6 +545,13 @@ struct vk_op_binary_push_constants {
     float param1; float param2; int32_t param3;
 };
 
+// the scale and bias of the four SCALE nodes of situ_pattern, in graph order
+struct vk_op_situ_push_constants {
+    vk_op_binary_push_constants bin;
+    float gate_in_scale; float gate_in_bias; float gate_out_scale; float gate_out_bias;
+    float up_in_scale;   float up_in_bias;   float up_out_scale;   float up_out_bias;
+};
+
 struct vk_op_concat_push_constants : vk_op_binary_push_constants {};
 
 static_assert(sizeof(vk_op_concat_push_constants) == sizeof(vk_op_binary_push_constants));

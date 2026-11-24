@@ -17,6 +17,10 @@ layout (push_constant) uniform parameter
 #if RMS_NORM_ROPE_FUSION
     rope_params rope;
 #endif
+#if SITU_FUSION
+    float gate_in_scale; float gate_in_bias; float gate_out_scale; float gate_out_bias;
+    float up_in_scale;   float up_in_bias;   float up_out_scale;   float up_out_bias;
+#endif
 } p;
 
 #if !RMS_NORM_ROPE_FUSION && !NORM_MUL_ADD_FUSION

@@ -1,0 +1,46 @@
+#version 450
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+const uint num_threads = 256;
+
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+// the scale.comp, op_tanh and op_sigmoid (unary.comp) and mul.comp expressions, in graph order
+float situ_scale(float x, float s, float b) {
+    return x * s + b;
+}
+
+float op_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+float op_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+void main() {
+    uint idx = get_idx();
+
+    // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation
+    const uint num_iter = 2;
+
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx >= p.ne) {
+            continue;
+        }
+        uint i00, i01, i02, i03;
+        get_indices(idx, i00, i01, i02, i03);
+
+        const float gate = float(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]);
+        const float up   = float(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]);
+
+        const float gate_act = situ_scale(op_tanh(situ_scale(gate, p.gate_in_scale, p.gate_in_bias)), p.gate_out_scale, p.gate_out_bias) * op_sigmoid(gate);
+        const float up_act   = situ_scale(op_tanh(situ_scale(up, p.up_in_scale, p.up_in_bias)), p.up_out_scale, p.up_out_bias);
+
+        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(gate_act * up_act);
+
+        idx += num_threads;
+    }
+}
