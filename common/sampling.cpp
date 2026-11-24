@@ -191,6 +191,11 @@ struct common_sampler {
             return LLAMA_TOKEN_NULL;
         }
 
+        // a backend sampler that only filters leaves compact logits/probs, which set_logits maps to token ids
+        if (llama_get_sampled_logits_ith(ctx, idx) != nullptr || llama_get_sampled_probs_ith(ctx, idx) != nullptr) {
+            return LLAMA_TOKEN_NULL;
+        }
+
         const float * logits = llama_get_logits_ith(ctx, idx);
         if (logits == nullptr) {
             return LLAMA_TOKEN_NULL;

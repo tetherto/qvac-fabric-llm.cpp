@@ -441,6 +441,35 @@ static void test_greedy_filtered(const test_params & params) {
     }
 }
 
+// backend top-k without selection + a greedy CPU sampler: the CPU pick must be a token id, not a candidate offset
+static void test_greedy_backend_filter_cpu(const test_params & params) {
+    const int k = 8;
+    llama_sampler_ptr backend(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(backend.get(), llama_sampler_init_top_k(k));
+    std::vector<llama_sampler_seq_config> configs = {{0, backend.get()}};
+    test_context test_ctx(params, configs);
+
+    common_params_sampling sp;
+    sp.temp = 0.0f;
+    sp.samplers = {COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE};
+    common_sampler_ptr sampler(common_sampler_init(params.model.get(), sp));
+
+    GGML_ASSERT(test_ctx.decode({{0, "Write a Python function"}}));
+    for (int step = 0; step < 4; ++step) {
+        const int idx = test_ctx.idx_for_seq(0);
+        GGML_ASSERT(llama_get_sampled_token_ith(test_ctx.ctx.get(), idx) == LLAMA_TOKEN_NULL);
+        GGML_ASSERT(llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), idx) == (uint32_t) k);
+        const auto * logits = llama_get_sampled_logits_ith(test_ctx.ctx.get(), idx);
+        const auto * ids = llama_get_sampled_candidates_ith(test_ctx.ctx.get(), idx);
+        const llama_token expected = ids[std::max_element(logits, logits + k) - logits];
+        const llama_token token = common_sampler_sample(sampler.get(), test_ctx.ctx.get(), idx);
+        printf("step %d: expected %d, sampled %d\n", step, expected, token);
+        GGML_ASSERT(token == expected);
+        common_sampler_accept(sampler.get(), token, true);
+        GGML_ASSERT(test_ctx.decode_token(token));
+    }
+}
+
 static void test_top_k(const test_params & params) {
     const int seq_id = 0;
     const int32_t k = 8;
@@ -2314,6 +2343,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_greedy",                 test_greedy,                 true },
     { "test_greedy_filtered",        test_greedy_filtered,        true },
     { "test_greedy_filtered_common", test_greedy_filtered_common, true },
+    { "test_greedy_backend_filter_cpu", test_greedy_backend_filter_cpu, true },
     { "test_temp",                   test_temp,                   true },
     { "test_temp_ext",               test_temp_ext,               true },
     { "test_top_k",                  test_top_k,                  true },
