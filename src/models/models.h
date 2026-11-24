@@ -2575,6 +2575,11 @@ struct llama_model_inkling2 : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
+
+        // no layer is offloaded and the output is on the CPU, see mix()
+        const bool on_cpu;
+        static bool model_on_cpu(const llama_model & model);
+
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(
@@ -2590,7 +2595,7 @@ struct llama_model_inkling2 : public llama_model_base {
     protected:
         // the helpers alone, a derived graph builds its own body
         struct no_build {};
-        graph(const llm_graph_params & params, no_build) : llm_graph_context(params) {}
+        graph(const llm_graph_params & params, no_build) : llm_graph_context(params), on_cpu(model_on_cpu(model)) {}
 
         // the inputs and the token embeddings
         ggml_tensor * build_inputs();
