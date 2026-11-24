@@ -17,6 +17,8 @@ using nlohmann::ordered_json;
 static_assert(sizeof(ordered_json)  <= sizeof(common_json),  "common_json storage is too small");
 static_assert(alignof(ordered_json) <= alignof(common_json), "common_json alignment is too weak");
 
+common_json_error::~common_json_error() = default;
+
 // runs fn and gives every error of the backing library as a common_json_error
 template <typename F>
 static decltype(auto) guard(F && fn) {
