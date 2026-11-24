@@ -771,6 +771,19 @@ static bool ggml_vk_move_shared_avail_to_barriers(const uint32_t * code, size_t 
     return ggml_vk_spv_emit_shared_avail(code, word_count, scan, out);
 }
 
+// Pipelines the shared-availability rewrite skips: rewritten, the multi-row prefill flash attention runs 3x slower
+// on Mesa 25.2.8 (Radeon 8060S), although its compiled code has fewer waits.
+static const char * const kSharedAvailRewriteSkipped[] = { "flash_attn_f32_f16_mr_cm1" };
+
+static bool ggml_vk_shared_avail_rewrite_skipped(const std::string & pipeline_name) {
+    for (const char * name : kSharedAvailRewriteSkipped) {
+        if (pipeline_name == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipeline, size_t spv_size, const void* spv_data, const std::string entrypoint,
                                          uint32_t parameter_count, std::array<uint32_t, 3> wg_denoms, std::vector<uint32_t> specialization_constants,
                                          bool disable_robustness, bool require_full_subgroups, uint32_t required_subgroup_size) {
@@ -886,7 +899,7 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     }
 #endif
 
-    if (device->shared_avail_to_barriers) {
+    if (device->shared_avail_to_barriers && !ggml_vk_shared_avail_rewrite_skipped(pipeline->name)) {
         const uint32_t * src   = spirv.empty() ? reinterpret_cast<const uint32_t *>(spv_data) : spirv.data();
         size_t           src_n = spirv.empty() ? spv_size / sizeof(uint32_t) : spirv.size();
         std::vector<uint32_t> moved;
