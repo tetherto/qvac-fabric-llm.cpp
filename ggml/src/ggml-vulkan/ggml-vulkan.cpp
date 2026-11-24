@@ -2412,6 +2412,11 @@ static bool ggml_vk_mmvq_wide_device(const vk_device & device) {
     return device->integer_dot_product && device->vendor_id == VK_VENDOR_ID_NVIDIA && device->uma;
 }
 
+static bool ggml_vk_is_radv_rdna3(const vk_device & device) {
+    return device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eMesaRadv &&
+           device->architecture == vk_device_architecture::AMD_RDNA3;
+}
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -9222,7 +9227,10 @@ static bool ggml_vk_mmvq_wide(const vk_device& device, ggml_type type, uint32_t 
     }
 }
 
-static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_t n, uint32_t k, ggml_type src0_type) {
+// On RADV RDNA3 the dense Q6_K float mat-vec slows down sharply past six columns, the q8_1 one does not.
+static constexpr uint32_t radv_q6_k_mmvq_min_cols = 7;
+
+static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_t n, uint32_t k, ggml_type src0_type, bool mul_mat_id = false) {
     if (device->mmvq_mode == 1) {
         return true;
     } else if (device->mmvq_mode == -1) {
@@ -9230,8 +9238,9 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     }
 
     // q6_k only has 2-byte alignment which makes it somewhat problematic,
-    // using MMVQ is only a win on Intel.
-    bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL;
+    // using MMVQ is only a win on Intel, and for wide dense mat-vecs on RADV RDNA3.
+    const bool radv_q6 = !mul_mat_id && n >= radv_q6_k_mmvq_min_cols && ggml_vk_is_radv_rdna3(device);
+    bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL || radv_q6;
     // Past mul_mat_vec_max_cols, MMVQ also wins for the ggml_vk_mmvq_wide() types, Q6_K included.
     const bool wide = n > mul_mat_vec_max_cols && ggml_vk_mmvq_wide(device, src0_type, m);
     if (src0_type == GGML_TYPE_Q6_K && !mmvq_q6 && !wide) {
@@ -10953,7 +10962,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst) && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
+    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst) && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type, true);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
