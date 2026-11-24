@@ -457,6 +457,37 @@ static NSString * ggml_metal_find_metallib(NSBundle * bundle, NSString * name) {
     return path_lib;
 }
 
+#if GGML_METAL_EMBED_PRECOMPILED
+static id<MTLLibrary> ggml_metal_library_load_precompiled(ggml_metal_device_t dev) {
+    if (!ggml_metal_device_get_props(dev)->has_bfloat || ggml_metal_device_get_props(dev)->has_tensor) {
+        return nil;
+    }
+    if (@available(macOS 14.0, *)) {
+        extern const char ggml_metal_precompiled_start[];
+        extern const char ggml_metal_precompiled_end[];
+        dispatch_data_t data = dispatch_data_create(ggml_metal_precompiled_start,
+                ggml_metal_precompiled_end - ggml_metal_precompiled_start,
+                dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{});
+        if (data == nil) {
+            return nil;
+        }
+        NSError * error = nil;
+        id<MTLLibrary> library = [ggml_metal_device_get_obj(dev) newLibraryWithData:data error:&error];
+#if !__has_feature(objc_arc)
+        dispatch_release(data);
+#endif
+        if (library != nil) {
+            GGML_LOG_INFO("%s: using embedded precompiled Metal library\n", __func__);
+        } else {
+            GGML_LOG_WARN("%s: precompiled Metal library unavailable, compiling source: %s\n",
+                    __func__, [[error localizedDescription] UTF8String]);
+        }
+        return library;
+    }
+    return nil;
+}
+#endif
+
 ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
     id<MTLDevice> device = ggml_metal_device_get_obj(dev);
 
@@ -479,6 +510,14 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
 
 #if GGML_METAL_EMBED_LIBRARY
     GGML_LOG_INFO("%s: using embedded metal library\n", __func__);
+
+#if GGML_METAL_EMBED_PRECOMPILED
+    res->objs[0] = ggml_metal_library_load_precompiled(dev);
+    if (res->objs[0] != nil) {
+        res->single_library = true;
+        return res;
+    }
+#endif
 
     // start/end symbols emitted by CMake (see CMakeLists.txt), one pair per kind
 #define X(e, s) extern const char ggml_metallib_##s##_start[]; extern const char ggml_metallib_##s##_end[];

@@ -246,11 +246,18 @@ option(GGML_METAL                           "ggml: use Metal"                   
 option(GGML_METAL_NDEBUG                    "ggml: disable Metal debugging"                   OFF)
 option(GGML_METAL_SHADER_DEBUG              "ggml: compile Metal with -fno-fast-math"         OFF)
 option(GGML_METAL_EMBED_LIBRARY             "ggml: embed Metal library"                       ${GGML_METAL})
+option(GGML_METAL_EMBED_PRECOMPILED         "ggml: also embed precompiled macOS Metal shaders" OFF)
 set   (GGML_METAL_MACOSX_VERSION_MIN "" CACHE STRING
                                             "ggml: metal minimum macOS version")
 set   (GGML_METAL_STD "" CACHE STRING       "ggml: metal standard version (-std flag)")
 set   (GGML_METAL_TARGET_OS "macos" CACHE STRING
                                             "ggml: metal -mtargetos OS name (macos, ios, xros, tvos)")
+if (GGML_METAL_EMBED_PRECOMPILED AND
+    (NOT GGML_METAL OR NOT GGML_METAL_EMBED_LIBRARY OR
+     NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR NOT GGML_METAL_TARGET_OS STREQUAL "macos"))
+    message(FATAL_ERROR "GGML_METAL_EMBED_PRECOMPILED requires Metal, embedded shaders and a macOS target")
+endif()
+
 option(GGML_OPENMP                          "ggml: use OpenMP"                                ON)
 option(GGML_OPENMP_FETCH                    "ggml: fetch LLVM OpenMP"                         OFF)
 option(GGML_RPC                             "ggml: use RPC"                                   OFF)

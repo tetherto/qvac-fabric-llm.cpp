@@ -8,6 +8,7 @@ on:
     paths: [
       '.github/workflows/ci-self-hosted-metal.yml',
       'ci/run.sh',
+      'ci/test-metal-precompiled.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
       '**/*.h',
@@ -24,6 +25,7 @@ on:
     paths: [
       '.github/workflows/ci-self-hosted-metal.yml',
       'ci/run.sh',
+      'ci/test-metal-precompiled.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
       'ggml/include/**',
@@ -105,3 +107,20 @@ jobs:
             build-ci-*/*.log
             build-ci-*/tests/**/*.log
             build-ci-*/tests/test-models/*.gguf
+
+  metal-precompiled:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: qvac-macos26-arm64-gpu
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test embedded precompiled Metal and source fallback
+        run: bash ci/test-metal-precompiled.sh
+      - name: Preserve precompiled Metal logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: metal-precompiled-failure-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            build-metal-precompiled/*.log
+            build-metal-precompiled/CMakeCache.txt
