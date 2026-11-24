@@ -7685,6 +7685,22 @@ struct test_gdn_gates : public test_case {
     }
 };
 
+// where the gdn of test_gated_delta_net_cache_fusion reads its state
+enum gdn_cache_state_src {
+    GDN_STATE_SEPARATE, // a tensor of its own
+    GDN_STATE_IN_PLACE, // the batch rows of cache slot 0, which the cpy rewrites (build_rs_ssm)
+    GDN_STATE_SHIFTED,  // the cache rows one past the batch, which the cpy overwrites in part
+};
+
+static std::string var_to_str(gdn_cache_state_src src) {
+    switch (src) {
+        case GDN_STATE_SEPARATE: return "separate";
+        case GDN_STATE_IN_PLACE: return "in_place";
+        case GDN_STATE_SHIFTED:  return "shifted";
+    }
+    return "unknown";
+}
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -7697,11 +7713,18 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t mem_size; // cache cells per snapshot slot (>= n_seqs)
     const int64_t kv_head;  // first cell of the batch in every slot
     const bool tail_reader; // the gdn output is a graph output and a second node reads its snapshot tail
+    const gdn_cache_state_src state_src;
 
     ggml_tensor * cpy_node  = nullptr;
     ggml_tensor * tail_node = nullptr; // node that reads the snapshot tail besides the cpy
+    ggml_tensor * attn_node = nullptr; // the attention scores, which a fused gdn still writes to its output
+
+    mutable bool has_fusion_counter = false;
 
     std::string vars() override {
+        if (state_src != GDN_STATE_SEPARATE) {
+            return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, K, mem_size, kv_head, state_src);
+        }
         if (tail_reader) {
             return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, K, mem_size, kv_head, tail_reader);
         }
@@ -7714,9 +7737,30 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
-            int64_t K = 2, int64_t mem_size = 0, int64_t kv_head = 0, bool tail_reader = false)
+            int64_t K = 2, int64_t mem_size = 0, int64_t kv_head = 0, bool tail_reader = false,
+            gdn_cache_state_src state_src = GDN_STATE_SEPARATE)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
-          mem_size(mem_size > 0 ? mem_size : n_seqs), kv_head(kv_head), tail_reader(tail_reader) {}
+          mem_size(mem_size > 0 ? mem_size : n_seqs), kv_head(kv_head), tail_reader(tail_reader), state_src(state_src) {}
+
+    bool fusable() const { return !tail_reader && state_src != GDN_STATE_SHIFTED; }
+
+    // only the Vulkan match rejects a state that the cache write overlaps in part
+    bool skip_backend(ggml_backend_t backend) override {
+        const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
+        return state_src == GDN_STATE_SHIFTED && strcmp(name, "Vulkan") != 0;
+    }
+
+    // Vulkan exports the counter only while GGML_VK_FUSE_GDN_CACHE leaves the fusion on
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn = uint64_t (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_gdn_cache_fusion_count");
+        has_fusion_counter = counter != nullptr;
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion()    override { return has_fusion_counter &&  fusable(); }
+    bool expect_no_fusion() override { return has_fusion_counter && !fusable(); }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
@@ -7733,10 +7777,15 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         ggml_set_name(v, "v");
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, H_v, n_seqs);
         ggml_set_name(g,     "g");
         ggml_set_name(beta,  "beta");
-        ggml_set_name(state, "state");
+
+        // recurrent cache: mem_size cells per snapshot slot, the batch's n_seqs cells from kv_head in each slot
+        GGML_ASSERT(kv_head + n_seqs <= mem_size);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, D, mem_size * n_written);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * state = build_state(ctx, cache);
 
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
@@ -7751,6 +7800,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 ggml_row_size(gdn_out->type, S_v * H_v),
                 ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens), 0);
         ggml_set_name(attn, "attn");
+        attn_node = ggml_cont(ctx, attn);
 
         // snapshot tail view [D, n_seqs, n_written]
         const int64_t attn_score_elems = S_v * H_v * n_seq_tokens * n_seqs;
@@ -7760,10 +7810,6 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 ggml_row_size(gdn_out->type, D * n_seqs),
                 ggml_row_size(gdn_out->type, attn_score_elems));
 
-        // recurrent cache: mem_size cells per snapshot slot, the batch's n_seqs cells from kv_head in each slot
-        GGML_ASSERT(kv_head + n_seqs <= mem_size);
-        ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, D, mem_size * n_written);
-        ggml_set_name(cache, "cache");
         ggml_tensor * dst = ggml_view_3d(ctx, cache,
                 D, n_seqs, n_written,
                 ggml_row_size(cache->type, D),
@@ -7785,6 +7831,24 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         return out;
     }
 
+    // the state as its own tensor, or read from the cache rows at kv_head (in place) or one row later (shifted)
+    ggml_tensor * build_state(ggml_context * ctx, ggml_tensor * cache) {
+        if (state_src == GDN_STATE_SEPARATE) {
+            ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count, n_seqs);
+            ggml_set_name(state, "state");
+            return state;
+        }
+        const int64_t first_row = kv_head + (state_src == GDN_STATE_SHIFTED ? 1 : 0);
+        GGML_ASSERT(first_row + n_seqs <= cache->ne[1]);
+        ggml_tensor * rows = ggml_view_2d(ctx, cache, cache->ne[0], n_seqs, cache->nb[1], first_row * cache->nb[1]);
+        return ggml_reshape_4d(ctx, rows, head_size, head_size, head_count, n_seqs);
+    }
+
+    // the scores are read after the cpy, so the cpy stays right behind the gdn
+    void prepare_graph(ggml_cgraph * graph) override {
+        ggml_build_forward_expand(graph, attn_node);
+    }
+
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "GATED_DELTA_NET_CACHE_FUSION";
@@ -7793,9 +7857,9 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override {
         if (tail_node) {
-            return { cpy_node, tail_node };
+            return { cpy_node, tail_node, attn_node };
         }
-        return { cpy_node };
+        return { cpy_node, attn_node };
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -7816,7 +7880,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 init_tensor_uniform(t, 0.0f, 1.0f);
             } else if (strcmp(t->name, "v") == 0) {
                 init_tensor_uniform(t, -0.3f, 5.0f);
-            } else if (strcmp(t->name, "cache") == 0) {
+            } else if (strcmp(t->name, "cache") == 0 && state_src == GDN_STATE_SEPARATE) {
                 init_tensor_uniform(t, 0.0f, 0.0f);
             } else {
                 init_tensor_uniform(t);
@@ -20859,6 +20923,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // a fused gdn must still write its snapshot tail when another node reads it
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  8,  32,  4, 2, 4, 0, 0, /*tail_reader=*/true));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128,  1, 1, 1, 0, 0, /*tail_reader=*/true));
+    // the Qwen3.8-27B decode shape: four sequences of one token, K == 1
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128,  1, 4, 1));
+    // the state read in place from the cache rows the cpy rewrites, as build_rs_ssm reads it
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128,  1, 4, 1, 5, 1, false, GDN_STATE_IN_PLACE));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  8,  32,  4, 2, 4, 3, 1, false, GDN_STATE_IN_PLACE));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128,  2, 2, 4, 2, 0, false, GDN_STATE_IN_PLACE));
+    // a state that the cpy overwrites in part keeps the cpy
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  8,  32,  1, 2, 1, 4, 1, false, GDN_STATE_SHIFTED));
 
     // head sizes spanning the backend threadgroup-shape decisions (columns per thread,
     // threads per threadgroup); every power of two the backends accept.
