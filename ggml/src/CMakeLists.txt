@@ -701,6 +701,12 @@ if (GGML_VECTOR_INDEX)
 endif()
 
 if (GGML_BACKEND_DL)
+    if (ANDROID)
+        # CMake suppresses Android INSTALL_RPATH even though API 24+ supports RUNPATH.
+        foreach (target ${GGML_CORE_TARGETS} ${GGML_AVAILABLE_BACKENDS})
+            target_link_options(${target} PRIVATE "LINKER:--enable-new-dtags" "LINKER:-rpath,$ORIGIN")
+        endforeach()
+    endif()
     if (TARGET ggml-vector-index)
         target_link_libraries(ggml-vector-index PRIVATE ggml-base)
     endif()
