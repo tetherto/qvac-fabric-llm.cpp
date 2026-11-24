@@ -875,12 +875,112 @@ struct case_short_ubatch_rollback : ctx_test {
     }
 };
 
+// archs whose graphs read recurrent states in place through s_copy_moved (build_rs with in_place), so that their
+// topology depends on the moved range of the ubatch
+static bool arch_reads_states_in_place(const llama_model * model) {
+    char arch_name[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch_name, sizeof(arch_name));
+    const llm_arch arch = llama_arch_from_string(arch_name);
+    return arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE;
+}
+
+// a partial rollback restores the state of the seq from a snapshot cell, which changes the moved range of the next
+// ubatch while its shape stays the same. a graph that gathers the states through s_copy fits any moved range and is
+// reused, a graph that reads them in place is rebuilt. both replay like a context that never rolled back
+struct case_rollback_graph_reuse : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "rollback_reuse"; }
+
+    const char * description() const override {
+        return "after a rollback the graph is reused unless it reads the states in place, and the replay matches";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prefill = 16;
+        constexpr llama_pos n_step    = 4;
+        constexpr llama_pos n_keep    = 2; // tokens of the last step kept by the rollback
+        constexpr double    nmse_eps  = 1e-4; // the reference splits the history into other ubatches
+
+        const auto make_ctx = [&]() {
+            ctx_opts opts;
+            opts.n_batch   = (uint32_t) n_prefill;
+            opts.n_ubatch  = (uint32_t) n_prefill;
+            opts.n_seq_max = 1;
+            opts.n_rs_seq  = 8;
+            return mr.ctx(opts);
+        };
+
+        llama_context_ptr ctx     = make_ctx();
+        llama_context_ptr ctx_ref = make_ctx();
+        if (!ctx || !ctx_ref) {
+            return case_result::fail();
+        }
+        if (llama_n_rs_seq(ctx.get()) < (uint32_t) n_step) {
+            return case_result::skip("partial rollback is disabled");
+        }
+
+        const llama_pos p_roll = n_prefill + n_step + n_keep;
+
+        llama_tokens tokens(p_roll + n_step);
+        for (llama_pos pos = 0; pos < (llama_pos) tokens.size(); ++pos) {
+            tokens[pos] = gen_token(n_vocab, 0, pos);
+        }
+
+        const auto n_reused = [](llama_context * c) { return llama_perf_context(c).n_reused; };
+
+        // two steps whose states stay in their own cells: the second one reuses the graph of the first
+        CTX_REQUIRE(decode_seq(ctx.get(), tokens, 0, n_prefill, 0, true) &&
+                    decode_seq(ctx.get(), tokens, n_prefill, n_prefill + n_step, 0, true),
+                "the prefill or the first step failed");
+        const int32_t n_reused_0 = n_reused(ctx.get());
+        CTX_REQUIRE(decode_seq(ctx.get(), tokens, n_prefill + n_step, n_prefill + 2*n_step, 0, true),
+                "the second step failed");
+        if (n_reused(ctx.get()) == n_reused_0) {
+            return case_result::skip("the graph of an identical step is not reused");
+        }
+
+        // keep n_keep tokens of the second step, then decode a step of the same shape
+        CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, p_roll, -1), "the rollback failed");
+        const int32_t n_reused_1 = n_reused(ctx.get());
+        CTX_REQUIRE(decode_seq(ctx.get(), tokens, p_roll, p_roll + n_step, 0, true), "the step after the rollback failed");
+        const bool reused = n_reused(ctx.get()) > n_reused_1;
+
+        CTX_REQUIRE(decode_seq(ctx_ref.get(), tokens, 0, n_prefill, 0, true) &&
+                    decode_seq(ctx_ref.get(), tokens, n_prefill, n_prefill + n_step, 0, true) &&
+                    decode_seq(ctx_ref.get(), tokens, n_prefill + n_step, p_roll, 0, true) &&
+                    decode_seq(ctx_ref.get(), tokens, p_roll, p_roll + n_step, 0, true),
+                "the reference decode failed");
+
+        const float * logits     = llama_get_logits_ith(ctx.get(), -1);
+        const float * logits_ref = llama_get_logits_ith(ctx_ref.get(), -1);
+        CTX_REQUIRE(logits != nullptr && logits_ref != nullptr, "missing logits");
+
+        // with the deferred gdn commit the moved range only looks at plane 0, where the rolled back seq keeps its own
+        // cell, so the rollback leaves the range empty and the graph is reused
+        const logits_diff diff = compare_logits(logits_ref, logits, n_vocab);
+        const bool in_place = arch_reads_states_in_place(mr.model) && !gdn_deferred_requested(mr.model);
+        TLOG_INF("%s: in place %d, graph reused %d, nmse %g\n", __func__, in_place, reused, diff.nmse());
+
+        CTX_REQUIRE(diff.nmse() <= nmse_eps,
+                string_format("replay logits differ (max diff %g, nmse %g)", (double) diff.diff_max, diff.nmse()));
+        CTX_REQUIRE(reused != in_place,
+                in_place ? "a graph that reads the states in place was reused for another moved range"
+                         : "a graph that does not depend on the moved range was rebuilt");
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_rollback_bound>());
     cases.push_back(std::make_unique<case_short_ubatch_rollback>());
+    cases.push_back(std::make_unique<case_rollback_graph_reuse>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
     cases.push_back(std::make_unique<case_multi_seq_cell_swap>());
