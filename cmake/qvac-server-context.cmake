@@ -7,27 +7,26 @@
 # and mtmd references resolve from the shared @qvac/fabric runtime. Enabling
 # LLAMA_BUILD_SERVER for that would also build the web UI, the CLI, the HTTP
 # listener (cpp-httplib) and the llama-server executable, none of which the
-# addon may contain. This file builds only the server-context target, with
-# the same sources, include directories and link libraries as upstream's
-# tools/server/CMakeLists.txt, and installs its archive and headers.
+# addon may contain.
 #
-# The source list is read from upstream's own tools/server/CMakeLists.txt, so a
-# rebase that adds or renames a server-context source is picked up without a
-# fork-side edit. If upstream restructures that block, configure fails here
-# with a message instead of building a different library silently.
+# This file adds upstream's tools/server directory, which stops right after
+# defining the server-context target when QVAC_FABRIC_SERVER_CONTEXT is on (a
+# guarded return() in tools/server/CMakeLists.txt). So the target is upstream's
+# own definition, with its sources, include directories, link libraries and
+# definitions as a rebase changes them; this file only makes it
+# position-independent and hidden, and installs its archive and headers.
 
 set(_qvac_sc_dir "${CMAKE_CURRENT_SOURCE_DIR}/tools/server")
 
 # The library this option ships must be position-independent and hidden (see
-# below). Upstream's own target, defined when LLAMA_BUILD_SERVER=ON, is neither
-# in a static build, and making it so would change what upstream's server
-# libraries export. The two options build different things; refuse the mix
-# rather than ship upstream's target unchanged.
+# below). With LLAMA_BUILD_SERVER=ON the tools build already defines the target,
+# for upstream's own server libraries, and making those hidden would change
+# what they export. The two options build different things; refuse the mix.
 if (TARGET server-context)
     message(FATAL_ERROR
         "QVAC_FABRIC_SERVER_CONTEXT cannot be combined with LLAMA_BUILD_SERVER: it builds "
-        "its own position-independent, hidden-visibility server-context for the QVAC "
-        "decision addon. Turn one of them off (the qvac-fabric port sets LLAMA_BUILD_SERVER=OFF).")
+        "a position-independent, hidden-visibility server-context for the QVAC decision "
+        "addon. Turn one of them off (the qvac-fabric port sets LLAMA_BUILD_SERVER=OFF).")
 endif()
 
 if (NOT TARGET llama-common)
@@ -37,41 +36,31 @@ if (NOT TARGET mtmd)
     message(FATAL_ERROR "QVAC_FABRIC_SERVER_CONTEXT requires LLAMA_MTMD=ON")
 endif()
 
-file(READ "${_qvac_sc_dir}/CMakeLists.txt" _qvac_sc_cmake)
-string(REGEX MATCH
-    "set\\(TARGET server-context\\)[ \t\r\n]+add_library\\(\\$\\{TARGET\\} STATIC([^)]*)\\)"
-    _qvac_sc_match "${_qvac_sc_cmake}")
-if (NOT _qvac_sc_match)
+# Before the directory: llama_add_compile_flags() sets directory-scope options
+# (warnings, LLAMA_FATAL_WARNINGS, LLAMA_SANITIZE_*), which seed the targets
+# created after it, as upstream calls it in tools/CMakeLists.txt before
+# add_subdirectory(server). No other target is created after this file.
+llama_add_compile_flags()
+add_subdirectory(tools/server)
+
+if (NOT TARGET server-context)
     message(FATAL_ERROR
-        "QVAC_FABRIC_SERVER_CONTEXT: could not find the server-context source list in "
-        "tools/server/CMakeLists.txt. Upstream changed how that target is declared; update "
-        "cmake/qvac-server-context.cmake to match.")
+        "QVAC_FABRIC_SERVER_CONTEXT: tools/server/CMakeLists.txt no longer defines "
+        "server-context before its qvac-fabric return(); update the guard there.")
 endif()
 
-string(REGEX REPLACE "[ \t\r\n]+" ";" _qvac_sc_files "${CMAKE_MATCH_1}")
-list(FILTER _qvac_sc_files EXCLUDE REGEX "^$")
-
-set(_qvac_sc_sources)
-foreach(_f IN LISTS _qvac_sc_files)
-    if (NOT EXISTS "${_qvac_sc_dir}/${_f}")
-        message(FATAL_ERROR "QVAC_FABRIC_SERVER_CONTEXT: listed source ${_f} does not exist")
-    endif()
-    # Guard the property that makes this target safe to ship: none of the
-    # HTTP server or model-router implementation files may be compiled in.
-    if (_f MATCHES "^(server|server-http|server-models)\\.cpp$")
+# Guard the property that makes this target safe to ship: none of the HTTP
+# server or model-router implementation files may be compiled in.
+get_target_property(_qvac_sc_sources server-context SOURCES)
+foreach(_f IN LISTS _qvac_sc_sources)
+    get_filename_component(_name "${_f}" NAME)
+    if (_name MATCHES "^(server|server-http|server-connect|server-models|server-models-sched)\\.cpp$")
         message(FATAL_ERROR
-            "QVAC_FABRIC_SERVER_CONTEXT: upstream's server-context now lists ${_f}, "
+            "QVAC_FABRIC_SERVER_CONTEXT: upstream's server-context now compiles ${_name}, "
             "which belongs to the HTTP server. Review before shipping it in the decision addon.")
     endif()
-    list(APPEND _qvac_sc_sources "${_qvac_sc_dir}/${_f}")
 endforeach()
 
-# Before the target: llama_add_compile_flags() sets directory-scope options
-# (warnings, LLAMA_FATAL_WARNINGS, LLAMA_SANITIZE_*), which only seed targets
-# created after it, as upstream calls it in tools/CMakeLists.txt before
-# add_subdirectory(server). No target is created after this file is included.
-llama_add_compile_flags()
-add_library(server-context STATIC ${_qvac_sc_sources})
 target_compile_features(server-context PRIVATE cxx_std_17)
 # Linked into a shared addon module, so position-independent regardless of
 # BUILD_SHARED_LIBS (upstream only sets it for shared builds).
@@ -85,11 +74,6 @@ set_target_properties(server-context PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON)
-target_include_directories(server-context PRIVATE
-    "${_qvac_sc_dir}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/tools/mtmd"
-    "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(server-context PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
 set(QVAC_FABRIC_SERVER_CONTEXT_TARGET server-context)
 
