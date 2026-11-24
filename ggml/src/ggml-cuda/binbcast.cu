@@ -3,6 +3,47 @@
 #include <cstdint>
 #include <utility>
 
+#if defined(GGML_USE_HIP)
+static __global__ void scale_residual_gfx1151(const float * value, const float * scale, float * dst, int rows) {
+#if defined(__gfx1151__)
+    const unsigned int column = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int row = blockIdx.y;
+    if (column >= GGML_CUDA_H3_HIDDEN_SIZE || row >= (unsigned int) rows) {
+        return;
+    }
+    const size_t index = size_t(row) * GGML_CUDA_H3_HIDDEN_SIZE + column;
+    const float x = value[index];
+    const float s = scale[column];
+    float product, result;
+    // Preserve the two original F32 roundings under fast-math; dst may equal value.
+    asm volatile("v_mul_f32 %0, %1, %2" : "=v"(product) : "v"(x), "v"(s));
+    asm volatile("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(x), "v"(product));
+    dst[index] = result;
+#else
+#if defined(__HIP_DEVICE_COMPILE__)
+    __builtin_trap();
+#endif
+    GGML_UNUSED(value);
+    GGML_UNUSED(scale);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(rows);
+#endif
+}
+
+void ggml_cuda_op_scale_residual_gfx1151(ggml_backend_cuda_context & ctx,
+                                      const ggml_tensor * value,
+                                      const ggml_tensor * scale,
+                                      ggml_tensor * dst) {
+    constexpr unsigned int threads = 256;
+    constexpr unsigned int blocks = (GGML_CUDA_H3_HIDDEN_SIZE + threads - 1) / threads;
+    const ggml_cuda_kernel_launch_params launch_params(dim3(blocks, (unsigned int) dst->ne[1], 1),
+                                                       dim3(threads, 1, 1), size_t(0), ctx.stream());
+    ggml_cuda_kernel_launch(scale_residual_gfx1151, launch_params,
+                           (const float *) value->data, (const float *) scale->data,
+                           (float *) dst->data, (int) dst->ne[1]);
+}
+#endif
+
 template<typename T, size_t>
 using type_for_index = T;
 
