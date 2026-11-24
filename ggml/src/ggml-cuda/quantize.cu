@@ -696,13 +696,14 @@ static __device__ __forceinline__ char4 quantize_mmq_few_values(const float4 xi,
     float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
     amax = warp_reduce_max<8>(amax);
 
-    const float d_inv = 127.0f / amax;
+    // an all-zero sub-block (the zeros past a row or past the entries of a pair) has d = 0 and q = 0, see ggml-org/llama.cpp#32566
+    const float d_inv = amax == 0.0f ? 0.0f : 127.0f / amax;
     char4 q;
     q.x = roundf(xi.x*d_inv);
     q.y = roundf(xi.y*d_inv);
     q.z = roundf(xi.z*d_inv);
     q.w = roundf(xi.w*d_inv);
-    d = 1.0f / d_inv;
+    d = amax == 0.0f ? 0.0f : 1.0f / d_inv;
 
     // as in quantize_mmq_q8_1: the sum of the quantized values; the int warp_reduce_sum reduces the whole warp on Ampere+
     sum = 0.0f;
@@ -742,14 +743,16 @@ static __global__ void quantize_mmq_few_q8_1(
     int4        * GGML_CUDA_RESTRICT vy = (int4 *) vy_ptr;
     const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
 
-    if (i0 >= ne00) {
+    // a row may end with half a unit, which is stored as a unit with its first 128 values and zeros
+    const int64_t nunits = (ne00 + QK_K - 1) / QK_K;
+    if (i0 >= nunits*QK_K) {
         return;
     }
     ggml_cuda_pdl_sync();
 
     const int64_t i2 = blockIdx.z % ne2;
     const int64_t i3 = blockIdx.z / ne2;
-    const float4  xi = (int) blockIdx.x < ne1 ? *(const float4 *) (x + i3*s03 + i2*s02 + blockIdx.x*s01 + i0) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float4  xi = (int) blockIdx.x < ne1 && i0 < ne00 ? *(const float4 *) (x + i3*s03 + i2*s02 + blockIdx.x*s01 + i0) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
     if constexpr (wmma) {
         float d;
@@ -772,8 +775,6 @@ static __global__ void quantize_mmq_few_q8_1(
         return;
     }
 
-    // a row may end with half a unit, which is stored as a unit with its first 128 values
-    const int64_t nunits = (ne00 + QK_K - 1) / QK_K;
     const int     g      = blockIdx.x % MMQ_FEW_NCOLS; // column in group
     int4 * yg = vy + ((blockIdx.z*nunits + i0/QK_K)*(gridDim.x/MMQ_FEW_NCOLS) + blockIdx.x/MMQ_FEW_NCOLS)*MMQ_FEW_Q8_1_INT4;
     quantize_mmq_few_store<ds_layout>(xi, yg, i0 % QK_K, g);
@@ -855,18 +856,27 @@ static __global__ void quantize_mmq_few_id_q8_1(
         }
     }
 
-    const int     e  = expert_of(blockIdx.x);
-    const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
-    if (e < 0 || i0 >= ne00) {
+    // the kernel loads whole units of all MMQ_FEW_NCOLS columns of a pair: a half unit at the end of the row is
+    // completed with zeros, and the first entry of a pair also writes zeros to the columns past its entries
+    const int     e      = expert_of(blockIdx.x);
+    const int64_t nunits = (ne00 + QK_K - 1) / QK_K;
+    const int64_t i0     = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
+    if (e < 0 || i0 >= nunits*QK_K) {
         return;
     }
     const int    it = blockIdx.x / n_expert_used;
     const int    is = blockIdx.x % n_expert_used;
-    const float4 xi = *(const float4 *) (x + it*s12 + (is % ne11)*s11 + i0);
+    const float4 xi = i0 < ne00 ? *(const float4 *) (x + it*s12 + (is % ne11)*s11 + i0) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
     const int r = rank(blockIdx.x, e);
-    int4 * yg = vy + (int64_t(pair0[e] + r/MMQ_FEW_NCOLS)*((ne00 + QK_K - 1) / QK_K) + i0/QK_K)*MMQ_FEW_Q8_1_INT4;
+    int4 * yg = vy + (int64_t(pair0[e] + r/MMQ_FEW_NCOLS)*nunits + i0/QK_K)*MMQ_FEW_Q8_1_INT4;
     quantize_mmq_few_store<ds_layout>(xi, yg, i0 % QK_K, r % MMQ_FEW_NCOLS);
+
+    if (r % MMQ_FEW_NCOLS == 0) {
+        for (int g = __popc(tokens[e]) - r; g < MMQ_FEW_NCOLS; ++g) {
+            quantize_mmq_few_store<ds_layout>(make_float4(0.0f, 0.0f, 0.0f, 0.0f), yg, i0 % QK_K, g);
+        }
+    }
 }
 
 template <bool wmma>
