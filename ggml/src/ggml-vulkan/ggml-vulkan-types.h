@@ -1702,6 +1702,8 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_situ {};
+    // GATED_DELTA_NET + CPY: the recurrent cache view the gdn writes its state snapshots to
+    const ggml_tensor * fused_gdn_cache {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
     struct ssm_conv_direct_match {
@@ -1723,6 +1725,7 @@ struct ggml_backend_vk_context {
     ggml_tensor * fused_glu_q8_1 {};
     std::atomic<uint64_t> fwht_fusion_count {};
     std::atomic<uint64_t> glu_mul_mat_fusion_count {};
+    std::atomic<uint64_t> gdn_cache_fusion_count {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
