@@ -30,6 +30,8 @@ layout(binding = 7) readonly   buffer IdxBuf { int        data_idx[]; };
 layout(binding = 8) readonly   buffer DtBuf  { FLOAT_TYPE data_dt[];  };
 layout(binding = 9) readonly   buffer ABuf   { FLOAT_TYPE data_a[];   };
 layout(binding = 10)           buffer DstBuf { FLOAT_TYPE data_dst[]; };
+// the new base: the dst tail, or the recurrent cache when the cache CPY is fused
+layout(binding = 11)           buffer BaseOutBuf { FLOAT_TYPE data_base_out[]; };
 
 FLOAT_TYPE s_shard[ROWS_PER_LANE];
 
@@ -99,7 +101,7 @@ void main() {
     for (uint t = 0; t < n_tokens; t++) {
         if (t == t_base) {
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                data_dst[base_base + r * LANES_PER_COLUMN + lane] = s_shard[r];
+                data_base_out[base_base + r * LANES_PER_COLUMN + lane] = s_shard[r];
             }
         }
 

@@ -5243,7 +5243,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
 
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_deferred[si][kda],
-                    gdn_deferred_names[si][kda], gdn_deferred_len, gdn_deferred_data, "main", 11, sizeof(vk_op_gated_delta_net_deferred_push_constants),
+                    gdn_deferred_names[si][kda], gdn_deferred_len, gdn_deferred_data, "main", 12, sizeof(vk_op_gated_delta_net_deferred_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
 
                 if (si != 0) {
@@ -14418,6 +14418,14 @@ static void ggml_vk_gated_delta_net_deferred(ggml_backend_vk_context * ctx, vk_c
     const auto fs  = [](size_t nb) { return (uint32_t) (nb / sizeof(float)); };
     const auto off = [&](const ggml_tensor * t) { return get_misalign_bytes(ctx, t) / (uint32_t) sizeof(float); };
 
+    // the new base goes to the dst tail, or straight to the cache view of a fused cache CPY
+    const ggml_tensor * cache = ctx->fused_gdn_cache;
+    const vk_subbuffer base_out_buf = cache != nullptr ? ggml_vk_tensor_subbuffer(ctx, cache, true) : dst_buf;
+    const uint32_t base_off = cache != nullptr ? off(cache) : S_v * H * n_tokens * n_seqs;
+    if (cache != nullptr) {
+        ctx->gdn_cache_fusion_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
     const uint32_t rec_v = K * S_v * H_k;
     const uint32_t rec_g = rec_v + K * S_v * H;
     const uint32_t rec_b = rec_g + K * G * H;
@@ -14430,14 +14438,14 @@ static void ggml_vk_gated_delta_net_deferred(ggml_backend_vk_context * ctx, vk_c
         fs(beta->nb[1]), fs(beta->nb[2]), fs(beta->nb[3]),
         fs(state->nb[1]), fs(state->nb[2]), fs(state->nb[3]),
         fs(rec->nb[1]), rec_v, rec_g, rec_b,
-        S_v * H * n_tokens * n_seqs,
+        base_off,
         dt ? 1u : 0u,
         1.0f / sqrtf((float) S_v),
         off(q), off(k), off(v), off(g), off(beta), off(state),
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], dst_buf},
+        {buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], dst_buf, base_out_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -19010,7 +19018,7 @@ static bool ggml_vk_can_fuse_glu_mul_mat(const ggml_backend_vk_context * ctx, co
             ggml_vk_can_quantize_y(ctx, glu, mm, false));
 }
 
-// GGML_VK_FUSE_GDN_CACHE=0 keeps the GATED_DELTA_NET and the CPY of its state snapshots into the cache as two passes.
+// GGML_VK_FUSE_GDN_CACHE=0 keeps the GATED_DELTA_NET (or _DEFERRED) and the CPY of its state into the cache as two passes.
 static bool ggml_vk_fuse_gdn_cache_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_VK_FUSE_GDN_CACHE");
@@ -19043,6 +19051,16 @@ static int ggml_vk_find_node(const struct ggml_cgraph * cgraph, const ggml_tenso
     return -1;
 }
 
+static bool ggml_vk_is_gdn_cache_op(const ggml_tensor * t) {
+    return t->op == GGML_OP_GATED_DELTA_NET || t->op == GGML_OP_GATED_DELTA_NET_DEFERRED;
+}
+
+// the snapshots the gdn writes; the deferred op writes the new base only
+static int64_t ggml_vk_gdn_cache_slot_count(const ggml_tensor * gdn) {
+    const int64_t n_tokens = gdn->src[2]->ne[2];
+    return gdn->op == GGML_OP_GATED_DELTA_NET ? std::min<int64_t>(n_tokens, ggml_get_op_params_i32(gdn, 0)) : 1;
+}
+
 // the state tail of the gdn output, right after the attention scores [S_v, H, n_tokens, n_seqs]
 static bool ggml_vk_is_gdn_state_tail(const ggml_tensor * gdn, const ggml_tensor * view) {
     const ggml_tensor * v = gdn->src[2];
@@ -19050,23 +19068,22 @@ static bool ggml_vk_is_gdn_state_tail(const ggml_tensor * gdn, const ggml_tensor
     return view->op == GGML_OP_VIEW && view->view_src == gdn && view->view_offs == tail_off && ggml_is_contiguous(view);
 }
 
-// the [D, n_seqs, n_written] F32 cache view, with the per-seq stride D the shader assumes
+// the [D, n_seqs, n_written] F32 cache view, with the per-seq stride D the shaders assume
 static bool ggml_vk_is_gdn_cache_view(const ggml_tensor * gdn, const ggml_tensor * view) {
     const ggml_tensor * v = gdn->src[2];
-    const int64_t D         = v->ne[0] * v->ne[0] * v->ne[1];
-    const int64_t n_written = std::min<int64_t>(v->ne[2], ggml_get_op_params_i32(gdn, 0));
-    const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, v->ne[3], n_written, 1 };
+    const int64_t D = v->ne[0] * v->ne[0] * v->ne[1];
+    const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, v->ne[3], ggml_vk_gdn_cache_slot_count(gdn), 1 };
     return view->op == GGML_OP_VIEW && view->type == GGML_TYPE_F32 &&
            std::equal(expected_ne.begin(), expected_ne.end(), view->ne) &&
            view->nb[0] == ggml_type_size(GGML_TYPE_F32) && view->nb[1] == ggml_row_size(GGML_TYPE_F32, D);
 }
 
-// GATED_DELTA_NET, views, then the CPY of its snapshot tail into the cache (the CUDA checks, plus the tail having no
-// other reader): the CPY offset from node_idx, or 0. Reads no address, so graph_optimize gates its ordering on it.
+// GATED_DELTA_NET (or _DEFERRED), views, then the CPY of its state tail into the cache (the CUDA checks, plus the tail
+// having no other reader): the CPY offset from node_idx, or 0. Reads no address, so graph_optimize gates its ordering on it.
 static int ggml_vk_gdn_cache_cpy_offset(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
     // the fused shader leaves the state tail unwritten, so the gdn must not be a graph output
-    if (!ggml_vk_fuse_gdn_cache_enabled() || ctx->device->disable_fusion || gdn->op != GGML_OP_GATED_DELTA_NET ||
+    if (!ggml_vk_fuse_gdn_cache_enabled() || ctx->device->disable_fusion || !ggml_vk_is_gdn_cache_op(gdn) ||
         gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
@@ -19118,7 +19135,7 @@ static bool ggml_vk_gdn_cache_overlap_ok(const ggml_tensor * gdn, const ggml_ten
            (!ggml_vk_tensors_overlap(state, cache, false) || ggml_vk_is_gdn_cache_slot0(state, cache));
 }
 
-// the cache CPY offset from node_idx when the gdn can write its snapshots straight to the cache, or 0
+// the cache CPY offset from node_idx when the gdn can write its state straight to the cache, or 0
 static int ggml_vk_can_fuse_gdn_cache(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     const int offset = ggml_vk_gdn_cache_cpy_offset(ctx, cgraph, node_idx);
     if (offset == 0) {
