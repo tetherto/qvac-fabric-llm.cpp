@@ -1354,6 +1354,12 @@ struct ggml_backend_sched {
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
 
+static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+    return t->buffer != NULL &&
+        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_backend_buffer_is_host(t->buffer);
+}
+
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
     if (split->inputs_capacity > 0) {
@@ -1964,6 +1970,16 @@ bool ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 ggml_backend_sched_split_inputs_grow(split);
                             }
                             split->inputs[n_inputs] = src;
+                        } else if (sched->callback_copy != NULL && fnode->op == GGML_OP_MUL_MAT_ID && j == 0 &&
+                                   ggml_backend_sched_is_host_weight(src) &&
+                                   std::find(split->inputs, split->inputs + split->n_inputs, src) == split->inputs + split->n_inputs) {
+                            // the copy callback may upload only the experts that the first split of the weight uses, so
+                            // another split with a MUL_MAT_ID of the same weight (layers that share their experts) copies it again
+                            int n_inputs = split->n_inputs++;
+                            if (n_inputs >= split->inputs_capacity) {
+                                ggml_backend_sched_split_inputs_grow(split);
+                            }
+                            split->inputs[n_inputs] = src;
                         }
                         fnode->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                     }
@@ -2285,12 +2301,6 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
 
     return true;
-}
-
-static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
-    return t->buffer != NULL &&
-        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-        ggml_backend_buffer_is_host(t->buffer);
 }
 
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
