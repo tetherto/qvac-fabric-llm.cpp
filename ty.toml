@@ -8,6 +8,8 @@ deprecated = "warn"
 [src]
 exclude = [
     "./tools/mtmd/legacy-models/**",
+    # The speech engines use their own Python environments (torch, coremltools)
+    "./engines/speech/**",
 ]
 
 [[overrides]]
