@@ -5296,11 +5296,15 @@ static bool ggml_vk_host_buffer_import_usable(uint32_t vendor_id) {
     return vendor_id != VK_VENDOR_ID_AMD;
 }
 
+static std::mutex & ggml_vk_device_init_mutex() {
+    static std::mutex * mutex = new std::mutex();
+    return *mutex;
+}
+
 vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(ggml_vk_device_init_mutex());
 
     if (vk_instance.devices[idx] == nullptr) {
         VK_LOG_DEBUG("Initializing new vk_device");
