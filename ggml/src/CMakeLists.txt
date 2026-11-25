@@ -752,11 +752,13 @@ if (GGML_BACKEND_DL AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     qvac_configure_shared_core_runtime()
 endif()
 
-if (GGML_BACKEND_DL AND WIN32 AND MSVC)
+if (GGML_BACKEND_DL AND WIN32 AND MSVC AND CMAKE_NM)
     add_custom_command(TARGET ggml-base POST_BUILD
         COMMAND ${CMAKE_COMMAND}
             "-DNM=${CMAKE_NM}"
             "-DIMPORT_LIBRARY=$<TARGET_LINKER_FILE:ggml-base>"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/check-stream-exports.cmake"
         VERBATIM)
+elseif (GGML_BACKEND_DL AND WIN32 AND MSVC)
+    message(STATUS "ggml: no nm found, skipping the ggml-base stream-export check")
 endif()
