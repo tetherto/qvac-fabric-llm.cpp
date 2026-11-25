@@ -13297,7 +13297,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
                    backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_argmax_f32_i32) >= 64;
         case GGML_OP_LIGHTNING_INDEXER:
-            return op->src[0]->type == GGML_TYPE_F32 &&
+            return op->src[4] == nullptr && // no K row list (ggml_lightning_indexer_rows)
+                   op->src[0]->type == GGML_TYPE_F32 &&
                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_BF16) &&
                    op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F16 &&
                    op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&

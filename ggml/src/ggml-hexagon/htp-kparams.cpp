@@ -5542,6 +5542,11 @@ static bool htp_kparams_solve_lightning_indexer(
     const struct ggml_tensor * op,
     struct htp_lid_kernel_params * kparams
 ) {
+    // no K row list (ggml_lightning_indexer_rows): the kernel reads K row by row
+    if (op->src[4] != nullptr) {
+        return false;
+    }
+
     if (htp_lightning_indexer_can_collapse(op->src[0], op->src[1], op->src[2], op->src[3], op)) {
         struct ggml_tensor q_c, k_c, w_c, m_c, d_c;
         htp_lightning_indexer_collapse_tensors(op->src[0], op->src[1], op->src[2], op->src[3], op,
