@@ -1162,6 +1162,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // block-internal attention
     bool causal_attn = false;
+    int32_t n_decode_max = 0; // tokens of one draft decode: n_batch, and n_ubatch for non-causal attention
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
@@ -1268,6 +1269,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // the DSpine code bridge and lattice need whole blocks, so the blocks of all sequences must fit one draft ubatch
         if (llama_model_is_dspine(model_dft) && (int64_t) n_seq * (this->params.n_max + 1) > (int64_t) llama_n_ubatch(ctx_dft)) {
             throw std::runtime_error("DSpine draft needs --spec-draft-n-ubatch >= n_parallel * (--spec-draft-n-max + 1)");
+        }
+
+        // the blocks of a step are decoded in groups of whole blocks that fit one decode, a non-causal draft needs the
+        // decode in one ubatch; one block must fit
+        n_decode_max = (int32_t) llama_n_batch(ctx_dft);
+        if (!causal_attn) {
+            n_decode_max = std::min(n_decode_max, (int32_t) llama_n_ubatch(ctx_dft));
+        }
+        {
+            const int32_t n_block_max = is_lilicorr || has_markov_context ? block_size :
+                    this->params.n_max + (is_dspark && sample_from_anchor ? 0 : 1);
+            if (n_block_max > n_decode_max) {
+                throw std::runtime_error(string_format("the draft decodes blocks of %d tokens, which do not fit "
+                        "--spec-draft-n-ubatch / --spec-draft-n-batch (%d)", n_block_max, n_decode_max));
+            }
         }
 
         batch        = common_batch(ctx_dft);
@@ -1524,6 +1540,139 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        // decodes the blocks in the batch and reads back their drafts
+        auto decode_blocks = [&]() -> bool {
+            if (batch.size() == 0) {
+                return true;
+            }
+            const int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (ret != 0) {
+                LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
+                return false;
+            }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] < 0) {
+                    continue;
+                }
+                auto & dp = dparams[seq_id];
+
+                const int32_t beg            = i_block_beg[seq_id];
+                const int32_t n_block_tokens = n_block[seq_id];
+
+                auto * smpl = smpls[seq_id].get();
+
+                auto & result = *dp.result;
+
+                if (is_dflash2 || is_lilicorr) {
+                    // Both DFlash and LiliCorr greedily walk the candidate lattice.
+                    const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                    GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+                    // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
+                    const bool sample = is_dflash2 && params.probabilistic && dp.result_q;
+
+                    if (sample && dflash2_seed[seq_id] != dp.seed) {
+                        dflash2_seed[seq_id] = dp.seed;
+                        // the default seed means random; mixed so it differs from the target's, as in spec_retune
+                        dflash2_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
+                    }
+
+                    common_speculative_lattice_walk(lattice + (size_t) beg * n_embd_dec, n_embd_dec,
+                            is_dflash2 ? n_block_tokens : params.n_max + 1, is_dflash2 ? selector_top_k : lilicorr_top_k,
+                            params, sample ? &dflash2_rng[seq_id] : nullptr, dp.temp, result, sample ? dp.result_q : nullptr);
+                    continue;
+                }
+
+                if (is_dspark) {
+                    // bonus-anchor drafts read the mask positions only, like DFlash
+                    const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
+                    const int32_t i_draft_end = std::min(n_block_tokens, i_draft_beg + n_draft);
+
+                    if (sampled[seq_id]) {
+                        // the tokens the graph drew, and the distribution q each one was drawn from
+                        const float * draws = llama_get_embeddings_nextn(ctx_dft);
+                        GGML_ASSERT(draws && "DSpark draws missing from h_nextn");
+                        for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
+                            const float * row = draws + (size_t) (beg + i) * n_embd_dec;
+                            const int32_t n_cand = (int32_t) row[1];
+
+                            auto & q = dp.result_q->emplace_back();
+                            q.reserve(n_cand);
+                            for (int32_t k = 0; k < n_cand; ++k) {
+                                const float p = row[2 + n_cand + k];
+                                q.push_back({ (llama_token) row[2 + k], std::log(p), p });
+                            }
+                            result.push_back((llama_token) row[0]);
+                        }
+                        if (result.size() < (size_t) params.n_min) {
+                            result.clear();
+                            dp.result_q->clear();
+                        }
+                        continue;
+                    }
+
+                    // DSpark: read from the first draft slot, truncate below the confidence threshold
+                    const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                    for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
+                        const int32_t idx = beg + i;
+
+                        if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                            break;
+                        }
+
+                        common_sampler_sample(smpl, ctx_dft, idx, true);
+
+                        const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                        for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                            LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                    seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                    common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                        }
+
+                        const llama_token id = cur_p->data[0].id;
+
+                        common_sampler_accept(smpl, id, true);
+
+                        result.push_back(id);
+                    }
+                } else {
+                    // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
+                    for (int32_t i = 1; i < n_block_tokens; ++i) {
+                        common_sampler_sample(smpl, ctx_dft, beg + i, true);
+
+                        const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                        for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                            LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                    seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
+                                    common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                        }
+
+                        const llama_token id = cur_p->data[0].id;
+
+                        if (cur_p->data[0].p < params.p_min) {
+                            break;
+                        }
+
+                        common_sampler_accept(smpl, id, true);
+
+                        result.push_back(id);
+                    }
+                }
+
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                }
+            }
+
+            std::fill(i_block_beg.begin(), i_block_beg.end(), -1);
+            batch.clear();
+            block_state.clear();
+            return true;
+        };
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1555,6 +1704,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             // the block attention is non-causal: a draft with a markov context decodes the full trained block, then reads n_draft of it
             const int32_t n_block_tokens = is_lilicorr || has_markov_context ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            if (batch.size() + n_block_tokens > n_decode_max && !decode_blocks()) {
+                return;
+            }
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1584,132 +1736,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        if (batch.size() == 0) {
-            return;
-        }
-
-        // decode all sequence's noise block in a single batch
-        int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-        if (ret != 0) {
-            LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
-            return;
-        }
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_block_beg[seq_id] < 0) {
-                continue;
-            }
-            auto & dp = dparams[seq_id];
-
-            const int32_t beg            = i_block_beg[seq_id];
-            const int32_t n_block_tokens = n_block[seq_id];
-
-            auto * smpl = smpls[seq_id].get();
-
-            auto & result = *dp.result;
-
-            if (is_dflash2 || is_lilicorr) {
-                // Both DFlash and LiliCorr greedily walk the candidate lattice.
-                const float * lattice = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
-
-                // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
-                const bool sample = is_dflash2 && params.probabilistic && dp.result_q;
-
-                if (sample && dflash2_seed[seq_id] != dp.seed) {
-                    dflash2_seed[seq_id] = dp.seed;
-                    // the default seed means random; mixed so it differs from the target's, as in spec_retune
-                    dflash2_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
-                }
-
-                common_speculative_lattice_walk(lattice + (size_t) beg * n_embd_dec, n_embd_dec,
-                        is_dflash2 ? n_block_tokens : params.n_max + 1, is_dflash2 ? selector_top_k : lilicorr_top_k,
-                        params, sample ? &dflash2_rng[seq_id] : nullptr, dp.temp, result, sample ? dp.result_q : nullptr);
-                continue;
-            }
-
-            if (is_dspark) {
-                // bonus-anchor drafts read the mask positions only, like DFlash
-                const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-                const int32_t i_draft_end = std::min(n_block_tokens, i_draft_beg + n_draft);
-
-                if (sampled[seq_id]) {
-                    // the tokens the graph drew, and the distribution q each one was drawn from
-                    const float * draws = llama_get_embeddings_nextn(ctx_dft);
-                    GGML_ASSERT(draws && "DSpark draws missing from h_nextn");
-                    for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
-                        const float * row = draws + (size_t) (beg + i) * n_embd_dec;
-                        const int32_t n_cand = (int32_t) row[1];
-
-                        auto & q = dp.result_q->emplace_back();
-                        q.reserve(n_cand);
-                        for (int32_t k = 0; k < n_cand; ++k) {
-                            const float p = row[2 + n_cand + k];
-                            q.push_back({ (llama_token) row[2 + k], std::log(p), p });
-                        }
-                        result.push_back((llama_token) row[0]);
-                    }
-                    if (result.size() < (size_t) params.n_min) {
-                        result.clear();
-                        dp.result_q->clear();
-                    }
-                    continue;
-                }
-
-                // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
-                for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
-                    const int32_t idx = beg + i;
-
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
-                        break;
-                    }
-
-                    common_sampler_sample(smpl, ctx_dft, idx, true);
-
-                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                    }
-
-                    const llama_token id = cur_p->data[0].id;
-
-                    common_sampler_accept(smpl, id, true);
-
-                    result.push_back(id);
-                }
-            } else {
-                // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
-                for (int32_t i = 1; i < n_block_tokens; ++i) {
-                    common_sampler_sample(smpl, ctx_dft, beg + i, true);
-
-                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                                seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                    }
-
-                    const llama_token id = cur_p->data[0].id;
-
-                    if (cur_p->data[0].p < params.p_min) {
-                        break;
-                    }
-
-                    common_sampler_accept(smpl, id, true);
-
-                    result.push_back(id);
-                }
-            }
-
-            if (result.size() < (size_t) params.n_min) {
-                result.clear();
-            }
-        }
+        decode_blocks();
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {

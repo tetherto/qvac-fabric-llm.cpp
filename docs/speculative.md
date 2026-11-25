@@ -176,11 +176,12 @@ llama-server -m Inkling-2-Mini.gguf -md Inkling-2-Mini-DSpark.gguf \
     --spec-type draft-dspark --spec-draft-n-max 3 -fa on --jinja
 ```
 
-The Inkling 2 drafter always decodes its full trained block. It also supports `--spec-draft-sampling probabilistic`:
-at a positive request temperature, each drawn token conditions the next one, and the target verifies the draft by
-rejection sampling.
+The Inkling 2 drafter always decodes its full trained block (8 tokens per sequence), so `--spec-draft-n-ubatch` must
+hold at least one block; the blocks of several sequences are decoded in groups that fit it. It also supports
+`--spec-draft-sampling probabilistic`: at a positive request temperature, each drawn token conditions the next one,
+and the target verifies the draft by rejection sampling.
 
-Currently only drafts with a Qwen3 backbone are supported; support for other backbones
+Currently drafts with a Qwen3 backbone and the Inkling 2 drafter are supported; support for other backbones
 (e.g. Gemma4) is planned.
 
 DSpark drafts exported in the [speculators](https://github.com/vllm-project/speculators) format
