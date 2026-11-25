@@ -19,6 +19,9 @@ readonly HOST_LOAD_WINDOW_SECONDS=1
 readonly GPU_LEASE_TOOL="gpu-run"
 readonly LEASED_GPU_INDEX=0
 readonly ENGINE_GGML_PIN_FILE="tts/scripts/setup-ggml.sh"
+readonly DEFAULT_ENGINE_REPO="https://github.com/tetherto/qvac-fabric-llm.cpp.git"
+readonly DEFAULT_ENGINE_BRANCH="temp-12032"
+readonly DEFAULT_ENGINE_SUBDIR="engines/speech"
 readonly HOST_LOAD_SUFFIX=".load.json"
 readonly MEMORY_SAMPLE_SECONDS=0.25
 readonly KIB_PER_MIB=1024
@@ -43,8 +46,9 @@ load_config() {
   MODELS_DIR="${MODELS_DIR:-$BENCH_HOME/models}"
   GPU_LOCK="${GPU_LOCK:-/tmp/gpu-bench.lock}"
   LOCK_WAIT_HOURS="${LOCK_WAIT_HOURS:-$DEFAULT_LOCK_WAIT_HOURS}"
-  ENGINE_REPO="${ENGINE_REPO:-https://github.com/tetherto/qvac-fabric-speech.cpp.git}"
-  ENGINE_BRANCH="${ENGINE_BRANCH:-master}"
+  ENGINE_REPO="${ENGINE_REPO:-$DEFAULT_ENGINE_REPO}"
+  ENGINE_BRANCH="${ENGINE_BRANCH:-$DEFAULT_ENGINE_BRANCH}"
+  ENGINE_SUBDIR="${ENGINE_SUBDIR-$DEFAULT_ENGINE_SUBDIR}"
   GGML_REPO="${GGML_REPO:-https://github.com/tetherto/qvac-fabric-llm.cpp.git}"
   GGML_BRANCH="${GGML_BRANCH:-}"
   BACKENDS="${BACKENDS:-auto}"
@@ -62,7 +66,8 @@ load_config() {
   SRC_DIR="$BENCH_HOME/src"
   BUILDS_DIR="$BENCH_HOME/builds"
   RUNS_DIR="$BENCH_HOME/runs"
-  ENGINE_SRC="$SRC_DIR/speech"
+  ENGINE_CHECKOUT="$SRC_DIR/speech"
+  ENGINE_SRC="$ENGINE_CHECKOUT${ENGINE_SUBDIR:+/$ENGINE_SUBDIR}"
   GGML_SRC="$SRC_DIR/ggml"
   REGISTRY_CLIENT_DIR="$BENCH_HOME/registry-client"
   MODELS_VENV="$BENCH_HOME/venv"
@@ -288,6 +293,12 @@ update_repo() {
   git -C "$dir" remote set-url origin "$url" && fetch_ref "$dir" "${pin:-$branch}"
 }
 
+engine_source_present() {
+  if [ -f "$ENGINE_SRC/CMakeLists.txt" ]; then return 0; fi
+  log "no engine sources at $ENGINE_SRC: $ENGINE_REPO has no ${ENGINE_SUBDIR:-top-level} speech tree at ${ENGINE_PIN:-$ENGINE_BRANCH}"
+  return 1
+}
+
 engine_ggml_pin() {
   sed -n 's/^GGML_REF="\([0-9a-f]\{40\}\)".*/\1/p' "$ENGINE_SRC/$ENGINE_GGML_PIN_FILE" 2>/dev/null | head -n 1
 }
@@ -331,7 +342,8 @@ apply_clock_shim() {
 
 update_sources() {
   mkdir -p "$SRC_DIR"
-  update_repo "$ENGINE_REPO" "$ENGINE_BRANCH" "$ENGINE_SRC" "${ENGINE_PIN:-}" || return 1
+  update_repo "$ENGINE_REPO" "$ENGINE_BRANCH" "$ENGINE_CHECKOUT" "${ENGINE_PIN:-}" || return 1
+  engine_source_present || return 1
   update_ggml || return 1
   apply_clock_shim
   log "engine $(repo_head_line "$ENGINE_SRC") ggml $(repo_head_line "$GGML_SRC") from $(ggml_ref_source)"

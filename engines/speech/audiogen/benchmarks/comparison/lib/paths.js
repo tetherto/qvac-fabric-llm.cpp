@@ -13,8 +13,12 @@ function engineDir () {
   return path.resolve(comparisonRoot(), '../..')
 }
 
+function speechDir () {
+  return path.resolve(engineDir(), '..')
+}
+
 function repositoryDir () {
-  return path.resolve(engineDir(), '../..')
+  return path.resolve(speechDir(), '../..')
 }
 
 function workspaceDir () {
@@ -25,6 +29,7 @@ module.exports = {
   comparisonRoot,
   engineDir,
   repositoryDir,
+  speechDir,
   workspaceDir,
   LIB_DIR
 }

@@ -3,6 +3,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
+SPEECH_SUBDIR="engines/speech"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 PASS=0
@@ -78,8 +79,9 @@ setup_home() {
   mkdir -p "$BENCH_HOME/runs"
   make_repo "$BENCH_HOME/src/speech"
   make_repo "$BENCH_HOME/src/ggml"
-  mkdir -p "$BENCH_HOME/src/speech/parakeet/test/samples"
-  cp "$REPO/parakeet/test/samples/jfk.wav" "$BENCH_HOME/src/speech/parakeet/test/samples/jfk.wav"
+  mkdir -p "$BENCH_HOME/src/speech/$SPEECH_SUBDIR/parakeet/test/samples"
+  cp "$REPO/parakeet/test/samples/jfk.wav" "$BENCH_HOME/src/speech/$SPEECH_SUBDIR/parakeet/test/samples/jfk.wav"
+  echo "project(speech)" > "$BENCH_HOME/src/speech/$SPEECH_SUBDIR/CMakeLists.txt"
   git -C "$BENCH_HOME/src/speech" add -A
   git -C "$BENCH_HOME/src/speech" -c user.name=test -c user.email=test@example.com commit -q -m fixture
 }
@@ -372,6 +374,43 @@ check_previous_and_prune() {
   [ ! -d "$BENCH_HOME/runs/2026-01-12-quick" ] || fail "prune kept an old quick run"
   [ -d "$BENCH_HOME/runs/2026-01-18" ] || fail "prune removed a recent run"
   ok "previous_summary and prune_old_runs walk runs/ newest first"
+}
+
+make_engine_origin() {
+  local origin="$1" subdir="$2" tree="$1${2:+/$2}"
+  make_repo "$origin"
+  mkdir -p "$tree/tts/scripts"
+  cp "$REPO/CMakeLists.txt" "$tree/CMakeLists.txt"
+  cp "$REPO/tts/scripts/setup-ggml.sh" "$tree/tts/scripts/setup-ggml.sh"
+  git -C "$origin" add -A && git -C "$origin" -c user.name=test -c user.email=test@example.com commit -q -m tree
+}
+
+check_default_source_layout() {
+  (
+    unset ENGINE_REPO ENGINE_BRANCH ENGINE_SUBDIR
+    . "$HERE/lib.sh"
+    load_config
+    local origin="$TMP/engine-origin" expected
+    expected="$(sed -n 's/^GGML_REF="\([0-9a-f]\{40\}\)".*/\1/p' "$REPO/tts/scripts/setup-ggml.sh" | head -n 1)"
+    [ -n "$expected" ] || { echo "the tree's own setup-ggml.sh has no GGML_REF" >&2; exit 1; }
+    [ "$ENGINE_REPO" = "https://github.com/tetherto/qvac-fabric-llm.cpp.git" ] || { echo "default engine repository: $ENGINE_REPO" >&2; exit 1; }
+    [ "$ENGINE_SRC" = "$BENCH_HOME/src/speech/$SPEECH_SUBDIR" ] || { echo "default engine sources: $ENGINE_SRC" >&2; exit 1; }
+    [ "$REPO" = "$(git -C "$REPO" rev-parse --show-toplevel)/$ENGINE_SUBDIR" ] || { echo "ENGINE_SUBDIR $ENGINE_SUBDIR is not where this tree lives: $REPO" >&2; exit 1; }
+    make_engine_origin "$origin" "$ENGINE_SUBDIR"
+    ENGINE_REPO="file://$origin"; ENGINE_BRANCH="$(git -C "$origin" rev-parse --abbrev-ref HEAD)"; ENGINE_CHECKOUT="$TMP/engine-checkout"
+    ENGINE_SRC="$ENGINE_CHECKOUT/$ENGINE_SUBDIR"
+    update_repo "$ENGINE_REPO" "$ENGINE_BRANCH" "$ENGINE_CHECKOUT" "" || { echo "engine checkout failed" >&2; exit 1; }
+    engine_source_present || { echo "the default layout has no engine sources" >&2; exit 1; }
+    [ "$(engine_ggml_pin)" = "$expected" ] || { echo "engine pin under the default layout: $(engine_ggml_pin)" >&2; exit 1; }
+    [ "$(ggml_ref)" = "$expected" ] || { echo "ggml ref under the default layout: $(ggml_ref)" >&2; exit 1; }
+    make_engine_origin "$TMP/flat-origin" ""
+    ENGINE_REPO="file://$TMP/flat-origin"; ENGINE_CHECKOUT="$TMP/flat-checkout"; ENGINE_SRC="$ENGINE_CHECKOUT/$ENGINE_SUBDIR"
+    update_repo "$ENGINE_REPO" "$ENGINE_BRANCH" "$ENGINE_CHECKOUT" "" || { echo "flat checkout failed" >&2; exit 1; }
+    engine_source_present > /dev/null && { echo "a repository without $ENGINE_SUBDIR passed as an engine source" >&2; exit 1; }
+    ENGINE_SUBDIR="" load_config
+    [ "$ENGINE_SRC" = "$BENCH_HOME/src/speech" ] || { echo "an empty ENGINE_SUBDIR resolves to $ENGINE_SRC" >&2; exit 1; }
+  ) || fail "default source layout"
+  ok "the default engine repository, branch and subdirectory resolve this tree's layout and its ggml pin, and a repository without that subdirectory is refused"
 }
 
 check_ggml_source() {
@@ -672,6 +711,7 @@ main() {
   check_lib_deadline
   check_failed_result
   check_previous_and_prune
+  check_default_source_layout
   check_ggml_source
   check_gpu_lease
   check_build_marker

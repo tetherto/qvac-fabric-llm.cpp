@@ -2,7 +2,7 @@
 
 const fs = require('fs')
 const path = require('path')
-const { comparisonRoot, engineDir, repositoryDir, workspaceDir } = require('./paths')
+const { comparisonRoot, engineDir, repositoryDir, speechDir, workspaceDir } = require('./paths')
 
 const DEFAULT_CONFIG_PATH = path.join(comparisonRoot(), 'config.json')
 const DEFAULT_MANIFEST_PATH = path.join(comparisonRoot(), 'prompts', 'manifest.json')
@@ -27,6 +27,21 @@ function firstExisting (root, candidates) {
     .find(candidate => fs.existsSync(candidate))
 }
 
+const QVAC_CLI_NAME = 'music-cli'
+const FABRIC_BUILD_CLI_DIRS = ['build/bin', 'build/engines/speech/audiogen']
+const SPEECH_BUILD_CLI_DIRS = ['build/audiogen', 'audiogen/build', 'audiogen/build-cpu', 'audiogen/build-metal']
+
+function cliCandidates (directories) {
+  return directories.map(directory => path.join(directory, QVAC_CLI_NAME))
+}
+
+function findQvacCli (roots) {
+  return firstSet(
+    firstExisting(roots.repositoryDir, cliCandidates(FABRIC_BUILD_CLI_DIRS)),
+    firstExisting(roots.speechDir, cliCandidates(SPEECH_BUILD_CLI_DIRS))
+  )
+}
+
 function readJson (filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'))
 }
@@ -48,14 +63,8 @@ function loadHarnessConfig (overrides = {}) {
 
   const qvacCli = path.resolve(firstSet(
     process.env.ACESTEP_QVAC_CLI,
-    firstExisting(repositoryDir(), [
-      'build/audiogen/music-cli',
-      'build/audiogen/music-cli',
-      'audiogen/build/music-cli',
-      'audiogen/build-cpu/music-cli',
-      'audiogen/build-metal/music-cli'
-    ]),
-    path.join(engineDir(), 'build', 'music-cli')
+    findQvacCli({ repositoryDir: repositoryDir(), speechDir: speechDir() }),
+    path.join(engineDir(), 'build', QVAC_CLI_NAME)
   ))
 
   const aceLm = path.resolve(firstSet(
@@ -141,6 +150,7 @@ function loadHarnessConfig (overrides = {}) {
 module.exports = {
   DEFAULT_CONFIG_PATH,
   DEFAULT_MANIFEST_PATH,
+  findQvacCli,
   firstExisting,
   loadHarnessConfig,
   readJson

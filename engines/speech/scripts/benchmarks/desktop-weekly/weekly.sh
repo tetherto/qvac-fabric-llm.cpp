@@ -162,7 +162,8 @@ main() {
   take_run_lock || fail "another weekly.sh run holds $(run_lock_dir) ($(run_lock_holder))"
   keep_awake
   if [ "$UPDATE" = 1 ]; then update_sources || fail "source update failed"; fi
-  [ -d "$ENGINE_SRC/.git" ] || fail "no engine checkout at $ENGINE_SRC"
+  [ -d "$ENGINE_CHECKOUT/.git" ] || fail "no engine checkout at $ENGINE_CHECKOUT"
+  engine_source_present || fail "no engine sources at $ENGINE_SRC"
   FAMILIES="$(selected_families)"
   export SELECTED_FAMILIES="$FAMILIES"
   apply_quick_iterations
