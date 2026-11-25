@@ -953,6 +953,10 @@ class tensor_traits_common : public tensor_traits_base {
         switch (op->op) {
             case GGML_OP_FLASH_ATTN_EXT:
                 {
+                    // K/V row lists and the indexed bias are handled by the generic CPU path, which sizes its own scratch
+                    if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
+                        return false;
+                    }
                     const int     n_tasks = n_threads;
                     const int64_t neq2    = op->src[0]->ne[2];  // number of query heads
                     const int64_t DK      = op->src[1]->ne[0];
