@@ -132,7 +132,7 @@ Everything lives under `BENCH_HOME` (`~/speech-bench` by default):
 ```
 tools/                 this directory, copied by install.sh
 config.env             per-machine settings (see config.example.env)
-src/speech, src/ggml   shallow checkouts of the engine and ggml branches
+src/speech, src/ggml   shallow checkouts of the engine and ggml branches; the engine sources are src/speech/engines/speech
 builds/<backend>/      ggml, ggml-install and speech build trees, plus BUILT with the commit pair they came from
 registry-client/       the npm registry client, private to this account
 venv/                  python venv with gguf and numpy for the requantized cut, private to this account

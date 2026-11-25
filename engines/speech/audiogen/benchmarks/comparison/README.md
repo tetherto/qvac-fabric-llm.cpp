@@ -73,7 +73,7 @@ both engines load.
 
 ## Build QVAC music-cli
 
-From the whisper.cpp / speech-stack repository root. Review
+From `engines/speech` in the fabric repository. Review
 `https://github.com/tetherto/qvac-ext-ggml` (`speech` branch) before compiling;
 the VAE needs `ggml_snake` and `ggml_col2im_1d`.
 
@@ -132,7 +132,7 @@ for an implementation comparison, but label the report as PTX rather than a
 native `sm_120` build. Set `CUDA_VISIBLE_DEVICES` before environment capture
 and generation when the host has more than one GPU.
 
-Set `ACESTEP_QVAC_CLI` to the `music-cli` you intend to measure.
+Without `ACESTEP_QVAC_CLI` the harness looks for `music-cli` in the fabric root build (`build/bin`), then in a standalone speech build (`engines/speech/build/audiogen`), then in `audiogen/build`, `build-cpu` and `build-metal`. Set `ACESTEP_QVAC_CLI` to the `music-cli` you intend to measure.
 
 ## Build acestep.cpp
 
