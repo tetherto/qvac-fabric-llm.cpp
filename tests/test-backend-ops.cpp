@@ -13025,6 +13025,7 @@ struct test_swiglu_mul_mat : public test_case {
     const bool fuses;
     mutable bool has_fusion_counter = false;
     mutable bool supported = false;
+    mutable int64_t vec_cols = 0; // the backend's mat-vec column limit for this weight (0: not reported)
 
     std::string vars() override {
         return VARS_TO_STR6(type_a, m, n, k, f16_b, tail);
@@ -13053,14 +13054,20 @@ struct test_swiglu_mul_mat : public test_case {
         using supported_fn = bool (*)(ggml_backend_t, ggml_type);
         auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_glu_mul_mat_fusion_count");
         auto support = (supported_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_glu_mul_mat_supported");
+        using vec_cols_fn = uint32_t (*)(ggml_backend_t, ggml_type, uint32_t);
+        auto cols = (vec_cols_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_glu_mul_mat_vec_cols");
         has_fusion_counter = counter != nullptr;
         supported = support != nullptr && support(backend, type_a);
+        vec_cols = cols != nullptr ? cols(backend, type_a, (uint32_t) m) : 0;
         return counter != nullptr ? counter(backend) : 0;
     }
 
-    bool expect_fusion() override { return fuses && has_fusion_counter && supported; }
+    // a batch that the backend's mat-vec covers is not fused
+    bool fuses_here() const { return fuses && n > vec_cols; }
 
-    bool expect_no_fusion() override { return !fuses && has_fusion_counter; }
+    bool expect_fusion() override { return fuses_here() && has_fusion_counter && supported; }
+
+    bool expect_no_fusion() override { return !fuses_here() && has_fusion_counter; }
 
     test_swiglu_mul_mat(ggml_type type_a, int64_t m, int64_t n, int64_t k, bool f16_b, bool tail, bool fuses)
         : type_a(type_a), m(m), n(n), k(k), f16_b(f16_b), tail(tail), fuses(fuses) {}
@@ -17901,11 +17908,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // XL-shaped down projections: on RADV RDNA3 the GLU stores the f16 B of the XL matmul (the XL minimum K and a 17408-wide GLU).
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q5_K, 5120, 512, 4096, false, true, true));
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q5_K, 5120, 512, 17408, false, true, true));
+    // 12 columns: fused, except where the 9-16 column mat-vec covers the down projection (RADV RDNA3)
+    test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q5_K, 5120, 12, 4096, false, true, true));
     // No fusion: F16 B precision, a mat-vec batch, F16 weights, and the MUL_MAT as the last computed node (an eval callback may read the GLU).
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 64, 1024, true, true, false));
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 8, 1024, false, true, false));
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_F16, 256, 64, 1024, false, true, false));
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 64, 1024, false, false, false));
+
+    // 9-16 column q8_1 mat-vec (ggml_vk_mmvq_wide: m >= 4096 on RADV RDNA3 and UMA NVIDIA)
+    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0 }) {
+        for (int n : { 9, 12, 16 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 1024, { 1, 1 }, { 1, 1 }));
+        }
+    }
 
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
