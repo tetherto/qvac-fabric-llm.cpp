@@ -626,6 +626,15 @@ llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK 
 
 llama_build_and_test(test-convrot.cpp LINK ggml)
 
+llama_build(test-im2col-3d.cpp LINK ggml)
+if (GGML_CPU)
+    llama_test(test-im2col-3d NAME test-im2col-3d-cpu LABEL "main behavior backend" ARGS CPU)
+endif()
+if (GGML_CUDA)
+    llama_test(test-im2col-3d NAME test-im2col-3d-cuda LABEL "main behavior backend" ARGS CUDA)
+    set_tests_properties(test-im2col-3d-cuda PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 llama_build(test-hip-scale-residual.cpp LINK ggml)
 llama_test(test-hip-scale-residual NAME test-hip-scale-residual-guards ARGS guards)
 if (GGML_CPU)

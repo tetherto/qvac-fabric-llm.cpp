@@ -8560,8 +8560,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 (!op->src[1] || op->src[1]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
                 ggml_nelements(op) <= INT32_MAX;
-        case GGML_OP_IM2COL:
         case GGML_OP_IM2COL_3D:
+            return op->src[1]->type == GGML_TYPE_F32 &&
+                   (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) && ggml_is_contiguous(op);
+        case GGML_OP_IM2COL:
         case GGML_OP_CONV_2D:
             return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
         case GGML_OP_CONV_3D:
