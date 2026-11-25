@@ -698,7 +698,8 @@ if (GGML_BACKEND_DL)
         target_link_libraries(ggml-vector-index PRIVATE ggml-base)
     endif()
     foreach (target ${GGML_CORE_TARGETS})
-        # Encode the native ABI in the filename, including Windows and Android.
+        # Shared-core linkage generation, not a cross-release ABI guarantee.
+        # See docs/build.md#qvac-shared-core-linkage for naming and lockstep requirements.
         set_target_properties(${target} PROPERTIES
             OUTPUT_NAME "qvac-${target}-1"
             INSTALL_RPATH "$ORIGIN"
