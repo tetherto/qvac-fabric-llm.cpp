@@ -2256,14 +2256,23 @@ static bool ggml_vk_mm_xl_enabled() {
     return on;
 }
 
-static constexpr uint32_t mm_xl_tile         = 256;  // BM = BN of the XL tile
-static constexpr uint32_t mm_xl_l_tile       = 128;  // BM = BN of the L tile it replaces
-static constexpr uint32_t mm_xl_l_wgs_per_cu = 2;    // L workgroups resident per CU, against one XL workgroup
-static constexpr uint32_t mm_xl_wave_cost    = 2;    // an XL wave does the work of two L waves
-static constexpr uint32_t mm_xl_min_m        = 1024;
-static constexpr uint32_t mm_xl_min_k        = 4096; // in-model on gfx1151, XL lost at k 2560 and won at k 4096 and up
+static constexpr uint32_t mm_xl_tile           = 256;  // BM = BN of the XL tile
+static constexpr uint32_t mm_xl_l_tile         = 128;  // BM = BN of the L tile it replaces
+static constexpr uint32_t mm_xl_l_wgs_per_cu   = 2;    // L workgroups resident per CU, against one XL workgroup
+static constexpr uint32_t mm_xl_wave_cost      = 2;    // an XL wave does the work of two L waves
+static constexpr uint32_t mm_xl_min_m          = 1024;
+static constexpr uint32_t mm_xl_min_k          = 4096; // in-model on gfx1151, XL lost at k 2560 and won at k 4096 and up
+static constexpr uint32_t mm_xl_min_full_waves = 2;
+static constexpr uint32_t mm_xl_max_idle_pct   = 25;   // gfx1151: XL won at 15-23% idle, lost at 28% and 40%
 
-// XL pays off where its rounded-up wave count costs no more than the L tile's.
+// Share of the XL waves' tile area that the tail wave and the padding past m and n leave idle, in percent.
+static uint32_t ggml_vk_mm_xl_idle_pct(uint32_t cu, uint32_t waves_xl, uint32_t m, uint32_t n) {
+    const uint64_t area = (uint64_t) waves_xl * cu * mm_xl_tile * mm_xl_tile;
+    return (uint32_t) (100 - (uint64_t) m * n * 100 / area);
+}
+
+// XL pays off where its rounded-up wave count costs no more than the L tile's, and from two waves with little idle
+// area (gfx1151, n 512: q5_K / q6_K / iq4_xs m17408 k5120 1.10-1.17x faster than int8 MMQ, Qwen3-8B Q4_K_M pp512 +3-5%).
 static bool ggml_vk_mm_xl_ok(const vk_device & device, uint32_t m, uint32_t n, uint32_t k) {
     if (m < mm_xl_min_m || k < mm_xl_min_k) {
         return false;
@@ -2271,7 +2280,10 @@ static bool ggml_vk_mm_xl_ok(const vk_device & device, uint32_t m, uint32_t n, u
     const uint32_t cu       = std::max(device->shader_core_count, 1u);
     const uint32_t waves_xl = CEIL_DIV(CEIL_DIV(m, mm_xl_tile) * CEIL_DIV(n, mm_xl_tile), cu);
     const uint32_t waves_l  = CEIL_DIV(CEIL_DIV(m, mm_xl_l_tile) * CEIL_DIV(n, mm_xl_l_tile), mm_xl_l_wgs_per_cu * cu);
-    return mm_xl_wave_cost * waves_xl <= waves_l;
+    if (mm_xl_wave_cost * waves_xl <= waves_l) {
+        return true;
+    }
+    return waves_xl >= mm_xl_min_full_waves && ggml_vk_mm_xl_idle_pct(cu, waves_xl, m, n) <= mm_xl_max_idle_pct;
 }
 
 // Whether the XL pipeline spills depends on the GPU and the compiler; where it does, the L tile is kept.

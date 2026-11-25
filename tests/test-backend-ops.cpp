@@ -17869,7 +17869,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // f16-B register-prefetch coopmat matmul (Vulkan RADV RDNA3, K >= 1024 and N >= 32): whole tiles, ragged M and N tiles
     // (non-prefetch loop), a batch with an odd superblock count per row, and a narrow shape split along k. On 40 CUs the
-    // m >= 1536 rows with k >= 4096 take the 256x256 XL tile; the k < 4096 rows stay on smaller tiles (q4_K) or int8 MMQ.
+    // m >= 1536 rows with k >= 4096 take the 256x256 XL tile (also m 12288 n 512, m 17000 n 500 and m 17408 n 467: two
+    // waves with little idle area); the k < 4096 rows stay on smaller tiles (q4_K) or int8 MMQ.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS }) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 512, 1024, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4200, 500, 1024, { 1, 1 }, { 1, 1 }));
@@ -17883,6 +17884,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4200, 500, 4096, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5000, 500, 4352, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1536, 1024, 4096, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 12288, 512, 4096, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17000, 500, 4352, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, 467, 4096, { 1, 1 }, { 1, 1 }));
     }
     // below XL, q5_K, q6_K and iq4_xs reach the prefetch matmul only with a B that cannot be quantized
     for (ggml_type type_a : { GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS }) {
