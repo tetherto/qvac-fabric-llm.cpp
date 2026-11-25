@@ -23,7 +23,12 @@
 #include <vector>
 
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 
 static int nf_dump() {
@@ -1362,12 +1367,46 @@ static uint64_t nf_hash(const std::string & s, uint64_t h) {
     return h;
 }
 
+static void nf_mkdir(const std::string & path) {
+#ifdef _WIN32
+    _mkdir(path.c_str());
+#else
+    mkdir(path.c_str(), 0755);
+#endif
+}
+
+static bool nf_is_dir(const std::string & path) {
+#ifdef _WIN32
+    struct _stat64 st;
+    return _stat64(path.c_str(), &st) == 0 && (st.st_mode & _S_IFDIR) != 0;
+#else
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+static int nf_getpid() {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return (int) getpid();
+#endif
+}
+
+static bool nf_is_sep(char c) {
+#ifdef _WIN32
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+
 static void nf_mkdirs(const std::string & path) {
     std::string cur;
     for (size_t i = 0; i < path.size(); ++i) {
         cur += path[i];
-        if ((path[i] == '/' && i > 0) || i + 1 == path.size()) {
-            mkdir(cur.c_str(), 0755);
+        if ((nf_is_sep(path[i]) && i > 0) || i + 1 == path.size()) {
+            nf_mkdir(cur);
         }
     }
 }
@@ -1382,13 +1421,16 @@ static void nf_init_dir(nf_compiler & c) {
         c.dir = env;
     } else if (getenv("XDG_CACHE_HOME") != nullptr) {
         c.dir = std::string(getenv("XDG_CACHE_HOME")) + "/ggml-nvrtc";
+#ifdef _WIN32
+    } else if (getenv("LOCALAPPDATA") != nullptr) {
+        c.dir = std::string(getenv("LOCALAPPDATA")) + "/ggml-nvrtc";
+#endif
     } else if (getenv("HOME") != nullptr) {
         c.dir = std::string(getenv("HOME")) + "/.cache/ggml-nvrtc";
     }
     if (!c.dir.empty() && c.dir != "0") {
         nf_mkdirs(c.dir);
-        struct stat st;
-        c.dir_ok = stat(c.dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+        c.dir_ok = nf_is_dir(c.dir);
     }
 }
 
@@ -1487,14 +1529,15 @@ static CUfunction nf_get_function(int device, const std::string & src, const std
         fprintf(stderr, "nvrtc-fusion: compiled kernel %d in %.1f ms\n", c.n_nvrtc, ms);
     }
     if (fn != nullptr && !path.empty()) {
-        const std::string tmp = path + ".tmp" + std::to_string(getpid());
+        const std::string tmp = path + ".tmp" + std::to_string(nf_getpid());
         FILE * f = fopen(tmp.c_str(), "wb");
         if (f != nullptr) {
             const uint64_t hdr[2] = { 0x31434e46ull, h2 };
             const bool ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 && fwrite(image.data(), 1, image.size(), f) == image.size();
             fclose(f);
+            // on Windows rename fails if another process already wrote this file; keep that copy
             if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
-                unlink(tmp.c_str());
+                remove(tmp.c_str());
             }
         }
     }

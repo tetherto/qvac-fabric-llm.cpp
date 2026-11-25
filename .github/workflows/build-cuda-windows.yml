@@ -40,9 +40,10 @@ jobs:
           - cuda: '12.4'
             arch: x64
             defines: '-DGGML_CUDA_CCCL_VERSION=v3.4.3'
+          # QVAC divergence from upstream: also build the NVRTC fusion pass with MSVC
           - cuda: '13.4'
             arch: x64
-            defines: '-DGGML_CUDA_CCCL_VERSION=v3.4.3'
+            defines: '-DGGML_CUDA_CCCL_VERSION=v3.4.3 -DGGML_CUDA_NVRTC_FUSION=ON'
           - cuda: '13.4'
             arch: arm64
             defines: '-DGGML_CUDA_CCCL_VERSION=v3.4.3 -DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake'
