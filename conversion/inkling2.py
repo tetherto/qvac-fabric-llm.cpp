@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 from .base import LazyTorchTensor, ModelBase, MmprojModel, TextModel, gguf, logger
+from .qwen import DFlashModel
 
 
 def _e4m3_table() -> np.ndarray:
@@ -494,6 +495,78 @@ class Inkling2DSparkModel(Inkling2Model):
             yield self.format_tensor_name(self._LAYER[key], bid), data_torch
             return
         yield from TextModel.modify_tensors(self, data_torch, name, bid)
+
+
+class Inkling2DFlashModel(DFlashModel):
+    """DFlash2 draft of an Inkling 2 target (e.g. incoai/Inkling-2-Mini-DFlash2), with --target-model-dir
+
+    Like the DSpark draft it reads the residual state entering target layer visits (loop passes counted), the last
+    id being the final norm output: target_visits holds these ids, target_layers the physical layer of each visit
+    (n_layer for the final norm). The draft shares the target's token embeddings (llama.cpp applies Inkling's
+    embedding norm) and output head over the unpadded vocabulary."""
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.target_model_dir is None:
+            raise ValueError("Inkling 2 DFlash draft needs --target-model-dir with the target checkpoint")
+        target = ModelBase.load_hparams(self.target_model_dir, False)
+        self.target_hparams = tp = {**target, **target.get("text_config", {})}
+
+        self.n_phys = tp["num_hidden_layers"]
+        loop = tp.get("loop_config")
+        self.loop = (loop["core_start"], loop["core_end"], loop["num_passes"]) if loop else (0, 0, 1)
+        start, end, passes = self.loop
+        n_visits = self.n_phys + (passes - 1) * (end - start)
+
+        cfg = self.hparams.get("dflash_config", {})
+        visits = cfg.get("target_layer_ids", [])
+        if len(visits) < 2 or visits != sorted(set(visits)) or visits[0] < 0 or visits[-1] != n_visits:
+            raise ValueError(f"Inkling2 DFlash: target_layer_ids {visits} must be sorted, unique and end at {n_visits} (the final norm)")
+        if self.hparams.get("num_target_layers", n_visits) != n_visits or self.hparams["hidden_size"] != tp["hidden_size"]:
+            raise ValueError("Inkling2 DFlash: the draft was not trained for this target")
+        mask_id = cfg.get("mask_token_id")
+        if mask_id is None or not 0 <= mask_id < tp["unpadded_vocab_size"]:
+            raise ValueError(f"Inkling2 DFlash: mask_token_id {mask_id} is not a token of the target")
+
+    def set_vocab(self):
+        # the target's tokenizer over its unpadded vocabulary, as in the Inkling 2 GGUFs
+        dir_model, hparams = self.dir_model, self.hparams
+        self.dir_model, self.hparams = self.target_model_dir, self.target_hparams
+        try:
+            Inkling2Model.set_vocab(self)  # ty: ignore[invalid-argument-type]
+        finally:
+            self.dir_model, self.hparams = dir_model, hparams
+        self.gguf_writer.add_mask_token_id(self.hparams["dflash_config"]["mask_token_id"])
+
+    def get_vocab_base(self):
+        tokens, types, pre = super().get_vocab_base()
+        n = self.target_hparams["unpadded_vocab_size"]
+        return tokens[:n], types[:n], pre
+
+    def extract_layer_ids(self, target_layer_ids: list[int]) -> list[int]:
+        # the physical layer of each visit: prelude, core passes, tail; the final norm maps to n_layer
+        start, end, passes = self.loop
+        core = (end - start) * passes
+
+        def layer(v: int) -> int:
+            if v < start:
+                return v
+            if v < start + core:
+                return start + (v - start) % (end - start)
+            return v - core + (end - start)
+
+        return [layer(v) for v in target_layer_ids]
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_target_visits(self.hparams["dflash_config"]["target_layer_ids"])
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # the selector codebooks cover the padded vocabulary, but only tokens are candidates
+        if name in ("model.candidate_selector.predecessor_codebook", "model.candidate_selector.successor_codebook"):
+            data_torch = data_torch[:self.target_hparams["unpadded_vocab_size"]]
+        yield from super().modify_tensors(data_torch, name, bid)
 
 
 @ModelBase.register("Inkling2ForConditionalGeneration", "Inkling2LoopForConditionalGeneration")
