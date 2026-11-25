@@ -279,6 +279,133 @@ static void cpy_thread_##NAME##_strided(unsigned int nth, unsigned int ith, void
 DEFINE_CPY_CONVERT_STRIDED(f32_f16, float, __fp16)
 DEFINE_CPY_CONVERT_STRIDED(f16_f32, __fp16, float)
 
+struct cpy_transpose_job {
+    const uint8_t * src;
+    uint8_t *       dst;
+    uint32_t        n_rows;
+    uint32_t        n_cols;
+    uint32_t        n_mats;
+    uint32_t        n_strips;
+    uint32_t        strips_per_thread;
+    bool            strips_along_rows;
+};
+
+struct cpy_transpose_rect {
+    uint32_t row0;
+    uint32_t row1;
+    uint32_t col0;
+    uint32_t col1;
+};
+
+static inline void cpy_transpose_shuffle_stage(HVX_Vector * out, const HVX_Vector * in) {
+    const uint32_t half = HTP_COPY_TRANSPOSE_TILE / 2;
+    for (uint32_t i = 0; i < half; i++) {
+        const HVX_VectorPair pair = Q6_W_vshuff_VVR(in[i + half], in[i], -(int) sizeof(float));
+        out[2 * i]     = Q6_V_lo_W(pair);
+        out[2 * i + 1] = Q6_V_hi_W(pair);
+    }
+}
+
+static inline void cpy_transpose_tile_load(HVX_Vector * rows, const uint8_t * src, uint32_t src_stride) {
+    for (uint32_t i = 0; i < HTP_COPY_TRANSPOSE_TILE; i++) {
+        rows[i] = hvx_vmemu(src + i * src_stride);
+    }
+}
+
+static inline void cpy_transpose_tile_store(uint8_t * dst, uint32_t dst_stride, const HVX_Vector * rows) {
+    for (uint32_t i = 0; i < HTP_COPY_TRANSPOSE_TILE; i++) {
+        hvx_vmemu(dst + i * dst_stride) = rows[i];
+    }
+}
+
+static inline void cpy_transpose_tile(uint8_t * dst, uint32_t dst_stride, const uint8_t * src, uint32_t src_stride) {
+    HVX_Vector a[HTP_COPY_TRANSPOSE_TILE];
+    HVX_Vector b[HTP_COPY_TRANSPOSE_TILE];
+    cpy_transpose_tile_load(a, src, src_stride);
+    cpy_transpose_shuffle_stage(b, a);
+    cpy_transpose_shuffle_stage(a, b);
+    cpy_transpose_shuffle_stage(b, a);
+    cpy_transpose_shuffle_stage(a, b);
+    cpy_transpose_shuffle_stage(b, a);
+    cpy_transpose_tile_store(dst, dst_stride, b);
+}
+
+static void cpy_transpose_rect_scalar(const struct cpy_transpose_job * job, const uint8_t * src, uint8_t * dst,
+                                      const struct cpy_transpose_rect * rect) {
+    const float * s = (const float *) src;
+    float *       d = (float *) dst;
+    for (uint32_t row = rect->row0; row < rect->row1; row++) {
+        for (uint32_t col = rect->col0; col < rect->col1; col++) {
+            d[col * job->n_rows + row] = s[row * job->n_cols + col];
+        }
+    }
+}
+
+static inline bool cpy_transpose_rect_is_tile(const struct cpy_transpose_rect * rect) {
+    return rect->row1 - rect->row0 == HTP_COPY_TRANSPOSE_TILE && rect->col1 - rect->col0 == HTP_COPY_TRANSPOSE_TILE;
+}
+
+static inline void cpy_transpose_rect(const struct cpy_transpose_job * job, const uint8_t * src, uint8_t * dst,
+                                      const struct cpy_transpose_rect * rect) {
+    if (!cpy_transpose_rect_is_tile(rect)) {
+        cpy_transpose_rect_scalar(job, src, dst, rect);
+        return;
+    }
+    const uint32_t src_stride = job->n_cols * sizeof(float);
+    const uint32_t dst_stride = job->n_rows * sizeof(float);
+    cpy_transpose_tile(dst + (rect->col0 * job->n_rows + rect->row0) * sizeof(float), dst_stride,
+                       src + (rect->row0 * job->n_cols + rect->col0) * sizeof(float), src_stride);
+}
+
+static void cpy_transpose_strip(const struct cpy_transpose_job * job, const uint8_t * src, uint8_t * dst, uint32_t strip) {
+    const uint32_t tile  = HTP_COPY_TRANSPOSE_TILE;
+    const uint32_t along = job->strips_along_rows ? job->n_rows : job->n_cols;
+    const uint32_t cross = job->strips_along_rows ? job->n_cols : job->n_rows;
+    const uint32_t lo    = strip * tile;
+    const uint32_t hi    = MIN(lo + tile, along);
+    for (uint32_t c0 = 0; c0 < cross; c0 += tile) {
+        const uint32_t c1 = MIN(c0 + tile, cross);
+        const struct cpy_transpose_rect rect = job->strips_along_rows
+            ? (struct cpy_transpose_rect) { lo, hi, c0, c1 }
+            : (struct cpy_transpose_rect) { c0, c1, lo, hi };
+        cpy_transpose_rect(job, src, dst, &rect);
+    }
+}
+
+static void cpy_thread_transpose(unsigned int nth, unsigned int ith, void * data) {
+    const struct cpy_transpose_job * job = (const struct cpy_transpose_job *) data;
+    const uint32_t total     = job->n_mats * job->n_strips;
+    const uint32_t unit0     = ith * job->strips_per_thread;
+    const uint32_t unit1     = MIN(unit0 + job->strips_per_thread, total);
+    const uint32_t mat_bytes = job->n_rows * job->n_cols * sizeof(float);
+    for (uint32_t unit = unit0; unit < unit1; unit++) {
+        const uint32_t mat = unit / job->n_strips;
+        cpy_transpose_strip(job, job->src + mat * mat_bytes, job->dst + mat * mat_bytes, unit - mat * job->n_strips);
+    }
+}
+
+static int cpy_transpose(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
+    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    const struct htp_copy_transpose_params * tp = &kparams->u.transpose;
+    const uint32_t n_threads = octx->n_threads;
+
+    struct cpy_transpose_job job;
+    job.src               = (const uint8_t *) (uintptr_t) octx->src[0]->data;
+    job.dst               = (uint8_t *) (uintptr_t) octx->dst->data;
+    job.n_rows            = tp->n_rows;
+    job.n_cols            = tp->n_cols;
+    job.n_mats            = tp->n_mats;
+    job.strips_along_rows = tp->n_rows >= tp->n_cols;
+    job.n_strips          = ((job.strips_along_rows ? tp->n_rows : tp->n_cols) + HTP_COPY_TRANSPOSE_TILE - 1) / HTP_COPY_TRANSPOSE_TILE;
+    job.strips_per_thread = fastdiv(job.n_mats * job.n_strips + n_threads - 1, &octx->n_threads_div);
+
+    work_queue_run(octx->ctx->work_queue, cpy_thread_transpose, &job, n_threads);
+    return HTP_STATUS_OK;
+}
+
 static int cpy_scalar(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
     if (octx->ctx->mdev.count > 1 && octx->ctx->mdev.idx > 0) {
         return HTP_STATUS_OK;
@@ -546,6 +673,9 @@ int op_cpy(struct htp_ops_context * octx) {
             break;
         case HTP_COPY_KERNEL_GATHER_ROWS:
             status = htp_gather_rows(octx, octx->src[0], NULL, &kparams->u.gather, kparams->n_threads);
+            break;
+        case HTP_COPY_KERNEL_TRANSPOSE:
+            status = cpy_transpose(octx, kparams);
             break;
         default:
             status = HTP_STATUS_NO_SUPPORT;

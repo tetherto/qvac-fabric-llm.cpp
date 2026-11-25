@@ -2670,6 +2670,40 @@ static bool htp_kparams_solve_concat(
     return false;
 }
 
+static bool htp_copy_solve_transpose(
+    const struct ggml_tensor * src0,
+    uint32_t type_size,
+    struct htp_copy_transpose_params * tp
+) {
+    uint64_t n_cols = 1;
+    int      outer  = 0;
+    for (int dim = 1; dim < GGML_MAX_DIMS && src0->nb[dim] == n_cols * type_size; dim++) {
+        n_cols *= (uint64_t) src0->ne[dim];
+        if (src0->nb[0] == n_cols * type_size) {
+            outer = dim + 1;
+            break;
+        }
+    }
+    if (outer == 0 || src0->ne[0] < 2 || n_cols < 2) {
+        return false;
+    }
+
+    uint64_t expected = (uint64_t) src0->ne[0] * n_cols * type_size;
+    uint64_t n_mats   = 1;
+    for (int dim = outer; dim < GGML_MAX_DIMS; dim++) {
+        if (src0->nb[dim] != expected) {
+            return false;
+        }
+        expected *= (uint64_t) src0->ne[dim];
+        n_mats   *= (uint64_t) src0->ne[dim];
+    }
+
+    tp->n_rows = (uint32_t) src0->ne[0];
+    tp->n_cols = (uint32_t) n_cols;
+    tp->n_mats = (uint32_t) n_mats;
+    return true;
+}
+
 static bool htp_kparams_solve_cpy(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -2770,6 +2804,14 @@ static bool htp_kparams_solve_cpy(
         if (sameshape) {
             kparams->kernel_type = HTP_COPY_KERNEL_SAMESHAPE_SAMETYPE;
             kparams->total_rows  = (uint32_t) (src0->ne[1] * src0->ne[2] * src0->ne[3]);
+            return true;
+        }
+
+        if (src_type_size == sizeof(float) && dst_is_contiguous && mdev_count <= 1 &&
+            htp_copy_solve_transpose(src0, src_type_size, &kparams->u.transpose)) {
+            const bool multi_thread = nelem_src >= HTP_COPY_TRANSPOSE_MT_MIN_ELEMS && n_threads > 1;
+            kparams->kernel_type = HTP_COPY_KERNEL_TRANSPOSE;
+            kparams->n_threads   = multi_thread ? (uint8_t) n_threads : 1;
             return true;
         }
 

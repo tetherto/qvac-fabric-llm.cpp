@@ -17163,6 +17163,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {8, 9, 70, 2}, false, {1, 2, 0, 3}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {16, 16, 320, 2}, false, {1, 2, 0, 3}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {70, 96, 3, 2}, false, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {320, 256, 2, 1}, false, {1, 0, 2, 3}));
+
     // source strides over 16 MB (24-bit DMA descriptor limit)
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {512, 8193, 2, 1}, false, {2, 1, 0, 3}));
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {256, 16385, 2, 1}, false, {0, 2, 1, 3}));
