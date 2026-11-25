@@ -1,0 +1,11 @@
+diff --git a/webgpu/src/webgpu.cpp b/webgpu/src/webgpu.cpp
+--- a/webgpu/src/webgpu.cpp
++++ b/webgpu/src/webgpu.cpp
+@@ -20,6 +20,7 @@
+ #include <mutex>
+ #include <set>
+ #include <span>
++#include <string>
+ #include <tuple>
+ #include <unordered_map>
+ #include <utility>
