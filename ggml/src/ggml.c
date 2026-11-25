@@ -278,6 +278,8 @@ void ggml_abort(const char * file, int line, const char * fmt, ...) {
 // logging
 //
 
+static void ggml_log_callback_default(enum ggml_log_level level, const char * text, void * user_data);
+
 struct ggml_logger_state {
     ggml_log_callback log_callback;
     void * log_callback_user_data;
@@ -312,7 +314,7 @@ void ggml_log_internal(enum ggml_log_level level, const char * format, ...) {
     va_end(args);
 }
 
-void ggml_log_callback_default(enum ggml_log_level level, const char * text, void * user_data) {
+static void ggml_log_callback_default(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     (void) user_data;
     fputs(text, stderr);
