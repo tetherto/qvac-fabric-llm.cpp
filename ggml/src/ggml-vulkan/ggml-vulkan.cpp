@@ -8875,11 +8875,12 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
 }
 
 // Must match the quantize_y choice in ggml_vk_mul_mat_vec_q_f16 for every column count it allows.
-static uint32_t ggml_vk_mul_mat_vec_cols(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
+static uint32_t ggml_vk_mul_mat_vec_cols(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     const uint32_t m = src0->ne[1];
     const uint32_t k = src0->ne[0];
     const bool wide = ggml_vk_mmvq_wide(ctx->device, src0->type, m) && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
-                      src1->ne[0] % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, m, mul_mat_vecq_max_cols, k, src0->type) &&
+                      src1->ne[0] % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst) &&
+                      ggml_vk_should_use_mmvq(ctx->device, m, mul_mat_vecq_max_cols, k, src0->type) &&
                       ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, GGML_TYPE_Q8_1, mul_mat_vecq_max_cols, m, k) != nullptr;
     return wide ? mul_mat_vecq_max_cols : ggml_vk_mul_mat_vec_max_cols(ctx->device);
 }
@@ -10111,7 +10112,7 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     // expects dim01-contiguous quantized src0 and would assert. supports_op
     // advertises these cases as supported via has_quant_f16_cpy, so we must
     // keep them on the GPU here rather than fall back to CPU.
-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= ggml_vk_mul_mat_vec_cols(ctx, src0, src1) && src1->ne[2] * src1->ne[3] == 1)) &&
+    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= ggml_vk_mul_mat_vec_cols(ctx, src0, src1, dst) && src1->ne[2] * src1->ne[3] == 1)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) &&
                !ggml_is_tbq_or_pq_64(src0->type) &&
                (!ggml_is_quantized(src0->type) || ggml_vk_dim01_contiguous(src0))) {
