@@ -99,6 +99,12 @@ jobs:
         run: |
           GGML_CUDA_FORCE_MM_SMALL=1 ./build-ci-release/bin/test-backend-ops test -b CUDA0 -o MUL_MAT
 
+      # The MMQ column-outer stream-k walk is opt-in, so the run above tests the default walk. Run MUL_MAT once more with it on.
+      - name: Test MMQ column-outer stream-k
+        id: mmq-col-outer
+        run: |
+          GGML_CUDA_FORCE_MMQ_COL_OUTER=1 ./build-ci-release/bin/test-backend-ops test -b CUDA0 -o MUL_MAT
+
       - name: ccache-buckets-save
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
         uses: ./.github/actions/ccache-buckets

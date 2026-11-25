@@ -18289,7 +18289,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // MMQ stream-k with several column tiles, also batched: the split walks the column tiles outermost
+    // MMQ stream-k with several column tiles, also batched; GGML_CUDA_FORCE_MMQ_COL_OUTER=1 walks the column tiles outermost
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1152, 256, 1024, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  512, 384, 1024, {2, 3}, {1, 1}));

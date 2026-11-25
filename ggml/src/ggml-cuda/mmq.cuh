@@ -1486,7 +1486,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
-// Whether the dense stream-k split walks column tiles outermost (all NVIDIA GPUs unless GGML_CUDA_DISABLE_MMQ_COL_OUTER is set).
+// Whether the dense stream-k split walks column tiles outermost (NVIDIA GPUs, only when GGML_CUDA_FORCE_MMQ_COL_OUTER is set).
 bool ggml_cuda_mmq_stream_k_col_outer(int cc);
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
