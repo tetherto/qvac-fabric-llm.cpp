@@ -389,7 +389,7 @@ static int cpy_transpose(struct htp_ops_context * octx, const struct htp_copy_ke
         return HTP_STATUS_INVAL_PARAMS;
     }
 
-    const struct htp_copy_transpose_params * tp = &kparams->u.transpose;
+    const struct htp_copy_transpose_params * tp = &kparams->transpose;
     const uint32_t n_threads = octx->n_threads;
 
     struct cpy_transpose_job job;
@@ -648,6 +648,10 @@ static int cpy_reshape(struct htp_ops_context * octx, const struct htp_copy_kern
     return HTP_STATUS_OK;
 }
 
+static bool cpy_needs_dma_addressing(const struct htp_ops_context * octx) {
+    return htp_tensor_is_extended(octx->src[0]) || htp_tensor_is_extended(octx->dst);
+}
+
 int op_cpy(struct htp_ops_context * octx) {
     const struct htp_copy_kernel_params * kparams = (const struct htp_copy_kernel_params *) octx->kernel_params;
     int status = HTP_STATUS_OK;
@@ -675,7 +679,7 @@ int op_cpy(struct htp_ops_context * octx) {
             status = htp_gather_rows(octx, octx->src[0], NULL, &kparams->u.gather, kparams->n_threads);
             break;
         case HTP_COPY_KERNEL_TRANSPOSE:
-            status = cpy_transpose(octx, kparams);
+            status = cpy_needs_dma_addressing(octx) ? cpy_reshape(octx, kparams) : cpy_transpose(octx, kparams);
             break;
         default:
             status = HTP_STATUS_NO_SUPPORT;

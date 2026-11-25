@@ -1517,8 +1517,8 @@ static bool htp_unary_reduces_whole_rows(uint32_t op) {
     return op == HTP_OP_NORM || op == HTP_OP_RMS_NORM || op == HTP_OP_L2_NORM;
 }
 
-static uint32_t htp_unary_fit_row_threads(uint32_t op, uint32_t n_threads, size_t vtcm_size, size_t src0_row_size, size_t dst_row_size) {
-    if (!htp_unary_reduces_whole_rows(op)) {
+static uint32_t htp_unary_fit_row_threads(uint32_t op, ggml_type type, uint32_t n_threads, size_t vtcm_size, size_t src0_row_size, size_t dst_row_size) {
+    if (!htp_unary_reduces_whole_rows(op) || type != GGML_TYPE_F32) {
         return n_threads;
     }
     const size_t staged_row_size = 2 * (hex_round_up(src0_row_size, 128) + hex_round_up(dst_row_size, 128));
@@ -1589,7 +1589,7 @@ static bool htp_kparams_solve_unary_impl(
     const uint32_t min_rows_per_thread = (uint32_t) (std::max<size_t>(1, (128 + dst_data_row_size - 1) / dst_data_row_size));
     const uint32_t max_threads         = (std::max)(1u, src0_nrows / min_rows_per_thread);
     const size_t   vtcm_size           = htp_session_vtcm_size(sess);
-    const uint32_t n_threads           = htp_unary_fit_row_threads(op, (std::min)(htp_session_n_threads(sess), max_threads),
+    const uint32_t n_threads           = htp_unary_fit_row_threads(op, src0->type, (std::min)(htp_session_n_threads(sess), max_threads),
                                                                    vtcm_size, src0->ne[0] * elem_size, dst_data_row_size);
 
     kparams->n_threads = n_threads;
@@ -2718,6 +2718,19 @@ static bool htp_copy_solve_transpose(
     return true;
 }
 
+static void htp_copy_solve_reshape(
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * dst,
+    struct htp_copy_reshape_params * rp
+) {
+    rp->div_ne0            = init_fastdiv_values((uint32_t) dst->ne[0]);
+    rp->div_ne1_ne0        = init_fastdiv_values((uint32_t) (dst->ne[1] * dst->ne[0]));
+    rp->div_ne2_ne1_ne0    = init_fastdiv_values((uint32_t) (dst->ne[2] * dst->ne[1] * dst->ne[0]));
+    rp->div_ne00           = init_fastdiv_values((uint32_t) src0->ne[0]);
+    rp->div_ne01_ne00      = init_fastdiv_values((uint32_t) (src0->ne[1] * src0->ne[0]));
+    rp->div_ne02_ne01_ne00 = init_fastdiv_values((uint32_t) (src0->ne[2] * src0->ne[1] * src0->ne[0]));
+}
+
 static bool htp_kparams_solve_cpy(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -2821,8 +2834,10 @@ static bool htp_kparams_solve_cpy(
             return true;
         }
 
+        htp_copy_solve_reshape(src0, dst, &kparams->u.reshape);
+
         if (src_type_size == sizeof(float) && dst_is_contiguous && mdev_count <= 1 &&
-            htp_copy_solve_transpose(src0, src_type_size, &kparams->u.transpose)) {
+            htp_copy_solve_transpose(src0, src_type_size, &kparams->transpose)) {
             const bool multi_thread = nelem_src >= HTP_COPY_TRANSPOSE_MT_MIN_ELEMS && n_threads > 1;
             kparams->kernel_type = HTP_COPY_KERNEL_TRANSPOSE;
             kparams->n_threads   = multi_thread ? (uint8_t) n_threads : 1;
@@ -2831,12 +2846,6 @@ static bool htp_kparams_solve_cpy(
 
         kparams->kernel_type = HTP_COPY_KERNEL_RESHAPE;
         kparams->n_threads   = n_threads > 0 ? (uint8_t) n_threads : 4;
-        kparams->u.reshape.div_ne0            = init_fastdiv_values((uint32_t) dst->ne[0]);
-        kparams->u.reshape.div_ne1_ne0        = init_fastdiv_values((uint32_t) (dst->ne[1] * dst->ne[0]));
-        kparams->u.reshape.div_ne2_ne1_ne0    = init_fastdiv_values((uint32_t) (dst->ne[2] * dst->ne[1] * dst->ne[0]));
-        kparams->u.reshape.div_ne00           = init_fastdiv_values((uint32_t) src0->ne[0]);
-        kparams->u.reshape.div_ne01_ne00      = init_fastdiv_values((uint32_t) (src0->ne[1] * src0->ne[0]));
-        kparams->u.reshape.div_ne02_ne01_ne00 = init_fastdiv_values((uint32_t) (src0->ne[2] * src0->ne[1] * src0->ne[0]));
         return true;
     }
 

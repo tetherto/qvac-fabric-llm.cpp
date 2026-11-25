@@ -3736,20 +3736,32 @@ struct test_cont : public test_case {
     const std::array<int64_t, 4> ne;
     bool use_view_slice;
     const std::array<int64_t, 4> permute;
+    const bool weights;
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, use_view_slice, permute);
+        return VARS_TO_STR4(type, ne, use_view_slice, permute) + (weights ? ",weights=1" : "");
     }
 
     test_cont(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {10, 10, 10, 1},
             bool use_view_slice = false,
-            std::array<int64_t, 4> permute = {0, 0, 0, 0})
-        : type(type), ne(ne), use_view_slice(use_view_slice), permute(permute) {}
+            std::array<int64_t, 4> permute = {0, 0, 0, 0},
+            bool weights = false)
+        : type(type), ne(ne), use_view_slice(use_view_slice), permute(permute), weights(weights) {}
+
+    bool use_weight_context() override {
+        return weights;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * src = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_param(src);
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * src = ggml_new_tensor(weights ? ctx_weights : ctx, type, 4, ne.data());
+        if (!weights && type != GGML_TYPE_I32) {
+            ggml_set_param(src);
+        }
         ggml_set_name(src, "src");
 
         const bool permuted = permute[0] != 0 || permute[1] != 0 || permute[2] != 0 || permute[3] != 0;
@@ -17167,6 +17179,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {16, 16, 320, 2}, false, {1, 2, 0, 3}));
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {70, 96, 3, 2}, false, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {320, 256, 2, 1}, false, {1, 0, 2, 3}));
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_I32 }) {
+        for (bool weights : { false, true }) {
+            test_cases.emplace_back(new test_cont(type, {8, 9, 70, 2}, false, {1, 2, 0, 3}, weights));
+            test_cases.emplace_back(new test_cont(type, {70, 96, 3, 2}, false, {1, 0, 2, 3}, weights));
+            test_cases.emplace_back(new test_cont(type, {64, 64, 320, 1}, false, {1, 2, 0, 3}, weights));
+        }
+    }
 
     // source strides over 16 MB (24-bit DMA descriptor limit)
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {512, 8193, 2, 1}, false, {2, 1, 0, 3}));
@@ -17278,6 +17297,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sigmoid_back());
 
     test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { 122880, 32, 2, 1 }));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { 122880, 32, 2, 1 }));
+    test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { 122880, 32, 2, 1 }));
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
         for (uint32_t n : { 64, 1025 }) {

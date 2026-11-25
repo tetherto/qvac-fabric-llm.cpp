@@ -64,8 +64,9 @@ struct htp_copy_kernel_params {
         struct htp_copy_reshape_params reshape;
         struct htp_copy_strided_params strided;
         struct htp_gather_rows_params  gather;
-        struct htp_copy_transpose_params transpose;
     } u;
+
+    struct htp_copy_transpose_params transpose;
 };
 
 // Size of one VTCM staging buffer: big enough that a DMA descriptor moves many short
