@@ -1957,10 +1957,19 @@ static std::vector<std::unique_ptr<server_tool>> build_tools() {
     tools.push_back(std::make_unique<server_tool_read_file>());
     tools.push_back(std::make_unique<server_tool_file_glob_search>());
     tools.push_back(std::make_unique<server_tool_grep_search>());
-    tools.push_back(std::make_unique<server_tool_exec_shell_command>());
+    // exec_shell_command is NOT included by default - must be explicitly enabled via --tools exec_shell_command
+    // due to security risk: arbitrary command execution (CVE-2026-xxxxx)
     tools.push_back(std::make_unique<server_tool_write_file>());
     tools.push_back(std::make_unique<server_tool_edit_file>());
     tools.push_back(std::make_unique<server_tool_get_info>());
+    return tools;
+}
+
+// Returns ALL available tools including dangerous ones (for validation purposes)
+static std::vector<std::unique_ptr<server_tool>> build_all_tools() {
+    auto tools = build_tools();
+    // Add dangerous tools that require explicit opt-in
+    tools.push_back(std::make_unique<server_tool_exec_shell_command>());
     return tools;
 }
 
@@ -2008,11 +2017,13 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools,
 
         std::unordered_set<std::string> enabled_set(enabled_tools.begin(), enabled_tools.end());
         auto all_tools = build_tools();
+        // Use build_all_tools() for validation to include explicitly opt-in tools like exec_shell_command
+        auto all_known_tools = build_all_tools();
 
         // collect all known tool names for validation
         std::vector<std::string> known_names;
-        known_names.reserve(all_tools.size());
-        for (const auto & t : all_tools) {
+        known_names.reserve(all_known_tools.size());
+        for (const auto & t : all_known_tools) {
             known_names.push_back(t->name);
         }
 
@@ -2031,6 +2042,22 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools,
         for (auto & t : all_tools) {
             if (enabled_set.count(t->name) > 0 || enabled_set.count("all") > 0) {
                 tools.push_back(std::move(t));
+            }
+        }
+        // Also add explicitly enabled dangerous tools (not in default list)
+        for (auto & t : all_known_tools) {
+            if (enabled_set.count(t->name) > 0) {
+                // Check if already added from default tools
+                bool already_added = false;
+                for (const auto & existing : tools) {
+                    if (existing->name == t->name) {
+                        already_added = true;
+                        break;
+                    }
+                }
+                if (!already_added) {
+                    tools.push_back(std::move(t));
+                }
             }
         }
     }
@@ -2082,13 +2109,35 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools,
             json params = body.value("params", json::object());
             bool stream = body.value("stream", false);
 
-            // accept x-tool-cwd header to override of the process
+            // accept x-tool-cwd header to override working directory
+            // SECURITY: validate against allowed base directory to prevent path traversal
             if (params.contains("cwd")) {
                 params.erase("cwd");
             }
             auto cwd = get_header(req.headers, "x-tool-cwd");
             if (!cwd.empty()) {
-                params["cwd"] = cwd;
+                // Resolve to absolute path and validate it's within allowed base directory
+                std::error_code ec;
+                fs::path cwd_path = fs::absolute(fs::path(cwd), ec);
+                if (ec) {
+                    throw std::invalid_argument("invalid x-tool-cwd path");
+                }
+                // Check against tools base directory (default: current working directory)
+                // Tools should only operate within the server's working directory or configured base
+                fs::path base_path = fs::current_path(ec);
+                if (ec) {
+                    base_path = fs::path("."); // fallback
+                }
+                base_path = fs::absolute(base_path, ec);
+                if (!ec) {
+                    // Ensure cwd_path is within base_path
+                    auto cwd_canonical = fs::weakly_canonical(cwd_path, ec);
+                    auto base_canonical = fs::weakly_canonical(base_path, ec);
+                    if (!ec && cwd_canonical.string().rfind(base_canonical.string(), 0) != 0) {
+                        throw std::invalid_argument("x-tool-cwd path traversal attempt blocked: must be within server working directory");
+                    }
+                }
+                params["cwd"] = cwd_path.string();
             }
 
             // accept x-tool-runtime header to route tool I/O through an isolate, e.g. "docker-container:<id>";
