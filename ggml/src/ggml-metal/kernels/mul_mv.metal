@@ -1668,6 +1668,46 @@ template [[host_name("kernel_mul_mv_ext_q3_K_f32_r1_3")]] kernel mul_mv_ext_q4x4
 template [[host_name("kernel_mul_mv_ext_q3_K_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_q3_K, 256, dequantize_q3_K>;
 template [[host_name("kernel_mul_mv_ext_q3_K_f32_r1_5")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<5, block_q3_K, 256, dequantize_q3_K>;
 
+template<typename T0, typename T1>
+kernel void kernel_mul_mv_compat(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       float * dst,
+        threadgroup float * sums [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]]) {
+    const uint i12 = group.z % args.ne12;
+    const uint i13 = group.z / args.ne12;
+    const uint64_t offset0 = group.x*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    const uint64_t offset1 = group.y*args.nb11 + i12*args.nb12 + i13*args.nb13;
+
+    float sum = 0.0f;
+    for (uint i = lane; i < uint(args.ne00); i += 32) {
+        const float x = float(*(device const T0 *)(src0 + offset0 + i*args.nb00));
+        const float y = float(*(device const T1 *)(src1 + offset1 + i*args.nb10));
+        sum += x*y;
+    }
+    sums[lane] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduce across the whole threadgroup, including pipelines with 16-lane SIMD groups.
+    for (uint stride = 16; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            sums[lane] += sums[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        dst[(uint64_t(group.z)*args.ne1 + group.y)*args.ne0 + group.x] = sums[0];
+    }
+}
+
+typedef decltype(kernel_mul_mv_compat<half, float>) mul_mv_compat_t;
+template [[host_name("kernel_mul_mv_f16_f32_compat")]] kernel mul_mv_compat_t kernel_mul_mv_compat<half, float>;
+template [[host_name("kernel_mul_mv_f16_f16_compat")]] kernel mul_mv_compat_t kernel_mul_mv_compat<half, half>;
+template [[host_name("kernel_mul_mv_f32_f32_compat")]] kernel mul_mv_compat_t kernel_mul_mv_compat<float, float>;
+
 template<typename T0, typename T1, short NR0, typename args_t>
 void kernel_mul_mv_t_t_impl(
         args_t args,

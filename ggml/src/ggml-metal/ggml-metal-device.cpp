@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -1542,6 +1543,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
+    }
+
+    const bool dense = (tsrc0 == GGML_TYPE_F16 && (tsrc1 == GGML_TYPE_F32 || tsrc1 == GGML_TYPE_F16)) ||
+                       (tsrc0 == GGML_TYPE_F32 && tsrc1 == GGML_TYPE_F32);
+    if (dense && !add && !norm &&
+        (getenv("GGML_METAL_MUL_MV_COMPAT") != nullptr || ggml_metal_pipeline_thread_execution_width(res) != 32)) {
+        snprintf(base, sizeof(base), "kernel_mul_mv_%s_%s_compat", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+        res = ggml_metal_library_get_or_compile(lib, base);
+        nr0 = 1;
+        nr1 = 1;
+        nsg = 1;
+        smem = 32*sizeof(float);
     }
 
     res.nr0  = nr0;
