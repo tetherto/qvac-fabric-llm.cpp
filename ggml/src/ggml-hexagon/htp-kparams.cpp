@@ -444,7 +444,7 @@ static bool htp_kparams_solve_flash_attn(
             kparams->Br                  = Br;
             kparams->Bc                  = Bc;
             kparams->n_kv_blocks         = (nek1 + Bc - 1) / Bc;
-            kparams->n_threads           = (kparams->n_kv_blocks >= 3 && n_threads >= 2) ? n_threads : 1;
+            kparams->n_threads           = hmx_fa_runs_threaded(kparams->n_kv_blocks, (size_t) G * neq1, n_threads) ? n_threads : 1;
             kparams->u.hmx.g_br          = hex_align_up(G * Br, 32);
             kparams->u.hmx.pipeline      = (kparams->n_kv_blocks >= 3 && n_threads >= 2) ? 1 : 0;
             kparams->vtcm_size           = hmx_fa_compute_vtcm_usage(G, DK_pad, DV_pad, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head);
