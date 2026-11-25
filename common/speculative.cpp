@@ -1131,6 +1131,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // block-internal attention
     bool causal_attn = false;
+    int32_t n_decode_max = 0; // tokens of one draft decode: n_batch, and n_ubatch for non-causal attention
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
@@ -1152,6 +1153,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             /* .dev_features     = */ true,
             /* .nextn_masked     = */ true,
         });
+        check_block_fits(this->params.n_max + 1);
     }
 
 protected:
@@ -1227,6 +1229,13 @@ protected:
         // the DSpine code bridge and lattice need whole blocks, so the blocks of all sequences must fit one draft ubatch
         if (llama_model_is_dspine(model_dft) && (int64_t) n_seq * (this->params.n_max + 1) > (int64_t) llama_n_ubatch(ctx_dft)) {
             throw std::runtime_error("DSpine draft needs --spec-draft-n-ubatch >= n_parallel * (--spec-draft-n-max + 1)");
+        }
+
+        // the blocks of a step are decoded in groups of whole blocks that fit one decode, a non-causal draft needs the
+        // decode in one ubatch; one block must fit, see check_block_fits()
+        n_decode_max = (int32_t) llama_n_batch(ctx_dft);
+        if (!causal_attn) {
+            n_decode_max = std::min(n_decode_max, (int32_t) llama_n_ubatch(ctx_dft));
         }
 
         batch        = common_batch(ctx_dft);
@@ -1342,6 +1351,14 @@ public:
             return -1;
         }
         return prompt_pos_end[seq_id] - attn_window + 1;
+    }
+
+    // one block must fit one draft decode; call after init() clamps n_max
+    void check_block_fits(int32_t n_block_tokens) const {
+        if (n_block_tokens > n_decode_max) {
+            throw std::runtime_error(string_format("the draft decodes blocks of %d tokens, which do not fit "
+                    "--spec-draft-n-ubatch / --spec-draft-n-batch (%d)", n_block_tokens, n_decode_max));
+        }
     }
 
     // first row of [beg, end] that a draft anchored at the prompt end can attend
@@ -1485,6 +1502,63 @@ public:
             }
         }
 
+        // decodes the blocks in the batch and reads back their drafts
+        auto decode_blocks = [&]() -> bool {
+            if (batch.size() == 0) {
+                return true;
+            }
+            const int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (ret != 0) {
+                LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
+                return false;
+            }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] < 0) {
+                    continue;
+                }
+                auto & dp = dparams[seq_id];
+
+                const int32_t beg            = i_block_beg[seq_id];
+                const int32_t n_block_tokens = n_block[seq_id];
+
+                auto * smpl = smpls[seq_id].get();
+
+                auto & result = *dp.result;
+
+                // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
+                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                    common_sampler_sample(smpl, ctx_dft, beg + i, true);
+
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+
+                    const llama_token id = cur_p->data[0].id;
+
+                    if (cur_p->data[0].p < params.p_min) {
+                        break;
+                    }
+
+                    common_sampler_accept(smpl, id, true);
+
+                    result.push_back(id);
+                }
+
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                }
+            }
+
+            std::fill(i_block_beg.begin(), i_block_beg.end(), -1);
+            batch.clear();
+            return true;
+        };
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1496,6 +1570,9 @@ public:
             const int32_t n = (int32_t) dp.pos0;
 
             const int32_t n_block_tokens = n_draft + 1;
+            if (batch.size() + n_block_tokens > n_decode_max && !decode_blocks()) {
+                return;
+            }
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1503,57 +1580,7 @@ public:
             }
         }
 
-        if (batch.size() == 0) {
-            return;
-        }
-
-        // decode all sequence's noise block in a single batch
-        int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-        if (ret != 0) {
-            LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
-            return;
-        }
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_block_beg[seq_id] < 0) {
-                continue;
-            }
-            auto & dp = dparams[seq_id];
-
-            const int32_t beg            = i_block_beg[seq_id];
-            const int32_t n_block_tokens = n_block[seq_id];
-
-            auto * smpl = smpls[seq_id].get();
-
-            auto & result = *dp.result;
-
-            // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
-            for (int32_t i = 1; i < n_block_tokens; ++i) {
-                common_sampler_sample(smpl, ctx_dft, beg + i, true);
-
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                }
-
-                const llama_token id = cur_p->data[0].id;
-
-                if (cur_p->data[0].p < params.p_min) {
-                    break;
-                }
-
-                common_sampler_accept(smpl, id, true);
-
-                result.push_back(id);
-            }
-
-            if (result.size() < (size_t) params.n_min) {
-                result.clear();
-            }
-        }
+        decode_blocks();
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
@@ -1624,6 +1651,7 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             /* .dev_features     = */ true,
             /* .nextn_masked     = */ !has_markov_context,
         });
+        check_block_fits(this->params.n_max + (sample_from_anchor ? 0 : 1));
     }
 
 protected:
@@ -1679,6 +1707,93 @@ public:
 
         block_state.clear();
 
+        // decodes the blocks in the batch and reads back their drafts
+        auto decode_blocks = [&]() -> bool {
+            if (batch.size() == 0) {
+                return true;
+            }
+            const int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (ret != 0) {
+                LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
+                return false;
+            }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] < 0) {
+                    continue;
+                }
+                auto & dp = dparams[seq_id];
+
+                const int32_t beg            = i_block_beg[seq_id];
+                const int32_t n_block_tokens = n_block[seq_id];
+
+                auto * smpl = smpls[seq_id].get();
+
+                auto & result = *dp.result;
+
+                // bonus-anchor drafts read the mask positions only, like DFlash
+                const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
+
+                if (sampled[seq_id]) {
+                    // the tokens the graph drew, and the distribution q each one was drawn from
+                    const float * draws = llama_get_embeddings_nextn(ctx_dft);
+                    GGML_ASSERT(draws && "DSpark draws missing from h_nextn");
+                    for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                        const float * row = draws + (size_t) (beg + i) * n_embd_dec;
+                        const int32_t n_cand = (int32_t) row[1];
+
+                        auto & q = dp.result_q->emplace_back();
+                        q.reserve(n_cand);
+                        for (int32_t k = 0; k < n_cand; ++k) {
+                            const float p = row[2 + n_cand + k];
+                            q.push_back({ (llama_token) row[2 + k], std::log(p), p });
+                        }
+                        result.push_back((llama_token) row[0]);
+                    }
+                    if (result.size() < (size_t) params.n_min) {
+                        result.clear();
+                        dp.result_q->clear();
+                    }
+                    continue;
+                }
+
+                // DSpark: read from the first draft slot, truncate below the confidence threshold
+                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                    const int32_t idx = beg + i;
+
+                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                        break;
+                    }
+
+                    common_sampler_sample(smpl, ctx_dft, idx, true);
+
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+
+                    const llama_token id = cur_p->data[0].id;
+
+                    common_sampler_accept(smpl, id, true);
+
+                    result.push_back(id);
+                }
+
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                }
+            }
+
+            std::fill(i_block_beg.begin(), i_block_beg.end(), -1);
+            batch.clear();
+            block_state.clear();
+            return true;
+        };
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1706,9 +1821,12 @@ public:
             const int32_t n_draft = params.n_max;
             const int32_t n_block_tokens = n_draft + (sample_from_anchor ? 0 : 1);
 
-            // all blocks share one decode: a block that does not fit in the draft context fails every sequence's draft
+            // a block that does not fit in the draft context fails the decode of its whole group
             if ((uint64_t) dp.pos0 + n_block_tokens > llama_n_ctx_seq(ctx_dft)) {
                 continue;
+            }
+            if (batch.size() + n_block_tokens > n_decode_max && !decode_blocks()) {
+                return;
             }
 
             i_block_beg[seq_id] = batch.size();
@@ -1735,86 +1853,7 @@ public:
             }
         }
 
-        if (batch.size() == 0) {
-            return;
-        }
-
-        // decode all sequence's noise block in a single batch
-        int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-        if (ret != 0) {
-            LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
-            return;
-        }
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_block_beg[seq_id] < 0) {
-                continue;
-            }
-            auto & dp = dparams[seq_id];
-
-            const int32_t beg            = i_block_beg[seq_id];
-            const int32_t n_block_tokens = n_block[seq_id];
-
-            auto * smpl = smpls[seq_id].get();
-
-            auto & result = *dp.result;
-
-            // bonus-anchor drafts read the mask positions only, like DFlash
-            const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-
-            if (sampled[seq_id]) {
-                // the tokens the graph drew, and the distribution q each one was drawn from
-                const float * draws = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(draws && "DSpark draws missing from h_nextn");
-                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
-                    const float * row = draws + (size_t) (beg + i) * n_embd_dec;
-                    const int32_t n_cand = (int32_t) row[1];
-
-                    auto & q = dp.result_q->emplace_back();
-                    q.reserve(n_cand);
-                    for (int32_t k = 0; k < n_cand; ++k) {
-                        const float p = row[2 + n_cand + k];
-                        q.push_back({ (llama_token) row[2 + k], std::log(p), p });
-                    }
-                    result.push_back((llama_token) row[0]);
-                }
-                if (result.size() < (size_t) params.n_min) {
-                    result.clear();
-                    dp.result_q->clear();
-                }
-                continue;
-            }
-
-            // DSpark: read from the first draft slot, truncate below the confidence threshold
-            const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
-            for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
-                const int32_t idx = beg + i;
-
-                if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
-                    break;
-                }
-
-                common_sampler_sample(smpl, ctx_dft, idx, true);
-
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                }
-
-                const llama_token id = cur_p->data[0].id;
-
-                common_sampler_accept(smpl, id, true);
-
-                result.push_back(id);
-            }
-
-            if (result.size() < (size_t) params.n_min) {
-                result.clear();
-            }
-        }
+        decode_blocks();
     }
 };
 
@@ -1844,6 +1883,7 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
             /* .dev_features     = */ true,
             /* .nextn_masked     = */ false,
         });
+        check_block_fits(this->params.n_max + 1);
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1865,6 +1905,49 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        // decodes the blocks in the batch and reads back their drafts
+        auto decode_blocks = [&]() -> bool {
+            if (batch.size() == 0) {
+                return true;
+            }
+            const int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (ret != 0) {
+                LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
+                return false;
+            }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] < 0) {
+                    continue;
+                }
+                auto & dp = dparams[seq_id];
+
+                const int32_t beg            = i_block_beg[seq_id];
+                const int32_t n_block_tokens = n_block[seq_id];
+
+                auto & result = *dp.result;
+
+                const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+                // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
+                const bool sample = params.probabilistic && dp.result_q;
+
+                if (sample && dflash2_seed[seq_id] != dp.seed) {
+                    dflash2_seed[seq_id] = dp.seed;
+                    // the default seed means random; mixed so it differs from the target's, as in spec_retune
+                    dflash2_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
+                }
+
+                common_speculative_lattice_walk(lattice + (size_t) beg * n_embd_dec, n_embd_dec, n_block_tokens, selector_top_k,
+                        params, sample ? &dflash2_rng[seq_id] : nullptr, dp.temp, result, sample ? dp.result_q : nullptr);
+            }
+
+            std::fill(i_block_beg.begin(), i_block_beg.end(), -1);
+            batch.clear();
+            return true;
+        };
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1877,6 +1960,9 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
 
             const int32_t n_draft = params.n_max;
             const int32_t n_block_tokens = n_draft + 1;
+            if (batch.size() + n_block_tokens > n_decode_max && !decode_blocks()) {
+                return;
+            }
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1884,43 +1970,7 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
             }
         }
 
-        if (batch.size() == 0) {
-            return;
-        }
-
-        // decode all sequence's noise block in a single batch
-        int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-        if (ret != 0) {
-            LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
-            return;
-        }
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_block_beg[seq_id] < 0) {
-                continue;
-            }
-            auto & dp = dparams[seq_id];
-
-            const int32_t beg            = i_block_beg[seq_id];
-            const int32_t n_block_tokens = n_block[seq_id];
-
-            auto & result = *dp.result;
-
-            const float * lattice = llama_get_embeddings_nextn(ctx_dft);
-            GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
-
-            // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
-            const bool sample = params.probabilistic && dp.result_q;
-
-            if (sample && dflash2_seed[seq_id] != dp.seed) {
-                dflash2_seed[seq_id] = dp.seed;
-                // the default seed means random; mixed so it differs from the target's, as in spec_retune
-                dflash2_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
-            }
-
-            common_speculative_lattice_walk(lattice + (size_t) beg * n_embd_dec, n_embd_dec, n_block_tokens, selector_top_k,
-                    params, sample ? &dflash2_rng[seq_id] : nullptr, dp.temp, result, sample ? dp.result_q : nullptr);
-        }
+        decode_blocks();
     }
 };
 
@@ -1952,6 +2002,7 @@ struct common_speculative_impl_draft_lilicorr final : public common_speculative_
             /* .dev_features     = */ false,
             /* .nextn_masked     = */ false,
         });
+        check_block_fits(block_size);
     }
 
 protected:
@@ -1984,6 +2035,40 @@ public:
         // record where each block starts, all blocks have the same size
         std::vector<int32_t> i_block_beg(n_seq, -1);
 
+        // decodes the blocks in the batch and reads back their drafts
+        auto decode_blocks = [&]() -> bool {
+            if (batch.size() == 0) {
+                return true;
+            }
+            const int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (ret != 0) {
+                LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
+                return false;
+            }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] < 0) {
+                    continue;
+                }
+                auto & dp = dparams[seq_id];
+
+                const int32_t beg = i_block_beg[seq_id];
+
+                auto & result = *dp.result;
+
+                const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                GGML_ASSERT(lattice && "LiliCorr scorer produced no lattice");
+
+                // LiliCorr never samples
+                common_speculative_lattice_walk(lattice + (size_t) beg * n_embd_dec, n_embd_dec, params.n_max + 1, lilicorr_top_k,
+                        params, nullptr, 1.0f, result, nullptr);
+            }
+
+            std::fill(i_block_beg.begin(), i_block_beg.end(), -1);
+            batch.clear();
+            return true;
+        };
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1995,6 +2080,9 @@ public:
             const int32_t n = (int32_t) dp.pos0;
 
             // the scorer reads a full block
+            if (batch.size() + block_size > n_decode_max && !decode_blocks()) {
+                return;
+            }
             i_block_beg[seq_id] = batch.size();
             for (int32_t i = 0; i < block_size; ++i) {
                 const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, false);
@@ -2005,34 +2093,7 @@ public:
             }
         }
 
-        if (batch.size() == 0) {
-            return;
-        }
-
-        // decode all sequence's noise block in a single batch
-        int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-        if (ret != 0) {
-            LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
-            return;
-        }
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_block_beg[seq_id] < 0) {
-                continue;
-            }
-            auto & dp = dparams[seq_id];
-
-            const int32_t beg = i_block_beg[seq_id];
-
-            auto & result = *dp.result;
-
-            const float * lattice = llama_get_embeddings_nextn(ctx_dft);
-            GGML_ASSERT(lattice && "LiliCorr scorer produced no lattice");
-
-            // LiliCorr never samples
-            common_speculative_lattice_walk(lattice + (size_t) beg * n_embd_dec, n_embd_dec, params.n_max + 1, lilicorr_top_k,
-                    params, nullptr, 1.0f, result, nullptr);
-        }
+        decode_blocks();
     }
 };
 

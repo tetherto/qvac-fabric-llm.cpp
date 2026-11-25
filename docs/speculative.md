@@ -197,7 +197,7 @@ The Inkling 2 drafter supports `--spec-draft-sampling probabilistic`:
 at a positive request temperature, each drawn token conditions the next one, and the target verifies the draft by
 rejection sampling.
 
-Currently only drafts with a Qwen3 backbone are supported; support for other backbones
+Currently drafts with a Qwen3 backbone and the Inkling 2 drafter are supported; support for other backbones
 (e.g. Gemma4) is planned.
 
 DSpark drafts exported in the [speculators](https://github.com/vllm-project/speculators) format
