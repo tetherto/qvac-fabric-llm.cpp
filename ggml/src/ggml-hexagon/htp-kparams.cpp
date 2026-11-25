@@ -1189,18 +1189,16 @@ bool htp_kparams_solve_mmidnx(
     return ok;
 }
 
-static bool htp_kparams_solve_binary(
+static bool htp_kparams_solve_binary_impl(
     const struct ggml_hexagon_session * sess,
-    const struct ggml_tensor * op_tensor,
+    uint32_t op,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * src2,
+    const struct ggml_tensor * dst,
     struct htp_binary_kernel_params * kparams
 ) {
     memset(kparams, 0, sizeof(*kparams));
-
-    const uint32_t op = htp_op_remap(op_tensor);
-    const struct ggml_tensor * src0 = op_tensor->src[0];
-    const struct ggml_tensor * src1 = op_tensor->src[1];
-    const struct ggml_tensor * src2 = (op == HTP_OP_ADD_ID) ? op_tensor->src[2] : nullptr;
-    const struct ggml_tensor * dst  = op_tensor;
 
     const bool is_add_id = (op == HTP_OP_ADD_ID);
     if (is_add_id) {
@@ -1409,6 +1407,50 @@ static bool htp_kparams_solve_binary(
     kparams->vtcm_size       = L.total_bytes;
 
     return true;
+}
+
+static bool htp_kparams_solve_binary(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op_tensor,
+    struct htp_binary_kernel_params * kparams
+) {
+    const uint32_t op = htp_op_remap(op_tensor);
+    const struct ggml_tensor * src2 = (op == HTP_OP_ADD_ID) ? op_tensor->src[2] : nullptr;
+    return htp_kparams_solve_binary_impl(sess, op, op_tensor->src[0], op_tensor->src[1], src2, op_tensor, kparams);
+}
+
+static const size_t HTP_BINARY_PLANE_ROW_MAX_BYTES = 64 * 1024;
+static const size_t HTP_BINARY_PLAIN_INPUTS        = 2;
+
+static bool htp_binary_is_plain(uint32_t op) {
+    return op == HTP_OP_ADD || op == HTP_OP_SUB || op == HTP_OP_MUL || op == HTP_OP_DIV;
+}
+
+static bool htp_tensor_has_contiguous_planes(const struct ggml_tensor * t) {
+    const size_t elem_size = ggml_type_size(t->type);
+    return t->nb[0] == elem_size && t->nb[1] == (size_t) t->ne[0] * elem_size;
+}
+
+static bool htp_binary_scales_whole_planes(const struct ggml_tensor * src0, const struct ggml_tensor * src1, const struct ggml_tensor * dst, uint32_t n_threads) {
+    const size_t plane_bytes = (size_t) src0->ne[0] * src0->ne[1] * ggml_type_size(src0->type);
+    const bool   per_plane   = src1->ne[0] == 1 && src1->ne[1] == 1 && ggml_nelements(src1) > 1;
+    const bool   same_layout = ggml_are_same_shape(src0, dst) && src0->type == dst->type && src0->type == src1->type;
+    return per_plane && same_layout && src0->ne[1] > 1 &&
+           htp_tensor_has_contiguous_planes(src0) && htp_tensor_has_contiguous_planes(dst) &&
+           plane_bytes <= HTP_BINARY_PLANE_ROW_MAX_BYTES &&
+           (uint64_t) src0->ne[2] * src0->ne[3] >= n_threads;
+}
+
+static struct ggml_tensor htp_tensor_merge_plane_rows(const struct ggml_tensor * t) {
+    struct ggml_tensor merged = *t;
+    merged.ne[0] = t->ne[0] * t->ne[1];
+    merged.ne[1] = t->ne[2];
+    merged.ne[2] = t->ne[3];
+    merged.ne[3] = 1;
+    merged.nb[1] = t->nb[2];
+    merged.nb[2] = t->nb[3];
+    merged.nb[3] = t->nb[3] * t->ne[3];
+    return merged;
 }
 
 // collapse contiguous dims of elementwise ops so that rows fill at least one HVX vector
@@ -4314,8 +4356,37 @@ static inline bool htp_kparams_invoke(
     return SolveFn(sess, op, kparams ? (KParams *) kparams : &tmp);
 }
 
+static bool htp_opnode_is_plain_binary(const htp_opnode & node) {
+    return htp_binary_is_plain(node.opcode) && node.inputs.size() == HTP_BINARY_PLAIN_INPUTS &&
+           node.inputs[0] && node.inputs[1] && !node.outputs.empty() && node.outputs[0];
+}
+
+static void htp_opnode_merge_binary_plane_rows(const struct ggml_hexagon_session * sess, htp_opnode & node) {
+    const struct ggml_tensor * src0 = node.inputs[0];
+    const struct ggml_tensor * src1 = node.inputs[1];
+    const struct ggml_tensor * dst  = node.outputs[0];
+    if (!htp_binary_scales_whole_planes(src0, src1, dst, htp_session_n_threads(sess))) {
+        return;
+    }
+    const struct ggml_tensor src0_merged = htp_tensor_merge_plane_rows(src0);
+    const struct ggml_tensor src1_merged = htp_tensor_merge_plane_rows(src1);
+    const struct ggml_tensor dst_merged  = htp_tensor_merge_plane_rows(dst);
+    struct htp_binary_kernel_params probe;
+    if (!htp_kparams_solve_binary_impl(sess, node.opcode, &src0_merged, &src1_merged, nullptr, &dst_merged, &probe)) {
+        return;
+    }
+    node.inputs[0]  = node.add_dummy(src0_merged);
+    node.inputs[1]  = node.add_dummy(src1_merged);
+    node.outputs[0] = node.add_dummy(dst_merged);
+}
+
 void htp_opnode_collapse(const struct ggml_hexagon_session * sess, htp_opnode & node) {
     const uint32_t n_threads = htp_session_n_threads(sess);
+
+    if (htp_opnode_is_plain_binary(node)) {
+        htp_opnode_merge_binary_plane_rows(sess, node);
+        return;
+    }
 
     if (htp_op_is_unary(node.opcode) && htp_unary_is_elementwise(node.opcode)) {
         if (node.inputs.empty() || !node.inputs[0] || node.outputs.empty() || !node.outputs[0]) {
@@ -4445,6 +4516,9 @@ bool htp_kparams_solve(
     }
     if (node.opcode == HTP_OP_UPSCALE) {
         return htp_kparams_solve_upscale(sess, src0, dst, node.kparams<htp_upscale_kernel_params>());
+    }
+    if (htp_opnode_is_plain_binary(node)) {
+        return htp_kparams_solve_binary_impl(sess, node.opcode, src0, src1, nullptr, dst, node.kparams<htp_binary_kernel_params>());
     }
 
     return htp_kparams_solve(sess, node.node, node.kernel_params);

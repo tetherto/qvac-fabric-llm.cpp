@@ -17242,6 +17242,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         add_test_bin_bcast(type, {640, 1, 1, 1}, {1, 1, 1, 1});
         add_test_bin_bcast(type, {64, 262144, 1, 1}, {1, 1, 1, 1});
         add_test_bin_bcast(type, {128, 1, 8, 1}, {1, 4, 1, 1});
+        add_test_bin_bcast(type, {1, 1, 320, 1}, {64, 64, 1, 2});
+        add_test_bin_bcast(type, {1, 1, 1280, 1}, {8, 8, 1, 2});
+        add_test_bin_bcast(type, {1, 1, 640, 2}, {32, 32, 1, 1});
+        add_test_bin_bcast(type, {1, 1, 5, 1}, {8, 8, 1, 1});
         //add_test_bin_bcast(type, {3, 3, 2560, 1280}, {1, 1, 1, 1});
         //add_test_bin_bcast(type, {3, 3, 2560, 1280}, {2, 1, 1, 1});
     }
