@@ -3668,6 +3668,128 @@ static bool htp_kparams_solve_solve_tri(
     return true;
 }
 
+static const size_t   HTP_CONV2D_TILE_BYTES     = 2048;
+static const uint32_t HTP_CONV2D_WIN_PHASE_COST = 120;
+static const uint32_t HTP_CONV2D_WIN_MAX_CHUNK  = 512;
+static const uint32_t HTP_CONV2D_WIN_MIN_CHUNK  = 8;
+static const uint32_t HTP_CONV2D_WIN_SEG_TILES  = 8;
+static const uint32_t HTP_CONV2D_WIN_MAX_SEG_T  = 32;
+
+struct htp_conv2d_win_shape {
+    uint32_t n_rt;
+    uint32_t n_wt;
+    uint32_t n_cc;
+    uint32_t n_ch;
+    uint32_t n_tiles;
+    uint32_t halo;
+    uint32_t n_threads;
+    uint32_t c_in;
+    uint32_t out_width;
+    uint32_t in_width;
+    bool     cwhn;
+    bool     fold;
+    size_t   weight_scratch;
+    size_t   vtcm_size;
+};
+
+struct htp_conv2d_win_fit {
+    uint32_t rt_block;
+    uint32_t ct;
+    uint32_t seg_b;
+    uint32_t seg_t;
+    size_t   stage;
+    size_t   thr;
+    size_t   total;
+};
+
+static size_t htp_conv2d_win_stage_size(const struct htp_conv2d_win_shape & shape, uint32_t seg_b) {
+    if (shape.fold) {
+        return hex_round_up((size_t) shape.c_in * ((seg_b * 32 + shape.out_width - 1) / shape.out_width + 1) * shape.in_width * sizeof(float) + 256, 128);
+    }
+    if (shape.cwhn) {
+        return hex_round_up((size_t) seg_b * 32 * shape.c_in * sizeof(float) + 256, 128);
+    }
+    return hex_round_up((size_t) shape.n_ch * seg_b * 32 * sizeof(float), 128);
+}
+
+static void htp_conv2d_win_measure(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit & fit) {
+    const size_t out_stage = (size_t) HTP_CONV2D_WIN_OBUF * 32 * fit.seg_t * 32 * sizeof(float);
+    fit.stage = htp_conv2d_win_stage_size(shape, fit.seg_b);
+    fit.thr   = hex_round_up((std::max)(2 * fit.stage + out_stage, shape.weight_scratch), HTP_CONV2D_TILE_BYTES);
+
+    const size_t w_size = (size_t) fit.rt_block * shape.n_wt * shape.n_cc * HTP_CONV2D_TILE_BYTES;
+    const size_t act    = (size_t) shape.n_cc * (fit.ct + shape.halo) * HTP_CONV2D_TILE_BYTES;
+    const size_t out    = (size_t) fit.rt_block * fit.ct * HTP_CONV2D_TILE_BYTES;
+    struct htp_conv2d_vtcm_layout layout;
+    htp_conv2d_vtcm_layout_build(&layout, fit.rt_block, w_size, act, out, fit.thr, shape.n_threads);
+    fit.total = layout.total_bytes;
+}
+
+static bool htp_conv2d_win_fits(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit & fit) {
+    htp_conv2d_win_measure(shape, fit);
+    return fit.total <= shape.vtcm_size;
+}
+
+static uint32_t htp_conv2d_win_max_rt_block(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit fit) {
+    fit.rt_block = 1;
+    if (!htp_conv2d_win_fits(shape, fit)) {
+        return 0;
+    }
+    const size_t per_rt = ((size_t) shape.n_wt * shape.n_cc + 2 * fit.ct) * HTP_CONV2D_TILE_BYTES;
+    fit.rt_block = (uint32_t) (std::min<size_t>)(shape.n_rt, 1 + (shape.vtcm_size - fit.total) / per_rt);
+    while (fit.rt_block > 1 && !htp_conv2d_win_fits(shape, fit)) {
+        fit.rt_block--;
+    }
+    return fit.rt_block;
+}
+
+static uint64_t htp_conv2d_win_cost(const struct htp_conv2d_win_shape & shape, const struct htp_conv2d_win_fit & fit) {
+    const uint64_t n_blocks    = (shape.n_rt + fit.rt_block - 1) / fit.rt_block;
+    const uint64_t n_chunks    = (shape.n_tiles + fit.ct - 1) / fit.ct;
+    const uint64_t phase_tiles = (std::max<uint64_t>)(1, HTP_CONV2D_WIN_PHASE_COST / shape.n_cc);
+    return n_blocks * (shape.n_tiles + n_chunks * (shape.halo + phase_tiles) + 2 * phase_tiles);
+}
+
+static void htp_conv2d_win_consider(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit candidate,
+                                    struct htp_conv2d_win_fit & best, uint64_t & best_cost) {
+    candidate.rt_block = htp_conv2d_win_max_rt_block(shape, candidate);
+    if (candidate.rt_block == 0) {
+        return;
+    }
+    htp_conv2d_win_measure(shape, candidate);
+    const uint64_t cost = htp_conv2d_win_cost(shape, candidate);
+    if (cost < best_cost) {
+        best      = candidate;
+        best_cost = cost;
+    }
+}
+
+static void htp_conv2d_win_consider_segments(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit candidate,
+                                             struct htp_conv2d_win_fit & best, uint64_t & best_cost) {
+    while (true) {
+        htp_conv2d_win_consider(shape, candidate, best, best_cost);
+        if (candidate.seg_b == 1 && candidate.seg_t == 1) {
+            return;
+        }
+        candidate.seg_b = (std::max)(candidate.seg_b / 2, 1u);
+        candidate.seg_t = (std::max)(candidate.seg_t / 2, 1u);
+    }
+}
+
+static uint32_t htp_conv2d_win_start_chunk(uint32_t n_tiles, uint32_t halo) {
+    const uint32_t quarter = (std::max)(4 * halo, (n_tiles + 3) / 4);
+    const uint32_t bounded = (std::min)((std::max)(quarter, HTP_CONV2D_WIN_MIN_CHUNK), HTP_CONV2D_WIN_MAX_CHUNK);
+    return (std::min)(bounded, n_tiles);
+}
+
+static bool htp_conv2d_win_fit_vtcm(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit start, struct htp_conv2d_win_fit & best) {
+    uint64_t best_cost = UINT64_MAX;
+    for (struct htp_conv2d_win_fit candidate = start; candidate.ct >= 1; candidate.ct /= 2) {
+        htp_conv2d_win_consider_segments(shape, candidate, best, best_cost);
+    }
+    return best_cost != UINT64_MAX;
+}
+
 // Implicit GEMM over sliding windows of fp16 input croutons (HMX activation:single), no im2col
 static bool htp_kparams_conv2d_win(
     const struct ggml_hexagon_session * sess,
@@ -3733,7 +3855,6 @@ static bool htp_kparams_conv2d_win(
     const uint32_t n_rt  = (Cout + 31) / 32;
     const uint64_t n_q   = (uint64_t) (N * IHS - (IHS - OH) - 1) * SR + OW;
     const uint32_t nth   = kp->n_threads;
-    const size_t   tile  = 2048;
 
     if ((uint64_t) N * IHS * SR + moff + 64 >= (1ull << 31)) {
         return false;
@@ -3768,51 +3889,26 @@ static bool htp_kparams_conv2d_win(
         wscr = 2 * (size_t) w_cs * 32 * 128;
     }
 
-    uint32_t rt_block = n_rt;
-    uint32_t ct       = (std::max)(4 * halo, (n_tiles + 3) / 4);
-    ct = (std::min)((std::max)(ct, 8u), 512u);
-    ct = (std::min)(ct, n_tiles);
-    uint32_t seg_b = 8;
-    // longer output rows make the output DMA more efficient
-    uint32_t seg_t = (std::min)(32u, (std::max)(8u, (OW + 31) / 32));
+    const struct htp_conv2d_win_shape shape = {
+        n_rt, n_wt, n_cc, n_ch, n_tiles, halo, nth, Cin, OW, IW, cwhn, fold, wscr, htp_session_vtcm_size(sess),
+    };
+    struct htp_conv2d_win_fit start = {};
+    start.ct    = htp_conv2d_win_start_chunk(n_tiles, halo);
+    start.seg_b = HTP_CONV2D_WIN_SEG_TILES;
+    start.seg_t = (std::min)(HTP_CONV2D_WIN_MAX_SEG_T, (std::max)(HTP_CONV2D_WIN_SEG_TILES, (OW + 31) / 32));
 
-    while (rt_block > 1 && (size_t) rt_block * n_wt * n_cc * tile > htp_session_vtcm_size(sess) / 2) {
-        rt_block = (rt_block + 1) / 2;
+    struct htp_conv2d_win_fit fit = {};
+    if (!htp_conv2d_win_fit_vtcm(shape, start, fit)) {
+        return false;
     }
-
-    size_t stage = 0, thr = 0, act = 0, out = 0, w_size = 0, total = 0;
-    uint32_t n_bc = 0;
-    while (true) {
-        n_bc   = ct + halo;
-        stage  = cwhn ? (size_t) seg_b * 32 * Cin * sizeof(float) + 256 : (size_t) n_ch * seg_b * 32 * sizeof(float);
-        if (fold) {
-            // raw input rows of the staged pixels with 128 bytes of read slack on both sides
-            stage = (size_t) Cin * ((seg_b * 32 + OW - 1) / OW + 1) * IW * sizeof(float) + 256;
-        }
-        stage  = hex_round_up(stage, 128);
-        thr    = hex_round_up((std::max)(2 * stage + (size_t) HTP_CONV2D_WIN_OBUF * 32 * seg_t * 32 * sizeof(float), wscr), tile);
-        w_size = (size_t) rt_block * n_wt * n_cc * tile;
-        act    = (size_t) n_cc * n_bc * tile;
-        out    = (size_t) rt_block * ct * tile;
-        struct htp_conv2d_vtcm_layout L;
-        htp_conv2d_vtcm_layout_build(&L, rt_block, w_size, act, out, thr, nth);
-        total  = L.total_bytes;
-        if (total <= htp_session_vtcm_size(sess)) {
-            break;
-        }
-        if (ct > 64) {
-            ct /= 2;
-        } else if (rt_block > 1) {
-            rt_block = (rt_block + 1) / 2;
-        } else if (seg_b > 1 || seg_t > 1) {
-            seg_b = (std::max)(seg_b / 2, 1u);
-            seg_t = (std::max)(seg_t / 2, 1u);
-        } else if (ct > 1) {
-            ct /= 2;
-        } else {
-            return false;
-        }
-    }
+    const uint32_t rt_block = fit.rt_block;
+    const uint32_t ct       = fit.ct;
+    const uint32_t seg_b    = fit.seg_b;
+    const uint32_t seg_t    = fit.seg_t;
+    const uint32_t n_bc     = ct + halo;
+    const size_t   stage    = fit.stage;
+    const size_t   thr      = fit.thr;
+    const size_t   total    = fit.total;
 
     if (hex_round_up((size_t) T * sizeof(uint32_t), 128) + 2 * hex_round_up((size_t) ct, 128) > HTP_DDR_SPAD_SIZE) {
         return false;
