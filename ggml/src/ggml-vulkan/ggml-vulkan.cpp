@@ -2171,6 +2171,15 @@ static bool ggml_vk_mmq_cm1_wide_enabled() {
     return on;
 }
 
+// GGML_VK_MMQ_CM1_FEW_COLS=0 keeps the one-wave 32x32 and four-wave 64x64 int8 coopmat tiles below 65 columns on RADV RDNA3.
+static bool ggml_vk_mmq_cm1_few_cols_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MMQ_CM1_FEW_COLS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type, ggml_type v_type) {
     // qvac: scalar FlashAttn MMQ (_int8) variants are disabled on this fork. The
     // TurboQuant import replaced the scalar shader's MMQ path with the compile-time
@@ -2430,7 +2439,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                           l_warptile_mmq, m_warptile_mmq, s_warptile_mmq,
                           l_warptile_mmq_int, m_warptile_mmq_int, s_warptile_mmq_int,
                           l_warptile_mmq_cm1_int, m_warptile_mmq_cm1_int, s_warptile_mmq_cm1_int,
-                          l_warptile_mmq_cm1_int_wide,
+                          l_warptile_mmq_cm1_int_wide, s_warptile_mmq_cm1_int_few, m_warptile_mmq_cm1_int_few,
                           l_warptile_mmq_cm1_int_k, m_warptile_mmq_cm1_int_k, s_warptile_mmq_cm1_int_k,
                           l_warptile_mmq_int_k, m_warptile_mmq_int_k, s_warptile_mmq_int_k,
                           l_warptile_mmq_k, m_warptile_mmq_k, s_warptile_mmq_k,
@@ -2568,6 +2577,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         s_warptile_mmq_cm1_int = { cm1_bs( 32,  32),  32,  32, 32, std::min(cm1_sg,  32u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
         // 32x64 warp tiles: half the A-scale reads per WMMA; only used on wave32 RDNA3 for types without a min term
         l_warptile_mmq_cm1_int_wide = { cm1_sg * (128 / 32) * (128 / 64), 128, 128, 32, 32, 64, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
+        // 16x32 warp tiles, 8 waves per workgroup: the small and medium tiles of ggml_vk_mmq_cm1_few_cols_tc
+        s_warptile_mmq_cm1_int_few = { cm1_sg * (128 / 16) * (32 / 32), 128, 32, 32, 16, 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
+        m_warptile_mmq_cm1_int_few = { cm1_sg * ( 64 / 16) * (64 / 32),  64, 64, 32, 16, 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
 
         l_warptile_mmq_cm1_int_k = { cm1_bs( 64, 128),  64, 128, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
         m_warptile_mmq_cm1_int_k = { cm1_bs( 64,  64),  64,  64, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture, packstore };
@@ -3516,6 +3528,21 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const bool rdna4 = device->architecture == AMD_RDNA4;
         const auto & tc_mmq_cm1_int_sym = (rdna3 && cm1_sg == 32 && ggml_vk_mmq_cm1_wide_enabled()) ? tc_mmq_cm1_int_wide : tc_mmq_cm1_int;
 
+        // gfx1151, 27B shapes at 24-64 columns: more waves per weight tile hide the per-weight unpack. The small tile gains
+        // 1.26-1.66x on the K-quants and IQ4_XS, the medium tile 1.06-1.46x with Q8_0; Q8_0 keeps its one-wave small tile.
+        const bool cm1_few_cols = ggml_vk_is_radv_rdna3(device) && cm1_sg == 32 && ggml_vk_mmq_cm1_few_cols_enabled();
+        const auto cm1_few_cols_tc = [&](const std::vector<vk_tile_config> & tc, ggml_type type, bool small_tile) {
+            std::vector<vk_tile_config> out = tc;
+            if (!cm1_few_cols || !ggml_vk_matmul_cm1_int_shmem_support(device, s_warptile_mmq_cm1_int_few, false, type)) {
+                return out;
+            }
+            if (small_tile) {
+                out[0] = { s_warptile_mmq_cm1_int_few, { s_warptile_mmq_cm1_int_few[1], s_warptile_mmq_cm1_int_few[2], 1 }, s_align };
+            }
+            out[1] = { m_warptile_mmq_cm1_int_few, { m_warptile_mmq_cm1_int_few[1], m_warptile_mmq_cm1_int_few[2], 1 }, m_align };
+            return out;
+        };
+
         if (device->coopmat_f32_support_16x16x16_f32acc) {
             std::vector<vk_tile_config> tc_mm_f32 = {{s_warptile_f32, s_wg_denoms, s_align}, {m_warptile_f32, m_wg_denoms, m_align}, {l_warptile_f32, l_wg_denoms, l_align}};
             cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, false, false}, tc_mm_f32, "matmul_f32_f32", matmul_f32_f32_cm1_fp32_len, matmul_f32_f32_cm1_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
@@ -3669,14 +3696,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q4_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_1_q8_1",   matmul_q4_1_q8_1_cm1_len,   matmul_q4_1_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
             cm1_create_mmq({GGML_TYPE_Q5_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_q5_0_q8_1",   matmul_q5_0_q8_1_cm1_len,   matmul_q5_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q5_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_1_q8_1",   matmul_q5_1_q8_1_cm1_len,   matmul_q5_1_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
-            cm1_create_mmq({GGML_TYPE_Q8_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_q8_0_q8_1",   matmul_q8_0_q8_1_cm1_len,   matmul_q8_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_Q8_0,   GGML_TYPE_Q8_1, false, false}, cm1_few_cols_tc(tc_mmq_cm1_int_sym, GGML_TYPE_Q8_0, false), "matmul_q8_0_q8_1",   matmul_q8_0_q8_1_cm1_len,   matmul_q8_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             cm1_create_mmq({GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_iq4_nl_q8_1", matmul_iq4_nl_q8_1_cm1_len, matmul_iq4_nl_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
-            cm1_create_mmq({GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_iq4_xs_q8_1", matmul_iq4_xs_q8_1_cm1_len, matmul_iq4_xs_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_1, false, false}, cm1_few_cols_tc(tc_mmq_cm1_int_sym, GGML_TYPE_IQ4_XS, true), "matmul_iq4_xs_q8_1", matmul_iq4_xs_q8_1_cm1_len, matmul_iq4_xs_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
             cm1_create_mmq({GGML_TYPE_MXFP4,  GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_sym, "matmul_mxfp4_q8_1",  matmul_mxfp4_q8_1_cm1_len,  matmul_mxfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_push_constants), 3);
             cm1_create_mmq({GGML_TYPE_Q3_K,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_k, "matmul_q3_k_q8_1",   matmul_q3_k_q8_1_cm1_len,   matmul_q3_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
-            if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q4_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_k_q8_1",   matmul_q4_k_q8_1_cm1_len,   matmul_q4_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
-            if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q5_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_k_q8_1",   matmul_q5_k_q8_1_cm1_len,   matmul_q5_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
-            cm1_create_mmq({GGML_TYPE_Q6_K,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_k, "matmul_q6_k_q8_1",   matmul_q6_k_q8_1_cm1_len,   matmul_q6_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
+            if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q4_K, GGML_TYPE_Q8_1, false, false}, cm1_few_cols_tc(tc_mmq_cm1_int, GGML_TYPE_Q4_K, true), "matmul_q4_k_q8_1",   matmul_q4_k_q8_1_cm1_len,   matmul_q4_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
+            if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q5_K, GGML_TYPE_Q8_1, false, false}, cm1_few_cols_tc(tc_mmq_cm1_int, GGML_TYPE_Q5_K, true), "matmul_q5_k_q8_1",   matmul_q5_k_q8_1_cm1_len,   matmul_q5_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
+            cm1_create_mmq({GGML_TYPE_Q6_K,   GGML_TYPE_Q8_1, false, false}, cm1_few_cols_tc(tc_mmq_cm1_int_k, GGML_TYPE_Q6_K, true), "matmul_q6_k_q8_1",   matmul_q6_k_q8_1_cm1_len,   matmul_q6_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_NVFP4, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_k, "matmul_nvfp4_q8_1",  matmul_nvfp4_q8_1_cm1_len,  matmul_nvfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_push_constants), 3); }
         }
 
