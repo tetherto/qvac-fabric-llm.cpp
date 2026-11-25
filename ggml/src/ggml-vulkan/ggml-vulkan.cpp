@@ -2193,14 +2193,24 @@ static bool ggml_vk_is_gfx1151(const vk_device & device) {
            device_name.find("GFX1151") != std::string::npos;
 }
 
-// The 9-16 column q8_1 mat-vec of ggml_vk_mmvq_wide() is tuned on UMA NVIDIA (DGX Spark) only.
-static bool ggml_vk_mmvq_wide_device(const vk_device & device) {
-    return device->integer_dot_product && device->vendor_id == VK_VENDOR_ID_NVIDIA && device->uma;
-}
-
 static bool ggml_vk_is_radv_rdna3(const vk_device & device) {
     return device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eMesaRadv &&
            device->architecture == vk_device_architecture::AMD_RDNA3;
+}
+
+// GGML_VK_MMVQ_WIDE=0 keeps 9-16 column dense mat-muls off the mat-vec.
+static bool ggml_vk_mmvq_wide_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MMVQ_WIDE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// The 9-16 column q8_1 mat-vec of ggml_vk_mmvq_wide() is tuned on UMA NVIDIA (DGX Spark) and RADV RDNA3 (Radeon 8060S).
+static bool ggml_vk_mmvq_wide_device(const vk_device & device) {
+    return device->integer_dot_product && ggml_vk_mmvq_wide_enabled() &&
+           ((device->vendor_id == VK_VENDOR_ID_NVIDIA && device->uma) || ggml_vk_is_radv_rdna3(device));
 }
 
 // RADV RDNA3 runs some dense q4_K / q5_K / q6_K / iq4_xs prefill GEMMs faster as f16-B KHR coopmat matmuls than as int8 MMQ
@@ -4262,8 +4272,6 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_q8_1_f32", arr_dmmv_q2_k_q8_1_f32_len[reduc], arr_dmmv_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32", arr_dmmv_q3_k_q8_1_f32_len[reduc], arr_dmmv_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
-                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_q8_1_f32", arr_dmmv_q4_k_q8_1_f32_len[reduc], arr_dmmv_q4_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
-                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
 
                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_S][i], "mul_mat_vec_iq1_s_q8_1_f32", arr_dmmv_iq1_s_q8_1_f32_len[reduc], arr_dmmv_iq1_s_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_M][i], "mul_mat_vec_iq1_m_q8_1_f32", arr_dmmv_iq1_m_q8_1_f32_len[reduc], arr_dmmv_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -4271,6 +4279,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_q8_1_f32", arr_dmmv_q8_0_q8_1_f32_len[reduc], arr_dmmv_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_q8_1_f32", arr_dmmv_q6_k_q8_1_f32_len[reduc], arr_dmmv_q6_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ4_XS][i], "mul_mat_vec_iq4_xs_q8_1_f32", arr_dmmv_iq4_xs_q8_1_f32_len[reduc], arr_dmmv_iq4_xs_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                // RADV RDNA3 also takes Q4_K and Q5_K past mul_mat_vec_max_cols (ggml_vk_mmvq_wide)
+                if (all_types || ggml_vk_is_radv_rdna3(device)) {
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_q8_1_f32", arr_dmmv_q4_k_q8_1_f32_len[reduc], arr_dmmv_q4_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                }
 
             }
 #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
@@ -7413,7 +7426,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }
-        // Past mul_mat_vec_max_cols (UMA NVIDIA only) the subgroup-size workgroup is up to 1.8x faster than the large one.
+        // Past mul_mat_vec_max_cols only the subgroup-size workgroup exists (UMA NVIDIA: up to 1.8x faster than the large one).
         if (num_cols > mul_mat_vec_max_cols) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }
@@ -9207,12 +9220,25 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 }
 
-// UMA NVIDIA (DGX Spark): for these types the integer-dot mat-vec beats mul_mm up to mul_mat_vecq_max_cols columns once M is large.
+// For these types the integer-dot mat-vec beats mul_mm up to mul_mat_vecq_max_cols columns once M is large.
 static bool ggml_vk_mmvq_wide(const vk_device& device, ggml_type type, uint32_t m) {
     // The DGX Spark sweep measured wins from M 5120 up and losses at M 1024.
     constexpr uint32_t min_rows = 4096;
     if (!ggml_vk_mmvq_wide_device(device) || m < min_rows) {
         return false;
+    }
+    // gfx1151, M 5120-17408 at 9-16 columns: Q4_K / Q5_K 1.16-2.3x, Q6_K 1.44-2.85x, IQ4_XS 1.5-3.0x faster than int8 MMQ;
+    // Q8_0 lost at 16 columns (0.67-0.95x).
+    if (ggml_vk_is_radv_rdna3(device)) {
+        switch (type) {
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_IQ4_XS:
+                return true;
+            default:
+                return false;
+        }
     }
     switch (type) {
         case GGML_TYPE_IQ4_XS:
@@ -19015,6 +19041,12 @@ static bool ggml_vk_has_compute_node_after(const struct ggml_cgraph * cgraph, in
     return false;
 }
 
+// The most columns at which a down projection with weight type w_type and m rows takes the mat-vec instead of the fused
+// matmul: on RADV RDNA3 the ggml_vk_mmvq_wide() types reach mul_mat_vecq_max_cols.
+static uint32_t ggml_vk_glu_mul_mat_vec_cols(const vk_device & device, ggml_type w_type, uint32_t m) {
+    return ggml_vk_is_radv_rdna3(device) && ggml_vk_mmvq_wide(device, w_type, m) ? mul_mat_vecq_max_cols : mul_mat_vec_max_cols;
+}
+
 // SWIGLU(split)+MUL_MAT that reaches the Q8_1 B or XL f16-B path of ggml_vk_mul_mat_q_f16 (no M split, FWHT or mat-vec); the GLU tensor is never written.
 // The MUL_MAT must not be the last computed node: a caller that splits the graph there may read its srcs (the llama-imatrix eval callback).
 static bool ggml_vk_can_fuse_glu_mul_mat(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -19024,7 +19056,7 @@ static bool ggml_vk_can_fuse_glu_mul_mat(const ggml_backend_vk_context * ctx, co
     const ggml_tensor * glu = cgraph->nodes[node_idx];
     const ggml_tensor * mm  = cgraph->nodes[node_idx + 1];
     const ggml_tensor * w   = mm->src[0];
-    return mm->ne[1] > mul_mat_vec_max_cols && get_misalign_bytes(ctx, glu->src[0]) == 0 &&
+    return mm->ne[1] > ggml_vk_glu_mul_mat_vec_cols(ctx->device, w->type, w->ne[1]) && get_misalign_bytes(ctx, glu->src[0]) == 0 &&
            get_misalign_bytes(ctx, glu->src[1]) == 0 && !ggml_vk_can_use_fwht(ctx, glu, mm) &&
            (ggml_vk_dense_f16coopmat_route(ctx->device, w->type, w->ne[1], mm->ne[1], w->ne[0], true) ||
             ggml_vk_can_quantize_y(ctx, glu, mm, false));
@@ -22969,6 +23001,11 @@ static bool ggml_backend_vk_glu_mul_mat_supported(ggml_backend_t backend, ggml_t
     return ggml_vk_glu_mul_mat_device_ok((ggml_backend_vk_context *) backend->context, w_type, GGML_PREC_DEFAULT);
 }
 
+static uint32_t ggml_backend_vk_glu_mul_mat_vec_cols(ggml_backend_t backend, ggml_type w_type, uint32_t m) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    return ggml_vk_glu_mul_mat_vec_cols(((ggml_backend_vk_context *) backend->context)->device, w_type, m);
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_get_buffer_capacity") == 0) {
@@ -22985,6 +23022,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_glu_mul_mat_supported") == 0) {
         return (void *) ggml_backend_vk_glu_mul_mat_supported;
+    }
+    if (strcmp(name, "ggml_backend_vk_glu_mul_mat_vec_cols") == 0) {
+        return (void *) ggml_backend_vk_glu_mul_mat_vec_cols;
     }
     // exported only while the fusion is on, so a test expects the fusion only then
     if (strcmp(name, "ggml_backend_vk_gdn_cache_fusion_count") == 0 && ggml_vk_fuse_gdn_cache_enabled()) {
