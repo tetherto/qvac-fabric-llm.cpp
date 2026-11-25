@@ -1513,6 +1513,19 @@ static void htp_collapse_dims(struct ggml_tensor ** tensors, size_t n_tensors, s
     }
 }
 
+static bool htp_unary_reduces_whole_rows(uint32_t op) {
+    return op == HTP_OP_NORM || op == HTP_OP_RMS_NORM || op == HTP_OP_L2_NORM;
+}
+
+static uint32_t htp_unary_fit_row_threads(uint32_t op, uint32_t n_threads, size_t vtcm_size, size_t src0_row_size, size_t dst_row_size) {
+    if (!htp_unary_reduces_whole_rows(op)) {
+        return n_threads;
+    }
+    const size_t staged_row_size = 2 * (hex_round_up(src0_row_size, 128) + hex_round_up(dst_row_size, 128));
+    const size_t fitting_threads = staged_row_size > 0 ? vtcm_size / staged_row_size : n_threads;
+    return (uint32_t) (std::max<size_t>(1, (std::min<size_t>)(n_threads, fitting_threads)));
+}
+
 static bool htp_kparams_solve_unary_impl(
     const struct ggml_hexagon_session * sess,
     uint32_t op,
@@ -1575,8 +1588,9 @@ static bool htp_kparams_solve_unary_impl(
     const uint32_t src0_nrows          = src0->ne[1] * src0->ne[2] * src0->ne[3];
     const uint32_t min_rows_per_thread = (uint32_t) (std::max<size_t>(1, (128 + dst_data_row_size - 1) / dst_data_row_size));
     const uint32_t max_threads         = (std::max)(1u, src0_nrows / min_rows_per_thread);
-    const uint32_t n_threads           = (std::min)(htp_session_n_threads(sess), max_threads);
     const size_t   vtcm_size           = htp_session_vtcm_size(sess);
+    const uint32_t n_threads           = htp_unary_fit_row_threads(op, (std::min)(htp_session_n_threads(sess), max_threads),
+                                                                   vtcm_size, src0->ne[0] * elem_size, dst_data_row_size);
 
     kparams->n_threads = n_threads;
 

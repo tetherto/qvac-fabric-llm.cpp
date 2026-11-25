@@ -17277,6 +17277,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gelu_back());
     test_cases.emplace_back(new test_sigmoid_back());
 
+    test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { 122880, 32, 2, 1 }));
+
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
         for (uint32_t n : { 64, 1025 }) {
             for (bool v : { false, true }) {
