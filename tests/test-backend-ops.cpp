@@ -17191,6 +17191,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (const std::array<int64_t, 4> & ne : std::vector<std::array<int64_t, 4>>{ {333, 517, 3, 1}, {517, 333, 3, 1}, {4096, 320, 2, 1}, {320, 4096, 2, 1}, {40, 2731, 1, 1} }) {
+        test_cases.emplace_back(new test_cont(GGML_TYPE_F32, ne, false, {1, 0, 2, 3}));
+    }
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {48, 40, 650, 2}, false, {1, 2, 0, 3}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {48, 40, 650, 2}, false, {2, 0, 1, 3}));
+
     // source strides over 16 MB (24-bit DMA descriptor limit)
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {512, 8193, 2, 1}, false, {2, 1, 0, 3}));
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {256, 16385, 2, 1}, false, {0, 2, 1, 3}));

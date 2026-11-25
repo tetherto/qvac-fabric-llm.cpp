@@ -2760,6 +2760,26 @@ static bool htp_copy_solve_transpose(
     return true;
 }
 
+static const uint32_t HTP_COPY_TRANSPOSE_STAGE_MIN_BLOCKS_PER_THREAD = 2;
+static const uint64_t HTP_COPY_TRANSPOSE_STAGE_MAX_BUFFER_BYTES      = 256 * 1024;
+
+static uint32_t htp_copy_transpose_stage_block(const struct htp_copy_transpose_params * tp, uint32_t n_threads, size_t vtcm_size) {
+    const uint64_t along        = (std::max)(tp->n_rows, tp->n_cols);
+    const uint64_t cross_bytes  = (uint64_t) (std::min)(tp->n_rows, tp->n_cols) * sizeof(float);
+    const uint64_t budget       = (std::min<uint64_t>)(HTP_COPY_TRANSPOSE_STAGE_MAX_BUFFER_BYTES,
+                                                        vtcm_size / ((uint64_t) HTP_COPY_TRANSPOSE_STAGE_BUFFERS * n_threads));
+    const uint64_t wanted_units = (uint64_t) HTP_COPY_TRANSPOSE_STAGE_MIN_BLOCKS_PER_THREAD * n_threads;
+    const uint64_t balanced     = hex_round_up((along * tp->n_mats + wanted_units - 1) / wanted_units, HTP_COPY_TRANSPOSE_TILE);
+    const uint64_t fitting      = budget / cross_bytes;
+    return (uint32_t) ((std::min)(fitting, balanced) / HTP_COPY_TRANSPOSE_TILE * HTP_COPY_TRANSPOSE_TILE);
+}
+
+static void htp_copy_stage_transpose(struct htp_copy_kernel_params * kparams, size_t vtcm_size) {
+    struct htp_copy_transpose_params * tp = &kparams->transpose;
+    tp->block = htp_copy_transpose_stage_block(tp, kparams->n_threads, vtcm_size);
+    kparams->vtcm_size = (uint32_t) ((uint64_t) HTP_COPY_TRANSPOSE_STAGE_BUFFERS * kparams->n_threads * htp_copy_transpose_stage_buffer_bytes(tp));
+}
+
 static void htp_copy_solve_reshape(
     const struct ggml_tensor * src0,
     const struct ggml_tensor * dst,
@@ -2883,6 +2903,7 @@ static bool htp_kparams_solve_cpy(
             const bool multi_thread = nelem_src >= HTP_COPY_TRANSPOSE_MT_MIN_ELEMS && n_threads > 1;
             kparams->kernel_type = HTP_COPY_KERNEL_TRANSPOSE;
             kparams->n_threads   = multi_thread ? (uint8_t) n_threads : 1;
+            htp_copy_stage_transpose(kparams, vtcm_size);
             return true;
         }
 

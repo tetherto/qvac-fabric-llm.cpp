@@ -406,6 +406,142 @@ static int cpy_transpose(struct htp_ops_context * octx, const struct htp_copy_ke
     return HTP_STATUS_OK;
 }
 
+struct cpy_transpose_stage {
+    struct htp_ops_context * octx;
+    uint8_t *                vtcm;
+    uint64_t                 src;
+    uint64_t                 dst;
+    uint32_t                 n_rows;
+    uint32_t                 n_cols;
+    uint32_t                 n_mats;
+    uint32_t                 block;
+    uint32_t                 n_blocks;
+    uint32_t                 blocks_per_thread;
+    uint32_t                 buffer_bytes;
+    bool                     blocks_along_rows;
+};
+
+struct cpy_transpose_block {
+    uint64_t src;
+    uint64_t dst;
+    uint32_t n_rows;
+    uint32_t n_cols;
+};
+
+static struct cpy_transpose_block cpy_transpose_stage_block(const struct cpy_transpose_stage * stage, uint32_t unit) {
+    const uint32_t mat        = unit / stage->n_blocks;
+    const uint32_t first      = (unit - mat * stage->n_blocks) * stage->block;
+    const uint64_t mat_offset = (uint64_t) mat * stage->n_rows * stage->n_cols * sizeof(float);
+    const uint64_t src        = stage->src + mat_offset;
+    const uint64_t dst        = stage->dst + mat_offset;
+    if (stage->blocks_along_rows) {
+        const uint32_t count = MIN(stage->block, stage->n_rows - first);
+        return (struct cpy_transpose_block) { src + (uint64_t) first * stage->n_cols * sizeof(float),
+                                              dst + (uint64_t) first * sizeof(float), count, stage->n_cols };
+    }
+    const uint32_t count = MIN(stage->block, stage->n_cols - first);
+    return (struct cpy_transpose_block) { src + (uint64_t) first * sizeof(float),
+                                          dst + (uint64_t) first * stage->n_rows * sizeof(float), stage->n_rows, count };
+}
+
+static void cpy_transpose_stage_fetch(const struct cpy_transpose_stage * stage, dma_queue * queue,
+                                      const struct cpy_transpose_block * block, uint8_t * buffer) {
+    const uint32_t row_bytes = block->n_cols * sizeof(float);
+    dma_queue_push(queue, dma_make_data(buffer, block->src), row_bytes, stage->n_cols * sizeof(float), row_bytes, block->n_rows);
+}
+
+static void cpy_transpose_stage_store(const struct cpy_transpose_stage * stage, dma_queue * queue,
+                                      const struct cpy_transpose_block * block, const uint8_t * buffer) {
+    const uint32_t row_bytes = block->n_rows * sizeof(float);
+    dma_queue_push(queue, dma_make_data(block->dst, buffer), stage->n_rows * sizeof(float), row_bytes, row_bytes, block->n_cols);
+}
+
+static void cpy_transpose_staged_block(const struct cpy_transpose_block * block, const uint8_t * in, uint8_t * out) {
+    struct cpy_transpose_job job;
+    job.n_rows            = block->n_rows;
+    job.n_cols            = block->n_cols;
+    job.strips_along_rows = true;
+    const uint32_t n_strips = (block->n_rows + HTP_COPY_TRANSPOSE_TILE - 1) / HTP_COPY_TRANSPOSE_TILE;
+    for (uint32_t strip = 0; strip < n_strips; strip++) {
+        cpy_transpose_strip(&job, in, out, strip);
+    }
+}
+
+static uint32_t cpy_transpose_stage_prime(const struct cpy_transpose_stage * stage, dma_queue * queue, uint8_t * buffers,
+                                          uint32_t unit0, uint32_t unit1) {
+    uint32_t next = unit0;
+    for (uint32_t slot = 0; slot < HTP_COPY_TRANSPOSE_STAGE_SLOTS && next < unit1; slot++, next++) {
+        uint8_t * in  = buffers + 2 * slot * stage->buffer_bytes;
+        uint8_t * out = in + stage->buffer_bytes;
+        const struct cpy_transpose_block block = cpy_transpose_stage_block(stage, next);
+        dma_queue_push(queue, dma_make_data(block.dst, out), 0, 0, 0, 0);
+        cpy_transpose_stage_fetch(stage, queue, &block, in);
+    }
+    return next;
+}
+
+static uint32_t cpy_transpose_stage_step(const struct cpy_transpose_stage * stage, dma_queue * queue,
+                                         uint32_t unit, uint32_t next, uint32_t unit1) {
+    uint8_t * out = (uint8_t *) (uintptr_t) dma_queue_pop(queue).src;
+    uint8_t * in  = (uint8_t *) (uintptr_t) dma_queue_pop(queue).dst;
+    const struct cpy_transpose_block block = cpy_transpose_stage_block(stage, unit);
+    cpy_transpose_staged_block(&block, in, out);
+    cpy_transpose_stage_store(stage, queue, &block, out);
+    if (next >= unit1) {
+        return next;
+    }
+    const struct cpy_transpose_block ahead = cpy_transpose_stage_block(stage, next);
+    cpy_transpose_stage_fetch(stage, queue, &ahead, in);
+    return next + 1;
+}
+
+static void cpy_thread_transpose_staged(unsigned int nth, unsigned int ith, void * data) {
+    const struct cpy_transpose_stage * stage = (const struct cpy_transpose_stage *) data;
+    const uint32_t total = stage->n_mats * stage->n_blocks;
+    const uint32_t unit0 = ith * stage->blocks_per_thread;
+    const uint32_t unit1 = MIN(unit0 + stage->blocks_per_thread, total);
+    if (unit0 >= unit1) {
+        return;
+    }
+    dma_queue * queue   = stage->octx->ctx->dma[ith];
+    uint8_t *   buffers = stage->vtcm + (size_t) ith * HTP_COPY_TRANSPOSE_STAGE_BUFFERS * stage->buffer_bytes;
+    uint32_t    next    = cpy_transpose_stage_prime(stage, queue, buffers, unit0, unit1);
+    for (uint32_t unit = unit0; unit < unit1; unit++) {
+        next = cpy_transpose_stage_step(stage, queue, unit, next, unit1);
+    }
+    dma_queue_flush(queue);
+}
+
+static bool cpy_transpose_is_staged(const struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
+    return kparams->transpose.block > 0 && kparams->vtcm_size > 0 && kparams->vtcm_size <= octx->ctx->vtcm_size;
+}
+
+static int cpy_transpose_staged(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
+    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    const struct htp_copy_transpose_params * tp = &kparams->transpose;
+    const uint32_t n_threads = octx->n_threads;
+
+    struct cpy_transpose_stage stage;
+    stage.octx              = octx;
+    stage.vtcm              = (uint8_t *) octx->ctx->vtcm_base;
+    stage.src               = octx->src[0]->data;
+    stage.dst               = octx->dst->data;
+    stage.n_rows            = tp->n_rows;
+    stage.n_cols            = tp->n_cols;
+    stage.n_mats            = tp->n_mats;
+    stage.block             = tp->block;
+    stage.blocks_along_rows = tp->n_rows >= tp->n_cols;
+    stage.n_blocks          = ((stage.blocks_along_rows ? tp->n_rows : tp->n_cols) + tp->block - 1) / tp->block;
+    stage.buffer_bytes      = htp_copy_transpose_stage_buffer_bytes(tp);
+    stage.blocks_per_thread = fastdiv(stage.n_mats * stage.n_blocks + n_threads - 1, &octx->n_threads_div);
+
+    work_queue_run(octx->ctx->work_queue, cpy_thread_transpose_staged, &stage, n_threads);
+    return HTP_STATUS_OK;
+}
+
 static int cpy_scalar(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
     if (octx->ctx->mdev.count > 1 && octx->ctx->mdev.idx > 0) {
         return HTP_STATUS_OK;
@@ -652,6 +788,13 @@ static bool cpy_needs_dma_addressing(const struct htp_ops_context * octx) {
     return htp_tensor_is_extended(octx->src[0]) || htp_tensor_is_extended(octx->dst);
 }
 
+static int cpy_transpose_any(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
+    if (cpy_transpose_is_staged(octx, kparams)) {
+        return cpy_transpose_staged(octx, kparams);
+    }
+    return cpy_needs_dma_addressing(octx) ? cpy_reshape(octx, kparams) : cpy_transpose(octx, kparams);
+}
+
 int op_cpy(struct htp_ops_context * octx) {
     const struct htp_copy_kernel_params * kparams = (const struct htp_copy_kernel_params *) octx->kernel_params;
     int status = HTP_STATUS_OK;
@@ -679,7 +822,7 @@ int op_cpy(struct htp_ops_context * octx) {
             status = htp_gather_rows(octx, octx->src[0], NULL, &kparams->u.gather, kparams->n_threads);
             break;
         case HTP_COPY_KERNEL_TRANSPOSE:
-            status = cpy_needs_dma_addressing(octx) ? cpy_reshape(octx, kparams) : cpy_transpose(octx, kparams);
+            status = cpy_transpose_any(octx, kparams);
             break;
         default:
             status = HTP_STATUS_NO_SUPPORT;

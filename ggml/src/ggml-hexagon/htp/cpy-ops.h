@@ -43,11 +43,21 @@ struct htp_copy_transpose_params {
     uint32_t n_rows;
     uint32_t n_cols;
     uint32_t n_mats;
+    uint32_t block;
 };
 
 #define HTP_COPY_TRANSPOSE_TILE 32
 
 #define HTP_COPY_TRANSPOSE_MT_MIN_ELEMS (16 * 1024)
+
+#define HTP_COPY_TRANSPOSE_STAGE_SLOTS   2
+#define HTP_COPY_TRANSPOSE_STAGE_BUFFERS (2 * HTP_COPY_TRANSPOSE_STAGE_SLOTS)
+#define HTP_COPY_TRANSPOSE_STAGE_ALIGN   128
+
+static inline uint32_t htp_copy_transpose_stage_buffer_bytes(const struct htp_copy_transpose_params * tp) {
+    const uint32_t cross = tp->n_rows < tp->n_cols ? tp->n_rows : tp->n_cols;
+    return hex_round_up(tp->block * cross * (uint32_t) sizeof(float), HTP_COPY_TRANSPOSE_STAGE_ALIGN);
+}
 
 struct htp_copy_kernel_params {
     uint8_t  kernel_type;
