@@ -129,7 +129,6 @@ static inline float ggml_compute_softplus_f32(float input) {
 
 GGML_ATTRIBUTE_FORMAT(2, 3)
 GGML_API void ggml_log_internal        (enum ggml_log_level level, const char * format, ...);
-GGML_API void ggml_log_callback_default(enum ggml_log_level level, const char * text, void * user_data);
 
 GGML_API enum ggml_log_level ggml_log_get_thread_min_level(void);
 GGML_API enum ggml_log_level ggml_log_set_thread_min_level(enum ggml_log_level level);

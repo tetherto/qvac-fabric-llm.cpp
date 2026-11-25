@@ -1,7 +1,7 @@
 // Stub backend module for test-backend-loader. Built once per case, with STUB_NAME
 // and STUB_SCORE set per copy. It registers no devices and appends one line to the
 // file named by GGML_LOADER_TEST_LOG each time the loader scores it. It also logs
-// "<name>: score" and "<name>: init" through its own ggml-base logger. With
+// "<name>: score" and "<name>: init" through the shared ggml-base logger. With
 // STUB_SCORE_FROM_DEP the score comes from an imported DLL, so the module only
 // loads when that DLL is found.
 
@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #ifdef _WIN32
 #    define STUB_EXPORT extern "C" __declspec(dllexport)
@@ -37,8 +38,14 @@ static ggml_backend_dev_t stub_get_device(ggml_backend_reg_t, size_t) {
     return nullptr;
 }
 
-static void * stub_get_proc_address(ggml_backend_reg_t, const char *) {
-    return nullptr;
+static void stub_log(void) {
+    GGML_LOG_INFO("%s: probe\n", STUB_NAME);
+    GGML_LOG_ERROR("%s: error\n", STUB_NAME);
+    GGML_LOG_CONT("  error detail\n");
+}
+
+static void * stub_get_proc_address(ggml_backend_reg_t, const char * name) {
+    return strcmp(name, "test_log") == 0 ? (void *) stub_log : nullptr;
 }
 
 STUB_EXPORT ggml_backend_reg_t ggml_backend_init(void) {
