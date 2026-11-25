@@ -2957,6 +2957,10 @@ static bool common_speculative_read_header(const std::string & path, common_spec
     }
     hdr.has_markov    = gguf_find_tensor(ctx.get(), "markov_w1.weight") >= 0;
     hdr.target_layers = common_speculative_gguf_int_array(ctx.get(), p + "target_layers");
+    // a draft of a looped model names the layer visits it reads in target_visits, which the loader uses instead
+    if (auto visits = common_speculative_gguf_int_array(ctx.get(), p + "target_visits"); !visits.empty()) {
+        hdr.target_layers = std::move(visits);
+    }
 
     // the loader assembles every file's tensors into one model, while the metadata is only in the first
     const int64_t split_count = common_speculative_gguf_int(ctx.get(), "split.count");

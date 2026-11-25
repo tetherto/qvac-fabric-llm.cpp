@@ -429,6 +429,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DECISION_CONFIG,              "%s.decision.config"              },
 
     { LLM_KV_TARGET_LAYERS,         "%s.target_layers"        },
+    { LLM_KV_TARGET_VISITS,         "%s.target_visits"        },
     { LLM_KV_TARGET_HIDDEN_SIZE,    "%s.target_hidden_size"   },
     { LLM_KV_NORM_BEFORE_RESIDUAL,  "%s.norm_before_residual" },
     { LLM_KV_NORM_BEFORE_FC,        "%s.norm_before_fc"       },
@@ -438,6 +439,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_CONV_GROUP_SIZE,  "%s.conv_group_size"  },
     { LLM_KV_DFLASH_SELECTOR_RANK,    "%s.selector_rank"    },
     { LLM_KV_DFLASH_SELECTOR_TOP_K,   "%s.selector_top_k"   },
+    { LLM_KV_DFLASH_SELECTOR_SOFTCAP_AFTER_CORRECTION, "%s.selector_softcap_after_correction" },
     { LLM_KV_DSPINE_HEAD_TOPK,        "%s.dspine.head_topk" },
     { LLM_KV_DSPINE_EPS,              "%s.dspine.eps"       },
 

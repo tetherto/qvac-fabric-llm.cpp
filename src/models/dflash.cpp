@@ -36,6 +36,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_TOP_K,   hparams.dflash_selector_top_k,   false);
+    ml.get_key(LLM_KV_DFLASH_SELECTOR_SOFTCAP_AFTER_CORRECTION, hparams.dflash_selector_softcap_after, false);
     const bool has_lilicorr = ml.get_key(LLM_KV_LILICORR_HIDDEN_SIZE, hparams.lilicorr_hidden_size, false);
     ml.get_key(LLM_KV_LILICORR_CANDIDATE_TOPK, hparams.lilicorr_candidate_topk, has_lilicorr);
     ml.get_key(LLM_KV_LILICORR_NUM_HEADS,      hparams.lilicorr_num_heads,      has_lilicorr);
@@ -64,6 +65,16 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
+    }
+
+    // looped targets (Inkling2) visit a physical layer more than once: target_layers then names the physical layers,
+    // target_visits the layer visits the target extracts (the last one, n_visits, is its final norm output)
+    std::vector<int32_t> target_visits;
+    if (ml.get_arr(LLM_KV_TARGET_VISITS, target_visits, false)) {
+        if (target_visits.empty() || target_visits.size() != target_layer_ids.size()) {
+            throw std::runtime_error("DFlash 'target_visits' must have the same nonzero length as 'target_layers'");
+        }
+        target_layer_ids = std::move(target_visits);
     }
 
     hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
@@ -947,6 +958,11 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
         }
         ggml_tensor * unary_bcast = ggml_reshape_4d(ctx0, unary_run, top_k, 1, n_pos, n_blocks);
         score = ggml_add(ctx0, score, ggml_repeat(ctx0, unary_bcast, score));
+        // drafts trained with the softcap after the transition correction (Inkling2) cap the score, not the logits
+        if (hparams.dflash_selector_softcap_after && hparams.f_final_logit_softcapping > 0.0f) {
+            const float cap = hparams.f_final_logit_softcapping;
+            score = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, score, 1.0f/cap)), cap);
+        }
 
         ggml_tensor * row = ggml_concat(ctx0,
                 ggml_cast(ctx0, cand_run, GGML_TYPE_F32),
@@ -1420,12 +1436,20 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // tok_embd from the target model (shared via ctx_other)
     auto * tok_embd = model.tok_embd;
+    // norm of the input embedding: the draft's own, or the one Inkling2 applies to its token embeddings
+    ggml_tensor * tok_norm     = model.tok_norm;
+    float         tok_norm_eps = hparams.f_norm_rms_eps;
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
         tok_embd = model_other->tok_embd;
+        if (!tok_norm && (model_other->arch == LLM_ARCH_INKLING2 || model_other->arch == LLM_ARCH_INKLING2_LOOP)) {
+            GGML_ASSERT(model_other->tok_norm != nullptr);
+            tok_norm     = model_other->tok_norm;
+            tok_norm_eps = model_other->hparams.f_norm_rms_eps;
+        }
     }
 
     ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
@@ -1468,11 +1492,14 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 }
             }
         }
+        if (tok_norm) {
+            cur = ggml_mul(ctx0, ggml_rms_norm(ctx0, cur, tok_norm_eps), tok_norm);
+        }
         return cur;
     };
 
     // DSpark block [anchor, mask_1, ..., mask_k] per sequence (Inkling2): slot k > 0 uses mask row k - 1,
-    // the anchor its (normed) token embedding, and the whole block shares the SWA window of the anchor
+    // the anchor its token embedding, and the whole block shares the SWA window of the anchor
     const int64_t n_blk_tok = ubatch.n_seqs_unq > 0 ? n_tokens / ubatch.n_seqs_unq : 0;
     const bool    use_block = model.dspark_mask_embd && n_blk_tok > 0 && n_tokens % ubatch.n_seqs_unq == 0 &&
             n_blk_tok <= (int64_t) hparams.dflash_block_size;
@@ -1483,9 +1510,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         ggml_tensor * anchors = ggml_view_2d(ctx0, inp_tokens, 1, n_blk, (size_t) n_blk_tok * inp_tokens->nb[0], 0);
         anchors = embed(ggml_cont_1d(ctx0, anchors, n_blk));
-        if (model.tok_norm) {
-            anchors = build_norm(anchors, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
-        }
 
         inpL = ggml_reshape_3d(ctx0, anchors, n_embd, 1, n_blk);
         if (n_blk_tok > 1) {
@@ -1658,7 +1682,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         if (hparams.f_logit_scale != 0.0f) {
             cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
         }
-        if (hparams.f_final_logit_softcapping > 0.0f) {
+        if (hparams.f_final_logit_softcapping > 0.0f && !hparams.dflash_selector_softcap_after) {
             cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
             cur = ggml_tanh(ctx0, cur);
             cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
