@@ -190,7 +190,7 @@ void llama_model_dflash::load_tensors_layers_mistral_large4() {
     }
 }
 
-// DSpark block [anchor, mask_1, ..., mask_k] per sequence: slot k > 0 uses mask row k - 1, the anchor uses its (normed) token embedding
+// DSpark block [anchor, mask_1, ..., mask_k] per sequence: slot k > 0 uses mask row k - 1, the anchor uses its token embedding
 ggml_tensor * llama_model_dflash::build_dspark_inp_block(const llm_graph_context & g, const llama_model & model, ggml_tensor * inp_tokens) {
     ggml_context * ctx0 = g.ctx0;
 
@@ -207,9 +207,6 @@ ggml_tensor * llama_model_dflash::build_dspark_inp_block(const llm_graph_context
 
     ggml_tensor * anchors = ggml_view_2d(ctx0, inp_tokens, 1, n_blocks, (size_t) block_drafts * inp_tokens->nb[0], 0);
     anchors = get_tok_rows(g, model, ggml_cont_1d(ctx0, anchors, n_blocks));
-    if (model.tok_norm) {
-        anchors = g.build_norm(anchors, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
-    }
 
     ggml_tensor * cur = ggml_reshape_3d(ctx0, anchors, n_embd, 1, n_blocks);
     if (block_drafts > 1) {
