@@ -917,6 +917,12 @@ class DFlashModel(Qwen3Model):
             self.gguf_writer.add_conv_group_size(int(dflash_config["conv_group_size"]))
             self.gguf_writer.add_selector_rank(int(dflash_config["selector_rank"]))
             self.gguf_writer.add_selector_top_k(int(dflash_config["selector_top_k"]))
+        # where the selector applies final_logit_softcapping: to the candidate logits, or to the corrected transition scores
+        softcap_mode = dflash_config.get("selector_softcap_mode", "before_correction")
+        if softcap_mode not in ("before_correction", "after_correction"):
+            raise ValueError(f"unsupported DFlash2 selector_softcap_mode {softcap_mode!r}")
+        if softcap_mode == "after_correction":
+            self.gguf_writer.add_selector_softcap_after_correction(True)
 
         output_multiplier = dflash_config.get(
             "output_multiplier", self.hparams.get("output_multiplier")
@@ -942,8 +948,7 @@ class DFlashModel(Qwen3Model):
 
         target_layer_ids = dflash_config.get("target_layer_ids", self.hparams.get("target_layer_ids", []))
         if target_layer_ids:
-            extract_layer_ids = [i + 1 for i in target_layer_ids]
-            self.gguf_writer.add_target_layers(extract_layer_ids)
+            self.gguf_writer.add_target_layers(self.extract_layer_ids(target_layer_ids))
 
         use_sliding_window = self.hparams.get("use_sliding_window", False) or dflash_config.get("use_swa", False)
         sliding_window = dflash_config.get("swa_window_size") or self.hparams.get("sliding_window")
@@ -969,6 +974,10 @@ class DFlashModel(Qwen3Model):
         if self._target_uses_mrope():
             head_dim = self.hparams.get("head_dim") or self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
             self.gguf_writer.add_rope_dimension_sections([head_dim // 2, 0, 0, 0])
+
+    def extract_layer_ids(self, target_layer_ids: list[int]) -> list[int]:
+        # HF ids name the target layer whose output is tapped, llama.cpp extracts the input of the next one
+        return [i + 1 for i in target_layer_ids]
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         yield from super().generate_extra_tensors()
