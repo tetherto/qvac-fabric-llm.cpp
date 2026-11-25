@@ -81,6 +81,28 @@ jobs:
       - name: Core ML contract tests without model assets
         run: ctest --test-dir build-coreml -R '^coreml-contract$' --output-on-failure
 
+  macos-speech-coreml-configure:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure speech Core ML without llama Core ML
+        shell: bash
+        run: >-
+          cmake -S . -B build-speech-coreml
+          -DFABRIC_BUILD_SPEECH=ON
+          -DPARAKEET_COREML=ON
+          -DLLAMA_COREML=OFF
+          -DLLAMA_BUILD_TESTS=OFF
+          -DLLAMA_BUILD_TOOLS=OFF
+          -DLLAMA_BUILD_APP=OFF
+          -DLLAMA_OPENSSL=OFF
+          2>&1 | tee configure-speech-coreml.log
+      - name: Objective-C languages are enabled before ggml
+        run: |
+          grep -q "fabric: Objective-C and Objective-C++ enabled before ggml for speech Core ML" configure-speech-coreml.log
+          grep -q "^CMAKE_OBJCXX_COMPILER:" build-speech-coreml/CMakeCache.txt
+          grep -q "^CMAKE_OBJC_COMPILER:" build-speech-coreml/CMakeCache.txt
+
   macos-latest-arm64:
     runs-on: macos-latest
 

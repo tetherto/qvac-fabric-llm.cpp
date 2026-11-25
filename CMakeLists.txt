@@ -64,6 +64,26 @@ endif()
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
 option(BUILD_LLAMA "Build, install LLAMA package artifacts as well." ON)
 option(FABRIC_BUILD_SPEECH "fabric: build the speech engines (engines/speech/) against the in-tree ggml" OFF)
+set(FABRIC_SPEECH_COREML_OPTIONS WHISPER_COREML PARAKEET_COREML TTS_CPP_COREML AUDIOGEN_COREML AUDIOGEN_MINIMAX_COREML)
+
+function(fabric_speech_coreml_requested result)
+    set(${result} OFF PARENT_SCOPE)
+    foreach (coreml_option IN LISTS FABRIC_SPEECH_COREML_OPTIONS)
+        if (${coreml_option})
+            set(${result} ON PARENT_SCOPE)
+        endif()
+    endforeach()
+endfunction()
+
+macro(fabric_enable_objc_before_ggml_for_speech_coreml)
+    fabric_speech_coreml_requested(FABRIC_SPEECH_COREML)
+    if (FABRIC_BUILD_SPEECH AND APPLE AND FABRIC_SPEECH_COREML)
+        enable_language(OBJC OBJCXX)
+        message(STATUS "fabric: Objective-C and Objective-C++ enabled before ggml for speech Core ML")
+    endif()
+endmacro()
+
+fabric_enable_objc_before_ggml_for_speech_coreml()
 
 option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)
 
