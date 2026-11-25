@@ -908,8 +908,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
     // a block drafter on the GPU (DFlash, DSpark) runs only small CPU splits, e.g. the anchor rows of the
-    // target's host token embeddings: waking a full thread pool for them costs more than they take
-    if (params.speculative.draft.cpuparams.n_threads == -1 && params.speculative.draft.n_gpu_layers != 0 && llama_supports_gpu_offload()) {
+    // target's host token embeddings: waking a full thread pool for them costs more than they take. the draft is on
+    // the GPU when -ngld is not 0, a GPU exists and its devices (by default those of the target) are not "none";
+    // a draft on the CPU keeps the inherited thread counts
+    const auto & draft_devices = params.speculative.draft.devices.empty() ? params.devices : params.speculative.draft.devices;
+    const bool   draft_on_gpu  = params.speculative.draft.n_gpu_layers != 0 && llama_supports_gpu_offload() &&
+                                 (draft_devices.empty() || draft_devices[0] != nullptr);
+    if (params.speculative.draft.cpuparams.n_threads == -1 && draft_on_gpu) {
         for (const auto t : params.speculative.types) {
             if (t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
                 params.speculative.draft.cpuparams.n_threads = 1;

@@ -1307,9 +1307,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
-        // offload draft sampling to the backend
+        // offload draft sampling to the backend; a markov context draft reads the tokens its graph drew instead
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !is_dflash2 && !is_lilicorr) {
+        if (this->params.backend_sampling && !is_dflash2 && !is_lilicorr && !has_markov_context) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));

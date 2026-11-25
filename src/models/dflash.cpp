@@ -813,6 +813,11 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         }
         res->t_h_nextn = ggml_reshape_2d(ctx0, draws, n_embd, ggml_nelements(draws)/n_embd);
         ggml_build_forward_expand(g.gf, res->t_h_nextn);
+
+        // the driver reads only the draws (greedy and sampled drafts), so the logits are not an output: no backend
+        // sampler and no copy to the host for them
+        res->t_logits = nullptr;
+        return;
     }
 
     // cat is position-major; restore ubatch block-major order
