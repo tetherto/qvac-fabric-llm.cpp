@@ -321,7 +321,8 @@ Use exactly one of these options:
 - `--spec-synth-rates P0,P1,...` sets unconditional per-position acceptance probabilities. Entry `i` is the probability that the first `i+1` draft tokens are all accepted. The number of entries must match the effective maximum draft length. Values must be finite, within `[0, 1]`, and monotonically non-increasing.
 - `--spec-synth-len L` sets the target mean acceptance length, including the target token. For `K` maximum draft tokens, `L` must be within `[1, K+1]`. The server finds a constant conditional probability `p` such that `p + p^2 + ... + p^K = L - 1`, then uses unconditional rates `[p, p^2, ..., p^K]`.
 
-Without `--spec-draft-n-max`, the maximum draft length of `draft-dflash`, `draft-dflash2` and `draft-lilicorr` is 5 (3 for a DSpark draft), so they take 5 rates and `L` within `[1, 6]`.
+Without `--spec-draft-n-max`, the maximum draft length of `draft-dflash`, `draft-dflash2` and `draft-lilicorr` is 5, so they take 5 rates and `L` within `[1, 6]`.
+A DSpark draft keeps 3, also under `draft-dflash`, so it takes 3 rates and `L` within `[1, 4]`.
 
 ### General Speculative Parameters
 
