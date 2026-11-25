@@ -3,6 +3,8 @@
 #include "htp/allreduce-ops.h"
 #include "htp/argsort-ops.h"
 #include "htp/binary-ops.h"
+#include "htp/conv2d-ops.h"
+#include "htp/cpy-ops.h"
 #include "htp/cumsum-ops.h"
 #include "htp/diag-ops.h"
 #include "htp/fill-ops.h"
@@ -238,6 +240,16 @@ static std::string format_kernel_params(const htp_opnode & node) {
             case HTP_UPSCALE_KERNEL_BICUBIC:     ktype_str = "bicubic";     break;
         }
         snprintf(str, max_size, "%s nth %d chk %d vtcm %u", ktype_str, (int) kparams->n_threads, (int) kparams->dst_nrows_per_chunk, (unsigned int) kparams->vtcm_size);
+    } else if (node.opcode == HTP_OP_CONV_2D) {
+        const auto * kparams = node.kparams<htp_conv2d_kernel_params>();
+        snprintf(str, max_size, "%s rt %u/%u ct %u nth %d vtcm %u",
+                 kparams->kernel_type == HTP_CONV2D_KERNEL_HMX_WINDOW ? "hmx-win" : "tiled",
+                 (unsigned int) kparams->rt_block, (unsigned int) kparams->n_row_tiles, (unsigned int) kparams->ct_chunk,
+                 (int) kparams->n_threads, (unsigned int) kparams->vtcm_size);
+    } else if (node.opcode == HTP_OP_CPY) {
+        const auto * kparams = node.kparams<htp_copy_kernel_params>();
+        snprintf(str, max_size, "k%d nth %d block %u vtcm %u", (int) kparams->kernel_type, (int) kparams->n_threads,
+                 (unsigned int) kparams->transpose.block, (unsigned int) kparams->vtcm_size);
     } else {
         snprintf(str, max_size, "----");
     }
