@@ -5,9 +5,9 @@
 #include <climits>
 
 // one warp per row; every lane reads its columns of the row before the warp reduction and writes only those columns
-// after it, so dst may be x itself
+// after it, so dst may be x itself (x is not __restrict__ for that reason)
 template <bool has_scale>
-static __global__ void l2_clip_f32(const float * __restrict__ x, const float * __restrict__ scale, float * dst,
+static __global__ void l2_clip_f32(const float * x, const float * __restrict__ scale, float * dst,
                                    const int ncols, const int nrows, const int scale_rows,
                                    const float thr, const float b_scale, const float b_bias, const float lo, const float hi) {
     const int row = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
@@ -88,6 +88,13 @@ bool ggml_cuda_match_l2_clip(const ggml_cgraph * cgraph, int i, ggml_cuda_l2_cli
     }
     if (!((out->src[0] == v && out->src[1] == cl) || (out->src[0] == cl && out->src[1] == v))) {
         return false;
+    }
+    // no in-place intermediates: e.g. an in-place FILL overwrites the norm before the DIV reads it, which the kernel
+    // does not reproduce
+    for (const ggml_tensor * t : { s, sqr, sum, sq, sb, fill, div, cl }) {
+        if (t && t->view_src) {
+            return false;
+        }
     }
 
     // the intermediate nodes must not be read outside the chain

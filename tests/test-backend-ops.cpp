@@ -4820,6 +4820,7 @@ struct test_l2_clip : public test_case {
     const std::array<int64_t, 4> ne;
     const bool  with_scale;
     const float thr;
+    const int   mode; // 0: out of place, 1: in-place FILL (must not fuse), 2: the output written in place
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4829,15 +4830,17 @@ struct test_l2_clip : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR3(ne, with_scale, thr);
+        return VARS_TO_STR4(ne, with_scale, thr, mode);
     }
 
-    test_l2_clip(std::array<int64_t, 4> ne = {128, 24, 3, 1}, bool with_scale = true, float thr = 22.6f)
-        : ne(ne), with_scale(with_scale), thr(thr) {}
+    test_l2_clip(std::array<int64_t, 4> ne = {128, 24, 3, 1}, bool with_scale = true, float thr = 22.6f, int mode = 0)
+        : ne(ne), with_scale(with_scale), thr(thr), mode(mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
-        ggml_set_param(a);
+        if (mode == 0) {
+            ggml_set_param(a);
+        }
         ggml_set_name(a, "a");
         ggml_tensor * cur = a;
         if (with_scale) {
@@ -4847,8 +4850,11 @@ struct test_l2_clip : public test_case {
         }
         ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur)));
         norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
-        ggml_tensor * factor = ggml_div(ctx, ggml_fill(ctx, norm, thr), norm);
-        ggml_tensor * out = ggml_mul(ctx, cur, ggml_clamp(ctx, factor, 0.0f, 1.0f));
+        ggml_tensor * fill = mode == 1 ? ggml_fill_inplace(ctx, norm, thr) : ggml_fill(ctx, norm, thr);
+        ggml_tensor * factor = ggml_div(ctx, fill, norm);
+        ggml_tensor * clamp  = ggml_clamp(ctx, factor, 0.0f, 1.0f);
+        // mode 2 without a scale writes the output over the input
+        ggml_tensor * out = mode == 2 ? ggml_mul_inplace(ctx, cur, clamp) : ggml_mul(ctx, cur, clamp);
         ggml_set_name(out, "out");
         return out;
     }
@@ -18198,6 +18204,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (std::array<int64_t, 4> ne : { std::array<int64_t, 4>{128, 24, 1, 1}, std::array<int64_t, 4>{128, 8, 7, 1},
                                            std::array<int64_t, 4>{16, 24, 5, 1}, std::array<int64_t, 4>{128, 24, 512, 1} }) {
             test_cases.emplace_back(new test_l2_clip(ne, with_scale, ne[0] == 16 ? 8.0f : 22.6f));
+        }
+        for (int mode : { 1, 2 }) {
+            test_cases.emplace_back(new test_l2_clip({128, 24, 3, 1}, with_scale, 22.6f, mode));
         }
     }
 
