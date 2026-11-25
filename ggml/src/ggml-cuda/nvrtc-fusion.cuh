@@ -5,6 +5,8 @@
 // Generic elementwise fusion: groups of pointwise, row-norm, concat and ssm_conv nodes are
 // compiled at runtime with NVRTC into one kernel each. Build with GGML_CUDA_NVRTC_FUSION,
 // disable at runtime with GGML_CUDA_NVRTC_FUSION=0.
+// Compiled kernels are cached in GGML_CUDA_NVRTC_CACHE_DIR (0 disables the cache), else in
+// %LOCALAPPDATA%\ggml-nvrtc on Windows, $XDG_CACHE_HOME/ggml-nvrtc, or ~/.cache/ggml-nvrtc.
 
 struct ggml_cuda_nvrtc_plan;
 

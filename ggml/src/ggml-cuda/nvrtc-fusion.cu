@@ -1419,18 +1419,25 @@ static void nf_init_dir(nf_compiler & c) {
     const char * env = getenv("GGML_CUDA_NVRTC_CACHE_DIR");
     if (env != nullptr) {
         c.dir = env;
-    } else if (getenv("XDG_CACHE_HOME") != nullptr) {
-        c.dir = std::string(getenv("XDG_CACHE_HOME")) + "/ggml-nvrtc";
 #ifdef _WIN32
     } else if (getenv("LOCALAPPDATA") != nullptr) {
-        c.dir = std::string(getenv("LOCALAPPDATA")) + "/ggml-nvrtc";
+        c.dir = std::string(getenv("LOCALAPPDATA")) + "\\ggml-nvrtc";
 #endif
+    } else if (getenv("XDG_CACHE_HOME") != nullptr) {
+        c.dir = std::string(getenv("XDG_CACHE_HOME")) + "/ggml-nvrtc";
     } else if (getenv("HOME") != nullptr) {
         c.dir = std::string(getenv("HOME")) + "/.cache/ggml-nvrtc";
     }
-    if (!c.dir.empty() && c.dir != "0") {
+    if (c.dir == "0") {
+        return;
+    }
+    if (!c.dir.empty()) {
         nf_mkdirs(c.dir);
         c.dir_ok = nf_is_dir(c.dir);
+    }
+    if (!c.dir_ok) {
+        GGML_LOG_DEBUG("nvrtc-fusion: no usable kernel cache directory (%s), kernels compile in every process\n",
+            c.dir.empty() ? "none found" : c.dir.c_str());
     }
 }
 
@@ -1467,7 +1474,13 @@ static CUfunction nf_get_function(int device, const std::string & src, const std
     const uint64_t h2 = nf_hash(id, 0x84222325cbf29ce4ull);
     char file[64];
     snprintf(file, sizeof(file), "%016llx.cubin", (unsigned long long) h1);
-    const std::string path = c.dir_ok ? c.dir + "/" + file : "";
+#ifdef _WIN32
+    // a \\?\ directory does not accept / as a separator
+    const char * sep = "\\";
+#else
+    const char * sep = "/";
+#endif
+    const std::string path = c.dir_ok ? c.dir + sep + file : "";
 
     const auto t0 = std::chrono::steady_clock::now();
     if (!path.empty()) {
@@ -1533,9 +1546,15 @@ static CUfunction nf_get_function(int device, const std::string & src, const std
         FILE * f = fopen(tmp.c_str(), "wb");
         if (f != nullptr) {
             const uint64_t hdr[2] = { 0x31434e46ull, h2 };
-            const bool ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 && fwrite(image.data(), 1, image.size(), f) == image.size();
-            fclose(f);
-            // on Windows rename fails if another process already wrote this file; keep that copy
+            bool ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 && fwrite(image.data(), 1, image.size(), f) == image.size();
+            ok = fclose(f) == 0 && ok;
+#ifdef _WIN32
+            // rename does not replace a file on Windows, so drop the copy the read above missed or rejected.
+            // A copy another process has open cannot be removed; it is kept and this one is dropped.
+            if (ok) {
+                remove(path.c_str());
+            }
+#endif
             if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
                 remove(tmp.c_str());
             }
