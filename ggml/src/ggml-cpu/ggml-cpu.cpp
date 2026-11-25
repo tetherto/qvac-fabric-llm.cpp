@@ -497,10 +497,6 @@ static bool ggml_backend_cpu_supports_convrot(const struct ggml_tensor * op) {
 }
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    if (ggml_flash_attn_ext_has_indexed_bias(op)) {
-        return false;
-    }
-
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
