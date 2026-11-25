@@ -38,7 +38,8 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
-# qvac-fabric: build only the core server library (cmake/qvac-server-context.cmake)
+# qvac: build only the core server library (cmake/qvac-server-context.cmake).
+# Anything upstream adds to server-context must stay above this line.
 if (QVAC_FABRIC_SERVER_CONTEXT)
     return()
 endif()

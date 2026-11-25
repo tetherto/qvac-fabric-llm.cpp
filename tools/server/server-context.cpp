@@ -5420,6 +5420,9 @@ void server_context::qvac_set_media_limits(uint64_t max_image_pixels, uint64_t m
     // mtmd counts audio in samples at the projector's rate, plus one: miniaudio
     // reads one frame more when the input rate is a multiple of the model's
     // (48 kHz to 16 kHz). Without an audio encoder mtmd rejects audio anyway.
+    if (max_audio_seconds > 0 && !impl->mctx) {
+        SRV_WRN("%s", "no projector loaded, the audio limit is not applied; set the media limits after load_model()\n");
+    }
     const int rate = impl->mctx ? mtmd_get_audio_sample_rate(impl->mctx) : 0;
     uint64_t frames = 0;
     if (max_audio_seconds > 0 && rate > 0) {

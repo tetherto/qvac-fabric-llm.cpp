@@ -1062,7 +1062,7 @@ server_tokens process_mtmd_prompt(
     std::vector<mtmd_helper::video_ptr> videos;
     for (auto & file : files) {
         auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
-        // qvac-fabric: a file over the media limits is a bad request, not a load failure
+        // qvac: a file over the media limits is a bad request, not a load failure
         if (out.status == MTMD_HELPER_BITMAP_IMAGE_TOO_LARGE) {
             throw std::invalid_argument("image is larger than the media size limit");
         }

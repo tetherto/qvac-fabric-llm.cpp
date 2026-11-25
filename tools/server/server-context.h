@@ -91,7 +91,7 @@ struct server_context {
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
 
-    // qvac-fabric: size limits for the media files requests decode
+    // qvac: size limits for the media files requests decode
     // (mtmd_helper_init_opt), checked before a file is decoded; a file over a
     // limit is rejected as an invalid request. 0 means no limit.
     // note: call after load_model() and before requests arrive

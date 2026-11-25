@@ -1,4 +1,4 @@
-# qvac-fabric: build and install upstream's server-context library on its own.
+# qvac: build and install upstream's server-context library on its own.
 #
 # QVAC's decision addon (@qvac/decision-ggml) runs upstream's decision execution
 # (server-context: decision parsing, task scheduling, the response queue and the
@@ -32,7 +32,7 @@ endif()
 if (NOT TARGET llama-common)
     message(FATAL_ERROR "QVAC_FABRIC_SERVER_CONTEXT requires LLAMA_BUILD_COMMON=ON")
 endif()
-if (NOT TARGET mtmd)
+if (NOT LLAMA_MTMD OR NOT TARGET mtmd)
     message(FATAL_ERROR "QVAC_FABRIC_SERVER_CONTEXT requires LLAMA_MTMD=ON")
 endif()
 
@@ -61,43 +61,46 @@ foreach(_f IN LISTS _qvac_sc_sources)
     endif()
 endforeach()
 
-target_compile_features(server-context PRIVATE cxx_std_17)
 # Linked into a shared addon module, so position-independent regardless of
 # BUILD_SHARED_LIBS (upstream only sets it for shared builds).
 #
 # Hidden visibility: the server classes are internals of the addon that links
 # this archive, and the addon exports only its module entry points. A hidden
-# symbol is never exported, whatever an export list or wildcard matches (for
-# example, mangled server symbols whose signatures mention common_params or
-# llama_model).
+# symbol is never exported from the addon, whatever its export list or a
+# platform's default export behaviour would match.
 set_target_properties(server-context PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON)
 
-set(QVAC_FABRIC_SERVER_CONTEXT_TARGET server-context)
-
-# Every server-*.h, not only the ones in the source list: server-context.h
-# includes server-http.h (header-only request/response structs), which upstream
-# lists under the HTTP target. Headers carry no code into the runtime.
-file(GLOB QVAC_FABRIC_SERVER_CONTEXT_HEADERS "${_qvac_sc_dir}/server-*.h")
-
 # Install rules. The headers go to a directory of their own, not next to the
 # public llama/common/mtmd headers: they are upstream internals, consumed only by
-# the decision addon that links the archive.
+# the decision addon that links the archive. They are the target's own headers
+# plus server-http.h, which server-context.h includes (header-only
+# request/response structs) and upstream lists under the HTTP target; together
+# they are everything server-context.h includes. The HTTP-only headers
+# (server-connect.h, server-cors-proxy.h, server-models*.h) are left out.
 #
 # The exported llama::server-context target carries the include directories its
 # headers need: they include "common.h", "mtmd.h" and their sibling server
 # headers without a path, so a consumer only links the target.
-function(qvac_fabric_install_server_context include_dir)
-    install(
-        TARGETS ${QVAC_FABRIC_SERVER_CONTEXT_TARGET}
-        EXPORT llama-targets
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        INCLUDES DESTINATION
-            ${include_dir}/server-context
-            ${include_dir}/common
-            ${include_dir}/mtmd)
-    install(FILES ${QVAC_FABRIC_SERVER_CONTEXT_HEADERS}
-        DESTINATION ${include_dir}/server-context)
-endfunction()
+set(_qvac_sc_headers "${_qvac_sc_dir}/server-http.h")
+foreach(_f IN LISTS _qvac_sc_sources)
+    if (_f MATCHES "\\.h$")
+        if (NOT IS_ABSOLUTE "${_f}")
+            set(_f "${_qvac_sc_dir}/${_f}")
+        endif()
+        list(APPEND _qvac_sc_headers "${_f}")
+    endif()
+endforeach()
+
+install(
+    TARGETS server-context
+    EXPORT llama-targets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    INCLUDES DESTINATION
+        ${LLAMA_INCLUDE_INSTALL_DIR}/server-context
+        ${LLAMA_INCLUDE_INSTALL_DIR}/common
+        ${LLAMA_INCLUDE_INSTALL_DIR}/mtmd)
+install(FILES ${_qvac_sc_headers}
+    DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/server-context)
