@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdlib>
 
 // threadgroups needed to fill the GPU
 // TODO: dedup
@@ -3676,6 +3677,14 @@ int ggml_metal_op_convrot(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+    const ggml_tensor * input = ctx->node(idx);
+    const bool dense = (input->src[0]->type == GGML_TYPE_F16 &&
+                        (input->src[1]->type == GGML_TYPE_F32 || input->src[1]->type == GGML_TYPE_F16)) ||
+                       (input->src[0]->type == GGML_TYPE_F32 && input->src[1]->type == GGML_TYPE_F32);
+    if (dense && getenv("GGML_METAL_MUL_MV_COMPAT") != nullptr) {
+        return ggml_metal_op_mul_mat_mv(ctx, idx);
+    }
+
     if (ctx->use_fusion()) {
         int n = 1;
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
@@ -3791,6 +3800,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         };
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
+
+        if (dense && ggml_metal_pipeline_thread_execution_width(pipeline) != 32) {
+            return ggml_metal_op_mul_mat_mv(ctx, idx);
+        }
 
         ggml_metal_kargs_mul_mv_ext args = {
             /*.ne00  =*/ ne00,
