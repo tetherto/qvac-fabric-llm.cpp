@@ -3731,12 +3731,15 @@ static bool htp_kparams_solve_solve_tri(
     return true;
 }
 
-static const size_t   HTP_CONV2D_TILE_BYTES     = 2048;
-static const uint32_t HTP_CONV2D_WIN_PHASE_COST = 120;
-static const uint32_t HTP_CONV2D_WIN_MAX_CHUNK  = 512;
-static const uint32_t HTP_CONV2D_WIN_MIN_CHUNK  = 8;
-static const uint32_t HTP_CONV2D_WIN_SEG_TILES  = 8;
-static const uint32_t HTP_CONV2D_WIN_MAX_SEG_T  = 32;
+static const size_t   HTP_CONV2D_TILE_BYTES           = 2048;
+static const uint64_t HTP_CONV2D_WIN_PHASE_COST       = 480;
+static const uint64_t HTP_CONV2D_WIN_CROUTON_COST     = 4;
+static const uint64_t HTP_CONV2D_WIN_WEIGHT_TILE_COST = 1;
+static const uint32_t HTP_CONV2D_WIN_MIN_THREADS      = 2;
+static const uint32_t HTP_CONV2D_WIN_MAX_CHUNK        = 512;
+static const uint32_t HTP_CONV2D_WIN_MIN_CHUNK        = 8;
+static const uint32_t HTP_CONV2D_WIN_SEG_TILES        = 8;
+static const uint32_t HTP_CONV2D_WIN_MAX_SEG_T        = 32;
 
 struct htp_conv2d_win_shape {
     uint32_t n_rt;
@@ -3760,6 +3763,7 @@ struct htp_conv2d_win_fit {
     uint32_t ct;
     uint32_t seg_b;
     uint32_t seg_t;
+    uint32_t n_threads;
     size_t   stage;
     size_t   thr;
     size_t   total;
@@ -3784,7 +3788,7 @@ static void htp_conv2d_win_measure(const struct htp_conv2d_win_shape & shape, st
     const size_t act    = (size_t) shape.n_cc * (fit.ct + shape.halo) * HTP_CONV2D_TILE_BYTES;
     const size_t out    = (size_t) fit.rt_block * fit.ct * HTP_CONV2D_TILE_BYTES;
     struct htp_conv2d_vtcm_layout layout;
-    htp_conv2d_vtcm_layout_build(&layout, fit.rt_block, w_size, act, out, fit.thr, shape.n_threads);
+    htp_conv2d_vtcm_layout_build(&layout, fit.rt_block, w_size, act, out, fit.thr, fit.n_threads);
     fit.total = layout.total_bytes;
 }
 
@@ -3807,10 +3811,14 @@ static uint32_t htp_conv2d_win_max_rt_block(const struct htp_conv2d_win_shape & 
 }
 
 static uint64_t htp_conv2d_win_cost(const struct htp_conv2d_win_shape & shape, const struct htp_conv2d_win_fit & fit) {
-    const uint64_t n_blocks    = (shape.n_rt + fit.rt_block - 1) / fit.rt_block;
-    const uint64_t n_chunks    = (shape.n_tiles + fit.ct - 1) / fit.ct;
-    const uint64_t phase_tiles = (std::max<uint64_t>)(1, HTP_CONV2D_WIN_PHASE_COST / shape.n_cc);
-    return n_blocks * (shape.n_tiles + n_chunks * (shape.halo + phase_tiles) + 2 * phase_tiles);
+    const uint64_t n_blocks     = (shape.n_rt + fit.rt_block - 1) / fit.rt_block;
+    const uint64_t n_chunks     = (shape.n_tiles + fit.ct - 1) / fit.ct;
+    const uint64_t packed_tiles = shape.n_tiles + n_chunks * shape.halo;
+    const uint64_t n_packs      = n_chunks <= HTP_CONV2D_WIN_ACT_BUFFERS ? 1 : n_blocks;
+    const uint64_t crouton_work = n_packs * packed_tiles * shape.n_cc * HTP_CONV2D_WIN_CROUTON_COST;
+    const uint64_t weight_work  = (uint64_t) shape.n_rt * shape.n_wt * shape.n_cc * HTP_CONV2D_WIN_WEIGHT_TILE_COST;
+    const uint64_t phases       = n_blocks * (n_chunks + 2) * HTP_CONV2D_WIN_PHASE_COST;
+    return (crouton_work + weight_work) * shape.n_threads / fit.n_threads + phases;
 }
 
 static void htp_conv2d_win_consider(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit candidate,
@@ -3845,10 +3853,29 @@ static uint32_t htp_conv2d_win_start_chunk(uint32_t n_tiles, uint32_t halo) {
     return (std::min)(bounded, n_tiles);
 }
 
-static bool htp_conv2d_win_fit_vtcm(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit start, struct htp_conv2d_win_fit & best) {
-    uint64_t best_cost = UINT64_MAX;
+static void htp_conv2d_win_consider_kept_croutons(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit candidate,
+                                                  struct htp_conv2d_win_fit & best, uint64_t & best_cost) {
+    for (uint32_t n_chunks = 1; n_chunks <= HTP_CONV2D_WIN_ACT_BUFFERS; n_chunks++) {
+        candidate.ct = (shape.n_tiles + n_chunks - 1) / n_chunks;
+        if (candidate.ct <= HTP_CONV2D_WIN_MAX_CHUNK) {
+            htp_conv2d_win_consider_segments(shape, candidate, best, best_cost);
+        }
+    }
+}
+
+static void htp_conv2d_win_consider_chunks(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit start,
+                                           struct htp_conv2d_win_fit & best, uint64_t & best_cost) {
+    htp_conv2d_win_consider_kept_croutons(shape, start, best, best_cost);
     for (struct htp_conv2d_win_fit candidate = start; candidate.ct >= 1; candidate.ct /= 2) {
         htp_conv2d_win_consider_segments(shape, candidate, best, best_cost);
+    }
+}
+
+static bool htp_conv2d_win_fit_vtcm(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit start, struct htp_conv2d_win_fit & best) {
+    const uint32_t min_threads = (std::min)(HTP_CONV2D_WIN_MIN_THREADS, shape.n_threads);
+    uint64_t       best_cost   = UINT64_MAX;
+    for (start.n_threads = shape.n_threads; start.n_threads >= min_threads; start.n_threads--) {
+        htp_conv2d_win_consider_chunks(shape, start, best, best_cost);
     }
     return best_cost != UINT64_MAX;
 }
@@ -3983,7 +4010,7 @@ static bool htp_kparams_conv2d_win(
     const uint32_t n_cs = (32 + CS - 1) / CS;
 
     kp->kernel_type        = (uint8_t) HTP_CONV2D_KERNEL_HMX_WINDOW;
-    kp->n_threads          = (uint8_t) nth;
+    kp->n_threads          = (uint8_t) fit.n_threads;
     kp->cwhn               = cwhn ? 1 : 0;
     kp->w_kmajor           = !w_rows ? 1 : 0;
     kp->n_row_tiles        = n_rt;

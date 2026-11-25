@@ -16843,6 +16843,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_2d({ 8, 8, 1280, 2 }, { 3, 3, 1280, 1280 }, GGML_TYPE_F16, 1, 1, 1, 1, 1, 1));
     test_cases.emplace_back(new test_conv_2d({ 16, 16, 1920, 1 }, { 3, 3, 1920, 320 }, GGML_TYPE_F16, 1, 1, 1, 1, 1, 1));
     test_cases.emplace_back(new test_conv_2d({ 32, 32, 640, 1 }, { 1, 1, 640, 1280 }, GGML_TYPE_F16, 1, 1, 0, 0, 1, 1));
+    test_cases.emplace_back(new test_conv_2d({ 16, 16, 2560, 1 }, { 3, 3, 2560, 96 }, GGML_TYPE_F16, 1, 1, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_conv_2d({ 8, 8, 2560, 2 }, { 3, 3, 2560, 160 }, GGML_TYPE_F16, 1, 1, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_conv_2d({ 32, 32, 1280, 1 }, { 3, 3, 1280, 96 }, GGML_TYPE_F16, 1, 1, 1, 1, 1, 1));
 
     // sycl backend will limit task global_range < MAX_INT
     // test cases for 2D im2col with large input W and H (occurs in stable-diffusion)
