@@ -932,6 +932,27 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+// strides in elements (see short_conv.comp)
+struct vk_op_short_conv_push_constants {
+    uint32_t x_nb1, x_nb2;
+    uint32_t w_nb1;
+    uint32_t res_nb1;
+    uint32_t dst_nb1;
+    uint32_t nr, n_t, n_s;
+    float scale, bias;
+};
+
+// short_conv.comp WITH_STATE: x_nb1 / x_nb2 are the past strides, state_nb1 the state row stride (elements)
+struct vk_op_short_conv_state_push_constants {
+    uint32_t x_nb1, x_nb2;
+    uint32_t w_nb1;
+    uint32_t res_nb1;
+    uint32_t dst_nb1;
+    uint32_t nr, n_t, n_s;
+    float scale, bias;
+    uint32_t state_nb1;
+};
+
 struct vk_op_gru_push_constants {
     uint32_t H, B, L, reverse;
 };

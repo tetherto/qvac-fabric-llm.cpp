@@ -1,0 +1,81 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// (res + ssm_conv(x, w)) * scale + bias in one pass: a width-4 conv with its residual and output scale (Inkling 2).
+// WITH_STATE: the concat is not materialised. The window comes from the past columns and from res, which is also
+// the conv input, and the last 3 columns of each channel go to the recurrent state, as the concat's copy would.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+#ifdef WITH_STATE
+layout(binding = 0) readonly buffer P { float past[]; };
+#else
+layout(binding = 0) readonly buffer X { float x[]; };
+#endif
+layout(binding = 1) readonly buffer W { float w[]; };
+layout(binding = 2) readonly buffer R { float res[]; };
+layout(binding = 3) writeonly buffer D { float dst[]; };
+#ifdef WITH_STATE
+layout(binding = 4) writeonly buffer S { float state[]; };
+#endif
+
+// strides in elements: x is the concat [3 + n_t, nr, n_s] (WITH_STATE: past [3, nr, n_s]), w [4, nr],
+// res and dst [nr, n_t * n_s], state [3 * nr, n_s]
+layout(push_constant) uniform PushConstants {
+    uint x_nb1; uint x_nb2;
+    uint w_nb1;
+    uint res_nb1;
+    uint dst_nb1;
+    uint nr; uint n_t; uint n_s;
+    float scale; float bias;
+#ifdef WITH_STATE
+    uint state_nb1;
+#endif
+};
+
+// the same dot() as SSM_CONV's width-4 path over the concat; a function, so the precise sum below does not mark it
+float conv4(const vec4 window, const uint wb) {
+    return dot(window, vec4(w[wb], w[wb + 1], w[wb + 2], w[wb + 3]));
+}
+
+#ifdef WITH_STATE
+// column j of channel c in the concat [past, res^T] the graph would build
+float concat_at(const uint c, const uint s, const uint j) {
+    return j < 3 ? past[s * x_nb2 + c * x_nb1 + j] : res[(s * n_t + j - 3) * res_nb1 + c];
+}
+#endif
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
+    const uint s = gl_WorkGroupID.z;
+
+    if (c >= nr || t >= n_t || s >= n_s) {
+        return;
+    }
+
+#ifdef WITH_STATE
+    const vec4 window = vec4(concat_at(c, s, t), concat_at(c, s, t + 1), concat_at(c, s, t + 2), concat_at(c, s, t + 3));
+#else
+    const uint xb = s * x_nb2 + c * x_nb1 + t;
+    const vec4 window = vec4(x[xb], x[xb + 1], x[xb + 2], x[xb + 3]);
+#endif
+
+    const uint tok = s * n_t + t;
+    // precise: the residual ADD rounds on its own, as the separate ADD pass does; the scale matches scale.comp
+    precise float sum = res[tok * res_nb1 + c] + conv4(window, c * w_nb1);
+    dst[tok * dst_nb1 + c] = sum * scale + bias;
+
+#ifdef WITH_STATE
+    // the last token's thread stores the state the next ubatch starts from: concat columns n_t .. n_t + 2
+    if (t == n_t - 1) {
+        [[unroll]] for (uint p = 0; p < 3; ++p) {
+            state[s * state_nb1 + c * 3 + p] = concat_at(c, s, n_t + p);
+        }
+    }
+#endif
+}

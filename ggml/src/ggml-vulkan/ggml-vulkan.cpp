@@ -5394,6 +5394,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // direct conv: 64 channels x 4 token groups of 8 tokens per workgroup; tail: 256 (channel, column) pairs
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_direct_silu_f32, "ssm_conv_direct_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {64, 32, 1}, {64, 4, 0, 1, 1, 8}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_tail_f32,        "ssm_conv_tail_f32",        ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {256, 1, 0, 0, 2, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_short_conv_f32, "short_conv_f32", short_conv_f32_len, short_conv_f32_data, "main", 4, sizeof(vk_op_short_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_short_conv_state_f32, "short_conv_state_f32", short_conv_state_f32_len, short_conv_state_f32_data, "main", 5, sizeof(vk_op_short_conv_state_push_constants), {32, 16, 1}, {32, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_sx_f32, "ssm_conv_back_sx_f32", ssm_conv_back_sx_f32_len, ssm_conv_back_sx_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_sx_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_c_f32, "ssm_conv_back_c_f32", ssm_conv_back_c_f32_len, ssm_conv_back_c_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_c_push_constants), {32, 1, 1}, {}, 1);
 
@@ -15019,6 +15021,63 @@ static void ggml_vk_concat_tail(ggml_backend_vk_context * ctx, vk_context& subct
 }
 
 
+// the ADD operand that is not the reshaped conv: the residual of short_conv_pattern
+static const ggml_tensor * ggml_vk_short_conv_residual(const ggml_tensor * add, const ggml_tensor * conv_out) {
+    return add->src[0] == conv_out ? add->src[1] : add->src[1] == conv_out ? add->src[0] : nullptr;
+}
+
+// short_conv_pattern at node_idx as one pass: reads the concat, the kernel and the residual, writes the SCALE
+static void ggml_vk_short_conv(ggml_backend_vk_context * ctx, vk_context & subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * conv = cgraph->nodes[node_idx];
+    const ggml_tensor * x    = conv->src[0];
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * res  = ggml_vk_short_conv_residual(cgraph->nodes[node_idx + 2], cgraph->nodes[node_idx + 1]);
+    ggml_tensor       * dst  = cgraph->nodes[node_idx + 3];
+
+    vk_pipeline pipeline = ctx->device->pipeline_short_conv_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_short_conv_push_constants pc = {
+        (uint32_t) (x->nb[1] / sizeof(float)), (uint32_t) (x->nb[2] / sizeof(float)),
+        (uint32_t) (w->nb[1] / sizeof(float)),
+        (uint32_t) (res->nb[1] / sizeof(float)),
+        (uint32_t) (dst->nb[1] / sizeof(float)),
+        (uint32_t) conv->ne[0], (uint32_t) conv->ne[1], (uint32_t) conv->ne[2],
+        ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1),
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, x), ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, res), ggml_vk_tensor_subbuffer(ctx, dst) },
+        pc, { (uint32_t) conv->ne[0], (uint32_t) conv->ne[1], (uint32_t) conv->ne[2] });
+}
+
+// short_conv_state_pattern at node_idx (the CONCAT) as one pass: reads past, the kernel and cur, writes the SCALE
+// and the state rows the CPY would write
+static void ggml_vk_short_conv_state(ggml_backend_vk_context * ctx, vk_context & subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * past  = cgraph->nodes[node_idx]->src[0];
+    const ggml_tensor * state = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * conv  = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * w     = conv->src[1];
+    const ggml_tensor * res   = ggml_vk_short_conv_residual(cgraph->nodes[node_idx + 6], cgraph->nodes[node_idx + 5]);
+    ggml_tensor       * dst   = cgraph->nodes[node_idx + 7];
+
+    vk_pipeline pipeline = ctx->device->pipeline_short_conv_state_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_short_conv_state_push_constants pc = {
+        (uint32_t) (past->nb[1] / sizeof(float)), (uint32_t) (past->nb[2] / sizeof(float)),
+        (uint32_t) (w->nb[1] / sizeof(float)),
+        (uint32_t) (res->nb[1] / sizeof(float)),
+        (uint32_t) (dst->nb[1] / sizeof(float)),
+        (uint32_t) conv->ne[0], (uint32_t) conv->ne[1], (uint32_t) conv->ne[2],
+        ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1),
+        (uint32_t) (state->nb[1] / sizeof(float)),
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, past), ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, res),
+          ggml_vk_tensor_subbuffer(ctx, dst), ggml_vk_tensor_subbuffer(ctx, state) },
+        pc, { (uint32_t) conv->ne[0], (uint32_t) conv->ne[1], (uint32_t) conv->ne[2] });
+}
+
 void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (ctx->fused_ssm_conv_direct >= 0) {
         GGML_ASSERT(ctx->num_additional_fused_ops == 1);
@@ -17667,6 +17726,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_CONCAT:
+        if (ctx->fused_short_conv_state) {
+            ggml_vk_short_conv_state(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         if (ctx->fused_concat_tail >= 0) {
             ggml_vk_concat_tail(ctx, compute_ctx, ctx->ssm_conv_direct_matches[ctx->fused_concat_tail]);
             break;
@@ -18072,7 +18135,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_SSM_CONV:
-        ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
+        if (ctx->fused_short_conv) {
+            ggml_vk_short_conv(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
+        }
 
         break;
 
@@ -19570,6 +19637,142 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
     return true;
 }
 
+// GGML_VK_FUSE_SHORT_CONV=0 runs the conv, its residual ADD and its SCALE as separate passes, in the same graph order
+static bool ggml_vk_fuse_short_conv_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_SHORT_CONV");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// shapes and types of short_conv_pattern at node_idx; graph_optimize calls it before the tensors are allocated
+static bool ggml_vk_short_conv_shape_ok(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, short_conv_pattern, { node_idx + 3 }) ||
+        !ggml_check_edges(cgraph, node_idx, short_conv_edges)) {
+        return false;
+    }
+    const ggml_tensor * conv = cgraph->nodes[node_idx];
+    const ggml_tensor * add  = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * dst  = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * x    = conv->src[0];
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * res  = ggml_vk_short_conv_residual(add, cgraph->nodes[node_idx + 1]);
+    if (res == nullptr) {
+        return false;
+    }
+    for (const ggml_tensor * n : { conv, add, dst, x, w, res }) {
+        if (n->type != GGML_TYPE_F32 || n->nb[0] != sizeof(float)) {
+            return false;
+        }
+    }
+    const int64_t C = conv->ne[0], T = conv->ne[1], S = conv->ne[2];
+    return w->ne[0] == 4 && w->ne[1] == C && x->ne[0] == T + 3 && x->ne[1] == C && x->ne[2] == S &&
+           ggml_are_same_shape(res, dst) && ggml_are_same_shape(add, dst) && dst->ne[0] == C && dst->ne[1] == T * S &&
+           dst->ne[2] == 1 && dst->ne[3] == 1;
+}
+
+static bool ggml_vk_can_fuse_short_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_fuse_short_conv_enabled() || !ggml_vk_short_conv_shape_ok(cgraph, node_idx)) {
+        return false;
+    }
+    const ggml_tensor * conv = cgraph->nodes[node_idx];
+    const ggml_tensor * x    = conv->src[0];
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * res  = ggml_vk_short_conv_residual(cgraph->nodes[node_idx + 2], cgraph->nodes[node_idx + 1]);
+    const ggml_tensor * dst  = cgraph->nodes[node_idx + 3];
+    // the shader takes no per-tensor offsets
+    for (const ggml_tensor * n : { x, w, res, dst }) {
+        if (get_misalign_bytes(ctx, n) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// GGML_VK_FUSE_SHORT_CONV_STATE=0 keeps the concat and the state copy as their own passes, in the same graph order
+static bool ggml_vk_fuse_short_conv_state_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_SHORT_CONV_STATE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static constexpr int SHORT_CONV_STATE_NODES = 8;
+// the SSM_CONV of short_conv_state_pattern; it reads 4 concat columns per output
+static constexpr int SHORT_CONV_STATE_CONV = 4;
+
+// the eight nodes of short_conv_state_pattern, given by index; graph_optimize calls it before the tensors are allocated
+static bool ggml_vk_short_conv_state_nodes_ok(const struct ggml_cgraph * cgraph, const int * idx) {
+    const int outputs[] = { idx[2], idx[3], idx[7] };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idx, SHORT_CONV_STATE_NODES, short_conv_state_pattern.begin(), outputs, 3)) {
+        return false;
+    }
+    const ggml_tensor * cc    = cgraph->nodes[idx[0]];
+    const ggml_tensor * tail  = cgraph->nodes[idx[1]];
+    const ggml_tensor * state = cgraph->nodes[idx[2]];
+    const ggml_tensor * cpy   = cgraph->nodes[idx[3]];
+    const ggml_tensor * conv  = cgraph->nodes[idx[4]];
+    const ggml_tensor * add   = cgraph->nodes[idx[6]];
+    const ggml_tensor * dst   = cgraph->nodes[idx[7]];
+    const ggml_tensor * res   = ggml_vk_short_conv_residual(add, cgraph->nodes[idx[5]]);
+    if (tail->src[0] != cc || cpy->src[0] != tail || cpy->src[1] != state || conv->src[0] != cc ||
+        cgraph->nodes[idx[5]]->src[0] != conv || dst->src[0] != add || res == nullptr) {
+        return false;
+    }
+    const ggml_tensor * past = cc->src[0];
+    const ggml_tensor * xt   = cc->src[1];
+    const ggml_tensor * w    = conv->src[1];
+    for (const ggml_tensor * n : { cc, past, xt, tail, state, cpy, conv, add, dst, w, res }) {
+        if (n->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const int64_t C = conv->ne[0], T = conv->ne[1], S = conv->ne[2];
+    const size_t  F = sizeof(float);
+    const bool conv_ok  = w->ne[0] == 4 && w->ne[1] == C && w->nb[0] == F && ggml_are_same_shape(res, dst) &&
+                          ggml_are_same_shape(add, dst) && dst->ne[0] == C && dst->ne[1] == T * S && dst->ne[2] == 1 &&
+                          dst->ne[3] == 1 && dst->nb[0] == F && res->nb[0] == F && res->view_src == nullptr;
+    // concat along dim 0 of past [3, C, S] and cur transposed, [T, C, S]
+    const bool past_ok  = past->ne[0] == 3 && past->ne[1] == C && past->ne[2] == S && past->ne[3] == 1 && past->nb[0] == F;
+    const bool xt_ok    = xt->view_src == res && xt->view_offs == 0 && xt->ne[0] == T && xt->ne[1] == C && xt->ne[2] == S &&
+                          xt->nb[0] == res->nb[1] && xt->nb[1] == F && xt->nb[2] == res->nb[1] * T;
+    // the CPY takes concat columns T .. T + 2 of each channel into a [3 * C, S] block of state rows
+    const bool tail_ok  = tail->ne[0] == 3 && tail->ne[1] == C && tail->ne[2] == S && tail->view_offs == T * F &&
+                          tail->nb[1] == cc->nb[1] && tail->nb[2] == cc->nb[2];
+    const bool state_ok = state->ne[0] == 3 * C && state->ne[1] == S && state->ne[2] == 1 && state->nb[0] == F;
+    return ggml_get_op_params_i32(cc, 0) == 0 && conv_ok && past_ok && xt_ok && tail_ok && state_ok;
+}
+
+// short_conv_state_pattern as eight consecutive nodes at node_idx, the order graph_optimize keeps
+static bool ggml_vk_short_conv_state_shape_ok(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + SHORT_CONV_STATE_NODES > cgraph->n_nodes) {
+        return false;
+    }
+    int idx[SHORT_CONV_STATE_NODES];
+    std::iota(idx, idx + SHORT_CONV_STATE_NODES, node_idx);
+    return ggml_vk_short_conv_state_nodes_ok(cgraph, idx);
+}
+
+static bool ggml_vk_can_fuse_short_conv_state(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_fuse_short_conv_state_enabled() || !ggml_vk_short_conv_state_shape_ok(cgraph, node_idx)) {
+        return false;
+    }
+    const ggml_tensor * past  = cgraph->nodes[node_idx]->src[0];
+    const ggml_tensor * state = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * w     = cgraph->nodes[node_idx + 4]->src[1];
+    const ggml_tensor * res   = ggml_vk_short_conv_residual(cgraph->nodes[node_idx + 6], cgraph->nodes[node_idx + 5]);
+    const ggml_tensor * dst   = cgraph->nodes[node_idx + 7];
+    // the shader takes no per-tensor offsets
+    for (const ggml_tensor * n : { past, state, w, res, dst }) {
+        if (get_misalign_bytes(ctx, n) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, int num_extra) {
     const ggml_tensor * conv = cgraph->nodes[node_idx];
@@ -20583,6 +20786,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_situ = false;
+        ctx->fused_short_conv = false;
+        ctx->fused_short_conv_state = false;
         ctx->fused_gdn_cache = nullptr;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_fwht_signed = false;
@@ -20656,6 +20861,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_situ = true;
                 fusion_string = "SITU";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_short_conv(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = short_conv_pattern.size() - 1;
+                ctx->fused_short_conv = true;
+                fusion_string = "SHORT_CONV";
+                // the conv reads 4 columns per output; the residual ADD and the SCALE are elementwise
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+                op_srcs_fused_elementwise[0] = false;
             } else if (const int gdn_cpy_offset = ggml_vk_can_fuse_gdn_cache(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = gdn_cpy_offset;
                 ctx->fused_gdn_cache = cgraph->nodes[i + gdn_cpy_offset]->src[1];
@@ -20722,6 +20934,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "CONCAT_SSM_CONV_SILU";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_short_conv_state(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = SHORT_CONV_STATE_NODES - 1;
+                ctx->fused_short_conv_state = true;
+                // the state CPY is the second output
+                ctx->fused_ops_write_mask |= 1 << 3;
+                fusion_string = "SHORT_CONV_STATE";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[SHORT_CONV_STATE_CONV] = false;
             } else if (ggml_vk_ssm_conv_direct_at_concat(ctx, cgraph, i)) {
                 fusion_string = "CONCAT_TAIL";
             } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
@@ -20890,6 +21111,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_situ = false;
+                ctx->fused_short_conv = false;
+                ctx->fused_short_conv_state = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
                 ctx->fused_fwht_signed = false;
@@ -21051,6 +21274,113 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
     std::vector<ggml_tensor *> new_order;
     std::vector<bool> used(graph->n_nodes, false);
+
+    // how many nodes past first_unused the lookahead and the view pass consider
+    const int NUM_TO_CHECK = 20;
+
+    // how far past the state CPY the conv of short_conv_state_pattern may be: the K and V convs are expanded when
+    // attention reads them, up to ~100 nodes after their state copy
+    static constexpr int SHORT_CONV_STATE_REACH = 128;
+
+    // the conv reading the CONCAT at start, -1 if none is within reach
+    auto const &short_conv_state_conv = [&](int start) -> int {
+        const int lo = start + SHORT_CONV_STATE_CONV;
+        const int hi = std::min(lo + SHORT_CONV_STATE_REACH, graph->n_nodes - (SHORT_CONV_STATE_NODES - SHORT_CONV_STATE_CONV) + 1);
+        for (int j = lo; j < hi; ++j) {
+            if (graph->nodes[j]->op == GGML_OP_SSM_CONV && graph->nodes[j]->src[0] == graph->nodes[start]) {
+                return j;
+            }
+        }
+        return -1;
+    };
+
+    auto const &short_conv_state_idx = [](int start, int conv, int * idx) {
+        std::iota(idx, idx + SHORT_CONV_STATE_CONV, start);
+        std::iota(idx + SHORT_CONV_STATE_CONV, idx + SHORT_CONV_STATE_NODES, conv);
+    };
+
+    // A block's head (the CONCAT, its two views and the state CPY) is deferred to its conv. Only block nodes read the
+    // concat, so a node in between, or one the lookahead may place before the conv, orders against the head only
+    // through shared storage; another deferred head there must belong to a later conv, so the heads keep their order.
+    struct short_conv_state_block { int start; int conv; bool valid; };
+    std::vector<short_conv_state_block> sc_state_blocks;
+    std::vector<int> sc_state_head_owner(graph->n_nodes, -1);
+
+    auto const &find_short_conv_state_candidates = [&]() {
+        for (int start = 0; start + SHORT_CONV_STATE_NODES <= graph->n_nodes; ++start) {
+            if (graph->nodes[start]->op != GGML_OP_CONCAT) {
+                continue;
+            }
+            const int conv = short_conv_state_conv(start);
+            int idx[SHORT_CONV_STATE_NODES];
+            short_conv_state_idx(start, conv, idx);
+            if (conv < 0 || !ggml_vk_short_conv_state_nodes_ok(graph, idx)) {
+                continue;
+            }
+            for (int k = start; k < start + SHORT_CONV_STATE_CONV; ++k) {
+                sc_state_head_owner[k] = (int) sc_state_blocks.size();
+            }
+            sc_state_blocks.push_back({ start, conv, true });
+        }
+    };
+
+    auto const &short_conv_state_gap_ok = [&](const short_conv_state_block & blk) -> bool {
+        const int body_end = blk.conv + SHORT_CONV_STATE_NODES - SHORT_CONV_STATE_CONV;
+        for (int j = blk.start + SHORT_CONV_STATE_CONV; j < std::min(body_end + NUM_TO_CHECK, graph->n_nodes); ++j) {
+            if (j >= blk.conv && j < body_end) {
+                continue;
+            }
+            const int owner = sc_state_head_owner[j];
+            if (owner >= 0 && sc_state_blocks[owner].valid) {
+                if (sc_state_blocks[owner].conv < blk.conv) {
+                    return false;
+                }
+                continue;
+            }
+            for (int k = blk.start; k < blk.start + SHORT_CONV_STATE_CONV; ++k) {
+                if (is_src_of(graph->nodes[j], graph->nodes[k])) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    // dropping a block turns its head into plain nodes in other gaps, so repeat until nothing changes
+    auto const &validate_short_conv_state_blocks = [&]() {
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (auto & blk : sc_state_blocks) {
+                if (blk.valid && !short_conv_state_gap_ok(blk)) {
+                    blk.valid = false;
+                    changed   = true;
+                }
+            }
+        }
+    };
+
+    // the head of each valid block at its conv index, and every block node, which the lookahead must not move
+    std::vector<int>  short_conv_state_head(graph->n_nodes, -1);
+    std::vector<bool> in_short_conv_state(graph->n_nodes, false);
+    auto const &defer_short_conv_state_heads = [&]() {
+        for (const auto & blk : sc_state_blocks) {
+            if (!blk.valid) {
+                continue;
+            }
+            int idx[SHORT_CONV_STATE_NODES];
+            short_conv_state_idx(blk.start, blk.conv, idx);
+            for (int k : idx) {
+                in_short_conv_state[k] = true;
+            }
+            for (int k = blk.start; k < blk.start + SHORT_CONV_STATE_CONV; ++k) {
+                used[k] = true;
+            }
+            short_conv_state_head[blk.conv] = blk.start;
+        }
+    };
+    find_short_conv_state_candidates();
+    validate_short_conv_state_blocks();
+    defer_short_conv_state_heads();
     std::set<ggml_tensor *> used_node_set;
 
     int first_unused = 0;
@@ -21096,7 +21426,6 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return false;
         };
 
-        const int NUM_TO_CHECK = 20;
 
         // gated on the fusion's own predicate, so a block that will not fuse keeps the default order
         auto const &is_situ_block = [&](int start) -> bool {
@@ -21108,6 +21437,20 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         auto const &in_situ_pattern = [&](int n) -> bool {
             for (int o = 0; o < (int) situ_pattern.size(); ++o) {
                 if (n - o >= 0 && is_situ_block(n - o)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto const &is_short_conv_block = [&](int start) -> bool {
+            return match_pattern(short_conv_pattern, start) && ggml_vk_short_conv_shape_ok(graph, start);
+        };
+
+        // the reshape view between the conv and its ADD must not be pulled out either
+        auto const &in_short_conv_pattern = [&](int n) -> bool {
+            for (int o = 0; o < (int) short_conv_pattern.size(); ++o) {
+                if (n - o >= 0 && is_short_conv_block(n - o)) {
                     return true;
                 }
             }
@@ -21127,7 +21470,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // have, so a pair after the block (MUL_MAT_ID + the MUL of its gathered scale) stays adjacent.
         auto const &schedule_ready_nodes = [&](int lo) {
             for (int j = lo; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
-                if (used[j] || in_situ_pattern(j) || !is_ready(j)) {
+                if (used[j] || in_situ_pattern(j) || in_short_conv_pattern(j) || in_short_conv_state[j] || !is_ready(j)) {
                     continue;
                 }
                 new_order.push_back(graph->nodes[j]);
@@ -21144,6 +21487,61 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     used[j] = true;
                 }
             }
+        };
+
+        // the deferred head nodes of a block, now in front of its conv
+        auto const &push_short_conv_state_head = [&](int start) {
+            for (int k = start; k < start + SHORT_CONV_STATE_CONV; ++k) {
+                new_order.push_back(graph->nodes[k]);
+                used_node_set.insert(graph->nodes[k]);
+            }
+        };
+
+        // the head and the conv's four nodes in fused order; if the conv's nodes were placed (never expected), only
+        // the head goes in, before the conv's plain scheduling
+        auto const &keep_short_conv_state = [&](int start, int conv) -> bool {
+            int idx[SHORT_CONV_STATE_NODES];
+            short_conv_state_idx(start, conv, idx);
+            for (int k = SHORT_CONV_STATE_CONV; k < SHORT_CONV_STATE_NODES; ++k) {
+                if (used[idx[k]]) {
+                    push_short_conv_state_head(start);
+                    return false;
+                }
+            }
+            ggml_tensor * block[SHORT_CONV_STATE_NODES];
+            for (int k = 0; k < SHORT_CONV_STATE_NODES; ++k) {
+                block[k] = graph->nodes[idx[k]];
+            }
+            ggml_tensor * out = block[SHORT_CONV_STATE_NODES - 1];
+            schedule_ready_nodes(idx[SHORT_CONV_STATE_NODES - 1] + 1);
+            push_short_conv_state_head(start);
+            // with GGML_VK_FUSE_SHORT_CONV_STATE=0 the short conv pass reads the concat while it writes the SCALE
+            if (params && params->add_alloc_dep) {
+                params->add_alloc_dep(params->user_data, block[0], out);
+            }
+            for (int k = 0; k < SHORT_CONV_STATE_NODES; ++k) {
+                ggml_tensor * node = block[k];
+                // the fused pass reads past, cur and the kernel while it writes the SCALE and the state rows
+                for (uint32_t s = 0; s < GGML_MAX_SRC && params && params->add_alloc_dep; ++s) {
+                    ggml_tensor * src = node->src[s];
+                    if (src == nullptr || std::find(block, block + SHORT_CONV_STATE_NODES, src) != block + SHORT_CONV_STATE_NODES) {
+                        continue;
+                    }
+                    params->add_alloc_dep(params->user_data, src, out);
+                    if (src->view_src != nullptr) {
+                        params->add_alloc_dep(params->user_data, src->view_src, out);
+                    }
+                }
+                if (k >= SHORT_CONV_STATE_CONV) {
+                    new_order.push_back(node);
+                    used_node_set.insert(node);
+                    used[idx[k]] = true;
+                }
+            }
+            while (first_unused < graph->n_nodes && used[first_unused]) {
+                first_unused++;
+            }
+            return true;
         };
 
         auto const &add_pattern_alloc_deps = [&](const std::initializer_list<ggml_op> &pattern, int last_node) {
@@ -21219,6 +21617,16 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             add_pattern_alloc_deps(situ_pattern, first_unused + (int) situ_pattern.size() - 1);
             schedule_ready_nodes(first_unused + (int) situ_pattern.size());
             keep_pattern(situ_pattern);
+            continue;
+        }
+        if (short_conv_state_head[first_unused] >= 0 && keep_short_conv_state(short_conv_state_head[first_unused], first_unused)) {
+            continue;
+        }
+        if (is_short_conv_block(first_unused)) {
+            // the fused pass reads the concat and the residual while it writes the SCALE
+            add_pattern_alloc_deps(short_conv_pattern, first_unused + (int) short_conv_pattern.size() - 1);
+            schedule_ready_nodes(first_unused + (int) short_conv_pattern.size());
+            keep_pattern(short_conv_pattern);
             continue;
         }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
@@ -21351,6 +21759,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(snake_pattern, j) ||
                 in_qsa_pattern(j) ||
                 in_situ_pattern(j) ||
+                in_short_conv_pattern(j) ||
+                in_short_conv_state[j] ||
                 ggml_vk_gdn_cache_cpy_offset(ctx, graph, j) > 0 ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
@@ -21518,7 +21928,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (used[j]) {
                     continue;
                 }
-                if (!is_empty(graph->nodes[j]) || in_situ_pattern(j)) {
+                if (!is_empty(graph->nodes[j]) || in_situ_pattern(j) || in_short_conv_pattern(j) || in_short_conv_state[j]) {
                     continue;
                 }
                 bool ok = true;
@@ -21549,6 +21959,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
     }
     // Replace the graph with the new order.
+    GGML_ASSERT((int) new_order.size() == graph->n_nodes);
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
     }

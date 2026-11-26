@@ -74,6 +74,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <memory>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -616,6 +617,19 @@ static constexpr std::initializer_list<ggml_op> situ_pattern {
     GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
     GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL,
 };
+
+// (res + ssm_conv(x, w)) * scale, a width-4 conv with its residual and output scale (Inkling 2)
+static constexpr std::initializer_list<ggml_op> short_conv_pattern { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+
+static constexpr std::initializer_list<std::array<int, 3>> short_conv_edges {
+    { 1, 0, 0 }, // reshape->src[0] == ssm_conv
+    { 3, 0, 2 }, // scale->src[0]   == add
+};
+
+// the short conv with its concat and recurrent state copy: CONCAT(past, cur^T), its tail VIEW, the state VIEW, the CPY,
+// then short_conv_pattern; built with views and other nodes between the CPY and the conv
+static constexpr std::initializer_list<ggml_op> short_conv_state_pattern {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
 
 static constexpr std::initializer_list<std::array<int, 3>> situ_edges {
     { 1, 0, 0 }, // tanh->src[0]  == scale
@@ -1161,6 +1175,8 @@ struct vk_device_struct {
     // directly, and the concat node only writes the tail columns its other readers (state copies) use
     vk_pipeline pipeline_ssm_conv_direct_silu_f32;
     vk_pipeline pipeline_ssm_conv_tail_f32;
+    vk_pipeline pipeline_short_conv_f32;
+    vk_pipeline pipeline_short_conv_state_f32;
     vk_pipeline pipeline_ssm_conv_back_sx_f32;
     vk_pipeline pipeline_ssm_conv_back_c_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
@@ -1706,6 +1722,8 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_situ {};
+    bool fused_short_conv {};
+    bool fused_short_conv_state {};
     // GATED_DELTA_NET (or _DEFERRED) + CPY: the recurrent cache view the gdn writes its state to
     const ggml_tensor * fused_gdn_cache {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};

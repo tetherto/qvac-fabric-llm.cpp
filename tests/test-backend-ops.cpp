@@ -5718,6 +5718,97 @@ struct test_situ : public test_case {
     }
 };
 
+// (cur + ssm_conv(concat(past, cur^T), w)) * scale, built like Inkling 2's convolve() so backends can fuse the chain
+struct test_short_conv : public test_case {
+    const int64_t n_channels;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SHORT_CONV";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_channels, n_seq_tokens, n_seqs);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_short_conv(int64_t n_channels = 1024, int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
+        : n_channels(n_channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_channels, n_seq_tokens * n_seqs);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * past = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, n_channels, n_seqs);
+        ggml_set_name(past, "past");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, n_channels);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * x = ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, n_channels, n_seq_tokens, n_seqs));
+        x = ggml_concat(ctx, past, x, 0);
+
+        ggml_tensor * conv = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, x, w), n_channels, n_seq_tokens * n_seqs);
+        ggml_tensor * out  = ggml_scale(ctx, ggml_add(ctx, cur, conv), 1.0f / sqrtf(5.0f));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// test_short_conv with the conv's state copy: the last 3 concat columns of each channel go to the recurrent state rows
+struct test_short_conv_state : public test_case {
+    const int64_t n_channels;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    std::vector<ggml_tensor *> verify;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SHORT_CONV_STATE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_channels, n_seq_tokens, n_seqs);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+
+    test_short_conv_state(int64_t n_channels = 1024, int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
+        : n_channels(n_channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_channels, n_seq_tokens * n_seqs);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * past = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, n_channels, n_seqs);
+        ggml_set_name(past, "past");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, n_channels);
+        ggml_set_name(w, "w");
+        // one spare state row in front, so the copy writes at an offset
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * n_channels, n_seqs + 1);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * x = ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, n_channels, n_seq_tokens, n_seqs));
+        x = ggml_concat(ctx, past, x, 0);
+
+        ggml_tensor * tail = ggml_view_3d(ctx, x, 3, n_channels, n_seqs, x->nb[1], x->nb[2], ggml_row_size(x->type, n_seq_tokens));
+        ggml_tensor * cell = ggml_view_2d(ctx, cache, 3 * n_channels, n_seqs, cache->nb[1], cache->nb[1]);
+        ggml_tensor * cpy  = ggml_cpy(ctx, tail, cell);
+        if (gf) {
+            ggml_build_forward_expand(gf, cpy);
+        }
+        verify.push_back(cpy);
+
+        ggml_tensor * conv = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, x, w), n_channels, n_seq_tokens * n_seqs);
+        ggml_tensor * out  = ggml_scale(ctx, ggml_add(ctx, cur, conv), 1.0f / sqrtf(5.0f));
+        ggml_set_name(out, "out");
+        verify.push_back(out);
+        return out;
+    }
+};
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -16818,6 +16909,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_situ({67, 3, 1}));
     test_cases.emplace_back(new test_situ({1152, 8, 4}));
     test_cases.emplace_back(new test_situ({1152, 8, 64}));
+    test_cases.emplace_back(new test_short_conv(67, 5, 3));
+    test_cases.emplace_back(new test_short_conv(1024, 1, 1));
+    test_cases.emplace_back(new test_short_conv(2304, 1, 1));
+    test_cases.emplace_back(new test_short_conv(2304, 4, 1));
+    test_cases.emplace_back(new test_short_conv(1024, 33, 2));
+    test_cases.emplace_back(new test_short_conv_state(67, 5, 3));
+    test_cases.emplace_back(new test_short_conv_state(64, 2, 2));   // the state takes past columns too
+    test_cases.emplace_back(new test_short_conv_state(64, 1, 1));
+    test_cases.emplace_back(new test_short_conv_state(2304, 1, 1));
+    test_cases.emplace_back(new test_short_conv_state(2304, 4, 1));
+    test_cases.emplace_back(new test_short_conv_state(1024, 33, 2));
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)
