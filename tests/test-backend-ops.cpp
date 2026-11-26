@@ -21447,6 +21447,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // Inkling 2 Mini experts: gate + up (k 2304) and down (k 1152)
+    for (int bs : {1, 4, 8}) {
+        for (int64_t k : {2304, 1152}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, bs, k));
+            test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, bs, k, 1));
+        }
+    }
+
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
