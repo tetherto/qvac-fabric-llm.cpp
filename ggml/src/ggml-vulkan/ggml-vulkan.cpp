@@ -2207,6 +2207,12 @@ static bool ggml_vk_is_radv_rdna3(const vk_device & device) {
            device->architecture == vk_device_architecture::AMD_RDNA3;
 }
 
+// RDNA4 without VK_EXT_shader_float8 is classified as RDNA3; the device name tells GFX11 apart.
+static bool ggml_vk_is_radv_gfx11(const vk_device & device) {
+    const std::string device_name = device->properties.deviceName.data();
+    return ggml_vk_is_radv_rdna3(device) && device_name.find("GFX11") != std::string::npos;
+}
+
 // GGML_VK_MMVQ_WIDE=0 keeps 9-16 column dense mat-muls off the mat-vec.
 static bool ggml_vk_mmvq_wide_enabled() {
     static const bool on = [] {
@@ -2224,6 +2230,32 @@ static bool ggml_vk_mmvq_wide_device(const vk_device & device) {
 
 // On RADV RDNA3, two rows per workgroup share each q8_1 B load of the 9-16 column mat-vec.
 static constexpr uint32_t radv_rdna3_mmvq_wide_rows = 2;
+
+// From this many columns, RADV RDNA3 runs the Q4_K, Q5_K and IQ4_XS q8_1 mat-vec on int8 WMMA (mul_mat_vecq_wmma.comp),
+// whose cost stays flat up to 16 columns while the mat-vec's grows with each column.
+static constexpr uint32_t radv_rdna3_mmvq_wmma_min_cols = 10;
+static constexpr uint32_t mmvq_wmma_rows = 16;
+static constexpr uint32_t mmvq_wmma_wg_size = 128; // four wave32 waves split K
+static constexpr uint32_t mmvq_wmma_subgroup_size = 32;
+
+static_assert(mul_mat_vecq_max_cols <= mmvq_wmma_rows, "the WMMA mat-vec computes at most 16 columns");
+
+// GGML_VK_MMVQ_WMMA=0 keeps these mat-vecs on the integer-dot shader.
+static bool ggml_vk_mmvq_wmma_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MMVQ_WMMA");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// The shader builds its operands in RADV's GFX11 WMMA register layout and needs full wave32 subgroups.
+static bool ggml_vk_mmvq_wmma_device(const vk_device & device) {
+    return ggml_vk_mmvq_wmma_enabled() && ggml_vk_is_radv_gfx11(device) && device->coopmat_int_support &&
+           device->coopmat_int_m == 16 && device->coopmat_int_n == 16 && device->coopmat_int_k == 16 &&
+           device->subgroup_size_control && device->subgroup_require_full_support &&
+           device->subgroup_min_size <= mmvq_wmma_subgroup_size && device->subgroup_max_size >= mmvq_wmma_subgroup_size;
+}
 
 // RADV RDNA3 runs some dense q4_K / q5_K / q6_K / iq4_xs prefill GEMMs faster as f16-B KHR coopmat matmuls than as int8 MMQ
 // (ggml_vk_dense_f16coopmat_route).
@@ -4278,6 +4310,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool all_types = i < mul_mat_vec_max_cols;
             const bool wide_types_only = !all_types && w == DMMV_WG_SIZE_SUBGROUP && ggml_vk_mmvq_wide_device(device);
             const uint32_t rm_wide = !all_types && ggml_vk_is_radv_rdna3(device) ? radv_rdna3_mmvq_wide_rows : 1;
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+            // from radv_rdna3_mmvq_wmma_min_cols columns Q4_K, Q5_K and IQ4_XS take the WMMA mat-vec instead
+            const bool wmma = !all_types && w == DMMV_WG_SIZE_SUBGROUP && i + 1 >= radv_rdna3_mmvq_wmma_min_cols && ggml_vk_mmvq_wmma_device(device);
+            auto const create_wmma = [&](ggml_type type, const char * name, size_t spv_size, const void * spv_data) {
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][type][i], name, spv_size, spv_data, "main",
+                                        mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {mmvq_wmma_rows, 1, 1},
+                                        {mmvq_wmma_wg_size, mmvq_wmma_rows, i + 1}, 1, true, true, mmvq_wmma_subgroup_size);
+            };
+#endif
             if (device->integer_dot_product && (all_types || wide_types_only)) {
                 const uint32_t subgroup_size_int = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
                 const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_int : (subgroup_size_int * 4);
@@ -4309,11 +4350,26 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 }
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_q8_1_f32", arr_dmmv_q8_0_q8_1_f32_len[reduc], arr_dmmv_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_q8_1_f32", arr_dmmv_q6_k_q8_1_f32_len[reduc], arr_dmmv_q6_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*rm_kq_int, 1, 1}, {wg_size_subgroup_int, rm_wide*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ4_XS][i], "mul_mat_vec_iq4_xs_q8_1_f32", arr_dmmv_iq4_xs_q8_1_f32_len[reduc], arr_dmmv_iq4_xs_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, rm_wide*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                if (wmma) {
+                    create_wmma(GGML_TYPE_IQ4_XS, "mul_mat_vec_iq4_xs_q8_1_f32_wmma", mul_mat_vec_iq4_xs_q8_1_f32_wmma_cm1_len, mul_mat_vec_iq4_xs_q8_1_f32_wmma_cm1_data);
+                } else
+#endif
+                {
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ4_XS][i], "mul_mat_vec_iq4_xs_q8_1_f32", arr_dmmv_iq4_xs_q8_1_f32_len[reduc], arr_dmmv_iq4_xs_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, rm_wide*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                }
                 // RADV RDNA3 also takes Q4_K and Q5_K past mul_mat_vec_max_cols (ggml_vk_mmvq_wide)
                 if (all_types || ggml_vk_is_radv_rdna3(device)) {
-                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_q8_1_f32", arr_dmmv_q4_k_q8_1_f32_len[reduc], arr_dmmv_q4_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*rm_kq_int, 1, 1}, {wg_size_subgroup_int, rm_wide*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
-                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*rm_kq_int, 1, 1}, {wg_size_subgroup_int, rm_wide*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                    if (wmma) {
+                        create_wmma(GGML_TYPE_Q4_K, "mul_mat_vec_q4_k_q8_1_f32_wmma", mul_mat_vec_q4_k_q8_1_f32_wmma_cm1_len, mul_mat_vec_q4_k_q8_1_f32_wmma_cm1_data);
+                        create_wmma(GGML_TYPE_Q5_K, "mul_mat_vec_q5_k_q8_1_f32_wmma", mul_mat_vec_q5_k_q8_1_f32_wmma_cm1_len, mul_mat_vec_q5_k_q8_1_f32_wmma_cm1_data);
+                    } else
+#endif
+                    {
+                        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_q8_1_f32", arr_dmmv_q4_k_q8_1_f32_len[reduc], arr_dmmv_q4_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*rm_kq_int, 1, 1}, {wg_size_subgroup_int, rm_wide*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*rm_kq_int, 1, 1}, {wg_size_subgroup_int, rm_wide*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                    }
                 }
                 if (!all_types && ggml_vk_is_radv_rdna3(device)) {
                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32", arr_dmmv_q3_k_q8_1_f32_len[reduc], arr_dmmv_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*rm_kq_int, 1, 1}, {wg_size_subgroup_int, rm_wide*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);

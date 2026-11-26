@@ -1,0 +1,288 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : enable
+
+// Few-column q8_1 mat-mul on int8 16x16x16 WMMA in wave32, after mul_mat_q_few_wmma in ggml-cuda/mmq-few.cu.
+// A = activations, B = weights, built in registers in RADV's GFX11 layout: lane l holds row / column l % 16, element i = K i.
+
+#define MMQ
+#define KVALUES_IQ4NL_I8
+#define B_TYPE block_q8_1_x4
+#define B_TYPEV4 block_q8_1_x4_packed128
+#define USE_SUBGROUP_ADD_NO_SHMEM 1
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+const uint WAVE = 32;
+const uint TILE = 16;
+const uint ROWS_PER_WG = 16;
+const uint UNIT = 256;
+const uint SUB = 32;
+const uint SUBS_PER_UNIT = UNIT / SUB;
+const uint NWAVES = BLOCK_SIZE / WAVE;
+const uint CM_ELEMS = 8;
+const uint Q8_1_PER_X4 = 4;
+const uint Q45_K_SCALE_BYTES = 12;
+
+// per wave, two slots of unit scales [8 subs][column parity][8 columns], so a lane reads its 8 columns contiguously
+const uint DS_SLOT_U32 = SUBS_PER_UNIT * TILE;
+const uint DS_WAVE_U32 = 2 * DS_SLOT_U32;
+
+shared uint32_t ds_sh[NWAVES * DS_WAVE_U32];
+shared float red_sh[NWAVES * CM_ELEMS * WAVE];
+
+uint lane_id;
+uint lane_row;  // weight row of the lane and activation column it loads
+uint lane_half; // half of a sub-block the lane decodes; its accumulator columns are lane_half + 2e
+uint col_q8_1;  // first q8_1 block of the activation column of the lane
+
+coopmat<int8_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> frag_act[2];
+coopmat<int8_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> frag_wgt[2];
+
+// orders only shared memory, so the global loads of the next sub-blocks can be issued early
+void shared_barrier() {
+    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+}
+
+uint ds_slot(const uint u) {
+    return gl_SubgroupID * DS_WAVE_U32 + (u / NWAVES % 2) * DS_SLOT_U32;
+}
+
+void stage_unit_scales(const uint u) {
+    // lane (column lane_row, x4 block lane_half of the unit) copies the four ds of that x4 block
+    const uint xb = (col_q8_1 + u * SUBS_PER_UNIT) / Q8_1_PER_X4 + lane_half;
+    const uint o = ds_slot(u) + (lane_row % 2) * (TILE / 2) + lane_row / 2;
+    [[unroll]] for (uint i = 0; i < Q8_1_PER_X4; ++i) {
+        ds_sh[o + (lane_half * Q8_1_PER_X4 + i) * TILE] = packFloat2x16(data_b_v4[xb].ds[i]);
+    }
+}
+
+// d and the q8_1 sum of the activation columns lane_half + 2e for sub-block s
+void load_act_scales(const uint u, const uint s, out vec2 ds[CM_ELEMS]) {
+    const uint o = ds_slot(u) + s * TILE + lane_half * (TILE / 2);
+    [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+        ds[e] = vec2(unpackFloat2x16(ds_sh[o + e]));
+    }
+}
+
+// the values [0, 16) and [16, 32) of a sub-block from the half that each half-wave decoded
+void split_halves(const uvec4 own, out uvec4 lo, out uvec4 hi) {
+    const uvec4 other = subgroupShuffleXor(own, TILE);
+    lo = lane_half == 0 ? own : other;
+    hi = lane_half == 0 ? other : own;
+}
+
+void set_act(const uint hh, const uvec4 v) {
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const i8vec4 b = unpack8(int32_t(v[i]));
+        frag_act[hh][4 * i + 0] = b.x;
+        frag_act[hh][4 * i + 1] = b.y;
+        frag_act[hh][4 * i + 2] = b.z;
+        frag_act[hh][4 * i + 3] = b.w;
+    }
+}
+
+void set_wgt(const uint hh, const uvec4 v) {
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const i8vec4 b = unpack8(int32_t(v[i]));
+        frag_wgt[hh][4 * i + 0] = b.x;
+        frag_wgt[hh][4 * i + 1] = b.y;
+        frag_wgt[hh][4 * i + 2] = b.z;
+        frag_wgt[hh][4 * i + 3] = b.w;
+    }
+}
+
+void build_act(const uint u, const uint s) {
+    const uint xb = (col_q8_1 + u * SUBS_PER_UNIT + s) / Q8_1_PER_X4;
+    uvec4 lo, hi;
+    split_halves(uvec4(data_b_v4[xb].qs[(s % Q8_1_PER_X4) * 2 + lane_half]), lo, hi);
+    set_act(0, lo);
+    set_act(1, hi);
+}
+
+void build_wgt(const uvec4 own) {
+    uvec4 lo, hi;
+    split_halves(own, lo, hi);
+    set_wgt(0, lo);
+    set_wgt(1, hi);
+}
+
+coopmat<int32_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> mul_sub_block() {
+    coopmat<int32_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc =
+        coopmat<int32_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0);
+    acc = coopMatMulAdd(frag_act[0], frag_wgt[0], acc);
+    return coopMatMulAdd(frag_act[1], frag_wgt[1], acc);
+}
+
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+// 6-bit scale and min of sub-block s from the 12 packed scale bytes
+uvec2 q45_k_scale_min(const uint s, const uint sc[3]) {
+    uint q[Q45_K_SCALE_BYTES];
+    [[unroll]] for (uint i = 0; i < Q45_K_SCALE_BYTES; ++i) {
+        q[i] = (sc[i / 4] >> (8 * (i % 4))) & 0xFF;
+    }
+    if (s < 4) {
+        return uvec2(q[s] & 63, q[s + 4] & 63);
+    }
+    return uvec2((q[s + 4] & 0xF) | ((q[s - 4] >> 6) << 4), (q[s + 4] >> 4) | ((q[s] >> 6) << 4));
+}
+
+void accumulate_unit(const uint ib, const uint u, inout float sums[CM_ELEMS]) {
+    const vec2 dm = vec2(data_a_packed32[ib].dm);
+    const uint sc[3] = { data_a_packed32[ib].scales[0], data_a_packed32[ib].scales[1], data_a_packed32[ib].scales[2] };
+#if defined(DATA_A_Q5_K)
+    // byte l of qh holds the high bit of value l of sub-block s in bit s
+    const uint ho = 4 * lane_half;
+    const uvec4 qh = uvec4(data_a_packed32[ib].qh[ho], data_a_packed32[ib].qh[ho + 1], data_a_packed32[ib].qh[ho + 2], data_a_packed32[ib].qh[ho + 3]);
+#endif
+    stage_unit_scales(u);
+    shared_barrier();
+
+    float sum_d[CM_ELEMS];
+    float sum_m[CM_ELEMS];
+    [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+        sum_d[e] = 0.0;
+        sum_m[e] = 0.0;
+    }
+    [[unroll]] for (uint j = 0; j < SUBS_PER_UNIT / 2; ++j) {
+        // bytes [32 j + 16 h, +16) hold values [16 h, +16) of sub-block 2 j (low nibbles) and 2 j + 1 (high)
+        const uint qo = 8 * j + 4 * lane_half;
+        const uvec4 q = uvec4(data_a_packed32[ib].qs[qo], data_a_packed32[ib].qs[qo + 1], data_a_packed32[ib].qs[qo + 2], data_a_packed32[ib].qs[qo + 3]);
+        [[unroll]] for (uint t = 0; t < 2; ++t) {
+            const uint s = 2 * j + t;
+            uvec4 w = (q >> (4 * t)) & 0x0F0F0F0F;
+#if defined(DATA_A_Q5_K)
+            w |= ((qh >> s) & 0x01010101) << 4;
+#endif
+            build_wgt(w);
+            build_act(u, s);
+            const coopmat<int32_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc = mul_sub_block();
+
+            const uvec2 lm = q45_k_scale_min(s, sc);
+            vec2 ds[CM_ELEMS];
+            load_act_scales(u, s, ds);
+            [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+                sum_d[e] += ds[e].x * float(acc[e] * int(lm.x));
+                sum_m[e] += float(lm.y) * ds[e].y;
+            }
+        }
+    }
+    [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+        sums[e] += dm.x * sum_d[e] - dm.y * sum_m[e];
+    }
+}
+#elif defined(DATA_A_IQ4_XS)
+uvec4 iq4_values(const uvec4 nib) {
+    uvec4 w;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const u8vec4 n = unpack8(nib[i]);
+        w[i] = uint(pack32(i8vec4(kvalues_iq4nl[n.x], kvalues_iq4nl[n.y], kvalues_iq4nl[n.z], kvalues_iq4nl[n.w])));
+    }
+    return w;
+}
+
+void accumulate_unit(const uint ib, const uint u, inout float sums[CM_ELEMS]) {
+    const float d = float(data_a[ib].d);
+    const uint scales_l = data_a_packed32[ib].scales_l;
+    const uint scales_h = uint(data_a_packed32[ib].scales_h);
+    stage_unit_scales(u);
+    shared_barrier();
+
+    float sum_d[CM_ELEMS];
+    [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+        sum_d[e] = 0.0;
+    }
+    [[unroll]] for (uint s = 0; s < SUBS_PER_UNIT; ++s) {
+        // bytes [16 s, +16): low nibbles are values [0, 16) of sub-block s, high nibbles values [16, 32)
+        const uvec4 q = uvec4(data_a_packed32[ib].qs[4 * s], data_a_packed32[ib].qs[4 * s + 1], data_a_packed32[ib].qs[4 * s + 2], data_a_packed32[ib].qs[4 * s + 3]);
+        build_wgt(iq4_values((q >> (4 * lane_half)) & 0x0F0F0F0F));
+        build_act(u, s);
+        const coopmat<int32_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc = mul_sub_block();
+
+        const int ls = int(((scales_l >> (4 * s)) & 0xF) | (((scales_h >> (2 * s)) & 3) << 4)) - 32;
+        vec2 ds[CM_ELEMS];
+        load_act_scales(u, s, ds);
+        [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+            sum_d[e] += ds[e].x * float(acc[e] * ls);
+        }
+    }
+    [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+        sums[e] += d * sum_d[e];
+    }
+}
+#else
+#error unsupported type
+#endif
+
+void accumulate_units(const uint a_row, inout float sums[CM_ELEMS]) {
+    const uint nunits = p.ncols / UNIT;
+    for (uint u = gl_SubgroupID; u < nunits; u += NWAVES) {
+        accumulate_unit(a_row + u, u, sums);
+    }
+}
+
+// waves 1.. hand their sums to wave 0 through shared memory
+void reduce_waves(inout float sums[CM_ELEMS]) {
+    if (gl_SubgroupID > 0) {
+        [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+            red_sh[(gl_SubgroupID * CM_ELEMS + e) * WAVE + lane_id] = sums[e];
+        }
+    }
+    barrier();
+    if (gl_SubgroupID == 0) {
+        for (uint w = 1; w < NWAVES; ++w) {
+            [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+                sums[e] += red_sh[(w * CM_ELEMS + e) * WAVE + lane_id];
+            }
+        }
+    }
+}
+
+void store_outputs(const uint row, const uint d_offset, const float sums[CM_ELEMS]) {
+    if (gl_SubgroupID != 0 || row >= p.stride_d) {
+        return;
+    }
+    [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+        const uint col = lane_half + 2 * e;
+        if (col < NUM_COLS) {
+            data_d[col * p.batch_stride_d + d_offset + row] = D_TYPE(sums[e]);
+        }
+    }
+}
+
+void main() {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
+    lane_id = gl_SubgroupInvocationID;
+    lane_row = lane_id % TILE;
+    lane_half = lane_id / TILE;
+
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+    b_offset /= QUANT_K_Q8_1;
+    // columns past NUM_COLS load column NUM_COLS - 1; their accumulator rows are never stored
+    col_q8_1 = min(lane_row, NUM_COLS - 1) * p.batch_stride_b / QUANT_K_Q8_1 + b_offset;
+
+    const uint row0 = ROWS_PER_WG * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+    const uint row = row0 + lane_row;
+    const uint a_row = min(row, p.stride_d - 1) * (p.ncols / QUANT_K) + a_offset;
+
+    float sums[CM_ELEMS];
+    [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+        sums[e] = 0.0;
+    }
+    accumulate_units(a_row, sums);
+    reduce_waves(sums);
+    store_outputs(row, d_offset, sums);
+}

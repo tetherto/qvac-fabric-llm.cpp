@@ -18421,6 +18421,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : { 9, 12, 16 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, 4097, n, 256, { 1, 1 }, { 1, 1 }));
     }
+    // 10-16 column WMMA mat-vec (RADV RDNA3): K over all four waves or three of them, and a ragged last block of 16 rows
+    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS }) {
+        for (int n : { 10, 13, 16 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 4096, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  200, n,  768, { 1, 1 }, { 1, 1 }));
+        }
+    }
 
     // int8 coopmat few-column tiles (RADV RDNA3): partial row tiles, and split-k at small m
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0 }) {
