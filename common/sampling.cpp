@@ -109,27 +109,37 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
-// index of the largest value, or -1 if it is not unique; NaNs are skipped
+// index of the largest value, or -1 if it is not unique or any value is NaN: the sampler chain's reductions keep a
+// NaN that comes first and skip later ones, so the chain decides whenever a NaN is present
 static int32_t argmax_unique(const float * x, int32_t n) {
     // independent lanes keep the compare/select loops vectorizable
     constexpr int32_t L = 32;
 
     float m[L];
+    int32_t nan[L];
     for (int32_t j = 0; j < L; ++j) {
         m[j] = -INFINITY;
+        nan[j] = 0;
     }
     int32_t i = 0;
     for (; i + L <= n; i += L) {
         for (int32_t j = 0; j < L; ++j) {
             m[j] = x[i + j] > m[j] ? x[i + j] : m[j];
+            nan[j] |= x[i + j] != x[i + j];
         }
     }
     float mx = -INFINITY;
+    int32_t any_nan = 0;
     for (int32_t j = 0; j < L; ++j) {
         mx = m[j] > mx ? m[j] : mx;
+        any_nan |= nan[j];
     }
     for (; i < n; ++i) {
         mx = x[i] > mx ? x[i] : mx;
+        any_nan |= x[i] != x[i];
+    }
+    if (any_nan) {
+        return -1;
     }
 
     // locate the max and make sure no other value equals it
