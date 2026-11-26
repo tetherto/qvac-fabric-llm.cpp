@@ -5396,6 +5396,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_tail_f32,        "ssm_conv_tail_f32",        ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {256, 1, 0, 0, 2, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_short_conv_f32, "short_conv_f32", short_conv_f32_len, short_conv_f32_data, "main", 4, sizeof(vk_op_short_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_short_conv_state_f32, "short_conv_state_f32", short_conv_state_f32_len, short_conv_state_f32_data, "main", 5, sizeof(vk_op_short_conv_state_push_constants), {32, 16, 1}, {32, 16}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_control_mix_f32, "control_mix_f32", control_mix_f32_len, control_mix_f32_data, "main", 5, sizeof(vk_op_control_mix_push_constants), {256, 1, 1}, {256}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_sx_f32, "ssm_conv_back_sx_f32", ssm_conv_back_sx_f32_len, ssm_conv_back_sx_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_sx_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_c_f32, "ssm_conv_back_c_f32", ssm_conv_back_c_f32_len, ssm_conv_back_c_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_c_push_constants), {32, 1, 1}, {}, 1);
 
@@ -15078,6 +15079,26 @@ static void ggml_vk_short_conv_state(ggml_backend_vk_context * ctx, vk_context &
         pc, { (uint32_t) conv->ne[0], (uint32_t) conv->ne[1], (uint32_t) conv->ne[2] });
 }
 
+// control_mix_pattern at node_idx as one pass: reads f, cur, g and m, writes the ADD
+static void ggml_vk_control_mix(ggml_backend_vk_context * ctx, vk_context & subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * f   = cgraph->nodes[node_idx]->src[0];
+    const ggml_tensor * cur = cgraph->nodes[node_idx + 1]->src[1];
+    const ggml_tensor * g   = cgraph->nodes[node_idx + 3]->src[0];
+    const ggml_tensor * m   = cgraph->nodes[node_idx + 4]->src[1];
+    ggml_tensor       * dst = cgraph->nodes[node_idx + 5];
+
+    vk_pipeline pipeline = ctx->device->pipeline_control_mix_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t ne0   = (uint32_t) dst->ne[0];
+    const uint32_t nrows = (uint32_t) ggml_nrows(dst);
+    const vk_op_control_mix_push_constants pc = { ne0, nrows };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, f), ggml_vk_tensor_subbuffer(ctx, cur), ggml_vk_tensor_subbuffer(ctx, g),
+          ggml_vk_tensor_subbuffer(ctx, m), ggml_vk_tensor_subbuffer(ctx, dst) },
+        pc, { ne0, nrows, 1 });
+}
+
 void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (ctx->fused_ssm_conv_direct >= 0) {
         GGML_ASSERT(ctx->num_additional_fused_ops == 1);
@@ -17862,6 +17883,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
             break;
         }
+        if (ctx->fused_control_mix) {
+            ggml_vk_control_mix(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         if (ctx->num_additional_fused_ops) {
             ggml_vk_unary_mul(ctx, compute_ctx, cgraph, node_idx);
             break;
@@ -19773,6 +19798,74 @@ static bool ggml_vk_can_fuse_short_conv_state(const ggml_backend_vk_context * ct
     return true;
 }
 
+// GGML_VK_FUSE_CONTROL_MIX=0 runs the controller mix as separate passes, in the same graph order
+static bool ggml_vk_fuse_control_mix_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_CONTROL_MIX");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static constexpr int CONTROL_MIX_NODES = 6;
+
+// the six nodes of control_mix_pattern, given by index; graph_optimize calls it before the tensors are allocated
+static bool ggml_vk_control_mix_nodes_ok(const struct ggml_cgraph * cgraph, const int * idx) {
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idx, CONTROL_MIX_NODES, control_mix_pattern.begin(), &idx[CONTROL_MIX_NODES - 1], 1)) {
+        return false;
+    }
+    const ggml_tensor * tf  = cgraph->nodes[idx[0]];
+    const ggml_tensor * mf  = cgraph->nodes[idx[1]];
+    const ggml_tensor * sub = cgraph->nodes[idx[2]];
+    const ggml_tensor * tg  = cgraph->nodes[idx[3]];
+    const ggml_tensor * mg  = cgraph->nodes[idx[4]];
+    const ggml_tensor * add = cgraph->nodes[idx[5]];
+    if (ggml_get_unary_op(tf) != GGML_UNARY_OP_TANH || ggml_get_unary_op(tg) != GGML_UNARY_OP_TANH) {
+        return false;
+    }
+    if (mf->src[0] != tf || sub->src[1] != mf || sub->src[0] != mf->src[1] || mg->src[0] != tg ||
+        add->src[0] != sub || add->src[1] != mg) {
+        return false;
+    }
+    const ggml_tensor * f = tf->src[0];
+    const ggml_tensor * g = tg->src[0];
+    const ggml_tensor * m = mg->src[1];
+    for (const ggml_tensor * n : std::initializer_list<const ggml_tensor *>{ f, sub->src[0], g, m, tf, mf, sub, tg, mg, add }) {
+        if (n->type != GGML_TYPE_F32 || !ggml_is_contiguous(n) || !ggml_are_same_shape(n, add)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the controller mix as six consecutive nodes at node_idx (the order graph_optimize keeps)
+static bool ggml_vk_control_mix_shape_ok(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + CONTROL_MIX_NODES > cgraph->n_nodes || !ggml_check_edges(cgraph, node_idx, control_mix_edges)) {
+        return false;
+    }
+    int idx[CONTROL_MIX_NODES];
+    std::iota(idx, idx + CONTROL_MIX_NODES, node_idx);
+    return ggml_vk_control_mix_nodes_ok(cgraph, idx);
+}
+
+static bool ggml_vk_can_fuse_control_mix(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_fuse_control_mix_enabled() || !ggml_vk_control_mix_shape_ok(cgraph, node_idx)) {
+        return false;
+    }
+    const ggml_tensor * f   = cgraph->nodes[node_idx]->src[0];
+    const ggml_tensor * cur = cgraph->nodes[node_idx + 1]->src[1];
+    const ggml_tensor * g   = cgraph->nodes[node_idx + 3]->src[0];
+    const ggml_tensor * m   = cgraph->nodes[node_idx + 4]->src[1];
+    const ggml_tensor * dst = cgraph->nodes[node_idx + 5];
+    // the shader takes no per-tensor offsets
+    for (const ggml_tensor * n : { f, cur, g, m, dst }) {
+        if (get_misalign_bytes(ctx, n) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, int num_extra) {
     const ggml_tensor * conv = cgraph->nodes[node_idx];
@@ -20788,6 +20881,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_situ = false;
         ctx->fused_short_conv = false;
         ctx->fused_short_conv_state = false;
+        ctx->fused_control_mix = false;
         ctx->fused_gdn_cache = nullptr;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_fwht_signed = false;
@@ -20868,6 +20962,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // the conv reads 4 columns per output; the residual ADD and the SCALE are elementwise
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
                 op_srcs_fused_elementwise[0] = false;
+            } else if (ggml_vk_can_fuse_control_mix(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = control_mix_pattern.size() - 1;
+                ctx->fused_control_mix = true;
+                fusion_string = "CONTROL_MIX";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
             } else if (const int gdn_cpy_offset = ggml_vk_can_fuse_gdn_cache(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = gdn_cpy_offset;
                 ctx->fused_gdn_cache = cgraph->nodes[i + gdn_cpy_offset]->src[1];
@@ -21113,6 +21212,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_situ = false;
                 ctx->fused_short_conv = false;
                 ctx->fused_short_conv_state = false;
+                ctx->fused_control_mix = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
                 ctx->fused_fwht_signed = false;
@@ -21457,6 +21557,56 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return false;
         };
 
+        // the gain mat-vec between the two halves of a controller mix as built
+        static constexpr int CONTROL_MIX_GAIN_MM = 3;
+
+        // a controller mix block at start: six consecutive nodes, or the built order with the gain mat-vec at offset 3
+        auto const &control_mix_block = [&](int start, int * idx) -> bool {
+            const int n_built = (int) control_mix_built_pattern.size();
+            if (graph->nodes[start]->op != GGML_OP_UNARY) {
+                return false;
+            }
+            bool built = start + n_built <= graph->n_nodes;
+            for (int k = 0; built && k < n_built; ++k) {
+                built = graph->nodes[start + k]->op == control_mix_built_pattern.begin()[k];
+            }
+            for (int k = 0, o = 0; k < CONTROL_MIX_NODES; ++k, ++o) {
+                o += built && k == CONTROL_MIX_GAIN_MM ? 1 : 0;
+                idx[k] = start + o;
+            }
+            if (built) {
+                // moving the forget half past the gain mat-vec needs the mat-vec to feed the second tanh only
+                const ggml_tensor * mm = graph->nodes[start + CONTROL_MIX_GAIN_MM];
+                if (graph->nodes[idx[CONTROL_MIX_GAIN_MM]]->src[0] != mm) {
+                    return false;
+                }
+                for (int k = 0; k < CONTROL_MIX_GAIN_MM; ++k) {
+                    if (is_src_of(mm, graph->nodes[idx[k]])) {
+                        return false;
+                    }
+                }
+            } else if (idx[CONTROL_MIX_NODES - 1] >= graph->n_nodes) {
+                return false;
+            }
+            for (int k = 0; k < CONTROL_MIX_NODES; ++k) {
+                if (used[idx[k]]) {
+                    return false;
+                }
+            }
+            return ggml_vk_control_mix_nodes_ok(graph, idx);
+        };
+
+        // the six nodes of a controller mix block; the lookahead and the view pass must not pull them out
+        auto const &in_control_mix_pattern = [&](int n) -> bool {
+            int idx[CONTROL_MIX_NODES];
+            for (int o = 0; o < (int) control_mix_built_pattern.size(); ++o) {
+                if (n - o >= 0 && control_mix_block(n - o, idx) && std::find(idx, idx + CONTROL_MIX_NODES, n) != idx + CONTROL_MIX_NODES) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         auto const &is_ready = [&](int j) -> bool {
             for (int c = first_unused; c < j; ++c) {
                 if (!used[c] && is_src_of(graph->nodes[j], graph->nodes[c])) {
@@ -21470,7 +21620,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // have, so a pair after the block (MUL_MAT_ID + the MUL of its gathered scale) stays adjacent.
         auto const &schedule_ready_nodes = [&](int lo) {
             for (int j = lo; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
-                if (used[j] || in_situ_pattern(j) || in_short_conv_pattern(j) || in_short_conv_state[j] || !is_ready(j)) {
+                if (used[j] || in_situ_pattern(j) || in_short_conv_pattern(j) || in_short_conv_state[j] || in_control_mix_pattern(j) ||
+                    !is_ready(j)) {
                     continue;
                 }
                 new_order.push_back(graph->nodes[j]);
@@ -21486,6 +21637,37 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     current_set.push_back(j);
                     used[j] = true;
                 }
+            }
+        };
+
+        // the gain mat-vec first if the lookahead has not placed it, then the six nodes in fused order
+        auto const &keep_control_mix = [&](const int * idx) {
+            const int gain_mm = idx[CONTROL_MIX_GAIN_MM] - 1;
+            if (gain_mm != idx[CONTROL_MIX_GAIN_MM - 1] && !used[gain_mm]) {
+                new_order.push_back(graph->nodes[gain_mm]);
+                used_node_set.insert(graph->nodes[gain_mm]);
+                used[gain_mm] = true;
+            }
+            ggml_tensor * block[CONTROL_MIX_NODES];
+            for (int k = 0; k < CONTROL_MIX_NODES; ++k) {
+                block[k] = graph->nodes[idx[k]];
+            }
+            ggml_tensor * out = block[CONTROL_MIX_NODES - 1];
+            schedule_ready_nodes(idx[CONTROL_MIX_NODES - 1] + 1);
+            for (int k = 0; k < CONTROL_MIX_NODES; ++k) {
+                ggml_tensor * node = block[k];
+                // the fused pass reads f, cur, g and m while it writes the ADD
+                for (uint32_t s = 0; s < GGML_MAX_SRC && params && params->add_alloc_dep; ++s) {
+                    if (node->src[s] && std::find(block, block + CONTROL_MIX_NODES, node->src[s]) == block + CONTROL_MIX_NODES) {
+                        params->add_alloc_dep(params->user_data, node->src[s], out);
+                    }
+                }
+                new_order.push_back(node);
+                used_node_set.insert(node);
+                used[idx[k]] = true;
+            }
+            while (first_unused < graph->n_nodes && used[first_unused]) {
+                first_unused++;
             }
         };
 
@@ -21629,6 +21811,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             keep_pattern(short_conv_pattern);
             continue;
         }
+        if (int control_mix_idx[CONTROL_MIX_NODES]; control_mix_block(first_unused, control_mix_idx)) {
+            keep_control_mix(control_mix_idx);
+            continue;
+        }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
             add_pattern_alloc_deps(hc_post_gate_pattern, first_unused + (int) hc_post_gate_pattern.size() - 1);
             keep_pattern(hc_post_gate_pattern);
@@ -21761,6 +21947,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 in_situ_pattern(j) ||
                 in_short_conv_pattern(j) ||
                 in_short_conv_state[j] ||
+                in_control_mix_pattern(j) ||
                 ggml_vk_gdn_cache_cpy_offset(ctx, graph, j) > 0 ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
@@ -21928,7 +22115,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (used[j]) {
                     continue;
                 }
-                if (!is_empty(graph->nodes[j]) || in_situ_pattern(j) || in_short_conv_pattern(j) || in_short_conv_state[j]) {
+                if (!is_empty(graph->nodes[j]) || in_situ_pattern(j) || in_short_conv_pattern(j) || in_short_conv_state[j] ||
+                    in_control_mix_pattern(j)) {
                     continue;
                 }
                 bool ok = true;

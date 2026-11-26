@@ -953,6 +953,12 @@ struct vk_op_short_conv_state_push_constants {
     uint32_t state_nb1;
 };
 
+// control_mix.comp: every tensor is contiguous with the shape [ne0, nrows]
+struct vk_op_control_mix_push_constants {
+    uint32_t ne0;
+    uint32_t nrows;
+};
+
 struct vk_op_gru_push_constants {
     uint32_t H, B, L, reverse;
 };

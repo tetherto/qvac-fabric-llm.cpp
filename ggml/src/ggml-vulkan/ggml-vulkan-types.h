@@ -631,6 +631,19 @@ static constexpr std::initializer_list<std::array<int, 3>> short_conv_edges {
 static constexpr std::initializer_list<ggml_op> short_conv_state_pattern {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
 
+// (cur - tanh(f)*cur) + tanh(g)*m, the Inkling loop controller's mix; built with the gain mat-vec after the SUB
+static constexpr std::initializer_list<ggml_op> control_mix_pattern { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+static constexpr std::initializer_list<ggml_op> control_mix_built_pattern {
+    GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+
+static constexpr std::initializer_list<std::array<int, 3>> control_mix_edges {
+    { 1, 0, 0 }, // mul->src[0] == tanh(f)
+    { 2, 1, 1 }, // sub->src[1] == mul
+    { 4, 0, 3 }, // mul->src[0] == tanh(g)
+    { 5, 0, 2 }, // add->src[0] == sub
+    { 5, 1, 4 }, // add->src[1] == mul
+};
+
 static constexpr std::initializer_list<std::array<int, 3>> situ_edges {
     { 1, 0, 0 }, // tanh->src[0]  == scale
     { 2, 0, 1 }, // scale->src[0] == tanh
@@ -1177,6 +1190,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_tail_f32;
     vk_pipeline pipeline_short_conv_f32;
     vk_pipeline pipeline_short_conv_state_f32;
+    vk_pipeline pipeline_control_mix_f32;
     vk_pipeline pipeline_ssm_conv_back_sx_f32;
     vk_pipeline pipeline_ssm_conv_back_c_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
@@ -1724,6 +1738,7 @@ struct ggml_backend_vk_context {
     bool fused_situ {};
     bool fused_short_conv {};
     bool fused_short_conv_state {};
+    bool fused_control_mix {};
     // GATED_DELTA_NET (or _DEFERRED) + CPY: the recurrent cache view the gdn writes its state to
     const ggml_tensor * fused_gdn_cache {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};

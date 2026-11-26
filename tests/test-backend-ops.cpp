@@ -5810,6 +5810,60 @@ struct test_short_conv_state : public test_case {
     }
 };
 
+// the Inkling loop controller's mix: (cur - tanh(f)*cur) + tanh(g)*m, with f and g from mat-vecs as the model builds it
+struct test_control_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool    with_mm;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONTROL_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, with_mm);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return with_mm ? 5e-4 : 1e-7; // the gate mat-muls round as in test_mul_mat
+    }
+
+    test_control_mix(int64_t n_embd = 2304, int64_t n_tokens = 1, bool with_mm = true)
+        : n_embd(n_embd), n_tokens(n_tokens), with_mm(with_mm) {}
+
+    ggml_tensor * build_gate_input(ggml_context * ctx, ggml_tensor * gate, const char * name) {
+        if (!with_mm) {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(x, name);
+            return x;
+        }
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, gate->ne[0], n_embd);
+        ggml_set_name(w, name);
+        return ggml_mul_mat(ctx, w, gate);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_gate = 64;
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(m, "m");
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_gate, n_tokens);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * gain   = ggml_tanh(ctx, build_gate_input(ctx, gate, "w_gain"));
+        ggml_tensor * forget = ggml_tanh(ctx, build_gate_input(ctx, gate, "w_forget"));
+
+        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, cur, ggml_mul(ctx, forget, cur)), ggml_mul(ctx, gain, m));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -16920,6 +16974,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_short_conv_state(2304, 1, 1));
     test_cases.emplace_back(new test_short_conv_state(2304, 4, 1));
     test_cases.emplace_back(new test_short_conv_state(1024, 33, 2));
+
+    for (bool with_mm : { true, false }) {
+        test_cases.emplace_back(new test_control_mix(2304, 1, with_mm));
+        test_cases.emplace_back(new test_control_mix(2304, 4, with_mm));
+        test_cases.emplace_back(new test_control_mix(67, 33, with_mm));
+    }
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)

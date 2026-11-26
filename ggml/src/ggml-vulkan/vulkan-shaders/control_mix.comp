@@ -1,0 +1,41 @@
+#version 450
+
+// (cur - tanh(f)*cur) + tanh(g)*m in one pass: the Inkling loop controller's gated mix
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer F { float f[]; };
+layout(binding = 1) readonly buffer C { float cur[]; };
+layout(binding = 2) readonly buffer G { float g[]; };
+layout(binding = 3) readonly buffer M { float m[]; };
+layout(binding = 4) writeonly buffer D { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ne0;
+    uint nrows;
+};
+
+// unary.comp's op_tanh; a function, so the precise terms below do not mark its operations
+float op_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+void main() {
+    const uint col = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y;
+
+    if (col >= ne0 || row >= nrows) {
+        return;
+    }
+
+    const uint i = row * ne0 + col;
+    const float c = cur[i];
+
+    // each product and sum rounds on its own, as the separate MUL, SUB and ADD passes do
+    precise float forget = op_tanh(f[i]) * c;
+    precise float gain   = op_tanh(g[i]) * m[i];
+    precise float mixed  = (c - forget) + gain;
+    dst[i] = mixed;
+}
