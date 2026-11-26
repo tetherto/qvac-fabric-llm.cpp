@@ -1174,7 +1174,8 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 // supports simdgroup intrinsics. Probe the Metal compiler/linker to see
                 // what actually works, and re-enable accordingly.
                 {
-                    if (!dev->props.has_simdgroup_reduction) {
+                    // Only probe simdgroup reduction on Apple GPUs: the kernels assume 32-wide simdgroups, and other GPUs (e.g. the Paravirtual GPU of Intel macOS VMs) can compile a kernel with a width of 16.
+                    if (!dev->props.has_simdgroup_reduction && [dev->mtl_device supportsFamily:MTLGPUFamilyApple1]) {
                         const char * src_simd_red =
                             "#include <metal_stdlib>\n"
                             "using namespace metal;\n"
