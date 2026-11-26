@@ -52,6 +52,7 @@ htp_op_code htp_op_remap(const struct ggml_tensor * t) {
         case GGML_OP_REPEAT:          return HTP_OP_REPEAT;
         case GGML_OP_CUMSUM:          return HTP_OP_CUMSUM;
         case GGML_OP_FILL:            return HTP_OP_FILL;
+        case GGML_OP_TIMESTEP_EMBEDDING: return HTP_OP_TIMESTEP_EMBEDDING;
         case GGML_OP_DIAG:            return HTP_OP_DIAG;
         case GGML_OP_SOLVE_TRI:       return HTP_OP_SOLVE_TRI;
         case GGML_OP_TRI:             return HTP_OP_TRI;
@@ -3461,6 +3462,33 @@ static bool htp_kparams_solve_fill(
     return true;
 }
 
+static constexpr int HTP_TIMESTEP_PARAM_DIM        = 0;
+static constexpr int HTP_TIMESTEP_PARAM_MAX_PERIOD = 1;
+
+static bool htp_kparams_solve_timestep_embedding(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_timestep_kernel_params * kparams
+) {
+    GGML_UNUSED(sess);
+    memset(kparams, 0, sizeof(*kparams));
+
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst) || ggml_nelements(src0) != src0->ne[0]) {
+        return false;
+    }
+
+    kparams->dim            = (uint32_t) ggml_get_op_params_i32(op, HTP_TIMESTEP_PARAM_DIM);
+    kparams->n_timesteps    = (uint32_t) src0->ne[0];
+    kparams->log_max_period = logf((float) ggml_get_op_params_i32(op, HTP_TIMESTEP_PARAM_MAX_PERIOD));
+    return true;
+}
+
 static bool htp_kparams_solve_roll(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -4665,6 +4693,9 @@ bool htp_kparams_solve(
 
         case HTP_OP_FILL:
             return htp_kparams_invoke<htp_kparams_solve_fill>(sess, op, kparams);
+
+        case HTP_OP_TIMESTEP_EMBEDDING:
+            return htp_kparams_invoke<htp_kparams_solve_timestep_embedding>(sess, op, kparams);
 
         case HTP_OP_ROLL:
             return htp_kparams_invoke<htp_kparams_solve_roll>(sess, op, kparams);
