@@ -470,6 +470,46 @@ static void test_greedy_backend_filter_cpu(const test_params & params) {
     }
 }
 
+// a NaN logit: common_sampler_sample must pick the token the sampler chain picks from the same logits (the chain
+// keeps a NaN that comes first, so the greedy fast path has to defer to it)
+static void test_greedy_nan_common(const test_params & params) {
+    std::vector<llama_sampler_seq_config> configs;
+    test_context test_ctx(params, configs);
+    GGML_ASSERT(test_ctx.decode({{0, "Some"}}));
+
+    common_params_sampling sp;
+    sp.temp = 0.0f;
+    sp.samplers = {COMMON_SAMPLER_TYPE_TEMPERATURE};
+
+    // {NaN position, top logit position}: a leading NaN, a NaN after the top logit, a NaN before it
+    const std::pair<int, int> cases[] = {{0, 3}, {5, 3}, {3, 7}};
+    for (const auto & [nan_id, top_id] : cases) {
+        const int idx = test_ctx.idx_for_seq(0);
+        float * logits = llama_get_logits_ith(test_ctx.ctx.get(), idx);
+        GGML_ASSERT(logits != nullptr);
+        for (int i = 0; i < test_ctx.n_vocab; ++i) {
+            logits[i] = -2.0f;
+        }
+        logits[nan_id] = NAN;
+        logits[top_id] = 2.0f;
+
+        common_sampler_ptr ref(common_sampler_init(params.model.get(), sp));
+        std::vector<llama_token_data> cur(test_ctx.n_vocab);
+        for (int i = 0; i < test_ctx.n_vocab; ++i) {
+            cur[i] = llama_token_data{i, logits[i], 0.0f};
+        }
+        llama_token_data_array cur_p = {cur.data(), cur.size(), -1, false};
+        llama_sampler_apply(common_sampler_get(ref.get()), &cur_p);
+        GGML_ASSERT(cur_p.selected >= 0);
+        const llama_token expected = cur_p.data[cur_p.selected].id;
+
+        common_sampler_ptr sampler(common_sampler_init(params.model.get(), sp));
+        const llama_token token = common_sampler_sample(sampler.get(), test_ctx.ctx.get(), idx);
+        printf("NaN at %d, top logit at %d: chain %d, common_sampler_sample %d\n", nan_id, top_id, expected, token);
+        GGML_ASSERT(token == expected);
+    }
+}
+
 static void test_top_k(const test_params & params) {
     const int seq_id = 0;
     const int32_t k = 8;
@@ -2344,6 +2384,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_greedy_filtered",        test_greedy_filtered,        true },
     { "test_greedy_filtered_common", test_greedy_filtered_common, true },
     { "test_greedy_backend_filter_cpu", test_greedy_backend_filter_cpu, true },
+    { "test_greedy_nan_common",      test_greedy_nan_common,      true },
     { "test_temp",                   test_temp,                   true },
     { "test_temp_ext",               test_temp_ext,               true },
     { "test_top_k",                  test_top_k,                  true },
