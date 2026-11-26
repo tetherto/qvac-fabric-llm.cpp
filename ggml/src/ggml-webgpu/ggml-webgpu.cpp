@@ -4681,6 +4681,11 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                               (src2->type == GGML_TYPE_F32 || src2->type == GGML_TYPE_F16 ||
                                src2->type == GGML_TYPE_Q4_0 || src2->type == GGML_TYPE_Q8_0) &&
                               op->type == GGML_TYPE_F32;
+                // the shaders read one mask plane per sequence: a mask with a plane per head (or head group,
+                // ne[2] > 1, e.g. Inkling 2's relative-position bias) is not supported
+                if (op->src[3] != nullptr && op->src[3]->ne[2] > 1) {
+                    supports_op = false;
+                }
                 if (!supports_op) {
                     break;
                 }

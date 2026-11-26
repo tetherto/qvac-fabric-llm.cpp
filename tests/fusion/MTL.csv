@@ -58,7 +58,6 @@ cohere2             ,0   ,any     ,ADD+ADD                     ,      2
 cohere2             ,0   ,any     ,NORM+MUL                    ,      3
 cohere2moe          ,1   ,any     ,ADD+ADD                     ,      2
 cohere2moe          ,1   ,any     ,MUL+ADD                     ,      2
-cohere2moe          ,1   ,decode  ,MUL_MAT_ID+GLU              ,      1
 cohere2moe          ,1   ,any     ,RMS_NORM+MUL                ,      3
 command-r           ,0   ,prefill ,MUL_MAT+ADD                 ,      1
 command-r           ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
@@ -221,7 +220,6 @@ hunyuan_vl          ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
 hunyuan_vl          ,0   ,any     ,RMS_NORM+MUL                ,      9
 hy_v3               ,0   ,any     ,ADD+ADD                     ,      2
 hy_v3               ,0   ,any     ,MUL+ADD                     ,      4
-hy_v3               ,0   ,decode  ,MUL_MAT_ID+GLU              ,      2
 hy_v3               ,0   ,any     ,RMS_NORM+MUL                ,      5
 hy_v3               ,0   ,any     ,RMS_NORM+MUL+ROPE           ,      2
 hy_v3               ,0   ,any     ,RMS_NORM+MUL+ROPE+SET_ROWS  ,      2
@@ -232,8 +230,9 @@ hy_v4               ,0   ,any     ,NORM+MUL+ADD                ,      1
 hy_v4               ,0   ,any     ,RMS_NORM+MUL                ,      9
 hy_v4               ,0   ,any     ,UNARY+MUL                   ,      2
 inkling2            ,0   ,any     ,MUL+ADD                     ,      6
+inkling2            ,0   ,any     ,MUL_MAT_ID+MUL              ,      3
 inkling2            ,0   ,any     ,RMS_NORM+MUL                ,     10
-inkling2            ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS+SUM_ROWS+SCALE+DIV+SCALE,      3
+inkling2            ,0   ,any     ,UNARY+MUL                   ,      6
 internlm2           ,0   ,prefill ,MUL_MAT+ADD                 ,      2
 internlm2           ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
 internlm2           ,0   ,any     ,RMS_NORM+MUL                ,      5
@@ -463,7 +462,6 @@ qwen35moe           ,1   ,decode  ,ADD+UNARY+MUL+UNARY+GATED_DELTA_NET+CPY,     
 qwen35moe           ,1   ,decode  ,CONCAT+CPY+SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE,      1
 qwen35moe           ,1   ,prefill ,GATED_DELTA_NET+CPY         ,      1
 qwen35moe           ,1   ,any     ,MUL+ADD                     ,      4
-qwen35moe           ,1   ,decode  ,MUL_MAT_ID+GLU              ,      2
 qwen35moe           ,1   ,any     ,RMS_NORM+MUL                ,      7
 qwen35moe           ,1   ,any     ,RMS_NORM+MUL+UNARY+MUL      ,      1
 qwen35moe           ,1   ,prefill ,RMS_NORM+SCALE              ,      2
@@ -481,7 +479,6 @@ qwen3next           ,0   ,any     ,ADD+ADD                     ,      2
 qwen3next           ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
 qwen3next           ,0   ,any     ,MUL+ADD                     ,      4
 qwen3next           ,0   ,prefill ,MUL_MAT+ADD                 ,      1
-qwen3next           ,0   ,decode  ,MUL_MAT_ID+GLU              ,      2
 qwen3next           ,0   ,any     ,RMS_NORM+MUL                ,      6
 qwen3next           ,0   ,any     ,RMS_NORM+MUL+ROPE           ,      1
 qwen3next           ,0   ,any     ,RMS_NORM+MUL+ROPE+SET_ROWS  ,      1
@@ -502,7 +499,6 @@ qwen3vlmoe          ,1   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,
 qwen4exp            ,0   ,any     ,ADD+ADD+ADD                 ,      2
 qwen4exp            ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
 qwen4exp            ,0   ,any     ,MUL+ADD                     ,      4
-qwen4exp            ,0   ,decode  ,MUL_MAT_ID+GLU              ,      2
 qwen4exp            ,0   ,any     ,RMS_NORM+MUL                ,     13
 qwen4exp            ,0   ,any     ,RMS_NORM+SCALE              ,      2
 qwen4exp            ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2

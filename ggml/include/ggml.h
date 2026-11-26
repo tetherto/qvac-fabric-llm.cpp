@@ -618,6 +618,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_TOP_K_ROWS,
 
         GGML_OP_UNARY,
 
@@ -3019,6 +3020,7 @@ extern "C" {
     // mask:    [n_kv,     n_batch, ne32,      ne3]
     // kv_rows: [n_kv,     ne3] I32, mask column i of slice i3 uses row kv_rows[i, i3] of k and v
     // negative rows are padding, their mask entries must be -inf
+    // the result is repeatable only for the same order of the list
     GGML_API struct ggml_tensor * ggml_flash_attn_ext_rows(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -3349,6 +3351,23 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
+    // ggml_lightning_indexer over the K rows that k_rows lists, instead of a gathered copy of them
+    //
+    // k:       [n_embd_idx, 1,          n_k,     1   ] rows of a larger storage, read in place
+    // k_rows:  [n_kv] i32, the K row of each score, in [0, n_k)
+    // mask:    [n_kv,       n_batch,    1,       ne33]
+    // res:     [n_kv,       n_batch,    1,       ne3 ]
+    //
+    // the rows are shared by the ne3 slices of q
+    //
+    GGML_API struct ggml_tensor * ggml_lightning_indexer_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * k_rows);
+
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.
@@ -3417,6 +3436,34 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // the cells that ggml_top_k_mask keeps as one list per group of n_group rows, for ggml_flash_attn_ext_rows
+    //
+    // top_k, score, blocks, extra: as in ggml_top_k_mask
+    // n_group == 1:
+    //   res: [n_res, ne1, ne2, ne3] i32: the cells of the picks in pick order (n_blk per pick), then the extra cells, then padding
+    //        entries of dead picks, cells out of [0, n_kv) and the padding are -1
+    //        f16 or f32: the matching mask, 0 for a listed cell and -inf for a -1 entry
+    // n_group > 1, rows i1 = g*n_group + j form group g, n_grp1 = ceil(ne1/n_group) groups:
+    //   res: i32 [n_res, n_grp1, ne2, ne3]: the cells of the picks that are live in any row of the group, in pick order,
+    //        then the extra cells of each row of the group, then padding
+    //        f16 or f32 [n_res, n_grp1*n_group, ne2, ne3]: the mask of each row over its group's list,
+    //        0 where the entry is a cell of a live pick of the row or one of its own extra cells, else -inf
+    //        the rows past ne1 that complete the last group are -inf
+    //   n_res >= min(n_pick, n_group*n_top)*n_blk + n_group*n_extra
+    //
+    // a cell that is listed twice is attended twice, the picks and the extra cells of a row must not overlap
+    //
+    GGML_API struct ggml_tensor * ggml_top_k_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * extra,
+            int64_t               n_kv,
+            int64_t               n_res,
+            int64_t               n_group,
+            enum ggml_type        type);
 
     // custom operators
 

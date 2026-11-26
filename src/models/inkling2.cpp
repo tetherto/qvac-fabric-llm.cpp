@@ -174,6 +174,18 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
     return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
 }
 
+bool llama_model_inkling2::graph::model_on_cpu(const llama_model & model) {
+    if (ggml_backend_dev_type(model.dev_output()) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+    for (int il = 0; il < (int) model.hparams.n_layer(); ++il) {
+        if (ggml_backend_dev_type(model.dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
     ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
@@ -187,7 +199,18 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    // the weighted sum has K = the number of states: with the scores as src0 n_embd is the long dimension, which is
+    // faster on GPUs, while the CPU is faster with one mat-vec per token (the states as src0). a partly offloaded
+    // model keeps the scores as src0 everywhere, which measured faster than choosing per layer
+    if (on_cpu) {
+        return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    }
+
+    ggml_tensor * out = ggml_mul_mat(ctx0, scores, ggml_cont(ctx0, ggml_transpose(ctx0, states))); // [n_queries, n_embd, n_tokens]
+    if (query->ne[1] == 1) {
+        return ggml_reshape_3d(ctx0, out, n_embd, 1, n_tokens);
+    }
+    return ggml_cont(ctx0, ggml_permute(ctx0, out, 1, 0, 2, 3));
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
@@ -438,7 +461,7 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     res->t_logits = cur;
 }
 
-llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params), model(model) {
+llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params), model(model), on_cpu(model_on_cpu(model)) {
     ggml_tensor * cur = build_inputs();
 
     std::vector<ggml_tensor *> blocks;

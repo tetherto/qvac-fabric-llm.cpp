@@ -419,9 +419,14 @@ llama_context::llama_context(
     {
         cparams.fused_kv_rows = false;
 
+        // a one-sequence cache has a single stream like a unified one. qwen4exp attends only through the QSA row
+        // lists, which read the selected cells instead of the whole cache, so it takes them there too. a dense model
+        // would read its whole sequence through the list, so it keeps the dense mask
+        const bool sparse_rows_only = model.arch == LLM_ARCH_QWEN4EXP && hparams.indexer_kpool > 0;
+
         const char * LLAMA_KV_ROWS_DISABLE = getenv("LLAMA_KV_ROWS_DISABLE");
         if (!LLAMA_KV_ROWS_DISABLE) {
-            cparams.auto_fkvr = cparams.kv_unified;
+            cparams.auto_fkvr = cparams.kv_unified || (sparse_rows_only && cparams.n_seq_max == 1);
         } else {
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;
@@ -3281,16 +3286,22 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids = ids;
     }
 
+    // a weight shared by several MUL_MAT_IDs (layers that share their experts) is copied again by each split that reads
+    // it, see ggml_backend_sched_split_graph; the experts that an earlier split of this compute uploaded are still there
+    std::vector<bool> & uploaded = st.uploaded[dst];
+    uploaded.resize(n_expert, false);
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
-        if (!st.used[first]) {
+        if (!st.used[first] || uploaded[first]) {
             first++;
             continue;
         }
         int64_t last = first;
-        while (last + 1 < n_expert && st.used[last + 1]) {
+        while (last + 1 < n_expert && st.used[last + 1] && !uploaded[last + 1]) {
             last++;
         }
+        std::fill(uploaded.begin() + first, uploaded.begin() + last + 1, true);
 
         // the experts in the MoE cache are copied from device memory, the others are uploaded
         int64_t next = first;

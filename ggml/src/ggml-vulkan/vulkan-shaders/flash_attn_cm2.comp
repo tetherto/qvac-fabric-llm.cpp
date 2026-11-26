@@ -142,13 +142,18 @@ layout (binding = 2) readonly buffer V16V4 {FLOAT_TYPEV4 data_v16v4[];};
 // K/V/mask offsets in 16-bit elements for the current head/batch, set in main().
 uint32_t g_k_off_elem, g_v_off_elem, g_m_off_elem;
 
+// Length of the index list read by the gather callbacks: n_kv_max for sparse, the kv_rows list length otherwise.
+uint32_t fa_gather_len() {
+    return USE_SPARSE ? p.split_kv : KV;
+}
+
 FLOAT_TYPE faGatherK(const decodeBufFA_K bl_in, const uint32_t blockCoords[2], const uint32_t coordInBlock[2]) {
-    if (blockCoords[0] >= p.split_kv) { return FLOAT_TYPE(0.0); }
+    if (blockCoords[0] >= fa_gather_len()) { return FLOAT_TYPE(0.0); }
     const int r = data_sparse[sparse_base + blockCoords[0]];
     if (r < 0) { return FLOAT_TYPE(0.0); }
 #if !defined(BFLOAT16) && defined(LLAMA_UPSTREAM_FA_MIXED_TYPES)
     if (USE_DECODE_K) {
-        decodeBufFA_K block = decodeBufFA_K(decodeBufFA_Byte(bl_in) + uint64_t(uint(r) - blockCoords[0]) * k_stride * FaBlockBytesK);
+        decodeBufFA_K block = decodeBufFA_K(decodeBufFA_Byte(bl_in) + (uint64_t(r) - uint64_t(blockCoords[0])) * uint64_t(k_stride * FaBlockBytesK));
         return faDecodeK(block, blockCoords, coordInBlock);
     }
 #endif
@@ -156,12 +161,12 @@ FLOAT_TYPE faGatherK(const decodeBufFA_K bl_in, const uint32_t blockCoords[2], c
 }
 
 FLOAT_TYPE faGatherV(const decodeBufFA_V bl_in, const uint32_t blockCoords[2], const uint32_t coordInBlock[2]) {
-    if (blockCoords[0] >= p.split_kv) { return FLOAT_TYPE(0.0); }
+    if (blockCoords[0] >= fa_gather_len()) { return FLOAT_TYPE(0.0); }
     const int r = data_sparse[sparse_base + blockCoords[0]];
     if (r < 0) { return FLOAT_TYPE(0.0); }
 #if !defined(BFLOAT16) && defined(LLAMA_UPSTREAM_FA_MIXED_TYPES)
     if (USE_DECODE_V) {
-        decodeBufFA_V block = decodeBufFA_V(decodeBufFA_Byte(bl_in) + uint64_t(uint(r) - blockCoords[0]) * v_stride * FaBlockBytesV);
+        decodeBufFA_V block = decodeBufFA_V(decodeBufFA_Byte(bl_in) + (uint64_t(r) - uint64_t(blockCoords[0])) * uint64_t(v_stride * FaBlockBytesV));
         return faDecodeV(block, blockCoords, coordInBlock);
     }
 #endif
@@ -170,12 +175,12 @@ FLOAT_TYPE faGatherV(const decodeBufFA_V bl_in, const uint32_t blockCoords[2], c
 
 #ifdef GL_NV_cooperative_matrix_decode_vector
 FLOAT_TYPEV4 faGatherKVector(const decodeBufFA_K bl_in, const uint32_t blockCoords[2], const uint32_t coordInBlock[2]) {
-    if (blockCoords[0] >= p.split_kv) { return FLOAT_TYPEV4(0.0); }
+    if (blockCoords[0] >= fa_gather_len()) { return FLOAT_TYPEV4(0.0); }
     const int r = data_sparse[sparse_base + blockCoords[0]];
     if (r < 0) { return FLOAT_TYPEV4(0.0); }
 #if !defined(BFLOAT16) && defined(LLAMA_UPSTREAM_FA_MIXED_TYPES)
     if (USE_DECODE_K) {
-        decodeBufFA_K block = decodeBufFA_K(decodeBufFA_Byte(bl_in) + uint64_t(uint(r) - blockCoords[0]) * k_stride * FaBlockBytesK);
+        decodeBufFA_K block = decodeBufFA_K(decodeBufFA_Byte(bl_in) + (uint64_t(r) - uint64_t(blockCoords[0])) * uint64_t(k_stride * FaBlockBytesK));
         return faDecodeKVector(block, blockCoords, coordInBlock);
     }
 #endif
@@ -184,12 +189,12 @@ FLOAT_TYPEV4 faGatherKVector(const decodeBufFA_K bl_in, const uint32_t blockCoor
 }
 
 FLOAT_TYPEV4 faGatherVVector(const decodeBufFA_V bl_in, const uint32_t blockCoords[2], const uint32_t coordInBlock[2]) {
-    if (blockCoords[0] >= p.split_kv) { return FLOAT_TYPEV4(0.0); }
+    if (blockCoords[0] >= fa_gather_len()) { return FLOAT_TYPEV4(0.0); }
     const int r = data_sparse[sparse_base + blockCoords[0]];
     if (r < 0) { return FLOAT_TYPEV4(0.0); }
 #if !defined(BFLOAT16) && defined(LLAMA_UPSTREAM_FA_MIXED_TYPES)
     if (USE_DECODE_V) {
-        decodeBufFA_V block = decodeBufFA_V(decodeBufFA_Byte(bl_in) + uint64_t(uint(r) - blockCoords[0]) * v_stride * FaBlockBytesV);
+        decodeBufFA_V block = decodeBufFA_V(decodeBufFA_Byte(bl_in) + (uint64_t(r) - uint64_t(blockCoords[0])) * uint64_t(v_stride * FaBlockBytesV));
         return faDecodeVVector(block, blockCoords, coordInBlock);
     }
 #endif
@@ -373,8 +378,8 @@ void main() {
     tensorViewNV<2, false, 1, 0> tensorViewTranspose = createTensorViewNV(2, false, 1, 0);
 
 #ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
-    const uint bs_k = USE_SPARSE ? max(FA_GATHER_BS, BLOCK_SIZE_K) : BLOCK_SIZE_K;
-    const uint bs_v = USE_SPARSE ? max(FA_GATHER_BS, BLOCK_SIZE_V) : BLOCK_SIZE_V;
+    const uint bs_k = KV_GATHER ? max(FA_GATHER_BS, BLOCK_SIZE_K) : BLOCK_SIZE_K;
+    const uint bs_v = KV_GATHER ? max(FA_GATHER_BS, BLOCK_SIZE_V) : BLOCK_SIZE_V;
     tensorLayoutK = setTensorLayoutBlockSizeNV(tensorLayoutK, 1, bs_k);
     tensorLayoutV = setTensorLayoutBlockSizeNV(tensorLayoutV, 1, bs_v);
 #else
@@ -421,6 +426,18 @@ void main() {
     tensorLayoutQ = setTensorLayoutStrideNV(tensorLayoutQ, q_stride, 1);
     tensorLayoutK = setTensorLayoutStrideNV(tensorLayoutK, k_stride, 1);
     tensorLayoutV = setTensorLayoutStrideNV(tensorLayoutV, v_stride, 1);
+
+    // kv_rows: a KV block with consecutive rows is loaded like the dense cache, through these layouts over the cache
+    // rows (dimension and stride set per block, setting the dimension resets the stride), the others through the
+    // gather callbacks
+    tensorLayoutNV<2, Clamp> tensorLayoutKd = createTensorLayoutNV(2, Clamp);
+    tensorLayoutNV<2, Clamp> tensorLayoutVd = createTensorLayoutNV(2, Clamp);
+#ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
+    if (USE_KV_ROWS) {
+        tensorLayoutKd = setTensorLayoutBlockSizeNV(tensorLayoutKd, 1, BLOCK_SIZE_K);
+        tensorLayoutVd = setTensorLayoutBlockSizeNV(tensorLayoutVd, 1, BLOCK_SIZE_V);
+    }
+#endif
 
     coopmat<Q_TYPE, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseAccumulator> Q;
     coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseA> Qf16;
@@ -535,10 +552,26 @@ void main() {
         coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, HSK_pad, Bc, gl_MatrixUseB> K_T;
 
         uint32_t k_offset = ik2*p.nb12 + ik3*p.nb13;
+
+        if (USE_KV_ROWS) {
+            fa_kv_rows_tile(j);
+        }
+        const bool kv_gather = USE_SPARSE || (USE_KV_ROWS && !kv_tile_dense);
         // F16: bs_k==1 (direct load). F32: bs_k==4 (vec4 / dequantFuncF32). Quantized types: bs_k==32.
 #ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
-        if (USE_SPARSE) {
+        if (kv_gather) {
             coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, 0, HSK_pad), tensorViewTranspose FAGATHERK);
+        } else if (USE_KV_ROWS) {
+            tensorLayoutKd = setTensorLayoutDimensionNV(tensorLayoutKd, kv_tile_r0 + Bc, HSK);
+            tensorLayoutKd = setTensorLayoutStrideNV(tensorLayoutKd, k_stride, 1);
+#if !defined(BFLOAT16)
+            if (USE_DECODE_K) {
+                coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutKd, kv_tile_r0, Bc, 0, HSK_pad), tensorViewTranspose FADECODEK);
+            } else
+#endif
+            {
+                coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutKd, kv_tile_r0, Bc, 0, HSK_pad), tensorViewTranspose);
+            }
 #if !defined(BFLOAT16)
         } else if (USE_DECODE_K) {
             coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, 0, HSK_pad), tensorViewTranspose FADECODEK);
@@ -691,8 +724,19 @@ void main() {
         coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, Bc, HSV_pad, gl_MatrixUseB> V;
         uint32_t v_offset = iv2*p.nb22 + iv3*p.nb23;
 #ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
-        if (USE_SPARSE) {
+        if (kv_gather) {
             coopMatLoadTensorNV(V, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc, Bc, 0, HSV_pad) FAGATHERV);
+        } else if (USE_KV_ROWS) {
+            tensorLayoutVd = setTensorLayoutDimensionNV(tensorLayoutVd, kv_tile_r0 + Bc, HSV);
+            tensorLayoutVd = setTensorLayoutStrideNV(tensorLayoutVd, v_stride, 1);
+#if !defined(BFLOAT16)
+            if (USE_DECODE_V) {
+                coopMatLoadTensorNV(V, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutVd, kv_tile_r0, Bc, 0, HSV_pad) FADECODEV);
+            } else
+#endif
+            {
+                coopMatLoadTensorNV(V, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutVd, kv_tile_r0, Bc, 0, HSV_pad));
+            }
 #if !defined(BFLOAT16)
         } else if (USE_DECODE_V) {
             coopMatLoadTensorNV(V, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc, Bc, 0, HSV_pad) FADECODEV);

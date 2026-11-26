@@ -76,6 +76,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -282,10 +283,11 @@ struct vk_matmul_pipeline_key {
     bool mul_mat_id;
     bool f16acc;
     bool full_f32 = false;
+    bool stream_k = false;
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc, full_f32)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.full_f32);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, full_f32, stream_k)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.full_f32, o.stream_k);
     }
 };
 
@@ -297,12 +299,14 @@ struct vk_matmul_pipeline_pair {
     vk_pipeline unaligned;
     vk_pipeline aligned;
     uint32_t align;
+    uint32_t narrow_n_max = 0;
 };
 
 struct vk_tile_config {
     std::vector<uint32_t> warptile;
     std::array<uint32_t, 3> wg_denoms;
     uint32_t align;
+    uint32_t narrow_n_max = 0;
 };
 
 using matmul_tile_selector_t = std::function<uint32_t(
@@ -387,6 +391,8 @@ struct vk_queue {
 };
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
+// Integer-dot mat-vec column limit where ggml_vk_mmvq_wide() allows it past mul_mat_vec_max_cols.
+static constexpr uint32_t mul_mat_vecq_max_cols = 16;
 
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
@@ -447,6 +453,7 @@ static constexpr uint32_t FA_FLAG_MULTI_ROW    = 128;   // host only: build the 
 static constexpr uint32_t FA_FLAG_MR_LAZY      = 256;   // multi-row: skip identity O rescales
 static constexpr uint32_t FA_FLAG_MR_NOEB      = 512;   // multi-row: no loop-end barrier
 static constexpr uint32_t FA_FLAG_MR_VPOST     = 1024;  // multi-row: V^T loads before the softmax barrier
+static constexpr uint32_t FA_FLAG_KV_ROWS      = 2048;  // K/V rows are read through the kv_rows lists (binding 7)
 
 struct vk_fa_pipeline_state {
     uint32_t HSK, HSV;
@@ -825,6 +832,7 @@ struct vk_device_struct {
     bool coopmat2;
     bool coopmat2_bf16_support {};
     bool coopmat2_decode_vector;
+    bool shared_avail_to_barriers {};
 
     bool dot2_f16 {};
     bool ocp_fp4 {};
@@ -872,7 +880,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mm_tbq_qjl[GGML_TYPE_COUNT][2];
 
     vk_pipeline pipeline_matmul_split_k_reduce;
+    vk_pipeline pipeline_matmul_stream_k_fixup;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_swiglu_quantize_q8_1_x4;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -881,7 +891,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
-    vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+    vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vecq_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
@@ -1142,6 +1152,8 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_fa_sparse_compact;
     vk_pipeline pipeline_fa_sparse_compact_subgroup;
+    vk_pipeline pipeline_fa_kv_rows_blocks;
+    vk_pipeline pipeline_fa_kv_rows_gather_f16;
     bool fa_sparse_compact_use_subgroups;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
@@ -1161,7 +1173,10 @@ struct vk_device_struct {
     bool disable_fusion;
     bool disable_descriptor_reuse;
     std::atomic<uint64_t> buffer_destroy_count {};
+    bool disable_stream_k;
+    bool force_stream_k;
     bool disable_graph_optimize;
+    bool disable_narrow_mul_mat;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
@@ -1677,7 +1692,10 @@ struct ggml_backend_vk_context {
     // set while the current node is a direct conv: srcs read outside node->src (x, state) for the sync tracking
     const ggml_tensor * fused_extra_srcs[2] {};
     bool fused_fwht_signed {};
+    // GLU whose result the next MMQ quantizes directly from the GLU inputs (GLU_MUL_MAT fusion)
+    ggml_tensor * fused_glu_q8_1 {};
     std::atomic<uint64_t> fwht_fusion_count {};
+    std::atomic<uint64_t> glu_mul_mat_fusion_count {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -1746,6 +1764,9 @@ static constexpr uint32_t kSpvOpCooperativeMatrixLoadTensorNV = 5367;
 static constexpr uint32_t kSpvCapabilityCooperativeMatrixDecodeVectorNV = 5447;
 
 static constexpr uint32_t kSpvTensorAddressingDecodeVectorFuncBit = 0x4;
+
+static constexpr uint32_t kSpvOpCooperativeMatrixLoadKHR  = 4457;
+static constexpr uint32_t kSpvOpCooperativeMatrixStoreKHR = 4458;
 
 struct vk_fa_tuning_params {
     FaCodePath path;

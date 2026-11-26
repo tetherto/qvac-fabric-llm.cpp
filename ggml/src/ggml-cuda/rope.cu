@@ -3,6 +3,94 @@
 #include "ggml.h"
 #include "rope.cuh"
 
+struct rope_flux_strides {
+    size_t x[GGML_MAX_DIMS];
+    size_t pe[GGML_MAX_DIMS];
+};
+
+static __device__ __forceinline__ float rope_flux_dot_uncontracted(float x0, float p0, float x1, float p1) {
+#if defined(GGML_USE_HIP)
+    float a = x0 * p0;
+    float b = x1 * p1;
+    asm volatile("" : "+v"(a), "+v"(b));
+    return a + b;
+#else
+    return __fadd_rn(__fmul_rn(x0, p0), __fmul_rn(x1, p1));
+#endif
+}
+
+static __device__ __forceinline__ float rope_flux_load(const char * base, const size_t offset) {
+    return *reinterpret_cast<const float *>(base + offset);
+}
+
+static __device__ __forceinline__ size_t rope_flux_x_offset(
+        const int pair, const int token, const int batch_head, const int n_head, const rope_flux_strides & strides) {
+    return (batch_head / n_head) * strides.x[3] + token * strides.x[2] +
+        (batch_head % n_head) * strides.x[1] + (2 * pair) * strides.x[0];
+}
+
+template <bool has_pe>
+static __global__ void rope_flux_f32(
+        const char * x, const char * pe, float * dst,
+        const int d_head, const int n_head, const int length,
+        const int pairs, const rope_flux_strides strides) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pairs) {
+        return;
+    }
+
+    const int    half_head  = d_head / 2;
+    const int    pair       = i % half_head;
+    const int    token      = (i / half_head) % length;
+    const int    batch_head = i / (half_head * length);
+    const size_t offset     = rope_flux_x_offset(pair, token, batch_head, n_head, strides);
+    const float  even       = rope_flux_load(x, offset);
+    const float  odd        = rope_flux_load(x, offset + strides.x[0]);
+
+    if constexpr (!has_pe) {
+        dst[2 * i]     = even;
+        dst[2 * i + 1] = odd;
+        return;
+    }
+
+    const char * p = pe + token * strides.pe[3] + pair * strides.pe[2];
+    dst[2 * i]     = rope_flux_dot_uncontracted(even, rope_flux_load(p, 0),             odd, rope_flux_load(p, strides.pe[0]));
+    dst[2 * i + 1] = rope_flux_dot_uncontracted(even, rope_flux_load(p, strides.pe[1]), odd, rope_flux_load(p, strides.pe[0] + strides.pe[1]));
+}
+
+static rope_flux_strides rope_flux_make_strides(const ggml_tensor * x, const ggml_tensor * pe) {
+    rope_flux_strides strides = {};
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        strides.x[d]  = x->nb[d];
+        strides.pe[d] = pe ? pe->nb[d] : 0;
+    }
+    return strides;
+}
+
+void ggml_cuda_op_rope_flux(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x  = dst->src[0];
+    const ggml_tensor * pe = dst->src[1];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(!pe || pe->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(dst) <= INT32_MAX);
+
+    const rope_flux_strides strides  = rope_flux_make_strides(x, pe);
+    const int               pairs    = ggml_nelements(dst) / 2;
+    const dim3              blocks((pairs + CUDA_ROPE_BLOCK_SIZE - 1) / CUDA_ROPE_BLOCK_SIZE);
+    const char *            x_data   = static_cast<const char *>(x->data);
+    float *                 dst_data = static_cast<float *>(dst->data);
+    cudaStream_t            stream   = ctx.stream();
+
+    if (pe) {
+        rope_flux_f32<true><<<blocks, CUDA_ROPE_BLOCK_SIZE, 0, stream>>>(
+            x_data, static_cast<const char *>(pe->data), dst_data, x->ne[0], x->ne[1], x->ne[2], pairs, strides);
+        return;
+    }
+    rope_flux_f32<false><<<blocks, CUDA_ROPE_BLOCK_SIZE, 0, stream>>>(
+        x_data, nullptr, dst_data, x->ne[0], x->ne[1], x->ne[2], pairs, strides);
+}
+
 struct rope_corr_dims {
     float v[2];
 };

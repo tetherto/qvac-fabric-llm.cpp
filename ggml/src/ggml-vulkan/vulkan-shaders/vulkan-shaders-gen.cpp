@@ -1236,6 +1236,7 @@ void process_shaders() {
     string_to_spv("acc_f32", "acc.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
+    string_to_spv("stream_k_fixup", "mul_mat_stream_k_fixup.comp", {});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
@@ -1246,6 +1247,8 @@ void process_shaders() {
 #endif
 
     string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});
+    string_to_spv("fa_kv_rows_blocks", "flash_attn_kv_rows_blocks.comp", {});
+    string_to_spv("fa_kv_rows_gather_f16", "flash_attn_kv_rows_gather.comp", {});
     string_to_spv("fa_sparse_compact_subgroup", "flash_attn_sparse_compact.comp", {{"USE_SUBGROUPS", "1"}});
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
@@ -1253,6 +1256,8 @@ void process_shaders() {
 
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
+    string_to_spv("swiglu_quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"GLU_SWIGLU", "1"}});
+    string_to_spv("swiglu_quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"GLU_SWIGLU", "1"}, {"USE_SUBGROUPS", "1"}});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 

@@ -4000,10 +4000,14 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
     GGML_UNUSED(dev);
     //TODO: call the remote backend and cache the results
     // the client cannot query the remote backend, and these ops are missing on some backends
+    // (TOP_K_ROWS: CPU and CUDA only; its probe then keeps the QSA selection on the mask attention path)
+    if (op->op == GGML_OP_LIGHTNING_INDEXER && op->src[4] != nullptr) {
+        return false; // the K row list of ggml_lightning_indexer_rows: CPU and CUDA only
+    }
     return op->op != GGML_OP_MUL_MAT_CONVROT && op->op != GGML_OP_CONVROT &&
            op->op != GGML_OP_SSM_CONV_RAGGED && op->op != GGML_OP_GATED_DELTA_NET_RAGGED &&
            op->op != GGML_OP_GATED_DELTA_NET_DEFERRED && op->op != GGML_OP_GDN_CONV_DEFERRED &&
-           op->op != GGML_OP_ROPE_FLUX &&
+           op->op != GGML_OP_ROPE_FLUX && op->op != GGML_OP_TOP_K_ROWS &&
            (op->op != GGML_OP_FLASH_ATTN_EXT || !ggml_flash_attn_ext_has_indexed_bias(op));
 }
 

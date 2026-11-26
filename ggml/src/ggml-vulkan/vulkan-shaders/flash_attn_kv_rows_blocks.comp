@@ -1,0 +1,41 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer R {int data_rows[];};
+layout (binding = 1) writeonly buffer D {int data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint KV;          // list length
+    uint Bc;          // KV block size of the flash attention kernel
+    uint n_blocks;    // CEIL_DIV(KV, Bc)
+    uint n_slices;
+    uint rows_stride; // elements between the lists of two slices
+} p;
+
+// For the flash attention over kv_rows lists: copies the lists to [n_slices][KV] and appends, for every KV block of
+// every slice, the cache row of its first column when the rows of the block are consecutive (the kernel then reads
+// the block like the dense cache), -1 otherwise.
+void main() {
+    const uint b = gl_GlobalInvocationID.x;
+    const uint s = gl_GlobalInvocationID.y;
+    if (b >= p.n_blocks) {
+        return;
+    }
+
+    const uint c0 = b * p.Bc;
+    const uint src = s * p.rows_stride + c0;
+    const uint dst = s * p.KV + c0;
+
+    const int r0 = data_rows[src];
+    bool ok = r0 >= 0 && c0 + p.Bc <= p.KV;
+    for (uint c = 0; c < p.Bc && c0 + c < p.KV; ++c) {
+        const int r = data_rows[src + c];
+        data_d[dst + c] = r;
+        ok = ok && r == r0 + int(c);
+    }
+
+    data_d[p.n_slices * p.KV + s * p.n_blocks + b] = ok ? r0 : -1;
+}
