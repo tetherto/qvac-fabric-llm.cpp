@@ -928,6 +928,7 @@ static int execute_op(struct htp_ops_context * octx) {
             return op_binary(octx);
 
         case HTP_OP_NORM:
+        case HTP_OP_NORM_AFFINE:
         case HTP_OP_RMS_NORM:
         case HTP_OP_RMS_NORM_MUL:
         case HTP_OP_SCALE:

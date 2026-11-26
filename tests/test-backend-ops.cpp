@@ -4308,6 +4308,51 @@ struct test_layer_norm : public test_case {
     }
 };
 
+// Group norm as a row norm: GGML_OP_NORM over one row per group, then GGML_OP_MUL and GGML_OP_ADD with one value
+// per channel and an optional SiLU
+struct test_group_norm_rows : public test_case {
+    const std::array<int64_t, 4> ne; // [W, H, C, N]
+    const int64_t groups;
+    const bool bias;
+    const bool silu;
+    const float eps = 1e-6f;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GROUP_NORM_ROWS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, groups, bias, silu);
+    }
+
+    test_group_norm_rows(std::array<int64_t, 4> ne = {8, 8, 64, 2}, int64_t groups = 32, bool bias = true, bool silu = true)
+        : ne(ne), groups(groups), bias(bias), silu(silu) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, ne[2], 1);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, ne[2], 1);
+        ggml_set_name(a, "a"); ggml_set_name(w, "w"); ggml_set_name(b, "b");
+
+        // an op in front, so that the norm input is a compute tensor
+        ggml_tensor * x    = ggml_scale(ctx, a, 2.0f);
+        ggml_tensor * rows = ggml_reshape_2d(ctx, x, ne[0] * ne[1] * ne[2] / groups, groups * ne[3]);
+        ggml_tensor * out  = ggml_reshape_4d(ctx, ggml_norm(ctx, rows, eps), ne[0], ne[1], ne[2], ne[3]);
+        out = ggml_mul(ctx, out, w);
+        if (bias) {
+            out = ggml_add(ctx, out, b);
+        }
+        if (silu) {
+            out = ggml_silu(ctx, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // nn.Linear: GGML_OP_MUL_MAT + GGML_OP_ADD of a bias with one value per output row
 struct test_mul_mat_bias : public test_case {
     const ggml_type type_a;
@@ -17487,6 +17532,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_layer_norm({ 128, 1, 90, 62 }, 1e-6f)); // tokens of an image, [C, 1, W, H]
+    for (bool bias : { false, true }) {
+        for (bool silu : { false, true }) {
+            test_cases.emplace_back(new test_group_norm_rows({ 8, 8, 64, 2 }, 32, bias, silu));
+            test_cases.emplace_back(new test_group_norm_rows({ 16, 16, 96, 1 }, 32, bias, silu));
+        }
+    }
+    test_cases.emplace_back(new test_group_norm_rows({ 64, 64, 320, 1 }, 32)); // a row of 160 KB
+    test_cases.emplace_back(new test_group_norm_rows({ 32, 32, 1920, 2 }, 32)); // a row that leaves VTCM for few threads
+    test_cases.emplace_back(new test_group_norm_rows({ 5, 5, 64, 1 }, 32)); // planes that do not fill whole vectors
+    test_cases.emplace_back(new test_group_norm_rows({ 8, 8, 64, 3 }, 16)); // groups of four channels
 
     // 37 output rows take the scalar bias kernel, the other row counts four elements per thread
     for (ggml_type type_a : { GGML_TYPE_F16, GGML_TYPE_F32 }) {

@@ -1557,7 +1557,7 @@ static void htp_collapse_dims(struct ggml_tensor ** tensors, size_t n_tensors, s
 }
 
 static bool htp_unary_reduces_whole_rows(uint32_t op) {
-    return op == HTP_OP_NORM || op == HTP_OP_RMS_NORM || op == HTP_OP_L2_NORM;
+    return op == HTP_OP_NORM || op == HTP_OP_NORM_AFFINE || op == HTP_OP_RMS_NORM || op == HTP_OP_L2_NORM;
 }
 
 static uint32_t htp_unary_fit_row_threads(uint32_t op, ggml_type type, uint32_t n_threads, size_t vtcm_size, size_t src0_row_size, size_t dst_row_size) {
@@ -1567,6 +1567,13 @@ static uint32_t htp_unary_fit_row_threads(uint32_t op, ggml_type type, uint32_t 
     const size_t staged_row_size = 2 * (hex_round_up(src0_row_size, 128) + hex_round_up(dst_row_size, 128));
     const size_t fitting_threads = staged_row_size > 0 ? vtcm_size / staged_row_size : n_threads;
     return (uint32_t) (std::max<size_t>(1, (std::min<size_t>)(n_threads, fitting_threads)));
+}
+
+static uint32_t htp_unary_weight_row_elems(uint32_t op, const struct ggml_tensor * src1) {
+    if (op == HTP_OP_NORM_AFFINE) {
+        return (uint32_t) (HTP_NORM_AFFINE_TERMS * htp_norm_affine_term_bytes(ggml_nelements(src1)) / sizeof(float));
+    }
+    return op == HTP_OP_RMS_NORM_MUL ? (uint32_t) src1->ne[0] : 0;
 }
 
 static bool htp_kparams_solve_unary_impl(
@@ -1637,7 +1644,8 @@ static bool htp_kparams_solve_unary_impl(
 
     kparams->n_threads = n_threads;
 
-    const bool broadcast_weight = (op == HTP_OP_RMS_NORM_MUL) && (src1->ne[1] * src1->ne[2] * src1->ne[3] == 1);
+    const bool broadcast_weight = (op == HTP_OP_NORM_AFFINE) ||
+                                  ((op == HTP_OP_RMS_NORM_MUL) && (src1->ne[1] * src1->ne[2] * src1->ne[3] == 1));
     kparams->broadcast_weight   = broadcast_weight;
 
     const bool     src0_contig           = ggml_is_contiguous_1(src0);
@@ -1657,7 +1665,7 @@ static bool htp_kparams_solve_unary_impl(
     uint32_t vtcm_row_per_thread = 0;
 
     htp_unary_solve_layout(&L, op, src0->ne[0], dst->ne[0],
-                           op == HTP_OP_RMS_NORM_MUL ? src1->ne[0] : 0,
+                           htp_unary_weight_row_elems(op, src1),
                            max_block, broadcast_weight, n_threads, vtcm_size, elem_size,
                            &col_tile, &vtcm_row_per_thread);
 
@@ -1694,6 +1702,16 @@ bool htp_kparams_solve_rms_norm_mul(
     struct htp_unary_kernel_params * kparams
 ) {
     return htp_kparams_solve_unary_impl(sess, HTP_OP_RMS_NORM_MUL, src0, src1, dst, kparams);
+}
+
+bool htp_kparams_solve_norm_affine(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * weight,
+    const struct ggml_tensor * dst,
+    struct htp_unary_kernel_params * kparams
+) {
+    return htp_kparams_solve_unary_impl(sess, HTP_OP_NORM_AFFINE, src0, weight, dst, kparams);
 }
 
 bool htp_kparams_solve_repeat_get_rows(
