@@ -48,6 +48,7 @@ enum llm_graph_type {
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
     LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
+    LLM_FUSED_OP_FLASH_ATTN_IDX_BIAS,
     LLM_FUSED_OP_GDN_AR,
     LLM_FUSED_OP_GDN_CH,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
@@ -318,6 +319,9 @@ public:
     // states from i0 = mv0 (n_seqs when the range is empty) through the extra states
     uint32_t mv0 = 0;
     uint32_t mv1 = 0;
+
+    // the graph reads s_copy_moved, so its topology depends on [mv0, mv1); other graphs can be reused for any range
+    bool     moved_used = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -1338,7 +1342,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kq_b_idx = nullptr) const; // with kq_b_idx, kq_b is the table of an indexed bias, see ggml_flash_attn_ext_add_indexed_bias
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1535,7 +1540,7 @@ struct llm_graph_context {
             uint32_t extent,
             uint32_t extent_swa) const;
 
-    // kq_b is added to the KQ mask, after the KQ scale
+    // the bias of key k for query q and head h, table[rel_pos[k, q], h, q], is added to the KQ mask, after the KQ scale
     ggml_tensor * build_attn(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
             ggml_tensor * wo,
@@ -1544,7 +1549,7 @@ struct llm_graph_context {
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
+            ggml_tensor * table, // [n_bins, n_head_q, n_tokens], indexed by the relative positions of inp
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
                     int   il) const;
