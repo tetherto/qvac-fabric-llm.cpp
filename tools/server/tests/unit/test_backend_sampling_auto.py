@@ -1,5 +1,12 @@
+import os
 import pytest
 from utils import *
+
+# --backend-sampling (here from the environment) samples every request on the backend, so the automatic choice never runs
+pytestmark = pytest.mark.skipif(
+    os.environ.get("LLAMA_ARG_BACKEND_SAMPLING", "") in ("on", "enabled", "true", "1"),
+    reason="automatic backend sampling applies only without --backend-sampling",
+)
 
 server = ServerPreset.tinyllama2()
 
