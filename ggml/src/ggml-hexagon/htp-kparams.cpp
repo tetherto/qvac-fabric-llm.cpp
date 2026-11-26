@@ -2092,6 +2092,15 @@ static bool htp_kparams_solve_sum_rows(
     return true;
 }
 
+static constexpr int64_t HTP_GLU_F16_PAIR_ELEMS = 2 * (128 / sizeof(float));
+
+static bool htp_glu_accepts_dst_type(uint32_t op, const struct ggml_tensor * src0, const struct ggml_tensor * dst) {
+    if (op == HTP_OP_GLU_GEGLU && src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+        return dst->ne[0] % HTP_GLU_F16_PAIR_ELEMS == 0;
+    }
+    return dst->type == src0->type;
+}
+
 bool htp_kparams_solve_unary_mul_glu(
     const struct ggml_hexagon_session * sess,
     uint32_t op,
@@ -2105,7 +2114,7 @@ bool htp_kparams_solve_unary_mul_glu(
     if (!htp_op_is_glu((htp_op_code) op)) {
         return false;
     }
-    if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) || dst->type != src0->type) {
+    if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) || !htp_glu_accepts_dst_type(op, src0, dst)) {
         return false;
     }
     if ((op == HTP_OP_GLU_GEGLU_QUICK || op == HTP_OP_GLU_GEGLU_ERF) && src0->type != GGML_TYPE_F32) {

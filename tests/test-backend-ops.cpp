@@ -4404,6 +4404,50 @@ struct test_mul_mat_bias : public test_case {
     }
 };
 
+// Transformer feed-forward: nn.Linear, GEGLU over the two halves of its rows, nn.Linear back to the input width.
+// The GEGLU result has the second linear layer as its only reader.
+struct test_feed_forward_geglu : public test_case {
+    const ggml_type type_w;
+    const int64_t dim;     // input and output values per row
+    const int64_t inner;   // values per row after the GEGLU
+    const int64_t n;       // rows
+    const std::array<int64_t, 2> bs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FEED_FORWARD_GEGLU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_w, dim, inner, n, bs);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4; // as test_mul_mat
+    }
+
+    test_feed_forward_geglu(ggml_type type_w = GGML_TYPE_F16, int64_t dim = 64, int64_t inner = 128, int64_t n = 96,
+            std::array<int64_t, 2> bs = {1, 1})
+        : type_w(type_w), dim(dim), inner(inner), n(n), bs(bs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dim, n, bs[0], bs[1]);
+        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, type_w, dim, 2 * inner);
+        ggml_tensor * b_up   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * inner);
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, type_w, inner, dim);
+        ggml_tensor * b_down = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, dim);
+        ggml_set_name(x, "x"); ggml_set_name(w_up, "w_up"); ggml_set_name(b_up, "b_up");
+        ggml_set_name(w_down, "w_down"); ggml_set_name(b_down, "b_down");
+
+        ggml_tensor * hidden = ggml_geglu_swapped(ctx, ggml_add(ctx, ggml_mul_mat(ctx, w_up, x), b_up));
+        ggml_tensor * out    = ggml_add(ctx, ggml_mul_mat(ctx, w_down, hidden), b_down);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // nn.Linear + GELU: GGML_OP_MUL_MAT + GGML_OP_ADD of a per-row bias + GGML_UNARY_OP_GELU_ERF
 struct test_mul_mat_bias_gelu_erf : public test_case {
     const ggml_type type_a;
@@ -17556,6 +17600,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat_bias(type_a, 384, 5581, 1536, { 1, 1 }, false)); // ViT-S MLP down at 90x62 patches
         test_cases.emplace_back(new test_mul_mat_bias(type_a,  16,    1,   32, { 1, 1 }, false)); // one column: mat-vec, bias same shape
+        test_cases.emplace_back(new test_feed_forward_geglu(type_a,  64,  128,   96, { 1, 1 }));
+        test_cases.emplace_back(new test_feed_forward_geglu(type_a, 320, 1280, 1024, { 2, 1 })); // tokens of two images
+        test_cases.emplace_back(new test_feed_forward_geglu(type_a,  64,  192,   77, { 3, 1 })); // odd row count
+        test_cases.emplace_back(new test_feed_forward_geglu(type_a,  64,   96,   64, { 1, 1 })); // rows of half a vector pair keep f32
     }
 
     // the same with a GELU_ERF after the ADD: 37 rows for the scalar kernel, 128 for four elements per thread
@@ -17569,6 +17617,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_mul_mat_bias_gelu_erf(type_a, 1536, 5581, 384, { 1, 1 }, true)); // ViT-S MLP up at 90x62 patches
+    }
+    for (ggml_type type_w : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_feed_forward_geglu(type_w, 320, 1280, 1024, { 2, 1 }));
+        test_cases.emplace_back(new test_feed_forward_geglu(type_w, 640, 2560,  256, { 2, 1 }));
+        test_cases.emplace_back(new test_feed_forward_geglu(type_w, 320, 1280, 4096, { 2, 1 })); // several row chunks of fp16 activations
+        test_cases.emplace_back(new test_feed_forward_geglu(type_w, 1280, 5120, 256, { 2, 1 }));
+        test_cases.emplace_back(new test_feed_forward_geglu(type_w, 1280, 5120,   1, { 1, 1 })); // one row runs on HVX and keeps f32
+        test_cases.emplace_back(new test_feed_forward_geglu(type_w,  640, 2560,  16, { 1, 1 }));
+        test_cases.emplace_back(new test_feed_forward_geglu(type_w,  320, 1280,  64, { 2, 1 }));
     }
 
     // many small F32 products: a contraction (k) of at most 32, at most 32 columns (n), and at least 1024 CUDA threads,

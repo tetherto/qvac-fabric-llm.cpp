@@ -1694,6 +1694,27 @@ struct ggml_hexagon_opbatch {
         }
     }
 
+    // A link gives the last op a new output tensor and the node a new input tensor
+    bool has_room_for_link(const htp_opnode & node) const {
+        return n_tens + node.inputs.size() + node.outputs.size() + 1 <= n_tens_max;
+    }
+
+    bool try_link(htp_opnode & node) {
+        if (n_ops == 0 || !has_room_for_link(node)) {
+            return false;
+        }
+
+        htp_opnode & last_node = ops[n_ops - 1];
+        if (!htp_fusion_try_link(sess, last_node, node)) {
+            return false;
+        }
+
+        sync_op_desc(n_ops - 1);
+        HEX_VERBOSE("ggml-hex: %s linked %s to %s through fp16 (#%u)\n",
+                    sess->c_name(), last_node.name().c_str(), node.name().c_str(), n_ops - 1);
+        return true;
+    }
+
     bool try_fuse(const htp_opnode & node) {
         if (n_ops == 0) {
             return false;
@@ -2041,18 +2062,23 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
         return;
     }
 
+    htp_opnode linked_node = node;
+    if (opt_opfusion && fits_tensors) {
+        op_batch->try_link(linked_node);
+    }
+
     if (op_batch->full() || !fits_tensors) {
         flush_async();
     }
 
     if (op_batch->empty()) {
         start_batch();
-        if (!op_batch->fit_tensors(node)) {
+        if (!op_batch->fit_tensors(linked_node)) {
             GGML_ABORT("ggml-hex: %s op does not fit into empty batch (vmem/tensor/buffer limit exceeded)\n", c_name());
         }
     }
 
-    op_batch->add_op(node);
+    op_batch->add_op(linked_node);
 }
 
 void ggml_hexagon_session::enqueue_mdev_group() {

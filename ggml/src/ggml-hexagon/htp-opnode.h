@@ -66,6 +66,9 @@ struct htp_opnode {
 
     std::vector<std::shared_ptr<ggml_tensor>>          dummy;
 
+    // set when the previous op hands its result over as fp16: the activation that replaces node->src[1]
+    const ggml_tensor *                                linked_src1 { nullptr };
+
     htp_opvec<const ggml_tensor *, HTP_OP_MAX_FUSED>   fused;
     htp_opvec<const ggml_tensor *, HTP_OP_MAX_INPUTS>  inputs;
     htp_opvec<const ggml_tensor *, HTP_OP_MAX_OUTPUTS> outputs;
@@ -112,6 +115,7 @@ struct htp_opnode {
 
     const ggml_tensor * src0() const { return node->src[0]; }
     const ggml_tensor * src1() const { return node->src[1]; }
+    const ggml_tensor * activation() const { return linked_src1 ? linked_src1 : node->src[1]; }
     const ggml_tensor * dst()  const { return outputs.empty() ? node : outputs.back(); }
 
     ggml_tensor * add_dummy(const ggml_tensor & t) {
