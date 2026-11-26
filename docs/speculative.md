@@ -90,6 +90,17 @@ llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2.gguf \
 The target GGUF must use the same tokenizer as the draft.
 Reconvert older DFlash2 GGUFs for image or video inputs; the draft needs the target's M-RoPE metadata.
 
+Inkling 2 DFlash2 drafters (for example `incoai/Inkling-2-Mini-DFlash2`) convert the same way against a local Inkling 2 checkpoint.
+They read the hidden states of target layer visits (loop passes counted, the last one is the final norm output), which the GGUF stores as `target_visits`, and they take the target's normalized token embeddings:
+
+```bash
+python convert_hf_to_gguf.py incoai/Inkling-2-Mini-DFlash2 \
+    --target-model-dir /path/to/Inkling-2-Mini --outtype q8_0 --outfile Inkling-2-Mini-DFlash2-Q8_0.gguf
+
+llama-server -m Inkling-2-Mini.gguf -md Inkling-2-Mini-DFlash2-Q8_0.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 7 -fa on --jinja
+```
+
 A DFlash2 drafter can propose tokens from part of the vocabulary only.
 `--spec-draft-vocab` takes ascending, disjoint `[begin, end)` token id ranges. The drafter computes its output head over those rows only, and the target still verifies over the full vocabulary, so the output is unchanged.
 Tokens outside the ranges are never drafted, which can lower acceptance for text that uses them.
