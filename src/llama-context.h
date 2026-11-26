@@ -16,6 +16,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 struct llama_model;
@@ -324,6 +325,7 @@ public:
     bool sched_plan_ragged(bool ragged);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    bool set_sampler_active(llama_seq_id seq_id, bool active);
 
 private:
     llm_graph_result * get_gf_res_prev();
@@ -413,8 +415,12 @@ private:
     std::vector<llama_pos> embd_layer_inp_pos_min;
 
     struct sampling_info {
-        // !samplers.empty() to check if any samplers are active
+        // !samplers.empty() to check if any samplers are attached, paused ones included
         std::map<llama_seq_id, llama_sampler *> samplers;
+        std::set<llama_seq_id>                  paused;
+
+        // row strides of the buffers below, from the reserve graph: zero before the first reserve
+        llm_sampling_row_size row_size;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};

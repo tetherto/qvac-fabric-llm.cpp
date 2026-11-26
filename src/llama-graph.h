@@ -783,14 +783,15 @@ public:
 
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
-    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
-        samplers(std::move(samplers)) { }
+    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers, std::set<llama_seq_id> samplers_paused) :
+        samplers(std::move(samplers)), samplers_paused(std::move(samplers_paused)) { }
     virtual ~llm_graph_input_sampling() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::set<llama_seq_id>                  samplers_paused;
 };
 
 //
@@ -839,6 +840,9 @@ struct llm_graph_params {
     ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    // the chains of paused samplers are in the graph but not computed
+    std::set<llama_seq_id> samplers_paused;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -902,7 +906,7 @@ struct llm_graph_params {
             return false;
         }
 
-        if (!samplers_equal(samplers, other.samplers)) {
+        if (!samplers_equal(samplers, other.samplers) || samplers_paused != other.samplers_paused) {
             return false;
         }
 
@@ -951,6 +955,13 @@ struct llm_graph_fused_node {
     llm_fused_op op;
     ggml_tensor * tensor;
     int il;
+};
+
+// elements per output row of the backend sampling outputs, the largest over the sampler chains of a graph
+struct llm_sampling_row_size {
+    uint32_t logits     = 0;
+    uint32_t probs      = 0;
+    uint32_t candidates = 0;
 };
 
 class llm_graph_result {
@@ -1014,6 +1025,8 @@ public:
     std::vector<ggml_tensor *> t_candidates;
 
     std::vector<ggml_tensor *> t_sampling_all;
+
+    llm_sampling_row_size sampling_row_size;
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -1119,6 +1132,7 @@ struct llm_graph_context {
     ggml_tensor * h_nextn_src;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::set<llama_seq_id>                  samplers_paused;
 
     const llm_graph_cb & cb_func;
 

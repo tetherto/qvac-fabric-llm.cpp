@@ -155,6 +155,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-j, --json-schema SCHEMA` | JSON schema to constrain generations (https://json-schema.org/), e.g. `{"type": "object"}` for any JSON object |
 | `-jf, --json-schema-file FILE` | File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{"type": "object"}` for any JSON object |
 | `-bs, --backend-sampling` | enable backend sampling (experimental) (default: disabled)<br/>(env: LLAMA_ARG_BACKEND_SAMPLING) |
+| `--backend-sampling-auto, --no-backend-sampling-auto` | sample greedy requests on the backend when this picks the same token as the CPU samplers (default: enabled) |
 
 
 ### Server-specific params
@@ -620,6 +621,8 @@ These words will not be included in the completion, so make sure to add them to 
 `sse_ping_interval`: Interval in seconds between SSE comment pings emitted while the stream stays silent, keeping the connection observable during long prompt processing. Overrides the server `--sse-ping-interval` setting for this request, `-1` disables pings. Default: server setting
 
 `post_sampling_probs`: Returns the probabilities of top `n_probs` tokens after applying sampling chain.
+
+`backend_sampling`: Run the sampler chain on the backend (GPU). Default: `false`, or `true` with `--backend-sampling`. If the request does not set it to `false`, the server samples a greedy request on the backend (`--backend-sampling-auto`, on by default) when every sampler of the chain keeps the most likely token: temperature 0, no logit bias, no penalties, DRY, typical-p or XTC, no grammar, reasoning budget or `n_probs`, and no speculative decoding. The token is the same as with the CPU samplers, except that an exact tie of the top logits can pick another of the tied tokens. `generation_settings.backend_sampling` in the response is `true` when the request was sampled on the backend.
 
 `response_fields`: A list of response fields, for example: `"response_fields": ["content", "generation_settings/n_predict"]`. If the specified field is missing, it will simply be omitted from the response without triggering an error. Note that fields with a slash will be unnested; for example, `generation_settings/n_predict` will move the field `n_predict` from the `generation_settings` object to the root of the response and give it a new name.
 

@@ -88,7 +88,8 @@ struct test_context {
             int32_t n_seq_max = -1,
             uint32_t n_outputs_max = 0,
             uint32_t n_ubatch = 0,
-            uint32_t n_outputs_max_per_seq = 1) {
+            uint32_t n_outputs_max_per_seq = 1,
+            bool kv_unified = true) {
         auto * model = params.model.get();
 
         GGML_ASSERT(model);
@@ -104,7 +105,7 @@ struct test_context {
         cparams.n_outputs_max_per_seq = n_outputs_max_per_seq;
         cparams.samplers = configs.data();
         cparams.n_samplers = configs.size();
-        cparams.kv_unified = true;
+        cparams.kv_unified = kv_unified;
 
         // If n_seq_max is not specified, calculate it from configs
         if (n_seq_max < 0) {
@@ -2060,6 +2061,247 @@ static void test_multi_output_cpu_suffix(const test_params & params) {
     printf("backend multi-output CPU suffix test PASSED\n");
 }
 
+// counts the scheduler reserves of the contexts while it lives, forwarding every log line
+struct reserve_counter {
+    ggml_log_callback prev_callback  = nullptr;
+    void *            prev_user_data = nullptr;
+    int               n_reserves     = 0;
+
+    static void log(ggml_log_level level, const char * text, void * user_data) {
+        auto * counter = (reserve_counter *) user_data;
+        if (strstr(text, "reserve took") != nullptr) {
+            counter->n_reserves++;
+        }
+        if (counter->prev_callback) {
+            counter->prev_callback(level, text, counter->prev_user_data);
+        }
+    }
+
+    reserve_counter() {
+        llama_log_get(&prev_callback, &prev_user_data);
+        llama_log_set(log, this);
+    }
+
+    ~reserve_counter() {
+        llama_log_set(prev_callback, prev_user_data);
+    }
+};
+
+static bool logits_have_unique_max(const float * logits, int n_vocab) {
+    const float max = *std::max_element(logits, logits + n_vocab);
+    return std::count(logits, logits + n_vocab, max) == 1;
+}
+
+// an argmax row holds one logit and one candidate on the host, no probabilities
+static void check_argmax_row(llama_context * ctx, int32_t idx) {
+    GGML_ASSERT(llama_get_sampled_logits_count_ith(ctx, idx) == 1);
+    GGML_ASSERT(llama_get_sampled_candidates_count_ith(ctx, idx) == 1);
+    GGML_ASSERT(llama_get_sampled_probs_ith(ctx, idx) == nullptr);
+}
+
+// the CPU chain of argmax params and the backend argmax chain pick the same token, step by step
+static void check_argmax_params(const test_params & params, common_params_sampling sp, const std::string & prompt) {
+    const int seq_id = 0;
+    const int n_steps = 16;
+
+    GGML_ASSERT(common_sampler_params_is_argmax(sp));
+
+    common_sampler_ptr cpu_sampler(common_sampler_init(params.model.get(), sp));
+    GGML_ASSERT(common_sampler_is_argmax(cpu_sampler.get(), llama_model_get_vocab(params.model.get())));
+
+    llama_sampler_ptr backend_chain(common_sampler_init_argmax_backend());
+    std::vector<llama_sampler_seq_config> no_configs;
+    std::vector<llama_sampler_seq_config> backend_configs = {{ seq_id, backend_chain.get() }};
+    test_context cpu_ctx(params, no_configs, 1);
+    test_context backend_ctx(params, backend_configs);
+
+    GGML_ASSERT(cpu_ctx.decode({{ seq_id, prompt }}));
+    GGML_ASSERT(backend_ctx.decode({{ seq_id, prompt }}));
+
+    for (int step = 0; step < n_steps; ++step) {
+        const int32_t cpu_idx = cpu_ctx.idx_for_seq(seq_id);
+        const float * logits = llama_get_logits_ith(cpu_ctx.ctx.get(), cpu_idx);
+        const llama_token cpu_token = common_sampler_sample(cpu_sampler.get(), cpu_ctx.ctx.get(), cpu_idx);
+        const llama_token backend_token = llama_get_sampled_token_ith(backend_ctx.ctx.get(), backend_ctx.idx_for_seq(seq_id));
+        check_argmax_row(backend_ctx.ctx.get(), backend_ctx.idx_for_seq(seq_id));
+
+        if (logits_have_unique_max(logits, cpu_ctx.n_vocab)) {
+            const llama_token argmax = std::max_element(logits, logits + cpu_ctx.n_vocab) - logits;
+            GGML_ASSERT(cpu_token == argmax);
+            GGML_ASSERT(backend_token == cpu_token);
+        } else {
+            printf("step %d: tied maximum logit, token not compared\n", step);
+        }
+
+        common_sampler_accept(cpu_sampler.get(), cpu_token, true);
+        GGML_ASSERT(cpu_ctx.decode_token(cpu_token, seq_id));
+        GGML_ASSERT(backend_ctx.decode_token(cpu_token, seq_id));
+    }
+}
+
+static void test_argmax_auto(const test_params & params) {
+    common_params_sampling sp;
+    sp.temp = 0.0f;
+    check_argmax_params(params, sp, "The capital of France is");
+
+    sp.top_p = 1.0f;
+    check_argmax_params(params, sp, "Write a Python function");
+
+    sp.top_k = 5;
+    sp.min_p = 0.5f;
+    sp.top_n_sigma = 1.0f;
+    sp.penalty_last_n = 0;
+    sp.penalty_repeat = 1.3f;
+    check_argmax_params(params, sp, "Once upon a time");
+
+    common_params_sampling top_k_last;
+    top_k_last.temp = 1.0f;
+    top_k_last.top_k = 1;
+    top_k_last.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE, COMMON_SAMPLER_TYPE_TOP_K };
+    check_argmax_params(params, top_k_last, "The capital of France is");
+
+    printf("argmax auto test PASSED\n");
+}
+
+static llama_token sampled_token(test_context & test_ctx, llama_seq_id seq_id) {
+    return llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
+}
+
+static llama_token raw_argmax(test_context & test_ctx, llama_seq_id seq_id) {
+    const int32_t idx = test_ctx.idx_for_seq(seq_id);
+    GGML_ASSERT(llama_get_sampled_logits_ith(test_ctx.ctx.get(), idx) == nullptr);
+    const float * logits = llama_get_logits_ith(test_ctx.ctx.get(), idx);
+    GGML_ASSERT(logits != nullptr);
+    if (!logits_have_unique_max(logits, test_ctx.n_vocab)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return std::max_element(logits, logits + test_ctx.n_vocab) - logits;
+}
+
+// the sampled-data accessors read for this sequence as in a context without samplers (n_probs reads all raw logits)
+static void check_no_sampled_data(test_context & test_ctx, llama_seq_id seq_id) {
+    llama_context * ctx = test_ctx.ctx.get();
+    const int32_t idx = test_ctx.idx_for_seq(seq_id);
+    GGML_ASSERT(llama_get_sampled_probs_ith(ctx, idx) == nullptr);
+    GGML_ASSERT(llama_get_sampled_logits_count_ith(ctx, idx) == (uint32_t) test_ctx.n_vocab);
+    GGML_ASSERT(llama_get_sampled_candidates_count_ith(ctx, idx) == 0);
+    GGML_ASSERT(llama_get_sampled_candidates_ith(ctx, idx)[test_ctx.n_vocab - 1] == test_ctx.n_vocab - 1);
+}
+
+// a paused sequence gets raw logits, equal to those of the same batch in a context without samplers
+static void check_paused(test_context & test_ctx, test_context & ref_ctx, llama_seq_id seq_id) {
+    GGML_ASSERT(sampled_token(test_ctx, seq_id) == LLAMA_TOKEN_NULL);
+    check_no_sampled_data(test_ctx, seq_id);
+    check_no_sampled_data(ref_ctx, seq_id);
+    GGML_ASSERT(raw_argmax(test_ctx, seq_id) == raw_argmax(ref_ctx, seq_id));
+}
+
+static void check_active(test_context & test_ctx, test_context & ref_ctx, llama_seq_id seq_id) {
+    const llama_token token  = sampled_token(test_ctx, seq_id);
+    const llama_token argmax = raw_argmax(ref_ctx, seq_id);
+    GGML_ASSERT(token != LLAMA_TOKEN_NULL);
+    GGML_ASSERT(argmax == LLAMA_TOKEN_NULL || token == argmax);
+}
+
+static void decode_both(test_context & test_ctx, test_context & ref_ctx, const std::map<llama_seq_id, llama_token> & tokens) {
+    GGML_ASSERT(test_ctx.decode_tokens(tokens));
+    GGML_ASSERT(ref_ctx.decode_tokens(tokens));
+}
+
+static std::vector<llama_sampler_seq_config> make_argmax_configs(int n_seq, std::vector<llama_sampler_ptr> & chains) {
+    std::vector<llama_sampler_seq_config> configs;
+    for (int i = 0; i < n_seq; ++i) {
+        chains.emplace_back(common_sampler_init_argmax_backend());
+        configs.push_back({ i, chains.back().get() });
+    }
+    return configs;
+}
+
+// pausing and resuming attached chains keeps the graph topology and the reserve, whatever the batch size
+static void test_argmax_pause(const test_params & params) {
+    const int n_seq = 3;
+    std::vector<llama_sampler_ptr> chains;
+    std::vector<llama_sampler_seq_config> configs = make_argmax_configs(n_seq, chains);
+    std::vector<llama_sampler_seq_config> no_configs;
+    test_context test_ctx(params, configs, n_seq);
+    test_context ref_ctx(params, no_configs, n_seq);
+    auto * ctx = test_ctx.ctx.get();
+
+    reserve_counter counter;
+
+    for (int i = 0; i < n_seq; ++i) {
+        GGML_ASSERT(llama_set_sampler_active(ctx, i, false));
+    }
+    const std::map<llama_seq_id, std::string> prompts = {{ 0, "Hello" }, { 1, "The capital of" }, { 2, "Once upon" }};
+    GGML_ASSERT(test_ctx.decode(prompts));
+    GGML_ASSERT(ref_ctx.decode(prompts));
+    check_paused(test_ctx, ref_ctx, 0);
+    check_paused(test_ctx, ref_ctx, 1);
+    check_paused(test_ctx, ref_ctx, 2);
+
+    GGML_ASSERT(llama_set_sampler_active(ctx, 2, true));
+    decode_both(test_ctx, ref_ctx, {{ 2, 1 }});
+    check_active(test_ctx, ref_ctx, 2);
+
+    // a larger graph after a one token graph, the active chain moved to another sequence
+    GGML_ASSERT(llama_set_sampler_active(ctx, 2, false));
+    GGML_ASSERT(llama_set_sampler_active(ctx, 0, true));
+    decode_both(test_ctx, ref_ctx, {{ 0, 1 }, { 2, 1 }});
+    check_active(test_ctx, ref_ctx, 0);
+    check_paused(test_ctx, ref_ctx, 2);
+
+    GGML_ASSERT(llama_set_sampler(ctx, 1, chains[1].get()));
+    GGML_ASSERT(llama_set_sampler_active(ctx, 1, true));
+    decode_both(test_ctx, ref_ctx, {{ 0, 1 }, { 1, 1 }, { 2, 1 }});
+    check_active(test_ctx, ref_ctx, 0);
+    check_active(test_ctx, ref_ctx, 1);
+    check_paused(test_ctx, ref_ctx, 2);
+    GGML_ASSERT(counter.n_reserves == 0);
+
+    // another chain shape changes the graph
+    llama_sampler_ptr top_k(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(top_k.get(), llama_sampler_init_top_k(4));
+    llama_sampler_chain_add(top_k.get(), llama_sampler_init_greedy());
+    GGML_ASSERT(llama_set_sampler(ctx, 0, top_k.get()));
+    decode_both(test_ctx, ref_ctx, {{ 0, 1 }, { 1, 1 }, { 2, 1 }});
+    check_active(test_ctx, ref_ctx, 0);
+    GGML_ASSERT(counter.n_reserves == 1);
+
+    // the first chain again: its backend state is kept and it is active
+    GGML_ASSERT(llama_set_sampler(ctx, 0, chains[0].get()));
+    GGML_ASSERT(llama_set_sampler_active(ctx, 1, false));
+    decode_both(test_ctx, ref_ctx, {{ 0, 1 }, { 1, 1 }, { 2, 1 }});
+    check_active(test_ctx, ref_ctx, 0);
+    check_paused(test_ctx, ref_ctx, 1);
+    GGML_ASSERT(counter.n_reserves == 2);
+
+    GGML_ASSERT(!llama_set_sampler_active(ctx, n_seq, true));
+
+    printf("argmax pause test PASSED\n");
+}
+
+// with a KV stream per sequence the outputs of a batch come back in another order and are swapped back, sampled rows
+// included: the short prompt of sequence 1 ends in an earlier ubatch than the long prompt of sequence 0
+static void test_argmax_reorder(const test_params & params) {
+    const int  n_seq      = 2;
+    const bool kv_unified = false;
+    std::vector<llama_sampler_ptr> chains;
+    std::vector<llama_sampler_seq_config> configs = make_argmax_configs(n_seq, chains);
+    std::vector<llama_sampler_seq_config> no_configs;
+    test_context test_ctx(params, configs, n_seq, 0, 0, 1, kv_unified);
+    test_context ref_ctx(params, no_configs, n_seq, 0, 0, 1, kv_unified);
+
+    const std::map<llama_seq_id, std::string> prompts = {{ 0, "Once upon a time there was a little" }, { 1, "Hi" }};
+    GGML_ASSERT(test_ctx.decode(prompts));
+    GGML_ASSERT(ref_ctx.decode(prompts));
+    check_active(test_ctx, ref_ctx, 0);
+    check_active(test_ctx, ref_ctx, 1);
+    check_argmax_row(test_ctx.ctx.get(), test_ctx.idx_for_seq(0));
+    check_argmax_row(test_ctx.ctx.get(), test_ctx.idx_for_seq(1));
+
+    printf("argmax reorder test PASSED\n");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -2086,6 +2328,9 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_mixed",                  test_mixed,                  true },
     { "test_cpu_mixed",              test_cpu_mixed,              true },
     { "test_set_sampler",            test_set_sampler,            true },
+    { "test_argmax_auto",            test_argmax_auto,            true },
+    { "test_argmax_pause",           test_argmax_pause,           true },
+    { "test_argmax_reorder",         test_argmax_reorder,         true },
     // multiple outputs per sequence
     { "test_multi_output_limit",                  test_multi_output_limit,               true },
     { "test_multi_output_multi_sequence_dist",    test_multi_output_multi_sequence_dist, true },

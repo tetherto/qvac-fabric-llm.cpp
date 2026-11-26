@@ -3388,6 +3388,90 @@ struct test_argmax : public test_case {
     }
 };
 
+// GGML_OP_ARGMAX on the rows that decide its tie and NaN rules, which only the CPU and Vulkan backends share
+struct test_argmax_special : public test_case {
+    enum row_kind { ROW_TIE, ROW_ALL_NEG_INF, ROW_NAN_RESTART, ROW_ALL_NAN, ROW_KIND_COUNT };
+
+    const std::array<int64_t, 4> ne;
+    // equal maxima: i_hi is read by a lower thread than i_lo for every power-of-two stride up to 1024
+    const int64_t i_lo;
+    const int64_t i_hi;
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, i_lo, i_hi);
+    }
+
+    test_argmax_special(std::array<int64_t, 4> ne, int64_t i_lo, int64_t i_hi)
+        : ne(ne), i_lo(i_lo), i_hi(i_hi) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_argmax(ctx, a);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    bool skip_backend(ggml_backend_t backend) override {
+        const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
+        return strcmp(name, "Vulkan") != 0;
+    }
+
+    // the CPU keeps the last of equal maxima; a NaN restarts its running maximum, so i_hi after the NaN wins
+    std::vector<float> make_row(row_kind kind, std::default_random_engine & rng) const {
+        std::vector<float> data(ne[0]);
+        for (int64_t i = 0; i < ne[0]; i++) {
+            data[i] = -1.0f - i;
+        }
+        std::shuffle(data.begin(), data.end(), rng);
+        switch (kind) {
+            case ROW_TIE:
+                data[i_lo] = 1.0f;
+                data[i_hi] = 1.0f;
+                break;
+            case ROW_ALL_NEG_INF:
+                std::fill(data.begin(), data.end(), -INFINITY);
+                break;
+            case ROW_NAN_RESTART:
+                data[i_lo] = 2.0f;
+                data[(i_lo + i_hi) / 2] = NAN;
+                data[i_hi] = 1.0f;
+                break;
+            case ROW_ALL_NAN:
+                std::fill(data.begin(), data.end(), NAN);
+                break;
+            case ROW_KIND_COUNT:
+                GGML_ABORT("not a row kind");
+        }
+        return data;
+    }
+
+    void set_rows(ggml_tensor * a, std::default_random_engine & rng) const {
+        for (int64_t r = 0; r < ggml_nrows(a); r++) {
+            const std::vector<float> data = make_row(row_kind(r % ROW_KIND_COUNT), rng);
+            ggml_backend_tensor_set(a, data.data(), r * a->nb[1], a->ne[0] * sizeof(float));
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "a") == 0) {
+                set_rows(t, rng);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+};
+
 // GGML_OP_COUNT_EQUAL
 struct test_count_equal : public test_case {
     const ggml_type type;
@@ -17464,6 +17548,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {2000, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
+    test_cases.emplace_back(new test_argmax_special({100,  4, 1, 1}, 31, 64));
+    test_cases.emplace_back(new test_argmax_special({1024, 4, 1, 1}, 63, 512));
+    test_cases.emplace_back(new test_argmax_special({2049, 4, 1, 1}, 1023, 2048));
+    for (int64_t rows : {1, 4, 16}) {
+        test_cases.emplace_back(new test_argmax_special({248320, rows, 1, 1}, 1023, 247808));
+    }
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));

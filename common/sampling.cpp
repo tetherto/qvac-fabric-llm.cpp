@@ -188,6 +188,55 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
+// keep distribution sampling when callers request probabilities
+static bool common_sampler_params_end_greedy(const common_params_sampling & params) {
+    return params.n_probs == 0 && !params.samplers.empty() &&
+        ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
+         (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
+}
+
+// the conditions mirror the no-op checks of the llama_sampler_init_* functions
+static bool common_sampler_type_keeps_argmax(enum common_sampler_type type, const common_params_sampling & params) {
+    switch (type) {
+        case COMMON_SAMPLER_TYPE_TOP_K:
+        case COMMON_SAMPLER_TYPE_TOP_P:
+        case COMMON_SAMPLER_TYPE_MIN_P:
+        case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+            return true;
+        case COMMON_SAMPLER_TYPE_TEMPERATURE:
+            // a positive scale can round two logits to a tie
+            return params.dynatemp_range <= 0.0f && (params.temp <= 0.0f || params.temp == 1.0f);
+        case COMMON_SAMPLER_TYPE_PENALTIES:
+            return std::max(params.penalty_last_n, 0) == 0 ||
+                (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f);
+        case COMMON_SAMPLER_TYPE_DRY:
+            return params.dry_multiplier == 0.0f || params.dry_base < 1.0f || std::max(params.dry_penalty_last_n, 0) == 0;
+        case COMMON_SAMPLER_TYPE_TYPICAL_P:
+            return params.typ_p >= 1.0f;
+        case COMMON_SAMPLER_TYPE_XTC:
+            return params.xtc_probability <= 0.0f || params.xtc_threshold > 0.5f;
+        case COMMON_SAMPLER_TYPE_INFILL:
+        case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+        case COMMON_SAMPLER_TYPE_NONE:
+            return false;
+    }
+    return false;
+}
+
+static bool common_sampler_types_keep_argmax(const common_params_sampling & params) {
+    for (const auto type : params.samplers) {
+        if (!common_sampler_type_keeps_argmax(type, params)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool common_sampler_params_is_argmax(const common_params_sampling & params) {
+    return params.mirostat == 0 && params.logit_bias.empty() &&
+        common_sampler_params_end_greedy(params) && common_sampler_types_keep_argmax(params);
+}
+
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params) {
@@ -400,11 +449,7 @@ struct common_sampler * common_sampler_init(
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
-            // Keep distribution sampling when callers request probabilities.
-            const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
-                ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
-                 (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
-            samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
+            samplers.push_back(common_sampler_params_end_greedy(params) ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
         }
     } else if (params.mirostat == 1) {
         samplers.push_back(llama_sampler_init_temp(params.temp));
@@ -602,6 +647,23 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     }
 
     return gsmpl->chain;
+}
+
+bool common_sampler_is_argmax(const struct common_sampler * gsmpl, const struct llama_vocab * vocab) {
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+
+    return !gsmpl->grmr && !gsmpl->rbudget && n_suppress == 0 && common_sampler_params_is_argmax(gsmpl->params);
+}
+
+struct llama_sampler * common_sampler_init_argmax_backend() {
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+
+    // temp 0 reduces the row to its argmax, so the host copies one candidate instead of the vocabulary
+    llama_sampler_chain_add(chain, llama_sampler_init_temp(0.0f));
+    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+
+    return chain;
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {

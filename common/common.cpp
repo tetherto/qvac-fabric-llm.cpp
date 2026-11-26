@@ -1153,6 +1153,10 @@ struct common_init_result::impl {
 
     std::vector<common_sampler_ptr> samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
+
+    // automatic backend sampling: one paused argmax chain per sequence, attached for the context lifetime
+    std::vector<llama_sampler_ptr>        samplers_argmax;
+    std::vector<llama_sampler_seq_config> samplers_argmax_seq_config;
 };
 
 static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NAMES = {
@@ -1287,6 +1291,30 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
                 (llama_time_us() - fit_start_us) * 1e-6);
     }
 }
+
+static void common_init_argmax_samplers(
+        uint32_t n_seq_max,
+        std::vector<llama_sampler_ptr> & samplers,
+        std::vector<llama_sampler_seq_config> & configs) {
+    samplers.resize(n_seq_max);
+    configs.resize(n_seq_max);
+    for (uint32_t i = 0; i < n_seq_max; ++i) {
+        samplers[i].reset(common_sampler_init_argmax_backend());
+        configs[i] = { (llama_seq_id) i, samplers[i].get() };
+    }
+}
+
+static void common_pause_samplers(llama_context * lctx, const std::vector<llama_sampler_seq_config> & configs) {
+    for (const auto & config : configs) {
+        llama_set_sampler_active(lctx, config.seq_id, false);
+    }
+}
+
+// the chains are part of the creation reserve, so resuming one later changes neither the graph nor the reserve
+static bool common_use_argmax_samplers(const common_params & params) {
+    return params.sampling.backend_sampling_auto && !params.sampling.backend_sampling;
+}
+
 common_init_result::common_init_result() : pimpl(new impl{}) {}
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
@@ -1407,11 +1435,19 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    if (common_use_argmax_samplers(params)) {
+        common_init_argmax_samplers(cparams.n_seq_max, pimpl->samplers_argmax, pimpl->samplers_argmax_seq_config);
+        cparams.samplers   = pimpl->samplers_argmax_seq_config.data();
+        cparams.n_samplers = pimpl->samplers_argmax_seq_config.size();
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
     }
+
+    common_pause_samplers(lctx, pimpl->samplers_argmax_seq_config);
 
     pimpl->context.reset(lctx);
 
@@ -1433,6 +1469,13 @@ common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
         return nullptr;
     }
     return pimpl->samplers[seq_id].get();
+}
+
+llama_sampler * common_init_result::sampler_argmax(llama_seq_id seq_id) {
+    if (seq_id < 0 || seq_id >= (int) pimpl->samplers_argmax.size()) {
+        return nullptr;
+    }
+    return pimpl->samplers_argmax[seq_id].get();
 }
 
 void common_init_result::reset_samplers() {
@@ -1690,11 +1733,18 @@ common_init_result_ptr common_init_from_model_and_params(llama_model * model, co
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    if (common_use_argmax_samplers(params)) {
+        common_init_argmax_samplers(cparams.n_seq_max, pimpl->samplers_argmax, pimpl->samplers_argmax_seq_config);
+        cparams.samplers   = pimpl->samplers_argmax_seq_config.data();
+        cparams.n_samplers = pimpl->samplers_argmax_seq_config.size();
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with externally-loaded model\n", __func__);
         return res;
     }
+    common_pause_samplers(lctx, pimpl->samplers_argmax_seq_config);
     pimpl->context.reset(lctx);
 
     return common_init_from_model_and_params(model, std::move(res), params);

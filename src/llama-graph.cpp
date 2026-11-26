@@ -1395,7 +1395,7 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
     }
 
     for (auto seq_id : active_samplers) {
-        if (samplers.find(seq_id) == samplers.end()) {
+        if (samplers.find(seq_id) == samplers.end() || samplers_paused.count(seq_id) > 0) {
             continue;
         }
 
@@ -1408,7 +1408,7 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
-    if (samplers.size() != params.samplers.size()) {
+    if (samplers.size() != params.samplers.size() || samplers_paused != params.samplers_paused) {
         return false;
     }
 
@@ -1456,6 +1456,7 @@ void llm_graph_result::reset() {
     t_sampled_logits.clear();
     t_candidates.clear();
     t_sampling_all.clear();
+    sampling_row_size = {};
 
     params = {};
 
@@ -1621,6 +1622,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
     samplers         (params.samplers),
+    samplers_paused  (params.samplers_paused),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -4546,6 +4548,16 @@ void llm_graph_context::build_h_nextn_dev() const {
     res->add_input(std::move(inp));
 }
 
+static uint32_t sampling_row_elements(const ggml_tensor * t) {
+    return t ? (uint32_t) ggml_nelements(t) : 0;
+}
+
+static void update_sampling_row_size(llm_sampling_row_size & size, const llama_sampler_data & data) {
+    size.logits     = std::max(size.logits,     sampling_row_elements(data.logits));
+    size.probs      = std::max(size.probs,      sampling_row_elements(data.probs));
+    size.candidates = std::max(size.candidates, sampling_row_elements(data.candidates));
+}
+
 void llm_graph_context::build_sampling() const {
     if (samplers.empty() || !res->t_logits) {
         return;
@@ -4554,15 +4566,21 @@ void llm_graph_context::build_sampling() const {
     std::array<ggml_tensor *, 2> outs;
     outs[0] = res->t_logits;
 
-    auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
+    auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers, samplers_paused);
     res->add_input(std::move(inp_sampling));
 
+    // the rows of a paused sampler stay out of its chains, which then work on the first row and are not selected
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
     uint32_t n_rows = 0;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        if (ubatch.output[i]) {
-            sampling_rows[ubatch.seq_id[i][0]].push_back(n_rows++);
+        if (!ubatch.output[i]) {
+            continue;
         }
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        if (samplers_paused.count(seq_id) == 0) {
+            sampling_rows[seq_id].push_back(n_rows);
+        }
+        n_rows++;
     }
 
     res->t_sampled.resize(n_rows, nullptr);
@@ -4607,6 +4625,8 @@ void llm_graph_context::build_sampling() const {
 
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+
+            update_sampling_row_size(res->sampling_row_size, data);
 
             if (data.sampled     != nullptr) { res->t_sampling_all.push_back(data.sampled);     }
             if (data.probs       != nullptr) { res->t_sampling_all.push_back(data.probs);       }

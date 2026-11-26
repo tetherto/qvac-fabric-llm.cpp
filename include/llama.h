@@ -1492,6 +1492,10 @@ extern "C" {
     // note: prefer initializing the context with llama_context_params.samplers when possible
     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
 
+    // [EXPERIMENTAL] pause or resume the sampler attached to seq_id, without a new reserve: a paused sampler samples
+    // nothing and the sequence gets raw logits; returns false if no sampler is attached
+    LLAMA_API bool llama_set_sampler_active(struct llama_context * ctx, llama_seq_id seq_id, bool active);
+
     // mirror of llama_sampler_i:
     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
     LLAMA_API const char *           llama_sampler_name  (const struct llama_sampler * smpl);
