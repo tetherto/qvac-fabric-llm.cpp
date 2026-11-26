@@ -6,8 +6,6 @@ Uint8BufferStreamBuf::Uint8BufferStreamBuf(std::vector<uint8_t> && _data) : data
     setg(start, start, start + data.size());
 }
 
-Uint8BufferStreamBuf::~Uint8BufferStreamBuf() = default;
-
 Uint8BufferStreamBuf::int_type Uint8BufferStreamBuf::underflow() {
     if (gptr() < egptr()) {
         return traits_type::to_int_type(*gptr());

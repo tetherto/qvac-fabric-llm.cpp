@@ -398,6 +398,18 @@ if (GGML_VECTOR_INDEX)
     add_subdirectory(ggml-vector-index)
 endif()
 
+# Windows with a static ggml-base: GGML_API exports nothing, so a backend module does not export the logger
+# functions that the loader uses to forward its log lines (ggml-backend-reg.cpp). Export them with the linker.
+# MinGW ld has no /EXPORT, so it is not covered.
+function(ggml_backend_export_log_functions target)
+    if (WIN32 AND NOT BUILD_SHARED_LIBS AND (MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC"))
+        target_link_options(${target} PRIVATE
+            "LINKER:/EXPORT:ggml_log_set"
+            "LINKER:/EXPORT:ggml_log_get"
+            "LINKER:/EXPORT:ggml_log_callback_default")
+    endif()
+endfunction()
+
 function(ggml_add_backend_library backend)
     if (GGML_BACKEND_EMBEDDED)
         # static copy linked into another backend module: not loadable, not installed, not exported
@@ -411,6 +423,7 @@ function(ggml_add_backend_library backend)
 
     if (GGML_BACKEND_DL)
         add_library(${backend} MODULE ${ARGN})
+        ggml_backend_export_log_functions(${backend})
         # write the shared library to the output directory
         # Set output name with qvac- prefix to match backend_filename_prefix() in ggml-backend-reg.cpp
         set_target_properties(${backend} PROPERTIES
@@ -687,28 +700,6 @@ if (GGML_VECTOR_INDEX)
     list(APPEND GGML_CORE_TARGETS ggml-vector-index)
 endif()
 
-if (GGML_BACKEND_DL)
-    if (ANDROID)
-        # CMake suppresses Android INSTALL_RPATH even though API 24+ supports RUNPATH.
-        foreach (target ${GGML_CORE_TARGETS} ${GGML_AVAILABLE_BACKENDS})
-            target_link_options(${target} PRIVATE "LINKER:--enable-new-dtags" "LINKER:-rpath,$ORIGIN")
-        endforeach()
-    endif()
-    if (TARGET ggml-vector-index)
-        target_link_libraries(ggml-vector-index PRIVATE ggml-base)
-    endif()
-    foreach (target ${GGML_CORE_TARGETS})
-        # Shared-core linkage generation, not a cross-release ABI guarantee.
-        # See docs/build.md#qvac-shared-core-linkage for naming and lockstep requirements.
-        set_target_properties(${target} PROPERTIES
-            OUTPUT_NAME "qvac-${target}-1"
-            INSTALL_RPATH "$ORIGIN"
-            BUILD_WITH_INSTALL_RPATH ON)
-        set_property(TARGET ${target} PROPERTY VERSION)
-        set_property(TARGET ${target} PROPERTY SOVERSION)
-    endforeach()
-endif()
-
 foreach (target ${GGML_CORE_TARGETS})
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump
@@ -744,22 +735,4 @@ if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
             target_compile_definitions(${target} PUBLIC  GGML_SHARED)
         endif()
     endforeach()
-endif()
-
-if (GGML_BACKEND_DL AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    include(linux-cxx-runtime.cmake)
-    qvac_configure_cxx_runtimes()
-    include(shared-core-runtime.cmake)
-    qvac_configure_shared_core_runtime()
-endif()
-
-if (GGML_BACKEND_DL AND WIN32 AND MSVC AND CMAKE_NM)
-    add_custom_command(TARGET ggml-base POST_BUILD
-        COMMAND ${CMAKE_COMMAND}
-            "-DNM=${CMAKE_NM}"
-            "-DIMPORT_LIBRARY=$<TARGET_LINKER_FILE:ggml-base>"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/check-stream-exports.cmake"
-        VERBATIM)
-elseif (GGML_BACKEND_DL AND WIN32 AND MSVC)
-    message(STATUS "ggml: no nm found, skipping the ggml-base stream-export check")
 endif()
