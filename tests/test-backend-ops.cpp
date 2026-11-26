@@ -18634,10 +18634,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_F16, 256, 64, 1024, false, true, false));
     test_cases.emplace_back(new test_swiglu_mul_mat(GGML_TYPE_Q8_0, 256, 64, 1024, false, false, false));
 
-    // 9-16 column q8_1 mat-vec (ggml_vk_mmvq_wide: m >= 4096 on RADV RDNA3 and UMA NVIDIA)
+    // 9-16 column q8_1 mat-vec (ggml_vk_mmvq_wide: m >= 4096 on RADV RDNA3 and UMA NVIDIA); the odd m leaves one row
+    // in the last two-row workgroup on RADV RDNA3
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0 }) {
         for (int n : { 9, 12, 16 }) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 1024, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4097, n,  256, { 1, 1 }, { 1, 1 }));
         }
     }
 
