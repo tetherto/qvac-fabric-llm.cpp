@@ -3254,6 +3254,22 @@ common_params common_base_params_to_speculative(const common_params & params) {
     return result;
 }
 
+// every repeating layer of a loaded draft is on a GPU: the loader keeps the layers below n_layer_all + 1 - n_gpu_layers
+// on the CPU (a negative n_gpu_layers offloads all), nothing goes to a GPU without a GPU device, and tensor overrides
+// can move layer weights to the CPU
+static bool common_speculative_draft_layers_on_gpu(const llama_model * model, const llama_model_params & mparams,
+                                                   const common_params_speculative_draft & draft) {
+    if (!llama_supports_gpu_offload() || (mparams.devices != nullptr && mparams.devices[0] == nullptr)) {
+        return false;
+    }
+    if (std::any_of(draft.tensor_buft_overrides.begin(), draft.tensor_buft_overrides.end(),
+                    [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; })) {
+        return false;
+    }
+    const int32_t n_layer_all = llama_model_n_layer(model) + llama_model_n_layer_nextn(model);
+    return mparams.n_gpu_layers < 0 || mparams.n_gpu_layers >= n_layer_all + 1;
+}
+
 struct common_speculative_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -3301,6 +3317,22 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->model.reset(model_dft);
+
+        // a block drafter (DFlash, DSpark) with every repeating layer on a GPU runs only small CPU splits, e.g. the
+        // anchor rows of the target's host token embeddings: waking a full thread pool for them costs more than they
+        // take, so thread counts the user left unset drop to one. A draft with any repeating layer on the CPU (a CPU
+        // device, partial offload, tensor overrides) keeps the inherited counts
+        const auto & draft = params.speculative.draft;
+        const bool block_draft = std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+        if (draft.n_threads_auto && block_draft && common_speculative_draft_layers_on_gpu(model_dft, mparams, draft)) {
+            LOG_INF("%s: every draft layer is on the GPU: the draft runs on 1 thread (--spec-draft-threads to change)\n", __func__);
+            cparams.n_threads = 1;
+            if (draft.n_threads_batch_auto) {
+                cparams.n_threads_batch = 1;
+            }
+        }
 
         // a draft with a markov context decodes its full trained block, whatever n_max is
         {
