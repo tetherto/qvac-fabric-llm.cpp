@@ -516,6 +516,32 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        // a draft that borrows the target's token embeddings or output head reads them in the target's buffers, so the
+        // scheduler can only place those ops on a backend that can read that buffer type: a draft on other devices (for
+        // example --spec-draft-device none with the target's head on a GPU) cannot reserve its graph
+        if (cparams.ctx_other && (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH)) {
+            const llama_model & model_other = cparams.ctx_other->get_model();
+            const std::pair<const char *, const ggml_tensor *> borrowed[] = {
+                { "token embeddings", model.tok_embd ? nullptr : model_other.tok_embd },
+                { "output head",      model.output   ? nullptr : model_other.output   },
+            };
+            for (const auto & [what, t] : borrowed) {
+                if (t == nullptr || t->buffer == nullptr) {
+                    continue;
+                }
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+                bool readable = false;
+                for (const auto & backend : backends) {
+                    readable = readable || ggml_backend_supports_buft(backend.get(), buft);
+                }
+                if (!readable) {
+                    throw std::runtime_error(format("the %s draft uses the target model's %s, which is in a %s buffer that "
+                        "none of the draft's devices can read; run the draft on a device that can, such as the target's "
+                        "GPU (not --spec-draft-device none)", model.arch_name().c_str(), what, ggml_backend_buft_name(buft)));
+                }
+            }
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
