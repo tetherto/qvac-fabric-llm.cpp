@@ -73,6 +73,8 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 ```
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
+Without `--spec-draft-n-max`, `draft-dflash` drafts 5 tokens instead of the default 3.
+A DSpine draft then needs a draft ubatch (`--spec-draft-n-ubatch`) of at least `6 * -np` tokens, see below.
 
 DFlash2 drafts add grouped convolution and a candidate selector. The selector is detected from the checkpoint; use the same `draft-dflash` type.
 For example, convert `incoai/Qwen3.8-27B-DFlash2` against its target tokenizer, then start the server:
@@ -111,6 +113,12 @@ python convert_hf_to_gguf.py tencent/Qwen3-8B-DSpine-b16 \
 
 llama-server -m Qwen3-8B.gguf -md Qwen3-8B-DSpine.gguf \
     --spec-type draft-dflash --spec-draft-n-max 15 -fa on --jinja
+```
+
+A DSpine draft can be quantized. Keep the codebook in bf16, because the draft only reads its rows:
+
+```bash
+llama-quantize --tensor-type dspine_codebook=bf16 Qwen3-8B-DSpine.gguf Qwen3-8B-DSpine-Q6_K.gguf q6_K
 ```
 
 The draft ubatch (`--spec-draft-n-ubatch`, default `--ubatch-size`) must hold one block per parallel sequence, that is `-np * (--spec-draft-n-max + 1)` tokens.
@@ -276,6 +284,8 @@ Use exactly one of these options:
 - `--spec-synth-rates P0,P1,...` sets unconditional per-position acceptance probabilities. Entry `i` is the probability that the first `i+1` draft tokens are all accepted. The number of entries must match the effective maximum draft length. Values must be finite, within `[0, 1]`, and monotonically non-increasing.
 - `--spec-synth-len L` sets the target mean acceptance length, including the target token. For `K` maximum draft tokens, `L` must be within `[1, K+1]`. The server finds a constant conditional probability `p` such that `p + p^2 + ... + p^K = L - 1`, then uses unconditional rates `[p, p^2, ..., p^K]`.
 
+Without `--spec-draft-n-max`, the maximum draft length of `draft-dflash` is 5, so it takes 5 rates and `L` within `[1, 6]`.
+
 ### General Speculative Parameters
 
 ```
@@ -297,7 +307,7 @@ Use exactly one of these options:
                                         HuggingFace repository for the draft model
                                         (env: LLAMA_ARG_SPEC_DRAFT_HF_REPO)
 --spec-draft-n-max                      N
-                                        number of tokens to draft for speculative decoding (default: 3)
+                                        number of tokens to draft for speculative decoding (default: 3, 5 with --spec-type draft-dflash)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MAX)
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding; greedy drafts only, a draft sampled with

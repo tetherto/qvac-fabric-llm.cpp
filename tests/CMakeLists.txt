@@ -309,6 +309,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 endif()
 llama_test(test-llama-archs NAME test-glm5-kpool-sequences ARGS --glm5-kpool-sequences)
 llama_test(test-llama-archs NAME test-glm5-invalid-metadata ARGS --glm5-invalid-metadata)
+llama_test(test-llama-archs NAME test-qsa-one-seq-rows ARGS --qsa-one-seq-rows)
 llama_test(test-llama-archs NAME test-hadamard-contracts ARGS --hadamard-contracts)
 llama_test(test-llama-archs NAME test-layer-inp-pos-min ARGS --layer-inp-pos-min)
 llama_test(test-llama-archs NAME test-fit-borrowing-draft ARGS --fit-borrowing-draft)
@@ -625,6 +626,19 @@ llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK 
 
 llama_build_and_test(test-convrot.cpp LINK ggml)
 
+llama_build(test-hip-scale-residual.cpp LINK ggml)
+llama_test(test-hip-scale-residual NAME test-hip-scale-residual-guards ARGS guards)
+if (GGML_CPU)
+    llama_test(test-hip-scale-residual NAME test-hip-scale-residual-cpu ARGS CPU)
+endif()
+
+llama_build(test-hip-fattn-f32.cpp LINK ggml)
+llama_test(test-hip-fattn-f32 NAME test-hip-fattn-f32-dispatch ARGS dispatch)
+if (GGML_CPU)
+    llama_test(test-hip-fattn-f32 NAME test-hip-fattn-f32-cpu ARGS CPU)
+endif()
+
+
 if (GGML_OPENCL)
     find_package(Threads REQUIRED)
     llama_build_and_test(test-opencl-concurrent-upload.cpp LINK ggml Threads::Threads)
@@ -688,10 +702,6 @@ if (GGML_BACKEND_DL AND NOT EMSCRIPTEN)
         target_include_directories(test-backend-loader-stub-${stub} PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
         target_link_libraries(test-backend-loader-stub-${stub} PRIVATE ggml-base)
         target_compile_definitions(test-backend-loader-stub-${stub} PRIVATE STUB_NAME="STUB_${stub_upper}")
-        # Like the real backend modules (ggml_add_backend_library), so the log forwarding checks also run on Windows.
-        if (COMMAND ggml_backend_export_log_functions)
-            ggml_backend_export_log_functions(test-backend-loader-stub-${stub})
-        endif()
     endforeach()
     target_compile_definitions(test-backend-loader-stub-zero PRIVATE STUB_SCORE=0)
     target_compile_definitions(test-backend-loader-stub-ok   PRIVATE STUB_SCORE=5)

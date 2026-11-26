@@ -297,8 +297,9 @@ inline void ggml_top_k_find_bucket(
     }
 }
 
-// writes the columns of the top_k largest of n values to dst_row (in no particular order): finds the k-th largest key
-// with 4 radix-8 histogram passes, then emits every key above it and fills the rest from its ties
+// writes the columns of the top_k largest of n values to dst_row: finds the k-th largest key with 4 radix-8
+// histogram passes, then emits every key above it and fills the rest from its ties, both in src order
+// (deterministic). ntg_x must be a multiple of 32, at most 1024
 template<typename Src>
 inline void ggml_top_k_radix_select(
         Src src,
@@ -343,28 +344,99 @@ inline void ggml_top_k_radix_select(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (tid == 0) {
-        atomic_store_explicit(out_count, 0u, memory_order_relaxed);
+    (void) out_count; // the compaction ranks with simdgroup scans instead of an atomic counter
+
+    // deterministic compaction (ggml-org/llama.cpp#31084): rank the kept elements by their order in src, so the
+    // result does not depend on the thread scheduling. above the threshold first, then the ties
+    const uint threshold = prefix;
+
+    // each simdgroup scans a contiguous range, its lanes interleave with stride 32 to keep the reads coalesced
+    const uint lane  = tid & 31u;
+    const uint wg    = tid >> 5u;
+    const uint nw    = ntg_x >> 5u;
+    const uint wlo   = wg*((n + nw - 1) / nw);
+    const uint whi   = min(wlo + (n + nw - 1) / nw, n);
+    const uint nstep = wlo < whi ? (whi - wlo + 31) >> 5 : 0;
+
+    uint ca = 0; // elements above the threshold in this lane's substream
+    uint ct = 0; // elements tied with the threshold in this lane's substream
+    for (uint i = wlo + lane; i < whi; i += 32u) {
+        const uint key = src.key(i);
+        ca += (key >  threshold) ? 1u : 0u;
+        ct += (key == threshold) ? 1u : 0u;
+    }
+
+    // per-simdgroup totals into the now unused histogram, the first simdgroup turns them into exclusive bases
+    const uint wca = simd_sum(ca);
+    const uint wct = simd_sum(ct);
+    if (lane == 0) {
+        atomic_store_explicit(&histo[wg],      wca, memory_order_relaxed);
+        atomic_store_explicit(&histo[32 + wg], wct, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // emit everything above the threshold, then fill the rest from ties
-    const uint threshold = prefix;
-
-    for (uint i = tid; i < n; i += ntg_x) {
-        if (src.key(i) > threshold) {
-            const uint pos = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-            dst_row[pos] = src.column(i);
+    if (tid < 32) {
+        const bool valid = tid < nw;
+        const uint sa = valid ? atomic_load_explicit(&histo[tid],      memory_order_relaxed) : 0u;
+        const uint st = valid ? atomic_load_explicit(&histo[32 + tid], memory_order_relaxed) : 0u;
+        const uint ea = simd_prefix_exclusive_sum(sa);
+        const uint et = simd_prefix_exclusive_sum(st);
+        if (valid) {
+            atomic_store_explicit(&histo[tid],      ea, memory_order_relaxed);
+            atomic_store_explicit(&histo[32 + tid], et, memory_order_relaxed);
+        }
+        const uint ta = simd_sum(sa);
+        const uint tt = simd_sum(st);
+        if (tid == 0) {
+            *sh_bucket = ta; // total above the threshold
+            *sh_above  = tt; // total tied with the threshold
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint i = tid; i < n; i += ntg_x) {
-        if (src.key(i) == threshold) {
-            const uint pos = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-            if (pos < top_k) {
+    const uint above_total = *sh_bucket;
+    const uint tie_total   = *sh_above;
+    const uint base_wa = atomic_load_explicit(&histo[wg],      memory_order_relaxed);
+    const uint base_wt = above_total + atomic_load_explicit(&histo[32 + wg], memory_order_relaxed);
+
+    // the lanes write their kept elements at lane-major ranks, which does not depend on the scheduling. with more ties
+    // than remaining slots, the ties are ranked in src order with a per-step cross-lane scan instead, so the lowest
+    // tied indices are the ones kept
+    const uint excl_a = simd_prefix_exclusive_sum(ca);
+    const uint excl_t = simd_prefix_exclusive_sum(ct);
+
+    if (tie_total <= top_k - above_total) {
+        uint na = 0;
+        uint nt = 0;
+        for (uint i = wlo + lane; i < whi; i += 32u) {
+            const uint key = src.key(i);
+            if (key > threshold) {
+                dst_row[base_wa + excl_a + na] = src.column(i);
+                ++na;
+            } else if (key == threshold) {
+                dst_row[base_wt + excl_t + nt] = src.column(i);
+                ++nt;
+            }
+        }
+    } else {
+        uint na = 0;
+        for (uint i = wlo + lane; i < whi; i += 32u) {
+            if (src.key(i) > threshold) {
+                dst_row[base_wa + excl_a + na] = src.column(i);
+                ++na;
+            }
+        }
+
+        uint tt = 0; // tied elements in the earlier steps of this simdgroup
+        for (uint step = 0; step < nstep; ++step) {
+            const uint i   = wlo + 32u*step + lane;
+            const bool ok  = i < whi;
+            const bool t   = ok && src.key(i) == threshold;
+            const uint pos = base_wt + tt + simd_prefix_exclusive_sum((uint) t);
+            if (t && pos < top_k) {
                 dst_row[pos] = src.column(i);
             }
+            tt += simd_sum((uint) t);
         }
     }
 }

@@ -957,4 +957,30 @@ The GPU may still be used to accelerate some parts of the computation even when 
 
 In most cases, it is possible to build and use multiple backends at the same time. For example, you can build llama.cpp with both CUDA and Vulkan support by using the `-DGGML_CUDA=ON -DGGML_VULKAN=ON` options with CMake. At runtime, you can specify which backend devices to use with the `--device` option. To see a list of available devices, use the `--list-devices` option.
 
+### Dynamic backend loading
+
 Backends can be built as dynamic libraries that can be loaded dynamically at runtime. This allows you to use the same llama.cpp binary on different machines with different GPUs. To enable this feature, use the `GGML_BACKEND_DL` option when building.
+
+#### QVAC shared-core linkage
+
+With `GGML_BACKEND_DL=ON`, backends and their consumers link the shared ggml
+core. The `qvac-ggml-*-1` library names and `QVAC_GGML_*_ABI_1` symbol nodes
+identify the first shared-core linkage generation. They do not promise ABI
+compatibility between Fabric releases.
+
+A process must use one Fabric release. Fabric, its core libraries, backend
+modules and consuming addons must be built and released in lockstep with
+matching build configurations. Mixing releases is unsupported; the library
+names and symbol nodes do not enforce this restriction.
+
+Upstream ggml changes, including changes to structures or backend interfaces,
+require rebuilding the dependent components together. They do not by themselves
+require a generation bump under this lockstep contract.
+
+Change the generation when replacing the shared-core linkage contract, such as
+moving the exported C++ runtime to another provider or restructuring the shared
+libraries so consumers need a different import contract. Update library names,
+symbol nodes, pkg-config files, package metadata and consumer imports together.
+
+Supporting independently updated consumers or multiple Fabric releases in one
+process would require a separate compatibility and loading design.

@@ -690,20 +690,33 @@ void quantize_mmq_q8_1_cuda(
 }
 
 // Quantizes the 4 values xi of a thread, the 32 values of a sub-block are held by 8 threads.
-// sum: d times the sum of the quantized values of the sub-block, only for the layouts with sums.
-template <mmq_q8_1_ds_layout ds_layout>
+// sum: d times the sum of the quantized values of the sub-block, only for the layouts with sums. fp8: see quantize_mmq_few_q8_1.
+template <mmq_q8_1_ds_layout ds_layout, bool fp8 = false>
 static __device__ __forceinline__ char4 quantize_mmq_few_values(const float4 xi, float & d, float & sum) {
     float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
     amax = warp_reduce_max<8>(amax);
 
-    // an all-zero sub-block (the zeros past a row or past the entries of a pair) has d = 0 and q = 0, see ggml-org/llama.cpp#32566
-    const float d_inv = amax == 0.0f ? 0.0f : 127.0f / amax;
-    char4 q;
-    q.x = roundf(xi.x*d_inv);
-    q.y = roundf(xi.y*d_inv);
-    q.z = roundf(xi.z*d_inv);
-    q.w = roundf(xi.w*d_inv);
-    d = amax == 0.0f ? 0.0f : 1.0f / d_inv;
+    char4 q = make_char4(0, 0, 0, 0);
+    d = 1.0f;
+    if constexpr (fp8) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        d = amax > 0.0f ? amax*(1.0f/448.0f) : 1.0f;
+        const float d_inv = 1.0f / d;
+        const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(xi.x*d_inv, xi.y*d_inv), __NV_SATFINITE, __NV_E4M3);
+        const uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(xi.z*d_inv, xi.w*d_inv), __NV_SATFINITE, __NV_E4M3);
+        *(uint32_t *) &q = lo | (hi << 16);
+#else
+        NO_DEVICE_CODE;
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    } else {
+        // an all-zero sub-block (the zeros past a row or past the entries of a pair) has d = 0 and q = 0, see ggml-org/llama.cpp#32566
+        const float d_inv = amax == 0.0f ? 0.0f : 127.0f / amax;
+        q.x = roundf(xi.x*d_inv);
+        q.y = roundf(xi.y*d_inv);
+        q.z = roundf(xi.z*d_inv);
+        q.w = roundf(xi.w*d_inv);
+        d = amax == 0.0f ? 0.0f : 1.0f / d_inv;
+    }
 
     // as in quantize_mmq_q8_1: the sum of the quantized values; the int warp_reduce_sum reduces the whole warp on Ampere+
     sum = 0.0f;
@@ -714,11 +727,11 @@ static __device__ __forceinline__ char4 quantize_mmq_few_values(const float4 xi,
 }
 
 // Stores the 4 values xi of a thread, values [iu, iu + 4) of column g in a unit of 256 values, in the column group yg of the unit, see quantize.cuh for the layout.
-template <mmq_q8_1_ds_layout ds_layout>
+template <mmq_q8_1_ds_layout ds_layout, bool fp8 = false>
 static __device__ __forceinline__ void quantize_mmq_few_store(const float4 xi, int4 * yg, const int iu, const int g) {
     float d;
     float sum;
-    const char4 q = quantize_mmq_few_values<ds_layout>(xi, d, sum);
+    const char4 q = quantize_mmq_few_values<ds_layout, fp8>(xi, d, sum);
 
     const int s = iu / QK8_1; // sub-block
     const int k = iu % QK8_1; // first value in sub-block
@@ -734,10 +747,12 @@ static __device__ __forceinline__ void quantize_mmq_few_store(const float4 xi, i
 }
 
 // Each thread quantizes 4 values of one column, see quantize.cuh for the layouts.
-template <mmq_q8_1_ds_layout ds_layout, bool wmma>
+// fp8: e4m3 values for the e4m3 MMA of F8_E4M3 weights, the amax of a sub-block maps to 448, d is its float scale (D4).
+template <mmq_q8_1_ds_layout ds_layout, bool wmma, bool fp8 = false>
 static __global__ void quantize_mmq_few_q8_1(
         const float * x_ptr, void * vy_ptr, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int ne1, const int ne2) {
+    static_assert(!wmma || !fp8, "no fp8 with WMMA");
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT x  = x_ptr;
     int4        * GGML_CUDA_RESTRICT vy = (int4 *) vy_ptr;
@@ -777,7 +792,7 @@ static __global__ void quantize_mmq_few_q8_1(
 
     const int     g      = blockIdx.x % MMQ_FEW_NCOLS; // column in group
     int4 * yg = vy + ((blockIdx.z*nunits + i0/QK_K)*(gridDim.x/MMQ_FEW_NCOLS) + blockIdx.x/MMQ_FEW_NCOLS)*MMQ_FEW_Q8_1_INT4;
-    quantize_mmq_few_store<ds_layout>(xi, yg, i0 % QK_K, g);
+    quantize_mmq_few_store<ds_layout, fp8>(xi, yg, i0 % QK_K, g);
 }
 
 // MUL_MAT_ID: block x is the (token, slot) entry, ids are as in mm_ids_helper. Each block finds the pair of its entry in shared memory, block (0, 0) also writes all pairs.
@@ -907,6 +922,19 @@ void quantize_mmq_few_q8_1_cuda(
         const float * x, void * vy, const mmq_q8_1_ds_layout ds_layout, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     quantize_mmq_few_q8_1_launch<false>(x, vy, ds_layout, ne00, s01, s02, s03, ne1, ne2, ne3, stream);
+}
+
+void quantize_mmq_few_fp8_cuda(
+        const float * x, void * vy, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+
+    const int64_t block_num_y = (ne00 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(GGML_PAD(ne1, MMQ_FEW_NCOLS), block_num_y, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+    ggml_cuda_kernel_launch(quantize_mmq_few_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true>, launch_params,
+        x, vy, ne00, s01, s02, s03, (int) ne1, (int) ne2);
 }
 
 void quantize_mmq_few_wmma_q8_1_cuda(

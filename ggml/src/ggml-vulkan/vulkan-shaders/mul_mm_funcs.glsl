@@ -25,6 +25,13 @@ void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
     buf_a[a_shmem_index(m, k_pair)] = value;
 }
 
+// 32-value blocks split into nibbles: a load's high half lands 16 values (8 pairs) after its low half,
+// inside the same block, so block offsets must step by 16 pairs for tiles wider than one block.
+uint nibble_k_pair(uint row, uint load_vec) {
+    const uint loads_per_block = 32 / load_vec;
+    return (row / loads_per_block) * 16 + (row % loads_per_block) * (load_vec / 4);
+}
+
 // bounds_check is a literal at every call site: the caller only passes true for
 // the ragged last tile in M, so interior tiles fold the checks away entirely.
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const bool bounds_check, const uint block, const uint end_k) {
@@ -297,7 +304,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
 #elif defined(DATA_A_IQ4_XS)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-    const uint k_pair = row * LOAD_VEC_A / 4;
+    const uint k_pair = nibble_k_pair(row, LOAD_VEC_A);
 
     const uint ib = idx / 32;
     const uint ib32 = (idx % 32) / 4;
@@ -321,7 +328,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
 #elif defined(DATA_A_IQ4_NL)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-    const uint k_pair = row * LOAD_VEC_A / 4;
+    const uint k_pair = nibble_k_pair(row, LOAD_VEC_A);
 
     const uint ib = idx / 8;
     const uint iqs = idx & 0x07;
@@ -337,7 +344,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
 #elif defined(DATA_A_MXFP4)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-    const uint k_pair = row * LOAD_VEC_A / 4;
+    const uint k_pair = nibble_k_pair(row, LOAD_VEC_A);
 
     const uint ib = idx / 8;
     const uint iqs = (idx & 0x07) * 2;
@@ -446,7 +453,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #else
     if (MmTypeA == GGML_TYPE_Q4_0) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
-        const uint k_pair = row * mm_load_vec_a() / 4;
+        const uint k_pair = nibble_k_pair(row, mm_load_vec_a());
 
         const uint ib = idx / 4;
         const uint iqs = idx & 0x03;
@@ -479,7 +486,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         store_a(col, k_pair + 9, FLOAT_TYPEV2(v1.zw));
     } else if (MmTypeA == GGML_TYPE_Q4_1) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
-        const uint k_pair = row * mm_load_vec_a() / 4;
+        const uint k_pair = nibble_k_pair(row, mm_load_vec_a());
 
         const uint ib = idx / 4;
         const uint iqs = idx & 0x03;
@@ -510,7 +517,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         store_a(col, k_pair + 9, FLOAT_TYPEV2(v1.zw));
     } else if (MmTypeA == GGML_TYPE_Q5_0) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
-        const uint k_pair = row * mm_load_vec_a() / 4;
+        const uint k_pair = nibble_k_pair(row, mm_load_vec_a());
 
         const uint ib = idx / 8;
         const uint iqs = idx & 0x07;
@@ -527,7 +534,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         store_a(col, k_pair + 8, FLOAT_TYPEV2(v.yw));
     } else if (MmTypeA == GGML_TYPE_Q5_1) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
-        const uint k_pair = row * mm_load_vec_a() / 4;
+        const uint k_pair = nibble_k_pair(row, mm_load_vec_a());
 
         const uint ib = idx / 4;
         const uint iqs = idx & 0x03;

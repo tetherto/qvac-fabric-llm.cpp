@@ -278,6 +278,8 @@ void ggml_abort(const char * file, int line, const char * fmt, ...) {
 // logging
 //
 
+static void ggml_log_callback_default(enum ggml_log_level level, const char * text, void * user_data);
+
 struct ggml_logger_state {
     ggml_log_callback log_callback;
     void * log_callback_user_data;
@@ -312,7 +314,7 @@ void ggml_log_internal(enum ggml_log_level level, const char * format, ...) {
     va_end(args);
 }
 
-void ggml_log_callback_default(enum ggml_log_level level, const char * text, void * user_data) {
+static void ggml_log_callback_default(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     (void) user_data;
     fputs(text, stderr);
@@ -1192,6 +1194,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "TOP_K_ROWS",
 
     "UNARY",
 
@@ -1235,7 +1238,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ROPE_FLUX",
 };
 
-static_assert(GGML_OP_COUNT == 133, "GGML_OP_COUNT != 133");
+static_assert(GGML_OP_COUNT == 134, "GGML_OP_COUNT != 134");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1344,6 +1347,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "top_k_rows(top_k, score, blocks, extra)",
 
     "unary(x)",
 
@@ -1387,7 +1391,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rope_flux(x,pe)",
 };
 
-static_assert(GGML_OP_COUNT == 133, "GGML_OP_COUNT != 133");
+static_assert(GGML_OP_COUNT == 134, "GGML_OP_COUNT != 134");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -7901,6 +7905,43 @@ struct ggml_tensor * ggml_lightning_indexer(
     return result;
 }
 
+struct ggml_tensor * ggml_lightning_indexer_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * k_rows) {
+
+    GGML_ASSERT(       q->type == GGML_TYPE_F32);
+    GGML_ASSERT( weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(  k_rows->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_vector(k_rows) && ggml_is_contiguous(k_rows));
+    GGML_ASSERT(      q->ne[0] == k->ne[0]);
+    GGML_ASSERT(      k->ne[1] == 1 && k->ne[3] == 1);
+    GGML_ASSERT(   mask->ne[0] == k_rows->ne[0]);
+    GGML_ASSERT(      q->ne[1] == weights->ne[0]);
+    GGML_ASSERT(   mask->ne[1] == q->ne[2]);
+    GGML_ASSERT(      q->ne[2] == weights->ne[1]);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(   mask->ne[2] == 1);
+    GGML_ASSERT(      q->ne[3] == weights->ne[3]);
+    GGML_ASSERT(weights->ne[3] % mask->ne[3] == 0);
+
+    int64_t ne[4] = { k_rows->ne[0], q->ne[2], 1, q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op   = GGML_OP_LIGHTNING_INDEXER;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = weights;
+    result->src[3] = mask;
+    result->src[4] = k_rows;
+
+    return result;
+}
+
 // ggml_dsv4_hc_comb
 
 struct ggml_tensor * ggml_dsv4_hc_comb(
@@ -8162,6 +8203,67 @@ struct ggml_tensor * ggml_gated_delta_net_back(
     result->src[4] = beta;
     result->src[5] = state;
     result->src[6] = d;
+    return result;
+}
+
+// ggml_top_k_rows
+
+struct ggml_tensor * ggml_top_k_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * extra,
+        int64_t               n_kv,
+        int64_t               n_res,
+        int64_t               n_group,
+        enum ggml_type        type) {
+    GGML_ASSERT(type == GGML_TYPE_I32 || type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(n_kv > 0 && n_kv <= INT32_MAX);
+    // a group marks its rows in the bits of one 32-bit word per pick
+    GGML_ASSERT(n_group >= 1 && n_group <= 32);
+
+    if (score) {
+        GGML_ASSERT(score->type == GGML_TYPE_F32);
+        GGML_ASSERT(score->ne[1] == top_k->ne[1] && score->ne[2] == top_k->ne[2] && score->ne[3] == top_k->ne[3]);
+    }
+
+    if (blocks) {
+        GGML_ASSERT(blocks->type == GGML_TYPE_I32);
+        GGML_ASSERT(blocks->ne[2] == 1 && blocks->ne[3] == 1);
+        GGML_ASSERT(!score || blocks->ne[1] == score->ne[0]);
+    }
+
+    if (extra) {
+        GGML_ASSERT(extra->type == GGML_TYPE_I32);
+        GGML_ASSERT(extra->ne[1] == top_k->ne[1] && extra->ne[2] == top_k->ne[2] && extra->ne[3] == top_k->ne[3]);
+    }
+
+    const int64_t n_blk   = blocks ? blocks->ne[0] : 1;
+    const int64_t n_extra = extra  ? extra->ne[0]  : 0;
+    const int64_t n_pick  = blocks ? blocks->ne[1] : score ? score->ne[0] : n_kv;
+    if (n_group == 1) {
+        GGML_ASSERT(n_res >= top_k->ne[0]*n_blk + n_extra);
+    } else {
+        GGML_ASSERT(n_res >= MIN(n_pick, n_group*top_k->ne[0])*n_blk + n_group*n_extra);
+    }
+
+    // the list is shared by the rows of a group, the mask has n_group rows per group, the last group may be partial
+    const int64_t n_grp1 = (top_k->ne[1] + n_group - 1)/n_group;
+    const int64_t ne1    = type == GGML_TYPE_I32 ? n_grp1 : n_grp1*n_group;
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, n_res, ne1, top_k->ne[2], top_k->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_kv);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_group);
+
+    result->op     = GGML_OP_TOP_K_ROWS;
+    result->src[0] = top_k;
+    result->src[1] = score;
+    result->src[2] = blocks;
+    result->src[3] = extra;
+
     return result;
 }
 

@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
@@ -197,6 +198,7 @@ static void usage(char ** argv) {
     LOG("  --glm5-kpool-sequences   Run only the GLM5 k-pool sequence edit and shared-token test\n");
     LOG("  --glm5-invalid-metadata  Run only the GLM5 invalid-metadata rejection test\n");
     LOG("  --qsa-unified-multiseq   Run only the QSA unified multi-sequence fallback test\n");
+    LOG("  --qsa-one-seq-rows       Run only the QSA one-sequence row-list test\n");
     LOG("  --layer-inp-pos-min      Run only the layer-input pos_min copy test\n");
     LOG("  --moe-no-output-ubatches Run only the MoE no-output ubatch realloc test (must be the sole argument)\n\n");
     LOG("Examples:\n");
@@ -1368,6 +1370,95 @@ static int test_qsa_unified_multiseq(size_t seed, float stdev) {
     GGML_ASSERT(observed.top_k);
 
     printf("QSA unified multi-sequence test passed\n");
+    return 0;
+}
+
+static void set_env_var(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+// A one-sequence cache in a non-unified context takes the QSA row lists by default: they must give the logits of the
+// mask path (LLAMA_KV_ROWS_DISABLE), for a prompt and for single-token decode steps. A qwen4exp model without QSA
+// layers keeps the dense mask. CPU only, so the result does not depend on which backends support the row lists.
+static int test_qsa_one_seq_rows(size_t seed, float stdev) {
+    struct observed_fattn {
+        bool fattn = false; // a FLASH_ATTN_EXT node ran
+        bool rows  = false; // one of them read K/V through a row list (src[5])
+    };
+
+    auto observe = [](ggml_tensor * tensor, bool ask, void * data) {
+        auto & obs = *static_cast<observed_fattn *>(data);
+        if (ask && tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+            obs.fattn = true;
+            obs.rows |= tensor->src[5] != nullptr;
+        }
+        return false;
+    };
+
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(cpu != nullptr);
+
+    // top_k below the context so the indexer drops cells
+    auto gguf_sparse = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto gguf_dense  = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    gguf_set_val_u32(gguf_sparse.get(), "qwen4exp.attention.indexer.top_k", 8);
+
+    const uint32_t dense_ratios[] = { 0, 0 };
+    gguf_set_arr_data(gguf_dense.get(), "qwen4exp.attention.compress_ratios", GGUF_TYPE_UINT32, dense_ratios, 2);
+
+    observed_fattn obs_rows, obs_mask, obs_dense;
+
+    auto rows = get_model_and_ctx(gguf_sparse.get(), nullptr, seed, stdev, { cpu }, LLAMA_SPLIT_MODE_LAYER,
+            false, nullptr, 0, 1, false, observe, &obs_rows);
+    set_env_var("LLAMA_KV_ROWS_DISABLE", "1");
+    auto mask = get_model_and_ctx(gguf_sparse.get(), nullptr, seed, stdev, { cpu }, LLAMA_SPLIT_MODE_LAYER,
+            false, nullptr, 0, 1, false, observe, &obs_mask);
+    set_env_var("LLAMA_KV_ROWS_DISABLE", nullptr);
+    auto dense = get_model_and_ctx(gguf_dense.get(), nullptr, seed, stdev, { cpu }, LLAMA_SPLIT_MODE_LAYER,
+            false, nullptr, 0, 1, false, observe, &obs_dense);
+
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(rows.first.get()));
+    const uint32_t n_prompt = 100; // two ubatches of 64: grouped lists, then a padded last group
+    const uint32_t n_steps  = 4;   // single tokens: one list per token
+    GGML_ASSERT(n_prompt + n_steps <= llama_n_ctx(rows.second.get()));
+
+    const std::vector<llama_token> tokens = get_tokens(n_prompt + n_steps, n_vocab, seed);
+    const std::vector<llama_token> prompt(tokens.begin(), tokens.begin() + n_prompt);
+
+    auto step = [n_vocab](llama_context * ctx, llama_token token, llama_pos pos) {
+        common_batch batch(ctx);
+        batch.add(token, pos, 0, true);
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode a single token");
+        }
+        const float * logits = llama_get_logits_ith(ctx, 0);
+        return std::vector<float>(logits, logits + n_vocab);
+    };
+
+    // the row lists sum the selected cells in cell order, like the mask path: same tolerance as the multi-sequence test
+    GGML_ASSERT(nmse(get_logits(rows.first.get(), rows.second.get(), prompt),
+                     get_logits(mask.first.get(), mask.second.get(), prompt)) < 1e-11);
+    get_logits(dense.first.get(), dense.second.get(), prompt);
+
+    for (uint32_t i = 0; i < n_steps; ++i) {
+        const llama_token t = tokens[n_prompt + i];
+        GGML_ASSERT(nmse(step(rows.second.get(), t, n_prompt + i), step(mask.second.get(), t, n_prompt + i)) < 1e-11);
+        step(dense.second.get(), t, n_prompt + i);
+    }
+
+    GGML_ASSERT(obs_rows.fattn && obs_rows.rows);
+    GGML_ASSERT(obs_mask.fattn && !obs_mask.rows);
+    GGML_ASSERT(obs_dense.fattn && !obs_dense.rows);
+
+    printf("QSA one-sequence row-list test passed\n");
     return 0;
 }
 
@@ -2924,6 +3015,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool qsa_unified_multiseq = false;
+    bool qsa_one_seq_rows     = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2933,6 +3025,8 @@ int main(int argc, char ** argv) {
             return 0;
         } else if (strcmp(argv[i], "--qsa-unified-multiseq") == 0) {
             qsa_unified_multiseq = true;
+        } else if (strcmp(argv[i], "--qsa-one-seq-rows") == 0) {
+            qsa_one_seq_rows = true;
         } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -3010,6 +3104,9 @@ int main(int argc, char ** argv) {
     try {
         if (qsa_unified_multiseq) {
             return test_qsa_unified_multiseq(seed, stdev);
+        }
+        if (qsa_one_seq_rows) {
+            return test_qsa_one_seq_rows(seed, stdev);
         }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
