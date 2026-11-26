@@ -170,6 +170,17 @@ Run VisionPsy Nano and Flash vision-language models through the multimodal subsy
 - **Image sizing**: `--image-no-upscale on` enables the Flash preprocessing rule, rounding image sizes to the slice grid without always stretching smaller images to the maximum size. Use it for Flash projectors that do not declare this rule in GGUF metadata.
 - **Memory-aware vision attention**: automatic flash-attention selection accounts for image size and device memory on backends without efficient cooperative-matrix flash attention.
 
+### Speech and Audio Engines
+
+The [`engines/speech/`](engines/speech/README.md) tree holds the speech and audio engines formerly developed in `qvac-fabric-speech.cpp`: Whisper, Parakeet, TTS and audio generation. They build against the in-tree `ggml/`:
+
+```bash
+cmake -B build -DFABRIC_BUILD_SPEECH=ON
+cmake --build build --config Release
+```
+
+Add `-DBUILD_LLAMA=OFF` to build only ggml and the speech engines, and `-DSPEECH_BUILD_TESTS=ON` for their tests. See [engines/speech/docs/BUILD.md](engines/speech/docs/BUILD.md) for the engine options.
+
 ---
 
 ## Quick Start

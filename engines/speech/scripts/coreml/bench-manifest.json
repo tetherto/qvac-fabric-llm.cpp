@@ -1,0 +1,250 @@
+{
+  "schema": 1,
+  "description": "Pinned workloads for scripts/coreml/bench-load-time.py. Files under root 'repo' are checked by --dry-run; files under root 'models' are checked with --check-models (QVAC_BENCH_MODELS, default ~/tether/models). Sidecars are exported locally from the pinned export_source GGUF with the pinned exporter options, so their digests are recorded per run in the results, not pinned here.",
+  "host": {
+    "chip": "Apple M2",
+    "memsize_gb": 24,
+    "os": "15.7.3",
+    "power": "AC"
+  },
+  "protocol": {
+    "ane_compiler_max_cpu_pct": 5,
+    "quiet_calm_samples": 3,
+    "quiet_timeout_s": 1800,
+    "cache_glob": "~/Library/Caches/qvac-bench-*",
+    "runs": {
+      "metal": 10,
+      "cold_prebuilt": 10,
+      "cold_generate": 10,
+      "time_to_ready": 5,
+      "cached_startup": 5,
+      "in_memory_ready": 5
+    },
+    "seed": 42,
+    "units": "cpu_and_ane",
+    "ane_compile_reserve_factor": 1.6
+  },
+  "exporter": {
+    "script": "tts/scripts/export-chatterbox-coreml.py",
+    "python": "~/tether/models/.venv-coreml-py312 (coremltools 9.0, torch 2.7.0, gguf 0.19; parakeet/scripts/requirements-coreml.txt)",
+    "command": "export-chatterbox-coreml.py --gguf <export_source> --frames <frames> --output <dir> --compile"
+  },
+  "sidecar_sets": {
+    "w7": {
+      "dir": "chatterbox",
+      "frames": [512, 640, 768, 896, 1024, 1280, 1536],
+      "hift_window": 128,
+      "stages": ["encoder", "cfm", "hift"]
+    },
+    "w3": {
+      "dir": "chatterbox/w3",
+      "frames": [512, 1024, 1536],
+      "hift_window": 128,
+      "stages": ["encoder", "cfm"],
+      "hift_from": "w7"
+    }
+  },
+  "variants": {
+    "turbo": {
+      "label": "Chatterbox Turbo",
+      "sidecar_stem": "chatterbox-s3gen",
+      "token_mel_ratio": 2,
+      "language": null,
+      "hf": {"repo": "ResembleAI/chatterbox-turbo", "revision": "749d1c1a46eb10492095d68fbcf55691ccf137cd"},
+      "t3": {
+        "root": "models",
+        "path": "chatterbox/chatterbox-t3-turbo-q8_0.gguf",
+        "sha256": "0d2d54fbaa6d90c3fdb834134a68d4f0b97fe39827f8a0603a087b7b63f65f31",
+        "bytes": 487861440
+      },
+      "s3gen": {
+        "root": "models",
+        "path": "chatterbox/chatterbox-s3gen-q8_0.gguf",
+        "sha256": "09038488320deb4091c895c8f589cbd6708ca7d445ba78fb2b5eefb14301073b",
+        "bytes": 829702464
+      },
+      "export_source": {
+        "root": "models",
+        "path": "chatterbox/chatterbox-s3gen-f32.gguf",
+        "sha256": "b7f2f6d2ef4a47fce896fdba7e445c4b49f15913a94a5ff0ca1e05cfa8059ff8",
+        "bytes": 1064879936
+      }
+    },
+    "mtl": {
+      "label": "Chatterbox Multilingual",
+      "sidecar_stem": "chatterbox-s3gen-mtl",
+      "token_mel_ratio": 2,
+      "language": "en",
+      "hf": {"repo": "ResembleAI/chatterbox", "revision": "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18"},
+      "t3": {
+        "root": "models",
+        "path": "chatterbox/chatterbox-t3-mtl-q8_0.gguf",
+        "sha256": "f3a111f46b22fd30bd42a151de0a5de98144f1619cc492512365d3d93014cfcc",
+        "bytes": 604323648
+      },
+      "s3gen": {
+        "root": "models",
+        "path": "chatterbox/chatterbox-s3gen-mtl-q8_0.gguf",
+        "sha256": "894f342725c253cbaf556bbb17ff6a7c71d8590bfa4dbd3dfca9e569b5182e33",
+        "bytes": 827414304
+      },
+      "export_source": {
+        "root": "models",
+        "path": "chatterbox/chatterbox-s3gen-mtl-f32.gguf",
+        "sha256": "1fcc780ab31eaee7440ac909bf4c49b1e583b40b150992ed6a96cad4ca737e1d",
+        "bytes": 1056431360
+      }
+    }
+  },
+  "workloads": {
+    "benchmark-prompt": {
+      "description": "The Chatterbox Core ML benchmark prompt: three sentences, two segments at max_sentence_chars 180 (tts/docs/chatterbox.md:134-137).",
+      "text": {
+        "root": "repo",
+        "path": "scripts/benchmarks/fixtures/tts-intelligibility.txt",
+        "sha256": "fc1943705a10ee241c67af032220e7c151519f34b9449b3892ccf4cf4ae5e294",
+        "bytes": 197
+      },
+      "max_sentence_chars": 180,
+      "voice": "built-in",
+      "seed": 42
+    },
+    "length-sweep": {
+      "description": "One S3Gen call per sentence for the Metal cost fit: each process synthesizes the warmup sentence, then one sweep sentence as its own segment (max_sentence_chars = its length); the warmup call is discarded.",
+      "warmup": "Hello there.",
+      "sentences": [
+        "The cat sat down.",
+        "Please bring the blue notebook before we leave.",
+        "The morning train arrived beside the quiet river while the station clock struck seven.",
+        "A young traveler opened the window and watched the sunlight move slowly across the green hills, the farms, and the small white houses.",
+        "When the storm finally passed over the valley, the villagers walked down to the harbor to count the boats, mend the torn nets, and thank the sailors who had stayed out all night.",
+        "Long after the last guests had left the old house on the hill, the musicians kept playing in the empty hall, slowly and softly, as if the candles, the portraits, and the tall dark windows were still listening to every single note they played."
+      ],
+      "voice": "built-in",
+      "seed": 42
+    }
+  },
+  "quality_sets": {
+    "wer": [
+      {
+        "name": "jfk",
+        "language": "en",
+        "normalizer": "english",
+        "audio": {
+          "root": "repo",
+          "path": "parakeet/test/samples/jfk.wav",
+          "sha256": "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+          "bytes": 352078
+        },
+        "reference": {
+          "root": "repo",
+          "path": "third_party/whisper.cpp/tests/parakeet-expected-jfk-output.txt",
+          "sha256": "9ad3785e831fb042a9491c8c40d79cc1810750abf17d89d108e7b41f4ebcf41d",
+          "bytes": 109
+        }
+      },
+      {
+        "name": "hi-16k",
+        "language": "hi",
+        "normalizer": "none",
+        "audio": {
+          "root": "repo",
+          "path": "parakeet/test/samples/hi-16k.wav",
+          "sha256": "c29d2a78bd47335fe2d8780f0f76516230ec26b0cf0ab5bde1159918b4c7551f",
+          "bytes": 233352
+        },
+        "reference": {
+          "root": "repo",
+          "path": "parakeet/test/samples/hi-16k.expected.txt",
+          "sha256": "17e7a247d094573df49b542a2195aaed9638a6ef5c92d3f23db231c1b0d72cdd",
+          "bytes": 297
+        }
+      }
+    ],
+    "der": [
+      {
+        "name": "abcba",
+        "collar_ms": 250,
+        "audio": {
+          "root": "repo",
+          "path": "parakeet/test/samples/abcba.wav",
+          "sha256": "f203c193da33a934a39cbeaff6dd985a994e2e2927797105f48f0bd7667c373f",
+          "bytes": 5139130
+        },
+        "rttm": {
+          "root": "repo",
+          "path": "parakeet/test/samples/abcba.rttm",
+          "sha256": "cf62fac9fd3ae7bafdbde4295037c09ce62dab575d92b0e3fe49fc9d6af0590c",
+          "bytes": 260
+        }
+      },
+      {
+        "name": "abcdba",
+        "collar_ms": 250,
+        "audio": {
+          "root": "repo",
+          "path": "parakeet/test/samples/abcdba.wav",
+          "sha256": "865f3793393361453bc95df6885be353533f8cdf93ff3b650cc92b97592e3946",
+          "bytes": 6117762
+        },
+        "rttm": {
+          "root": "repo",
+          "path": "parakeet/test/samples/abcdba.rttm",
+          "sha256": "d88301f2953e4ca6858e95c9d8cece3ebdc087a9da7fb4913b9975d31e516537",
+          "bytes": 319
+        }
+      }
+    ]
+  },
+  "measurements": {
+    "sizes": {
+      "what": "Multifunction spec sizes: model.mil, model.mlmodel, weight.bin, zlib and LZFSE sizes, per stage and width set.",
+      "variants": ["turbo", "mtl"],
+      "sets": ["w7", "w3"]
+    },
+    "memory": {
+      "what": "The runtime's available-memory reading under the normal desktop load (the input to memory admission), against each artifact's ane_compile_reserve_bytes.",
+      "samples": 120,
+      "interval_ms": 1000
+    },
+    "load": {
+      "what": "Per function: cold load (fresh identity, fresh path), warm load + first prediction (expected_warm_load_ms), prediction time, and whether loaded functions share weight memory.",
+      "variants": ["turbo", "mtl"],
+      "sets": ["w7", "w3"],
+      "warm_runs": 5,
+      "predictions": 5,
+      "sharing_runs": 3,
+      "sharing_units": ["cpu_and_ane", "cpu_only"]
+    },
+    "ttr": {
+      "what": "Time until every function is ready, with and without the admission gate, the worst-case prepare-queue wait, and cached startup with the same identity.",
+      "variants": ["turbo", "mtl"],
+      "configs": [
+        {"name": "prebuilt-gated", "route": "prebuilt", "mode": "manager", "set": "w7", "runs": 5, "cached_startup_runs": 1},
+        {"name": "prebuilt-gated-w3", "route": "prebuilt", "mode": "manager", "set": "w3", "runs": 3, "cached_startup_runs": 1},
+        {"name": "generate-gated", "route": "generate", "mode": "manager", "set": "w7", "runs": 5},
+        {"name": "generate-ungated", "route": "generate", "mode": "ungated", "set": "w7", "runs": 5}
+      ],
+      "memory_admission": true,
+      "timeout_s": 1800
+    },
+    "metal_cost": {
+      "what": "Per-variant linear Metal cost constants for s3gen_estimate_metal_ms: stage ms = a + b x frames, from CHATTERBOX_CHUNK_PROFILE.",
+      "variants": ["turbo", "mtl"],
+      "workload": "length-sweep",
+      "runs": 3
+    },
+    "synthesis": {
+      "what": "Warm tts-cli synthesis on the benchmark prompt: Metal, Core ML with 7 and 3 widths (padding cost), and Core ML without the encoder sidecar (encoder-fallback contention during overlap).",
+      "variants": ["turbo", "mtl"],
+      "workload": "benchmark-prompt",
+      "configs": [
+        {"name": "metal", "coreml": false},
+        {"name": "coreml-w7", "coreml": true, "set": "w7", "stages": ["encoder", "cfm", "hift"]},
+        {"name": "coreml-w3", "coreml": true, "set": "w3", "stages": ["encoder", "cfm", "hift"]},
+        {"name": "coreml-no-encoder", "coreml": true, "set": "w7", "stages": ["cfm", "hift"]}
+      ],
+      "runs": 3
+    }
+  }
+}

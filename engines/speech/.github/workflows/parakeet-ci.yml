@@ -1,0 +1,737 @@
+# CI for the parakeet engine (parakeet/ — moved from parakeet-cpp/
+# by the repo reorg QIP, PR 1).
+#
+# Scope (QIP "PR 0" lane): build the engine + every test harness against
+# system ggml (the ggml/ tree of qvac-fabric-llm.cpp at GGML_REF, the same
+# ggml the qvac-fabric vcpkg port ships), then run the non-GPU ctest suites.
+# Tests whose model/reference
+# fixtures aren't present are registered as DISABLED by the CMakeLists and
+# show up as "Not Run" — the lane stays green with the committed fixtures
+# only. GPU suites (`ctest -L gpu`) need real GPUs → self-hosted lane, see
+# the gpu job at the bottom.
+name: parakeet CI
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'parakeet/**'
+      - 'coreml/**'
+      - 'test/**'
+      - '.github/workflows/parakeet-ci.yml'
+  pull_request:
+    paths:
+      - 'parakeet/**'
+      - 'coreml/**'
+      - 'test/**'
+      - '.github/workflows/parakeet-ci.yml'
+  workflow_dispatch:
+    inputs:
+      run_gpu:
+        description: 'Also run the GPU ctest lane (on the self-hosted NVIDIA Linux runner)'
+        type: boolean
+        default: false
+      fixture_root:
+        description: 'Pre-staged fixture root on runners, containing models/, audio/ and references/'
+        type: string
+        default: ''
+      required_fixture_tests:
+        description: 'Space-separated CPU fixture test names that must execute successfully'
+        type: string
+        default: ''
+      required_gpu_tests:
+        description: 'Space-separated GPU test names that must execute successfully when run_gpu is enabled'
+        type: string
+        default: ''
+      run_mosaic:
+        description: 'Provision exact Mosaic and run real CPU/Metal/Core ML integration tests'
+        type: boolean
+        default: false
+      mosaic_compact_url:
+        description: 'Optional CI-accessible URL for the hash-pinned 339.6 MB Mosaic Compact GGUF; enables all twelve model/sidecar cases'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# Dedupe per PR and per branch: a re-push or re-dispatch supersedes the
+# in-flight run. The guard below previously excluded every event but
+# pull_request, so a push or a re-dispatch stacked a second run instead of
+# replacing the first.
+#
+# Two things are exempt and keyed per run instead, so they can never be
+# superseded:
+#
+#   run_gpu / run_mosaic dispatch - the opt-in jobs below only run under a
+#     workflow_dispatch with their input enabled, can take ~90 minutes on a self-hosted
+#     runner, and is SKIPPED by whatever run would replace it. Since that
+#     dispatch is made on a branch rather than master, keying on the ref alone
+#     left it cancellable — a second dispatch would kill it and the
+#     replacement would not re-run `gpu`, silently losing the result.
+#   master - so a merged commit always gets a CI verdict.
+#
+# github.event.inputs.* is a string even for a `type: boolean` input, hence
+# the explicit == 'true'.
+concurrency:
+  group: parakeet-ci-${{ ((github.event.inputs.run_gpu == 'true' || github.event.inputs.run_mosaic == 'true' || github.ref == 'refs/heads/master') && github.run_id) || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GGML_REPO: https://github.com/tetherto/qvac-fabric-llm.cpp.git
+  GGML_REF: 3cefcca8107194a372f015b13f27cd1aac301b67 # the fabric ggml pin (qvac-fabric-llm.cpp, ggml/); one pin shared by every lane
+
+jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
+  build-test:
+    needs: runner_names
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os == 'macos-14' && needs.runner_names.outputs.macos_14 || needs.runner_names.outputs.ubuntu_2404 }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test converter arguments
+        run: python3 -m unittest parakeet/test/test_converter_args.py
+
+      - name: Test the Core ML memory schedule checker
+        run: python3 -B -m unittest parakeet/test/test_check_coreml_memory_schedule.py
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test GGUF round-trip verification
+        run: |
+          qvac_roundtrip_venv="$RUNNER_TEMP/parakeet-gguf-roundtrip"
+          python -m venv "$qvac_roundtrip_venv"
+          "$qvac_roundtrip_venv/bin/python" -m pip install 'numpy==1.26.4' 'gguf==0.19.0'
+          "$qvac_roundtrip_venv/bin/python" -B parakeet/test/test_verify_gguf_roundtrip.py
+
+      - name: Install ccache
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install ccache; else sudo apt-get update -q && sudo apt-get install -y ccache; fi
+          echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
+
+      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+        id: ggml
+        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ggml install
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: ggml-install
+          key: ggml-install-portable-${{ matrix.os }}-${{ steps.ggml.outputs.sha }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-parakeet-${{ matrix.os }}-${{ github.sha }}
+          restore-keys: ccache-parakeet-${{ matrix.os }}-
+
+      # CPU-only ggml: this lane runs `-LE gpu` tests, and hosted runners
+      # have no Vulkan/OpenCL; Metal is exercised by the gpu lane instead.
+      - name: Build ggml (system ggml, qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          # Fetch exactly the pinned SHA the cache key was derived from.
+          git init -q ggml-src
+          git -C ggml-src remote add origin "$GGML_REPO"
+          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
+          git -C ggml-src checkout -q FETCH_HEAD
+          cmake -S ggml-src/ggml -B ggml-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_METAL=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j4
+          cmake --install ggml-src/build
+
+      - name: Configure
+        env:
+          FIXTURE_ROOT: ${{ inputs.fixture_root }}
+        run: |
+          fixture_options=()
+          if [ -n "$FIXTURE_ROOT" ]; then
+            fixture_options+=("-DPARAKEET_TEST_MODEL_DIR=$FIXTURE_ROOT/models"
+                              "-DPARAKEET_TEST_AUDIO_DIR=$FIXTURE_ROOT/audio"
+                              "-DPARAKEET_TEST_REF_DIR=$FIXTURE_ROOT/references")
+          fi
+          cmake -S parakeet -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPARAKEET_USE_SYSTEM_GGML=ON \
+            -DPARAKEET_BUILD_TESTS=ON \
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-install" "${fixture_options[@]}"
+
+      - name: Build
+        run: cmake --build build -j4
+
+      - name: Verify bundled install and external package consumers
+        run: |
+          if [ ! -d ggml-src/.git ]; then
+            git init -q ggml-src
+            git -C ggml-src remote add origin "$GGML_REPO"
+            git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
+            git -C ggml-src checkout -q FETCH_HEAD
+          fi
+          ln -s "$PWD/ggml-src" parakeet/ggml
+          PARAKEET_PKGTEST_CMAKE_ARGS="-DGGML_NATIVE=OFF -DGGML_METAL=OFF -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF" \
+            bash parakeet/scripts/test-package-consumption.sh \
+              --bundled --work-dir "$RUNNER_TEMP/parakeet-bundled-${{ github.run_id }}-${{ github.run_attempt }}" --keep
+
+      - name: Verify unavailable Apple runtime is reported as skipped with Torch installed
+        if: github.event_name == 'workflow_dispatch' && inputs.run_mosaic && matrix.os == 'ubuntu-24.04'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/coreml-skip-python"
+          skip_python="$RUNNER_TEMP/coreml-skip-python/bin/python"
+          "$skip_python" -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+          "$skip_python" -m pip install numpy==2.2.6
+          cmake -S parakeet -B build -DPython3_EXECUTABLE="$skip_python"
+          ctest --test-dir build -R '^test_coreml_padding_runtime$' --verbose \
+            --no-tests=error --output-junit coreml-skip-results.xml
+          "$skip_python" - <<'PY'
+          import xml.etree.ElementTree as ET
+          tests = list(ET.parse('build/coreml-skip-results.xml').iter('testcase'))
+          if len(tests) != 1 or tests[0].find('skipped') is None:
+              raise SystemExit('Unavailable Apple runtime must be reported as skipped, never passed')
+          print('Confirmed Apple runtime coverage is skipped on Linux with Torch installed')
+          PY
+
+      # Excludes gpu (no GPU on hosted runners) and perf (timing gates are
+      # meaningless on shared runners). Model-dependent tests are DISABLED
+      # at configure time when fixtures are absent and report as "Not Run".
+      # LD_LIBRARY_PATH: the ggml install ships libqvac-speech-ggml.so whose
+      # own dependency on the ggml-cpu/base siblings is resolved transitively
+      # — Linux RUNPATH doesn't apply to transitive loads, so the loader
+      # needs the directory explicitly (macOS @rpath chains handle it).
+      - name: Test (non-GPU)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+        run: ctest --test-dir build -LE 'gpu|perf|coreml-runtime|coreml-toy' --output-on-failure --timeout 600
+
+      # Shared Core ML runtime (coreml): portable scheduler, lifetime
+      # and option tests with fake loaders. --no-tests=error fails the step
+      # when the test is not registered; the test has no skip path.
+      - name: Test (Core ML runtime, portable)
+        run: ctest --test-dir build -L coreml-runtime --no-tests=error --output-on-failure --timeout 300
+
+      - name: Require requested CPU fixture coverage
+        if: inputs.required_fixture_tests != ''
+        env:
+          REQUIRED_TESTS: ${{ inputs.required_fixture_tests }}
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+        run: |
+          read -r -a required_tests <<< "$REQUIRED_TESTS"
+          required_options=()
+          for test_name in "${required_tests[@]}"; do
+            required_options+=(--require "$test_name")
+          done
+          python3 parakeet/scripts/run-fixture-tests.py \
+            --test-dir build --label fixture "${required_options[@]}"
+
+      # Guards the *installed* artifact contract, which no in-tree ctest
+      # can see: the qvac-parakeet package/target names, a static-only
+      # install with no dead bin/ reference, a self-sufficient .pc
+      # (including Libs.private for the PRIVATE OpenMP / Core ML deps —
+      # OpenMP is found on the ubuntu runner, so this lane is where that
+      # path is exercised), and the absence of any bare-`parakeet`
+      # artifact that would collide with upstream whisper.cpp's own
+      # parakeet in a shared vcpkg prefix.
+      - name: Package-consumption contract (find_package + pkg-config)
+        run: |
+          bash parakeet/scripts/test-package-consumption.sh \
+            --ggml-prefix "$PWD/ggml-install"
+
+  coreml_authorize:
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
+  # Core ML PR lane, built from the dispatch-only Mosaic
+  # job: PARAKEET_COREML=ON against a Metal ggml on the self-hosted Apple
+  # runner. Builds every Core ML harness and runs the Core ML runtime and
+  # routing tests; the step fails when any selected test is skipped, disabled
+  # or not run (a green CTest step alone does not prove a test ran). With
+  # fixture_root, the device test of the background sidecars runs as well.
+  coreml:
+    needs: [runner_names, coreml_authorize]
+    if: needs.coreml_authorize.outputs.allowed == 'true'
+    runs-on: ${{ needs.runner_names.outputs.macos_arm64_gpu }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+        id: ggml
+        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Metal ggml install
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: coreml-ggml-install
+          key: ggml-install-metal-${{ runner.os }}-${{ runner.arch }}-${{ steps.ggml.outputs.sha }}
+
+      - name: Build ggml (Metal, qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          git init -q coreml-ggml-src
+          git -C coreml-ggml-src remote add origin "$GGML_REPO"
+          git -C coreml-ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
+          git -C coreml-ggml-src checkout -q FETCH_HEAD
+          cmake -S coreml-ggml-src/ggml -B coreml-ggml-build -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON -DGGML_METAL=ON -DGGML_NATIVE=OFF \
+            -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/coreml-ggml-install"
+          cmake --build coreml-ggml-build -j4
+          cmake --install coreml-ggml-build
+
+      # NVIDIA's Nemotron 3 Diarization q8_0 GGUF (107 MB) at a pinned
+      # revision and sha256, alone in its directory: no diarizer bundle sits
+      # beside it, so the engine generates the diarizers from the GGUF.
+      - name: Cache the Nemotron 3 Diarization q8_0 GGUF
+        id: nemotron-cache
+        uses: actions/cache@v4
+        with:
+          path: nemotron-generated
+          key: nemotron-3-diarization-q8_0-f667ed73aee57d40cc39428eb768b4fd87a0a29e
+
+      - name: Stage the Nemotron 3 Diarization q8_0 GGUF
+        if: steps.nemotron-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p nemotron-generated
+          curl -fL --retry 3 -o nemotron-generated/Nemotron-3-Diarization.q8_0.gguf \
+            https://huggingface.co/nvidia/Nemotron-3-Diarization/resolve/f667ed73aee57d40cc39428eb768b4fd87a0a29e/Nemotron-3-Diarization.q8_0.gguf
+
+      - name: Verify the Nemotron 3 Diarization q8_0 GGUF
+        run: |
+          echo "08456d9e22cd9a323c0364d98375f3746d6e68507ebb705cd46438c534c7a3a1  nemotron-generated/Nemotron-3-Diarization.q8_0.gguf" | shasum -a 256 -c -
+          if ls nemotron-generated | grep -q -- '-diarizer-'; then
+            echo "::error::a diarizer bundle sits beside the staged GGUF"; exit 1
+          fi
+
+      # The Sortformer v2.1 q8_0 GGUF (141 MB) the SDK stages, from the QVAC
+      # model registry at a pinned key and sha256, alone in its directory, so
+      # the engine generates the diarizer from the GGUF.
+      - name: Cache the Sortformer v2.1 q8_0 GGUF
+        id: sortformer-cache
+        uses: actions/cache@v4
+        with:
+          path: sortformer-generated
+          key: sortformer-v2.1-q8_0-7fef9f1edf82f9e5c308f89509d017fb85781e03c1dc05447b617e0421f51d90
+
+      - name: Stage the Sortformer v2.1 q8_0 GGUF
+        if: steps.sortformer-cache.outputs.cache-hit != 'true'
+        run: |
+          client="$RUNNER_TEMP/qvac-registry-client"
+          rm -rf "$client"
+          mkdir -p "$client" sortformer-generated
+          echo '{"name": "parakeet-ci-registry-client", "private": true}' > "$client/package.json"
+          npm install --prefix "$client" --silent --no-audit --no-fund --ignore-scripts @qvac/registry-client@0.7.0
+          REGISTRY_CLIENT="$client/node_modules/@qvac/registry-client" \
+            node scripts/benchmarks/desktop-weekly/fetch-registry.js sortformer-generated \
+            parakeet/2026-09-30/diar_streaming_sortformer_4spk-v2.1.q8_0.gguf
+
+      - name: Verify the Sortformer v2.1 q8_0 GGUF
+        run: |
+          echo "7fef9f1edf82f9e5c308f89509d017fb85781e03c1dc05447b617e0421f51d90  sortformer-generated/diar_streaming_sortformer_4spk-v2.1.q8_0.gguf" | shasum -a 256 -c -
+          if ls sortformer-generated | grep -q -- '\.mlmodelc'; then
+            echo "::error::a Core ML bundle sits beside the staged GGUF"; exit 1
+          fi
+
+      - name: Configure (PARAKEET_COREML=ON)
+        env:
+          FIXTURE_ROOT: ${{ inputs.fixture_root }}
+        run: |
+          fixture_options=("-DPARAKEET_TEST_NEMOTRON_GENERATED_GGUF=$PWD/nemotron-generated/Nemotron-3-Diarization.q8_0.gguf"
+                           "-DPARAKEET_TEST_SORTFORMER_GENERATED_GGUF=$PWD/sortformer-generated/diar_streaming_sortformer_4spk-v2.1.q8_0.gguf")
+          if [ -n "$FIXTURE_ROOT" ]; then
+            fixture_options+=("-DPARAKEET_TEST_MODEL_DIR=$FIXTURE_ROOT/models"
+                              "-DPARAKEET_TEST_AUDIO_DIR=$FIXTURE_ROOT/audio"
+                              "-DPARAKEET_TEST_REF_DIR=$FIXTURE_ROOT/references")
+          fi
+          cmake -S parakeet -B build-coreml -DCMAKE_BUILD_TYPE=Release \
+            -DPARAKEET_USE_SYSTEM_GGML=ON -DPARAKEET_COREML=ON \
+            -DPARAKEET_BUILD_TESTS=ON -DPARAKEET_INSTALL=OFF \
+            -DCMAKE_PREFIX_PATH="$PWD/coreml-ggml-install" "${fixture_options[@]}"
+
+      - name: Build (every target, Core ML harnesses included)
+        id: coreml-build
+        run: cmake --build build-coreml -j4
+
+      - name: Test (Core ML runtime and Parakeet routing, no skips)
+        run: |
+          ctest --test-dir build-coreml -L coreml-runtime --no-tests=error \
+            --output-on-failure --timeout 300 --output-junit coreml-runtime-results.xml
+          python3 parakeet/scripts/check-ctest-junit.py \
+            build-coreml/coreml-runtime-results.xml \
+            --require test-coreml-scheduler --require test-parakeet-coreml-route \
+            --require test-coreml-encoder-owner-stub-tdt \
+            --require test-sortformer-diarizer-template-match
+
+      # The generated diarizers on the device (Nemotron 3 Diarization and
+      # Sortformer v2.1): an empty cache, the staged GGUF alone, and the
+      # Core ML / ggml parity gate on every capacity the sample covers. Each
+      # test fails (never skips) unless every diarizer was generated. The fit
+      # tests check the generated charge is the same with an empty and a full
+      # cache, the memory-degrade near the budget, and the status of compute
+      # units the templates were not validated for.
+      - name: Test (generated diarizers on the device, no skips)
+        run: |
+          ctest --test-dir build-coreml -L coreml-generated --no-tests=error \
+            --output-on-failure --timeout 1800 --output-junit coreml-generated-results.xml
+          python3 parakeet/scripts/check-ctest-junit.py \
+            build-coreml/coreml-generated-results.xml \
+            --require test-nemotron-diarization-coreml-generated-parity \
+            --require test-fit-coreml-generated-diarizers \
+            --require test-nemotron-diarization-coreml-source \
+            --require test-sortformer-diarizer-coreml-generated-parity \
+            --require test-fit-coreml-generated-sortformer-diarizer \
+            --require test-sortformer-diarizer-coreml-source \
+            --require test-sortformer-diarizer-coreml-require
+
+      # Real-weights gate: for each Nemotron template, the unchanged exporter on
+      # the staged GGUF dequantised by ggml against the C++ generator on the
+      # GGUF itself, weight.bin blob by blob and the spec.
+      - name: Install the pinned coremltools venv
+        id: coreml-venv
+        if: ${{ !cancelled() && steps.coreml-build.outcome == 'success' }}
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          coreml_python="$(command -v python3.11 || command -v python3)"
+          "$coreml_python" -m venv .venv-coreml-templates
+          .venv-coreml-templates/bin/python -m pip install -r parakeet/scripts/requirements-coreml.txt
+
+      - name: Real-weights gate (Nemotron templates on the staged q8_0)
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          .venv-coreml-templates/bin/python -B coreml/python/coreml_template.py \
+            --tool build-coreml/qvac-coreml-tool real \
+            --gguf nemotron-generated/Nemotron-3-Diarization.q8_0.gguf \
+            --template-dir parakeet/coreml-templates/nemotron-diar-f358 \
+            --template-dir parakeet/coreml-templates/nemotron-diar-f745 \
+            --template-dir parakeet/coreml-templates/nemotron-diar-f1125 \
+            --json nemotron-real-gate.json
+
+      # Runs whenever the build and the venv succeeded, so a failing test in
+      # an earlier step (which still fails the job) does not hide it.
+      - name: Real-weights gate (Sortformer template on the staged q8_0)
+        if: ${{ !cancelled() && steps.coreml-venv.outcome == 'success' }}
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          .venv-coreml-templates/bin/python -B coreml/python/coreml_template.py \
+            --tool build-coreml/qvac-coreml-tool real \
+            --gguf sortformer-generated/diar_streaming_sortformer_4spk-v2.1.q8_0.gguf \
+            --template-dir parakeet/coreml-templates/sortformer-diar-f410 \
+            --json sortformer-real-gate.json
+
+      # The memory validation behind the Nemotron templates' memory envelope,
+      # on this runner's chip: diarizer passes run while the engine generates,
+      # compiles, loads and warms every capacity in the background (prewarm
+      # all), from a re-signed copy of the tool and an empty cache each run, so
+      # every Neural Engine load is cold. The checker prints the per-run table
+      # and fails when the peak footprint increment over a ggml-only run of the
+      # same passes exceeds what fit charges, when a prepare, a load, a
+      # capacity's resident step or ANECompilerService's growth during the
+      # loads exceeds the constant the templates record, or when a capacity
+      # shows no generate or load phase. Runs whenever the build succeeded, so
+      # an earlier test failure does not hide it.
+      - name: Memory schedule (generated Nemotron diarizers, overlapped, this runner)
+        id: nemotron-memory
+        if: ${{ !cancelled() && steps.coreml-build.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          sw_vers
+          sysctl -n machdep.cpu.brand_string hw.memsize
+          tool=build-coreml/diarizer-coreml-memory
+          gguf=nemotron-generated/Nemotron-3-Diarization.q8_0.gguf
+          wav=parakeet/test/samples/diarization-sample-16k.wav
+          rm -rf nemotron-memory
+          mkdir -p nemotron-memory
+          "$tool" --ggml-only --gguf "$gguf" --wav "$wav" --ggml-passes 60 --json nemotron-memory/ggml.json
+          base=$(python3 -c "import json; print(json.load(open('nemotron-memory/ggml.json'))['peak_footprint'])")
+          status=0
+          for i in 1 2; do
+            id="qvac-memory-$(uuidgen)"
+            cp "$tool" "nemotron-memory/$id"
+            codesign -s - -f -i "$id" "nemotron-memory/$id"
+            "nemotron-memory/$id" --gguf "$gguf" --wav "$wav" --cache-dir "$PWD/nemotron-memory/cache-$i" \
+              --baseline-bytes "$base" --json "nemotron-memory/run-$i.json" || status=1
+            rm -rf "nemotron-memory/cache-$i" "nemotron-memory/$id" "$HOME/Library/Caches/$id"
+          done
+          python3 parakeet/scripts/check-coreml-memory-schedule.py \
+            --template-dir parakeet/coreml-templates/nemotron-diar-f358 \
+            --template-dir parakeet/coreml-templates/nemotron-diar-f745 \
+            --template-dir parakeet/coreml-templates/nemotron-diar-f1125 \
+            nemotron-memory/run-*.json || status=1
+          exit "$status"
+
+      - name: Upload the memory schedule reports
+        if: ${{ !cancelled() && steps.nemotron-memory.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nemotron-memory-schedule
+          path: nemotron-memory/*.json
+          if-no-files-found: warn
+
+      # The same validation for the Sortformer v2.1 template, on this runner's
+      # chip: diarizer passes on the sample clip (342 frames) while the
+      # engine generates, compiles, loads and warms its capacity in the
+      # background, from a re-signed copy of the tool and an empty cache each
+      # run.
+      - name: Memory schedule (generated Sortformer diarizer, overlapped, this runner)
+        id: sortformer-memory
+        if: ${{ !cancelled() && steps.coreml-build.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          sw_vers
+          sysctl -n machdep.cpu.brand_string hw.memsize
+          tool=build-coreml/diarizer-coreml-memory
+          gguf=sortformer-generated/diar_streaming_sortformer_4spk-v2.1.q8_0.gguf
+          wav=parakeet/test/samples/diarization-sample-16k.wav
+          rm -rf sortformer-memory
+          mkdir -p sortformer-memory
+          "$tool" --ggml-only --gguf "$gguf" --wav "$wav" --ggml-passes 60 --json sortformer-memory/ggml.json
+          base=$(python3 -c "import json; print(json.load(open('sortformer-memory/ggml.json'))['peak_footprint'])")
+          status=0
+          for i in 1 2; do
+            id="qvac-memory-$(uuidgen)"
+            cp "$tool" "sortformer-memory/$id"
+            codesign -s - -f -i "$id" "sortformer-memory/$id"
+            "sortformer-memory/$id" --gguf "$gguf" --wav "$wav" --cache-dir "$PWD/sortformer-memory/cache-$i" \
+              --baseline-bytes "$base" --json "sortformer-memory/run-$i.json" || status=1
+            rm -rf "sortformer-memory/cache-$i" "sortformer-memory/$id" "$HOME/Library/Caches/$id"
+          done
+          python3 parakeet/scripts/check-coreml-memory-schedule.py \
+            --template-dir parakeet/coreml-templates/sortformer-diar-f410 \
+            sortformer-memory/run-*.json || status=1
+          exit "$status"
+
+      - name: Upload the Sortformer memory schedule reports
+        if: ${{ !cancelled() && steps.sortformer-memory.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sortformer-memory-schedule
+          path: sortformer-memory/*.json
+          if-no-files-found: warn
+
+      - name: Test (background sidecars on the device, no skips)
+        if: inputs.fixture_root != ''
+        run: |
+          ctest --test-dir build-coreml -R '^test-parakeet-coreml-runtime' --no-tests=error \
+            --output-on-failure --timeout 900 --output-junit coreml-device-results.xml
+          python3 parakeet/scripts/check-ctest-junit.py \
+            build-coreml/coreml-device-results.xml --require test-parakeet-coreml-runtime \
+            --require test-parakeet-coreml-runtime-diarizer \
+            --require test-parakeet-coreml-runtime-encoderless \
+            --require test-parakeet-coreml-runtime-eu-labels \
+            --require test-parakeet-coreml-runtime-fit-layouts \
+            --require test-parakeet-coreml-runtime-sortformer
+
+  mosaic_authorize:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_mosaic
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
+  # Unlike fixture-free PR CI, this lane fails if any Mosaic arm is skipped.
+  # Sources are public; the archive, GGUF and complete audio are hash-verified.
+  mosaic:
+    needs: [runner_names, mosaic_authorize]
+    if: github.event_name == 'workflow_dispatch' && inputs.run_mosaic && needs.mosaic_authorize.outputs.allowed == 'true'
+    runs-on: ${{ needs.runner_names.outputs.macos_arm64_gpu }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize isolated fixture paths
+        run: |
+          echo "MOSAIC_FIXTURES=$RUNNER_TEMP/mosaic-fixtures-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          echo "MOSAIC_PYTHON=$RUNNER_TEMP/mosaic-python-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/bin/python" >> "$GITHUB_ENV"
+      - name: Provision isolated Python 3.11
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+          python-version: '3.11'
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/mosaic-python-runtime
+      - name: Create pinned export environment
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/mosaic-python-runtime
+        run: |
+          uv venv --python 3.11 "$(dirname "$(dirname "$MOSAIC_PYTHON")")"
+          uv pip install --python "$MOSAIC_PYTHON" \
+            torch==2.7.0 numpy==2.2.6 gguf==0.19.0 coremltools==9.0 \
+            PyYAML==6.0.3 sentencepiece==0.2.0 soundfile==0.13.1 pip==25.1.1
+      - name: Check decoder export and failure guards
+        run: |
+          "$MOSAIC_PYTHON" parakeet/test/test_export_mosaic.py
+          "$MOSAIC_PYTHON" parakeet/test/test_mosaic_compact.py
+      - name: Check merged Core ML interfaces and Neural Engine exporter helpers
+        run: |
+          "$MOSAIC_PYTHON" parakeet/test/test_coreml_padding_runtime.py
+          "$MOSAIC_PYTHON" parakeet/test/test_export_coreml_ane.py
+          "$MOSAIC_PYTHON" parakeet/test/test_route_experiments.py
+          "$MOSAIC_PYTHON" parakeet/test/test_route_probe_runtime.py
+      - name: Cache exact model, sidecar and audio fixtures
+        id: mosaic-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.MOSAIC_FIXTURES }}/bundle
+            ${{ env.MOSAIC_FIXTURES }}/audio
+            ${{ env.MOSAIC_FIXTURES }}/compact
+          key: mosaic-${{ inputs.mosaic_compact_url != '' && 'both' || 'standard' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('parakeet/scripts/*.py', 'parakeet/configs/parakeet-mosaic*.json', 'parakeet/test/mosaic-fixtures.json', 'parakeet/test/prepare_mosaic_fixtures.py') }}
+      - name: Provision frozen Mosaic fixtures
+        if: steps.mosaic-cache.outputs.cache-hit != 'true'
+        env:
+          MOSAIC_COMPACT_URL: ${{ inputs.mosaic_compact_url }}
+        run: |
+          compact_args=()
+          if [ -n "$MOSAIC_COMPACT_URL" ]; then compact_args=(--compact-url "$MOSAIC_COMPACT_URL"); fi
+          "$MOSAIC_PYTHON" parakeet/test/prepare_mosaic_fixtures.py \
+            --fixtures "$MOSAIC_FIXTURES" --coreml "${compact_args[@]}"
+      - name: Build normal speech dependency and Mosaic harness
+        run: |
+          git init -q mosaic-ggml-src
+          git -C mosaic-ggml-src remote add origin "$GGML_REPO"
+          git -C mosaic-ggml-src fetch --depth 1 origin "$GGML_REF"
+          git -C mosaic-ggml-src checkout -q FETCH_HEAD
+          git -C mosaic-ggml-src rev-parse HEAD > mosaic-dependency-sha.txt
+          cmake -S mosaic-ggml-src/ggml -B mosaic-ggml-build -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON -DGGML_METAL=ON -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX="$PWD/mosaic-ggml-install"
+          cmake --build mosaic-ggml-build -j4
+          cmake --install mosaic-ggml-build
+          cmake -S parakeet -B build-mosaic -DCMAKE_BUILD_TYPE=Release \
+            -DPARAKEET_USE_SYSTEM_GGML=ON -DPARAKEET_COREML=ON \
+            -DPARAKEET_BUILD_TESTS=ON -DPARAKEET_BUILD_EXAMPLES=OFF -DPARAKEET_INSTALL=OFF \
+            -DPython3_EXECUTABLE="$MOSAIC_PYTHON" \
+            -DPARAKEET_TEST_MOSAIC_DIR="$MOSAIC_FIXTURES" \
+            -DCMAKE_PREFIX_PATH="$PWD/mosaic-ggml-install"
+          cmake --build build-mosaic --target test-mosaic-inference -j4
+      - name: Run all requested real-model arms and reject skipped coverage
+        env:
+          INCLUDE_COMPACT: ${{ inputs.mosaic_compact_url != '' && '1' || '0' }}
+        run: |
+          pattern='^test-mosaic-(native|coreml)'
+          if [ "$INCLUDE_COMPACT" = 1 ]; then pattern='^test-mosaic-'; fi
+          ctest --test-dir build-mosaic -R "$pattern" \
+            --output-on-failure --no-tests=error --output-junit mosaic-results.xml
+          "$MOSAIC_PYTHON" - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          tests = list(ET.parse('build-mosaic/mosaic-results.xml').iter('testcase'))
+          expected = 12 if os.environ['INCLUDE_COMPACT'] == '1' else 6
+          if len(tests) != expected or any(t.find(tag) is not None for t in tests for tag in ('skipped', 'failure', 'error')):
+              raise SystemExit(f'Expected {expected} executed, passing Mosaic integration tests')
+          print(f'All {expected} requested Mosaic CPU/Metal/Core ML cases executed and passed')
+          PY
+      - name: Upload integration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosaic-integration-${{ github.sha }}
+          path: |
+            build-mosaic/mosaic-results.xml
+            build-mosaic/Testing/Temporary/LastTest.log
+            mosaic-dependency-sha.txt
+            ${{ env.MOSAIC_FIXTURES }}/audio/receipt.json
+            ${{ env.MOSAIC_FIXTURES }}/bundle/complete.json
+            ${{ env.MOSAIC_FIXTURES }}/bundle/plan.json
+            ${{ env.MOSAIC_FIXTURES }}/bundle/failure.json
+            ${{ env.MOSAIC_FIXTURES }}/bundle/gguf-export.log
+            ${{ env.MOSAIC_FIXTURES }}/compact/complete.json
+            ${{ env.MOSAIC_FIXTURES }}/compact/plan.json
+            ${{ env.MOSAIC_FIXTURES }}/compact/failure.json
+
+  # Non-Metal GPU lane, opt-in via run_gpu. Runner choice mirrors tts-ci.yml:
+  # the generic [self-hosted, gpu] label resolves to a mixed pool — an Apple
+  # Silicon host whose Vulkan loader is absent from the test rpath, and a
+  # Windows host whose default PowerShell breaks this bash run script — so
+  # pin the NVIDIA Linux runner the qvac monorepo's benchmark and e2e lanes
+  # use (it exposes nvidia-smi and a Vulkan ICD).
+  gpu:
+    needs: runner_names
+    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
+    runs-on: ${{ needs.runner_names.outputs.linux_x64_gpu }}
+    timeout-minutes: 90
+    steps:
+      # Self-hosted runners are persistent, so the previous job's tree can
+      # survive into this one (docs/ci/SELF-HOSTED-RUNNERS.md in the qvac
+      # monorepo). This job is self-hosted-only, so no hosted-runner guard.
+      - name: Manual Workspace Cleanup
+        run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+        shell: bash
+        working-directory: .
+      - uses: actions/checkout@v4
+      - name: Show what this runner has
+        run: |
+          uname -a
+          nvidia-smi || echo "no NVIDIA driver"
+          command -v nvcc && nvcc --version || echo "no CUDA toolkit on PATH"
+          ls /usr/local/cuda*/bin/nvcc 2>/dev/null || echo "no /usr/local/cuda*"
+          command -v vulkaninfo && vulkaninfo --summary 2>/dev/null | head -20 || echo "no vulkaninfo"
+      # GGML_VULKAN=ON is the backend the -L gpu suites primarily target
+      # (test_vk_vs_cpu et al). CUDA is added only where a toolkit exists —
+      # requesting it without one fails the configure outright. A CPU-only
+      # ggml would skip or falsely pass the GPU suites.
+      - name: Build ggml + engine (native backends)
+        env:
+          FIXTURE_ROOT: ${{ inputs.fixture_root }}
+        run: |
+          git init -q ggml-src
+          git -C ggml-src remote add origin "$GGML_REPO"
+          git -C ggml-src fetch --depth 1 origin "$GGML_REF"
+          git -C ggml-src checkout -q FETCH_HEAD
+          CUDA_OPTION=""
+          if command -v nvcc >/dev/null 2>&1 || [ -x /usr/local/cuda/bin/nvcc ]; then
+            NVCC_PATH=$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)
+            CUDA_OPTION="-DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=$NVCC_PATH"
+            echo "CUDA toolkit found at $NVCC_PATH; building the NVIDIA backend as well"
+          else
+            echo "::notice::no CUDA toolkit on this runner; the CUDA arms cannot run here"
+          fi
+          # GGML_BUILD_TESTS=OFF as every other ggml build in this repo does:
+          # this lane runs the *engine's* ctest suite, never ggml's, so
+          # compiling ggml's tests only spends runner time and couples the
+          # lane to breakage in code it does not exercise.
+          cmake -S ggml-src/ggml -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DGGML_VULKAN=ON \
+            $CUDA_OPTION \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j && cmake --install ggml-src/build
+          fixture_options=()
+          if [ -n "$FIXTURE_ROOT" ]; then
+            fixture_options+=("-DPARAKEET_TEST_MODEL_DIR=$FIXTURE_ROOT/models"
+                              "-DPARAKEET_TEST_AUDIO_DIR=$FIXTURE_ROOT/audio"
+                              "-DPARAKEET_TEST_REF_DIR=$FIXTURE_ROOT/references")
+          fi
+          cmake -S parakeet -B build -DCMAKE_BUILD_TYPE=Release \
+            -DPARAKEET_USE_SYSTEM_GGML=ON -DPARAKEET_BUILD_TESTS=ON \
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-install" "${fixture_options[@]}"
+          cmake --build build -j
+      - name: Run GPU suites and require executed coverage
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          REQUIRED_TESTS: ${{ inputs.required_gpu_tests }}
+        run: |
+          read -r -a required_tests <<< "$REQUIRED_TESTS"
+          required_options=()
+          for test_name in "${required_tests[@]}"; do
+            required_options+=(--require "$test_name")
+          done
+          python3 parakeet/scripts/run-fixture-tests.py \
+            --test-dir build --label gpu "${required_options[@]}"

@@ -1,0 +1,1146 @@
+#include "tts-cpp/chatterbox/engine.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <future>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "backend_selection.h"
+#include "chatterbox_coreml.h"
+#include "chatterbox_t3_internal.h"
+#include "gpt2_bpe.h"
+#include "mtl_tokenizer.h"
+#include "npy.h"
+#include "t3_alignment_analyzer.h"
+#include "t3_mtl.h"
+#include "t3_stop_controller.h"
+#include "tts-cpp/chatterbox/s3gen_pipeline.h"
+#include "text_preprocess.h"
+#include "voice_encoder.h"
+#include "voice_features.h"
+
+namespace tts_cpp::chatterbox {
+
+using namespace detail;
+
+namespace {
+
+int resolve_thread_count(int requested) {
+    if (requested > 0) return requested;
+    const int hw = (int) std::thread::hardware_concurrency();
+    return hw > 0 ? std::min(hw, 4) : 4;
+}
+
+void wait_for_preload(std::thread & t) {
+    if (t.joinable()) t.join();
+}
+
+} // namespace
+
+struct Engine::Impl {
+    EngineOptions opts;
+
+    chatterbox_model     model{};
+    ggml_gallocr_t       allocr = nullptr;
+    std::thread          s3gen_preload_thread;
+
+    // Baked voice-conditioning state.  Populated at construction when
+    // `reference_audio` or `voice_dir` is set, then reused by every
+    // synthesize() call so we never re-run VoiceEncoder / CAMPPlus /
+    // S3TokenizerV2 / mel extraction more than once.
+    bool                 voice_overridden = false;
+    std::vector<float>   s3gen_prompt_feat;
+    int                  s3gen_prompt_feat_rows = 0;
+    std::vector<float>   s3gen_embedding;
+    std::vector<int32_t> s3gen_prompt_token;
+
+    // Tokenizer cache.  Exactly one of bpe / mtl_tok is populated based
+    // on the loaded GGUF's variant metadata; the other stays default-
+    // constructed.  Constructed once in the ctor and reused per
+    // synthesize() call (gpt2_bpe rebuilds amortise poorly on Turbo's
+    // 64K vocab + ~50K merges; mtl_tokenizer JSON parse is heavier
+    // still).
+    gpt2_bpe             bpe;
+    mtl_tokenizer        mtl_tok;
+
+    std::atomic<bool>    cancel_flag{false};
+    // Core ML options (the legacy fields folded in) and this Engine's own
+    // S3Gen sidecar slots; null when Core ML is not built, off or absent.
+    // The slots load in the background; dropping them never waits.
+    CoremlOptions        coreml;
+    std::shared_ptr<detail::s3gen_sidecars> sidecars;
+    // S3Gen stage backends reported by every s3gen_synthesize_to_wav call of
+    // the current synthesize(); folded into SynthesisResult::s3gen_backend.
+    std::set<std::string> s3gen_backends;
+    // Some call of the current synthesize() ran a stage on ggml only because
+    // its Core ML function was still loading.
+    bool                 coreml_pending = false;
+
+    explicit Impl(const EngineOptions & o)
+        : opts(o) {
+        if (opts.t3_gguf_path.empty()) {
+            throw std::runtime_error("Engine: t3_gguf_path is required");
+        }
+        if (opts.s3gen_gguf_path.empty()) {
+            throw std::runtime_error("Engine: s3gen_gguf_path is required");
+        }
+        if (!std::filesystem::exists(opts.t3_gguf_path)) {
+            throw std::runtime_error("Engine: T3 GGUF not found: " + opts.t3_gguf_path);
+        }
+        if (!std::filesystem::exists(opts.s3gen_gguf_path)) {
+            throw std::runtime_error("Engine: S3Gen GGUF not found: " + opts.s3gen_gguf_path);
+        }
+        if (!opts.reference_audio.empty() &&
+            !std::filesystem::exists(opts.reference_audio)) {
+            throw std::runtime_error("Engine: reference_audio not found: " + opts.reference_audio);
+        }
+        if (!opts.voice_dir.empty() &&
+            !std::filesystem::is_directory(opts.voice_dir)) {
+            throw std::runtime_error("Engine: voice_dir not found: " + opts.voice_dir);
+        }
+        // fail fast on an unsupported output frequency.
+        validate_output_sample_rate(opts.output_sample_rate, "chatterbox::Engine");
+        coreml = detail::merge_legacy_coreml(opts.coreml, opts.coreml_compute_units,
+                                             opts.coreml_strict ? (*opts.coreml_strict ? 1 : 0) : -1,
+                                             /*disabled=*/false);
+        detail::validate_coreml_options(coreml);
+
+        ggml_time_init();
+        g_log_verbose = opts.verbose ? 1 : 0;
+
+        // Wire backends_dir + opencl_cache_dir BEFORE any backend init.
+        // The ggml-backend registry is a process-singleton: only the
+        // first Engine construction's `set_backends_directory` /
+        // `set_opencl_cache_dir` actually take effect (second + later
+        // Engines log a one-shot warn and reuse the already-loaded
+        // registry; see backend_selection.cpp for the contract). Mirrors
+        // parakeet-cpp's Engine ctor.
+        if (!opts.backends_dir.empty()) {
+            ::tts_cpp::detail::set_backends_directory(opts.backends_dir);
+        }
+        if (!opts.opencl_cache_dir.empty()) {
+            ::tts_cpp::detail::set_opencl_cache_dir(opts.opencl_cache_dir);
+        }
+
+        // Note: we deliberately do NOT call ggml_log_set here.  The
+        // process-global sink is owned by the host application via
+        // tts_cpp_log_set (see <tts-cpp/log.h>); installing one
+        // unconditionally per Engine ctor would clobber whatever
+        // structured-logging callback the host (Bare addon, telemetry
+        // pipeline, ...) already registered for the process.
+
+        if (!opts.reference_audio.empty() &&
+            !validate_reference_audio(opts.reference_audio)) {
+            throw std::runtime_error("Engine: reference_audio failed validation: " + opts.reference_audio);
+        }
+
+        if (!load_model_gguf(opts.t3_gguf_path, model, opts.n_ctx, opts.n_gpu_layers,
+                             chatterbox_kv_type_from_str(opts.kv_cache_type),
+                             /*measure=*/nullptr, opts.backend)) {
+            throw std::runtime_error("Engine: failed to load T3 GGUF: " + opts.t3_gguf_path);
+        }
+
+        // Variant dispatch.  Turbo uses the GPT-2 BPE (built from the
+        // model's tok_tokens / tok_merges arrays); multilingual uses
+        // the HuggingFace MTL tokenizer JSON embedded in the GGUF.
+        // synthesize() / run_t3() switch graph + sampling paths on the
+        // same flag.
+        //
+        // The whole block is wrapped in one try/catch so any throw -
+        // whether from the BPE/MTL tokenizer load, an unsupported
+        // language, or the unknown-variant case - calls free_model()
+        // before unwinding.  Without this the Turbo path's
+        // bpe.load_from_arrays would leak the partially-constructed
+        // model (backend, ctx_w, buffer_w) on a future malformed-vocab
+        // throw, since ~Impl never runs on a partial construction.
+        try {
+            if (model.hparams.variant == CHBX_VARIANT_TURBO) {
+                bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
+            } else if (model.hparams.variant == CHBX_VARIANT_MTL) {
+                if (model.mtl_tokenizer_json.empty()) {
+                    throw std::runtime_error(
+                        "Engine: T3 GGUF reports chatterbox.variant == t3_mtl "
+                        "but does not embed an mtl_tokenizer.json blob; "
+                        "regenerate with scripts/convert-t3-mtl-to-gguf.py.  "
+                        "Path: " + opts.t3_gguf_path);
+                }
+                if (!opts.mecab_dict_path.empty()) {
+                    mtl_tokenizer::set_mecab_dict_path(opts.mecab_dict_path);
+                }
+                if (!opts.cangjie_tsv_path.empty()) {
+                    mtl_tokenizer::set_cangjie_tsv_path(opts.cangjie_tsv_path);
+                }
+                if (!mtl_tok.load_from_json(model.mtl_tokenizer_json)) {
+                    throw std::runtime_error(
+                        "Engine: failed to parse embedded mtl_tokenizer.json "
+                        "for: " + opts.t3_gguf_path);
+                }
+                if (!opts.language.empty() && !mtl_tok.is_language_supported(opts.language)) {
+                    throw std::runtime_error(
+                        "Engine: language '" + opts.language +
+                        "' not in the multilingual tokenizer's tier-1 set");
+                }
+            } else {
+                throw std::runtime_error(
+                    "Engine: T3 GGUF reports unknown chatterbox.variant; "
+                    "supported: t3_turbo, t3_mtl.  Path: " + opts.t3_gguf_path);
+            }
+        } catch (...) {
+            free_model();
+            throw;
+        }
+
+        allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!allocr) {
+            free_model();
+            throw std::runtime_error("Engine: ggml_gallocr_new failed");
+        }
+
+        // bake_voice_conditioning() must run BEFORE we spawn the s3gen
+        // preload thread.  Both paths funnel into gguf_init_from_file()
+        // (voice_encoder_load opens the T3 GGUF for the VoiceEncoder
+        // weights; s3gen_preload opens the s3gen GGUF), and the ggml_init
+        // / gguf_init_from_file pair underneath is not safe to invoke
+        // concurrently from two threads against ggml's process-global
+        // state.  Empirically this races on Apple Silicon (Bare iOS Test
+        // Consumer) with a fast SIGABRT inside ggml_abort coming from the
+        // preload thread's ggml_init while the main thread is still
+        // executing voice_encoder_load's gguf_init_from_file.  Serialising
+        // the two GGUF loads removes the data race; we still get the
+        // intended overlap because s3gen_preload now runs in parallel with
+        // the caller's post-construction work (registry wiring, first
+        // synthesize() T3 inference) up to the wait_for_preload() at the
+        // top of synthesize().
+        try {
+            bake_voice_conditioning();
+        } catch (...) {
+            if (allocr) { ggml_gallocr_free(allocr); allocr = nullptr; }
+            free_model();
+            throw;
+        }
+
+        s3gen_preload_thread = std::thread([path = opts.s3gen_gguf_path,
+                                            ngpu = opts.n_gpu_layers,
+                                            backend = opts.backend]() {
+            s3gen_preload(path, ngpu, backend);
+        });
+
+        // Block until s3gen_preload finishes its Metal buffer allocation
+        // before returning from the constructor.  This defeats the parallel-
+        // preload optimisation (s3gen_preload no longer overlaps with the
+        // caller's post-construction work / first T3 inference inside
+        // synthesize()), but is required for safe interleaving with the
+        // load -> immediate unload pattern used by the QVAC SDK e2e bootstrap
+        // ("preLoadUnload"): on iOS the destructor's pthread_join would
+        // otherwise race with the preload thread inside
+        // ggml_backend_metal_buffer_type_shared_alloc_buffer ->
+        // ggml_metal_buffer_is_shared (crash, KERN_INVALID_ADDRESS at 0x10).
+        // Reverse this and keep the wait at the top of synthesize() once
+        // ggml-metal's shared buffer-type init is safe to use from a
+        // preload thread concurrent with construction-time teardown.
+        wait_for_preload(s3gen_preload_thread);
+
+        // The construction group: HiFT plus the widths this host loaded most
+        // recently (prewarm minimal / predicted), every function (all) or
+        // nothing (none). Loads run in the background unless wait = construct.
+        // The Engine's own slots, resident pools and construction group: two
+        // Engines never share or clobber each other's requests, predictions
+        // or groups (the runtime still shares their loads and models), and
+        // dropping this Engine cancels its unstarted loads.
+        sidecars = detail::s3gen_sidecars::create(opts.s3gen_gguf_path, coreml);
+        if (sidecars) sidecars->start_construction(&cancel_flag);
+    }
+
+    // The voice prompt length every S3Gen call of this Engine starts with.
+    int prompt_tokens() const {
+        return !s3gen_prompt_token.empty() ? (int) s3gen_prompt_token.size()
+                                           : (sidecars ? sidecars->facts().builtin_prompt_tokens : 0);
+    }
+
+    // Acquires the Core ML models of one S3Gen call, once, before it starts:
+    // the deadline is now plus the call's estimated ggml time, so a bounded
+    // wait for a warm-hinted load never makes the sentence slower than ggml.
+    std::shared_ptr<const S3genCoremlPlan> acquire_plan(const s3gen_synthesize_opts & sopts,
+                                                        const std::vector<int32_t> & speech_tokens) {
+        // No sidecar for this Engine (Core ML not built, off or absent at
+        // construction): an explicit empty plan, so the call never resolves
+        // Core ML again on its own.
+        if (!sidecars) return detail::empty_coreml_plan();
+        const detail::s3gen_call_shape shape = detail::s3gen_call_shape_for(sopts, speech_tokens, sidecars->facts());
+        const auto budget = std::chrono::duration<double, std::milli>(
+            detail::s3gen_estimate_metal_ms_frames(sidecars->facts().meanflow, shape.frames));
+        auto plan = sidecars->acquire(
+            shape, std::chrono::steady_clock::now() +
+                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(budget),
+            &cancel_flag);
+        if (plan && detail::plan_pending(*plan)) coreml_pending = true;
+        return plan;
+    }
+
+    ~Impl() {
+        // Dropping the slots never waits: unstarted loads are cancelled and a
+        // started one finishes in the background with nothing to publish to.
+        sidecars.reset();
+        wait_for_preload(s3gen_preload_thread);
+        // Release the S3Gen cache (which holds its own backend + buffers)
+        // BEFORE freeing the T3 backend.  If we don't, the cache's
+        // backend resources get torn down by static destructors at
+        // process exit, after ggml-metal's global device has already
+        // been finalised, tripping its "rsets count == 0" assertion.
+        s3gen_unload();
+        if (allocr) {
+            ggml_gallocr_free(allocr);
+            allocr = nullptr;
+        }
+        free_model();
+    }
+
+    Impl(const Impl &)             = delete;
+    Impl & operator=(const Impl &) = delete;
+
+    void free_model() {
+        // Pull (buffer_stack, ctx_stack) out of the process-wide t3_stack_registry
+        // BEFORE freeing them locally — otherwise the atexit hook installed
+        // by load_model_gguf_mtl on non-CPU backends would later double-free
+        // (or, worse, ggml_backend_buffer_free a buffer whose backend has
+        // already been destroyed below).  Mirrors the free_t3 lambda in
+        // src/chatterbox_cli.cpp.  No-op on CPU backends and on Turbo
+        // (those code paths never allocate buffer_stack / ctx_stack).
+        if (model.buffer_stack || model.ctx_stack) {
+            t3_stack_unregister(model.buffer_stack, model.ctx_stack);
+        }
+        // Drop the T3 step-graph cache BEFORE freeing the backend.
+        // Cached gallocators carry backend references; freeing them
+        // against a dead backend asserts inside the GPU-backend dylib
+        // finalisers.
+        tts_cpp::chatterbox::detail::t3_release_caches();
+        // Same ordering contract for the eval-side fallback scheduler.
+        tts_cpp::detail::sched_fallback_free(model.sched_fb);
+        if (model.buffer_w)        { ggml_backend_buffer_free(model.buffer_w);        model.buffer_w        = nullptr; }
+        if (model.buffer_kv)       { ggml_backend_buffer_free(model.buffer_kv);       model.buffer_kv       = nullptr; }
+        if (model.buffer_stack)    { ggml_backend_buffer_free(model.buffer_stack);    model.buffer_stack    = nullptr; }
+        if (model.buffer_override) { ggml_backend_buffer_free(model.buffer_override); model.buffer_override = nullptr; }
+        if (model.backend)         { ggml_backend_free(model.backend);                model.backend         = nullptr; }
+        if (model.ctx_w)           { ggml_free(model.ctx_w);                          model.ctx_w           = nullptr; }
+        if (model.ctx_kv)          { ggml_free(model.ctx_kv);                         model.ctx_kv          = nullptr; }
+        if (model.ctx_stack)       { ggml_free(model.ctx_stack);                      model.ctx_stack       = nullptr; }
+        if (model.ctx_override)    { ggml_free(model.ctx_override);                   model.ctx_override    = nullptr; }
+    }
+
+    // Loads speaker_emb + cond_prompt_speech_tokens from voice_dir when
+    // available, computes them from reference_audio otherwise, and writes
+    // the results into model.builtin_speaker_emb / builtin_cond_prompt_tokens
+    // so subsequent T3 graphs pick up the cloned voice.  Also stashes the
+    // three S3Gen-side tensors (prompt_feat, embedding, prompt_token) on
+    // the Impl for reuse in synthesize().
+    void bake_voice_conditioning() {
+        if (opts.reference_audio.empty() && opts.voice_dir.empty()) {
+            return;
+        }
+
+        const int n_threads = resolve_thread_count(opts.n_threads);
+
+        bool have_se = false;
+        bool have_ct = false;
+        std::vector<float>   se_data;
+        std::vector<int32_t> ct_data;
+
+        if (!opts.voice_dir.empty()) {
+            const std::string se_path = opts.voice_dir + "/speaker_emb.npy";
+            const std::string ct_path = opts.voice_dir + "/cond_prompt_speech_tokens.npy";
+            const std::string emb_path = opts.voice_dir + "/embedding.npy";
+            const std::string pt_path  = opts.voice_dir + "/prompt_token.npy";
+            const std::string pf_path  = opts.voice_dir + "/prompt_feat.npy";
+
+            if (std::filesystem::exists(se_path)) {
+                npy_array a = npy_load(se_path);
+                se_data.assign((const float *) a.data.data(),
+                               (const float *) a.data.data() + a.n_elements());
+                have_se = true;
+            }
+            if (std::filesystem::exists(ct_path)) {
+                npy_array a = npy_load(ct_path);
+                ct_data.assign((const int32_t *) a.data.data(),
+                               (const int32_t *) a.data.data() + a.n_elements());
+                have_ct = true;
+            }
+            if (std::filesystem::exists(emb_path)) {
+                npy_array a = npy_load(emb_path);
+                s3gen_embedding.assign((const float *) a.data.data(),
+                                      (const float *) a.data.data() + a.n_elements());
+            }
+            if (std::filesystem::exists(pt_path)) {
+                npy_array a = npy_load(pt_path);
+                s3gen_prompt_token.assign((const int32_t *) a.data.data(),
+                                          (const int32_t *) a.data.data() + a.n_elements());
+            }
+            if (std::filesystem::exists(pf_path)) {
+                npy_array a = npy_load(pf_path);
+                s3gen_prompt_feat.assign((const float *) a.data.data(),
+                                         (const float *) a.data.data() + a.n_elements());
+                // prompt_feat.npy shape is (T_mel, 80)
+                if (a.shape.size() >= 1) {
+                    s3gen_prompt_feat_rows = (int) a.shape[0];
+                }
+            }
+        }
+
+        if (!have_se && !opts.reference_audio.empty()) {
+            voice_encoder_weights vew;
+            if (voice_encoder_load(opts.t3_gguf_path, vew)) {
+                std::vector<float> wav;
+                int sr = 0;
+                if (!wav_load(opts.reference_audio, wav, sr)) {
+                    throw std::runtime_error("Engine: failed to load reference_audio");
+                }
+                normalise_lufs(wav, sr, -27.0);
+                if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
+                // CPU regardless of model backend: a one-time LSTM conditioning
+                // step with strided-view activations + a >128MB gate matmul, which
+                // are invalid under single-backend GPU compute (see
+                // chatterbox_cli.cpp). nullptr -> own CPU backend.
+                if (!voice_encoder_embed(wav, vew, /*backend=*/nullptr, se_data)) {
+                    throw std::runtime_error("Engine: VoiceEncoder forward failed");
+                }
+                have_se = true;
+            }
+        }
+
+        std::vector<int32_t> prompt_token_from_ref;
+        if (!have_ct && !opts.reference_audio.empty()) {
+            std::vector<int32_t> cond_tokens;
+            if (compute_speech_tokens_native(
+                    opts.reference_audio, opts.s3gen_gguf_path,
+                    /*max_cond_tokens=*/ model.hparams.cond_prompt_len,
+                    prompt_token_from_ref, cond_tokens,
+                    n_threads, voice_frontend_backend(model.backend), opts.verbose)) {
+                ct_data = std::move(cond_tokens);
+                have_ct = true;
+            }
+        }
+
+        if (have_se) {
+            if ((int64_t) se_data.size() != ggml_nelements(model.builtin_speaker_emb)) {
+                throw std::runtime_error(
+                    "Engine: speaker_emb size mismatch with builtin tensor");
+            }
+            ggml_backend_tensor_set(
+                model.builtin_speaker_emb, se_data.data(), 0,
+                ggml_nbytes(model.builtin_speaker_emb));
+            voice_overridden = true;
+        }
+
+        if (have_ct) {
+            if ((int64_t) ct_data.size() == ggml_nelements(model.builtin_cond_prompt_tokens)) {
+                ggml_backend_tensor_set(
+                    model.builtin_cond_prompt_tokens, ct_data.data(), 0,
+                    ggml_nbytes(model.builtin_cond_prompt_tokens));
+            } else {
+                ggml_init_params op = { ggml_tensor_overhead() * 2, nullptr, true };
+                model.ctx_override = ggml_init(op);
+                if (!model.ctx_override) {
+                    throw std::runtime_error("Engine: ggml_init(ctx_override) failed");
+                }
+                ggml_tensor * new_ct = ggml_new_tensor_1d(
+                    model.ctx_override, GGML_TYPE_I32, (int64_t) ct_data.size());
+                ggml_set_name(new_ct,
+                              "chatterbox/builtin/cond_prompt_speech_tokens_override");
+                model.buffer_override = ggml_backend_alloc_ctx_tensors(
+                    model.ctx_override, model.backend);
+                if (!model.buffer_override) {
+                    throw std::runtime_error("Engine: alloc override buffer failed");
+                }
+                ggml_backend_tensor_set(
+                    new_ct, ct_data.data(), 0, ct_data.size() * sizeof(int32_t));
+                model.builtin_cond_prompt_tokens = new_ct;
+                model.hparams.cond_prompt_len = (int32_t) ct_data.size();
+            }
+            voice_overridden = true;
+        }
+
+        if (!opts.reference_audio.empty()) {
+            if (s3gen_prompt_feat.empty()) {
+                int rows = 0;
+                if (!compute_prompt_feat_native(
+                        opts.reference_audio, opts.s3gen_gguf_path,
+                        s3gen_prompt_feat, rows, opts.verbose)) {
+                    throw std::runtime_error(
+                        "Engine: failed to compute prompt_feat from reference_audio");
+                }
+                s3gen_prompt_feat_rows = rows;
+            }
+            if (s3gen_embedding.empty()) {
+                if (!compute_embedding_native(
+                        opts.reference_audio, opts.s3gen_gguf_path,
+                        s3gen_embedding,
+                        voice_frontend_backend(model.backend), opts.verbose)) {
+                    // CAMPPlus tensors predate Phase 2d-a in this GGUF.
+                    // `compute_embedding_native` already logged the concrete
+                    // error to stderr; callers that want a hard failure can
+                    // re-run after re-exporting the S3Gen GGUF with a
+                    // current scripts/convert-s3gen-to-gguf.py.
+                    fprintf(stderr,
+                            "Engine: voice-cloning embedding unavailable; "
+                            "falling back to built-in speaker embedding for %s\n",
+                            opts.reference_audio.c_str());
+                }
+            }
+            if (s3gen_prompt_token.empty() && !prompt_token_from_ref.empty()) {
+                s3gen_prompt_token = std::move(prompt_token_from_ref);
+            }
+        }
+    }
+
+    std::vector<int32_t> run_t3(const std::string & text) {
+        const bool is_mtl = (model.hparams.variant == CHBX_VARIANT_MTL);
+
+        // Tokenise via the variant-appropriate tokenizer.  Both paths
+        // produce a flat vector<int32_t> the rest of the loop is
+        // agnostic to.
+        std::vector<int32_t> text_tokens;
+        if (is_mtl) {
+            // Wrap with start_text_token (255) + ids + stop_text_token (0) to
+            // mirror chatterbox_cli.cpp and Python ChatterboxMultilingualTTS.generate;
+            // the MTL T3 prompt graph anchors position 0 on the SOT and drops
+            // the first speech tokens (audible as a missing leading syllable)
+            // when it is omitted.
+            std::vector<int32_t> ids = mtl_tok.encode(text, opts.language);
+            text_tokens.reserve(ids.size() + 2);
+            text_tokens.push_back(model.hparams.start_text_token);
+            text_tokens.insert(text_tokens.end(), ids.begin(), ids.end());
+            text_tokens.push_back(model.hparams.stop_text_token);
+        } else {
+            if (model.tok_tokens.empty()) {
+                throw std::runtime_error(
+                    "Engine: T3 GGUF has no embedded tokenizer; "
+                    "re-run scripts/convert-t3-turbo-to-gguf.py");
+            }
+            const std::string normalised = gpt2_bpe::punc_norm(text);
+            text_tokens = bpe.tokenize(normalised);
+        }
+        if (text_tokens.empty()) {
+            throw std::runtime_error("Engine: text tokenised to empty sequence");
+        }
+
+        chatterbox_sampling_params sp;
+        sp.top_k          = opts.top_k;
+        sp.top_p          = opts.top_p;
+        sp.temp           = opts.temperature;
+        sp.repeat_penalty = opts.repeat_penalty;
+        sp.min_p          = opts.min_p;
+        sp.cfg_weight     = opts.cfg_weight;
+
+        const int n_threads = resolve_thread_count(opts.n_threads);
+        std::mt19937 rng(opts.seed);
+
+        // Prompt eval.  Turbo: single-pass; MTL: cond + uncond batched
+        // into one B=2 forward, with the eval_*_mtl helpers returning
+        // both logit slices.
+        std::vector<float> logits;
+        std::vector<float> logits_c, logits_u;
+        int prompt_len = 0;
+        if (is_mtl) {
+            if (!eval_prompt_mtl(model, allocr, n_threads,
+                                 text_tokens, opts.exaggeration,
+                                 logits_c, logits_u, prompt_len)) {
+                throw std::runtime_error("Engine: T3 prompt eval failed (mtl)");
+            }
+        } else {
+            if (!eval_prompt(model, allocr, n_threads,
+                             text_tokens, logits, prompt_len)) {
+                throw std::runtime_error("Engine: T3 prompt eval failed");
+            }
+        }
+
+        int n_past = prompt_len;
+        std::vector<int32_t> generated;
+        generated.reserve((size_t) opts.n_predict + 1);
+
+        // Attention-free end-of-speech stop controller.  The MTL
+        // T3 often fails to emit stop_speech_token after it has finished the
+        // input text and rambles — a repeated near-silent cadence (audible as
+        // gutural / empty sounds) or fresh hallucinated content — until it
+        // hits n_predict (~40 s of audio).  The controller folds three
+        // signals into one place: (1) force EOS once the model's own argmax
+        // has preferred the stop token for several consecutive steps but
+        // sampling kept missing it, (2) detect a stuck repetition cadence,
+        // (3) a generous text-length-derived budget as a last-resort backstop.
+        // It is disabled for Turbo (default-constructed params) so that path
+        // is unchanged.  See src/t3_stop_controller.h.
+        t3_stop_controller stop_ctrl;
+        stop_ctrl.reset(is_mtl
+            ? make_mtl_stop_params(model.hparams.stop_speech_token, sp.cfg_weight,
+                                   (int) text_tokens.size(), opts.n_predict)
+            : t3_stop_params{});
+
+        // Phase 2: alignment-based EOS (primary signal on the CPU
+        // path).  Configures the in-graph probe; a no-op (graph unchanged) for
+        // Turbo / short text / the batched GPU path, where the Phase 1
+        // controller above remains the stop signal.
+        const int align_S = t3_align_begin_generation(model, (int) text_tokens.size());
+        t3_alignment_analyzer align_az;
+        const bool align_on = (align_S > 0);
+        if (align_on) {
+            align_az.reset(t3_align_params_for_language(opts.language, align_S));
+        }
+
+        int32_t current = is_mtl
+            ? sample_next_token_mtl(logits_c, logits_u, generated, sp, rng,
+                                    model.hparams.stop_speech_token)
+            : sample_next_token_ex(logits, generated, sp, rng);
+        generated.push_back(current);
+
+        for (int i = 0; i < opts.n_predict; ++i) {
+            if (cancel_flag.load(std::memory_order_relaxed)) {
+                throw std::runtime_error("Engine: synthesis cancelled during T3 decode");
+            }
+            if (current == model.hparams.stop_speech_token) break;
+            if (n_past + 1 > model.hparams.n_ctx) break;
+            const bool step_ok = is_mtl
+                ? eval_step_mtl(model, allocr, n_threads, n_past, current,
+                                logits_c, logits_u)
+                : eval_step(model, allocr, n_threads, n_past, current, logits);
+            if (!step_ok) {
+                throw std::runtime_error("Engine: T3 step eval failed");
+            }
+            ++n_past;
+            const t3_align_action aa = align_on
+                ? align_az.step(t3_align_last_row(), current)
+                : t3_align_action::none;
+            bool force_eos_now = (aa == t3_align_action::force_eos);
+            if (!force_eos_now && is_mtl &&
+                stop_ctrl.force_eos((int) generated.size(), logits_c, logits_u)) {
+                force_eos_now = true;
+            }
+            if (force_eos_now) {
+                current = model.hparams.stop_speech_token;
+            } else {
+                const bool suppress = (aa == t3_align_action::suppress_eos);
+                current = is_mtl
+                    ? sample_next_token_mtl(logits_c, logits_u, generated, sp, rng,
+                                            model.hparams.stop_speech_token, suppress)
+                    : sample_next_token_ex(logits, generated, sp, rng);
+            }
+            generated.push_back(current);
+            if (current == model.hparams.stop_speech_token) break;
+
+            const t3_post_result pr = stop_ctrl.post_check(generated);
+            if (pr.reason != t3_stop_reason::none) {
+                if (pr.trim_tail > 0 && (int) generated.size() >= pr.trim_tail) {
+                    generated.resize(generated.size() - (size_t) pr.trim_tail);
+                }
+                break;
+            }
+        }
+
+        if (align_on) t3_align_reset();
+
+        if (!generated.empty() && generated.back() == model.hparams.stop_speech_token) {
+            generated.pop_back();
+        }
+        return generated;
+    }
+
+    // Populate the fixed fields of s3gen_synthesize_opts (paths, threads,
+    // seed, voice overrides, backend hints).  Streaming-specific fields
+    // (finalize, hift_cache_source, skip_mel_frames, ...) are set per
+    // chunk by `synthesize_streaming` below.
+    void fill_common_s3gen_opts(s3gen_synthesize_opts & sopts) {
+        sopts.s3gen_gguf_path = opts.s3gen_gguf_path;
+        sopts.out_wav_path    = "";
+        sopts.seed            = opts.seed;
+        sopts.n_threads       = resolve_thread_count(opts.n_threads);
+        sopts.verbose         = opts.verbose;
+        sopts.n_gpu_layers    = opts.n_gpu_layers;
+        sopts.backend         = opts.backend;
+        sopts.cfg_rate        = opts.s3gen_cfg_rate;
+        sopts.coreml          = coreml;
+
+        // Use the non-owning view fields rather than the *_override
+        // vectors so the streaming path doesn't pay a per-chunk MB-
+        // sized value-copy.  Engine::Impl owns the underlying storage
+        // for the duration of the synthesize() / synthesize_streaming()
+        // call; the views are valid as long as 'this' is.
+        if (!s3gen_prompt_feat.empty()) {
+            sopts.prompt_feat_view_data = s3gen_prompt_feat.data();
+            sopts.prompt_feat_view_size = s3gen_prompt_feat.size();
+            sopts.prompt_feat_view_rows = s3gen_prompt_feat_rows;
+        }
+        if (!s3gen_embedding.empty()) {
+            sopts.embedding_view_data = s3gen_embedding.data();
+            sopts.embedding_view_size = s3gen_embedding.size();
+        }
+        if (!s3gen_prompt_token.empty()) {
+            sopts.prompt_token_view_data = s3gen_prompt_token.data();
+            sopts.prompt_token_view_size = s3gen_prompt_token.size();
+        }
+        // Cooperative-cancel hook so a single Engine::cancel() reaches
+        // both the T3 decode loop (handled directly) and the S3Gen +
+        // HiFT path (cooperatively checked between CFM steps and
+        // before HiFT decode).
+        sopts.cancel_flag = &cancel_flag;
+    }
+
+    // One batch segment's S3Gen output, before it is folded into the result.
+    struct rendered_segment {
+        std::vector<float> pcm;
+        std::string        backend;
+        double             s3gen_ms = 0.0;
+        int                tokens   = 0;
+        size_t             index    = 0;  // the sentence
+        // A Core ML stage failed on the worker: nothing was rendered, and the
+        // dispatching thread renders the segment again (redo_tokens) with
+        // the same plan, the failed stage now on ggml (detail::replay_plan).
+        bool                 redo = false;
+        std::vector<int32_t> redo_tokens;
+        std::shared_ptr<const S3genCoremlPlan> redo_plan;
+    };
+
+    // The batch-segment options of this Engine (no plan yet).
+    s3gen_synthesize_opts batch_segment_opts() {
+        s3gen_synthesize_opts sopts;
+        fill_common_s3gen_opts(sopts);
+        sopts.cfm_steps = opts.cfm_steps;
+        // apply_trim_fade defaults to true at the s3gen layer to mask
+        // reference-audio bleed-through across the prompt-feat / first
+        // synthesized-mel boundary -- the prompt audio context can leak
+        // ~20-40 ms of HiFT state into the start of "real" output. When
+        // there's no reference audio (built-in voice baked into the S3Gen
+        // GGUF, default for chatterbox::Engine), there's nothing to bleed
+        // through: the prompt_feat tensor is well-formed pre-recorded mel
+        // and HiFT primes cleanly. Leaving apply_trim_fade=true in that
+        // mode silently zeros + fades the first 40 ms of legitimate
+        // speech, which empirically clipped the leading consonant of the
+        // first word ("Hello" -> "lo", "El" -> "l", etc.) for the
+        // chatterbox-mtl variant whose built-in conds.pt produces audio
+        // with zero leading silence. Gate on the actual presence of a
+        // reference-audio source so the existing reference-audio path is
+        // unaffected.
+        sopts.apply_trim_fade = !opts.reference_audio.empty() || !opts.voice_dir.empty();
+        return sopts;
+    }
+
+    // Renders ONE segment in batch (non-streaming) mode on this thread with
+    // `plan` and appends it (see append_batch_segment).  All per-segment
+    // s3gen state is local to this call, so consecutive calls reset
+    // naturally.
+    void synthesize_batch_segment(const std::vector<int32_t> & speech_tokens, size_t index,
+                                  std::shared_ptr<const S3genCoremlPlan> plan,
+                                  SynthesisResult & result) {
+        append_batch_segment(render_batch_segment(speech_tokens, index, std::move(plan)), result);
+    }
+
+    // S3Gen + HiFT of one batch segment on the models in `plan`.  Touches no
+    // Engine state but the read-only options and voice views, so it can run
+    // on a worker thread while T3 decodes the next segment; with a plan
+    // marked defer_coreml_failures, a Core ML failure returns `redo` instead
+    // of running ggml there.
+    rendered_segment render_batch_segment(const std::vector<int32_t> & speech_tokens, size_t index,
+                                          std::shared_ptr<const S3genCoremlPlan> plan) {
+        s3gen_synthesize_opts sopts = batch_segment_opts();
+        sopts.coreml_plan = plan;
+
+        rendered_segment seg;
+        seg.index = index;
+        sopts.pcm_out = &seg.pcm;
+        sopts.s3gen_backend_out = &seg.backend;
+
+        const auto s3_t0 = std::chrono::steady_clock::now();
+        const int rc = s3gen_synthesize_to_wav(speech_tokens, sopts);
+        const auto s3_t1 = std::chrono::steady_clock::now();
+        if (rc == detail::S3GEN_RC_COREML_REDO) {
+            seg.redo = true;
+            seg.redo_tokens = speech_tokens;
+            seg.redo_plan = std::move(plan);
+            detail::coreml_test().trace("handed back " + std::to_string(index));
+            return seg;
+        }
+        if (rc == 2) {
+            throw std::runtime_error("Engine: synthesis cancelled during S3Gen+HiFT");
+        }
+        if (rc != 0) {
+            throw std::runtime_error("Engine: s3gen_synthesize_to_wav failed with code "
+                                     + std::to_string(rc));
+        }
+        seg.s3gen_ms = std::chrono::duration<double, std::milli>(s3_t1 - s3_t0).count();
+        seg.tokens   = (int) speech_tokens.size();
+        return seg;
+    }
+
+    // Folds a rendered segment into result.pcm (crossfaded into the previous
+    // segment's tail when not the first) and accumulates its stats.  A
+    // segment the worker handed back (a Core ML failure there) is rendered
+    // again here first, on this thread and so in sequence with T3, with its
+    // own plan: the other stages keep their models and the failed one runs
+    // on ggml (never on another width of the retired function's sidecar).
+    void append_batch_segment(rendered_segment && seg, SynthesisResult & result) {
+        if (seg.redo) {
+            const std::vector<int32_t> tokens = std::move(seg.redo_tokens);
+            auto plan = detail::replay_plan(std::move(seg.redo_plan));
+            detail::coreml_test().trace("replay " + std::to_string(seg.index) + " cfm=" +
+                                        detail::plan_view(*plan, detail::s3gen_stage::cfm).label);
+            seg = render_batch_segment(tokens, seg.index, std::move(plan));
+        }
+        s3gen_backends.insert(seg.backend);
+        // First segment: result.pcm is empty, so this is a plain append.
+        // Later segments: raised-cosine crossfade the seam (a no-op when
+        // crossfade_ms == 0).  Only the batch path crossfades; the streaming
+        // path stays gapless to preserve result.pcm == concat(callbacks).
+        tts_cpp::chatterbox::text_preprocess::append_pcm_crossfade(
+            result.pcm, seg.pcm, 24000, opts.crossfade_ms);
+        result.t3_tokens += seg.tokens;
+        result.s3gen_ms  += seg.s3gen_ms;
+    }
+
+    // Renders ONE segment in streaming mode: chunks speech_tokens, invokes
+    // on_chunk per chunk (global_chunk_idx is monotonic across segments;
+    // is_last fires only on the final chunk of the final segment), and
+    // plain-concatenates each chunk's PCM into result.pcm so the documented
+    // `result.pcm == concat(callback chunks)` invariant holds.  boundaries,
+    // win_start, hift_cache_source and prev_mels_emitted are all function-local
+    // so per-segment reset is automatic -- this is load-bearing for the
+    // skip_mel_frames = prev_mels_emitted - 2*win_start arithmetic, which is
+    // only correct because BOTH terms are segment-local.
+    void synthesize_streaming_segment(
+        const std::vector<int32_t> & speech_tokens,
+        const StreamCallback & on_chunk,
+        SynthesisResult & result,
+        bool is_first_segment,
+        bool is_last_segment,
+        int & global_chunk_idx,
+        OutputResampler & out_resampler) {
+
+        std::vector<int32_t> seg_toks = speech_tokens;
+        for (int i = 0; i < kS3GenLookaheadTokens; ++i) {
+            seg_toks.push_back(kS3GenSilenceToken);
+        }
+        const int total_n = (int) seg_toks.size();
+
+        const int chunk_n       = opts.stream_chunk_tokens;
+        // The smaller first chunk minimises first-audio latency, but only for
+        // the very first segment; later segments use the full chunk size for
+        // their first chunk (matches the CLI's per-segment behaviour).
+        const int first_chunk_n = (is_first_segment && opts.stream_first_chunk_tokens > 0)
+                                    ? opts.stream_first_chunk_tokens
+                                    : chunk_n;
+
+        std::vector<int> boundaries = {0};
+        int cursor = std::min(first_chunk_n, total_n);
+        boundaries.push_back(cursor);
+        while (cursor < total_n) {
+            cursor = std::min(cursor + chunk_n, total_n);
+            boundaries.push_back(cursor);
+        }
+        // Absorb a tiny trailing chunk into the previous one (avoids
+        // paying the full encoder+CFM cost for a handful of new tokens;
+        // matches main.cpp's tail-merge heuristic).
+        const int min_tail = std::max(6, chunk_n / 3);
+        if (boundaries.size() >= 3) {
+            const int tail_len = boundaries.back() - boundaries[boundaries.size() - 2];
+            if (tail_len < min_tail) boundaries.erase(boundaries.end() - 2);
+        }
+
+        std::vector<float> hift_cache_source;
+        int prev_mels_emitted = 0;
+
+        const int n_chunks = (int) boundaries.size() - 1;
+        double s3gen_ms_total = 0.0;
+
+        for (int k = 1; k <= n_chunks; ++k) {
+            if (cancel_flag.load(std::memory_order_relaxed)) {
+                throw std::runtime_error("Engine: synthesis cancelled during streaming");
+            }
+            const int end              = boundaries[k];
+            const bool is_last_in_seg  = (end == total_n);
+            // Sliding left-context window: feed S3Gen only [win_start, end)
+            // instead of the whole [0, end) prefix so per-chunk encoder+CFM
+            // cost stays bounded.  The cumulative prefix otherwise makes
+            // per-chunk cost grow with elapsed output (~O(N^2) over the
+            // utterance).  L == 0 preserves the exact legacy cumulative slice.
+            const int L_ctx     = opts.stream_left_context_tokens;
+            const int win_start = (L_ctx > 0) ? std::max(0, boundaries[k - 1] - L_ctx) : 0;
+            std::vector<int32_t> toks(seg_toks.begin() + win_start,
+                                      seg_toks.begin() + end);
+
+            s3gen_synthesize_opts copts;
+            fill_common_s3gen_opts(copts);
+            std::vector<float> chunk_pcm;
+            copts.pcm_out                   = &chunk_pcm;
+            copts.append_lookahead_silence  = false;
+            copts.finalize                  = is_last_in_seg;
+            // Drop the already-emitted left-context mels (2 per token) still
+            // inside the window; reduces to prev_mels_emitted when win_start==0.
+            // Correct only because prev_mels_emitted AND win_start are both
+            // segment-local (reset each call).
+            copts.skip_mel_frames           = prev_mels_emitted - 2 * win_start;
+            copts.apply_trim_fade           = (k == 1);
+            copts.hift_cache_source         = hift_cache_source;
+            std::vector<float> tail_out;
+            copts.hift_source_tail_out      = &tail_out;
+            std::string chunk_backend;
+            copts.s3gen_backend_out         = &chunk_backend;
+            copts.source_tail_samples       = 480;
+            copts.cfm_steps                 = opts.stream_cfm_steps;
+            copts.streaming = true;  // floor CFM steps for standard CFM
+            // Each chunk is one S3Gen call: its own Core ML plan, acquired
+            // before it starts. Streaming never overlaps T3.
+            copts.coreml_plan = acquire_plan(copts, toks);
+
+            const auto s3_t0 = std::chrono::steady_clock::now();
+            const int rc = s3gen_synthesize_to_wav(toks, copts);
+            const auto s3_t1 = std::chrono::steady_clock::now();
+            if (rc == 2) {
+                throw std::runtime_error(
+                    "Engine: synthesis cancelled during S3Gen+HiFT chunk "
+                    + std::to_string(k));
+            }
+            if (rc != 0) {
+                throw std::runtime_error(
+                    "Engine: streaming chunk " + std::to_string(k) +
+                    " failed with code " + std::to_string(rc));
+            }
+            s3gen_backends.insert(chunk_backend);
+            s3gen_ms_total += std::chrono::duration<double, std::milli>(s3_t1 - s3_t0).count();
+            detail::coreml_test().trace(
+                "chunk " + std::to_string(global_chunk_idx) + " s3gen=" + chunk_backend +
+                (copts.coreml_plan && detail::plan_pending(*copts.coreml_plan) ? " pending" : ""));
+
+            // is_last is true only on the final chunk of the final segment.
+            // chunk_index is the global monotonic counter (post-incremented so
+            // the first chunk is index 0, matching the single-segment legacy).
+            const bool is_final_chunk = is_last_in_seg && is_last_segment;
+            // feed the native chunk through the utterance-spanning
+            // resampler (0 / 24000 = passthrough).  process() returns only the
+            // now-stable output samples and finish() flushes the tail on the
+            // final chunk, so the emitted chunks concatenate to the exact same
+            // PCM as resampling the whole utterance once — no per-chunk seam
+            // artifacts, while result.pcm == concat(chunks) still holds.  The
+            // mel bookkeeping below stays on the NATIVE 24 kHz sample count
+            // (480-sample hop), so snapshot it before resampling.
+            const size_t native_chunk_samples = chunk_pcm.size();
+            std::vector<float> emit = out_resampler.process(chunk_pcm);
+            if (is_final_chunk) {
+                std::vector<float> tail = out_resampler.finish();
+                emit.insert(emit.end(), tail.begin(), tail.end());
+            }
+            on_chunk(emit.data(), emit.size(), global_chunk_idx, is_final_chunk);
+            ++global_chunk_idx;
+
+            result.pcm.insert(result.pcm.end(), emit.begin(), emit.end());
+            hift_cache_source = std::move(tail_out);
+            prev_mels_emitted += (int)(native_chunk_samples / 480);
+        }
+
+        result.t3_tokens += (int) speech_tokens.size();
+        result.s3gen_ms  += s3gen_ms_total;
+    }
+
+    SynthesisResult synthesize(const std::string & text,
+                               const StreamCallback & on_chunk) {
+        if (text.empty()) {
+            throw std::runtime_error("Engine: text is empty");
+        }
+        cancel_flag.store(false, std::memory_order_relaxed);
+
+        // Sentence-level auto-split (parity with the CLI).  Adopt the split
+        // only when it yields >1 segment; otherwise treat the whole text as a
+        // single segment -- which, at max_sentence_chars == 0, reproduces the
+        // legacy single-pass behaviour byte-for-byte (one run_t3, chunk_index
+        // 0..n-1, is_last on the final chunk).
+        std::vector<std::string> segments;
+        if (opts.max_sentence_chars > 0) {
+            auto segs = tts_cpp::chatterbox::text_preprocess::split_text_for_tts(
+                text, opts.max_sentence_chars);
+            if (segs.size() > 1) segments = std::move(segs);
+        }
+        if (segments.empty()) segments.push_back(text);
+
+        // S3Gen weights finish loading on a background thread (usually already
+        // joined in the constructor); ensure they're ready before any S3Gen.
+        wait_for_preload(s3gen_preload_thread);
+
+        const bool use_streaming = on_chunk && opts.stream_chunk_tokens > 0;
+        coreml_pending = false;
+        if (sidecars) {
+            // The S3Gen calls this request is expected to make, from the text
+            // length: their widths load at `current` priority, ahead of
+            // unstarted construction loads, and the resident cap keeps them.
+            const detail::s3gen_gguf_facts & facts = sidecars->facts();
+            std::vector<detail::s3gen_call_shape> calls;
+            for (size_t si = 0; si < segments.size(); ++si) {
+                const int speech = detail::coreml_expected_speech_tokens(segments[si].size());
+                if (!use_streaming) {
+                    calls.push_back(detail::s3gen_shape(prompt_tokens(), speech, facts.token_mel_ratio, true, true));
+                    continue;
+                }
+                for (int window : detail::coreml_stream_windows(speech, si == 0 ? opts.stream_first_chunk_tokens : 0,
+                                                                opts.stream_chunk_tokens,
+                                                                opts.stream_left_context_tokens)) {
+                    calls.push_back(detail::s3gen_shape(prompt_tokens(), window, facts.token_mel_ratio, false, true));
+                }
+            }
+            sidecars->predict(calls);
+        }
+        struct predicted_guard {
+            detail::s3gen_sidecars * sidecars;
+            ~predicted_guard() { if (sidecars) sidecars->end_call(); }
+        } predicted{sidecars.get()};
+
+        // resolve the output rate once. 0 keeps the native
+        // 24 kHz.  Streaming flows every chunk through a single utterance-
+        // spanning resampler (so the streamed output equals the batch resample
+        // with no per-chunk seams); the batch path resamples the assembled PCM
+        // once at the end.
+        constexpr int kNativeSr = 24000;
+        const int out_sr = opts.output_sample_rate > 0 ? opts.output_sample_rate : kNativeSr;
+        OutputResampler out_resampler(kNativeSr, opts.output_sample_rate);
+
+        SynthesisResult result;
+        result.sample_rate   = out_sr;
+        int global_chunk_idx = 0;  // monotonic across all segments
+        s3gen_backends.clear();
+
+        // Each sentence's S3Gen models are acquired after its T3. When they
+        // put CFM and HiFT on the CPU and Neural Engine, the GPU is free for
+        // T3, so the batch path renders sentence i on a worker thread while
+        // T3 decodes sentence i + 1 (one in flight; the PCM is still appended
+        // in order).  Otherwise (ggml stages, or Core ML units that may use
+        // the GPU) the sentence renders inline, as the two would only contend.
+        std::future<rendered_segment> in_flight;
+
+        for (size_t si = 0; si < segments.size(); ++si) {
+            // Bound cancel latency to a sentence boundary (run_t3 and the
+            // chunk loop also poll cancel_flag internally).
+            if (cancel_flag.load(std::memory_order_relaxed)) {
+                throw std::runtime_error("Engine: synthesis cancelled");
+            }
+            const auto t3_t0 = std::chrono::steady_clock::now();
+            std::vector<int32_t> speech_tokens = run_t3(segments[si]);
+            const auto t3_t1 = std::chrono::steady_clock::now();
+            result.t3_ms += std::chrono::duration<double, std::milli>(t3_t1 - t3_t0).count();
+            detail::coreml_test().trace("t3 " + std::to_string(si));
+
+            if (use_streaming) {
+                synthesize_streaming_segment(
+                    speech_tokens, on_chunk, result,
+                    /*is_first_segment=*/si == 0,
+                    /*is_last_segment=*/si + 1 == segments.size(),
+                    global_chunk_idx, out_resampler);
+                continue;
+            }
+            std::shared_ptr<const S3genCoremlPlan> plan = acquire_plan(batch_segment_opts(), speech_tokens);
+            if (in_flight.valid()) append_batch_segment(in_flight.get(), result);
+            if (segments.size() > 1 && plan && s3gen_coreml_plan_offloads(*plan)) {
+                // The worker never runs ggml: a Core ML failure there hands
+                // the segment back to be rendered on this thread.
+                detail::defer_coreml_failures(*plan);
+                in_flight = std::async(std::launch::async,
+                                       [this, tokens = std::move(speech_tokens), si, plan = std::move(plan)]() mutable {
+                                           return render_batch_segment(tokens, si, std::move(plan));
+                                       });
+            } else {
+                synthesize_batch_segment(speech_tokens, si, std::move(plan), result);
+            }
+        }
+        if (in_flight.valid()) append_batch_segment(in_flight.get(), result);
+
+        // the batch path assembles + crossfades segments at the
+        // native 24 kHz; resample the whole utterance once for best quality.
+        // The streaming path already emitted/accumulated at out_sr per chunk.
+        if (!use_streaming) {
+            result.pcm = resample_for_output(std::move(result.pcm), kNativeSr, out_sr);
+        }
+
+        result.audio_samples = (int) result.pcm.size();
+        if (s3gen_backends.size() == 1) {
+            result.s3gen_backend = *s3gen_backends.begin();
+        } else if (s3gen_backends.size() > 1) {
+            result.s3gen_backend = detail::MIXED_STAGE_BACKEND;
+        }
+        result.coreml_pending = coreml_pending;
+        return result;
+    }
+
+    SynthesisResult synthesize(const std::string & text) {
+        return synthesize(text, StreamCallback{});
+    }
+};
+
+Engine::Engine(const EngineOptions & opts)
+    : pimpl_(std::make_unique<Impl>(opts)) {}
+
+Engine::~Engine() = default;
+Engine::Engine(Engine &&) noexcept            = default;
+Engine & Engine::operator=(Engine &&) noexcept = default;
+
+SynthesisResult Engine::synthesize(const std::string & text) {
+    return pimpl_->synthesize(text);
+}
+
+SynthesisResult Engine::synthesize(const std::string & text,
+                                   const StreamCallback & on_chunk) {
+    return pimpl_->synthesize(text, on_chunk);
+}
+
+void Engine::cancel() {
+    if (pimpl_) pimpl_->cancel_flag.store(true, std::memory_order_relaxed);
+}
+
+const EngineOptions & Engine::options() const {
+    return pimpl_->opts;
+}
+
+std::string Engine::backend_name() const {
+    if (!pimpl_->model.backend) {
+        return "(unknown)";
+    }
+    if (const char * name = ggml_backend_name(pimpl_->model.backend)) {
+        return std::string(name);
+    }
+    return "(unknown)";
+}
+
+BackendDevice Engine::backend_device() const {
+    ggml_backend_t b = pimpl_ ? pimpl_->model.backend : nullptr;
+    if (!b) return BackendDevice::CPU;
+    ggml_backend_dev_t dev = ggml_backend_get_device(b);
+    if (!dev) return BackendDevice::CPU;
+    return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU
+               ? BackendDevice::CPU
+               : BackendDevice::GPU;
+}
+
+bool Engine::gpu_unsupported() const {
+    return pimpl_ && pimpl_->model.gpu_unsupported;
+}
+
+std::string Engine::coreml_status() const {
+    return pimpl_ && pimpl_->sidecars ? pimpl_->sidecars->status_json() : detail::coreml_status_without_sidecars();
+}
+
+std::string Engine::coreml_construction() const {
+    return pimpl_ && pimpl_->sidecars ? pimpl_->sidecars->construction_json()
+                                      : detail::coreml_empty_group_json("construction");
+}
+
+bool Engine::coreml_wait(int64_t timeout_ms) {
+    if (!pimpl_) return false;
+    // No sidecar in use: the construction group is empty, which succeeds.
+    if (!pimpl_->sidecars) return true;
+    pimpl_->cancel_flag.store(false, std::memory_order_relaxed);
+    return pimpl_->sidecars->wait(timeout_ms, &pimpl_->cancel_flag);
+}
+
+std::string Engine::coreml_prewarm(CoremlOptions::Prewarm scope, bool wait) {
+    if (!pimpl_ || !pimpl_->sidecars) return detail::coreml_empty_group_json("prewarm");
+    pimpl_->cancel_flag.store(false, std::memory_order_relaxed);
+    return pimpl_->sidecars->prewarm(scope, wait, &pimpl_->cancel_flag);
+}
+
+} // namespace tts_cpp::chatterbox

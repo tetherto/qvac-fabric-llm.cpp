@@ -1,0 +1,14 @@
+mlrecipe 1
+template toy-stateless
+spec_sha256 7d1e16444e758548cf6da4f396ba73d3cc4dee09bfd20f4377ab1dac5a863b32
+weight_bin_size 4064
+blobs 4
+source "toy.w1" f32 [32,8]
+source "toy.b1" f32 [32]
+source "toy.w2" f32 [32,48]
+source "toy.b2" f32 [48]
+blob 64 fp16 256 f16(t("toy.w1"))
+blob 640 fp16 32 f16(t("toy.b1"))
+blob 768 fp16 1536 f16(permute(t("toy.w2"), [1, 0]))
+blob 3904 fp16 48 f16(mul(t("toy.b2"), 0.5))
+end

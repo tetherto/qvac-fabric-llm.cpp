@@ -1,0 +1,92 @@
+# Enforces the third_party/whisper.cpp divergence policy (QIP #94):
+# the subtree must be byte-identical to the upstream tag recorded in
+# UPSTREAM_PIN, except for the files declared in PATCHES.md. Anything
+# else — including any edit under the vendored ggml/ — fails the PR.
+# See docs/UPSTREAM-SYNC.md for the sync workflow.
+name: whisper divergence guard
+
+on:
+  pull_request:
+    paths:
+      - 'third_party/whisper.cpp/**'
+      - '.github/workflows/whisper-divergence-guard.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'third_party/whisper.cpp/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Dedupe per PR and per branch: a newer push or dispatch supersedes the
+# in-flight guard. master is exempt on purpose — pushes to the default branch
+# must not cancel each other.
+concurrency:
+  group: whisper-divergence-guard-${{ (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
+  guard:
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.ubuntu_2404 }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the pinned upstream tag
+        id: pin
+        run: |
+          PIN=$(tr -d '[:space:]' < third_party/whisper.cpp/UPSTREAM_PIN)
+          echo "pin=$PIN" >> "$GITHUB_OUTPUT"
+          git remote add upstream https://github.com/ggml-org/whisper.cpp.git
+          git fetch --no-tags --depth 1 upstream "refs/tags/$PIN:refs/tags/$PIN"
+
+      - name: Diff subtree vs pin, filtered by the PATCHES.md manifest
+        run: |
+          PIN="${{ steps.pin.outputs.pin }}"
+          # Allowed divergence = files named in backticks in the first column
+          # of PATCHES.md's manifest table, plus the manifest/pin files
+          # themselves. Rows may declare several comma-separated files, and an
+          # entry ending in `/` declares a whole directory (prefix match).
+          allowed=$(mktemp)
+          {
+            echo "PATCHES.md"
+            echo "UPSTREAM_PIN"
+            grep -E '^\|' third_party/whisper.cpp/PATCHES.md \
+              | cut -d'|' -f2 \
+              | grep -oE '`[^`]+`' \
+              | tr -d '`'
+          } | sort -u > "$allowed"
+
+          diverged=$(mktemp)
+          git diff --name-only "$(git rev-parse "$PIN^{tree}")" \
+                               "$(git rev-parse "HEAD:third_party/whisper.cpp")" \
+            | sort -u > "$diverged"
+
+          echo "== declared (PATCHES.md) =="; cat "$allowed"
+          echo "== actual divergence vs $PIN =="; cat "$diverged"
+
+          undeclared=$(awk '
+            NR == FNR { exact[$0] = 1; if ($0 ~ /\/$/) prefix[$0] = 1; next }
+            {
+              if ($0 in exact) next
+              for (d in prefix) if (index($0, d) == 1) next
+              print
+            }' "$allowed" "$diverged")
+          if [ -n "$undeclared" ]; then
+            echo "::error::third_party/whisper.cpp diverges from $PIN in files not declared in PATCHES.md:"
+            echo "$undeclared"
+            echo "Either revert these files, or declare them in third_party/whisper.cpp/PATCHES.md (and justify in the PR)."
+            case "$undeclared" in *ggml*) echo "::error::ggml/ divergence is never allowed here — patch the fabric ggml (qvac-fabric-llm.cpp ggml/) instead (see PATCHES.md).";; esac
+            exit 1
+          fi
+          # Declared-but-identical files are fine (e.g. right after a sync
+          # absorbed a patch) — PATCHES.md hygiene is handled in review.
+          echo "OK: divergence matches the manifest."
+

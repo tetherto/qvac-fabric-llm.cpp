@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 1,
+  "notes": [
+    "All lyrics are original. Prompts do not request imitation of living artists.",
+    "timesignature is the CoT YAML string '4' (numerator), matching acestep.cpp field convention rather than a '4/4' display string.",
+    "Every prompt supplies caption, lyrics, duration, bpm, keyscale, timesignature, language, and seed so both engines skip Phase-1 lyric generation."
+  ],
+  "prompts": [
+    {
+      "id": "instrumental-folk",
+      "category": "instrumental-acoustic",
+      "caption": "Gentle acoustic folk instrumental with fingerpicked steel-string guitar, light upright bass, and soft shaker, recorded in a small wooden room",
+      "lyrics": "[Instrumental]",
+      "duration": 8,
+      "bpm": 92,
+      "keyscale": "G major",
+      "timesignature": "4",
+      "vocal_language": "en",
+      "seed": 101
+    },
+    {
+      "id": "instrumental-house",
+      "category": "electronic",
+      "caption": "Driving deep house instrumental with analog bass, four-on-the-floor kick, crisp hi-hats, and a warm pad, no vocals",
+      "lyrics": "[Instrumental]",
+      "duration": 12,
+      "bpm": 124,
+      "keyscale": "A minor",
+      "timesignature": "4",
+      "vocal_language": "en",
+      "seed": 202
+    },
+    {
+      "id": "vocal-pop",
+      "category": "vocal-pop",
+      "caption": "Bright indie pop with electric guitar, snare backbeat, and a clear female lead vocal in English",
+      "lyrics": "[Verse]\nSunrise on the quiet street\nI count the windows, count the beat\n[Chorus]\nHold the light a little longer\nLet the morning make us stronger",
+      "duration": 10,
+      "bpm": 118,
+      "keyscale": "C major",
+      "timesignature": "4",
+      "vocal_language": "en",
+      "seed": 303
+    },
+    {
+      "id": "vocal-jazz",
+      "category": "vocal-jazz",
+      "caption": "Slow jazz trio with brushed drums, upright bass, piano, and a relaxed male vocal",
+      "lyrics": "[Verse]\nThe river keeps a slower time\nLamps flicker off the waterline\n[Chorus]\nStay until the last small train\nLeave the night its quiet rain",
+      "duration": 12,
+      "bpm": 72,
+      "keyscale": "Eb major",
+      "timesignature": "4",
+      "vocal_language": "en",
+      "seed": 404
+    },
+    {
+      "id": "short-drone",
+      "category": "simple-arrangement",
+      "caption": "Minimal ambient drone: one analog synthesizer tone with slow filter movement and no percussion",
+      "lyrics": "[Instrumental]",
+      "duration": 6,
+      "bpm": 60,
+      "keyscale": "D minor",
+      "timesignature": "4",
+      "vocal_language": "en",
+      "seed": 505
+    },
+    {
+      "id": "dense-orchestral",
+      "category": "dense-arrangement",
+      "caption": "Dense cinematic orchestra with strings, brass, woodwinds, timpani, harp, and choir pads in a dramatic crescendo, instrumental only",
+      "lyrics": "[Instrumental]",
+      "duration": 16,
+      "bpm": 96,
+      "keyscale": "C minor",
+      "timesignature": "4",
+      "vocal_language": "en",
+      "seed": 606
+    },
+    {
+      "id": "acoustic-chamber",
+      "category": "acoustic",
+      "caption": "Simple chamber arrangement: solo cello and nylon guitar playing a short lyrical melody in a dry studio",
+      "lyrics": "[Instrumental]",
+      "duration": 8,
+      "bpm": 76,
+      "keyscale": "D major",
+      "timesignature": "4",
+      "vocal_language": "en",
+      "seed": 707
+    },
+    {
+      "id": "dense-electronic",
+      "category": "electronic-dense",
+      "caption": "Busy electronic production with arpeggiated synths, layered percussion, distorted bass, granular textures, and stereo delays",
+      "lyrics": "[Instrumental]",
+      "duration": 10,
+      "bpm": 140,
+      "keyscale": "F# minor",
+      "timesignature": "4",
+      "vocal_language": "en",
+      "seed": 808
+    },
+    {
+      "id": "unusual-prepared",
+      "category": "unusual-structure",
+      "caption": "Prepared piano, glass bowls, a detuned radio hiss, and a single bamboo flute entering only in the second half, irregular phrases, instrumental",
+      "lyrics": "[Instrumental]",
+      "duration": 10,
+      "bpm": 54,
+      "keyscale": "B minor",
+      "timesignature": "5",
+      "vocal_language": "en",
+      "seed": 909
+    },
+    {
+      "id": "adversarial-clash",
+      "category": "adversarial",
+      "caption": "Funeral-slow pipe organ and distant bells mixed with rapid 200 BPM breakbeats, toy kazoo choir, whispered spoken word, and sudden silence gaps",
+      "lyrics": "[Verse]\nCount backward from a broken clock\n[Chorus]\nLouder, quieter, never the same room",
+      "duration": 8,
+      "bpm": 200,
+      "keyscale": "C# minor",
+      "timesignature": "7",
+      "vocal_language": "en",
+      "seed": 1010
+    }
+  ]
+}

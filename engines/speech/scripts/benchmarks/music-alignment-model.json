@@ -1,0 +1,17 @@
+{
+  "model_id": "laion/larger_clap_music_and_speech",
+  "revision": "195c3a3e68faebb3e2088b9a79e79b43ddbda76b",
+  "sampling_rate": 48000,
+  "window_samples": 480000,
+  "files": {
+    "config.json": "04733de73869ed861b469b275a0f31d04a7004f578234bcc3d080fd38da6c4db",
+    "merges.txt": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
+    "preprocessor_config.json": "9739f58296aa6f9ac18008fd0150fb2649bc554985fbde86d0a4041c882ac753",
+    "pytorch_model.bin": "b73c5e596fda5b29b522a1ab3f0842977fe2b147bf8b78c2ec5f7ae6267038a1",
+    "special_tokens_map.json": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+    "tokenizer.json": "dc239041d98de27ffc3975473a1a23e3db4c937b23c138c38bbc66588bd247e5",
+    "tokenizer_config.json": "e2eb445cfdbf4711de620cbdf10478b0423950799e85652d9f28da47066ab86d",
+    "vocab.json": "ed19656ea1707df69134c4af35c8ceda2cc9860bf2c3495026153a133670ab5e"
+  },
+  "license": "apache-2.0"
+}

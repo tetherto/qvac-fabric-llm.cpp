@@ -1,0 +1,289 @@
+	±¢(
+main
+x
+*
+†Ä
+y
+*
+ †Ä¢'
+alt
+x
+*
+†Ä
+y
+*
+ †Ä™main¢—¢:
+,com.github.apple.coremltools.conversion_date
+2026-11-13¢2
+#com.github.apple.coremltools.sourcemilinternal¢+
+$com.github.apple.coremltools.version9.0¢
+qvac.toy.kindmulti¢
+qvac.toy.version1≤ˇ–
+
+alt»
+
+
+x
+
+
+CoreML8£
+
+CoreML8ó
+yf
+const
+x_to_fp16_dtype_0
+*'
+name
+
+"
+x_to_fp16_dtype_0*
+val
+
+
+"
+fp16™
+const/
+linear_1_weight_0_to_fp16
+
+
+ 
+*/
+name'
+
+"
+linear_1_weight_0_to_fp16*?
+val8
+
+
+ 
+*"
+@model_path/weights/weight.bin@õ
+const'
+linear_1_bias_0_to_fp16
+
+
+
+ *-
+name%
+
+"
+linear_1_bias_0_to_fp16*:
+val3
+
+
+
+ *#
+@model_path/weights/weight.binÄq
+cast
+dtype
+
+x_to_fp16_dtype_0
+
+x
+
+x
+	x_to_fp16
+
+
+
+*
+name
+
+
+"
+cast_1æ
+linear#
+bias
+
+linear_1_bias_0_to_fp16'
+weight
+
+linear_1_weight_0_to_fp16
+x
+
+	x_to_fp16(
+linear_1_cast_fp16
+
+
+
+ *(
+name 
+
+"
+linear_1_cast_fp16õ
+const'
+mul_0_y_0_to_fp16
+
+
+
+ *'
+name
+
+"
+mul_0_y_0_to_fp16*@
+val9
+
+
+
+ *#
+@model_path/weights/weight.binÄå
+mul
+x
+
+linear_1_cast_fp16
+y
+
+mul_0_y_0_to_fp16%
+mul_0_cast_fp16
+
+
+
+ *%
+name
+
+"
+mul_0_cast_fp16z
+const#
+y_cast_fp16_to_fp32_dtype_0
+*1
+name)
+!
+"
+y_cast_fp16_to_fp32_dtype_0*
+val
+
+
+"
+fp32Å
+cast(
+dtype
+
+y_cast_fp16_to_fp32_dtype_0
+x
+
+mul_0_cast_fp16
+y
+
+
+ *
+name
+
+
+"
+cast_0ß
+mainû
+
+x
+
+
+CoreML8˘
+CoreML8Ìyf
+const
+x_to_fp16_dtype_0
+*'
+name
+
+"
+x_to_fp16_dtype_0*
+val
+
+
+"
+fp16™
+const/
+linear_0_weight_0_to_fp16
+
+
+ 
+*/
+name'
+
+"
+linear_0_weight_0_to_fp16*?
+val8
+
+
+ 
+*"
+@model_path/weights/weight.bin@õ
+const'
+linear_0_bias_0_to_fp16
+
+
+
+ *-
+name%
+
+"
+linear_0_bias_0_to_fp16*:
+val3
+
+
+
+ *#
+@model_path/weights/weight.binÄq
+cast
+dtype
+
+x_to_fp16_dtype_0
+
+x
+
+x
+	x_to_fp16
+
+
+
+*
+name
+
+
+"
+cast_1æ
+linear#
+bias
+
+linear_0_bias_0_to_fp16'
+weight
+
+linear_0_weight_0_to_fp16
+x
+
+	x_to_fp16(
+linear_0_cast_fp16
+
+
+
+ *(
+name 
+
+"
+linear_0_cast_fp16z
+const#
+y_cast_fp16_to_fp32_dtype_0
+*1
+name)
+!
+"
+y_cast_fp16_to_fp32_dtype_0*
+val
+
+
+"
+fp32Ñ
+cast(
+dtype
+
+y_cast_fp16_to_fp32_dtype_0
+x
+
+linear_0_cast_fp16
+y
+
+
+ *
+name
+
+
+"
+cast_0
