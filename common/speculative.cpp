@@ -1356,8 +1356,11 @@ public:
     // one block must fit one draft decode; call after init() clamps n_max
     void check_block_fits(int32_t n_block_tokens) const {
         if (n_block_tokens > n_decode_max) {
+            // the draft inherits the logical batch (-b / --batch-size); only the physical batch has a draft option
+            const char * fix = causal_attn ? "the logical batch; raise -b / --batch-size" :
+                    "one physical batch of the draft; raise --spec-draft-n-ubatch, and -b / --batch-size if it is smaller";
             throw std::runtime_error(string_format("the draft decodes blocks of %d tokens, which do not fit "
-                    "--spec-draft-n-ubatch / --spec-draft-n-batch (%d)", n_block_tokens, n_decode_max));
+                    "%s (%d tokens)", n_block_tokens, fix, n_decode_max));
         }
     }
 
