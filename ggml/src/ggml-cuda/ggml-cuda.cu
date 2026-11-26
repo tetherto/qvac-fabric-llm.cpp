@@ -2870,6 +2870,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(
         return false;
     }
 
+    // do not fuse the matmuls that few-row MMQ takes in ggml_cuda_mul_mat_id
+    if (tensor->op == GGML_OP_MUL_MAT_ID && ggml_cuda_should_use_mmq_few(src0, src1, tensor->src[2], cc)) {
+        return false;
+    }
+
     return use_mul_mat_vec_q;
 }
 
@@ -2988,7 +2993,7 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     const ggml_tensor * y    = up->src[1];
     const int           cc   = ggml_cuda_info().devices[device].cc;
 
-    // For MUL_MAT_ID: same kernel choice as ggml_cuda_mul_mat_id, with the nominal tiles of all experts (the per-expert token counts are only known on the GPU).
+    // For MUL_MAT_ID: the MMVQ/MMQ choice of ggml_cuda_mul_mat_id, with the nominal tiles of all experts (the per-expert token counts are only known on the GPU).
     const bool    is_id     = up->op == GGML_OP_MUL_MAT_ID;
     const int64_t ncols     = is_id ? y->ne[2]    : y->ne[1];
     const int64_t nchannels = is_id ? x_up->ne[2] : y->ne[2]*y->ne[3];
@@ -3074,8 +3079,8 @@ static void ggml_cuda_mul_mat_canonical(
         return;
     }
     // from a per-type number of src1 columns up to 24, few-row MMQ is faster than MMVQ and MMQ
-    if (ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
-        ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
+    if (ggml_cuda_should_use_mmq_few(src0, src1, nullptr, cc)) {
+        ggml_cuda_mul_mat_q_few(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
@@ -3186,6 +3191,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         }
     }
 
+    if (ggml_cuda_should_use_mmq_few(src0, src1, dst->src[2], cc)) {
+        return false;
+    }
+
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
         return false;
     }
@@ -3212,8 +3221,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        // up to 24 tokens few-row MMQ is faster than MMQ, on DGX Spark also faster than MMVQ
+        const bool use_mmq_few = ggml_cuda_should_use_mmq_few(src0, src1, ids, cc);
+
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+        if (!use_mmq_few && ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = ggml_cuda_mmid_mmvq_max_batch(src0, ids, cc);
                 if (ne2 <= mmvq_mmid_max) {
@@ -3229,6 +3241,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             }
+        }
+
+        if (use_mmq_few) {
+            ggml_cuda_mul_mat_q_few(ctx, src0, src1, ids, dst);
+            return;
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {

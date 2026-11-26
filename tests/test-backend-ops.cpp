@@ -17877,6 +17877,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6170, 13, k, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 21, k, {1, 1}, {1, 1}));
         }
+        // MUL_MAT_ID: K = 8 units (the warps split K, broadcast src1), K = 2 units (the warps split the rows, more than 8 tokens per expert, unaligned experts)
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, true,   72, 13, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32,  4, 2, false, 202, 24,  512));
+        // MUL_MAT_ID rows of 9 units, not a whole number of ring stages (edge kernel), also with strided experts
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false,  72,  5, 2304));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, true,   72, 13, 2304, 80));
+    }
+    // few-row MMQ edge kernel for Q8_0 and IQ4_NL rows that end with half a unit and are only 8 or 2 byte aligned:
+    // the Inkling 2 expert down projection (K = 1152), K = 1.5 and 8.5 units, a view of 8.5 units in rows of 9 units
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+        for (int64_t n : {2, 3, 8, 13}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 72, n, 1152));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, true,   72, 13, 1152, 80));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32,  4, 2, false, 202, 24,  384));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false,  72, 13, 2176));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000,  8, 2176, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 21, 2176, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000,  8, 2176, {1, 1}, {1, 1}, {0, 1, 2, 3}, 2304));
     }
     // permuted and broadcast src0/src1 for the 2 byte aligned types
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 64, 13, 2304, {2, 3}, {1, 1}, {0, 2, 1, 3}));
@@ -17894,6 +17913,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_pos(GGML_TYPE_Q5_K, GGML_TYPE_F32, 1000, 13, 4608, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 6170, 13, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1000, 21, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, true));
+    // CUDA few-row MMQ for MUL_MAT_ID: strided experts, more than 32 experts
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32,  16, 4, true,  72, 13, 2048, 80));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 8, false, 72, 16, 2048));
     // the first column counts of the per-type few-row ranges that the lists above skip
     for (int64_t n : {2, 3, 4, 6, 7}) {
         for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
@@ -19679,6 +19701,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // K = 2048: few-row MMQ, where enabled, takes the gate and up matmuls of this pattern
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,         9,   128, 2048, false, 1, 1, false, false, true, false, { 1, 1 }));
+    // on DGX Spark also the expert gate and up matmuls at 8 tokens, instead of the fused MMVQ path
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,         8,   128, 2048, true, 16, 4, true));
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
