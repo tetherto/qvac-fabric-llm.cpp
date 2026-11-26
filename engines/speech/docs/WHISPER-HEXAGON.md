@@ -26,7 +26,7 @@ desktop OpenCL library cannot be used for this cross build.
 From the Speech repository root:
 
 ```sh
-GGML_REF=<commit from .github/workflows/whisper-ci.yml>
+GGML_REF=<commit from tts/scripts/setup-ggml.sh>
 git init -q ggml-src
 git -C ggml-src fetch --depth 1 https://github.com/tetherto/qvac-fabric-llm.cpp "$GGML_REF"
 git -C ggml-src checkout -q FETCH_HEAD

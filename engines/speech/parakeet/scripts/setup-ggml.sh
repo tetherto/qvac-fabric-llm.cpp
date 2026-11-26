@@ -7,8 +7,8 @@
 # support and the OpenCL program-binary cache are commits in that tree, so no
 # local patches are applied here.
 #
-# GGML_REF is the single source of truth for which commit parakeet builds
-# against; keep it equal to GGML_REF in .github/workflows/parakeet-ci.yml.
+# GGML_REF is the single source of truth for which commit a standalone
+# parakeet build uses; CI builds against the in-tree ggml/ instead.
 
 set -euo pipefail
 

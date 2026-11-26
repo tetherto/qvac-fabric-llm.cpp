@@ -5,13 +5,13 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { buildMatrices, changedPaths, comparisonBase, selectEngines } from '../lib/engine-matrix.mjs'
+import { SPEECH_ROOT, buildMatrices, changedPaths, comparisonBase, selectEngines } from '../lib/engine-matrix.mjs'
 
 const allEngines = ['parakeet', 'tts', 'audiogen', 'whisper']
 
 test('engine changes select only that engine across supported platforms', () => {
   for (const engine of allEngines.slice(0, 3)) {
-    const selected = selectEngines([`${engine}/src/model.cpp`])
+    const selected = selectEngines([`${SPEECH_ROOT}${engine}/src/model.cpp`])
     assert.deepEqual(selected, [engine])
     for (const matrix of Object.values(buildMatrices(selected))) {
       assert.deepEqual(matrix.include.map((entry) => entry.engine), [engine])
@@ -22,19 +22,20 @@ test('engine changes select only that engine across supported platforms', () => 
 
 test('multiple engines and deleted paths retain all affected engines', () => {
   assert.deepEqual(selectEngines([
-    'tts/src/deleted.cpp', 'parakeet/src/new.cpp', 'tts/README.md',
+    'engines/speech/tts/src/deleted.cpp', 'engines/speech/parakeet/src/new.cpp', 'engines/speech/tts/README.md',
   ]), ['parakeet', 'tts'])
 })
 
 test('shared dependencies and CI configuration run the full matrix', () => {
   for (const path of [
-    'CMakeLists.txt', 'third_party/whisper.cpp/include/whisper.h',
-    'test/moss_gpu_arm.h', 'whisper-gpu-picker.h',
-    'cmake/toolchain.cmake', 'scripts/benchmarks/test_audio8_streaming.py',
-    '.github/workflows/engines-cross-ci.yml', '.github/scripts/select-engine-matrix.mjs',
-    '.github/runners.yaml', '.github/workflows/reusable-runner-names.yml',
+    'engines/speech/CMakeLists.txt', 'engines/speech/third_party/whisper.cpp/include/whisper.h',
+    'engines/speech/test/moss_gpu_arm.h', 'engines/speech/whisper-gpu-picker.h',
+    'engines/speech/cmake/toolchain.cmake', 'engines/speech/scripts/benchmarks/test_audio8_streaming.py',
+    '.github/workflows/speech-engines-cross-ci.yml', 'engines/speech/ci/scripts/select-engine-matrix.mjs',
+    'engines/speech/ci/runners.yaml', '.github/workflows/speech-reusable-runner-names.yml',
+    'ggml/src/ggml.c', 'CMakeLists.txt', 'tts/src/model.cpp',
   ]) {
-    assert.deepEqual(selectEngines(['tts/src/model.cpp', path]), allEngines, path)
+    assert.deepEqual(selectEngines(['engines/speech/tts/src/model.cpp', path]), allEngines, path)
   }
 })
 
@@ -62,7 +63,7 @@ test('comparison bases support PRs, multi-commit pushes and new branches', () =>
 })
 
 test('diff includes both sides of moves and preserves spaces and newlines in paths', () => {
-  const paths = ['tts/old name.cpp', 'parakeet/new\nname.cpp']
+  const paths = ['engines/speech/tts/old name.cpp', 'engines/speech/parakeet/new\nname.cpp']
   const commands = []
   const run = (_command, args) => {
     commands.push(args)

@@ -22,13 +22,14 @@ const ENGINE_FLAGS = {
 }
 
 const ALL_ENGINES = Object.keys(ENGINE_FLAGS)
+export const SPEECH_ROOT = 'engines/speech/'
 
 export function selectEngines(paths) {
   // A missing comparison or a shared dependency change requires every lane.
   if (paths === null) return ALL_ENGINES
   const engines = new Set()
   for (const path of paths) {
-    const engine = ALL_ENGINES.find((name) => path.startsWith(`${name}/`))
+    const engine = ALL_ENGINES.find((name) => path.startsWith(`${SPEECH_ROOT}${name}/`))
     if (!engine) return ALL_ENGINES
     engines.add(engine)
   }

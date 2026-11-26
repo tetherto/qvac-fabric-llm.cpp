@@ -32,14 +32,14 @@ ggml install prefix; paths are relative to `engines/speech/`.
 From the repository root, build and install the shared fabric ggml, the
 `ggml/` tree of [qvac-fabric-llm.cpp](https://github.com/tetherto/qvac-fabric-llm.cpp)
 (the same ggml the LLM stack ships), then configure the umbrella against its
-install prefix. Use the commit the CI lanes pin (`GGML_REF` in
-`.github/workflows/whisper-ci.yml`) and record it with your build. To
+install prefix. Use the commit the engines pin (`GGML_REF` in
+`tts/scripts/setup-ggml.sh`) and record it with your build. To
 reproduce a registry build, check out the `v<VERSION>` tag the
 [`qvac-fabric` portfile](https://github.com/tetherto/qvac-registry-vcpkg/blob/main/ports/qvac-fabric/portfile.cmake)
 pins instead.
 
 ```sh
-GGML_REF=<commit from .github/workflows/whisper-ci.yml>
+GGML_REF=<commit from tts/scripts/setup-ggml.sh>
 git init -q ggml-src
 git -C ggml-src fetch --depth 1 https://github.com/tetherto/qvac-fabric-llm.cpp "$GGML_REF"
 git -C ggml-src checkout -q FETCH_HEAD
@@ -65,7 +65,7 @@ Run from the repository root in Developer PowerShell. This example uses the
 Visual Studio generator and a Release configuration:
 
 ```powershell
-$ggmlRef = "<commit from .github/workflows/whisper-ci.yml>"
+$ggmlRef = "<commit from tts/scripts/setup-ggml.sh>"
 git init -q ggml-src
 git -C ggml-src fetch --depth 1 https://github.com/tetherto/qvac-fabric-llm.cpp $ggmlRef
 git -C ggml-src checkout -q FETCH_HEAD

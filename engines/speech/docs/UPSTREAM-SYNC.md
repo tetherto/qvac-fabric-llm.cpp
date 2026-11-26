@@ -52,7 +52,7 @@ syncs too while the original subtree ancestry is absent.
    tag — **never** resolve a conflict by editing vendored ggml. ggml changes
    go to the `ggml/` tree of [qvac-fabric-llm.cpp](https://github.com/tetherto/qvac-fabric-llm.cpp).
 4. Local sanity: umbrella configure/build + `ctest -LE 'gpu|perf'` + the
-   whisper-cli smoke (see `.github/workflows/whisper-ci.yml` for the exact
+   whisper-cli smoke (see `.github/workflows/speech-whisper-ci.yml` for the exact
    commands).
 5. Open the PR and verify whisper CI and the divergence guard. The guard
    re-derives the allowed-file set from PATCHES.md, so a stale manifest fails

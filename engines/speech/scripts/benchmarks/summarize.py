@@ -2,7 +2,7 @@
 # Aggregate the per-(family, runner) result.json files produced by
 # scripts/benchmarks/run-family.sh into a single markdown table.
 #
-# Called from .github/workflows/benchmark-desktop.yml's summarize job:
+# Called from .github/workflows/speech-benchmark-desktop.yml's summarize job:
 #
 #   summarize.py --results-dir all-results \
 #                --out speech-benchmark-findings.md

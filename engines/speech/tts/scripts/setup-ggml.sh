@@ -13,8 +13,8 @@
 #   cmake -S tts -B tts/build -DTTS_CPP_USE_SYSTEM_GGML=OFF
 #   cmake --build tts/build -j
 #
-# To move the pin: bump GGML_REF below (keep it equal to GGML_REF in
-# .github/workflows/tts-ci.yml) and re-run. The script is idempotent: an
+# To move the pin: bump GGML_REF below and re-run. CI builds against the
+# in-tree ggml/ instead of this pin. The script is idempotent: an
 # existing clone is fetched and checked out at the pin without re-cloning.
 
 set -euo pipefail

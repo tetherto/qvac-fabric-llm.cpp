@@ -1,11 +1,11 @@
-# Specialized GitHub Actions runner labels for qvac-ext-lib-whisper.cpp CI.
-# Edit this file, then run: node .github/scripts/sync-runner-names.mjs
+# Specialized GitHub Actions runner labels for the speech engines' CI.
+# Edit this file, then run: node engines/speech/ci/scripts/sync-runner-names.mjs
 #
 # ubuntu-latest / macos-latest / windows-latest are intentionally omitted; keep
 # them hardcoded as GitHub's rolling aliases.
 #
 # FORMAT CONTRACT: a flat `key: value # comment` list, one entry per line. The
-# parser (.github/scripts/lib/runner-names.mjs) is line-based, not YAML. A value
+# parser (engines/speech/ci/scripts/lib/runner-names.mjs) is line-based, not YAML. A value
 # is EITHER a bare single label (`ubuntu-24.04`) OR a flow array of bare tokens
 # (`[self-hosted, Linux, X64]`) for composite self-hosted label sets. Do not
 # quote values or nest maps (the parser fails loudly).
