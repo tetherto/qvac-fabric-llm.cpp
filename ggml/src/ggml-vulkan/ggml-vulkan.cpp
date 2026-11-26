@@ -4315,6 +4315,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_q8_1_f32", arr_dmmv_q4_k_q8_1_f32_len[reduc], arr_dmmv_q4_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*rm_kq_int, 1, 1}, {wg_size_subgroup_int, rm_wide*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*rm_kq_int, 1, 1}, {wg_size_subgroup_int, rm_wide*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 }
+                if (!all_types && ggml_vk_is_radv_rdna3(device)) {
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32", arr_dmmv_q3_k_q8_1_f32_len[reduc], arr_dmmv_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*rm_kq_int, 1, 1}, {wg_size_subgroup_int, rm_wide*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                }
 
             }
 #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
@@ -9256,25 +9259,34 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 }
 
-// For these types the integer-dot mat-vec beats mul_mm up to mul_mat_vecq_max_cols columns once M is large.
+// On RADV RDNA3 Q8_0 takes the 9-16 column mat-vec below this many rows.
+static constexpr uint32_t radv_rdna3_mmvq_wide_q8_0_max_rows = 4096;
+
+// For these types the integer-dot mat-vec beats mul_mm up to mul_mat_vecq_max_cols columns.
 static bool ggml_vk_mmvq_wide(const vk_device& device, ggml_type type, uint32_t m) {
-    // The DGX Spark sweep measured wins from M 5120 up and losses at M 1024.
-    constexpr uint32_t min_rows = 4096;
-    if (!ggml_vk_mmvq_wide_device(device) || m < min_rows) {
+    if (!ggml_vk_mmvq_wide_device(device)) {
         return false;
     }
-    // gfx1151, M 5120-17408 at 9-16 columns: Q4_K / Q5_K 1.16-2.3x, Q6_K 1.44-2.85x, IQ4_XS 1.5-3.0x faster than int8 MMQ;
-    // Q8_0 lost at 16 columns (0.67-0.95x).
+    // gfx1151 at 9-16 columns: Q4_K / Q5_K 1.16-2.3x, Q6_K 1.44-2.85x, IQ4_XS 1.5-3.0x faster than int8 MMQ at M 5120-17408;
+    // at M 48-1024 and for Q3_K, MMQ reaches only 6-52 GB/s. Q8_0 loses from M 5120 (0.67-0.95x).
     if (ggml_vk_is_radv_rdna3(device)) {
         switch (type) {
+            case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q6_K:
             case GGML_TYPE_IQ4_XS:
                 return true;
+            case GGML_TYPE_Q8_0:
+                return m < radv_rdna3_mmvq_wide_q8_0_max_rows;
             default:
                 return false;
         }
+    }
+    // The DGX Spark sweep measured wins from M 5120 up and losses at M 1024.
+    constexpr uint32_t min_rows = 4096;
+    if (m < min_rows) {
+        return false;
     }
     switch (type) {
         case GGML_TYPE_IQ4_XS:
