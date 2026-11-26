@@ -7,7 +7,6 @@ on:
       - master
     paths: [
       '.github/workflows/build-wasm.yml',
-      '.github/patches/emdawnwebgpu-include-string.patch',
       '**/CMakeLists.txt',
       '**/.cmake',
       '**/*.h',
@@ -23,7 +22,6 @@ on:
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/build-wasm.yml',
-      '.github/patches/emdawnwebgpu-include-string.patch',
       '**/CMakeLists.txt',
       '**/.cmake',
       '**/*.h',
@@ -78,13 +76,12 @@ jobs:
 
       - name: Fetch emdawnwebgpu
         run: |
-          DAWN_TAG="v20260908.214631"
+          DAWN_TAG="v20261125.181839"
           EMDAWN_PKG="emdawnwebgpu_pkg-${DAWN_TAG}.zip"
           echo "Downloading ${EMDAWN_PKG}"
           curl -L -o emdawn.zip \
             "https://github.com/google/dawn/releases/download/${DAWN_TAG}/${EMDAWN_PKG}"
           unzip emdawn.zip
-          git apply --directory=emdawnwebgpu_pkg .github/patches/emdawnwebgpu-include-string.patch
 
       - name: ccache-buckets-restore
         uses: ./.github/actions/ccache-buckets
