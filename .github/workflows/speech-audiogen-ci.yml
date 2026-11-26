@@ -16,11 +16,13 @@ on:
     paths:
       - 'engines/speech/audiogen/**'
       - 'engines/speech/coreml/**'
+      - 'ggml/**'
       - '.github/workflows/speech-audiogen-ci.yml'
   pull_request:
     paths:
       - 'engines/speech/audiogen/**'
       - 'engines/speech/coreml/**'
+      - 'ggml/**'
       - '.github/workflows/speech-audiogen-ci.yml'
   workflow_dispatch:
 

@@ -26,6 +26,7 @@ on:
       - 'engines/speech/scripts/benchmarks/test-chatterbox-hexagon-validation.py'
       - 'engines/speech/scripts/ci/moss-gpu-e2e.py'
       - 'engines/speech/scripts/ci/test_moss_gpu_e2e.py'
+      - 'ggml/**'
       - '.github/workflows/speech-tts-ci.yml'
   pull_request:
     paths:
@@ -38,6 +39,7 @@ on:
       - 'engines/speech/scripts/benchmarks/test-chatterbox-hexagon-validation.py'
       - 'engines/speech/scripts/ci/moss-gpu-e2e.py'
       - 'engines/speech/scripts/ci/test_moss_gpu_e2e.py'
+      - 'ggml/**'
       - '.github/workflows/speech-tts-ci.yml'
   workflow_dispatch:
     inputs:

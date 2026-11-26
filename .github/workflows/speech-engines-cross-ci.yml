@@ -28,6 +28,7 @@ on:
       - 'engines/speech/ci/runners.yaml'
       - '.github/workflows/speech-reusable-runner-names.yml'
       - 'engines/speech/ci/scripts/**'
+      - 'ggml/**'
       - '.github/workflows/speech-engines-cross-ci.yml'
   pull_request:
     paths:
@@ -44,6 +45,7 @@ on:
       - 'engines/speech/ci/runners.yaml'
       - '.github/workflows/speech-reusable-runner-names.yml'
       - 'engines/speech/ci/scripts/**'
+      - 'ggml/**'
       - '.github/workflows/speech-engines-cross-ci.yml'
   workflow_dispatch:
 

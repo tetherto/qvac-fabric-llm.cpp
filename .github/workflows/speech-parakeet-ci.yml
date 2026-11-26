@@ -18,12 +18,14 @@ on:
       - 'engines/speech/parakeet/**'
       - 'engines/speech/coreml/**'
       - 'engines/speech/test/**'
+      - 'ggml/**'
       - '.github/workflows/speech-parakeet-ci.yml'
   pull_request:
     paths:
       - 'engines/speech/parakeet/**'
       - 'engines/speech/coreml/**'
       - 'engines/speech/test/**'
+      - 'ggml/**'
       - '.github/workflows/speech-parakeet-ci.yml'
   workflow_dispatch:
     inputs:
