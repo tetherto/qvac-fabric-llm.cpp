@@ -493,10 +493,6 @@ if (LLAMA_COREML_FFN)
     string(APPEND LLAMA_PC_LIBS_PRIVATE " -framework Metal")
 endif()
 
-set(LLAMA_PC_GGML_LIBS "-lggml -lggml-base")
-if (GGML_BACKEND_DL)
-    set(LLAMA_PC_GGML_LIBS "-lqvac-ggml-1 -lqvac-ggml-base-1")
-endif()
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         @ONLY)

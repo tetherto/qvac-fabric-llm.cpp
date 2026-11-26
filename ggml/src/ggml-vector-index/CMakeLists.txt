@@ -404,11 +404,6 @@ if (GGML_VECTOR_INDEX_USE_ACCELERATE_QUERY)
 endif()
 string(JOIN " " GGML_VECTOR_INDEX_PC_LIBS_PRIVATE ${GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST})
 
-set(GGML_VECTOR_INDEX_PC_LIBS "-lggml-vector-index")
-if (GGML_BACKEND_DL)
-    set(GGML_VECTOR_INDEX_PC_LIBS "-lqvac-ggml-vector-index-1 -lqvac-ggml-base-1")
-    set(GGML_VECTOR_INDEX_PC_LIBS_PRIVATE "")
-endif()
 configure_file(
     ${CMAKE_CURRENT_LIST_DIR}/../../ggml-vector-index.pc.in
     ${CMAKE_CURRENT_BINARY_DIR}/ggml-vector-index.pc

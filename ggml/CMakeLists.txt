@@ -84,10 +84,6 @@ endif()
 
 option(BUILD_SHARED_LIBS           "ggml: build shared libraries" ${BUILD_SHARED_LIBS_DEFAULT})
 option(GGML_BACKEND_DL             "ggml: build backends as dynamic libraries (requires BUILD_SHARED_LIBS)" OFF)
-# Dynamic backends share one core. Keep llama and its helpers on the parent's linkage.
-if (GGML_BACKEND_DL)
-    set(BUILD_SHARED_LIBS ON)
-endif()
 set(GGML_BACKEND_DIR "" CACHE PATH "ggml: directory to load dynamic backends from (requires GGML_BACKEND_DL")
 
 #
@@ -375,8 +371,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-webgpu.h
     include/ggml-zendnn.h
     include/ggml-openvino.h
-    include/gguf.h
-    include/uint8-buff-stream.h)
+    include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
 #if (GGML_METAL)
@@ -477,11 +472,6 @@ if (GGML_STANDALONE)
     list(REMOVE_DUPLICATES GGML_PC_LIBS_PRIVATE)
     string(REPLACE ";" " " GGML_PC_LIBS_PRIVATE "${GGML_PC_LIBS_PRIVATE}")
 
-    set(GGML_PC_CORE_LIBS "-lggml -lggml-base")
-    if (GGML_BACKEND_DL)
-        set(GGML_PC_CORE_LIBS "-lqvac-ggml-1 -lqvac-ggml-base-1")
-        set(GGML_PC_LIBS_PRIVATE "")
-    endif()
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml.pc.in
         ${CMAKE_CURRENT_BINARY_DIR}/ggml.pc
         @ONLY)
