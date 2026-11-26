@@ -1419,6 +1419,12 @@ static common_chat_params_init_fn common_chat_template_detect_params_init(const 
         return common_chat_params_init_qwen3_coder;
     }
 
+    // Inkling 1 and 2
+    if (is_inkling_template(src)) {
+        LOG_DBG("Using specialized template: Inkling\n");
+        return common_chat_params_init_inkling;
+    }
+
     return nullptr;
 }
 

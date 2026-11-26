@@ -695,6 +695,9 @@ class GGUFWriter:
     def add_vocab_size(self, size: int) -> None:
         self.add_uint32(Keys.LLM.VOCAB_SIZE.format(arch=self.arch), size)
 
+    def add_vocab_size_unpadded(self, size: int) -> None:
+        self.add_uint32(Keys.LLM.VOCAB_SIZE_UNPADDED.format(arch=self.arch), size)
+
     def add_context_length(self, length: int) -> None:
         self.add_uint32(Keys.LLM.CONTEXT_LENGTH.format(arch=self.arch), length)
 
@@ -978,6 +981,21 @@ class GGUFWriter:
     def add_hrm_prefix_lm(self, value: bool) -> None:
         self.add_bool(Keys.HRM.PREFIX_LM.format(arch=self.arch), value)
 
+    def add_loop_start(self, value: int) -> None:
+        self.add_uint32(Keys.Loop.START.format(arch=self.arch), value)
+
+    def add_loop_end(self, value: int) -> None:
+        self.add_uint32(Keys.Loop.END.format(arch=self.arch), value)
+
+    def add_loop_count(self, value: int) -> None:
+        self.add_uint32(Keys.Loop.COUNT.format(arch=self.arch), value)
+
+    def add_loop_gate_rank(self, value: int) -> None:
+        self.add_uint32(Keys.Loop.GATE_RANK.format(arch=self.arch), value)
+
+    def add_loop_varying(self, value: bool) -> None:
+        self.add_bool(Keys.Loop.VARYING.format(arch=self.arch), value)
+
     def add_adapter_count(self, count: int) -> None:
         self.add_uint32(Keys.Adapters.COUNT.format(arch=self.arch), count)
 
@@ -1171,6 +1189,24 @@ class GGUFWriter:
 
     def add_xsa_eps(self, value: float) -> None:
         self.add_float32(Keys.Attention.XSA_EPS.format(arch=self.arch), value)
+
+    def add_relative_length(self, length: int) -> None:
+        self.add_uint32(Keys.Attention.RELATIVE_LENGTH.format(arch=self.arch), length)
+
+    def add_relative_extent(self, extent: int) -> None:
+        self.add_uint32(Keys.Attention.RELATIVE_EXTENT.format(arch=self.arch), extent)
+
+    def add_qk_clip(self, value: float) -> None:
+        self.add_float32(Keys.Attention.QK_CLIP.format(arch=self.arch), value)
+
+    def add_relative_clip(self, value: float) -> None:
+        self.add_float32(Keys.Attention.RELATIVE_CLIP.format(arch=self.arch), value)
+
+    def add_log_scale_floor(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.LOG_SCALE_FLOOR.format(arch=self.arch), value)
+
+    def add_log_scale_alpha(self, value: float) -> None:
+        self.add_float32(Keys.Attention.LOG_SCALE_ALPHA.format(arch=self.arch), value)
 
     def add_attn_output_scale(self, value: float) -> None:
         self.add_float32(Keys.Attention.OUTPUT_SCALE.format(arch=self.arch), value)

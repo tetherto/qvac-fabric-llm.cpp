@@ -437,10 +437,14 @@ private:
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
 
+        // the experts of each weight copy uploaded so far in this graph compute
+        std::map<const ggml_tensor *, std::vector<bool>> uploaded;
+
         void reset() {
             ids = nullptr;
             ids_data.clear();
             used.clear();
+            uploaded.clear();
         }
     };
 

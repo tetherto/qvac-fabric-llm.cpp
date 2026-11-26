@@ -5,6 +5,8 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts); // mmq.cuh
+
 #include <cstdint>
 #include <type_traits>
 #include <utility>
@@ -394,6 +396,22 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
         }
     }
     return MMVQ_MAX_BATCH_SIZE;
+}
+
+int ggml_cuda_mmid_mmvq_max_batch(const ggml_tensor * src0, const ggml_tensor * ids, int cc) {
+    const int max_batch = get_mmvq_mmid_max_batch(src0->type, cc);
+    if (cc != GGML_CUDA_CC_DGX_SPARK || ids == nullptr || !ggml_cuda_should_use_mmq(src0->type, cc, max_batch, src0->ne[2])) {
+        return max_batch;
+    }
+    // MMVQ reads an expert once for every token that picks it, MMQ groups the tokens by expert and reads it once.
+    // With n tokens picking n_used of n_expert experts each, the shared reads pay for the grouping one token after
+    // n*n_used reaches n_expert/6, and never at 2 tokens: MMQ from 4 tokens with 128 experts and top 8 (Inkling 2,
+    // Qwen3-30B-A3B), from 3 with 32 experts and top 4 (gpt-oss-20b) or 8 experts and top 2 (Mixtral), MMVQ up to
+    // 8 tokens as before with 512 experts and top 10 (Qwen3.8-Flash-Next).
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_expert = src0->ne[2];
+    const int64_t n_min    = (n_expert + 6*n_used - 1) / (6*n_used);
+    return (int) std::min<int64_t>(max_batch, std::max<int64_t>(2, n_min));
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {

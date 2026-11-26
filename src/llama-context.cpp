@@ -2972,7 +2972,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_01 ||
         model.arch == LLM_ARCH_MINIMAX_M3 ||
-        model.arch == LLM_ARCH_HY_V4) {
+        model.arch == LLM_ARCH_HY_V4 ||
+        model.arch == LLM_ARCH_INKLING2) {
         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,
@@ -3294,16 +3295,22 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids = ids;
     }
 
+    // a weight shared by several MUL_MAT_IDs (layers that share their experts) is copied again by each split that reads
+    // it, see ggml_backend_sched_split_graph; the experts that an earlier split of this compute uploaded are still there
+    std::vector<bool> & uploaded = st.uploaded[dst];
+    uploaded.resize(n_expert, false);
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
-        if (!st.used[first]) {
+        if (!st.used[first] || uploaded[first]) {
             first++;
             continue;
         }
         int64_t last = first;
-        while (last + 1 < n_expert && st.used[last + 1]) {
+        while (last + 1 < n_expert && st.used[last + 1] && !uploaded[last + 1]) {
             last++;
         }
+        std::fill(uploaded.begin() + first, uploaded.begin() + last + 1, true);
 
         // the experts in the MoE cache are copied from device memory, the others are uploaded
         int64_t next = first;

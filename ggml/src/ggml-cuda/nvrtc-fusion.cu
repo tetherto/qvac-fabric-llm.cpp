@@ -1,4 +1,5 @@
 #include "nvrtc-fusion.cuh"
+#include "l2-clip.cuh"
 
 #ifdef GGML_CUDA_NVRTC_FUSION
 
@@ -259,6 +260,16 @@ struct nf_graph {
         for (int i = 0; i < n; ++i) {
             idx[node(i)] = i;
             kind[i] = nf_classify(node(i));
+        }
+        // leave row L2 clip chains to their own kernel (ggml_cuda_try_fuse), one launch for the whole chain
+        for (int i = 0; i < n; ++i) {
+            ggml_cuda_l2_clip_match m;
+            if (ggml_cuda_match_l2_clip(g, i, m)) {
+                for (int k = 0; k < m.n_nodes; ++k) {
+                    kind[i + k] = NF_NONE;
+                }
+                i += m.n_nodes - 1;
+            }
         }
         for (int i = 0; i < n; ++i) {
             const ggml_tensor * t = node(i);
