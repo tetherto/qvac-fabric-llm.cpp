@@ -55,6 +55,16 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// true when the chain for these params returns the most likely token: no logit bias, a greedy last sampler, and the
+// other samplers keep the most likely token (with ties, the token is one of the tied tokens)
+bool common_sampler_params_is_argmax(const common_params_sampling & params);
+
+// as above, and no grammar, no reasoning budget and no model suppress tokens: the backend argmax gives the same token
+bool common_sampler_is_argmax(const struct common_sampler * gsmpl, const struct llama_vocab * vocab);
+
+// backend sampler chain that picks the most likely token, all chains from it have the same backend graph
+struct llama_sampler * common_sampler_init_argmax_backend();
+
 // extended sampling implementation:
 //
 // - set logits

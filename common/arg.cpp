@@ -1424,6 +1424,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         params.sampling.temp = 0.2; // lower temp by default for better quality
     } else if (ex == LLAMA_EXAMPLE_SERVER) {
         params.n_parallel = -1;     // auto by default
+        params.sampling.backend_sampling_auto = true;
     } else if (ex == LLAMA_EXAMPLE_TOKENIZE) {
         params.parse_special = true; // parse special tokens by default, like the old tokenize tool
     } else if (ex == LLAMA_EXAMPLE_TTS) {
@@ -2333,6 +2334,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.backend_sampling = true;
         }
     ).set_sampling().set_env("LLAMA_ARG_BACKEND_SAMPLING"));
+    add_opt(common_arg(
+        {"--backend-sampling-auto"},
+        {"--no-backend-sampling-auto"},
+        string_format("sample greedy requests on the backend when this picks the same token as the CPU samplers (default: %s)", params.sampling.backend_sampling_auto ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.sampling.backend_sampling_auto = value;
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",

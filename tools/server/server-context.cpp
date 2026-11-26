@@ -396,6 +396,9 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
+    // argmax chain of automatic backend sampling (owned by common_init_result), paused while unused
+    llama_sampler * smpl_argmax = nullptr;
+
     llama_token sampled; // in speculative mode, this is the last accepted token
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
@@ -456,7 +459,7 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        reset_backend_sampler();
 
         // clear alora start
         alora_invocation_start = -1;
@@ -566,6 +569,16 @@ struct server_slot {
 
     bool can_speculate() const {
         return !!spec;
+    }
+
+    // back to the paused argmax chain, or no backend sampler without automatic backend sampling
+    void reset_backend_sampler() {
+        llama_set_sampler(ctx_tgt, id, smpl_argmax);
+        llama_set_sampler_active(ctx_tgt, id, false);
+    }
+
+    bool resume_backend_argmax() {
+        return smpl_argmax && llama_set_sampler(ctx_tgt, id, smpl_argmax) && llama_set_sampler_active(ctx_tgt, id, true);
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
@@ -1229,6 +1242,12 @@ private:
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
+        // the automatic backend sampling reserve holds one chain per slot with one output each
+        const bool is_embedding = params_base.embedding ||
+            (params_base.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params_base.pooling_type != LLAMA_POOLING_TYPE_NONE);
+        params_base.sampling.backend_sampling_auto = params_base.sampling.backend_sampling_auto && !has_spec &&
+            output_limits.per_seq == 1 && !is_embedding && params_base.coreml_model.empty();
+
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
             if (has_spec) {
@@ -1535,6 +1554,7 @@ private:
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
+            slot.smpl_argmax = llama_init->sampler_argmax(i);
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
@@ -1962,6 +1982,14 @@ private:
         return output;
     }
 
+    // the backend argmax picks the token of the CPU samplers, see common_sampler_is_argmax
+    bool can_sample_argmax_on_backend(const server_slot & slot, const server_task & task) const {
+        const bool is_text = task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL;
+
+        return slot.smpl_argmax && task.params.sampling.backend_sampling_auto && is_text && !slot.can_speculate() &&
+            common_sampler_is_argmax(slot.smpl.get(), vocab);
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         if (spec_n_auto.ready()) {
             spec_n_auto.reset_seq(slot.id);
@@ -2091,10 +2119,14 @@ private:
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
 
             // TODO: tmp until backend sampling is fully implemented
-            if (use_backend_sampling) {
+            // a greedy request, backend sampling asked or not, takes the argmax chain: no new chain, no reserve
+            if (can_sample_argmax_on_backend(slot, task)) {
+                task.params.sampling.backend_sampling = slot.resume_backend_argmax();
+            } else if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
-                llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                slot.reset_backend_sampler();
+                task.params.sampling.backend_sampling = false;
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());

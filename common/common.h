@@ -300,6 +300,7 @@ struct common_params_sampling {
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
+    bool backend_sampling_auto = false; // sample greedy requests on the backend when the result is the same
 
     // print the parameters into a string
     std::string print() const;
@@ -1045,6 +1046,9 @@ struct common_init_result {
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();
+
+    // the paused argmax chain of automatic backend sampling, nullptr when it is off
+    llama_sampler * sampler_argmax(llama_seq_id seq_id);
 
     std::vector<llama_adapter_lora_ptr> & lora();
 

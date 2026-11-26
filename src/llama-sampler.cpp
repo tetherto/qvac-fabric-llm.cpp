@@ -737,9 +737,18 @@ static bool llama_sampler_chain_backend_init(
         uint32_t                     n_outputs_max_per_seq) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
-    GGML_ASSERT(chain->is_init == false && "llama_sampler_chain_backend_init() called twice");
+    if (chain->is_init) {
+        GGML_ASSERT(chain->init_buft == buft && chain->init_n_outputs_max_per_seq == n_outputs_max_per_seq &&
+                "llama_sampler_chain_backend_init() called again with other arguments");
+        GGML_ASSERT(chain->init_n_edits == chain->n_edits &&
+                "llama_sampler_chain_backend_init() called again after samplers were added or removed");
+        return chain->init_res;
+    }
 
     chain->is_init = true;
+    chain->init_buft = buft;
+    chain->init_n_outputs_max_per_seq = n_outputs_max_per_seq;
+    chain->init_n_edits = chain->n_edits;
 
     bool res = true;
     bool backend_prefix = true;
@@ -767,6 +776,7 @@ static bool llama_sampler_chain_backend_init(
 
     auto probe = llama_sampler_backend_probe_graph(smpl, 128*1024, GGML_DEFAULT_GRAPH_SIZE, false);
     chain->n_nodes = llama_sampler_backend_probe_n_nodes(probe);
+    chain->init_res = res;
 
     return res;
 }
@@ -846,7 +856,7 @@ static void llama_sampler_chain_copy_state(const struct llama_sampler * src, str
         llama_sampler_copy(src_chain->samplers[i].ptr, dst_chain->samplers[i].ptr);
     }
 
-    // note: is_init, n_nodes and is_backend belong to the current sampling graph
+    // note: is_init, the init arguments, n_nodes and is_backend belong to the current sampling graph
     dst_chain->params      = src_chain->params;
     dst_chain->cur         = src_chain->cur;
     dst_chain->t_sample_us = src_chain->t_sample_us;
@@ -874,6 +884,11 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
         /* .ctx   = */ new llama_sampler_chain {
             /* .params               = */ params,
             /* .is_init              = */ false,
+            /* .init_buft            = */ nullptr,
+            /* .init_n_outputs_max_per_seq = */ 0,
+            /* .init_n_edits         = */ 0,
+            /* .init_res             = */ false,
+            /* .n_edits              = */ 0,
             /* .n_nodes              = */ 0,
             /* .samplers             = */ {},
             /* .cur                  = */ {},
@@ -970,6 +985,7 @@ void llama_sampler_chain_add(struct llama_sampler * chain, struct llama_sampler 
         /* .is_backend = */ false,
         /* .ptr        = */ smpl,
     });
+    p->n_edits++;
 }
 
 struct llama_sampler * llama_sampler_chain_get(struct llama_sampler * chain, int32_t i) {
@@ -1003,6 +1019,7 @@ struct llama_sampler * llama_sampler_chain_remove(struct llama_sampler * chain, 
 
     auto * result = p->samplers[i].ptr;
     p->samplers.erase(p->samplers.begin() + i);
+    p->n_edits++;
 
     return result;
 }
