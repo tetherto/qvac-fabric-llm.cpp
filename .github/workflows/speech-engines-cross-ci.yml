@@ -107,6 +107,7 @@ jobs:
     defaults:
       run:
         shell: bash
+        working-directory: engines/speech
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
