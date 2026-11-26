@@ -1281,8 +1281,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n_block_max = is_lilicorr || has_markov_context ? block_size :
                     this->params.n_max + (is_dspark && sample_from_anchor ? 0 : 1);
             if (n_block_max > n_decode_max) {
+                // the draft inherits the logical batch (-b / --batch-size); only the physical batch has a draft option
+                const char * fix = causal_attn ? "the logical batch; raise -b / --batch-size" :
+                        "one physical batch of the draft; raise --spec-draft-n-ubatch, and -b / --batch-size if it is smaller";
                 throw std::runtime_error(string_format("the draft decodes blocks of %d tokens, which do not fit "
-                        "--spec-draft-n-ubatch / --spec-draft-n-batch (%d)", n_block_max, n_decode_max));
+                        "%s (%d tokens)", n_block_max, fix, n_decode_max));
             }
         }
 
