@@ -3064,7 +3064,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kq_b_idx) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -3081,10 +3082,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // an indexed bias (kq_b_idx) exists for flash attention only, a dense kq_b for the other path only
+    const bool use_flash_attn = cparams.flash_attn && (kq_b == nullptr || kq_b_idx != nullptr);
     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);
+    GGML_ASSERT(use_flash_attn || kq_b_idx == nullptr);
     if (use_flash_attn) {
-        GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
+        GGML_ASSERT((kq_b == nullptr || kq_b_idx != nullptr) && "Flash attention does not support a dense KQ bias");
 
         if (v_trans) {
             v = ggml_transpose(ctx0, v);
@@ -3109,6 +3112,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        if (kq_b_idx) {
+            ggml_flash_attn_ext_add_indexed_bias(cur, kq_b, kq_b_idx);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN_IDX_BIAS, cur, il});
+        }
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
@@ -3683,7 +3690,8 @@ static ggml_tensor * build_attn_iswa_impl(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) {
+            int       il,
+        ggml_tensor * kq_b_idx = nullptr) {
     ggml_context * ctx0 = gctx.ctx0;
     ggml_cgraph  * gf   = gctx.gf;
 
@@ -3756,9 +3764,13 @@ static ggml_tensor * build_attn_iswa_impl(
                 k->ne[2], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
                 kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], 0);
         kq_mask = ggml_cont(ctx0, kq_mask);
+        // the indices of an indexed bias follow the mask columns
+        if (kq_b_idx) {
+            kq_b_idx = ggml_cont(ctx0, ggml_view_2d(ctx0, kq_b_idx, k->ne[2], kq_b_idx->ne[1], kq_b_idx->nb[1], 0));
+        }
     }
 
-    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il, kq_b_idx);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     gctx.cb(cur, "kqv_out", il);
 
@@ -4450,7 +4462,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * q_cur,
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
-        ggml_tensor * kq_b,
+        ggml_tensor * table,
         ggml_tensor * sinks,
             float     kq_scale,
             int       il) const {
@@ -4463,6 +4475,23 @@ ggml_tensor * llm_graph_context::build_attn(
     // TODO: support kv_rows - fill the distances over the kv_rows cell lists and pass the rows to build_attn_mha,
     //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
     GGML_ASSERT(attn_mask.rows == nullptr);
+
+    ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+
+    // flash attention adds the bias by index: no mask per head
+    if (cparams.flash_attn && cparams.fused_fa_idx_bias) {
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, table, attn_mask.raw, nullptr, sinks, nullptr, kq_scale, il, rel_pos);
+    }
+
+    // gather the bias by distance: [n_kv, n_tokens/n_stream, n_head, n_stream]
+    const int64_t n_head   = table->ne[1];
+    const int64_t n_stream = attn_mask.raw->ne[3];
+    const int64_t n_kv     = rel_pos->ne[0];
+
+    ggml_tensor * kq_b = ggml_get_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3)), rel_pos);
+    kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+    kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+    cb(kq_b, "kq_b", il);
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;
