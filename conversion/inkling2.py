@@ -532,6 +532,7 @@ class Inkling2DFlashModel(DFlashModel):
     def set_vocab(self):
         # the target's tokenizer over its unpadded vocabulary, as in the Inkling 2 GGUFs
         dir_model, hparams = self.dir_model, self.hparams
+        assert self.target_model_dir is not None
         self.dir_model, self.hparams = self.target_model_dir, self.target_hparams
         try:
             Inkling2Model.set_vocab(self)  # ty: ignore[invalid-argument-type]
