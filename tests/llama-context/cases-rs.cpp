@@ -904,12 +904,21 @@ struct case_rollback_graph_reuse : ctx_test {
         constexpr llama_pos n_keep    = 2; // tokens of the last step kept by the rollback
         constexpr double    nmse_eps  = 1e-4; // the reference splits the history into other ubatches
 
+        // with the deferred gdn commit the moved range only looks at plane 0, where the rolled back seq keeps its own
+        // cell, so the rollback leaves the range empty and the graph is reused
+        const bool in_place = arch_reads_states_in_place(mr.model) && !gdn_deferred_requested(mr.model);
+
+        // a graph that reads the states in place is rebuilt after the rollback for a non-empty moved range, which the
+        // reservation (made with an empty range) does not cover: the scheduler grows its buffers there, by an amount
+        // that depends on the backend (CUDA, Metal and Vulkan, not the CPU), so only those contexts skip the realloc
+        // check. the reused graphs keep it
         const auto make_ctx = [&]() {
             ctx_opts opts;
-            opts.n_batch   = (uint32_t) n_prefill;
-            opts.n_ubatch  = (uint32_t) n_prefill;
-            opts.n_seq_max = 1;
-            opts.n_rs_seq  = 8;
+            opts.n_batch       = (uint32_t) n_prefill;
+            opts.n_ubatch      = (uint32_t) n_prefill;
+            opts.n_seq_max     = 1;
+            opts.n_rs_seq      = 8;
+            opts.realloc_check = !in_place;
             return mr.ctx(opts);
         };
 
@@ -958,10 +967,7 @@ struct case_rollback_graph_reuse : ctx_test {
         const float * logits_ref = llama_get_logits_ith(ctx_ref.get(), -1);
         CTX_REQUIRE(logits != nullptr && logits_ref != nullptr, "missing logits");
 
-        // with the deferred gdn commit the moved range only looks at plane 0, where the rolled back seq keeps its own
-        // cell, so the rollback leaves the range empty and the graph is reused
         const logits_diff diff = compare_logits(logits_ref, logits, n_vocab);
-        const bool in_place = arch_reads_states_in_place(mr.model) && !gdn_deferred_requested(mr.model);
         TLOG_INF("%s: in place %d, graph reused %d, nmse %g\n", __func__, in_place, reused, diff.nmse());
 
         CTX_REQUIRE(diff.nmse() <= nmse_eps,
