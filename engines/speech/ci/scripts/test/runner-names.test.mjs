@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import {
   REUSABLE_WORKFLOW,
   RUNNERS_YAML,
+  SCRIPTS_DIR,
   assertReusableMatchesCatalog,
   findHardcodedLabelViolations,
   findMissingRunnerNamesNeeds,
@@ -99,7 +100,7 @@ test('detector flags a quoted catalog label used as a value in an expression', (
 })
 
 test('validate-runner-names.mjs exits 0', () => {
-  const result = spawnSync(process.execPath, [join(repoRoot, '.github/scripts/validate-runner-names.mjs')], {
+  const result = spawnSync(process.execPath, [join(repoRoot, SCRIPTS_DIR, 'validate-runner-names.mjs')], {
     encoding: 'utf8',
     cwd: repoRoot,
   })
@@ -107,6 +108,6 @@ test('validate-runner-names.mjs exits 0', () => {
 })
 
 test('catalog path constant points at a tracked file', () => {
-  assert.equal(RUNNERS_YAML, '.github/runners.yaml')
+  assert.equal(RUNNERS_YAML, 'engines/speech/ci/runners.yaml')
   assert.match(readRepoFile(RUNNERS_YAML), /qvac-macos26-arm64-gpu/)
 })

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Regenerate .github/workflows/reusable-runner-names.yml from .github/runners.yaml.
+ * Regenerate .github/workflows/speech-reusable-runner-names.yml from engines/speech/ci/runners.yaml.
  *
  * After editing the catalog:
- *   node .github/scripts/sync-runner-names.mjs
- *   node --test .github/scripts/test/runner-names.test.mjs
+ *   node engines/speech/ci/scripts/sync-runner-names.mjs
+ *   node --test engines/speech/ci/scripts/test/runner-names.test.mjs
  */
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
