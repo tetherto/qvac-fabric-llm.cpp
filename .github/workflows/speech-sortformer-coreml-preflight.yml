@@ -1,0 +1,114 @@
+name: Sortformer Core ML preflight
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/speech-sortformer-coreml-preflight.yml'
+      - 'engines/speech/scripts/benchmarks/*'
+      - 'engines/speech/parakeet/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sortformer-coreml-preflight-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: engines/speech
+
+jobs:
+  authorize:
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+    permissions: {}
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test scoring and preflight guards
+        run: |
+          bash scripts/benchmarks/test-run-family.sh
+          python3 scripts/benchmarks/test-sortformer-preflight.py
+
+  reproduce:
+    needs: [authorize, scripts]
+    if: >-
+      needs.authorize.outputs.allowed == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: qvac-macos26-arm64-gpu
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize isolated paths
+        run: |
+          preflight_root="$RUNNER_TEMP/sortformer-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$preflight_root/assets" "$preflight_root/results"
+          echo "PREFLIGHT_ROOT=$preflight_root" >> "$GITHUB_ENV"
+          git rev-parse HEAD > "$preflight_root/results/speech-revision.txt"
+          sw_vers > "$preflight_root/results/host.txt"
+          uname -srm >> "$preflight_root/results/host.txt"
+          sysctl hw.model hw.memsize >> "$preflight_root/results/host.txt"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+          python-version: '3.11'
+      - name: Prepare export environment
+        run: |
+          uv venv --python 3.11 "$PREFLIGHT_ROOT/python"
+          uv pip install --python "$PREFLIGHT_ROOT/python/bin/python" \
+            torch==2.7.0 numpy==2.2.6 gguf==0.19.0 coremltools==9.0 \
+            PyYAML==6.0.3 sentencepiece==0.2.0
+          uv pip freeze --python "$PREFLIGHT_ROOT/python/bin/python" > "$PREFLIGHT_ROOT/results/python-packages.txt"
+      - name: Convert pinned NVIDIA checkpoint
+        run: |
+          set -euo pipefail
+          "$PREFLIGHT_ROOT/python/bin/python" scripts/benchmarks/prepare-sortformer-preflight.py \
+            --root "$PREFLIGHT_ROOT" 2>&1 | tee "$PREFLIGHT_ROOT/results/conversion.log"
+      - name: Export full diarizer from the same GGUF
+        run: |
+          set -euo pipefail
+          "$PREFLIGHT_ROOT/python/bin/python" parakeet/scripts/export-sortformer-diarizer-coreml.py \
+            --gguf "$PREFLIGHT_ROOT/assets/diar_streaming_sortformer_4spk-v2.1.q8_0.gguf" \
+            --frames 2048 --precision fp16 --out-dir "$PREFLIGHT_ROOT" \
+            --compile-dir "$PREFLIGHT_ROOT/assets" 2>&1 | tee "$PREFLIGHT_ROOT/results/export.log"
+      - name: Build Metal and Core ML engine
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD:ggml > "$PREFLIGHT_ROOT/results/ggml-revision.txt"
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B "$PREFLIGHT_ROOT/ggml-build" \
+            -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX="$PREFLIGHT_ROOT/ggml-install"
+          cmake --build "$PREFLIGHT_ROOT/ggml-build" --target install -j4
+          cmake -S parakeet -B "$PREFLIGHT_ROOT/build" \
+            -DCMAKE_BUILD_TYPE=Release -DPARAKEET_USE_SYSTEM_GGML=ON -DPARAKEET_COREML=ON \
+            -DPARAKEET_BUILD_TESTS=ON -DPARAKEET_BUILD_EXAMPLES=OFF -DPARAKEET_BUILD_EXECUTABLES=ON \
+            -DCMAKE_PREFIX_PATH="$PREFLIGHT_ROOT/ggml-install"
+          cmake --build "$PREFLIGHT_ROOT/build" --target sortformer-preflight -j4
+      - name: Compare two complete calls per backend
+        run: |
+          "$PREFLIGHT_ROOT/python/bin/python" scripts/benchmarks/sortformer-preflight.py \
+            --binary "$PREFLIGHT_ROOT/build/sortformer-preflight" --assets "$PREFLIGHT_ROOT/assets" \
+            --samples "$PWD/parakeet/test/samples" --out "$PREFLIGHT_ROOT/results"
+      - name: Publish quality summary
+        if: always()
+        run: |
+          if [[ -f "$PREFLIGHT_ROOT/results/summary.json" ]]; then
+            cat "$PREFLIGHT_ROOT/results/summary.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sortformer-coreml-preflight-${{ github.run_attempt }}
+          path: ${{ env.PREFLIGHT_ROOT }}/results
+          if-no-files-found: error
+      - name: Remove isolated assets and build
+        if: always()
+        run: |
+          if [[ -n "${PREFLIGHT_ROOT:-}" && "$PREFLIGHT_ROOT" == "$RUNNER_TEMP"/sortformer-* ]]; then
+            rm -rf -- "$PREFLIGHT_ROOT"
+          fi

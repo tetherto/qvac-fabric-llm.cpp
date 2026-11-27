@@ -1,6 +1,7 @@
 #include "moss/transcribe_fit.h"
 #include "fit_util.h"
 #include "moss/transcribe_audio.h"
+#include "moss/transcribe_coreml.h"
 #include "moss/transcribe_networks.h"
 #include "moss/transcribe_request.h"
 #include "parakeet/moss_transcribe_fit.h"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <limits>
 #include <sstream>
 
@@ -20,6 +22,16 @@ using fitutil::sat_mul;
 constexpr uint64_t VECTOR_CAPACITY_FACTOR = 2;
 constexpr uint64_t TRANSCRIPT_COPIES = 4;
 constexpr int MAX_THREADS = 1024;
+
+bool uses_coreml(const TranscribeOptions & options) {
+#ifdef PARAKEET_USE_COREML
+    return !detail::read_coreml_policy().disabled &&
+        std::filesystem::is_directory(detail::transcribe_encoder_sidecar_path(options.model_path));
+#else
+    (void) options;
+    return false;
+#endif
+}
 
 struct Workload {
     size_t samples;
@@ -196,6 +208,11 @@ FitResult fit_params(const TranscribeOptions & options, const TranscribeRequest 
         } catch (const std::runtime_error & error) {
             result.reason = "invalid-arguments";
             result.report = error.what();
+            return result;
+        }
+        if (uses_coreml(options)) {
+            result.reason = "coreml-memory-estimate-unavailable";
+            result.report = "Core ML encoder memory cannot be projected by the ggml fit estimator.\n";
             return result;
         }
         result = model.measure_weights();

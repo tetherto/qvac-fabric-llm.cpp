@@ -272,12 +272,11 @@ bool compute_speech_tokens_native(const std::string & wav_path,
     // prompt_token: first 10 s of the reference → up to 250 tokens (S3Gen side).
     const int dec_cond_samples = 10 * 16000;
     std::vector<float> prompt_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), dec_cond_samples));
-    if (!s3tokv2_tokenize(prompt_wav, w, /*max_tokens=*/-1, out_prompt_tokens, n_threads, backend)) return false;
-
     // cond_prompt_speech_tokens: first 15 s → up to max_cond_tokens (T3 side).
     const int enc_cond_samples = 15 * 16000;
     std::vector<float> cond_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), enc_cond_samples));
-    if (!s3tokv2_tokenize(cond_wav, w, max_cond_tokens, out_cond_tokens, n_threads, backend)) return false;
+    if (!s3tokv2_tokenize_pair(prompt_wav, cond_wav, w, max_cond_tokens,
+                               out_prompt_tokens, out_cond_tokens, n_threads, backend)) return false;
 
     if (verbose) fprintf(stderr, "voice: prompt_token=(%zu,) cond_prompt_speech_tokens=(%zu,) via S3TokenizerV2\n",
             out_prompt_tokens.size(), out_cond_tokens.size());

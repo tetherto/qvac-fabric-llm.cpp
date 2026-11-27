@@ -39,10 +39,12 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "gguf.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -256,6 +258,27 @@ int main(int argc, char ** argv) {
             } else {
                 expect_eq(sm.weights_bytes, hooks::s3gen_cached_weights_bytes(),
                           "S3Gen weights parity");
+                gguf_init_params gguf_params = { /*no_alloc=*/true, /*ctx=*/nullptr };
+                gguf_context * gguf = gguf_init_from_file(s3gen_path.c_str(), gguf_params);
+                if (!gguf) {
+                    fail("failed to read S3Gen tensor metadata");
+                } else {
+                    uint64_t packed_bytes = 0;
+                    uint64_t conditioning_bytes = 0;
+                    for (int64_t i = 0; i < gguf_get_n_tensors(gguf); ++i) {
+                        const char * name = gguf_get_tensor_name(gguf, i);
+                        const uint64_t bytes = gguf_get_tensor_size(gguf, i);
+                        packed_bytes += bytes;
+                        if (std::strncmp(name, "s3tokv2/", 8) == 0 ||
+                            std::strncmp(name, "campplus/", 9) == 0) {
+                            conditioning_bytes += bytes;
+                        }
+                    }
+                    expect(conditioning_bytes > 0 &&
+                           sm.weights_bytes < packed_bytes - conditioning_bytes / 2,
+                           "S3Gen must not retain the reference encoder weights");
+                    gguf_free(gguf);
+                }
                 expect_eq(sm.encoder_bytes, hooks::encoder_graph_cache_buffer_bytes(),
                           "S3Gen encoder arena parity");
                 expect_eq(sm.cfm_bytes, hooks::cfm_estimator_cache_buffer_bytes(),

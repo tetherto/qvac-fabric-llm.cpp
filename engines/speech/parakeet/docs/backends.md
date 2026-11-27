@@ -946,7 +946,7 @@ passes on the same host:
 | Host | Runs | Peak increment | Largest prepare | Largest load and warm | Largest resident step | Steady growth | `ANECompilerService` growth |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | M2, macOS 27.2.1 | 18 | 64.7-138.0 MiB | 64.8-86.1 MiB | 12.7-96.7 MiB | 6.6-108.8 MiB | 30.6-138.0 MiB | 280.0-557.1 MiB |
-| M4 Max, macOS 26.7.2 | 16 | 63.0-79.4 MiB | 63.6-84.4 MiB | 14.9-26.7 MiB | 5.9-29.9 MiB | 32.4-46.6 MiB | 279.9-628.2 MiB |
+| M4 Max, macOS 26.7.2 | 18 | 63.0-116.2 MiB | 63.6-88.3 MiB | 14.9-26.7 MiB | 5.9-33.1 MiB | 32.4-65.5 MiB | 279.9-628.2 MiB |
 
 The ranges are over runs, each run's largest value. Steady growth comes from
 the runs that recorded the settled footprint (14 on the M2, 10 on the M4 Max).
@@ -960,7 +960,7 @@ on both hosts, rounded up to 1 MiB (`memory.measured` in `template.json`):
 
 | Constant | Largest measured | Recorded |
 |---|---:|---:|
-| prepare: `generation_peak_bytes` (9 MiB) + 8 MiB + `compile_peak_bytes` | 86.1 MiB (M2) | 108 MiB |
+| prepare: `generation_peak_bytes` (9 MiB) + 8 MiB + `compile_peak_bytes` | 88.3 MiB (M4 Max) | 111 MiB |
 | `load_peak_bytes.cpu_and_ane` | 96.7 MiB (M2) | 121 MiB |
 | resident part per capacity: `runtime_weight_bytes` + 2 x I/O (`workspace_bytes` 0) | 108.8 MiB (M2) | 137 MiB |
 | `ane_compile_reserve_bytes` | 628.2 MiB (M4 Max) | 786 MiB |
@@ -1001,19 +1001,23 @@ ggml-only run of the same passes:
 | Host | Runs | Peak increment | Prepare | Load and warm | Resident step | `ANECompilerService` growth |
 |---|---:|---:|---:|---:|---:|---:|
 | M2, macOS 27.2.1 | 22 | 62.5-108.9 MiB | 72.8-82.5 MiB | 36.5-90.3 MiB | 0.0-108.9 MiB | 252.1-674.2 MiB |
-| M4 Max, macOS 26.7.2 | 10 | 55.8-72.8 MiB | 80.9-96.3 MiB | 35.8-51.2 MiB | 39.2-61.0 MiB | 120.0-460.4 MiB |
+| M4 Max, macOS 26.7.2 | 12 | 55.8-73.3 MiB | 80.9-97.3 MiB | 35.8-51.2 MiB | 39.2-61.0 MiB | 120.0-460.4 MiB |
 
-Each constant is 1.25 times the largest value over the 32 runs, rounded up
+Each constant is 1.25 times the largest value over the 34 runs, rounded up
 to 1 MiB:
 
 | Constant | Largest measured | Recorded |
 |---|---:|---:|
-| prepare: `generation_peak_bytes` (8 MiB) + 8 MiB + `compile_peak_bytes` | 96.3 MiB (M4 Max) | 121 MiB |
+| prepare: `generation_peak_bytes` (8 MiB) + 8 MiB + `compile_peak_bytes` | 97.3 MiB (M4 Max) | 122 MiB |
 | `load_peak_bytes.cpu_and_ane` | 90.3 MiB (M2) | 113 MiB |
 | resident part: `runtime_weight_bytes` + 2 x I/O (`workspace_bytes` 0) | 108.9 MiB (M2) | 137 MiB |
 | `ane_compile_reserve_bytes` | 674.2 MiB (M2) | 843 MiB |
 
-Fit charges the capacity 137 + 121 = 258 MiB, against a largest measured
+The two [2026-11-25 CI runs](https://github.com/tetherto/qvac-fabric-speech.cpp/actions/runs/45614667211)
+raised the largest preparation increment to 101,990,880 bytes. Its 1.25 margin
+requires 122 MiB after rounding; the checker and its safety margin are unchanged.
+
+Fit charges the capacity 137 + 122 = 259 MiB, against a largest measured
 peak increment of 108.9 MiB. As with Nemotron, the M2 sometimes keeps most of
 a load resident: in 3 of 22 runs the load grew the footprint by 83-90 MiB and
 the step to the settled footprint was 104-109 MiB; the M4 Max never did. The

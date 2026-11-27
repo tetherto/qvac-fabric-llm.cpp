@@ -6,6 +6,7 @@
 #include "mel_preprocess.h"
 
 #include <cmath>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -44,12 +45,40 @@ std::vector<float> make_synthetic_filterbank(int n_mels, int n_bins) {
     return fb;
 }
 
-parakeet::MelConfig make_config(int n_threads) {
+parakeet::MelConfig make_config(int n_threads, int n_fft = 512) {
     parakeet::MelConfig cfg;
+    cfg.n_fft = n_fft;
+    cfg.win_length = n_fft * 25 / 32;
     cfg.filterbank = make_synthetic_filterbank(cfg.n_mels, cfg.n_fft / 2 + 1);
     cfg.window     = make_hann_window(cfg.win_length);
     cfg.n_threads  = n_threads;
     return cfg;
+}
+
+bool mel_repeated_worker_lifetimes() {
+    constexpr std::array<int, 3> fft_sizes = {256, 512, 1024};
+    constexpr int repetitions = 12;
+    constexpr int worker_count = 7;
+    constexpr int sample_count = 16000;
+    const auto signal = make_signal(sample_count);
+    for (const int fft_size : fft_sizes) {
+        std::vector<float> expected;
+        int expected_frames = 0;
+        if (parakeet::compute_log_mel(signal.data(), sample_count, make_config(1, fft_size),
+                                      expected, expected_frames) != 0) return false;
+        for (int iteration = 0; iteration < repetitions; ++iteration) {
+            std::vector<float> actual;
+            int actual_frames = 0;
+            if (parakeet::compute_log_mel(signal.data(), sample_count, make_config(worker_count, fft_size),
+                                          actual, actual_frames) != 0 ||
+                actual_frames != expected_frames || actual != expected) {
+                std::fprintf(stderr, "[mel-threads] repeated worker result changed for FFT size %d\n", fft_size);
+                return false;
+            }
+        }
+    }
+    std::printf("[mel-threads] repeated mixed-size FFT workers preserve serial results\n");
+    return true;
 }
 
 bool mel_equal_across_threads(int n_samples) {
@@ -76,6 +105,7 @@ int main() {
     // 30 s engages every worker; 0.5 s stays on one thread by the frame heuristic.
     if (!mel_equal_across_threads(16000 * 30)) return 1;
     if (!mel_equal_across_threads(8000)) return 1;
+    if (!mel_repeated_worker_lifetimes()) return 1;
     std::printf("[mel-threads] PASS\n");
     return 0;
 }

@@ -1035,6 +1035,31 @@ preserve_music_generation_logs() {
     echo "warning: could not retain music generation stderr" >&2
 }
 
+score_der_runs() {
+  local index scored score kind reference last_reference="" complete=true
+  local records="$tmp_dir/der-runs.jsonl"
+  : > "$records"
+  for ((index=1; index<=RUNS; index++)); do
+    cp "$tmp_dir/run-$index.err.stdout" "${OUT%.json}.run-$index.hypothesis.jsonl"
+    scored="$(score_correctness text-file "$tmp_dir/run-$index.err.stdout" || true)"
+    IFS='|' read -r score kind reference <<< "$scored"
+    if [[ "$kind" != der || -z "$score" ]]; then
+      score=null
+      complete=false
+    else
+      last_reference="$reference"
+    fi
+    jq -n --argjson run "$index" --argjson der "$score" '{run:$run, der:$der}' >> "$records"
+  done
+  jq -s --argjson complete "$complete" '{runs:., complete:$complete,
+    median:(if $complete then (map(.der) | sort |
+      if length%2==1 then .[length/2|floor] else (.[length/2-1]+.[length/2])/2 end)
+      else null end)}' "$records" > "${OUT%.json}.der-runs.json"
+  if [[ "$complete" == true ]]; then
+    printf '%s|der|%s\n' "$(jq -r .median "${OUT%.json}.der-runs.json")" "$last_reference"
+  fi
+}
+
 # ---- time-wrapped bench: N invocations, we take the median ------------------
 run_one_time_wrapped() {
   local iter="$1" stderr_log="$2" rss_log="$3"
@@ -1373,14 +1398,12 @@ case "$BENCH_KIND" in
       RTF_MEDIAN="$(awk -v m="$med" -v s="$AUDIO_DURATION_S" 'BEGIN { printf "%.3f", m / (s * 1000.0) }')"
     fi
 
-    # Correctness scoring — no-op unless the family declares a correctness
-    # block. The hypothesis is the last successful run's captured stdout
-    # ($r_stderr.stdout from the final loop iteration, still on disk in
-    # $tmp_dir). Runs after perf is captured so a scoring failure never
-    # downgrades a green perf run. Score is routed into WER_MEDIAN /
-    # DER_MEDIAN / F1_MEDIAN based on the kind the family declared.
     corr_out=""
-    corr_out="$(score_correctness text-file "$r_stderr.stdout" || true)"
+    if [[ "$(jq -r --arg f "$FAMILY" '.[$f].correctness.kind // ""' "$FAMILIES_JSON")" == der ]]; then
+      corr_out="$(score_der_runs)"
+    else
+      corr_out="$(score_correctness text-file "$r_stderr.stdout" || true)"
+    fi
     if [[ -n "$corr_out" ]]; then
       IFS='|' read -r c_score c_kind c_ref <<< "$corr_out"
       case "$c_kind" in

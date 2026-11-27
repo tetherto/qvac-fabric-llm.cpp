@@ -1951,6 +1951,43 @@ void test_model_pair_case_and_ambiguity() {
     CHECK(throws_runtime_error([&] { resolve_model_pair(directory.root.string(), "", ""); }));
 }
 
+void test_explicit_model_pair_mixed_quants() {
+    using tts_cpp::minimax::detail::resolve_model_pair;
+    const auto pair = resolve_model_pair("", "mm3-lm-Q4_0.gguf", "mm3-synth-q8_0.gguf");
+    CHECK(pair.lm == "mm3-lm-Q4_0.gguf");
+    CHECK(pair.synth == "mm3-synth-q8_0.gguf");
+
+    const auto reverse = resolve_model_pair("", "mm3-lm-q8_0.gguf", "mm3-synth-q4_0.gguf");
+    CHECK(reverse.lm == "mm3-lm-q8_0.gguf");
+    CHECK(reverse.synth == "mm3-synth-q4_0.gguf");
+
+    const auto alias = resolve_model_pair("", "language-model-block-Q4_0.gguf", "mm3-synth-q8_0.gguf");
+    CHECK(alias.lm == "language-model-block-Q4_0.gguf");
+    CHECK(alias.synth == "mm3-synth-q8_0.gguf");
+}
+
+void test_discovered_model_pair_requires_matching_quant() {
+    using tts_cpp::minimax::detail::resolve_model_pair;
+    ModelPairDirectory directory;
+    touch(directory.root / "mm3-lm-q4_0.gguf");
+    touch(directory.root / "mm3-synth-q8_0.gguf");
+    CHECK(throws_runtime_error([&] { resolve_model_pair(directory.root.string(), "", ""); }));
+    CHECK(throws_runtime_error([&] {
+        resolve_model_pair(directory.root.string(), "mm3-lm-q4_0.gguf", "");
+    }));
+    CHECK(throws_runtime_error([&] {
+        resolve_model_pair(directory.root.string(), "", "mm3-synth-q8_0.gguf");
+    }));
+
+    directory.add("q8_0");
+    const auto synth = resolve_model_pair(directory.root.string(), "mm3-lm-q8_0.gguf", "");
+    CHECK(synth.lm == "mm3-lm-q8_0.gguf");
+    CHECK(std::filesystem::path(synth.synth).filename() == "mm3-synth-q8_0.gguf");
+    const auto lm = resolve_model_pair(directory.root.string(), "", "mm3-synth-q8_0.gguf");
+    CHECK(std::filesystem::path(lm.lm).filename() == "mm3-lm-q8_0.gguf");
+    CHECK(lm.synth == "mm3-synth-q8_0.gguf");
+}
+
 void test_backend_configuration() {
     backend_set_abort_handler(nullptr, nullptr, nullptr);
     using tts_cpp::minimax::detail::backend_configuration_matches;
@@ -2177,6 +2214,8 @@ int main() {
     test_malformed_utf8();
     test_model_pair_resolution();
     test_model_pair_case_and_ambiguity();
+    test_explicit_model_pair_mixed_quants();
+    test_discovered_model_pair_requires_matching_quant();
     test_backend_configuration();
     test_device_configuration();
     test_device_backend_init();

@@ -1,10 +1,12 @@
 #include "tts-cpp/moss/fit.h"
 #include "moss/codec.h"
 #include "moss/delay_lm.h"
+#include "moss/coreml_sidecar.h"
 #include "backend_selection.h"
 #include "fit_util.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -38,6 +40,19 @@ bool valid_budget(const EngineOptions & options, const FitWorkload & workload, i
     const int64_t duration = int64_t(options.duration_tokens) + channels - 1 + TERMINATION_ROWS;
     return total <= options.context &&
         (options.duration_tokens == 0 || duration <= options.max_new_tokens);
+}
+
+bool uses_coreml(const EngineOptions & options, const FitWorkload & workload) {
+#ifdef TTS_CPP_USE_COREML
+    if (detail::read_coreml_policy().disabled) return false;
+    return std::filesystem::is_directory(detail::codec_decoder_sidecar_path(options.decoder_path)) ||
+           (workload.reference_samples > 0 &&
+            std::filesystem::is_directory(detail::speech_tokenizer_sidecar_path(options.encoder_path)));
+#else
+    (void) options;
+    (void) workload;
+    return false;
+#endif
 }
 
 void add_component(FitResult & result, const FitResult & component) {
@@ -129,6 +144,11 @@ FitResult fit_params(const EngineOptions & options, const FitWorkload & workload
         result = backbone.measure(workload.prompt_rows, options.max_new_tokens);
         result.model_variant = "moss";
         measure_reference(result, options, workload, channels, decoder.sample_rate(), decoder.samples_per_frame());
+        if (uses_coreml(options, workload)) {
+            result.reason = "coreml-memory-estimate-unavailable";
+            result.report = "Core ML model memory cannot be projected by the ggml fit estimator.\n";
+            return result;
+        }
         measure_decoder(result, decoder, options, workload, channels);
         finish_result(result, workload);
     } catch (const std::invalid_argument &) {

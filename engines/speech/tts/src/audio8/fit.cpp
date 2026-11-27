@@ -150,6 +150,12 @@ FitResult fit_params(const FitOptions & opts) {
         }
     }
 
+    if (m.decoder.synthesis_on_coreml) {
+        r.reason = "coreml-memory-estimate-unavailable";
+        r.report = "Core ML codec memory cannot be projected by the ggml fit estimator.\n";
+        return r;
+    }
+
     // All three sub-models resolve their backend through the same
     // validated-GPU policy (init_backend), so they land on the same device;
     // the LM's handle stands in for all of them.

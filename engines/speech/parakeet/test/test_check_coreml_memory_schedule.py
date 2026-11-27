@@ -17,6 +17,7 @@ checker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checker)
 
 MIB = 1 << 20
+SORTFORMER_TEMPLATE = SCRIPT.parents[1] / "coreml-templates" / "sortformer-diar-f410" / "template.json"
 STAGES = ("diarizer-358", "diarizer-745")
 
 # I/O: 1 x 4 x 256 fp32 in (4096 bytes), 1 x 512 fp16 out (1024 bytes).
@@ -105,6 +106,17 @@ class CheckerTest(unittest.TestCase):
         self.assertEqual(checker.io_bytes(self.templates[0]), IO_BYTES)
         self.assertEqual(checker.charged(self.templates[0], "cpu_and_ane"),
                          (30 * MIB, 30 * MIB, 300 * MIB, RESIDENT))
+
+    def test_sortformer_prepare_charge_covers_recorded_ci_peaks(self):
+        # M4 Max, macOS 26.7.2: both overlapped runs recorded on 2026-11-25.
+        recorded_prepare_peaks = (101990880, 98582960)
+        measured_template = json.loads(SORTFORMER_TEMPLATE.read_text())
+        margin = checker.margin_of(measured_template)
+        self.assertEqual(margin, 1.25)
+        prepare, _, _, _ = checker.charged(measured_template, "cpu_and_ane")
+        for peak in recorded_prepare_peaks:
+            self.assertIsNone(checker.over("recorded CI", "diarizer-410 prepare", peak, margin, prepare))
+        self.assertEqual(prepare, checker.with_margin(max(recorded_prepare_peaks), margin))
 
     def test_null_constants_use_the_runtime_defaults(self):
         t = template("diarizer-358", runtime_weight_bytes=0, workspace_bytes=0, compile_peak_bytes=None,

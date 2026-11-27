@@ -1697,6 +1697,9 @@ if (TTS_CPP_BUILD_TESTS)
     add_executable(test-moss-fit test/moss/test_fit.cpp)
     target_link_libraries(test-moss-fit PRIVATE tts-cpp)
     target_include_directories(test-moss-fit PRIVATE src)
+    if (TTS_CPP_COREML)
+        target_compile_definitions(test-moss-fit PRIVATE TTS_CPP_USE_COREML)
+    endif()
     tts_cpp_apply_ccache(test-moss-fit)
     tts_cpp_register_test(test-moss-fit)
 
@@ -1770,6 +1773,9 @@ if (TTS_CPP_BUILD_TESTS)
     add_executable(test-moss-sfx-fit test/moss/test_sfx_fit.cpp)
     target_link_libraries(test-moss-sfx-fit PRIVATE tts-cpp)
     target_include_directories(test-moss-sfx-fit PRIVATE src)
+    if (TTS_CPP_COREML)
+        target_compile_definitions(test-moss-sfx-fit PRIVATE TTS_CPP_USE_COREML)
+    endif()
     tts_cpp_apply_ccache(test-moss-sfx-fit)
     tts_cpp_register_test(test-moss-sfx-fit)
 
@@ -3955,6 +3961,9 @@ if (TTS_CPP_BUILD_TESTS)
     add_executable(test-audio8-fit-params test/audio8/test_fit_params.cpp)
     target_link_libraries(test-audio8-fit-params PRIVATE tts-cpp ggml)
     target_include_directories(test-audio8-fit-params PRIVATE ggml/include src include test)
+    if (TTS_CPP_COREML)
+        target_compile_definitions(test-audio8-fit-params PRIVATE TTS_CPP_USE_COREML)
+    endif()
     tts_cpp_apply_ccache(test-audio8-fit-params)
     tts_cpp_register_test(test-audio8-fit-params LABEL "unit")
     tts_cpp_register_test(test-audio8-fit-params-fixture
@@ -4015,6 +4024,9 @@ if (TTS_CPP_BUILD_TESTS)
     add_executable(test-supertonic-fit-params test/test_supertonic_fit_params.cpp)
     target_link_libraries(test-supertonic-fit-params PRIVATE tts-cpp ggml)
     target_include_directories(test-supertonic-fit-params PRIVATE ggml/include src include)
+    if (TTS_CPP_COREML)
+        target_compile_definitions(test-supertonic-fit-params PRIVATE TTS_CPP_USE_COREML)
+    endif()
     tts_cpp_apply_ccache(test-supertonic-fit-params)
     tts_cpp_register_test(test-supertonic-fit-params LABEL "unit")
 
@@ -4391,6 +4403,19 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-supertonic-api PRIVATE src include)
     tts_cpp_apply_ccache(test-supertonic-api)
     tts_cpp_register_test(test-supertonic-api LABEL "unit")
+
+    add_executable(test-supertonic-request-lifecycle test/test_supertonic_request_lifecycle.cpp)
+    target_link_libraries(test-supertonic-request-lifecycle PRIVATE tts-cpp Threads::Threads)
+    tts_cpp_apply_ccache(test-supertonic-request-lifecycle)
+    tts_cpp_register_test(test-supertonic-request-lifecycle
+        LABEL    "fixture"
+        ARGS     "${_tcb_super_gguf}"
+        REQUIRES "${_tcb_super_gguf}")
+    tts_cpp_register_test(test-supertonic-request-lifecycle-v3
+        EXE      test-supertonic-request-lifecycle
+        LABEL    "fixture"
+        ARGS     "${_tcb_super3_gguf}"
+        REQUIRES "${_tcb_super3_gguf}")
 
     # round 3 — multi-device Vulkan auto-pick policy
     # (--vulkan-device -1 → pick device with most free VRAM).

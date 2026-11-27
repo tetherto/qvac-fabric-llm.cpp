@@ -597,12 +597,12 @@ static ggml_tensor * build_encoder_graph(encoder_ctx & ec,
     return h;   // ne = (n_state, T)
 }
 
-bool s3tokv2_tokenize(const std::vector<float> & wav,
-                      const s3tokv2_weights & w,
-                      int max_tokens,
-                      std::vector<int32_t> & out_tokens,
-                      int n_threads,
-                      ggml_backend_t backend)
+static bool tokenize_with_encoder(const std::vector<float> & wav,
+                                  const s3tokv2_weights & w,
+                                  int max_tokens,
+                                  std::vector<int32_t> & out_tokens,
+                                  int n_threads,
+                                  encoder_ctx & ec)
 {
     int T_mel = 0;
     std::vector<float> mel = s3tokv2_log_mel(wav, w, T_mel);
@@ -611,9 +611,6 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
     // Expected length after two stride-2 convs.
     const int T1 = (T_mel + 2 - 2 - 1) / 2 + 1;
     const int T2 = (T1    + 2 - 2 - 1) / 2 + 1;
-
-    encoder_ctx ec;
-    if (!build_encoder_ctx(ec, w, backend)) { free_encoder_ctx(ec); return false; }
 
     // Allocate the per-run input + positions tensors in a separate sub-context.
     // (They have a variable size that depends on T_mel/T2, so we can't bake
@@ -637,7 +634,7 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
     ggml_set_name(ec.pos, "pos");
 
     ggml_backend_buffer_t input_buf = ggml_backend_alloc_ctx_tensors(input_ctx, ec.backend);
-    if (!input_buf) { free_encoder_ctx(ec); ggml_free(input_ctx); return false; }
+    if (!input_buf) { ggml_free(input_ctx); return false; }
 
     // Graph context: holds all intermediate tensor structs (nodes).  Size
     // scales with number of ops; ~4000 tensor overheads is plenty for 6
@@ -652,7 +649,7 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
         run_ctx = ggml_init(ip3);
         if (!run_ctx) {
             fprintf(stderr, "s3tokv2: ggml_init(run_ctx) failed\n");
-            free_encoder_ctx(ec); ggml_backend_buffer_free(input_buf); ggml_free(input_ctx);
+            ggml_backend_buffer_free(input_buf); ggml_free(input_ctx);
             return false;
         }
     }
@@ -677,7 +674,7 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
     ec.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ec.backend));
     if (!ggml_gallocr_alloc_graph(ec.alloc, gf)) {
         fprintf(stderr, "s3tokv2: gallocr_alloc_graph failed\n");
-        free_encoder_ctx(ec);
+        ggml_gallocr_free(ec.alloc); ec.alloc = nullptr;
         ggml_backend_buffer_free(input_buf); ggml_free(input_ctx);
         ggml_free(run_ctx);
         return false;
@@ -689,7 +686,7 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
 
     if (ggml_backend_graph_compute(ec.backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "s3tokv2: graph_compute failed\n");
-        free_encoder_ctx(ec);
+        ggml_gallocr_free(ec.alloc); ec.alloc = nullptr;
         ggml_backend_buffer_free(input_buf); ggml_free(input_ctx);
         ggml_free(run_ctx);
         return false;
@@ -701,7 +698,7 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
     std::vector<float> hidden((size_t)T_out * D_out);
     ggml_backend_tensor_get(h_out, hidden.data(), 0, hidden.size() * sizeof(float));
 
-    free_encoder_ctx(ec);
+    ggml_gallocr_free(ec.alloc); ec.alloc = nullptr;
     ggml_backend_buffer_free(input_buf); ggml_free(input_ctx);
     ggml_free(run_ctx);
 
@@ -735,4 +732,36 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
     if (max_tokens > 0 && (int)tokens.size() > max_tokens) tokens.resize(max_tokens);
     out_tokens = std::move(tokens);
     return true;
+}
+
+bool s3tokv2_tokenize(const std::vector<float> & wav,
+                      const s3tokv2_weights & w,
+                      int max_tokens,
+                      std::vector<int32_t> & out_tokens,
+                      int n_threads,
+                      ggml_backend_t backend)
+{
+    encoder_ctx ec;
+    if (!build_encoder_ctx(ec, w, backend)) { free_encoder_ctx(ec); return false; }
+    const bool ok = tokenize_with_encoder(wav, w, max_tokens, out_tokens, n_threads, ec);
+    free_encoder_ctx(ec);
+    return ok;
+}
+
+bool s3tokv2_tokenize_pair(const std::vector<float> & first_wav,
+                           const std::vector<float> & second_wav,
+                           const s3tokv2_weights & w,
+                           int second_max_tokens,
+                           std::vector<int32_t> & first_tokens,
+                           std::vector<int32_t> & second_tokens,
+                           int n_threads,
+                           ggml_backend_t backend)
+{
+    encoder_ctx ec;
+    if (!build_encoder_ctx(ec, w, backend)) { free_encoder_ctx(ec); return false; }
+    const bool first_ok = tokenize_with_encoder(first_wav, w, -1, first_tokens, n_threads, ec);
+    const bool second_ok = first_ok && tokenize_with_encoder(
+        second_wav, w, second_max_tokens, second_tokens, n_threads, ec);
+    free_encoder_ctx(ec);
+    return second_ok;
 }

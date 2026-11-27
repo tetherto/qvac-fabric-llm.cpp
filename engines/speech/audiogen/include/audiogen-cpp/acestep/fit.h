@@ -32,7 +32,9 @@
 //              answer, not an error.
 //   Error   -- no projection could be made (unreadable model, no backend
 //              device registered, measurement failure). An empty device
-//              registry is always Error, never Success.
+//              registry is always Error, never Success. An active Core ML VAE
+//              decoder sidecar also returns Error with reason
+//              "coreml-memory-estimate-unavailable" until it can be priced.
 
 #include "audiogen-cpp/export.h"
 

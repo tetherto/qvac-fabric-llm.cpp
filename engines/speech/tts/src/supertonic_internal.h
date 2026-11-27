@@ -666,8 +666,8 @@ struct supertonic_fit_load_measure {
     // documented ~5 MiB steady state.
     uint64_t host_bytes           = 0;
     // Transient host peak of the load itself: gguf_init_from_file's full
-    // tensor-data copy plus the conversion staging maps, alive alongside
-    // buffer_w until the upload loop finishes.  Often the true process peak.
+    // tensor-data copy plus the largest single-tensor conversion scratch,
+    // alive alongside buffer_w during upload. Often the process peak.
     uint64_t host_transient_bytes = 0;
 };
 

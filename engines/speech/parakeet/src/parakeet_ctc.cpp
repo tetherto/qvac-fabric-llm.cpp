@@ -2,12 +2,12 @@
 
 #include "parakeet_ctc.h"
 #include "decoder_backend.h"
+#include "depthwise_conv_layout.h"
 #include "coreml/parakeet_coreml_shape.h"
 #include "long_form.h"
 #include "mel_preprocess.h"
 #include "parakeet_log.h"
 #include "backend_util.h"
-#include "conv_channels_layout.h"
 #include "encoder_graph_allocator.h"
 #include "packed_affine.h"
 
@@ -4497,7 +4497,7 @@ ggml_tensor * depthwise_conv_channels_first(ggml_context * ctx, ggml_tensor * y,
     ggml_tensor * kernel = channels_first_kernel(ctx, w_f32, conv_kernel, d_model);
     ggml_tensor * out    = ggml_conv_2d_dw_direct(ctx, kernel, channels_first_view(ctx, y, d_model),
                                                   1, 1, pad, 0, 1, 1);
-    return channels_first_conv_output(ctx, out);
+    return flatten_channels_first_convolution(ctx, out);
 }
 
 // The channel-contiguous view of a [d_model, T] activation is only distinguishable

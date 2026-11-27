@@ -11,6 +11,7 @@
 
 #ifdef WHISPER_USE_COREML
 #include "coreml/whisper-encoder.h"
+#include <sys/stat.h>
 #endif
 
 #ifdef WHISPER_USE_OPENVINO
@@ -3661,8 +3662,12 @@ static std::vector<whisper_vocab::id> tokenize(const whisper_vocab & vocab, cons
 #ifdef WHISPER_USE_COREML
 // replace .bin with -encoder.mlmodelc
 static std::string whisper_get_coreml_path_encoder(std::string path_bin) {
+    const std::string fit_suffix = ".fit.gguf";
     auto pos = path_bin.rfind('.');
-    if (pos != std::string::npos) {
+    if (path_bin.size() >= fit_suffix.size() &&
+        path_bin.compare(path_bin.size() - fit_suffix.size(), fit_suffix.size(), fit_suffix) == 0) {
+        path_bin.resize(path_bin.size() - fit_suffix.size());
+    } else if (pos != std::string::npos) {
         path_bin = path_bin.substr(0, pos);
     }
 
@@ -10430,6 +10435,17 @@ int whisper_fit_params(const struct whisper_fit_options * opts, struct whisper_f
         whisper_fit_set_str(result->reason, sizeof(result->reason), "model-unreadable");
         return (int) result->status;
     }
+
+#ifdef WHISPER_USE_COREML
+    struct stat coreml_stat;
+    const std::string coreml_path = whisper_get_coreml_path_encoder(opts->model_path);
+    if (stat(coreml_path.c_str(), &coreml_stat) == 0 && S_ISDIR(coreml_stat.st_mode)) {
+        whisper_fit_set_str(result->reason, sizeof(result->reason), "coreml-memory-estimate-unavailable");
+        whisper_fit_set_str(result->report, sizeof(result->report),
+                            "Core ML encoder memory cannot be projected by the ggml fit estimator.\n");
+        return (int) result->status;
+    }
+#endif
 
     {
         std::string type_name = "unknown";

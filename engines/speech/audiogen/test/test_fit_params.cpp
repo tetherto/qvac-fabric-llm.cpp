@@ -34,9 +34,13 @@
 #include "lm_ggml.h"
 #include "textenc_ggml.h"
 #include "vae_ggml.h"
+#ifdef AUDIOGEN_USE_COREML
+#include "vae_coreml_path.h"
+#endif
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -65,6 +69,9 @@ void expect_eq(uint64_t projected, uint64_t real, const std::string & what) {
 }  // namespace
 
 int main(int argc, char ** argv) {
+#ifdef AUDIOGEN_USE_COREML
+    setenv("ACESTEP_COREML_DISABLE", "1", 1);
+#endif
     const char * dir_env    = std::getenv("AUDIOGEN_TEST_MODELS_DIR");
     const char * models_dir = argc > 1 ? argv[1] : dir_env;
     if (!models_dir || !*models_dir) {
@@ -106,6 +113,19 @@ int main(int argc, char ** argv) {
     if (g_failures) {
         return g_failures;  // nothing below is meaningful without a projection
     }
+#ifdef AUDIOGEN_USE_COREML
+    {
+        const std::string sidecar = coreml_vae_sidecar_path(paths.vae_model_path);
+        const bool created = std::filesystem::create_directory(sidecar);
+        unsetenv("ACESTEP_COREML_DISABLE");
+        const FitResult routed = fit_params(fopts);
+        setenv("ACESTEP_COREML_DISABLE", "1", 1);
+        expect(routed.status == FitStatus::Error &&
+                   routed.reason == "coreml-memory-estimate-unavailable",
+               "Core ML VAE sidecar was omitted from the fit verdict");
+        if (created) std::filesystem::remove(sidecar);
+    }
+#endif
     std::printf("%s", fit.report.c_str());
 
     // Backends resolved exactly as fit_params / Engine::create resolve them.

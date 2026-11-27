@@ -6,6 +6,8 @@
 
 #include "mel_preprocess.h"
 #include "parakeet/moss_transcribe.h"
+#include "parakeet/moss_transcribe_fit.h"
+#include "transcribe_fixtures.h"
 
 #include <algorithm>
 #include <chrono>
@@ -198,6 +200,24 @@ void test_invalid_sidecar(const std::string & model_path, const std::vector<floa
     std::filesystem::remove_all(dir);
 }
 
+void test_fit_sidecar_route() {
+    const auto model_path = moss_transcribe_fixtures::write_transcribe_model("moss-coreml-fit", 26493);
+    const auto sidecar = transcribe_encoder_sidecar_path(model_path.string());
+    const bool created = std::filesystem::create_directory(sidecar);
+    parakeet::moss::TranscribeOptions options;
+    options.model_path = model_path.string();
+    const auto fit = parakeet::moss::fit_params(options, {}, 0.02, 0);
+    check(fit.status == parakeet::FitStatus::Error &&
+              fit.reason == "coreml-memory-estimate-unavailable",
+          "fit refuses to omit an active Core ML encoder");
+    set_env(COREML_DISABLE_ENV, "1");
+    check(parakeet::moss::fit_params(options, {}, 0.02, 0).status != parakeet::FitStatus::Error,
+          "disabled Core ML keeps the ggml fit verdict");
+    clear_env(COREML_DISABLE_ENV);
+    if (created) std::filesystem::remove(sidecar);
+    std::filesystem::remove(model_path);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -205,6 +225,8 @@ int main(int argc, char ** argv) {
     std::printf("SKIP: built without PARAKEET_COREML\n");
     return SKIP;
 #endif
+    test_fit_sidecar_route();
+    if (failures) return 1;
     const char * model_path = std::getenv(MODEL_ENV);
     if (!model_path || argc < 2) {
         std::printf("SKIP: set %s to a GGUF with its -encoder.mlmodelc beside it, and pass a 16 kHz WAV\n",

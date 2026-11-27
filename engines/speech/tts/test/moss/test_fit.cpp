@@ -1,8 +1,11 @@
 #include "gguf_fixtures.h"
 #include "tts-cpp/moss/fit.h"
 #include "moss/codec.h"
+#include "moss/coreml_sidecar.h"
 #include "moss/delay_lm.h"
+#include "../test_env_portable.h"
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 
 using namespace moss_fixtures;
@@ -136,14 +139,45 @@ void test_runtime_after_measurement() {
     check(decoder.decode(std::vector<int32_t>(N_VQ * 4), N_VQ).size() == OUT_DIM * 4,
           "runtime decoder still computes after measure");
 }
+
+#ifdef TTS_CPP_USE_COREML
+void test_coreml_route() {
+    Models models;
+    auto options = models.options();
+    unsetenv("MOSS_COREML_DISABLE");
+    const auto decoder_sidecar = moss::detail::codec_decoder_sidecar_path(options.decoder_path);
+    const bool decoder_created = std::filesystem::create_directory(decoder_sidecar);
+    check(moss::fit_params(options, {PROMPT_ROWS, 0, false, 0}).reason ==
+              "coreml-memory-estimate-unavailable", "Core ML decoder cannot report a ggml-only fit");
+    setenv("MOSS_COREML_DISABLE", "1", 1);
+    check(moss::fit_params(options, {PROMPT_ROWS, 0, false, 0}).status == FitStatus::Success,
+          "disabled Core ML keeps the ggml fit verdict");
+    if (decoder_created) std::filesystem::remove(decoder_sidecar);
+    unsetenv("MOSS_COREML_DISABLE");
+
+    options.encoder_path = models.encoder.string();
+    const auto tokenizer_sidecar = moss::detail::speech_tokenizer_sidecar_path(options.encoder_path);
+    const bool tokenizer_created = std::filesystem::create_directory(tokenizer_sidecar);
+    check(moss::fit_params(options, {PROMPT_ROWS, REFERENCE_SAMPLES, false, 0}).reason ==
+              "coreml-memory-estimate-unavailable", "Core ML tokenizer cannot report a ggml-only fit");
+    check(moss::fit_params(options, {PROMPT_ROWS, 0, false, 0}).status == FitStatus::Success,
+          "unused tokenizer sidecar does not change the fit verdict");
+    if (tokenizer_created) std::filesystem::remove(tokenizer_sidecar);
+    setenv("MOSS_COREML_DISABLE", "1", 1);
+}
+#endif
 }
 
 int main() {
+    setenv("MOSS_COREML_DISABLE", "1", 1);
     test_metadata_only();
     test_workloads();
     test_errors();
     test_explicit_backend();
     test_runtime_after_measurement();
+#ifdef TTS_CPP_USE_COREML
+    test_coreml_route();
+#endif
     if (!failures) std::puts("MOSS fit tests passed");
     return failures ? 1 : 0;
 }

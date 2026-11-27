@@ -36,6 +36,9 @@
 #include "acestep/textenc_ggml.h"
 #include "acestep/vae_encode_windows.h"
 #include "acestep/vae_ggml.h"
+#ifdef AUDIOGEN_USE_COREML
+#include "acestep/vae_coreml_path.h"
+#endif
 
 #include "ggml-backend.h"
 
@@ -44,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <string>
@@ -184,6 +188,18 @@ static FitResult fit_params_unguarded(const FitOptions & opts) {
         r.reason = "invalid-arguments";  // a stage GGUF is missing from the request
         return r;
     }
+#ifdef AUDIOGEN_USE_COREML
+    if (!std::getenv("ACESTEP_COREML_DISABLE") &&
+        std::filesystem::is_directory(coreml_vae_sidecar_path(paths.vae_model_path)) &&
+        std::filesystem::is_regular_file(paths.text_enc_model_path) &&
+        std::filesystem::is_regular_file(paths.lm_model_path) &&
+        std::filesystem::is_regular_file(paths.dit_model_path) &&
+        std::filesystem::is_regular_file(paths.vae_model_path)) {
+        r.reason = "coreml-memory-estimate-unavailable";
+        r.report = "Core ML VAE memory cannot be projected by the ggml fit estimator.\n";
+        return r;
+    }
+#endif
 
     // ── Backends: same resolution + placement as Engine::create ────────────
     load_backends(opts.backends_dir);

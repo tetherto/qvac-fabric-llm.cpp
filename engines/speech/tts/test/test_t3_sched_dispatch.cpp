@@ -93,6 +93,46 @@ void test_walk_and_force_env(ggml_backend_t cpu) {
     CHECK(!graph_has_unsupported_preallocated_op(cpu, g.gf));
 }
 
+size_t buffer_offset(const ggml_tensor * t) {
+    return (size_t) ((const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer));
+}
+
+bool same_layout(const toy_graph & x, const toy_graph & y) {
+    return buffer_offset(x.a) == buffer_offset(y.a) && buffer_offset(x.b) == buffer_offset(y.b) &&
+           buffer_offset(x.out) == buffer_offset(y.out);
+}
+
+void test_direct_alloc_layout_ignores_allocator_history(ggml_backend_t cpu) {
+    const int n_small = 8;
+    const int n_large = 4096;
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(cpu);
+
+    ggml_gallocr_t fresh = ggml_gallocr_new(buft);
+    toy_graph reference(n_small);
+    CHECK(direct_alloc_with_fresh_layout(fresh, reference.gf));
+
+    ggml_gallocr_t used = ggml_gallocr_new(buft);
+    toy_graph large(n_large);
+    CHECK(direct_alloc_with_fresh_layout(used, large.gf));
+    toy_graph after_large(n_small);
+    CHECK(direct_alloc_with_fresh_layout(used, after_large.gf));
+    CHECK(same_layout(reference, after_large));
+
+    ggml_gallocr_t reusing = ggml_gallocr_new(buft);
+    toy_graph large_again(n_large);
+    CHECK(ggml_gallocr_alloc_graph(reusing, large_again.gf));
+    toy_graph inherited(n_small);
+    CHECK(ggml_gallocr_alloc_graph(reusing, inherited.gf));
+    CHECK(!same_layout(reference, inherited));
+
+    CHECK(!direct_alloc_with_fresh_layout(nullptr, reference.gf));
+    CHECK(!direct_alloc_with_fresh_layout(fresh, nullptr));
+
+    ggml_gallocr_free(reusing);
+    ggml_gallocr_free(used);
+    ggml_gallocr_free(fresh);
+}
+
 void test_sched_lifecycle_and_compute(ggml_backend_t cpu) {
     const int n = 8;
 
@@ -306,6 +346,7 @@ int main(int argc, char ** argv) {
 
     test_walk_and_force_env(cpu);
     test_sched_lifecycle_and_compute(cpu);
+    test_direct_alloc_layout_ignores_allocator_history(cpu);
     test_abort_guard_both_branches(cpu);
 
     ggml_backend_free(cpu);

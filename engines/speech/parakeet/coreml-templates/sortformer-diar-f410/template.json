@@ -99,7 +99,7 @@
   "memory": {
     "runtime_weight_bytes": 141959152,
     "workspace_bytes": 0,
-    "compile_peak_bytes": 110100476,
+    "compile_peak_bytes": 111149052,
     "ane_compile_reserve_bytes": 883949568,
     "load_peak_bytes": {
       "cpu_and_ane": 118489088,
@@ -123,7 +123,7 @@
     ],
     "measured": {
       "margin": 1.25,
-      "runs": 32,
+      "runs": 34,
       "resident_bytes": 143654912,
       "basis": "Each constant is 1.25 x the largest value measured over every overlapped generated-schedule run on the validated_for hosts, rounded up to 1 MiB, so the envelope's own margin is 1.0: the prepare charge (generation_peak_bytes + 8 MiB + compile_peak_bytes) covers the prepare from the start of the capacity's generation to the end of its compile; load_peak_bytes.cpu_and_ane the load and warm increment; the resident part (runtime_weight_bytes + 2 x I/O + workspace_bytes, with workspace_bytes 0) the step in the process's settled footprint when the capacity becomes ready, which on cpu_and_ane holds no copy of the fp16 weights (the Neural Engine keeps them outside the process); and ane_compile_reserve_bytes ANECompilerService's growth during the load over its size before it"
     }

@@ -16,6 +16,7 @@
 // serialized (single-threaded CLI/engine synthesis loops); lazy creation is
 // guarded by a plain null check, matching that contract.
 
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include <vector>
@@ -91,6 +92,8 @@ bool sched_fallback_alloc(sched_fallback & fb, ggml_cgraph * gf);
 // it does not retry).
 ggml_status sched_fallback_compute(sched_fallback & fb, ggml_backend_t primary,
                                    ggml_cgraph * gf, int n_threads);
+
+bool direct_alloc_with_fresh_layout(ggml_gallocr_t allocr, ggml_cgraph * gf);
 
 // Direct-path twin so call sites get a status check without duplicating the
 // n_threads plumbing: registry-routed set_n_threads + graph_compute.

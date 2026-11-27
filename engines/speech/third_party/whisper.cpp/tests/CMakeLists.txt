@@ -208,6 +208,9 @@ set_tests_properties(test-whisper-device-cli PROPERTIES LABELS "unit;gh" TIMEOUT
 set(FIT_TEST test-whisper-fit-params)
 add_executable(${FIT_TEST} ${FIT_TEST}.cpp)
 target_include_directories(${FIT_TEST} PRIVATE ../include)
+if (WHISPER_COREML)
+    target_compile_definitions(${FIT_TEST} PRIVATE WHISPER_USE_COREML)
+endif()
 target_link_libraries(${FIT_TEST} PRIVATE whisper)
 target_compile_definitions(${FIT_TEST} PRIVATE
     WHISPER_FIT_TEST_MODEL="${PROJECT_SOURCE_DIR}/models/for-tests-ggml-tiny.bin"
@@ -233,6 +236,9 @@ set(FIT_DESCRIPTION_FIXTURES
     ${PROJECT_SOURCE_DIR}/models/for-tests-ggml-bci.fit.gguf)
 add_executable(${FIT_DESCRIPTION_TEST} ${FIT_DESCRIPTION_TEST}.cpp)
 target_include_directories(${FIT_DESCRIPTION_TEST} PRIVATE ../include)
+if (WHISPER_COREML)
+    target_compile_definitions(${FIT_DESCRIPTION_TEST} PRIVATE WHISPER_USE_COREML)
+endif()
 target_link_libraries(${FIT_DESCRIPTION_TEST} PRIVATE whisper)
 add_test(NAME ${FIT_DESCRIPTION_TEST} COMMAND ${FIT_DESCRIPTION_TEST} ${FIT_DESCRIPTION_FIXTURES})
 set_tests_properties(${FIT_DESCRIPTION_TEST} PROPERTIES LABELS "unit;tiny;gh")

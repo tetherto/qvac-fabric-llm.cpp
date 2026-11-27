@@ -432,6 +432,15 @@ static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_lay
 
 static double s3gen_model_cache_last_load_ms() { return g_s3gen_cache_last_load_ms; }
 
+// The GGUF also packages S3TokenizerV2 and CAMPPlus for one-time reference
+// audio conditioning. Their loaders stream those tensors independently and
+// release them after the voice is baked. Keeping a second copy in S3Gen's
+// persistent weight buffer wastes nearly 500 MiB on multilingual models.
+static bool s3gen_runtime_tensor(const char * name) {
+    return std::strncmp(name, "s3tokv2/", 8) != 0 &&
+           std::strncmp(name, "campplus/", 9) != 0;
+}
+
 static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers,
                                  const std::string & backend, bool verbose,
                                  size_t * measure_bytes) {
@@ -482,10 +491,15 @@ static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers,
     if (verbose && m.is_mali)
         fprintf(stderr, "s3gen: ARM Mali Vulkan detected -> CFM uses unfused attention\n");
     int64_t n_tensors = gguf_get_n_tensors(g);
-    ggml_init_params p = { ggml_tensor_overhead() * (size_t)n_tensors, nullptr, true };
+    size_t runtime_tensors = 0;
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        runtime_tensors += s3gen_runtime_tensor(gguf_get_tensor_name(g, i));
+    }
+    ggml_init_params p = { ggml_tensor_overhead() * runtime_tensors, nullptr, true };
     m.ctx_w = ggml_init(p);
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(g, i);
+        if (!s3gen_runtime_tensor(name)) continue;
         ggml_tensor * src = ggml_get_tensor(tmp_ctx, name);
         ggml_tensor * dst = ggml_dup_tensor(m.ctx_w, src);
         ggml_set_name(dst, name);

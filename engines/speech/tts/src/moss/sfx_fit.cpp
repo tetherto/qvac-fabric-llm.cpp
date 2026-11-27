@@ -1,5 +1,6 @@
 #include "tts-cpp/moss/sound_effect_fit.h"
 #include "moss/sfx_model.h"
+#include "moss/coreml_sidecar.h"
 #include "moss/sfx_networks.h"
 #include "moss/sfx_request.h"
 #include "moss/sfx_tokenizer.h"
@@ -7,6 +8,7 @@
 #include "fit_util.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -20,6 +22,17 @@ constexpr int TENTHS_PER_SECOND = 10;
 constexpr int GUIDED_LATENT_BUFFERS = 4;
 constexpr int UNGUIDED_LATENT_BUFFERS = 2;
 constexpr int PROMPT_CONTEXTS = 2;
+
+bool uses_coreml(const SoundEffectOptions & options) {
+#ifdef TTS_CPP_USE_COREML
+    if (detail::read_coreml_policy().disabled) return false;
+    return std::filesystem::is_directory(detail::sfx_dit_sidecar_path(options.model_path)) ||
+           std::filesystem::is_directory(detail::sfx_vae_sidecar_path(options.model_path));
+#else
+    (void) options;
+    return false;
+#endif
+}
 
 uint64_t host_rows_payload(const detail::SfxModel & model, size_t tokens) {
     return model.table_on_host() ? sat_mul(sat_mul(tokens, model.config().text.n_embd), sizeof(float)) : 0;
@@ -128,6 +141,11 @@ FitResult fit_params(const SoundEffectOptions & options, const SoundEffectReques
         } catch (const std::runtime_error & error) {
             result.reason = "invalid-arguments";
             result.report = error.what();
+            return result;
+        }
+        if (uses_coreml(options)) {
+            result.reason = "coreml-memory-estimate-unavailable";
+            result.report = "Core ML model memory cannot be projected by the ggml fit estimator.\n";
             return result;
         }
         result = model.measure_weights();

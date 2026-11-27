@@ -335,7 +335,8 @@ bool parler_dec_step(const parler_model & model,
     ggml_free(ctx);
 
     bool use_sched = false;
-    if (!parler_graph_prepare(model, gf, allocr, use_sched, __func__)) return false;
+    if (!parler_graph_prepare(model, gf, allocr, use_sched, __func__,
+                              parler_graph_layout::reuse_previous)) return false;
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "frame_ids"),
                             frame.data(), 0, frame.size() * sizeof(int32_t));
