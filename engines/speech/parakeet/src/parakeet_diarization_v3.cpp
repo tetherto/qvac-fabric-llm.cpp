@@ -41,7 +41,7 @@ ggml_tensor * linear(
     ggml_context * context, ggml_tensor * input,
     ggml_tensor * weight, ggml_tensor * bias, const GraphOptions & options) {
     ggml_tensor * output = ggml_mul_mat(context, weight, input);
-    if (options.f32_matmuls) ggml_mul_mat_set_prec(output, GGML_PREC_F32);
+    if (options.f32_matmuls) ggml_prec_set_acc(output, GGML_PREC_F32);
     return bias ? ggml_add(context, output, bias) : output;
 }
 

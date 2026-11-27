@@ -934,7 +934,7 @@ bool hexagon_decode_attention(ggml_backend_t backend, int head_dim, int heads, i
     auto out = ggml_flash_attn_ext(probe.ctx, q, ggml_permute(probe.ctx, k, 0, 2, 1, 3),
                                   ggml_permute(probe.ctx, v, 0, 2, 1, 3), nullptr,
                                   1.0f / std::sqrt(static_cast<float>(head_dim)), 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
     return ggml_backend_supports_op(backend, out);
 }
 
@@ -1185,7 +1185,7 @@ static bool load_codec_impl(const std::string & path, int n_gpu_layers,
     if (hexagon_decoder && (!fp16 || std::strcmp(fp16, "0") != 0)) {
         // Default to the validated F16 activation/HMX path for eligible
         // synthesis products. The explicit opt-out restores the F32 request.
-        model.synthesis_convs.precision = GGML_PREC_DEFAULT;
+        model.synthesis_convs.precision = GGML_PREC_UNDEFINED;
         std::fprintf(stderr, "[audio8] Hexagon codec FP16 synthesis: enabled\n");
     } else if (hexagon_decoder && tiled && std::strcmp(tiled, "1") == 0) {
         const auto registry = ggml_backend_dev_backend_reg(device);

@@ -843,7 +843,7 @@ static ggml_tensor * lm_attn(ggml_context * ctx, ggml_cgraph * gf, const Qwen3Co
     ggml_tensor * attn;
     if (use_flash_attn) {
         attn = ggml_flash_attn_ext(ctx, q, k_full, v_full, mask, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn, c.prec);
+        ggml_prec_set_acc(attn, c.prec);
     } else {
         attn = q3_attn(ctx, ggml_cont(ctx, q), k_full, v_full, mask, scale, c.prec);
     }
@@ -1180,7 +1180,7 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
                                                  m->kv_v4[l]->nb[3], off);
             const float scale = 1.0f / sqrtf((float) D);
             ggml_tensor * attn = ggml_flash_attn_ext(ctx, q4, k_batch, v_batch, mask, scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(attn, c.prec);
+            ggml_prec_set_acc(attn, c.prec);
             attn = ggml_reshape_2d(ctx, attn, (int64_t) Nh * D, N);
 
             hidden = ggml_add(ctx, hidden, q3_linear(ctx, ly->o_proj, attn, c.prec));

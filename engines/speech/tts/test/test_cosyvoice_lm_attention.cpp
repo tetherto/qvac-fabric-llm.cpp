@@ -41,7 +41,7 @@ bool supports_lm_attention(ggml_backend_t backend, const qwen_hp & hp) {
     ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hp.head_dim, kProbeLength, hp.n_kv, 1);
     ggml_tensor * v = ggml_dup_tensor(ctx, k);
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f, 0, 0);
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
     const bool supported = ggml_backend_supports_op(backend, out);
     ggml_free(ctx);
     return supported;
@@ -114,7 +114,7 @@ void check_attention(ggml_backend_t backend, int length) {
     ggml_tensor * kh = ggml_view_3d(ctx, k, kHeadDim, length, kKvHeads, k->nb[2], k->nb[1], 0);
     ggml_tensor * vh = ggml_view_3d(ctx, v, kHeadDim, length, kKvHeads, v->nb[2], v->nb[1], 0);
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, kh, vh, nullptr, 1.0f / std::sqrt(float(kHeadDim)), 0, 0);
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);

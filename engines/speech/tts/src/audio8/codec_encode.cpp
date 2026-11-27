@@ -124,7 +124,7 @@ ggml_tensor * nearest_codes(ggml_context * ctx, const quantizer_weights & quanti
                             ggml_tensor * latents) {
     ggml_tensor * similarity = ggml_mul_mat(ctx, unit_length(ctx, quantizer.codebook),
                                             unit_length(ctx, latents));
-    ggml_mul_mat_set_prec(similarity, GGML_PREC_F32);
+    ggml_prec_set_acc(similarity, GGML_PREC_F32);
     return ggml_argmax(ctx, similarity);
 }
 

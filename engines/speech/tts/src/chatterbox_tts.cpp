@@ -1384,7 +1384,7 @@ static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
         // At ggml e16d1332 CPU DEFAULT/F32 share the F32 implementation;
         // Metal/CUDA flash attention do not read this flag (not a global F32
         // arithmetic guarantee). Re-audit on ggml upgrades; see docs/moss.md.
-        ggml_flash_attn_ext_set_prec(attn_fa, GGML_PREC_F32);
+        ggml_prec_set_acc(attn_fa, GGML_PREC_F32);
         // flash_attn_ext output: ne=[HD, H, T, 1] (contiguous). Reshape to (INNER, T).
         flat = ggml_reshape_2d(ctx, attn_fa, INNER, T);
     }
@@ -1490,7 +1490,7 @@ static ggml_tensor * basic_tfm_b(ggml_context * ctx, const basic_tfm_w & w,
         ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr,
                                                     1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
         // Same accumulation requirement as the single-batch CFM path above.
-        ggml_flash_attn_ext_set_prec(attn_fa, GGML_PREC_F32);
+        ggml_prec_set_acc(attn_fa, GGML_PREC_F32);
         // flash_attn_ext output ne=[HD, H, T, B].  Reshape back to (INNER, T, B).
         flat = ggml_reshape_3d(ctx, attn_fa, INNER, T, B);
     }
