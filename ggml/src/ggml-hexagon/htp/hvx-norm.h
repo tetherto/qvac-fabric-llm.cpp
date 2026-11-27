@@ -7,6 +7,7 @@
 #include "hvx-inverse.h"
 #include "hvx-sqrt.h"
 #include "hvx-repl.h"
+#include "hvx-sigmoid.h"
 
 static inline void hvx_fast_rms_norm_f32(const uint8_t * restrict src,
                                          uint8_t * restrict dst,
@@ -141,13 +142,12 @@ static inline void hvx_fast_rms_norm_mul_f32(const uint8_t * restrict src,
     }
 }
 
-static inline void hvx_fast_norm_f32(const uint8_t * restrict src,
-                                     uint8_t * restrict dst,
-                                     const int num_elems,
-                                     float     epsilon) {
-
+static inline void hvx_norm_moments_f32(const uint8_t * restrict src,
+                                        const int num_elems,
+                                        float     epsilon,
+                                        HVX_Vector * mean,
+                                        HVX_Vector * scale) {
     const HVX_Vector * restrict v_src = (HVX_Vector *) src;
-    HVX_Vector * restrict v_dst       = (HVX_Vector *) dst;
 
     const int nvec = num_elems / VLEN_FP32;    // number of full vectors
     const int nloe = num_elems % VLEN_FP32;    // leftover elements
@@ -186,9 +186,69 @@ static inline void hvx_fast_norm_f32(const uint8_t * restrict src,
     HVX_Vector var_v          = Q6_Vqf32_vsub_Vqf32Vqf32(mean_sq_v, mean_x_sq_v);
     HVX_Vector var_epsilon_v  = Q6_Vqf32_vadd_Vqf32Vsf(var_v, epsilon_v);
 
-    // scale = rsqrt(variance + epsilon),  mean_x broadcast for subtraction
-    HVX_Vector scale_v  = hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(var_epsilon_v));
-    HVX_Vector mean_x_b = hvx_vec_repl_f32(Q6_Vsf_equals_Vqf32(mean_x_v));
+    *scale = hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(var_epsilon_v));
+    *mean  = Q6_Vsf_equals_Vqf32(mean_x_v);
+}
+
+static inline void hvx_norm_affine_plane_f32(const HVX_Vector * restrict src,
+                                             HVX_Vector * restrict dst,
+                                             const uint32_t n_vectors,
+                                             HVX_Vector mean,
+                                             HVX_Vector gain,
+                                             HVX_Vector shift) {
+    #pragma unroll(4)
+    for (uint32_t i = 0; i < n_vectors; i++) {
+        HVX_Vector centered = Q6_Vqf32_vsub_VsfVsf(src[i], mean);
+        HVX_Vector scaled   = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(centered), gain);
+        dst[i] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(scaled, shift));
+    }
+}
+
+static inline void hvx_norm_affine_row_f32(const HVX_Vector * restrict src,
+                                           HVX_Vector * restrict dst,
+                                           const uint32_t n_vectors,
+                                           HVX_Vector mean,
+                                           HVX_Vector scale,
+                                           const HVX_Vector * restrict weight,
+                                           const HVX_Vector * restrict bias) {
+    #pragma unroll(4)
+    for (uint32_t i = 0; i < n_vectors; i++) {
+        HVX_Vector centered = Q6_Vqf32_vsub_VsfVsf(src[i], mean);
+        HVX_Vector gain     = Q6_Vqf32_vmpy_VsfVsf(scale, weight[i]);
+        HVX_Vector scaled   = Q6_Vqf32_vmpy_Vqf32Vqf32(centered, gain);
+        dst[i] = Q6_Vsf_equals_Vqf32(bias ? Q6_Vqf32_vadd_Vqf32Vsf(scaled, bias[i]) : scaled);
+    }
+}
+
+static inline void hvx_norm_affine_silu_plane_f32(const HVX_Vector * restrict src,
+                                                  HVX_Vector * restrict dst,
+                                                  const uint32_t n_vectors,
+                                                  HVX_Vector mean,
+                                                  HVX_Vector gain,
+                                                  HVX_Vector shift) {
+    #pragma unroll(4)
+    for (uint32_t i = 0; i < n_vectors; i++) {
+        HVX_Vector centered = Q6_Vqf32_vsub_VsfVsf(src[i], mean);
+        HVX_Vector scaled   = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(centered), gain);
+        dst[i] = hvx_vec_silu_f32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(scaled, shift)));
+    }
+}
+
+static inline void hvx_fast_norm_f32(const uint8_t * restrict src,
+                                     uint8_t * restrict dst,
+                                     const int num_elems,
+                                     float     epsilon) {
+
+    const HVX_Vector * restrict v_src = (HVX_Vector *) src;
+    HVX_Vector * restrict v_dst       = (HVX_Vector *) dst;
+
+    const int nvec = num_elems / VLEN_FP32;    // number of full vectors
+    const int nloe = num_elems % VLEN_FP32;    // leftover elements
+
+    HVX_Vector mean_x_v;
+    HVX_Vector scale_v;
+    hvx_norm_moments_f32(src, num_elems, epsilon, &mean_x_v, &scale_v);
+    HVX_Vector mean_x_b = hvx_vec_repl_f32(mean_x_v);
 
     #pragma unroll(4)
     for (int i = 0; i < nvec; i++) {

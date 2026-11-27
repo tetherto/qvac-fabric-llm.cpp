@@ -16,6 +16,7 @@ enum htp_copy_kernel_type {
     HTP_COPY_KERNEL_SCALAR             = 5,
     HTP_COPY_KERNEL_GATHER_ROWS        = 6,
     HTP_COPY_KERNEL_STRIDED_CONVERT    = 7,
+    HTP_COPY_KERNEL_TRANSPOSE          = 8,
 };
 
 struct htp_copy_convert_params {
@@ -38,6 +39,26 @@ struct htp_copy_reshape_params {
     struct fastdiv_values div_ne02_ne01_ne00;
 };
 
+struct htp_copy_transpose_params {
+    uint32_t n_rows;
+    uint32_t n_cols;
+    uint32_t n_mats;
+    uint32_t block;
+};
+
+#define HTP_COPY_TRANSPOSE_TILE 32
+
+#define HTP_COPY_TRANSPOSE_MT_MIN_ELEMS (16 * 1024)
+
+#define HTP_COPY_TRANSPOSE_STAGE_SLOTS   2
+#define HTP_COPY_TRANSPOSE_STAGE_BUFFERS (2 * HTP_COPY_TRANSPOSE_STAGE_SLOTS)
+#define HTP_COPY_TRANSPOSE_STAGE_ALIGN   128
+
+static inline uint32_t htp_copy_transpose_stage_buffer_bytes(const struct htp_copy_transpose_params * tp) {
+    const uint32_t cross = tp->n_rows < tp->n_cols ? tp->n_rows : tp->n_cols;
+    return hex_round_up(tp->block * cross * (uint32_t) sizeof(float), HTP_COPY_TRANSPOSE_STAGE_ALIGN);
+}
+
 struct htp_copy_kernel_params {
     uint8_t  kernel_type;
     uint8_t  src0_type_size;
@@ -54,6 +75,8 @@ struct htp_copy_kernel_params {
         struct htp_copy_strided_params strided;
         struct htp_gather_rows_params  gather;
     } u;
+
+    struct htp_copy_transpose_params transpose;
 };
 
 // Size of one VTCM staging buffer: big enough that a DMA descriptor moves many short

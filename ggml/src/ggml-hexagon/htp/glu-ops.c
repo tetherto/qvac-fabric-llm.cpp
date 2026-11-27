@@ -433,6 +433,53 @@ static void geglu_f32(const float * restrict src0,
     }
 }
 
+// gelu(x) * g, the same steps as hvx_geglu_f32_aa
+static inline HVX_Vector hvx_vec_geglu_f32(HVX_Vector x, HVX_Vector g) {
+    const HVX_Vector v_coef_a_times_sqrt = hvx_vec_splat_f32(GELU_COEF_A * SQRT_2_OVER_PI);
+    const HVX_Vector v_sqrt_2_pi         = hvx_vec_splat_f32(SQRT_2_OVER_PI);
+    const HVX_Vector v_one               = hvx_vec_splat_f32(1.0f);
+    const HVX_Vector v_max_exp           = hvx_vec_splat_f32(87.0f);
+    const HVX_Vector v_min_exp           = hvx_vec_splat_f32(-87.0f);
+
+    HVX_Vector x2    = hvx_vec_mul_f32_f32(x, x);
+    HVX_Vector coef  = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(x2, v_coef_a_times_sqrt), v_sqrt_2_pi);
+    HVX_Vector inner = hvx_vec_mul_f32_f32(x, coef);
+    HVX_Vector sig2y = hvx_vec_fast_sigmoid_f32_guard_2it(hvx_vec_add_f32_f32(inner, inner), v_one, v_max_exp, v_min_exp);
+
+    return hvx_vec_mul_f32_f32(hvx_vec_mul_f32_f32(x, sig2y), g);
+}
+
+// Two f32 result vectors make one fp16 vector, so nc is a multiple of two vectors
+static inline void hvx_geglu_f32_to_f16_aa(uint8_t * restrict dst, const uint8_t * restrict src0, const uint8_t * restrict src1, uint32_t n) {
+    HVX_Vector * restrict vdst        = (HVX_Vector *) dst;
+    const HVX_Vector * restrict vsrc0 = (const HVX_Vector *) src0;
+    const HVX_Vector * restrict vsrc1 = (const HVX_Vector *) src1;
+
+    const uint32_t n_pairs = n / (2 * (128 / sizeof(float)));
+
+    _Pragma("unroll(2)")
+    for (uint32_t i = 0; i < n_pairs; i++) {
+        vdst[i] = hvx_vec_f32_to_f16(hvx_vec_geglu_f32(vsrc0[2 * i], vsrc1[2 * i]), hvx_vec_geglu_f32(vsrc0[2 * i + 1], vsrc1[2 * i + 1]));
+    }
+}
+
+// geglu(x, g) with f32 operands and an fp16 result
+static void geglu_f32_to_f16(const float * restrict src0,
+                             const float * restrict src1,
+                             float * restrict dst,
+                             const uint32_t num_rows,
+                             const struct htp_glu_context * gctx) {
+    htp_glu_op_preamble;
+
+    for (uint32_t ib = 0; ib < num_rows; ib++) {
+        const uint8_t * restrict src0_ptr = (const uint8_t *) src0 + (ib * src0_row_size_aligned);
+        const uint8_t * restrict src1_ptr = (const uint8_t *) src1 + (ib * src1_row_size_aligned);
+        uint8_t * restrict dst_ptr        = (uint8_t *) dst + (ib * dst_row_size_aligned);
+
+        hvx_geglu_f32_to_f16_aa(dst_ptr, src0_ptr, src1_ptr, nc);
+    }
+}
+
 // geglu_quick(x, g) = x * sigmoid(1.702 * x) * g
 static void geglu_quick_f32(const float * restrict src0,
                             const float * restrict src1,
@@ -923,7 +970,12 @@ static int execute_op_glu_f32(struct htp_ops_context * octx) {
     }
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
-    const size_t dst_row_size = dst->ne[0] * SIZEOF_FP32;
+    const bool   to_f16       = dst->type == HTP_TYPE_F16;
+    const size_t src_row_size = dst->ne[0] * SIZEOF_FP32;
+    const size_t dst_row_size = dst->ne[0] * (to_f16 ? sizeof(_Float16) : SIZEOF_FP32);
+    if (to_f16 && octx->op != HTP_OP_GLU_GEGLU) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
 
     uint32_t row_start = 0;
     uint32_t nrows     = src0_nrows;
@@ -944,14 +996,14 @@ static int execute_op_glu_f32(struct htp_ops_context * octx) {
 
     // row_size   = bytes of useful data per row (what the kernel touches / what DMA copies).
     // row_stride = bytes between successive rows in DDR (may exceed row_size for non-contig src).
-    const size_t nc_bytes        = dst_row_size;
+    const size_t nc_bytes        = src_row_size;
     const size_t src0_row_size   = nc_bytes;
     const size_t src1_row_size   = nc_bytes;
     const size_t src0_row_stride = src0->nb[1];
     const size_t src1_row_stride = src1 ? src1->nb[1] : src0->nb[1];
 
     struct htp_glu_vtcm_layout L;
-    htp_glu_vtcm_layout_build(&L, dst_row_size, n_threads, kparams->vtcm_row_per_thread);
+    htp_glu_vtcm_layout_build(&L, src_row_size, n_threads, kparams->vtcm_row_per_thread);
 
     const size_t src0_row_size_aligned = L.row_size_aligned;
     const size_t src1_row_size_aligned = L.row_size_aligned;
@@ -978,7 +1030,7 @@ static int execute_op_glu_f32(struct htp_ops_context * octx) {
     // Prepare context
     struct htp_glu_context gctx;
     gctx.octx    = octx;
-    gctx.compute = (void *) compute_fn;
+    gctx.compute = to_f16 ? (void *) geglu_f32_to_f16 : (void *) compute_fn;
     gctx.op_str  = op_type;
 
     gctx.src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);

@@ -52,6 +52,7 @@ htp_op_code htp_op_remap(const struct ggml_tensor * t) {
         case GGML_OP_REPEAT:          return HTP_OP_REPEAT;
         case GGML_OP_CUMSUM:          return HTP_OP_CUMSUM;
         case GGML_OP_FILL:            return HTP_OP_FILL;
+        case GGML_OP_TIMESTEP_EMBEDDING: return HTP_OP_TIMESTEP_EMBEDDING;
         case GGML_OP_DIAG:            return HTP_OP_DIAG;
         case GGML_OP_SOLVE_TRI:       return HTP_OP_SOLVE_TRI;
         case GGML_OP_TRI:             return HTP_OP_TRI;
@@ -444,7 +445,7 @@ static bool htp_kparams_solve_flash_attn(
             kparams->Br                  = Br;
             kparams->Bc                  = Bc;
             kparams->n_kv_blocks         = (nek1 + Bc - 1) / Bc;
-            kparams->n_threads           = (kparams->n_kv_blocks >= 3 && n_threads >= 2) ? n_threads : 1;
+            kparams->n_threads           = hmx_fa_runs_threaded(kparams->n_kv_blocks, (size_t) G * neq1, n_threads) ? n_threads : 1;
             kparams->u.hmx.g_br          = hex_align_up(G * Br, 32);
             kparams->u.hmx.pipeline      = (kparams->n_kv_blocks >= 3 && n_threads >= 2) ? 1 : 0;
             kparams->vtcm_size           = hmx_fa_compute_vtcm_usage(G, DK_pad, DV_pad, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head);
@@ -1189,18 +1190,16 @@ bool htp_kparams_solve_mmidnx(
     return ok;
 }
 
-static bool htp_kparams_solve_binary(
+static bool htp_kparams_solve_binary_impl(
     const struct ggml_hexagon_session * sess,
-    const struct ggml_tensor * op_tensor,
+    uint32_t op,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * src2,
+    const struct ggml_tensor * dst,
     struct htp_binary_kernel_params * kparams
 ) {
     memset(kparams, 0, sizeof(*kparams));
-
-    const uint32_t op = htp_op_remap(op_tensor);
-    const struct ggml_tensor * src0 = op_tensor->src[0];
-    const struct ggml_tensor * src1 = op_tensor->src[1];
-    const struct ggml_tensor * src2 = (op == HTP_OP_ADD_ID) ? op_tensor->src[2] : nullptr;
-    const struct ggml_tensor * dst  = op_tensor;
 
     const bool is_add_id = (op == HTP_OP_ADD_ID);
     if (is_add_id) {
@@ -1411,6 +1410,50 @@ static bool htp_kparams_solve_binary(
     return true;
 }
 
+static bool htp_kparams_solve_binary(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op_tensor,
+    struct htp_binary_kernel_params * kparams
+) {
+    const uint32_t op = htp_op_remap(op_tensor);
+    const struct ggml_tensor * src2 = (op == HTP_OP_ADD_ID) ? op_tensor->src[2] : nullptr;
+    return htp_kparams_solve_binary_impl(sess, op, op_tensor->src[0], op_tensor->src[1], src2, op_tensor, kparams);
+}
+
+static const size_t HTP_BINARY_PLANE_ROW_MAX_BYTES = 64 * 1024;
+static const size_t HTP_BINARY_PLAIN_INPUTS        = 2;
+
+static bool htp_binary_is_plain(uint32_t op) {
+    return op == HTP_OP_ADD || op == HTP_OP_SUB || op == HTP_OP_MUL || op == HTP_OP_DIV;
+}
+
+static bool htp_tensor_has_contiguous_planes(const struct ggml_tensor * t) {
+    const size_t elem_size = ggml_type_size(t->type);
+    return t->nb[0] == elem_size && t->nb[1] == (size_t) t->ne[0] * elem_size;
+}
+
+static bool htp_binary_scales_whole_planes(const struct ggml_tensor * src0, const struct ggml_tensor * src1, const struct ggml_tensor * dst, uint32_t n_threads) {
+    const size_t plane_bytes = (size_t) src0->ne[0] * src0->ne[1] * ggml_type_size(src0->type);
+    const bool   per_plane   = src1->ne[0] == 1 && src1->ne[1] == 1 && ggml_nelements(src1) > 1;
+    const bool   same_layout = ggml_are_same_shape(src0, dst) && src0->type == dst->type && src0->type == src1->type;
+    return per_plane && same_layout && src0->ne[1] > 1 &&
+           htp_tensor_has_contiguous_planes(src0) && htp_tensor_has_contiguous_planes(dst) &&
+           plane_bytes <= HTP_BINARY_PLANE_ROW_MAX_BYTES &&
+           (uint64_t) src0->ne[2] * src0->ne[3] >= n_threads;
+}
+
+static struct ggml_tensor htp_tensor_merge_plane_rows(const struct ggml_tensor * t) {
+    struct ggml_tensor merged = *t;
+    merged.ne[0] = t->ne[0] * t->ne[1];
+    merged.ne[1] = t->ne[2];
+    merged.ne[2] = t->ne[3];
+    merged.ne[3] = 1;
+    merged.nb[1] = t->nb[2];
+    merged.nb[2] = t->nb[3];
+    merged.nb[3] = t->nb[3] * t->ne[3];
+    return merged;
+}
+
 // collapse contiguous dims of elementwise ops so that rows fill at least one HVX vector
 static void htp_collapse_dims(struct ggml_tensor ** tensors, size_t n_tensors, size_t elem_size, uint32_t n_threads) {
     if (n_tensors == 0 || !tensors[0]) {
@@ -1513,6 +1556,26 @@ static void htp_collapse_dims(struct ggml_tensor ** tensors, size_t n_tensors, s
     }
 }
 
+static bool htp_unary_reduces_whole_rows(uint32_t op) {
+    return op == HTP_OP_NORM || op == HTP_OP_NORM_AFFINE || op == HTP_OP_RMS_NORM || op == HTP_OP_L2_NORM;
+}
+
+static uint32_t htp_unary_fit_row_threads(uint32_t op, ggml_type type, uint32_t n_threads, size_t vtcm_size, size_t src0_row_size, size_t dst_row_size) {
+    if (!htp_unary_reduces_whole_rows(op) || type != GGML_TYPE_F32) {
+        return n_threads;
+    }
+    const size_t staged_row_size = 2 * (hex_round_up(src0_row_size, 128) + hex_round_up(dst_row_size, 128));
+    const size_t fitting_threads = staged_row_size > 0 ? vtcm_size / staged_row_size : n_threads;
+    return (uint32_t) (std::max<size_t>(1, (std::min<size_t>)(n_threads, fitting_threads)));
+}
+
+static uint32_t htp_unary_weight_row_elems(uint32_t op, const struct ggml_tensor * src1) {
+    if (op == HTP_OP_NORM_AFFINE) {
+        return (uint32_t) (HTP_NORM_AFFINE_TERMS * htp_norm_affine_term_bytes(ggml_nelements(src1)) / sizeof(float));
+    }
+    return op == HTP_OP_RMS_NORM_MUL ? (uint32_t) src1->ne[0] : 0;
+}
+
 static bool htp_kparams_solve_unary_impl(
     const struct ggml_hexagon_session * sess,
     uint32_t op,
@@ -1575,12 +1638,14 @@ static bool htp_kparams_solve_unary_impl(
     const uint32_t src0_nrows          = src0->ne[1] * src0->ne[2] * src0->ne[3];
     const uint32_t min_rows_per_thread = (uint32_t) (std::max<size_t>(1, (128 + dst_data_row_size - 1) / dst_data_row_size));
     const uint32_t max_threads         = (std::max)(1u, src0_nrows / min_rows_per_thread);
-    const uint32_t n_threads           = (std::min)(htp_session_n_threads(sess), max_threads);
     const size_t   vtcm_size           = htp_session_vtcm_size(sess);
+    const uint32_t n_threads           = htp_unary_fit_row_threads(op, src0->type, (std::min)(htp_session_n_threads(sess), max_threads),
+                                                                   vtcm_size, src0->ne[0] * elem_size, dst_data_row_size);
 
     kparams->n_threads = n_threads;
 
-    const bool broadcast_weight = (op == HTP_OP_RMS_NORM_MUL) && (src1->ne[1] * src1->ne[2] * src1->ne[3] == 1);
+    const bool broadcast_weight = (op == HTP_OP_NORM_AFFINE) ||
+                                  ((op == HTP_OP_RMS_NORM_MUL) && (src1->ne[1] * src1->ne[2] * src1->ne[3] == 1));
     kparams->broadcast_weight   = broadcast_weight;
 
     const bool     src0_contig           = ggml_is_contiguous_1(src0);
@@ -1600,7 +1665,7 @@ static bool htp_kparams_solve_unary_impl(
     uint32_t vtcm_row_per_thread = 0;
 
     htp_unary_solve_layout(&L, op, src0->ne[0], dst->ne[0],
-                           op == HTP_OP_RMS_NORM_MUL ? src1->ne[0] : 0,
+                           htp_unary_weight_row_elems(op, src1),
                            max_block, broadcast_weight, n_threads, vtcm_size, elem_size,
                            &col_tile, &vtcm_row_per_thread);
 
@@ -1637,6 +1702,16 @@ bool htp_kparams_solve_rms_norm_mul(
     struct htp_unary_kernel_params * kparams
 ) {
     return htp_kparams_solve_unary_impl(sess, HTP_OP_RMS_NORM_MUL, src0, src1, dst, kparams);
+}
+
+bool htp_kparams_solve_norm_affine(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * weight,
+    const struct ggml_tensor * dst,
+    struct htp_unary_kernel_params * kparams
+) {
+    return htp_kparams_solve_unary_impl(sess, HTP_OP_NORM_AFFINE, src0, weight, dst, kparams);
 }
 
 bool htp_kparams_solve_repeat_get_rows(
@@ -2017,6 +2092,15 @@ static bool htp_kparams_solve_sum_rows(
     return true;
 }
 
+static constexpr int64_t HTP_GLU_F16_PAIR_ELEMS = 2 * (128 / sizeof(float));
+
+static bool htp_glu_accepts_dst_type(uint32_t op, const struct ggml_tensor * src0, const struct ggml_tensor * dst) {
+    if (op == HTP_OP_GLU_GEGLU && src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+        return dst->ne[0] % HTP_GLU_F16_PAIR_ELEMS == 0;
+    }
+    return dst->type == src0->type;
+}
+
 bool htp_kparams_solve_unary_mul_glu(
     const struct ggml_hexagon_session * sess,
     uint32_t op,
@@ -2030,7 +2114,7 @@ bool htp_kparams_solve_unary_mul_glu(
     if (!htp_op_is_glu((htp_op_code) op)) {
         return false;
     }
-    if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) || dst->type != src0->type) {
+    if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) || !htp_glu_accepts_dst_type(op, src0, dst)) {
         return false;
     }
     if ((op == HTP_OP_GLU_GEGLU_QUICK || op == HTP_OP_GLU_GEGLU_ERF) && src0->type != GGML_TYPE_F32) {
@@ -2670,6 +2754,73 @@ static bool htp_kparams_solve_concat(
     return false;
 }
 
+static bool htp_copy_solve_transpose(
+    const struct ggml_tensor * src0,
+    uint32_t type_size,
+    struct htp_copy_transpose_params * tp
+) {
+    uint64_t n_cols = 1;
+    int      outer  = 0;
+    for (int dim = 1; dim < GGML_MAX_DIMS && src0->nb[dim] == n_cols * type_size; dim++) {
+        n_cols *= (uint64_t) src0->ne[dim];
+        if (src0->nb[0] == n_cols * type_size) {
+            outer = dim + 1;
+            break;
+        }
+    }
+    if (outer == 0 || src0->ne[0] < 2 || n_cols < 2) {
+        return false;
+    }
+
+    uint64_t expected = (uint64_t) src0->ne[0] * n_cols * type_size;
+    uint64_t n_mats   = 1;
+    for (int dim = outer; dim < GGML_MAX_DIMS; dim++) {
+        if (src0->nb[dim] != expected) {
+            return false;
+        }
+        expected *= (uint64_t) src0->ne[dim];
+        n_mats   *= (uint64_t) src0->ne[dim];
+    }
+
+    tp->n_rows = (uint32_t) src0->ne[0];
+    tp->n_cols = (uint32_t) n_cols;
+    tp->n_mats = (uint32_t) n_mats;
+    return true;
+}
+
+static const uint32_t HTP_COPY_TRANSPOSE_STAGE_MIN_BLOCKS_PER_THREAD = 2;
+static const uint64_t HTP_COPY_TRANSPOSE_STAGE_MAX_BUFFER_BYTES      = 256 * 1024;
+
+static uint32_t htp_copy_transpose_stage_block(const struct htp_copy_transpose_params * tp, uint32_t n_threads, size_t vtcm_size) {
+    const uint64_t along        = (std::max)(tp->n_rows, tp->n_cols);
+    const uint64_t cross_bytes  = (uint64_t) (std::min)(tp->n_rows, tp->n_cols) * sizeof(float);
+    const uint64_t budget       = (std::min<uint64_t>)(HTP_COPY_TRANSPOSE_STAGE_MAX_BUFFER_BYTES,
+                                                        vtcm_size / ((uint64_t) HTP_COPY_TRANSPOSE_STAGE_BUFFERS * n_threads));
+    const uint64_t wanted_units = (uint64_t) HTP_COPY_TRANSPOSE_STAGE_MIN_BLOCKS_PER_THREAD * n_threads;
+    const uint64_t balanced     = hex_round_up((along * tp->n_mats + wanted_units - 1) / wanted_units, HTP_COPY_TRANSPOSE_TILE);
+    const uint64_t fitting      = budget / cross_bytes;
+    return (uint32_t) ((std::min)(fitting, balanced) / HTP_COPY_TRANSPOSE_TILE * HTP_COPY_TRANSPOSE_TILE);
+}
+
+static void htp_copy_stage_transpose(struct htp_copy_kernel_params * kparams, size_t vtcm_size) {
+    struct htp_copy_transpose_params * tp = &kparams->transpose;
+    tp->block = htp_copy_transpose_stage_block(tp, kparams->n_threads, vtcm_size);
+    kparams->vtcm_size = (uint32_t) ((uint64_t) HTP_COPY_TRANSPOSE_STAGE_BUFFERS * kparams->n_threads * htp_copy_transpose_stage_buffer_bytes(tp));
+}
+
+static void htp_copy_solve_reshape(
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * dst,
+    struct htp_copy_reshape_params * rp
+) {
+    rp->div_ne0            = init_fastdiv_values((uint32_t) dst->ne[0]);
+    rp->div_ne1_ne0        = init_fastdiv_values((uint32_t) (dst->ne[1] * dst->ne[0]));
+    rp->div_ne2_ne1_ne0    = init_fastdiv_values((uint32_t) (dst->ne[2] * dst->ne[1] * dst->ne[0]));
+    rp->div_ne00           = init_fastdiv_values((uint32_t) src0->ne[0]);
+    rp->div_ne01_ne00      = init_fastdiv_values((uint32_t) (src0->ne[1] * src0->ne[0]));
+    rp->div_ne02_ne01_ne00 = init_fastdiv_values((uint32_t) (src0->ne[2] * src0->ne[1] * src0->ne[0]));
+}
+
 static bool htp_kparams_solve_cpy(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -2773,14 +2924,19 @@ static bool htp_kparams_solve_cpy(
             return true;
         }
 
+        htp_copy_solve_reshape(src0, dst, &kparams->u.reshape);
+
+        if (src_type_size == sizeof(float) && dst_is_contiguous && mdev_count <= 1 &&
+            htp_copy_solve_transpose(src0, src_type_size, &kparams->transpose)) {
+            const bool multi_thread = nelem_src >= HTP_COPY_TRANSPOSE_MT_MIN_ELEMS && n_threads > 1;
+            kparams->kernel_type = HTP_COPY_KERNEL_TRANSPOSE;
+            kparams->n_threads   = multi_thread ? (uint8_t) n_threads : 1;
+            htp_copy_stage_transpose(kparams, vtcm_size);
+            return true;
+        }
+
         kparams->kernel_type = HTP_COPY_KERNEL_RESHAPE;
         kparams->n_threads   = n_threads > 0 ? (uint8_t) n_threads : 4;
-        kparams->u.reshape.div_ne0            = init_fastdiv_values((uint32_t) dst->ne[0]);
-        kparams->u.reshape.div_ne1_ne0        = init_fastdiv_values((uint32_t) (dst->ne[1] * dst->ne[0]));
-        kparams->u.reshape.div_ne2_ne1_ne0    = init_fastdiv_values((uint32_t) (dst->ne[2] * dst->ne[1] * dst->ne[0]));
-        kparams->u.reshape.div_ne00           = init_fastdiv_values((uint32_t) src0->ne[0]);
-        kparams->u.reshape.div_ne01_ne00      = init_fastdiv_values((uint32_t) (src0->ne[1] * src0->ne[0]));
-        kparams->u.reshape.div_ne02_ne01_ne00 = init_fastdiv_values((uint32_t) (src0->ne[2] * src0->ne[1] * src0->ne[0]));
         return true;
     }
 
@@ -3333,6 +3489,33 @@ static bool htp_kparams_solve_fill(
     return true;
 }
 
+static constexpr int HTP_TIMESTEP_PARAM_DIM        = 0;
+static constexpr int HTP_TIMESTEP_PARAM_MAX_PERIOD = 1;
+
+static bool htp_kparams_solve_timestep_embedding(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_timestep_kernel_params * kparams
+) {
+    GGML_UNUSED(sess);
+    memset(kparams, 0, sizeof(*kparams));
+
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst) || ggml_nelements(src0) != src0->ne[0]) {
+        return false;
+    }
+
+    kparams->dim            = (uint32_t) ggml_get_op_params_i32(op, HTP_TIMESTEP_PARAM_DIM);
+    kparams->n_timesteps    = (uint32_t) src0->ne[0];
+    kparams->log_max_period = logf((float) ggml_get_op_params_i32(op, HTP_TIMESTEP_PARAM_MAX_PERIOD));
+    return true;
+}
+
 static bool htp_kparams_solve_roll(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -3603,6 +3786,155 @@ static bool htp_kparams_solve_solve_tri(
     return true;
 }
 
+static const size_t   HTP_CONV2D_TILE_BYTES           = 2048;
+static const uint64_t HTP_CONV2D_WIN_PHASE_COST       = 480;
+static const uint64_t HTP_CONV2D_WIN_CROUTON_COST     = 4;
+static const uint64_t HTP_CONV2D_WIN_WEIGHT_TILE_COST = 1;
+static const uint32_t HTP_CONV2D_WIN_MIN_THREADS      = 2;
+static const uint32_t HTP_CONV2D_WIN_MAX_CHUNK        = 512;
+static const uint32_t HTP_CONV2D_WIN_MIN_CHUNK        = 8;
+static const uint32_t HTP_CONV2D_WIN_SEG_TILES        = 8;
+static const uint32_t HTP_CONV2D_WIN_MAX_SEG_T        = 32;
+
+struct htp_conv2d_win_shape {
+    uint32_t n_rt;
+    uint32_t n_wt;
+    uint32_t n_cc;
+    uint32_t n_ch;
+    uint32_t n_tiles;
+    uint32_t halo;
+    uint32_t n_threads;
+    uint32_t c_in;
+    uint32_t out_width;
+    uint32_t in_width;
+    bool     cwhn;
+    bool     fold;
+    size_t   weight_scratch;
+    size_t   vtcm_size;
+};
+
+struct htp_conv2d_win_fit {
+    uint32_t rt_block;
+    uint32_t ct;
+    uint32_t seg_b;
+    uint32_t seg_t;
+    uint32_t n_threads;
+    size_t   stage;
+    size_t   thr;
+    size_t   total;
+};
+
+static size_t htp_conv2d_win_stage_size(const struct htp_conv2d_win_shape & shape, uint32_t seg_b) {
+    if (shape.fold) {
+        return hex_round_up((size_t) shape.c_in * ((seg_b * 32 + shape.out_width - 1) / shape.out_width + 1) * shape.in_width * sizeof(float) + 256, 128);
+    }
+    if (shape.cwhn) {
+        return hex_round_up((size_t) seg_b * 32 * shape.c_in * sizeof(float) + 256, 128);
+    }
+    return hex_round_up((size_t) shape.n_ch * seg_b * 32 * sizeof(float), 128);
+}
+
+static void htp_conv2d_win_measure(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit & fit) {
+    const size_t out_stage = (size_t) HTP_CONV2D_WIN_OBUF * 32 * fit.seg_t * 32 * sizeof(float);
+    fit.stage = htp_conv2d_win_stage_size(shape, fit.seg_b);
+    fit.thr   = hex_round_up((std::max)(2 * fit.stage + out_stage, shape.weight_scratch), HTP_CONV2D_TILE_BYTES);
+
+    const size_t w_size = (size_t) fit.rt_block * shape.n_wt * shape.n_cc * HTP_CONV2D_TILE_BYTES;
+    const size_t act    = (size_t) shape.n_cc * (fit.ct + shape.halo) * HTP_CONV2D_TILE_BYTES;
+    const size_t out    = (size_t) fit.rt_block * fit.ct * HTP_CONV2D_TILE_BYTES;
+    struct htp_conv2d_vtcm_layout layout;
+    htp_conv2d_vtcm_layout_build(&layout, fit.rt_block, w_size, act, out, fit.thr, fit.n_threads);
+    fit.total = layout.total_bytes;
+}
+
+static bool htp_conv2d_win_fits(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit & fit) {
+    htp_conv2d_win_measure(shape, fit);
+    return fit.total <= shape.vtcm_size;
+}
+
+static uint32_t htp_conv2d_win_max_rt_block(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit fit) {
+    fit.rt_block = 1;
+    if (!htp_conv2d_win_fits(shape, fit)) {
+        return 0;
+    }
+    const size_t per_rt = ((size_t) shape.n_wt * shape.n_cc + 2 * fit.ct) * HTP_CONV2D_TILE_BYTES;
+    fit.rt_block = (uint32_t) (std::min<size_t>)(shape.n_rt, 1 + (shape.vtcm_size - fit.total) / per_rt);
+    while (fit.rt_block > 1 && !htp_conv2d_win_fits(shape, fit)) {
+        fit.rt_block--;
+    }
+    return fit.rt_block;
+}
+
+static uint64_t htp_conv2d_win_cost(const struct htp_conv2d_win_shape & shape, const struct htp_conv2d_win_fit & fit) {
+    const uint64_t n_blocks     = (shape.n_rt + fit.rt_block - 1) / fit.rt_block;
+    const uint64_t n_chunks     = (shape.n_tiles + fit.ct - 1) / fit.ct;
+    const uint64_t packed_tiles = shape.n_tiles + n_chunks * shape.halo;
+    const uint64_t n_packs      = n_chunks <= HTP_CONV2D_WIN_ACT_BUFFERS ? 1 : n_blocks;
+    const uint64_t crouton_work = n_packs * packed_tiles * shape.n_cc * HTP_CONV2D_WIN_CROUTON_COST;
+    const uint64_t weight_work  = (uint64_t) shape.n_rt * shape.n_wt * shape.n_cc * HTP_CONV2D_WIN_WEIGHT_TILE_COST;
+    const uint64_t phases       = n_blocks * (n_chunks + 2) * HTP_CONV2D_WIN_PHASE_COST;
+    return (crouton_work + weight_work) * shape.n_threads / fit.n_threads + phases;
+}
+
+static void htp_conv2d_win_consider(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit candidate,
+                                    struct htp_conv2d_win_fit & best, uint64_t & best_cost) {
+    candidate.rt_block = htp_conv2d_win_max_rt_block(shape, candidate);
+    if (candidate.rt_block == 0) {
+        return;
+    }
+    htp_conv2d_win_measure(shape, candidate);
+    const uint64_t cost = htp_conv2d_win_cost(shape, candidate);
+    if (cost < best_cost) {
+        best      = candidate;
+        best_cost = cost;
+    }
+}
+
+static void htp_conv2d_win_consider_segments(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit candidate,
+                                             struct htp_conv2d_win_fit & best, uint64_t & best_cost) {
+    while (true) {
+        htp_conv2d_win_consider(shape, candidate, best, best_cost);
+        if (candidate.seg_b == 1 && candidate.seg_t == 1) {
+            return;
+        }
+        candidate.seg_b = (std::max)(candidate.seg_b / 2, 1u);
+        candidate.seg_t = (std::max)(candidate.seg_t / 2, 1u);
+    }
+}
+
+static uint32_t htp_conv2d_win_start_chunk(uint32_t n_tiles, uint32_t halo) {
+    const uint32_t quarter = (std::max)(4 * halo, (n_tiles + 3) / 4);
+    const uint32_t bounded = (std::min)((std::max)(quarter, HTP_CONV2D_WIN_MIN_CHUNK), HTP_CONV2D_WIN_MAX_CHUNK);
+    return (std::min)(bounded, n_tiles);
+}
+
+static void htp_conv2d_win_consider_kept_croutons(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit candidate,
+                                                  struct htp_conv2d_win_fit & best, uint64_t & best_cost) {
+    for (uint32_t n_chunks = 1; n_chunks <= HTP_CONV2D_WIN_ACT_BUFFERS; n_chunks++) {
+        candidate.ct = (shape.n_tiles + n_chunks - 1) / n_chunks;
+        if (candidate.ct <= HTP_CONV2D_WIN_MAX_CHUNK) {
+            htp_conv2d_win_consider_segments(shape, candidate, best, best_cost);
+        }
+    }
+}
+
+static void htp_conv2d_win_consider_chunks(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit start,
+                                           struct htp_conv2d_win_fit & best, uint64_t & best_cost) {
+    htp_conv2d_win_consider_kept_croutons(shape, start, best, best_cost);
+    for (struct htp_conv2d_win_fit candidate = start; candidate.ct >= 1; candidate.ct /= 2) {
+        htp_conv2d_win_consider_segments(shape, candidate, best, best_cost);
+    }
+}
+
+static bool htp_conv2d_win_fit_vtcm(const struct htp_conv2d_win_shape & shape, struct htp_conv2d_win_fit start, struct htp_conv2d_win_fit & best) {
+    const uint32_t min_threads = (std::min)(HTP_CONV2D_WIN_MIN_THREADS, shape.n_threads);
+    uint64_t       best_cost   = UINT64_MAX;
+    for (start.n_threads = shape.n_threads; start.n_threads >= min_threads; start.n_threads--) {
+        htp_conv2d_win_consider_chunks(shape, start, best, best_cost);
+    }
+    return best_cost != UINT64_MAX;
+}
+
 // Implicit GEMM over sliding windows of fp16 input croutons (HMX activation:single), no im2col
 static bool htp_kparams_conv2d_win(
     const struct ggml_hexagon_session * sess,
@@ -3668,7 +4000,6 @@ static bool htp_kparams_conv2d_win(
     const uint32_t n_rt  = (Cout + 31) / 32;
     const uint64_t n_q   = (uint64_t) (N * IHS - (IHS - OH) - 1) * SR + OW;
     const uint32_t nth   = kp->n_threads;
-    const size_t   tile  = 2048;
 
     if ((uint64_t) N * IHS * SR + moff + 64 >= (1ull << 31)) {
         return false;
@@ -3703,51 +4034,26 @@ static bool htp_kparams_conv2d_win(
         wscr = 2 * (size_t) w_cs * 32 * 128;
     }
 
-    uint32_t rt_block = n_rt;
-    uint32_t ct       = (std::max)(4 * halo, (n_tiles + 3) / 4);
-    ct = (std::min)((std::max)(ct, 8u), 512u);
-    ct = (std::min)(ct, n_tiles);
-    uint32_t seg_b = 8;
-    // longer output rows make the output DMA more efficient
-    uint32_t seg_t = (std::min)(32u, (std::max)(8u, (OW + 31) / 32));
+    const struct htp_conv2d_win_shape shape = {
+        n_rt, n_wt, n_cc, n_ch, n_tiles, halo, nth, Cin, OW, IW, cwhn, fold, wscr, htp_session_vtcm_size(sess),
+    };
+    struct htp_conv2d_win_fit start = {};
+    start.ct    = htp_conv2d_win_start_chunk(n_tiles, halo);
+    start.seg_b = HTP_CONV2D_WIN_SEG_TILES;
+    start.seg_t = (std::min)(HTP_CONV2D_WIN_MAX_SEG_T, (std::max)(HTP_CONV2D_WIN_SEG_TILES, (OW + 31) / 32));
 
-    while (rt_block > 1 && (size_t) rt_block * n_wt * n_cc * tile > htp_session_vtcm_size(sess) / 2) {
-        rt_block = (rt_block + 1) / 2;
+    struct htp_conv2d_win_fit fit = {};
+    if (!htp_conv2d_win_fit_vtcm(shape, start, fit)) {
+        return false;
     }
-
-    size_t stage = 0, thr = 0, act = 0, out = 0, w_size = 0, total = 0;
-    uint32_t n_bc = 0;
-    while (true) {
-        n_bc   = ct + halo;
-        stage  = cwhn ? (size_t) seg_b * 32 * Cin * sizeof(float) + 256 : (size_t) n_ch * seg_b * 32 * sizeof(float);
-        if (fold) {
-            // raw input rows of the staged pixels with 128 bytes of read slack on both sides
-            stage = (size_t) Cin * ((seg_b * 32 + OW - 1) / OW + 1) * IW * sizeof(float) + 256;
-        }
-        stage  = hex_round_up(stage, 128);
-        thr    = hex_round_up((std::max)(2 * stage + (size_t) HTP_CONV2D_WIN_OBUF * 32 * seg_t * 32 * sizeof(float), wscr), tile);
-        w_size = (size_t) rt_block * n_wt * n_cc * tile;
-        act    = (size_t) n_cc * n_bc * tile;
-        out    = (size_t) rt_block * ct * tile;
-        struct htp_conv2d_vtcm_layout L;
-        htp_conv2d_vtcm_layout_build(&L, rt_block, w_size, act, out, thr, nth);
-        total  = L.total_bytes;
-        if (total <= htp_session_vtcm_size(sess)) {
-            break;
-        }
-        if (ct > 64) {
-            ct /= 2;
-        } else if (rt_block > 1) {
-            rt_block = (rt_block + 1) / 2;
-        } else if (seg_b > 1 || seg_t > 1) {
-            seg_b = (std::max)(seg_b / 2, 1u);
-            seg_t = (std::max)(seg_t / 2, 1u);
-        } else if (ct > 1) {
-            ct /= 2;
-        } else {
-            return false;
-        }
-    }
+    const uint32_t rt_block = fit.rt_block;
+    const uint32_t ct       = fit.ct;
+    const uint32_t seg_b    = fit.seg_b;
+    const uint32_t seg_t    = fit.seg_t;
+    const uint32_t n_bc     = ct + halo;
+    const size_t   stage    = fit.stage;
+    const size_t   thr      = fit.thr;
+    const size_t   total    = fit.total;
 
     if (hex_round_up((size_t) T * sizeof(uint32_t), 128) + 2 * hex_round_up((size_t) ct, 128) > HTP_DDR_SPAD_SIZE) {
         return false;
@@ -3759,7 +4065,7 @@ static bool htp_kparams_conv2d_win(
     const uint32_t n_cs = (32 + CS - 1) / CS;
 
     kp->kernel_type        = (uint8_t) HTP_CONV2D_KERNEL_HMX_WINDOW;
-    kp->n_threads          = (uint8_t) nth;
+    kp->n_threads          = (uint8_t) fit.n_threads;
     kp->cwhn               = cwhn ? 1 : 0;
     kp->w_kmajor           = !w_rows ? 1 : 0;
     kp->n_row_tiles        = n_rt;
@@ -4153,8 +4459,37 @@ static inline bool htp_kparams_invoke(
     return SolveFn(sess, op, kparams ? (KParams *) kparams : &tmp);
 }
 
+static bool htp_opnode_is_plain_binary(const htp_opnode & node) {
+    return htp_binary_is_plain(node.opcode) && node.inputs.size() == HTP_BINARY_PLAIN_INPUTS &&
+           node.inputs[0] && node.inputs[1] && !node.outputs.empty() && node.outputs[0];
+}
+
+static void htp_opnode_merge_binary_plane_rows(const struct ggml_hexagon_session * sess, htp_opnode & node) {
+    const struct ggml_tensor * src0 = node.inputs[0];
+    const struct ggml_tensor * src1 = node.inputs[1];
+    const struct ggml_tensor * dst  = node.outputs[0];
+    if (!htp_binary_scales_whole_planes(src0, src1, dst, htp_session_n_threads(sess))) {
+        return;
+    }
+    const struct ggml_tensor src0_merged = htp_tensor_merge_plane_rows(src0);
+    const struct ggml_tensor src1_merged = htp_tensor_merge_plane_rows(src1);
+    const struct ggml_tensor dst_merged  = htp_tensor_merge_plane_rows(dst);
+    struct htp_binary_kernel_params probe;
+    if (!htp_kparams_solve_binary_impl(sess, node.opcode, &src0_merged, &src1_merged, nullptr, &dst_merged, &probe)) {
+        return;
+    }
+    node.inputs[0]  = node.add_dummy(src0_merged);
+    node.inputs[1]  = node.add_dummy(src1_merged);
+    node.outputs[0] = node.add_dummy(dst_merged);
+}
+
 void htp_opnode_collapse(const struct ggml_hexagon_session * sess, htp_opnode & node) {
     const uint32_t n_threads = htp_session_n_threads(sess);
+
+    if (htp_opnode_is_plain_binary(node)) {
+        htp_opnode_merge_binary_plane_rows(sess, node);
+        return;
+    }
 
     if (htp_op_is_unary(node.opcode) && htp_unary_is_elementwise(node.opcode)) {
         if (node.inputs.empty() || !node.inputs[0] || node.outputs.empty() || !node.outputs[0]) {
@@ -4285,6 +4620,9 @@ bool htp_kparams_solve(
     if (node.opcode == HTP_OP_UPSCALE) {
         return htp_kparams_solve_upscale(sess, src0, dst, node.kparams<htp_upscale_kernel_params>());
     }
+    if (htp_opnode_is_plain_binary(node)) {
+        return htp_kparams_solve_binary_impl(sess, node.opcode, src0, src1, nullptr, dst, node.kparams<htp_binary_kernel_params>());
+    }
 
     return htp_kparams_solve(sess, node.node, node.kernel_params);
 }
@@ -4382,6 +4720,9 @@ bool htp_kparams_solve(
 
         case HTP_OP_FILL:
             return htp_kparams_invoke<htp_kparams_solve_fill>(sess, op, kparams);
+
+        case HTP_OP_TIMESTEP_EMBEDDING:
+            return htp_kparams_invoke<htp_kparams_solve_timestep_embedding>(sess, op, kparams);
 
         case HTP_OP_ROLL:
             return htp_kparams_invoke<htp_kparams_solve_roll>(sess, op, kparams);

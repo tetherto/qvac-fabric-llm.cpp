@@ -1002,6 +1002,7 @@ struct htp_conv2d_win_context {
     uint32_t                             n_rt;
     int32_t                              pack_chunk;
     int32_t                              unpack_chunk;
+    bool                                 scale_block;
     uint32_t                             n_scat;  // small Cin: scatters per crouton into zeroed croutons, else 0
     uint8_t *                            live[2]; // per chunk: tiles with an output row to write
 };
@@ -2078,8 +2079,7 @@ static void conv2d_hmx_win_phase_thread(unsigned int nth, unsigned int ith, void
     if (wc->unpack_chunk >= 0) {
         conv2d_hmx_win_unpack(wc, nth, ith);
     }
-    // weights of this rt block are packed before its first chunk
-    if (wc->pack_chunk == 0) {
+    if (wc->scale_block) {
         const struct htp_tensor * kernel = wc->octx->src[0];
         const uint32_t            n_wt   = (wc->kp->window.fold ? kernel->ne[1] : kernel->ne[0] * kernel->ne[1]) * wc->kp->window.n_cc;
         for (uint32_t rt = ith; rt < wc->n_rt; rt += nth) {
@@ -2110,10 +2110,15 @@ static void conv2d_hmx_win_zero_thread(unsigned int nth, unsigned int ith, void 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, block);
 }
 
-static void conv2d_hmx_win_run_phase(struct htp_conv2d_win_context * wc, int32_t pack, int32_t unpack) {
+static void conv2d_hmx_win_run_phase(struct htp_conv2d_win_context * wc, int32_t pack, int32_t unpack, bool scale_block) {
     wc->pack_chunk   = pack;
     wc->unpack_chunk = unpack;
+    wc->scale_block  = scale_block;
     work_queue_run(wc->octx->ctx->work_queue, conv2d_hmx_win_phase_thread, wc, wc->kp->n_threads);
+}
+
+static inline bool conv2d_hmx_win_keeps_croutons(int32_t n_chunks) {
+    return n_chunks <= HTP_CONV2D_WIN_ACT_BUFFERS;
 }
 
 
@@ -2222,12 +2227,16 @@ static int conv2d_hmx_win(struct htp_ops_context * octx, const struct htp_conv2d
         .wr_last    = (hex_round_up(rem, 8) / 2) * VLEN - 1,
     };
 
+    const bool keeps_croutons = conv2d_hmx_win_keeps_croutons(n_chunks);
+
     for (uint32_t rt0 = 0; rt0 < kp->n_row_tiles; rt0 += kp->rt_block) {
+        const bool croutons_ready = keeps_croutons && rt0 > 0;
+
         wctx.rt0  = rt0;
         wctx.n_rt = MIN(kp->rt_block, kp->n_row_tiles - rt0);
         work_queue_run(octx->ctx->work_queue, conv2d_hmx_win_wpack_thread, &wctx, kp->n_threads);
 
-        conv2d_hmx_win_run_phase(&wctx, 0, -1);
+        conv2d_hmx_win_run_phase(&wctx, croutons_ready ? -1 : 0, -1, true);
 
         for (int32_t c = 0; c < n_chunks; c++) {
             uint32_t ts;
@@ -2241,16 +2250,16 @@ static int conv2d_hmx_win(struct htp_ops_context * octx, const struct htp_conv2d
             task.n_tiles = nt;
             hmx_queue_push(octx->ctx->hmx_queue, hmx_queue_make_desc(conv2d_hmx_win_worker, &task));
 
-            const int32_t pack   = c + 1 < n_chunks ? c + 1 : -1;
+            const int32_t pack   = (c + 1 < n_chunks && !croutons_ready) ? c + 1 : -1;
             const int32_t unpack = c - 1;
             if (pack >= 0 || unpack >= 0) {
-                conv2d_hmx_win_run_phase(&wctx, pack, unpack);
+                conv2d_hmx_win_run_phase(&wctx, pack, unpack, false);
             }
 
             hmx_queue_pop(octx->ctx->hmx_queue);
         }
 
-        conv2d_hmx_win_run_phase(&wctx, -1, n_chunks - 1);
+        conv2d_hmx_win_run_phase(&wctx, -1, n_chunks - 1, false);
     }
 
     return HTP_STATUS_OK;

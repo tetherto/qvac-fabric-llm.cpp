@@ -18,6 +18,8 @@ enum htp_conv2d_kernel_type {
 // HMX_WINDOW output staging buffers per thread
 #define HTP_CONV2D_WIN_OBUF 2
 
+#define HTP_CONV2D_WIN_ACT_BUFFERS 2
+
 // HMX scales of one row tile at the start of VTCM: 32 (scale, bias) fp16 pairs and 128 zero bytes
 #define HTP_CONV2D_HMX_SCALES_SIZE 256
 

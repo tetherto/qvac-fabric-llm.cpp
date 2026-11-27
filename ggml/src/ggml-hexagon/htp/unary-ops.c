@@ -36,7 +36,7 @@ typedef void (*unary_rms_norm_mul_compute_fn_t)(const void * restrict src,
                                                 uint32_t num_rows,
                                                 const struct htp_unary_context * uctx);
 
-typedef void (*unary_tri_compute_fn_t)(const void * restrict src,
+typedef void (*unary_indexed_compute_fn_t)(const void * restrict src,
                                        void * restrict dst,
                                        uint32_t num_rows,
                                        uint32_t ir,
@@ -241,6 +241,119 @@ static void rms_norm_mul_f32(const void * restrict src,
         uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
 
         hvx_fast_rms_norm_mul_f32(src_local, w_local, dst_local, ne0, epsilon, scale);
+    }
+}
+
+typedef void (*norm_affine_plane_fn_t)(const HVX_Vector * restrict src,
+                                       HVX_Vector * restrict dst,
+                                       uint32_t n_vectors,
+                                       HVX_Vector mean,
+                                       HVX_Vector gain,
+                                       HVX_Vector shift);
+
+struct norm_affine_plan {
+    const float *          weight;
+    const float *          bias;
+    norm_affine_plane_fn_t apply_plane;
+    float                  epsilon;
+    uint32_t               row_elems;
+    uint32_t               row_vectors;
+    uint32_t               plane_bytes;
+    uint32_t               plane_vectors;
+    uint32_t               planes_per_row;
+    uint32_t               n_channels;
+};
+
+static uint32_t norm_affine_channels(const struct htp_tensor * weight) {
+    return weight->ne[0] * weight->ne[1] * weight->ne[2] * weight->ne[3];
+}
+
+static size_t norm_affine_terms_bytes(const struct htp_tensor * weight) {
+    return HTP_NORM_AFFINE_TERMS * htp_norm_affine_term_bytes(norm_affine_channels(weight));
+}
+
+static struct norm_affine_plan norm_affine_make_plan(const struct htp_unary_context * uctx) {
+    const struct htp_ops_context * octx = uctx->octx;
+    const uint32_t plane_elems = (uint32_t) octx->op_params[HTP_NORM_AFFINE_PARAM_PLANE];
+    const bool     with_silu   = octx->op_params[HTP_NORM_AFFINE_PARAM_ACTIVATION] == HTP_NORM_ACTIVATION_SILU;
+    const size_t   term_bytes  = uctx->src1_row_size_aligned / HTP_NORM_AFFINE_TERMS;
+
+    struct norm_affine_plan plan = {
+        .weight         = (const float *) uctx->vtcm_src1,
+        .bias           = octx->src[2] ? (const float *) (uctx->vtcm_src1 + term_bytes) : NULL,
+        .apply_plane    = with_silu ? hvx_norm_affine_silu_plane_f32 : hvx_norm_affine_plane_f32,
+        .row_elems      = uctx->nc,
+        .row_vectors    = uctx->nc / VLEN_FP32,
+        .plane_bytes    = plane_elems * sizeof(float),
+        .plane_vectors  = plane_elems / VLEN_FP32,
+        .planes_per_row = plane_elems == HTP_NORM_AFFINE_PLANE_ROW ? 0 : uctx->nc / plane_elems,
+        .n_channels     = norm_affine_channels(octx->src[1]),
+    };
+    memcpy(&plan.epsilon, &octx->op_params[HTP_NORM_AFFINE_PARAM_EPSILON], sizeof(float));
+    return plan;
+}
+
+static void norm_affine_stage_terms(const struct htp_unary_context * uctx) {
+    const struct htp_ops_context * octx   = uctx->octx;
+    const struct htp_tensor *      weight = octx->src[1];
+    const struct htp_tensor *      bias   = octx->src[2];
+    const size_t term_bytes = uctx->src1_row_size_aligned / HTP_NORM_AFFINE_TERMS;
+    const size_t data_bytes = norm_affine_channels(weight) * sizeof(float);
+    dma_queue *  dma_q      = octx->ctx->dma[0];
+
+    dma_queue_push(dma_q, dma_make_data(uctx->vtcm_src1, weight->data), term_bytes, 0, data_bytes, 1);
+    if (bias) {
+        dma_queue_push(dma_q, dma_make_data(uctx->vtcm_src1 + term_bytes, bias->data), term_bytes, 0, data_bytes, 1);
+    }
+    dma_queue_flush(dma_q);
+}
+
+static void norm_affine_planes_f32(const uint8_t * restrict src,
+                                   uint8_t * restrict dst,
+                                   uint32_t channel,
+                                   HVX_Vector mean,
+                                   float scale,
+                                   const struct norm_affine_plan * plan) {
+    for (uint32_t ip = 0; ip < plan->planes_per_row; ip++) {
+        const HVX_Vector gain  = hvx_vec_splat_f32(scale * plan->weight[channel]);
+        const HVX_Vector shift = hvx_vec_splat_f32(plan->bias ? plan->bias[channel] : 0.0f);
+        const size_t     off   = (size_t) ip * plan->plane_bytes;
+
+        plan->apply_plane((const HVX_Vector *) (src + off), (HVX_Vector *) (dst + off), plan->plane_vectors, mean, gain, shift);
+        channel = (channel + 1 == plan->n_channels) ? 0 : channel + 1;
+    }
+}
+
+static void norm_affine_row_f32(const uint8_t * restrict src,
+                                uint8_t * restrict dst,
+                                uint32_t row,
+                                const struct norm_affine_plan * plan) {
+    HVX_Vector mean;
+    HVX_Vector scale;
+    hvx_norm_moments_f32(src, plan->row_elems, plan->epsilon, &mean, &scale);
+
+    if (plan->planes_per_row == 0) {
+        hvx_norm_affine_row_f32((const HVX_Vector *) src, (HVX_Vector *) dst, plan->row_vectors, hvx_vec_repl_f32(mean),
+                                hvx_vec_repl_f32(scale), (const HVX_Vector *) plan->weight, (const HVX_Vector *) plan->bias);
+        return;
+    }
+
+    const uint32_t first_channel = (row * plan->planes_per_row) % plan->n_channels;
+    norm_affine_planes_f32(src, dst, first_channel, hvx_vec_repl_f32(mean), hvx_vec_get_f32(scale), plan);
+}
+
+static void norm_affine_f32(const void * restrict src,
+                            void * restrict dst,
+                            const uint32_t num_rows,
+                            const uint32_t first_row,
+                            const struct htp_unary_context * uctx) {
+    const struct norm_affine_plan plan = norm_affine_make_plan(uctx);
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const uint8_t * restrict src_local = (const uint8_t *) src + (ir * uctx->src0_row_size_aligned);
+        uint8_t * restrict dst_local       = (uint8_t *) dst + (ir * uctx->dst_row_size_aligned);
+
+        norm_affine_row_f32(src_local, dst_local, first_row + ir, &plan);
     }
 }
 
@@ -1431,7 +1544,7 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
 }
 
 // 3. TRI row-block task with row index ir.
-static void unary_thread_tri_f32(unsigned int nth, unsigned int ith, void * data) {
+static void unary_thread_indexed_row_block_f32(unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     const struct htp_unary_context * uctx = (const struct htp_unary_context *) data;
     struct htp_ops_context * octx = uctx->octx;
@@ -1482,7 +1595,7 @@ static void unary_thread_tri_f32(unsigned int nth, unsigned int ith, void * data
         ir += block_size;
     }
 
-    unary_tri_compute_fn_t compute = (unary_tri_compute_fn_t) uctx->compute;
+    unary_indexed_compute_fn_t compute = (unary_indexed_compute_fn_t) uctx->compute;
 
     for (uint32_t ir = src0_start_row; ir < src0_end_row; ) {
         const uint32_t block_size = MIN(BLOCK, src0_end_row - ir);
@@ -1750,6 +1863,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
 
     switch (octx->op) {
         case HTP_OP_NORM:            op_type = is_f16 ? "norm-f16"     : "norm-f32";         break;
+        case HTP_OP_NORM_AFFINE:     op_type = "norm-affine-f32";                            break;
         case HTP_OP_RMS_NORM:        op_type = is_f16 ? "rmsnorm-f16"  : "rmsnorm-f32";      break;
         case HTP_OP_RMS_NORM_MUL:    op_type = "rmsnorm-mul-f32";                            break;
         case HTP_OP_SCALE:           op_type = is_f16 ? "scale-f16"    : "scale-f32";        break;
@@ -1823,6 +1937,10 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         src1 = octx->src[1];
         src1_data_row_size = src1->ne[0] * sizeof(float);
     }
+    if (octx->op == HTP_OP_NORM_AFFINE) {
+        src1 = octx->src[1];
+        src1_data_row_size = norm_affine_terms_bytes(src1);
+    }
 
     if ((!col_tile && kparams->block == 0) || octx->ctx->vtcm_size < (size_t) kparams->vtcm_size) {
         FARF(ERROR, "unary-%s : current VTCM reservation %zu is too small, needed %zu\n", op_type, octx->ctx->vtcm_size, (size_t) kparams->vtcm_size);
@@ -1850,7 +1968,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         .row_start             = row_start,
 
         .data_src0             = src0->data,
-        .data_src1             = (octx->op == HTP_OP_RMS_NORM_MUL) ? src1->data : 0,
+        .data_src1             = src1 ? src1->data : 0,
         .data_dst              = dst->data,
 
         .src0_data_row_size    = src0_data_row_size,
@@ -1862,7 +1980,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         .dst_row_size_aligned  = L.dst_row_size_aligned,
 
         .src0_vtcm_half_size   = L.src0_bytes >> 1,
-        .src1_vtcm_half_size   = (octx->op == HTP_OP_RMS_NORM_MUL) ? (L.src1_bytes >> (broadcast_weight ? 0 : 1)) : 0,
+        .src1_vtcm_half_size   = src1 ? (L.src1_bytes >> (broadcast_weight ? 0 : 1)) : 0,
         .dst_vtcm_half_size    = L.dst_bytes >> 1,
 
         .block                 = kparams->block,
@@ -1935,6 +2053,10 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         task_func = unary_thread_row_block;
         switch (octx->op) {
             case HTP_OP_NORM:            compute_func = (void *) norm_f32;                break;
+            case HTP_OP_NORM_AFFINE:
+                task_func    = unary_thread_indexed_row_block_f32;
+                compute_func = (void *) norm_affine_f32;
+                break;
             case HTP_OP_RMS_NORM:        compute_func = (void *) rms_norm_f32;            break;
             case HTP_OP_RMS_NORM_MUL:
                 task_func    = unary_thread_rms_norm_mul_f32;
@@ -1963,7 +2085,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
             case HTP_OP_L2_NORM:         compute_func = (void *) l2_norm_f32;             break;
             case HTP_OP_HADAMARD:        compute_func = (void *) hadamard_f32;            break;
             case HTP_OP_TRI:
-                task_func    = unary_thread_tri_f32;
+                task_func    = unary_thread_indexed_row_block_f32;
                 compute_func = (void *) tri_f32;
                 break;
             default:                     break;
@@ -1976,6 +2098,9 @@ static int execute_op_unary(struct htp_ops_context * octx) {
     }
 
     uctx.compute = compute_func;
+    if (octx->op == HTP_OP_NORM_AFFINE) {
+        norm_affine_stage_terms(&uctx);
+    }
     work_queue_run(octx->ctx->work_queue, task_func, &uctx, n_threads);
 
     return err;

@@ -92,6 +92,8 @@ enum htp_op_code {
     HTP_OP_TRI,
     HTP_OP_PAD,
     HTP_OP_NORM,
+    HTP_OP_NORM_AFFINE,
+    HTP_OP_TIMESTEP_EMBEDDING,
     HTP_OP_CONCAT,
     HTP_OP_CLAMP,
     HTP_OP_LEAKY_RELU,

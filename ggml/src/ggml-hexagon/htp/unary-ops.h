@@ -32,8 +32,28 @@ static_assert(sizeof(struct htp_unary_kernel_params) <= 128, "htp_unary_kernel_p
 _Static_assert(sizeof(struct htp_unary_kernel_params) <= 128, "htp_unary_kernel_params is too large for kernel_params blob");
 #endif
 
+#define HTP_NORM_AFFINE_PARAM_EPSILON    0
+#define HTP_NORM_AFFINE_PARAM_PLANE      1
+#define HTP_NORM_AFFINE_PARAM_ACTIVATION 2
+#define HTP_NORM_AFFINE_TERMS            2
+#define HTP_NORM_AFFINE_PLANE_ROW        0
+
+enum htp_norm_activation {
+    HTP_NORM_ACTIVATION_NONE = 0,
+    HTP_NORM_ACTIVATION_SILU = 1,
+};
+
+static inline bool htp_unary_has_weight(uint32_t opcode) {
+    return opcode == HTP_OP_RMS_NORM_MUL || opcode == HTP_OP_NORM_AFFINE;
+}
+
+static inline size_t htp_norm_affine_term_bytes(size_t n_channels) {
+    return hex_round_up(n_channels * sizeof(float), 128);
+}
+
 static inline bool htp_op_is_unary(uint32_t opcode) {
     switch (opcode) {
+        case HTP_OP_NORM_AFFINE:
         case HTP_OP_CLAMP:
         case HTP_OP_LEAKY_RELU:
         case HTP_OP_NORM:
@@ -72,6 +92,7 @@ static inline bool htp_unary_is_elementwise(uint32_t opcode) {
     }
     switch (opcode) {
         case HTP_OP_NORM:
+        case HTP_OP_NORM_AFFINE:
         case HTP_OP_RMS_NORM:
         case HTP_OP_RMS_NORM_MUL:
         case HTP_OP_L2_NORM:
@@ -112,7 +133,7 @@ static inline void htp_unary_vtcm_layout_build(
 ) {
     L->src0_row_size_aligned = hex_round_up(src0_data_row_size, 128);
     L->dst_row_size_aligned  = hex_round_up(dst_data_row_size,  128);
-    L->src1_row_size_aligned = (op == HTP_OP_RMS_NORM_MUL) ? hex_round_up(src1_data_row_size, 128) : 0;
+    L->src1_row_size_aligned = htp_unary_has_weight(op) ? hex_round_up(src1_data_row_size, 128) : 0;
 
     if (col_tile > 0) {
         const size_t col_tile_bytes = col_tile * elem_size;
@@ -122,7 +143,7 @@ static inline void htp_unary_vtcm_layout_build(
     } else {
         L->src0_bytes = L->src0_row_size_aligned * block * 2;
         L->dst_bytes  = L->dst_row_size_aligned  * block * 2;
-        if (op == HTP_OP_RMS_NORM_MUL) {
+        if (htp_unary_has_weight(op)) {
             L->src1_bytes = broadcast_weight ? L->src1_row_size_aligned : (L->src1_row_size_aligned * block * 2);
         } else {
             L->src1_bytes = 0;
@@ -153,16 +174,16 @@ static inline void htp_unary_solve_layout(
     const size_t dst_elem_size      = (op == HTP_OP_HADAMARD) ? sizeof(float) : elem_size;
     const size_t src0_data_row_size = ne00 * elem_size;
     const size_t dst_data_row_size  = ne10 * dst_elem_size;
-    const size_t src1_data_row_size = (op == HTP_OP_RMS_NORM_MUL) ? (ne11 * sizeof(float)) : 0;
+    const size_t src1_data_row_size = htp_unary_has_weight(op) ? (ne11 * sizeof(float)) : 0;
 
     const size_t src0_row_size_aligned = hex_round_up(src0_data_row_size, 128);
     const size_t dst_row_size_aligned  = hex_round_up(dst_data_row_size,  128);
-    const size_t src1_row_size_aligned = (op == HTP_OP_RMS_NORM_MUL) ? hex_round_up(src1_data_row_size, 128) : 0;
+    const size_t src1_row_size_aligned = htp_unary_has_weight(op) ? hex_round_up(src1_data_row_size, 128) : 0;
 
     size_t vtcm_size_per_row = 0;
     size_t vtcm_row_per_thread = 0;
 
-    if (op == HTP_OP_RMS_NORM_MUL) {
+    if (htp_unary_has_weight(op)) {
         if (broadcast_weight) {
             size_t available_vtcm = vtcm_size;
             size_t src1_vtcm_total = n_threads * src1_row_size_aligned;
@@ -186,7 +207,7 @@ static inline void htp_unary_solve_layout(
         vtcm_row_per_thread = max_block;
     }
 
-    const bool is_reduction = (op == HTP_OP_NORM || op == HTP_OP_RMS_NORM ||
+    const bool is_reduction = (op == HTP_OP_NORM || op == HTP_OP_NORM_AFFINE || op == HTP_OP_RMS_NORM ||
                                op == HTP_OP_RMS_NORM_MUL || op == HTP_OP_L2_NORM ||
                                op == HTP_OP_HADAMARD);
     // The tiled fallback path below only has F32 task functions (unary_task_f32_tiled_*);

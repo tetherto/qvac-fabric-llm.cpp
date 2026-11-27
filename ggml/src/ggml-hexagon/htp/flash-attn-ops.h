@@ -319,6 +319,11 @@ static inline size_t hvx_fa_compute_vtcm_usage(size_t DK, size_t DV, bool is_q_f
 }
 
 #define FA_MIN_KV_BLOCKS 3
+#define FA_MIN_THREADED_Q_ROWS (FA_MIN_KV_BLOCKS * HMX_FP16_TILE_N_COLS * 2)
+
+static inline bool hmx_fa_runs_threaded(size_t kv_blocks, size_t q_rows, size_t n_threads) {
+    return n_threads >= 2 && (kv_blocks >= FA_MIN_KV_BLOCKS || q_rows >= FA_MIN_THREADED_Q_ROWS);
+}
 
 // Cost-based (Br, Bc) search for flash attention with pipeline constraint.
 static inline int hmx_fa_find_chunk_size(size_t * Br_out,
@@ -366,7 +371,7 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
                 // This Bc fits for this Br!
                 const size_t q_blocks       = (qo_len + Br - 1) / Br;
                 const size_t kv_blocks      = (kv_len + Bc - 1) / Bc;
-                const size_t actual_threads = (kv_blocks >= 3 && n_threads >= 2) ? n_threads : 1;
+                const size_t actual_threads = hmx_fa_runs_threaded(kv_blocks, gqa_factor * qo_len, n_threads) ? n_threads : 1;
                 const size_t n_rows_g       = Br * gqa_factor;
                 const size_t n_row_vec_cnt  = (n_rows_g + 63) / 64;
                 const size_t n_use          = n_row_vec_cnt < actual_threads ? n_row_vec_cnt : actual_threads;

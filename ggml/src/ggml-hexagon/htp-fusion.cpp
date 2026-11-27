@@ -185,6 +185,107 @@ static bool fuse_rms_norm_scale(const ggml_hexagon_session * sess, htp_opnode & 
     return true;
 }
 
+static constexpr int64_t HTP_NORM_AFFINE_PLANE_ALIGN = 128 / sizeof(float);
+
+static bool htp_is_norm_term(const ggml_tensor * term) {
+    return term->type == GGML_TYPE_F32 && ggml_is_contiguous(term);
+}
+
+static bool htp_is_row_term(const ggml_tensor * term, const ggml_tensor * dst) {
+    return htp_is_norm_term(term) && term->ne[0] == dst->ne[0] && ggml_nelements(term) == term->ne[0] &&
+           term->ne[0] % HTP_NORM_AFFINE_PLANE_ALIGN == 0;
+}
+
+static bool htp_is_channel_term(const ggml_tensor * term, const ggml_tensor * dst) {
+    return htp_is_norm_term(term) && term->ne[0] == 1 && term->ne[1] == 1 && term->ne[2] == dst->ne[2] && term->ne[3] == 1;
+}
+
+static ggml_tensor htp_tensor_with_rows_of(const ggml_tensor * dst, const ggml_tensor * rows) {
+    ggml_tensor shaped = *dst;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        shaped.ne[i] = rows->ne[i];
+        shaped.nb[i] = rows->nb[i];
+    }
+    return shaped;
+}
+
+static bool htp_norm_affine_accepts(const htp_opnode & prev, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = prev.inputs[0];
+    return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(src0) && ggml_is_contiguous(dst) && ggml_nelements(src0) == ggml_nelements(dst);
+}
+
+static bool htp_norm_affine_find_plane(const htp_opnode & prev, const ggml_tensor * dst, const ggml_tensor * weight, int32_t * plane) {
+    const ggml_tensor * src0 = prev.inputs[0];
+    if (htp_is_row_term(weight, dst)) {
+        *plane = HTP_NORM_AFFINE_PLANE_ROW;
+        return src0->ne[0] == dst->ne[0];
+    }
+    if (htp_is_channel_term(weight, dst)) {
+        *plane = (int32_t) (dst->ne[0] * dst->ne[1]);
+        return *plane % HTP_NORM_AFFINE_PLANE_ALIGN == 0 && src0->ne[0] % *plane == 0;
+    }
+    return false;
+}
+
+static bool htp_norm_affine_absorb(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur, const ggml_tensor * term) {
+    const ggml_tensor * src0   = prev.inputs[0];
+    const ggml_tensor * weight = prev.opcode == HTP_OP_NORM ? term : prev.inputs[1];
+    const ggml_tensor   dst    = htp_tensor_with_rows_of(cur.node, src0);
+    if (htp_inputs_overlap_unsafe(prev, &dst, term)) return false;
+
+    struct htp_unary_kernel_params kparams;
+    if (!htp_kparams_solve_norm_affine(sess, src0, weight, &dst, &kparams)) return false;
+
+    prev.opcode = HTP_OP_NORM_AFFINE;
+    if (term) {
+        prev.inputs.push_back(term);
+    }
+    prev.outputs = { prev.add_dummy(dst) };
+    prev.fused.push_back(cur.node);
+    prev.set_kparams(kparams);
+    return true;
+}
+
+static bool fuse_norm_mul(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    if (prev.opcode != HTP_OP_NORM) return false;
+
+    const ggml_tensor * weight = nullptr;
+    if (!htp_match_consumer(prev, cur, /*commutative=*/ true, &weight)) return false;
+
+    int32_t plane = 0;
+    if (!htp_norm_affine_accepts(prev, cur.node) || !htp_norm_affine_find_plane(prev, cur.node, weight, &plane)) return false;
+    if (!htp_norm_affine_absorb(sess, prev, cur, weight)) return false;
+
+    prev.params[HTP_NORM_AFFINE_PARAM_PLANE]      = plane;
+    prev.params[HTP_NORM_AFFINE_PARAM_ACTIVATION] = HTP_NORM_ACTIVATION_NONE;
+    return true;
+}
+
+static bool htp_norm_affine_is_open(const htp_opnode & prev) {
+    return prev.opcode == HTP_OP_NORM_AFFINE && prev.params[HTP_NORM_AFFINE_PARAM_ACTIVATION] == HTP_NORM_ACTIVATION_NONE;
+}
+
+static bool fuse_norm_affine_add(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    if (!htp_norm_affine_is_open(prev) || prev.inputs.size() != HTP_NORM_AFFINE_TERMS) return false;
+
+    const ggml_tensor * bias = nullptr;
+    if (!htp_match_consumer(prev, cur, /*commutative=*/ true, &bias)) return false;
+
+    if (!htp_norm_affine_accepts(prev, cur.node) || !htp_is_norm_term(bias) || !ggml_are_same_shape(bias, prev.inputs[1])) return false;
+    return htp_norm_affine_absorb(sess, prev, cur, bias);
+}
+
+static bool fuse_norm_affine_silu(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    if (!htp_norm_affine_is_open(prev) || prev.params[HTP_NORM_AFFINE_PARAM_PLANE] == HTP_NORM_AFFINE_PLANE_ROW) return false;
+    if (!htp_match_consumer(prev, cur, /*commutative=*/ false)) return false;
+    if (!htp_norm_affine_accepts(prev, cur.node)) return false;
+    if (!htp_norm_affine_absorb(sess, prev, cur, nullptr)) return false;
+
+    prev.params[HTP_NORM_AFFINE_PARAM_ACTIVATION] = HTP_NORM_ACTIVATION_SILU;
+    return true;
+}
+
 static bool fuse_mul_mat_add(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
     if (prev.opcode != HTP_OP_MUL_MAT) return false;
 
@@ -193,9 +294,10 @@ static bool fuse_mul_mat_add(const ggml_hexagon_session * sess, htp_opnode & pre
     if (src2->type != GGML_TYPE_F32) return false;
 
     const ggml_tensor * src0 = prev.node->src[0];
-    const ggml_tensor * src1 = prev.node->src[1];
+    const ggml_tensor * src1 = prev.activation();
     const ggml_tensor * dst  = cur.node;
     if (!ggml_are_same_shape(prev.node, dst)) return false;
+    if (prev.linked_src1 && htp_tensors_overlap(dst, src1)) return false;
 
     const bool prev_collapsed = htp_matmul_can_collapse(src0, src1, prev.node);
     const bool cur_collapsed  = htp_matmul_add_can_collapse(src0, src1, src2, dst);
@@ -237,7 +339,7 @@ static bool fuse_mul_mat_nx(const ggml_hexagon_session * sess, htp_opnode & prev
     if (prev.opcode != HTP_OP_MUL_MAT && prev.opcode != HTP_OP_MUL_MAT_NX) return false;
 
     const uint32_t curr_n = (uint32_t) prev.outputs.size();
-    if (curr_n >= HTP_OP_MAX_OUTPUTS || curr_n + 1 >= HTP_OP_MAX_INPUTS) return false;
+    if (curr_n >= HTP_OP_MAX_OUTPUTS || curr_n + 1 >= HTP_OP_MAX_INPUTS || prev.linked_src1) return false;
 
     const ggml_tensor * w0     = prev.inputs[0];
     const ggml_tensor * x_orig = prev.node->src[1];
@@ -538,6 +640,75 @@ static bool fuse_binary_nx(const ggml_hexagon_session * sess, htp_opnode & prev,
     return true;
 }
 
+static constexpr int64_t HTP_F16_PAIR_ELEMS = 2 * (128 / sizeof(float));
+
+// The same tensor data with fp16 elements, for a tensor that only two ops of one batch write and read
+static ggml_tensor htp_tensor_as_f16(const ggml_tensor & t) {
+    ggml_tensor half = t;
+    half.type = GGML_TYPE_F16;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        half.nb[i] = t.nb[i] / (sizeof(float) / sizeof(ggml_fp16_t));
+    }
+    return half;
+}
+
+static bool htp_overlaps_any_input(const htp_opnode & node, const ggml_tensor * t) {
+    for (const auto * input : node.inputs) {
+        if (input && htp_tensors_overlap(t, input)) return true;
+    }
+    return false;
+}
+
+static bool htp_geglu_can_write_f16(const htp_opnode & prev) {
+    if (prev.opcode != HTP_OP_GLU_GEGLU || prev.outputs.size() != 1 || prev.node->src[1] != nullptr) return false;
+
+    const ggml_tensor * dst = prev.dst();
+    return prev.node->src[0]->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && dst->view_src == nullptr &&
+           ggml_is_contiguous(dst) && dst->ne[0] % HTP_F16_PAIR_ELEMS == 0 && htp_tensor_is_fuseable(dst);
+}
+
+static bool htp_mul_mat_reads(const htp_opnode & cur, const ggml_tensor * result) {
+    if (cur.opcode != HTP_OP_MUL_MAT || htp_is_hadamard(cur.node)) return false;
+
+    const ggml_tensor * act = cur.node->src[1];
+    return act->type == GGML_TYPE_F32 && act->data == result->data && ggml_is_contiguous(act) &&
+           ggml_nelements(act) == ggml_nelements(result);
+}
+
+// GEGLU writes fp16 and the linear layer after it reads fp16, so the tensor between them is half the bytes.
+// Only the HMX kernels of the linear layer take fp16 activations; with few rows it runs on HVX and stays f32.
+// The result keeps its own buffer, which must be clear of the inputs of the GEGLU and of the output of the linear
+// layer because its rows are now half as long.
+static bool link_geglu_mul_mat_f16(const ggml_hexagon_session * sess, htp_opnode & prev, htp_opnode & cur) {
+    if (!htp_geglu_can_write_f16(prev) || !htp_mul_mat_reads(cur, prev.dst())) return false;
+
+    const ggml_tensor glu_dst = htp_tensor_as_f16(*prev.dst());
+    if (htp_overlaps_any_input(prev, &glu_dst) || htp_tensors_overlap(&glu_dst, cur.node)) return false;
+
+    const ggml_tensor act = htp_tensor_as_f16(*cur.node->src[1]);
+    struct htp_glu_kernel_params glu_kparams;
+    struct htp_mm_kernel_params  mm_kparams;
+    if (!htp_kparams_solve_unary_mul_glu(sess, prev.opcode, prev.node->src[0], nullptr, &glu_dst, &glu_kparams)) return false;
+    if (!htp_kparams_solve_matmul_add(sess, cur.node->src[0], &act, nullptr, cur.node, &mm_kparams)) return false;
+    if (mm_kparams.n_hmx == 0) return false;
+
+    prev.outputs = { prev.add_dummy(glu_dst) };
+    prev.set_kparams(glu_kparams);
+
+    cur.linked_src1 = cur.add_dummy(act);
+    cur.inputs      = { cur.node->src[0], cur.linked_src1 };
+    cur.outputs     = { cur.node };
+    htp_opnode_collapse(sess, cur);
+    cur.set_kparams(mm_kparams);
+    return true;
+}
+
+bool htp_fusion_try_link(const struct ggml_hexagon_session * sess, struct htp_opnode & prev, struct htp_opnode & cur) {
+    if (!opt_opfusion) return false;
+
+    return htp_fusion_enabled(HTP_FUSE_F16_EDGES) && link_geglu_mul_mat_f16(sess, prev, cur);
+}
+
 bool htp_fusion_can_stack(const struct ggml_tensor * a) {
     if (!a || !a->src[0] || !a->src[1]) return false;
     switch (a->op) {
@@ -604,7 +775,7 @@ void htp_fusion_tag_graph(struct ggml_cgraph * graph) {
         extra->flags &= ~HTP_TENSOR_FUSEABLE;
 
         const ggml_op op = graph->nodes[i]->op;
-        if ((op == GGML_OP_RMS_NORM || op == GGML_OP_SCALE || op == GGML_OP_REPEAT ||
+        if ((op == GGML_OP_RMS_NORM || op == GGML_OP_SCALE || op == GGML_OP_REPEAT || op == GGML_OP_NORM || op == GGML_OP_GLU ||
              op == GGML_OP_UNARY    || op == GGML_OP_ADD   || op == GGML_OP_SUB    ||
              op == GGML_OP_MUL      || op == GGML_OP_DIV   || op == GGML_OP_MUL_MAT_ID ||
              op == GGML_OP_SSM_CONV ||
@@ -622,9 +793,11 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
         case HTP_OP_ADD:
             return (htp_fusion_enabled(HTP_FUSE_ALLREDUCE_ADD) && fuse_allreduce_add(sess, prev, cur)) ||
                    (htp_fusion_enabled(HTP_FUSE_MUL_MAT_ADD)   && fuse_mul_mat_add(sess, prev, cur))   ||
+                   (htp_fusion_enabled(HTP_FUSE_NORM_AFFINE)   && fuse_norm_affine_add(sess, prev, cur)) ||
                    (htp_fusion_enabled(HTP_FUSE_BINARY_NX)     && fuse_binary_nx(sess, prev, cur));
         case HTP_OP_MUL:
             return (htp_fusion_enabled(HTP_FUSE_RMS_NORM_MUL)   && fuse_rms_norm_mul(sess, prev, cur))   ||
+                   (htp_fusion_enabled(HTP_FUSE_NORM_AFFINE)    && fuse_norm_mul(sess, prev, cur))       ||
                    (htp_fusion_enabled(HTP_FUSE_UNARY_MUL_GLU)  && fuse_unary_mul_glu(sess, prev, cur))  ||
                    (htp_fusion_enabled(HTP_FUSE_MUL_MUL_SCALAR) && fuse_mul_mul_scalar(sess, prev, cur)) ||
                    (htp_fusion_enabled(HTP_FUSE_BINARY_NX)      && fuse_binary_nx(sess, prev, cur));
@@ -634,7 +807,8 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
         case HTP_OP_SCALE:
             return htp_fusion_enabled(HTP_FUSE_RMS_NORM_SCALE) && fuse_rms_norm_scale(sess, prev, cur);
         case HTP_OP_UNARY_SILU:
-            return htp_fusion_enabled(HTP_FUSE_SSM_CONV_SILU) && fuse_ssm_conv_silu(sess, prev, cur);
+            return (htp_fusion_enabled(HTP_FUSE_SSM_CONV_SILU) && fuse_ssm_conv_silu(sess, prev, cur)) ||
+                   (htp_fusion_enabled(HTP_FUSE_NORM_AFFINE)  && fuse_norm_affine_silu(sess, prev, cur));
         case HTP_OP_GET_ROWS:
             return htp_fusion_enabled(HTP_FUSE_REPEAT_GET_ROWS) && fuse_repeat_get_rows(sess, prev, cur);
         case HTP_OP_CPY:
