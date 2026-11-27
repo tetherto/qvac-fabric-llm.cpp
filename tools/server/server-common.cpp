@@ -1144,6 +1144,41 @@ size_t validate_utf8(const std::string& text) {
     return len;
 }
 
+// qvac: the errors for a file over the media limits name the limit, so the
+// caller knows how far to downscale or trim the file
+static std::string qvac_image_limit_error(const mtmd_helper_init_opt & opt) {
+    // a still image is limited by max_image_pixels, a video frame by the lower
+    // of it and video_params.max_frame_pixels; 0 means no limit
+    const uint64_t image = opt.max_image_pixels;
+    uint64_t frame = opt.video_params.max_frame_pixels;
+    if (image > 0 && (frame == 0 || image < frame)) {
+        frame = image;
+    }
+    std::string msg = "image is larger than the media size limit";
+    if (image > 0) {
+        msg += " of " + std::to_string(image) + " pixels (width * height)";
+    }
+    if (frame > 0 && frame != image) {
+        msg += (image > 0 ? "; " : " of ") + std::to_string(frame) + " pixels for a video frame";
+    }
+    return msg;
+}
+
+static std::string qvac_audio_limit_error(mtmd_context * mctx, const mtmd_helper_init_opt & opt) {
+    std::string msg = "audio is longer than the media length limit";
+    if (opt.max_audio_frames > 0) {
+        const int rate = mctx ? mtmd_get_audio_sample_rate(mctx) : 0;
+        if (rate > 0) {
+            // whole seconds: server_context::qvac_set_media_limits() allows
+            // N seconds plus one sample
+            msg += " of " + std::to_string(opt.max_audio_frames / (uint64_t) rate) + " seconds";
+        } else {
+            msg += " of " + std::to_string(opt.max_audio_frames) + " samples";
+        }
+    }
+    return msg;
+}
+
 server_tokens process_mtmd_prompt(
         mtmd_context * mctx,
         const std::string & prompt,
@@ -1157,10 +1192,10 @@ server_tokens process_mtmd_prompt(
         auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
         // qvac: a file over the media limits is a bad request, not a load failure
         if (out.status == MTMD_HELPER_BITMAP_IMAGE_TOO_LARGE) {
-            throw std::invalid_argument("image is larger than the media size limit");
+            throw std::invalid_argument(qvac_image_limit_error(init_opt));
         }
         if (out.status == MTMD_HELPER_BITMAP_AUDIO_TOO_LONG) {
-            throw std::invalid_argument("audio is longer than the media length limit");
+            throw std::invalid_argument(qvac_audio_limit_error(mctx, init_opt));
         }
         if (!out.bitmap) {
             throw std::runtime_error("Failed to load image or audio file");
