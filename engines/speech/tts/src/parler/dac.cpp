@@ -22,7 +22,7 @@ const int dilations[3] = { 1, 3, 9 };
 //
 // Keeping im2col in F32 only helps if the matmul that consumes it stays in F32 too, so
 // the contraction asks for it explicitly: backends are free to multiply f32 operands in
-// fp16 for GGML_PREC_DEFAULT, and over 26 convolutions that dominates the output error.
+// fp16 for GGML_PREC_UNDEFINED, and over 26 convolutions that dominates the output error.
 ggml_tensor * conv1d(ggml_context * ctx, ggml_tensor * kernel, ggml_tensor * input,
                      int stride, int padding, int dilation, bool f16_gemm) {
     ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0,
@@ -30,7 +30,7 @@ ggml_tensor * conv1d(ggml_context * ctx, ggml_tensor * kernel, ggml_tensor * inp
     ggml_tensor * result = ggml_mul_mat(ctx,
         ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
         ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]));
-    if (!f16_gemm) ggml_mul_mat_set_prec(result, GGML_PREC_F32);
+    if (!f16_gemm) ggml_prec_set_acc(result, GGML_PREC_F32);
     return ggml_reshape_3d(ctx, result, im2col->ne[1], kernel->ne[2], im2col->ne[2]);
 }
 
@@ -67,7 +67,7 @@ ggml_tensor * conv_transpose_1d_matmul(ggml_context * ctx, ggml_tensor * kernel,
         ggml_tensor * Wr = ggml_reshape_2d(ctx,
             ggml_cont(ctx, ggml_permute(ctx, Wv, 1, 2, 0, 3)), IC, s * OC); // [IC, s*OC]
         ggml_tensor * M  = ggml_mul_mat(ctx, Wr, x2);                   // [s*OC, IL]
-        ggml_mul_mat_set_prec(M, GGML_PREC_F32); // deep-IC contraction; DAC is precision-sensitive
+        ggml_prec_set_acc(M, GGML_PREC_F32); // deep-IC contraction; DAC is precision-sensitive
         ggml_tensor * Mi = ggml_cont(ctx, ggml_permute(ctx,
             ggml_reshape_3d(ctx, M, s, OC, IL), 0, 2, 1, 3));           // [s, IL, OC]
         return ggml_reshape_2d(ctx, Mi, IL * s, OC);                    // [IL*s, OC] ol=i*s+p
@@ -162,7 +162,7 @@ ggml_cgraph * build_dac_graph(ggml_context * ctx, const parler_model & model,
         ggml_tensor * w2  = ggml_reshape_2d(ctx, q.out_proj_w,
                                             q.out_proj_w->ne[1], q.out_proj_w->ne[2]);
         ggml_tensor * proj = ggml_mul_mat(ctx, w2, z);
-        ggml_mul_mat_set_prec(proj, GGML_PREC_F32); // latent feeds the precision-sensitive conv stack
+        ggml_prec_set_acc(proj, GGML_PREC_F32); // latent feeds the precision-sensitive conv stack
         ggml_tensor * p   = ggml_add(ctx, proj, q.out_proj_b);                     // [1024, T]
         latent = latent ? ggml_add(ctx, latent, p) : p;
     }
@@ -301,7 +301,7 @@ ggml_tensor * parler_dac_convt_columns(ggml_context * ctx, ggml_tensor * x, ggml
     GGML_ASSERT(w_cols->ne[0] == IC && w_cols->ne[1] == K * OC);
     ggml_tensor * xt   = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, x, IL, IC)));  // [IC, IL]
     ggml_tensor * cols = ggml_mul_mat(ctx, w_cols, xt);                                         // [K*OC, IL]
-    if (f32_precision) ggml_mul_mat_set_prec(cols, GGML_PREC_F32);
+    if (f32_precision) ggml_prec_set_acc(cols, GGML_PREC_F32);
     ggml_tensor * y = ggml_col2im_1d(ctx, cols, stride, (int) OC, stride / 2);                  // [IL*s, OC]
     return ggml_reshape_3d(ctx, y, y->ne[0], y->ne[1], 1);
 }

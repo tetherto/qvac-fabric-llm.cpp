@@ -66,7 +66,7 @@ struct prec_tally {
 };
 
 const char * prec_name(ggml_prec prec) {
-    return prec == GGML_PREC_F32 ? "GGML_PREC_F32" : "GGML_PREC_DEFAULT";
+    return prec == GGML_PREC_F32 ? "GGML_PREC_F32" : "GGML_PREC_UNDEFINED";
 }
 
 // Graph matmuls carry no name, so the node index and the weight it multiplies
@@ -186,7 +186,7 @@ int main(int argc, char ** argv) {
     }
 
     const ggml_prec want =
-        backend_drops_the_marker(model.backend) ? GGML_PREC_DEFAULT : GGML_PREC_F32;
+        backend_drops_the_marker(model.backend) ? GGML_PREC_UNDEFINED : GGML_PREC_F32;
     std::printf("backend: %s, expecting %s on quantised weights\n",
                 ggml_backend_name(model.backend), prec_name(want));
     check_language_model(model, want);

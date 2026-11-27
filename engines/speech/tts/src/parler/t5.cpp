@@ -51,14 +51,14 @@ struct t5_graph {
 // pure fp16. Every reduction in the encoder therefore has to accumulate in f32, so
 // each matmul says so explicitly instead of leaving it to the backend's default.
 //
-// Backends are free to reduce precision for GGML_PREC_DEFAULT and both GPU backends do:
+// Backends are free to reduce precision for GGML_PREC_UNDEFINED and both GPU backends do:
 // ggml-vulkan picks an f16 accumulator for any matmul whose weights are f16 or quantized,
 // and on coopmat2 hardware it also rewrites an f32 x f32 matmul into f16 operands;
 // ggml-metal accumulates in f32 but stages both operands as half. Either way T5 loses
 // roughly three orders of magnitude of accuracy. Requesting f32 is a no-op on CPU.
 ggml_tensor * mul_mat_f32acc(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
     ggml_tensor * out = ggml_mul_mat(ctx, a, b);
-    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
     return out;
 }
 

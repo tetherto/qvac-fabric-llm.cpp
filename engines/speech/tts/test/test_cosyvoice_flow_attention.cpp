@@ -102,7 +102,7 @@ bool supports_half_attention(ggml_backend_t backend) {
     auto k = ggml_new_tensor_4d(owner.ctx, GGML_TYPE_F16, kHeadDim, 16, kHeads, kBatches);
     auto v = ggml_dup_tensor(owner.ctx, k);
     auto output = ggml_flash_attn_ext(owner.ctx, q, k, v, nullptr, 1.0f, 0, 0);
-    ggml_flash_attn_ext_set_prec(output, GGML_PREC_F32);
+    ggml_prec_set_acc(output, GGML_PREC_F32);
     return ggml_backend_supports_op(backend, output);
 }
 
@@ -114,7 +114,7 @@ void check_attention(ggml_backend_t backend, ggml_type kv_type, int length) {
     auto v = ggml_dup_tensor(owner.ctx, q);
     auto output = ggml_flash_attn_ext(owner.ctx, q, ggml_cast(owner.ctx, k, kv_type),
         ggml_cast(owner.ctx, v, kv_type), nullptr, 1.0f / std::sqrt(float(kHeadDim)), 0, 0);
-    ggml_flash_attn_ext_set_prec(output, GGML_PREC_F32);
+    ggml_prec_set_acc(output, GGML_PREC_F32);
     auto graph = ggml_new_graph(owner.ctx);
     ggml_build_forward_expand(graph, output);
     owner.buffer = ggml_backend_alloc_ctx_tensors(owner.ctx, backend);

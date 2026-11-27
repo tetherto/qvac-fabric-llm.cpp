@@ -43,9 +43,9 @@ struct Qwen3Config {
     // ~1.9e6 and produces repetitive, robotic audio without it; the cond encoder reaches
     // ~4.2e5 at one hidden channel and, unfixed, returns rows of zeros carrying a single
     // NaN -- enough to silence a whole song through the DiT cross-attention.
-    // The text encoder and detokenizer stay at GGML_PREC_DEFAULT. That is an untested
+    // The text encoder and detokenizer stay at GGML_PREC_UNDEFINED. That is an untested
     // assumption about their activation ranges, not a measurement: check before trusting it.
-    ggml_prec prec = GGML_PREC_DEFAULT;
+    ggml_prec prec = GGML_PREC_UNDEFINED;
 };
 
 struct Qwen3Layer {
@@ -186,14 +186,14 @@ static inline ggml_tensor * q3_rms_norm_w(ggml_context * ctx, ggml_tensor * x, g
 }
 
 static inline ggml_tensor * q3_linear(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x,
-                                      ggml_prec prec = GGML_PREC_DEFAULT) {
+                                      ggml_prec prec = GGML_PREC_UNDEFINED) {
     ggml_tensor * t = ggml_mul_mat(ctx, w, x);
-    ggml_mul_mat_set_prec(t, prec);
+    ggml_prec_set_acc(t, prec);
     return t;
 }
 
 static inline ggml_tensor * q3_linear_bias(ggml_context * ctx, ggml_tensor * w, ggml_tensor * b, ggml_tensor * x,
-                                           ggml_prec prec = GGML_PREC_DEFAULT) {
+                                           ggml_prec prec = GGML_PREC_UNDEFINED) {
     return ggml_add(ctx, q3_linear(ctx, w, x, prec), q3_as_f32(ctx, b));
 }
 
@@ -203,13 +203,13 @@ static inline ggml_tensor * q3_linear_bias(ggml_context * ctx, ggml_tensor * w, 
 // error the scores carry, so this is not a knob to set casually. It is nonetheless a
 // caller decision rather than a fixed F32: see Qwen3Config::prec for who asks for what.
 static inline ggml_tensor * q3_attn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
-                                    ggml_tensor * mask, float scale, ggml_prec prec = GGML_PREC_DEFAULT) {
+                                    ggml_tensor * mask, float scale, ggml_prec prec = GGML_PREC_UNDEFINED) {
     ggml_tensor * scores = ggml_mul_mat(ctx, k, q);
-    ggml_mul_mat_set_prec(scores, prec);
+    ggml_prec_set_acc(scores, prec);
     scores               = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
     ggml_tensor * vt     = ggml_cont(ctx, ggml_transpose(ctx, v));
     ggml_tensor * out    = ggml_mul_mat(ctx, vt, scores);
-    ggml_mul_mat_set_prec(out, prec);
+    ggml_prec_set_acc(out, prec);
     return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
 }
 
@@ -249,7 +249,7 @@ q3_backend_supports_flash_attention(ggml_backend_t backend,
     ggml_free(context);
     return false;
   }
-  ggml_flash_attn_ext_set_prec(operation, GGML_PREC_F32);
+  ggml_prec_set_acc(operation, GGML_PREC_F32);
   const bool supported = ggml_backend_supports_op(backend, operation);
   ggml_free(context);
   return supported;
@@ -265,7 +265,7 @@ static inline ggml_tensor * q3_flash_attn(ggml_context * ctx, ggml_tensor * q, g
     ggml_tensor * attention =
         ggml_flash_attn_ext(ctx, q, k, v, mask, scale,
                             Q3_FLASH_ATTENTION_MAX_BIAS, Q3_FLASH_ATTENTION_LOGIT_SOFTCAP);
-    ggml_flash_attn_ext_set_prec(attention, GGML_PREC_F32);
+    ggml_prec_set_acc(attention, GGML_PREC_F32);
     return attention;
 }
 
@@ -313,7 +313,7 @@ static inline ggml_tensor * q3_build_self_attn(ggml_context * ctx, const Qwen3Co
 }
 
 static inline ggml_tensor * q3_build_mlp(ggml_context * ctx, Qwen3Layer * ly, ggml_tensor * x,
-                                         ggml_prec prec = GGML_PREC_DEFAULT) {
+                                         ggml_prec prec = GGML_PREC_UNDEFINED) {
     ggml_tensor * gate = q3_linear(ctx, ly->gate_proj, x, prec);
     ggml_tensor * up   = q3_linear(ctx, ly->up_proj, x, prec);
     ggml_tensor * ff   = ggml_swiglu_split(ctx, gate, up);

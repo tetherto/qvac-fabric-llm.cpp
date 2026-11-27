@@ -648,10 +648,10 @@ void test_linear_precision_follows_weight_type() {
     ggml_tensor * wide = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 2);
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
         ggml_tensor * y = mm3_linear(ctx, ggml_new_tensor_2d(ctx, type, 256, 8), wide, GGML_PREC_F32);
-        CHECK(y->src[0]->op_params[0] == GGML_PREC_DEFAULT);
+        CHECK(y->src[0]->op_params[0] == GGML_PREC_UNDEFINED);
     }
     ggml_tensor * y = mm3_linear(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 8), x);
-    CHECK(y->src[0]->op_params[0] == GGML_PREC_DEFAULT);
+    CHECK(y->src[0]->op_params[0] == GGML_PREC_UNDEFINED);
     ggml_free(ctx);
 }
 
@@ -770,7 +770,7 @@ ggml_tensor * explicit_dit_block(ggml_context * ctx, const MM3DitGraph & dit, co
     if (dit.use_flash_attn) {
         attn = ggml_flash_attn_ext(ctx, q, ggml_cast(ctx, k, GGML_TYPE_F16), ggml_cast(ctx, v, GGML_TYPE_F16), NULL,
                                    scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        ggml_prec_set_acc(attn, GGML_PREC_F32);
     } else {
         attn = mm3_dit_attn_f32(ctx, q, k, v, scale);
     }

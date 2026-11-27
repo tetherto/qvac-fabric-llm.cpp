@@ -38,7 +38,7 @@ std::vector<float> product(lm_model & model, ggml_tensor * weight, const std::ve
     require(held.ctx, "graph context");
     auto * x = ggml_new_tensor_2d(held.ctx, GGML_TYPE_F32, weight->ne[0], width);
     auto * y = ggml_mul_mat(held.ctx, weight, x);
-    ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+    ggml_prec_set_acc(y, GGML_PREC_F32);
     auto * graph = ggml_new_graph_custom(held.ctx, 4, false);
     ggml_build_forward_expand(graph, y);
     require(ggml_backend_supports_op(model.backend, y), "unsupported projection");

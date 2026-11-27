@@ -262,7 +262,7 @@ static ggml_tensor * mm3_dit_block(ggml_context * ctx, const MM3DitGraph & g, co
 
         attn = ggml_flash_attn_ext(ctx, q, ggml_cast(ctx, k, GGML_TYPE_F16), ggml_cast(ctx, v, GGML_TYPE_F16), NULL,
                                    scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        ggml_prec_set_acc(attn, GGML_PREC_F32);
     } else {
         attn = mm3_dit_attn_f32(ctx, q, k, v, scale);
     }

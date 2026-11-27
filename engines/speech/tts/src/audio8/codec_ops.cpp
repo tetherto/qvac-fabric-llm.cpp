@@ -57,7 +57,7 @@ void synthesis_precision(ggml_tensor * product, const codec_conv_options & optio
     const bool eligible = weights->type == GGML_TYPE_F16 &&
                           weights->ne[0] >= 64 && weights->ne[0] % 32 == 0 &&
                           weights->ne[1] >= 64 && weights->ne[1] % 32 == 0;
-    ggml_mul_mat_set_prec(product, eligible ? options.precision : GGML_PREC_F32);
+    ggml_prec_set_acc(product, eligible ? options.precision : GGML_PREC_F32);
 }
 
 ggml_tensor * sum_taps(ggml_context * ctx, ggml_tensor * kernel, ggml_tensor * padded,
