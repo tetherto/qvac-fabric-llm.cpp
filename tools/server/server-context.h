@@ -7,6 +7,7 @@
 #include "json.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -89,6 +90,12 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    // qvac: size limits for the media files requests decode
+    // (mtmd_helper_init_opt), checked before a file is decoded; a file over a
+    // limit is rejected as an invalid request. 0 means no limit.
+    // note: call after load_model() and before requests arrive
+    void qvac_set_media_limits(uint64_t max_image_pixels, uint64_t max_audio_seconds);
 };
 
 
