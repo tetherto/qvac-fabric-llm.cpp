@@ -1307,9 +1307,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
-        // offload draft sampling to the backend
+        // offload draft sampling to the backend; a markov context draft reads the tokens its graph drew instead
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !is_dflash2 && !is_lilicorr) {
+        if (this->params.backend_sampling && !is_dflash2 && !is_lilicorr && !has_markov_context) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1615,6 +1615,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         continue;
                     }
 
+                    // greedy markov context drafts: the graph already drew the argmax chain, no sampling over the vocabulary
+                    if (has_markov_context && params.p_min <= 0.0f) {
+                        const float * draws = llama_get_embeddings_nextn(ctx_dft);
+                        GGML_ASSERT(draws && "DSpark draws missing from h_nextn");
+                        for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
+                            result.push_back((llama_token) draws[(size_t) (beg + i) * n_embd_dec]);
+                        }
+                        if (result.size() < (size_t) params.n_min) {
+                            result.clear();
+                        }
+                        continue;
+                    }
+
                     // DSpark: read from the first draft slot, truncate below the confidence threshold
                     const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                     for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
@@ -1707,13 +1720,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             // the block attention is non-causal: a draft with a markov context decodes the full trained block, then reads n_draft of it
             const int32_t n_block_tokens = is_lilicorr || has_markov_context ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            // a markov context draft outputs only the anchor and the drafted positions, the graph runs its lm head and markov chain on them
+            const int32_t n_block_out = has_markov_context ? std::min(n_block_tokens, (sample_from_anchor ? 0 : 1) + n_draft) : n_block_tokens;
             if (batch.size() + n_block_tokens > n_decode_max && !decode_blocks()) {
                 return;
             }
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2 && !is_lilicorr);
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2 && !is_lilicorr && i < n_block_out);
                 if (is_lilicorr) {
                     // For LiliCorr drafting batch, set state embeddings for use in the associated transformer head.
                     const llama_pos pos = dp.pos0 - 1;
@@ -3239,6 +3254,22 @@ common_params common_base_params_to_speculative(const common_params & params) {
     return result;
 }
 
+// every repeating layer of a loaded draft is on a GPU: the loader keeps the layers below n_layer_all + 1 - n_gpu_layers
+// on the CPU (a negative n_gpu_layers offloads all), nothing goes to a GPU without a GPU device, and tensor overrides
+// can move layer weights to the CPU
+static bool common_speculative_draft_layers_on_gpu(const llama_model * model, const llama_model_params & mparams,
+                                                   const common_params_speculative_draft & draft) {
+    if (!llama_supports_gpu_offload() || (mparams.devices != nullptr && mparams.devices[0] == nullptr)) {
+        return false;
+    }
+    if (std::any_of(draft.tensor_buft_overrides.begin(), draft.tensor_buft_overrides.end(),
+                    [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; })) {
+        return false;
+    }
+    const int32_t n_layer_all = llama_model_n_layer(model) + llama_model_n_layer_nextn(model);
+    return mparams.n_gpu_layers < 0 || mparams.n_gpu_layers >= n_layer_all + 1;
+}
+
 struct common_speculative_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -3286,6 +3317,22 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->model.reset(model_dft);
+
+        // a block drafter (DFlash, DSpark) with every repeating layer on a GPU runs only small CPU splits, e.g. the
+        // anchor rows of the target's host token embeddings: waking a full thread pool for them costs more than they
+        // take, so thread counts the user left unset drop to one. A draft with any repeating layer on the CPU (a CPU
+        // device, partial offload, tensor overrides) keeps the inherited counts
+        const auto & draft = params.speculative.draft;
+        const bool block_draft = std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+        if (draft.n_threads_auto && block_draft && common_speculative_draft_layers_on_gpu(model_dft, mparams, draft)) {
+            LOG_INF("%s: every draft layer is on the GPU: the draft runs on 1 thread (--spec-draft-threads to change)\n", __func__);
+            cparams.n_threads = 1;
+            if (draft.n_threads_batch_auto) {
+                cparams.n_threads_batch = 1;
+            }
+        }
 
         // a draft with a markov context decodes its full trained block, whatever n_max is
         {

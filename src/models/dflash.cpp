@@ -605,8 +605,9 @@ static ggml_tensor * build_vocab_scatter(ggml_context * ctx, ggml_tensor * logit
 //   anchor row: f_rnn, an extra rnn input; draft row i: [uniform | 1/temp | 0...] of its draw
 //   each step draws its token at 1/temp (0: argmax) and packs [token, k, ids, probs] into h_nextn
 // softcap_after_bias: softcap(base + bias) instead of leaving the logits uncapped
+// tokens_per_block: input tokens of a block when base, hidden and rnn_state hold only its output rows (0: the same count)
 static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * hidden = nullptr,
-        ggml_tensor * rnn_state = nullptr, bool softcap_after_bias = false) {
+        ggml_tensor * rnn_state = nullptr, bool softcap_after_bias = false, int64_t tokens_per_block = 0) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -644,7 +645,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     }
 
     // anchor (committed last) token of every block: token 0 of each block, i.e. a strided view
-    const size_t token_stride = (size_t) block_drafts * tokens->nb[0];
+    const size_t token_stride = (size_t) (tokens_per_block > 0 ? tokens_per_block : block_drafts) * tokens->nb[0];
     const size_t base_stride = (size_t) block_drafts * base->nb[1];
 
     ggml_tensor * prev = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
@@ -806,8 +807,17 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         // position-major like cat; restore ubatch block-major order
         ggml_tensor * draws = ggml_reshape_3d(ctx0, cat_draw, n_embd, n_blocks, block_drafts);
         draws = ggml_cont(ctx0, ggml_permute(ctx0, draws, 0, 2, 1, 3));
-        res->t_h_nextn = ggml_reshape_2d(ctx0, draws, n_embd, n_tok);
+        // h_nextn is read per input token: pad each block back to its token count
+        if (tokens_per_block > block_drafts) {
+            draws = ggml_pad(ctx0, draws, 0, tokens_per_block - block_drafts, 0, 0);
+        }
+        res->t_h_nextn = ggml_reshape_2d(ctx0, draws, n_embd, ggml_nelements(draws)/n_embd);
         ggml_build_forward_expand(g.gf, res->t_h_nextn);
+
+        // the driver reads only the draws (greedy and sampled drafts), so the logits are not an output: no backend
+        // sampler and no copy to the host for them
+        res->t_logits = nullptr;
+        return;
     }
 
     // cat is position-major; restore ubatch block-major order
@@ -1642,6 +1652,16 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_tensor * cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
+    // a markov context draft decodes the whole block but reads only the anchor and the drafted positions (its output
+    // rows, the first rows of each block): the lm head and the markov chain run on these rows only
+    int64_t tokens_per_block = 0;
+    if (rnn_state && use_block && n_outputs < n_tokens && n_outputs % ubatch.n_seqs_unq == 0 && n_outputs / ubatch.n_seqs_unq >= 2) {
+        ggml_tensor * out_ids = build_inp_out_ids();
+        tokens_per_block = n_blk_tok;
+        cur       = ggml_get_rows(ctx0, cur,       out_ids);
+        rnn_state = ggml_get_rows(ctx0, rnn_state, out_ids);
+    }
+
     res->t_embd = cur;
 
     // lm_head from the target model (shared via ctx_other)
@@ -1708,7 +1728,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         if (!hparams.dspark_f_rnn) {
             build_dspark_markov_head(*this, model, inp_tokens);
         } else if (rnn_state) {
-            build_dspark_markov_head(*this, model, inp_tokens, res->t_embd, rnn_state, true);
+            build_dspark_markov_head(*this, model, inp_tokens, res->t_embd, rnn_state, true, tokens_per_block);
         }
     }
 

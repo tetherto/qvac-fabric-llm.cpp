@@ -907,6 +907,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
+    // a block drafter (DFlash, DSpark) with every repeating layer on a GPU runs on one thread unless the user sets the
+    // draft's thread counts; that depends on where the loader puts its layers, so it is decided once the draft model is
+    // loaded (common_speculative_init_result). Record which counts were left unset before they inherit the target's
+    params.speculative.draft.n_threads_auto       = params.speculative.draft.cpuparams.n_threads == -1;
+    params.speculative.draft.n_threads_batch_auto = params.speculative.draft.cpuparams_batch.n_threads == -1;
+
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
 
@@ -4185,7 +4191,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_HF_REPO"));
     add_opt(common_arg(
         {"--spec-draft-threads", "-td", "--threads-draft"}, "N",
-        "number of threads to use during generation (default: same as --threads)",
+        "number of threads to use during generation (default: same as --threads, 1 for a DFlash or DSpark draft with every layer on the GPU)",
         [](common_params & params, int value) {
             params.speculative.draft.cpuparams.n_threads = value;
             if (params.speculative.draft.cpuparams.n_threads <= 0) {
