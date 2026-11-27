@@ -1020,6 +1020,13 @@ struct whisper_global {
 
 static whisper_global g_state;
 
+// QVAC patch, see PATCHES.md: a host that owns the ggml logger builds without WHISPER_FORWARD_GGML_LOG.
+static void whisper_forward_ggml_log() {
+#ifdef WHISPER_FORWARD_GGML_LOG
+    ggml_log_set(g_state.log_callback, g_state.log_callback_user_data);
+#endif
+}
+
 template<typename T>
 static void read_safe(whisper_model_loader * loader, T & dest) {
     loader->read(loader->context, &dest, sizeof(T));
@@ -1424,7 +1431,7 @@ static size_t aheads_masks_nbytes(struct whisper_aheads_masks & aheads_masks) {
 }
 
 static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params & params) {
-    ggml_log_set(g_state.log_callback, g_state.log_callback_user_data);
+    whisper_forward_ggml_log(); // QVAC patch, see PATCHES.md
 
     ggml_backend_dev_t dev = nullptr;
 
@@ -9653,7 +9660,7 @@ static void whisper_exp_compute_token_level_timestamps_dtw(
 void whisper_log_set(ggml_log_callback log_callback, void * user_data) {
     g_state.log_callback = log_callback ? log_callback : whisper_log_callback_default;
     g_state.log_callback_user_data = user_data;
-    ggml_log_set(g_state.log_callback, g_state.log_callback_user_data);
+    whisper_forward_ggml_log(); // QVAC patch, see PATCHES.md
 }
 
 const char * whisper_version(void) {

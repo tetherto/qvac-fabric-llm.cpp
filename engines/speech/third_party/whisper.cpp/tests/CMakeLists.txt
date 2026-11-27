@@ -163,6 +163,17 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
         LABELS "unit;tiny;gh" SKIP_RETURN_CODE 77 TIMEOUT 180)
 endif()
 
+# QVAC patch, see PATCHES.md
+set(GGML_LOG_OWNERSHIP_TEST test-whisper-ggml-log-ownership)
+add_executable(${GGML_LOG_OWNERSHIP_TEST} ${GGML_LOG_OWNERSHIP_TEST}.cpp)
+target_include_directories(${GGML_LOG_OWNERSHIP_TEST} PRIVATE ../include)
+target_link_libraries(${GGML_LOG_OWNERSHIP_TEST} PRIVATE whisper ggml)
+if (WHISPER_FORWARD_GGML_LOG)
+    target_compile_definitions(${GGML_LOG_OWNERSHIP_TEST} PRIVATE WHISPER_FORWARD_GGML_LOG)
+endif()
+add_test(NAME ${GGML_LOG_OWNERSHIP_TEST} COMMAND ${GGML_LOG_OWNERSHIP_TEST})
+set_tests_properties(${GGML_LOG_OWNERSHIP_TEST} PROPERTIES LABELS "unit;gh")
+
 # Tests are configured before the example targets, so gate on the option
 # that creates whisper-quantize rather than TARGET existence at this point.
 if (WHISPER_BUILD_EXAMPLES)

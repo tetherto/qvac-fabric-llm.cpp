@@ -116,6 +116,7 @@ option(WHISPER_BUILD_SERVER   "whisper: build server example" ${WHISPER_STANDALO
 # target names collide with the engines/parakeet project. Default ON
 # preserves stock upstream behavior; candidate for upstreaming.
 option(WHISPER_BUILD_PARAKEET "whisper: build the bundled parakeet library" ON)
+option(WHISPER_FORWARD_GGML_LOG "whisper: route the process-wide ggml log through the whisper log callback" ON) # QVAC patch, see PATCHES.md
 
 # 3rd party libs
 option(WHISPER_CURL "whisper: use libcurl to download model from an URL" OFF)

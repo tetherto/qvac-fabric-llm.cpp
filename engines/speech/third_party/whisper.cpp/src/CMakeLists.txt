@@ -272,6 +272,10 @@ if (WHISPER_MKL)
     target_link_libraries(whisper PRIVATE MKL::MKL)
 endif()
 
+if (WHISPER_FORWARD_GGML_LOG) # QVAC patch, see PATCHES.md
+    target_compile_definitions(whisper PRIVATE WHISPER_FORWARD_GGML_LOG)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(whisper PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(whisper PRIVATE WHISPER_SHARED WHISPER_BUILD)
