@@ -714,9 +714,6 @@ ModelPair resolve_model_pair(const std::string & model_dir, const std::string & 
     const CanonicalName lm_name = parse_canonical_name(explicit_lm);
     const CanonicalName synth_name = parse_canonical_name(explicit_synth);
     if (!explicit_lm.empty() && !explicit_synth.empty()) {
-        if (!lm_name.quant.empty() && !synth_name.quant.empty() && lm_name.quant != synth_name.quant) {
-            throw std::runtime_error("minimax engine: explicit canonical GGUF files use different quants");
-        }
         return {explicit_lm, explicit_synth, lm_name.quant};
     }
     if (model_dir.empty()) {

@@ -432,11 +432,23 @@ public:
     SynthesisResult synthesize(const std::string & text,
                                const StreamCallback & on_chunk);
 
+    // Synthesize one caller-selected sentence or clause without splitting it.
+    // Non-terminated clauses retain continuation intonation instead of gaining
+    // an implicit terminal period. The optional callback receives one PCM chunk.
+    // Resampling, cancellation, and returned PCM follow the streaming API above.
+    SynthesisResult synthesize_segment(const std::string & text,
+                                      const StreamCallback & on_chunk = {});
+
     // Best-effort cancel of an in-flight synthesize() call on another
-    // thread.  Setting the flag is all this does; actual termination
-    // happens at the next cancellation check inside the vector-
-    // estimator loop (one step is the worst-case cancel latency).
+    // thread. The flag is checked at synthesis stage and chunk boundaries.
+    // An active vector-estimator loop can run to completion before the next
+    // check; cancellation is not checked between its individual steps.
+    // A subsequent synthesize() starts a new request with cancellation cleared.
     void cancel();
+
+    // Release inference caches on the calling thread while this engine is alive.
+    // Call after its last synthesis on a worker, before that worker exits.
+    void release_thread_resources() noexcept;
 
     // follow-up — first-synth-latency pre-warming.
     //

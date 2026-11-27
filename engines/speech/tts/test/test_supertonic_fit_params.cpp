@@ -43,6 +43,8 @@
 #include "tts-cpp/supertonic/fit.h"
 
 #include "supertonic_internal.h"
+#include "supertonic_coreml_path.h"
+#include "test_env_portable.h"
 
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -77,6 +79,27 @@ void expect_eq(uint64_t projected, uint64_t real, const std::string & what) {
     }
 }
 
+uint64_t source_tensor_bytes(const std::string & path) {
+    ggml_context * ctx = nullptr;
+    gguf_init_params params = { /*.no_alloc=*/true, /*.ctx=*/&ctx };
+    gguf_context * gguf = gguf_init_from_file(path.c_str(), params);
+    if (!gguf || !ctx) {
+        if (gguf) gguf_free(gguf);
+        if (ctx) ggml_free(ctx);
+        fail("could not read GGUF metadata for upload transient check");
+        return 0;
+    }
+    uint64_t source_bytes = 0;
+    for (int64_t i = 0; i < gguf_get_n_tensors(gguf); ++i) {
+        const char * name = gguf_get_tensor_name(gguf, i);
+        const ggml_tensor * src = ggml_get_tensor(ctx, name);
+        source_bytes += ggml_nbytes(src);
+    }
+    gguf_free(gguf);
+    ggml_free(ctx);
+    return source_bytes;
+}
+
 // ── Metadata-only synthetic supertonic GGUF ─────────────────────────────────
 // The exact load-time contract of load_supertonic_gguf (hparams keys, the
 // unicode indexer, one voice, the full bind_vocoder_weights roster, RoPE
@@ -108,6 +131,16 @@ struct synthetic_writer {
             tensor_names.push_back(name);
             source_names.push_back(source);
         }
+    }
+
+    void add_f16(const std::string & name, std::initializer_list<int64_t> ne) {
+        ggml_tensor * t = ggml_new_tensor(ctx, GGML_TYPE_F16, (int) ne.size(),
+                                          std::vector<int64_t>(ne).data());
+        ggml_set_name(t, name.c_str());
+        std::vector<float> values((size_t) ggml_nelements(t), 0.5f);
+        ggml_fp32_to_fp16_row(values.data(), reinterpret_cast<ggml_fp16_t *>(t->data),
+                              ggml_nelements(t));
+        gguf_add_tensor(g, t);
     }
 };
 
@@ -143,8 +176,8 @@ std::string write_tiny_supertonic_gguf() {
         for (int i = 0; i < 16; ++i) d[i] = i;
         gguf_add_tensor(w.g, t);
     }
-    w.add_f32("supertonic/voices/F1/ttl", { 256, 50 });
-    w.add_f32("supertonic/voices/F1/dp",  { 192 });
+    w.add_f16("supertonic/voices/F1/ttl", { 256, 50 });
+    w.add_f16("supertonic/voices/F1/dp",  { 192 });
 
     // bind_vocoder_weights roster (tiny except the two pinned widths).
     int n = 0;
@@ -224,6 +257,12 @@ void run_synthetic_gates() {
             fail("synthetic: load_supertonic_gguf_metadata_only failed");
             return;
         }
+        // Both voice tensors require F16-to-F32 upload. The larger one has
+        // 12,800 elements and needs two F32 arrays: 102,400 bytes total.
+        // Their scratch must not accumulate across uploads.
+        expect_eq(fm.host_transient_bytes,
+                  source_tensor_bytes(path) + 102400,
+                  "synthetic load transient keeps only the largest conversion scratch");
         if (!load_supertonic_gguf(path, real, /*n_gpu_layers=*/99)) {
             fail("synthetic: real load_supertonic_gguf failed");
             free_supertonic_model(mm);
@@ -299,6 +338,22 @@ void run_synthetic_gates() {
                    fr.reason == "model-unreadable",
                "synthetic missing model was not model-unreadable (" + fr.reason + ")");
     }
+
+#ifdef TTS_CPP_USE_COREML
+    {
+        const std::string sidecar = coreml_vocoder_sidecar_path(path);
+        const bool created = std::filesystem::create_directory(sidecar);
+        tts_cpp::supertonic::FitOptions opts;
+        opts.model_gguf_path = path;
+        unsetenv("SUPERTONIC_COREML_DISABLE");
+        const auto fit = tts_cpp::supertonic::fit_params(opts);
+        setenv("SUPERTONIC_COREML_DISABLE", "1", 1);
+        expect(fit.status == tts_cpp::FitStatus::Error &&
+                   fit.reason == "coreml-memory-estimate-unavailable",
+               "synthetic Core ML sidecar was omitted from the fit verdict");
+        if (created) std::filesystem::remove(sidecar);
+    }
+#endif
 
     std::error_code ec;
     std::filesystem::remove(path, ec);
@@ -500,6 +555,7 @@ void run_gates(const std::string & path, int n_gpu_layers) {
 }  // namespace
 
 int main(int argc, char ** argv) {
+    setenv("SUPERTONIC_COREML_DISABLE", "1", 1);
     if (argc < 2) {
         // No-argument (always-on CI) form: metadata-only synthetic GGUF.
         // Weight-sizing parity + the refusal paths need no fixture; the

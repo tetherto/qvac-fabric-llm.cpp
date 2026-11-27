@@ -5,6 +5,9 @@
 
 namespace tts_cpp::moss {
 
+// An active Core ML decoder or reference tokenizer sidecar returns Error with
+// reason "coreml-memory-estimate-unavailable".
+
 struct FitWorkload {
     int prompt_rows;
     int64_t reference_samples;

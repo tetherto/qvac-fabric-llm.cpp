@@ -4,7 +4,11 @@
 //   * streamed pcm == whole-utterance decode -- BIT-IDENTICAL on the plain ggml
 //     CPU path (the DAC is local/convolutional so a prefix decode reproduces the
 //     interior exactly), within tolerance on GPU and on a tinyBLAS or
-//     Accelerate CPU build (shape-dependent rounding; cpu_dac_is_shape_exact).
+//     Accelerate CPU build (shape-dependent rounding; cpu_dac_is_shape_exact);
+//   * a repeated streamed run on the same engine is BIT-IDENTICAL on every
+//     backend: the short first chunk decodes a DAC window smaller than the
+//     ones the previous call left in the graph allocator, and the buffer
+//     layout must not depend on that history (run_repeat_case).
 //
 // A fixed seed makes the AR codes identical between the streamed and batch
 // runs, so the only difference under test is windowed-vs-whole DAC decode.  Both
@@ -110,6 +114,42 @@ static void run_case(const std::string & model, int n_gpu_layers) {
     }
 }
 
+static std::vector<float> synthesize_streamed(Engine & eng, const char * prompt, const char * desc) {
+    return eng.synthesize(prompt, desc, [](const float *, std::size_t, int, bool) {}).pcm;
+}
+
+static std::size_t count_differing_samples(const std::vector<float> & a, const std::vector<float> & b) {
+    std::size_t differing = a.size() > b.size() ? a.size() - b.size() : b.size() - a.size();
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+        if (a[i] != b[i]) ++differing;
+    }
+    return differing;
+}
+
+static void run_repeat_case(const std::string & model, int n_gpu_layers) {
+    const char * prompt = "Today is a wonderful day.";
+    const char * desc   = "Laura speaks with a happy tone.";
+
+    EngineOptions opts;
+    opts.model_gguf_path           = model;
+    opts.seed                      = 42;
+    opts.max_frames                = 430;
+    opts.n_threads                 = 4;
+    opts.n_gpu_layers              = n_gpu_layers;
+    opts.stream_first_chunk_frames = 20;
+    opts.stream_chunk_frames       = 43;
+
+    Engine eng(opts);
+    const std::vector<float> first  = synthesize_streamed(eng, prompt, desc);
+    const std::vector<float> second = synthesize_streamed(eng, prompt, desc);
+
+    std::fprintf(stderr, "[%s] repeat: %zu samples\n",
+                 eng.backend_device() == BackendDevice::GPU ? "GPU" : "CPU", first.size());
+    CHECK(!first.empty(), "repeat case produced audio");
+    std::fprintf(stderr, "  repeat: %zu differing samples\n", count_differing_samples(first, second));
+    CHECK(first == second, "repeated streamed run on one engine is BIT-IDENTICAL");
+}
+
 int main(int argc, char ** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s MODEL.gguf\n", argv[0]);
@@ -118,6 +158,8 @@ int main(int argc, char ** argv) {
     const std::string model = argv[1];
     run_case(model, 0);    // CPU: bit-identical on the plain path, tolerance under tinyBLAS
     run_case(model, 99);   // GPU where present (else CPU fallback): tolerance
+    run_repeat_case(model, 0);
+    run_repeat_case(model, 99);
 
     if (g_failures == 0) {
         std::printf("test_parler_engine_stream: OK\n");

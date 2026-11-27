@@ -14,6 +14,17 @@ On-device speech and audio AI in C++17 on [ggml](https://github.com/tetherto/qva
 
 ## Supported models
 
+Parakeet mel preprocessing keeps FFT twiddle tables in worker or stream scope,
+avoiding a reproduced MinGW heap crash during dynamic thread-local cleanup while
+preserving parallel execution and serial/threaded numerical parity.
+
+Supertonic engines can be reused after cancellation without reloading their
+models. `Engine::synthesize_segment()` preserves caller-selected sentence or
+clause boundaries, and `Engine::release_thread_resources()` releases a worker's
+inference caches before that thread exits. See the
+[TTS guide](tts/README.md) for the lifecycle contract.
+Cancellation can wait for an active vector-estimator loop to finish.
+
 The engine guides own model formats, quantization, backend validation, and input
 requirements. An available ggml backend does not imply every model has been
 validated on it. AudioGen automatic GPU selection requires F32 matrix
@@ -155,6 +166,9 @@ the `parakeet` CLI (which defaults to
 `~/Library/Application Support/qvac-speech/coreml`). See
 [Generated sidecars](parakeet/README.md#generated-sidecars) for the
 setup, options and memory.
+The generated Sortformer v2.1 capacity is charged at 259 MiB after calibration
+against the latest overlapped Core ML preparation measurements, retaining the
+required 25% safety margin.
 
 TranscribePsy conversion uses 60-second windows with 25% overlap for full EU
 and records its Apache-2.0 provenance. For EU-sub Core ML deployment, the
@@ -377,3 +391,50 @@ delivery on ggml and Core ML. See the [streaming API and measurement guide](tts/
 Audio8 preserves separate CUDA F32 projection shapes during multi-token prefill
 for fused/separate numerical consistency. Decode and other weight types retain
 projection fusion; shared CUDA matmul routing is unchanged.
+
+### Sortformer Core ML reproduction preflight
+
+The `Sortformer Core ML preflight` workflow runs on same-repository pull requests
+that touch Parakeet or benchmark scripts, and supports manual dispatch. It uses
+the existing self-hosted authorization gate and the Apple GPU runner. It downloads
+NVIDIA's public v2.1 NeMo checkpoint at revision
+`cd03eee90fbec18297ac31b8c21546e596b7f71c`, checks its pinned SHA-256, and converts
+it to q8_0 with the repository converter before exporting Core ML. Keeping the
+original checkpoint filename lets the converter emit the required AOSC variant
+metadata. No AWS role or private model artifact is required. Download, checksum,
+conversion and exporter validation failures fail the job.
+
+`model-provenance.json` records the checkpoint URL, revision and checksum,
+converter checksum, command and generated GGUF checksum. `conversion.log`
+preserves converter diagnostics. Exporter compatibility validation is unchanged.
+
+The preflight makes two complete `Engine::diarize` calls on the three-speaker
+`abcba` recording per backend, reusing each engine between calls. It compares
+forced native Metal with a freshly exported fp16 2048-frame whole-network
+Core ML diarizer from the same q8_0 GGUF. The capacity covers the entire
+recording; only the full diarizer is staged beside the accelerated model, so
+`encoder_used_coreml` confirms whole-network execution. A native fallback or
+empty output fails the preflight. The accelerated process sets
+`PARAKEET_COREML_STRICT=1` so current runtimes wait for background sidecar
+loading and throw if the requested capacity cannot serve a call. The native
+process clears strict mode and disables Core ML. The audio frontend remains native.
+
+Artifacts retain each call's speaker probabilities, segments, routing flag,
+commands, logs, asset hashes and revisions. Probability comparisons use the
+existing `test_sortformer_diarizer_coreml_parity.cpp` limits: maximum absolute
+error <= 0.02 and relative L2 <= 0.003, with native probabilities as reference.
+Both calls must pass. DER is reported per call with a 250 ms collar and optimal
+speaker-label mapping; it has no new threshold. The separate AOSC speaker test
+has a default 30% DER ceiling on streaming output without this collar, so that
+ceiling is not applied to these offline calls.
+
+This is a repository-fixture reproduction, not the original failed recording:
+the original audio, model/bundle identity and gate invocation are unknown.
+The parity limits above originate in a lower-level batch/slab test; applying
+them to complete calls is an explicit diagnostic extension. The exported bundle
+is a diagnostic candidate, not a replacement for distributed artifacts.
+
+The generic benchmark driver now computes `der_median` from every measured run
+and preserves `.der-runs.json` plus per-run hypothesis files. Any scoring failure
+leaves the median unset. The legacy `.hypothesis.jsonl` remains the last run's
+output, not a representative median hypothesis.

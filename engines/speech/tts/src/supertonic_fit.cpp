@@ -101,6 +101,12 @@ FitResult fit_params(const FitOptions & opts) {
     m.armed = true;
     r.model_variant = m.model.hparams.arch;
 
+    if (m.model.vocoder_on_coreml || m.model.encoder_on_coreml || m.model.vector_on_coreml) {
+        r.reason = "coreml-memory-estimate-unavailable";
+        r.report = "Core ML model memory cannot be projected by the ggml fit estimator.\n";
+        return r;
+    }
+
     ggml_backend_t backend = m.model.backend;
     ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
     if (!dev) {

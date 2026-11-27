@@ -532,24 +532,14 @@ struct Engine::Impl {
 
         std::vector<float> latent_mask((size_t) latent_len, 1.0f);
 
-        // Master's CFM loop unrolling (Phase A1+A2) replaced the
-        // round-7 per-step `supertonic_vector_step_ggml` loop with
-        // a single `supertonic_vector_loop_ggml` call below.  The
-        // per-step cancellation hook from round 7 collapses into
-        // this single pre-synth check (cancel granularity moves
-        // from per-step to per-synth on the GPU path; the CPU
-        // path's per-step fallback inside `supertonic_vector_loop_ggml`
-        // retains finer cancellation if needed).
+        // The estimator receives no cancellation flag, including its CPU
+        // fallback. Cancellation is checked around the entire call.
         if (cancel_flag.load(std::memory_order_acquire)) {
             throw std::runtime_error("Supertonic Engine: cancelled before vector estimator");
         }
-        // Phase A1+A2: run all CFM steps as ONE ggml graph on non-CPU
-        // backends.  Latent flows step-to-step in GPU memory; on CPU this
-        // falls back to a per-step loop over `supertonic_vector_step_ggml`.
-        // Override via SUPERTONIC_DISABLE_LOOP_GRAPH=1.
-        // NOTE: cancellation granularity is now per-synth on the GPU path
-        // (worst-case cancel latency = whole CFM loop).  CPU keeps per-step
-        // cancellation via the fallback.
+        // Non-CPU backends run all CFM steps in one graph; CPU uses per-step
+        // graphs. SUPERTONIC_DISABLE_LOOP_GRAPH=1 also selects per-step graphs,
+        // without adding cancellation checks between them.
         std::vector<float> final_latent;
         std::string vector_backend;
         if (!supertonic_vector_loop_ggml(model, latent.data(), latent_len,
@@ -612,12 +602,13 @@ struct Engine::Impl {
     // accumulate the full PCM in the returned result (callback is an
     // *addition*, not a replacement — matches Chatterbox semantics).
     SynthesisResult synthesize_streaming(const std::string & text,
-                                         const StreamCallback & on_chunk) {
+                                         const StreamCallback & on_chunk,
+                                         bool preserve_segment = false) {
         if (text.empty()) {
             throw std::runtime_error("Supertonic Engine: text is empty");
         }
 
-        std::vector<std::string> chunks = detail::split_for_streaming(
+        std::vector<std::string> chunks = preserve_segment ? std::vector<std::string>{text} : detail::split_for_streaming(
             text,
             opts.stream_chunk_tokens,
             opts.stream_first_chunk_tokens,
@@ -735,7 +726,7 @@ struct Engine::Impl {
                 std::vector<float> tail = out_resampler.finish();
                 emit.insert(emit.end(), tail.begin(), tail.end());
             }
-            on_chunk(emit.data(), emit.size(), k, is_last);
+            if (on_chunk) on_chunk(emit.data(), emit.size(), k, is_last);
 
             full.pcm.insert(full.pcm.end(), emit.begin(), emit.end());
             full.duration_s += chunk_res.duration_s;
@@ -796,11 +787,13 @@ Engine::Engine(Engine &&) noexcept            = default;
 Engine & Engine::operator=(Engine &&) noexcept = default;
 
 SynthesisResult Engine::synthesize(const std::string & text) {
+    pimpl_->cancel_flag.store(false, std::memory_order_release);
     return pimpl_->synthesize(text);
 }
 
 SynthesisResult Engine::synthesize(const std::string & text,
                                    const StreamCallback & on_chunk) {
+    pimpl_->cancel_flag.store(false, std::memory_order_release);
     // Fall through to the batch path when streaming is disabled or no
     // callback is wired up.  Both conditions match the Chatterbox
     // semantics — callers can pass a no-op callback safely.
@@ -810,8 +803,21 @@ SynthesisResult Engine::synthesize(const std::string & text,
     return pimpl_->synthesize_streaming(text, on_chunk);
 }
 
+SynthesisResult Engine::synthesize_segment(const std::string & text,
+                                          const StreamCallback & on_chunk) {
+    pimpl_->cancel_flag.store(false, std::memory_order_release);
+    return pimpl_->synthesize_streaming(text, on_chunk, true);
+}
+
 void Engine::cancel() {
     pimpl_->cancel_flag.store(true, std::memory_order_release);
+}
+
+void Engine::release_thread_resources() noexcept {
+    detail::release_vector_estimator_thread_local_caches();
+    detail::release_text_encoder_thread_local_caches();
+    detail::release_vocoder_thread_local_caches();
+    detail::release_duration_thread_local_caches();
 }
 
 // follow-up — explicit first-synth pre-warm.

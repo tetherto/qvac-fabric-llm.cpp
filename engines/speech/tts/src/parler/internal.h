@@ -273,11 +273,14 @@ bool parler_should_fuse_decode_weights(const parler_model & model, bool measurin
 bool parler_fuse_decode_weights(parler_model & model,
                                 parler_fit_measure * measure = nullptr);
 
+enum class parler_graph_layout { reuse_previous, fresh };
+
 // Dual-path graph dispatch honoring the sched_dispatch contract (gf must be
 // freshly built per call; set inputs AFTER this returns true, via
 // ggml_backend_tensor_set on named graph tensors).
 bool parler_graph_prepare(const parler_model & model, ggml_cgraph * gf,
-                          ggml_gallocr_t allocr, bool & use_sched, const char * caller);
+                          ggml_gallocr_t allocr, bool & use_sched, const char * caller,
+                          parler_graph_layout layout = parler_graph_layout::fresh);
 bool parler_graph_compute(const parler_model & model, ggml_cgraph * gf,
                           bool use_sched, int n_threads, const char * caller);
 

@@ -122,6 +122,10 @@ ggml_status sched_fallback_compute(sched_fallback & fb, ggml_backend_t primary,
     return ggml_backend_sched_graph_compute(fb.sched, gf);
 }
 
+bool direct_alloc_with_fresh_layout(ggml_gallocr_t allocr, ggml_cgraph * gf) {
+    return allocr && gf && ggml_gallocr_reserve(allocr, gf) && ggml_gallocr_alloc_graph(allocr, gf);
+}
+
 ggml_status direct_compute(ggml_backend_t backend, ggml_cgraph * gf, int n_threads) {
     if (!backend || !gf) return GGML_STATUS_FAILED;
     backend_set_n_threads(backend, n_threads);

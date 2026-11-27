@@ -4,6 +4,8 @@
 #include "moss/sfx_networks.h"
 #include "moss/sfx_dit_cache.h"
 #include "moss/sfx_request.h"
+#include "moss/coreml_sidecar.h"
+#include "../test_env_portable.h"
 
 #include <cmath>
 #include <cstdio>
@@ -197,9 +199,27 @@ void test_real_model() {
     check(projection.device.weights_bytes > 0 && projection.host_bytes > 0, "real model memory measured");
     std::puts(projection.report.c_str());
 }
+
+#ifdef TTS_CPP_USE_COREML
+void test_coreml_route() {
+    Model model;
+    const auto options = model.options();
+    unsetenv("MOSS_COREML_DISABLE");
+    const auto sidecar = moss::detail::sfx_dit_sidecar_path(options.model_path);
+    const bool created = std::filesystem::create_directory(sidecar);
+    check(moss::fit_params(options, request(), 0).reason == "coreml-memory-estimate-unavailable",
+          "Core ML DiT cannot report a ggml-only fit");
+    setenv("MOSS_COREML_DISABLE", "1", 1);
+    check(moss::fit_params(options, request(), 0).status == FitStatus::Success,
+          "disabled Core ML keeps the ggml fit verdict");
+    if (created) std::filesystem::remove(sidecar);
+    setenv("MOSS_COREML_DISABLE", "1", 1);
+}
+#endif
 }
 
 int main() {
+    setenv("MOSS_COREML_DISABLE", "1", 1);
     test_weightless();
     test_workloads();
     test_cache_memory();
@@ -208,6 +228,9 @@ int main() {
     test_generation_after_fit();
     test_retained_vae_memory();
     test_real_model();
+#ifdef TTS_CPP_USE_COREML
+    test_coreml_route();
+#endif
     if (!failures) std::puts("MOSS sound-effect fit tests passed");
     return failures ? 1 : 0;
 }

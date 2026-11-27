@@ -42,8 +42,10 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 namespace {
@@ -133,6 +135,29 @@ int main(int argc, char ** argv) {
     expect(fit.report[0] != '\0',        "empty report");
     expect(fit.model_type[0] != '\0',    "empty model_type");
     expect(fit.device_total_bytes > 0,   "device_total_bytes == 0");
+#ifdef WHISPER_USE_COREML
+    {
+        const auto scratch = std::filesystem::temp_directory_path() /
+            ("whisper-fit-coreml-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directory(scratch);
+        const auto copied_model = scratch / "tiny.bin";
+        std::filesystem::copy_file(model_path, copied_model);
+        auto coreml_opts = opts;
+        const std::string copied_path = copied_model.string();
+        coreml_opts.model_path = copied_path.c_str();
+        whisper_fit_result plain;
+        expect(whisper_fit_params(&coreml_opts, &plain) != (int) WHISPER_FIT_ERROR,
+               "fit refuses a model without a Core ML sidecar");
+        std::filesystem::create_directory(scratch / "tiny-encoder.mlmodelc");
+        whisper_fit_result routed;
+        const int routed_status = whisper_fit_params(&coreml_opts, &routed);
+        expect(routed_status == (int) WHISPER_FIT_ERROR &&
+               std::strcmp(routed.reason, "coreml-memory-estimate-unavailable") == 0 &&
+               routed.report[0] != '\0',
+               "fit omitted the Core ML encoder's memory");
+        std::filesystem::remove_all(scratch);
+    }
+#endif
     if (g_failures) {
         return g_failures; // nothing below is meaningful without a projection
     }

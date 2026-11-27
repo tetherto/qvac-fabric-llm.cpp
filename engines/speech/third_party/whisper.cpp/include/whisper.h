@@ -844,7 +844,8 @@ extern "C" {
 
         // "fits" | "does-not-fit" | "model-unreadable" | "vad-model-unreadable" |
         // "no-backend-device" | "measurement-failed" | "invalid-arguments" |
-        // "memory-capacity-unavailable" | "backend-memory-unavailable"
+        // "memory-capacity-unavailable" | "backend-memory-unavailable" |
+        // "coreml-memory-estimate-unavailable" (active Core ML encoder)
         char reason[64];
 
         char model_type[32];   // "tiny" | "base" | ... | "large v3"

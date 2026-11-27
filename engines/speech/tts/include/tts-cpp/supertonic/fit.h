@@ -54,6 +54,9 @@
 //   * A latent length is a PREDICTION of the duration model at runtime; the
 //     audio_seconds knob sets the projected utterance length explicitly.
 //
+// An active Core ML encoder, vector estimator, or vocoder sidecar returns
+// Error with reason "coreml-memory-estimate-unavailable" until its resident
+// memory is priced.
 // See tts-cpp/fit.h for the status contract and result layout.
 
 #include "tts-cpp/export.h"

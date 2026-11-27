@@ -59,49 +59,26 @@ int load_wav_mono_f32(const std::string & wav_path,
 
 namespace {
 
-// Precomputed cooley-tukey twiddle table keyed on FFT size. The
-// reference implementation accumulated `w *= wlen` inside the inner
-// butterfly which costs one complex multiply per butterfly (4 muls +
-// 2 adds + a fused cos/sin during table seeding). For our use case
-// (n_fft ∈ {256, 512, 1024} called once per frame for ~T_mel frames
-// per inference) the cost is dominated by trig + per-butterfly mul,
-// so caching cos/sin per (len, k) is a clean ~1.5-2x win on the FFT
-// alone. Each FFT length costs sum_{len=2..n step ×2} (len/2) =
-// (n - 1) twiddles, i.e. 511 complex twiddles for n_fft=512: a
-// 4 KiB table that's reused across every frame for the rest of the
-// process lifetime.
-struct FftTwiddleTable {
-    int n_fft = 0;
-    std::vector<std::complex<float>> w; // size = n - 1
-};
-
-// Process-wide twiddle cache keyed on n_fft. `compute_log_mel` is
-// allowed to be called from multiple threads in principle (the
-// engine doesn't today, but we don't want to assume), so the cache
-// uses a thread-local store -- per-thread cache is cheap (bytes per
-// FFT length) and avoids any locking on the hot path.
-std::complex<float> * get_fft_twiddles(int n) {
-    thread_local std::vector<FftTwiddleTable> cache;
-    for (auto & e : cache) {
-        if (e.n_fft == n) return e.w.data();
-    }
-    FftTwiddleTable tab;
-    tab.n_fft = n;
-    tab.w.reserve(n - 1);
+// Tables belong to an FFT worker or incremental stream, so no heap-owning
+// thread-local destructor runs when a short-lived worker exits. MinGW's TLS
+// teardown can corrupt the heap under concurrent dynamic TLS destruction.
+std::vector<std::complex<float>> make_fft_twiddles(int n) {
+    std::vector<std::complex<float>> table;
+    table.reserve(n - 1);
     for (int len = 2; len <= n; len <<= 1) {
         const float ang = -2.0f * 3.14159265358979323846f / (float) len;
         const std::complex<float> wlen(std::cos(ang), std::sin(ang));
         std::complex<float> wk(1.0f, 0.0f);
         for (int k = 0; k < len / 2; ++k) {
-            tab.w.push_back(wk);
+            table.push_back(wk);
             wk *= wlen;
         }
     }
-    cache.push_back(std::move(tab));
-    return cache.back().w.data();
+    return table;
 }
 
-void fft_radix2_inplace(std::complex<float> * data, int n) {
+void fft_radix2_inplace(std::complex<float> * data, int n,
+                        const std::complex<float> * twiddles) {
     int log_n = 0;
     while ((1 << log_n) < n) ++log_n;
     if ((1 << log_n) != n) throw std::runtime_error("fft_radix2_inplace: n must be a power of two");
@@ -113,7 +90,6 @@ void fft_radix2_inplace(std::complex<float> * data, int n) {
         if (i < j) std::swap(data[i], data[j]);
     }
 
-    const std::complex<float> * twiddles = get_fft_twiddles(n);
     int twiddle_off = 0;
     for (int len = 2; len <= n; len <<= 1) {
         const std::complex<float> * w_table = twiddles + twiddle_off;
@@ -136,7 +112,7 @@ void fft_radix2_inplace(std::complex<float> * data, int n) {
 // packed sequence y[k] = x[2k] + i*x[2k+1] and then unpacking.
 // Cuts the butterfly count in half (256 vs 512 at n_fft=512) at the
 // cost of an O(n/2) post-processing pass that reuses the same
-// thread_local twiddle cache. We compute the *power* spectrum
+// worker-owned twiddle tables. We compute the *power* spectrum
 // directly so the caller never sees the unpacked complex bins.
 //
 // Reference: any FFT textbook (Numerical Recipes §12.3, "Fast
@@ -155,7 +131,9 @@ void fft_radix2_inplace(std::complex<float> * data, int n) {
 void rfft_power_radix2(const float * __restrict x_real,
                        float       * __restrict power,
                        int                       n_fft,
-                       std::complex<float>     * scratch /* size >= n_fft / 2 */) {
+                       std::complex<float>     * scratch, // size >= n_fft / 2
+                       const std::complex<float> * half_twiddles,
+                       const std::complex<float> * full_twiddles) {
     const int half = n_fft / 2;
 
     // Pack: y[k] = x[2k] + i*x[2k+1], complex sequence of length n/2.
@@ -163,9 +141,8 @@ void rfft_power_radix2(const float * __restrict x_real,
         scratch[k] = std::complex<float>(x_real[2 * k], x_real[2 * k + 1]);
     }
 
-    // n/2-point complex FFT. Twiddles for size `half` cached in the
-    // shared thread_local table.
-    fft_radix2_inplace(scratch, half);
+    // The caller reuses the same tables for every frame in its range.
+    fft_radix2_inplace(scratch, half, half_twiddles);
 
     // Unpack to recover power[0..half], the real-input spectrum's
     // n/2+1 non-redundant bins. Two real-valued endpoints (DC and
@@ -185,15 +162,9 @@ void rfft_power_radix2(const float * __restrict x_real,
         power[half] = rNy * rNy;
     }
 
-    // Reuse the shared twiddle cache for size `n_fft` to grab
-    // W[k] = twiddles[half - 1 + k] for k in [1, half - 1]. The
-    // cache layout per `get_fft_twiddles` is:
-    //   for len=2..n step *=2: twiddles[off..off+len/2)] = exp(-2πi k / len)
-    // so the segment for `len = n_fft` starts at `n_fft/2 - 1` and
-    // contains exactly the n_fft/2 values exp(-2πi*k/n_fft) for
-    // k = 0..n_fft/2 - 1. We need k = 1..half-1 from that segment.
-    const std::complex<float> * twiddles = get_fft_twiddles(n_fft);
-    const std::complex<float> * w_n      = twiddles + (n_fft / 2 - 1);
+    // The full-length table's final stage starts after n_fft / 2 - 1
+    // entries and holds exp(-2*pi*i*k/n_fft) for k = 0..n_fft/2-1.
+    const std::complex<float> * w_n = full_twiddles + (n_fft / 2 - 1);
     for (int k = 1; k < half; ++k) {
         const std::complex<float> yk = scratch[k];
         const std::complex<float> ym = std::conj(scratch[half - k]);
@@ -261,6 +232,8 @@ void parallel_over_frames(int n_frames, int requested_threads, Fn && fn) {
 void power_spectrum_rows(int t0, int t1, int n_fft, int hop, int n_bins,
                          const float * __restrict x_padded, const float * __restrict window_padded,
                          float * __restrict power_data) {
+    const auto half_twiddles = make_fft_twiddles(n_fft / 2);
+    const auto full_twiddles = make_fft_twiddles(n_fft);
     std::vector<float>               windowed((size_t) n_fft);
     std::vector<std::complex<float>> tbuf((size_t) n_fft / 2);
     float               * __restrict windowed_data = windowed.data();
@@ -270,7 +243,8 @@ void power_spectrum_rows(int t0, int t1, int n_fft, int hop, int n_bins,
         for (int i = 0; i < n_fft; ++i) {
             windowed_data[i] = x_padded[start + i] * window_padded[i];
         }
-        rfft_power_radix2(windowed_data, power_data + (size_t) t * n_bins, n_fft, tbuf_data);
+        rfft_power_radix2(windowed_data, power_data + (size_t) t * n_bins, n_fft,
+                          tbuf_data, half_twiddles.data(), full_twiddles.data());
     }
 }
 
@@ -513,6 +487,8 @@ struct IncrementalMelState::Impl {
     std::vector<float> windowed;
     std::vector<float> power;
     std::vector<std::complex<float>> fft;
+    std::vector<std::complex<float>> half_twiddles;
+    std::vector<std::complex<float>> full_twiddles;
     std::vector<MelFilterBand> filter_bands;
     std::vector<float> filterbank_src;
 
@@ -617,6 +593,8 @@ void prepare_incremental_window(
     state.power.resize(
         static_cast<size_t>(config.n_fft / 2 + 1));
     state.fft.resize(static_cast<size_t>(config.n_fft / 2));
+    state.half_twiddles = make_fft_twiddles(config.n_fft / 2);
+    state.full_twiddles = make_fft_twiddles(config.n_fft);
 }
 
 void compute_incremental_frame(
@@ -638,7 +616,9 @@ void compute_incremental_frame(
         state.windowed.data(),
         state.power.data(),
         config.n_fft,
-        state.fft.data());
+        state.fft.data(),
+        state.half_twiddles.data(),
+        state.full_twiddles.data());
 
     const int bins = config.n_fft / 2 + 1;
     if (state.filter_bands.size() != static_cast<size_t>(config.n_mels) ||

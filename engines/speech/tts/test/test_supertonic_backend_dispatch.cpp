@@ -19,9 +19,14 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <thread>
+
+#if defined(__ELF__) && (defined(__GNUC__) || defined(__clang__))
+extern "C" int openblas_get_num_threads(void) __attribute__((weak));
+#endif
 
 using namespace tts_cpp::supertonic::detail;
 
@@ -243,6 +248,23 @@ void test_set_n_threads_backend_classification() {
     CHECK(gpu_model.n_threads == 3);
 }
 
+void test_openblas_default_worker_cap() {
+#if defined(__ELF__) && (defined(__GNUC__) || defined(__clang__))
+    if (!cpu_pointwise_accel_compiled() || !openblas_get_num_threads) return;
+    // The BLAS library may already have initialized before main(). The
+    // runtime API must still cap it when Supertonic chooses its defaults.
+    const char * previous = std::getenv("OPENBLAS_NUM_THREADS");
+    const std::string previous_value = previous ? previous : "";
+    const bool had_previous = previous != nullptr;
+    unsetenv("OPENBLAS_NUM_THREADS");
+    supertonic_model model;
+    model.backend_is_cpu = true;
+    supertonic_set_n_threads(model, 0);
+    CHECK(openblas_get_num_threads() == 1);
+    if (had_previous) setenv("OPENBLAS_NUM_THREADS", previous_value.c_str(), 1);
+#endif
+}
+
 // Test 10 - a packed Q8_0 weight kept at Q8_0 must not stage an F32 expansion.
 //
 // The loader stages a dequantized copy for a packed source, then uploads it.
@@ -311,6 +333,7 @@ void test_packed_q8_0_weight_is_not_expanded() {
 int main() {
     test_cpu_kernel_preference_tracks_compiled_accel();
     test_thread_count_resolver();
+    test_openblas_default_worker_cap();
     test_set_n_threads_backend_classification();
     test_packed_q8_0_weight_is_not_expanded();
     test_default_flags();

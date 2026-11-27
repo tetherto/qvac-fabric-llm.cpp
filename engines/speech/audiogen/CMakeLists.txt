@@ -391,6 +391,9 @@ if (AUDIOGEN_BUILD_TESTS)
 
     add_executable(test-acestep-fit-params test/test_fit_params.cpp)
     audiogen_link_in_tree_binary(test-acestep-fit-params)
+    if (AUDIOGEN_COREML)
+        target_compile_definitions(test-acestep-fit-params PRIVATE AUDIOGEN_USE_COREML)
+    endif()
     audiogen_register_test(test-acestep-fit-params LABEL "integration")
     set_property(TEST test-acestep-fit-params PROPERTY SKIP_RETURN_CODE 77)
 

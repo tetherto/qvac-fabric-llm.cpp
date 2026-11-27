@@ -23,6 +23,8 @@
 //               (and, when cloning, the encoder's convolution block and
 //               full-reference analysis graphs)
 //
+// An active Core ML codec decoder sidecar returns Error with reason
+// "coreml-memory-estimate-unavailable" until its resident memory is priced.
 // See tts-cpp/fit.h for the status contract and result layout.
 
 #include "tts-cpp/export.h"

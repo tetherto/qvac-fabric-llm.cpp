@@ -1091,6 +1091,10 @@ if (PARAKEET_BUILD_TESTS)
     parakeet_apply_ccache(test-sentencepiece-bpe)
     parakeet_register_test(test-sentencepiece-bpe LABEL "unit")
 
+    add_executable(sortformer-preflight test/sortformer_preflight.cpp)
+    target_link_libraries(sortformer-preflight PRIVATE qvac-parakeet)
+    parakeet_apply_ccache(sortformer-preflight)
+
     add_executable(test-sortformer-streaming test/test_sortformer_streaming.cpp)
     target_link_libraries(test-sortformer-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-sortformer-streaming PRIVATE include src ggml/include)
@@ -1195,6 +1199,12 @@ if (PARAKEET_BUILD_TESTS)
         EXE      test-perf-regression
         ARGS     "--model" "${_qvp_sf_q8_gguf}" "--wav" "${_qvp_diar_wav}"
         REQUIRES "${_qvp_sf_q8_gguf}" "${_qvp_diar_wav}")
+
+    find_package(Threads REQUIRED)
+    add_executable(test-coreml-compile-wait test/test_coreml_compile_wait.cpp)
+    target_compile_features(test-coreml-compile-wait PRIVATE cxx_std_17)
+    target_link_libraries(test-coreml-compile-wait PRIVATE Threads::Threads)
+    parakeet_register_test(test-coreml-compile-wait LABEL "unit")
 
     # Internal regression gate for the round-2 mel preprocess sweep
     # (real-FFT, MelState reuse). Pure unit test -- no GGUF needed.

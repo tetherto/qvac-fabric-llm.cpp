@@ -1,22 +1,20 @@
 // The conformer conv module hands the depthwise kernel a channel-contiguous view
 // of its [d_model, T] activation. ggml tells that view apart from a plain
 // contiguous tensor by nb[1] > nb[0], which needs at least two frames; the
-// graph builder falls back to the portable lowering below that. The kernel
-// answers in the same channel-innermost memory, which the builder reads back
-// as a contiguous [d_model, T] tensor.
-#include "conv_channels_layout.h"
-
+// graph builder falls back to the portable lowering below that.
 #include "ggml.h"
+#include "depthwise_conv_layout.h"
 
 #include <cstdio>
+#include <vector>
 
 namespace {
 
 constexpr int     k_d_model    = 8;
 constexpr int64_t k_min_frames = 2;
-constexpr int     k_kernel     = 3;
-constexpr int     k_pad        = 1;
-constexpr int     k_frames     = 4;
+constexpr int k_context_tensors = 128;
+constexpr int k_kernel_width = 3;
+constexpr int k_kernel_padding = k_kernel_width / 2;
 
 bool view_is_channels_first(ggml_context * ctx, int T) {
     ggml_tensor * y  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_d_model, T);
@@ -24,28 +22,41 @@ bool view_is_channels_first(ggml_context * ctx, int T) {
     return ggml_is_contiguous_channels(ggml_permute(ctx, y4, 2, 0, 1, 3));
 }
 
-ggml_tensor * channels_first_kernel(ggml_context * ctx) {
-    ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k_d_model, k_kernel, 1, 1);
-    return ggml_permute(ctx, w, 3, 0, 1, 2);
+ggml_tensor * create_channels_first_convolution(ggml_context * ctx, int frames) {
+    auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_d_model, frames);
+    auto * input4 = ggml_reshape_4d(ctx, input, k_d_model, frames, 1, 1);
+    auto * channels = ggml_permute(ctx, input4, 2, 0, 1, 3);
+    auto * weights = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k_d_model, k_kernel_width, 1, 1);
+    auto * kernel = ggml_permute(ctx, weights, 3, 0, 1, 2);
+    return ggml_conv_2d_dw_direct(ctx, kernel, channels, 1, 1, k_kernel_padding, 0, 1, 1);
 }
 
-ggml_tensor * channels_first_input(ggml_context * ctx) {
-    ggml_tensor * y4 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k_d_model, k_frames, 1, 1);
-    return ggml_permute(ctx, y4, 2, 0, 1, 3);
-}
+bool output_preserves_channels_and_frames(ggml_context * ctx, int frames) {
+    auto * out = create_channels_first_convolution(ctx, frames);
+    if (!ggml_is_contiguous_channels(out) || out->nb[0] == sizeof(float)) return false;
 
-bool conv_output_is_contiguous_activation(ggml_context * ctx) {
-    ggml_tensor * conv = ggml_conv_2d_dw_direct(ctx, channels_first_kernel(ctx), channels_first_input(ctx),
-                                                1, 1, k_pad, 0, 1, 1);
-    ggml_tensor * out = parakeet::channels_first_conv_output(ctx, conv);
-    return ggml_is_contiguous(out) && ggml_n_dims(out) == 2 &&
-           out->ne[0] == k_d_model && out->ne[1] == k_frames && out->view_src == conv;
+    // Populate the GPU output layout without executing a GPU kernel.
+    std::vector<float> values(k_d_model * frames);
+    for (size_t i = 0; i < values.size(); ++i) values[i] = static_cast<float>(i);
+    out->data = values.data();
+    auto * flat = parakeet::flatten_channels_first_convolution(ctx, out);
+    if (!ggml_is_contiguous(flat) || flat->ne[0] != k_d_model || flat->ne[1] != frames ||
+        flat->data != out->data || flat->view_src != out) return false;
+
+    for (int frame = 0; frame < frames; ++frame) {
+        for (int channel = 0; channel < k_d_model; ++channel) {
+            const auto * source = reinterpret_cast<const float *>(
+                static_cast<const char *>(out->data) + frame * out->nb[0] + channel * out->nb[2]);
+            if (ggml_get_data_f32(flat)[frame * k_d_model + channel] != *source) return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
 
 int main() {
-    ggml_init_params ip = { ggml_tensor_overhead() * 32, nullptr, true };
+    ggml_init_params ip = { ggml_tensor_overhead() * k_context_tensors, nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     if (!ctx) return 1;
     int failures = 0;
@@ -55,10 +66,12 @@ int main() {
         std::printf("[conv-channels-view] T=%d channel-contiguous=%d expected=%d: %s\n",
                     T, (int) got, (int) expect, got == expect ? "ok" : "FAIL");
         failures += got != expect;
+        if (expect) {
+            const bool preserves = output_preserves_channels_and_frames(ctx, T);
+            std::printf("[conv-channels-output] T=%d: %s\n", T, preserves ? "ok" : "FAIL");
+            failures += !preserves;
+        }
     }
-    const bool output_ok = conv_output_is_contiguous_activation(ctx);
-    std::printf("[conv-channels-view] conv output reads back as [d_model, T]: %s\n", output_ok ? "ok" : "FAIL");
-    failures += !output_ok;
     ggml_free(ctx);
     std::printf("[conv-channels-view] %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

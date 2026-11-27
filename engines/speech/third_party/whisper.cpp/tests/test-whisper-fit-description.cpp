@@ -15,6 +15,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -112,6 +113,28 @@ void check_models(const std::vector<fit_pair> & models, bool use_gpu) {
         check_model(model, use_gpu);
     }
 }
+
+#ifdef WHISPER_USE_COREML
+void check_coreml_description_route(const fit_pair & model, bool use_gpu) {
+    const auto scratch = std::filesystem::temp_directory_path() /
+        ("whisper-fit-description-coreml-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directory(scratch);
+    const auto artifact = scratch / "tiny.bin";
+    const auto description = scratch / "tiny.fit.gguf";
+    std::filesystem::copy_file(model.artifact, artifact);
+    std::filesystem::copy_file(model.description, description);
+    std::filesystem::create_directory(scratch / "tiny-encoder.mlmodelc");
+    const whisper_fit_result artifact_fit = project(artifact.string(), "", use_gpu);
+    const whisper_fit_result description_fit = project(description.string(), "", use_gpu);
+    expect(artifact_fit.status == WHISPER_FIT_ERROR &&
+           std::strcmp(artifact_fit.reason, "coreml-memory-estimate-unavailable") == 0,
+           "artifact fit omitted the Core ML encoder");
+    expect(description_fit.status == WHISPER_FIT_ERROR &&
+           std::strcmp(description_fit.reason, "coreml-memory-estimate-unavailable") == 0,
+           "description fit omitted the Core ML encoder");
+    std::filesystem::remove_all(scratch);
+}
+#endif
 
 void check_vad(const fit_pair & model, const fit_pair & vad, bool use_gpu) {
     const whisper_fit_result artifact = project(model.artifact, vad.artifact, use_gpu);
@@ -211,6 +234,9 @@ int main(int argc, char ** argv) {
     const std::vector<fit_pair> models(pairs.begin() + 1, pairs.end());
 
     check_models(models, use_gpu);
+#ifdef WHISPER_USE_COREML
+    check_coreml_description_route(models.front(), use_gpu);
+#endif
     check_vad(models.front(), vad, use_gpu);
     check_wrong_kind(models.front(), vad);
     check_truncated_vad_encoder(models.front(), vad);

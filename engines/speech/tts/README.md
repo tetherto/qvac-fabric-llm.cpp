@@ -36,6 +36,30 @@ in [MOSS GPU validation](docs/moss.md#gpu-validation-cuda-and-vulkan); smoke cov
 not establish general speech quality. OpenCL remains untested here. See the [API matrix](docs/api.md) for
 streaming support and the [model guide](docs/models.md) for storage tiers.
 
+Supertonic cancellation applies to the in-flight synthesis request. Starting a
+subsequent batch or streaming `Engine::synthesize()` clears the prior cancellation
+state, so voice applications can interrupt playback and reuse the loaded engine
+for the next reply.
+Cancellation is checked between synthesis stages and chunks; an active vector
+estimator can finish its entire loop before cancellation is observed.
+
+Supertonic also exposes `Engine::synthesize_segment()` for callers that already
+select sentence or clause boundaries. It synthesizes the entire supplied segment
+without applying the internal text chunker, preserves continuation intonation
+for unfinished clauses, and optionally delivers one PCM callback. The existing
+`synthesize()` streaming API retains its configured internal text chunking.
+
+Hosts that synthesize on worker threads should reuse one thread for the session
+and call `Engine::release_thread_resources()` on that thread before it exits.
+This releases its inference graph caches while the model backend is still
+alive. Keep the engine alive until the worker has completed this cleanup; the
+same engine can synthesize again after its caches are released.
+
+The `test-supertonic-request-lifecycle` and `-v3` fixture tests cover cancellation
+and reuse, whole-segment continuation/resampling parity, optional callbacks, and
+worker cache cleanup. They run when the corresponding model exists under
+`TTS_CPP_TEST_MODEL_DIR`; `test-supertonic-api` checks the public API without models.
+
 MOSS generation starts at the reference assistant header. ISO language codes
 accepted by the API/CLI are converted to the model's language names (`en` to
 `English`, `zh` to `Chinese`); spelled-out names pass through.

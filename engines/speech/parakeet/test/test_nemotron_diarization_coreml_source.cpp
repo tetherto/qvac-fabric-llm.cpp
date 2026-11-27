@@ -27,6 +27,7 @@
 #include "coreml/parakeet_coreml_sidecars.h"
 #include "parakeet_ctc.h"
 #include "qvac_coreml/generation.h"
+#include "coreml_compile_wait.h"
 
 #include <atomic>
 #include <chrono>
@@ -73,7 +74,7 @@ std::atomic<bool> g_compile_entered{false};
 std::atomic<bool> g_compile_release{false};
 std::string held_compile(const std::string &, const std::string &) {
     g_compile_entered = true;
-    while (!g_compile_release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    while (!g_compile_release.load()) std::this_thread::sleep_for(parakeet::test::coreml_compile_poll_interval);
     return "compile held by the test";
 }
 
@@ -199,11 +200,20 @@ int main(int argc, char ** argv) {
         parakeet::CoremlOptions options;
         options.cache_dir = (g_dir / "cache-join").string();
         parakeet::ParakeetCtcModel first;
-        check(parakeet::load_from_gguf((g_dir / "m.gguf").string(), first, kThreads, kGpuLayers, false, "auto",
-                                       options) == 0,
-              "the first model loads");
-        for (int i = 0; i < 6000 && !g_compile_entered; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        check(g_compile_entered, "the first model's job is compiling (held open)");
+        const bool first_loaded = parakeet::load_from_gguf((g_dir / "m.gguf").string(), first,
+            kThreads, kGpuLayers, false, "auto", options) == 0;
+        check(first_loaded, "the first model loads");
+        const auto compile_wait = first_loaded ? parakeet::test::wait_for_compile_entry({
+            [] { return g_compile_entered.load(); },
+            [&] { return slot_json(parakeet::model_coreml_status_json(first), g_stage.c_str()); },
+        }) : parakeet::test::CompileWaitResult{parakeet::test::CompileWaitState::failed, "model load failed"};
+        if (compile_wait.state != parakeet::test::CompileWaitState::entered) {
+            std::fprintf(stderr, "compile hook not reached (%s): %s\n",
+                         compile_wait.state == parakeet::test::CompileWaitState::failed ? "failed" : "timed out",
+                         compile_wait.status.c_str());
+        }
+        check(compile_wait.state == parakeet::test::CompileWaitState::entered,
+              "the first model's job is compiling (held open)");
         parakeet::set_gguf_load_observer(&touch_in_place);
         parakeet::ParakeetCtcModel second;
         check(parakeet::load_from_gguf((g_dir / "m.gguf").string(), second, kThreads, kGpuLayers, false, "auto",

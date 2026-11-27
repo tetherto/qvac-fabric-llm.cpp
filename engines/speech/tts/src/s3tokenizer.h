@@ -109,3 +109,15 @@ bool s3tokv2_tokenize(const std::vector<float> & wav_16k,
                       std::vector<int32_t> & out_tokens,
                       int n_threads = 0,
                       ggml_backend_t backend = nullptr);
+
+// Encode two reference-audio slices with one weight upload. The outputs are
+// identical to two separate s3tokv2_tokenize calls; attention still runs on
+// each slice independently, preserving the 10 s and 15 s conditioning rules.
+bool s3tokv2_tokenize_pair(const std::vector<float> & first_wav_16k,
+                           const std::vector<float> & second_wav_16k,
+                           const s3tokv2_weights & w,
+                           int second_max_tokens,
+                           std::vector<int32_t> & first_tokens,
+                           std::vector<int32_t> & second_tokens,
+                           int n_threads = 0,
+                           ggml_backend_t backend = nullptr);

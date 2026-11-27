@@ -163,7 +163,12 @@ the bounded parity harness.
 
 Streaming is available through the `parler::Engine` callback API using
 `stream_chunk_frames` and `stream_first_chunk_frames`. Neither `parler-cli` nor
-the limited `tts-cli` Parler route exposes those controls.
+the limited `tts-cli` Parler route exposes those controls. With a fixed seed,
+repeating a call on one engine reproduces its PCM bit for bit on every backend,
+streamed or not: the prefill and every DAC window plan their graph buffers from
+that graph alone, so a backend whose kernel choice follows the buffer layout
+(the CUDA fused kernels) cannot pick up the layout an earlier, larger window
+left in the allocator.
 
 ## Core ML DAC sidecar (Apple Neural Engine)
 

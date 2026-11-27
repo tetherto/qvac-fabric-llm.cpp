@@ -59,5 +59,15 @@ int main(int argc, char ** argv) {
     npy_array ref_tok = npy_load(tokp);
     const bool tokens_ok = tts_test::check_i32("tokens", tokens,
                                               {(int64_t) tokens.size()}, ref_tok);
-    return mel_ok && tokens_ok ? 0 : 1;
+    // Voice cloning runs the 10 s and 15 s slices with shared encoder
+    // weights. Reusing the encoder must not carry activations from the first
+    // graph into the second, and max_tokens must still clip only its output.
+    std::vector<float> second_wav(wav.begin(), wav.begin() + wav.size() / 2);
+    std::vector<int32_t> first, second, expected;
+    const int max_second = 10;
+    if (!s3tokv2_tokenize(second_wav, w, max_second, expected) ||
+        !s3tokv2_tokenize_pair(wav, second_wav, w, max_second, first, second)) return 1;
+    const bool pair_ok = first == tokens && second == expected;
+    if (!pair_ok) fprintf(stderr, "FAIL: shared encoder changed tokenizer output\n");
+    return mel_ok && tokens_ok && pair_ok ? 0 : 1;
 }

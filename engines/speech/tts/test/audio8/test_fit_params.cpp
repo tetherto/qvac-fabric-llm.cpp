@@ -35,6 +35,7 @@
 
 #include "audio8/graph.h"
 #include "audio8/internal.h"
+#include "audio8/coreml_path.h"
 #include "fit_price.h"
 
 #include "ggml-alloc.h"
@@ -436,6 +437,19 @@ void run_fixture_gates(const std::string & lm_path, const std::string & dec_path
     expect(fit.device.codec_compute_bytes > 0, "projected codec_compute_bytes == 0");
     expect(!fit.report.empty(),                "empty report");
     if (g_failures) return;
+#ifdef TTS_CPP_USE_COREML
+    {
+        const std::string sidecar = coreml_codec_sidecar_path(dec_path);
+        const bool created = fs::create_directory(sidecar);
+        unsetenv("AUDIO8_COREML_DISABLE");
+        const auto routed = tts_cpp::audio8::fit_params(fopts);
+        setenv("AUDIO8_COREML_DISABLE", "1", 1);
+        expect(routed.status == tts_cpp::FitStatus::Error &&
+                   routed.reason == "coreml-memory-estimate-unavailable",
+               "Core ML codec sidecar was omitted from the fit verdict");
+        if (created) fs::remove(sidecar);
+    }
+#endif
     std::printf("%s", fit.report.c_str());
 
     // Codec decode parity: a real decode leaves the latent arena in

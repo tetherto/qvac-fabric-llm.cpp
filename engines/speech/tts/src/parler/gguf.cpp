@@ -859,12 +859,19 @@ bool parler_fuse_decode_weights(parler_model & model, parler_fit_measure * measu
     return true;
 }
 
+static bool direct_alloc(ggml_gallocr_t allocr, ggml_cgraph * gf, parler_graph_layout layout) {
+    return layout == parler_graph_layout::fresh
+        ? ::tts_cpp::detail::direct_alloc_with_fresh_layout(allocr, gf)
+        : ggml_gallocr_alloc_graph(allocr, gf);
+}
+
 bool parler_graph_prepare(const parler_model & model, ggml_cgraph * gf,
-                          ggml_gallocr_t allocr, bool & use_sched, const char * caller) {
+                          ggml_gallocr_t allocr, bool & use_sched, const char * caller,
+                          parler_graph_layout layout) {
     use_sched = ::tts_cpp::detail::sched_force_enabled() ||
                 !::tts_cpp::detail::graph_fully_supported(model.backend, gf);
     if (!use_sched) {
-        if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        if (!direct_alloc(allocr, gf, layout)) {
             fprintf(stderr, "%s: gallocr alloc failed\n", caller);
             return false;
         }

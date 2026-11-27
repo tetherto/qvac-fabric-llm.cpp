@@ -4,6 +4,9 @@
 
 namespace tts_cpp::moss {
 
+// An active Core ML DiT or VAE sidecar returns Error with reason
+// "coreml-memory-estimate-unavailable".
+
 TTS_CPP_API FitResult fit_params(const SoundEffectOptions & options,
                                 const SoundEffectRequest & request, uint64_t margin_bytes);
 

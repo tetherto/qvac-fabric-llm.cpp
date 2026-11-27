@@ -16,6 +16,14 @@ using namespace tts_cpp::supertonic::detail;
 static_assert(std::is_same<decltype(EngineOptions::prewarm_text), std::string>::value);
 static_assert(std::is_same<decltype(&Engine::warm_up),
                            void (Engine::*)(const std::string &)>::value);
+static_assert(std::is_same<decltype(&Engine::synthesize_segment),
+                           tts_cpp::supertonic::SynthesisResult (Engine::*)(
+                               const std::string &, const tts_cpp::supertonic::StreamCallback &)>::value);
+static_assert(std::is_same<decltype(std::declval<Engine &>().synthesize_segment(
+                               std::declval<const std::string &>())),
+                           tts_cpp::supertonic::SynthesisResult>::value);
+static_assert(std::is_same<decltype(&Engine::release_thread_resources),
+                           void (Engine::*)() noexcept>::value);
 static_assert(std::is_same<decltype(EngineOptions::f16_weights_deny_list),
                            std::vector<std::string>>::value);
 static_assert(std::is_same<decltype(EngineOptions::kv_attn_type), int>::value);
