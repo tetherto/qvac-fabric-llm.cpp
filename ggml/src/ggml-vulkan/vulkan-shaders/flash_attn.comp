@@ -215,8 +215,8 @@ void main() {
                 // skip this block
                 continue;
             }
-            // Only load if the block is not all zeros
-            if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
+            // Only load if the block is not all zeros, or it has a bias to stage
+            if (mask_opt_bits != MASK_OPT_ALL_ZERO || USE_BIAS) {
                 bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
@@ -229,6 +229,9 @@ void main() {
                         bool m_active = fa_mask_index(j * Bc + c, mcol);
                         if (m_active && (!nem1_bounds_check || i * Br + r < p.nem1)) {
                             FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + mcol]);
+                            if (USE_BIAS) {
+                                m = FLOAT_TYPE(fa_add_bias(float(m), r, mcol));
+                            }
                             masksh[c * masksh_stride + r] = m;
                             max_mask = max(max_mask, float(m));
                         } else {
@@ -557,7 +560,7 @@ void main() {
             }
         }
 
-        if (MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+        if (MASK_ENABLE && (mask_opt_bits != MASK_OPT_ALL_ZERO || USE_BIAS)) {
             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                     FLOAT_TYPE mvf = masksh[(c * cols_per_iter + col_tid) * masksh_stride + tile_row(r)];

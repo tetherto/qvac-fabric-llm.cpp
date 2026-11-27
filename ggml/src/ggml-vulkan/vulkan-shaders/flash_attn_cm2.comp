@@ -218,6 +218,15 @@ ACC_TYPE faAddSparseMask(const uint32_t row, const uint32_t col, const ACC_TYPE 
     return r < 0 ? ACC_TYPE(NEG) : elem + ACC_TYPE(data_mf16[g_m_off_elem + row * m_stride + uint(r)]);
 }
 
+// Add the indexed bias to the mask value at row, col of KV block jblk.
+ACC_TYPE faAddBias(const uint32_t row, const uint32_t col, const ACC_TYPE elem, const uint32_t jblk) {
+    const uint32_t kv_col = jblk * Bc + col;
+    if (KV_bounds_check && kv_col >= KV) {
+        return elem;
+    }
+    return ACC_TYPE(fa_add_bias(float(elem), row, kv_col));
+}
+
 ACC_TYPE maxReduce(const in ACC_TYPE x, const in ACC_TYPE y) {
     return max(x, y);
 }
@@ -673,7 +682,11 @@ void main() {
         if (MASK_ENABLE && USE_SPARSE) {
             coopMatPerElementNV(S, S, faAddSparseMask, j);
         } else if (MASK_ENABLE) {
-            S += slopeMat*coopmat<ACC_TYPE, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator>(mv);
+            coopmat<ACC_TYPE, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator> mva = coopmat<ACC_TYPE, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator>(mv);
+            if (USE_BIAS) {
+                coopMatPerElementNV(mva, mva, faAddBias, j);
+            }
+            S += slopeMat*mva;
         }
 
         // Clear padding elements to -inf, so they don't contribute to rowmax
