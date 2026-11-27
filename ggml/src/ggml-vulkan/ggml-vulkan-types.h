@@ -920,6 +920,8 @@ struct vk_device_struct {
     bool mul_mat_id_l_int[GGML_TYPE_COUNT];
     bool mul_mat_id_m_int[GGML_TYPE_COUNT];
     bool mul_mat_id_s_int[GGML_TYPE_COUNT];
+    // int8 MUL_MAT_ID whose small tile is the 128x32 eight-wave tile: its tile follows the rows per expert
+    bool mul_mat_id_rows_tile[GGML_TYPE_COUNT];
 
     vk::DescriptorSetLayout dsl;
 
