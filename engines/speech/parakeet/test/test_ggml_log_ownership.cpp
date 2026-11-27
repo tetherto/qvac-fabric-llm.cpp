@@ -1,6 +1,6 @@
 // PARAKEET_FORWARD_GGML_LOG decides who owns the process-wide ggml logger: with it
 // the parakeet log callback takes the ggml log over, without it the host's logger stays.
-#include "parakeet_log.h"
+#include "parakeet/log.h"
 
 #include "ggml.h"
 
@@ -27,14 +27,14 @@ bool expect(bool ok, const char * what) {
 
 int main() {
     ggml_log_set(&host_logger, nullptr);
-    parakeet::log_set_callback(&engine_sink, nullptr);
+    parakeet_log_set(&engine_sink, nullptr);
     const bool host_kept = installed_ggml_logger() == &host_logger;
 #ifdef PARAKEET_FORWARD_GGML_LOG
     const bool passed = expect(!host_kept, "the parakeet callback takes over the ggml log");
 #else
     const bool passed = expect(host_kept, "the host keeps the ggml log");
 #endif
-    parakeet::log_set_callback(nullptr, nullptr);
+    parakeet_log_set(nullptr, nullptr);
     std::printf("[ggml-log-ownership] %s\n", passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }

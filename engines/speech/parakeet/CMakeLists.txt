@@ -2877,7 +2877,7 @@ if (PARAKEET_BUILD_TESTS)
 
     add_executable(test-ggml-log-ownership test/test_ggml_log_ownership.cpp)
     target_link_libraries(test-ggml-log-ownership PRIVATE qvac-parakeet)
-    target_include_directories(test-ggml-log-ownership PRIVATE src include ggml/include)
+    target_include_directories(test-ggml-log-ownership PRIVATE include ggml/include)
     if (PARAKEET_FORWARD_GGML_LOG)
         target_compile_definitions(test-ggml-log-ownership PRIVATE PARAKEET_FORWARD_GGML_LOG)
     endif()
