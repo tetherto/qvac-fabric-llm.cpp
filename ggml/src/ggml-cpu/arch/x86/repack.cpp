@@ -1453,6 +1453,9 @@ void ggml_gemv_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
 
         gemv_q4_b32_8x8_q8_0_lut_avx<block_q4_0x8>(n, s, bs, vx, vy, nr, nc, signextendlut);
+        // the kernel gets the LUT as a 256-bit argument, so the compiler emits no vzeroupper on its exit
+        // dirty upper YMM state makes later SSE code on this thread (e.g. libm exp) much slower on Intel
+        _mm256_zeroupper();
 
         return;
     }
@@ -1690,6 +1693,8 @@ void ggml_gemv_iq4_nl_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const 
     signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
 
     gemv_q4_b32_8x8_q8_0_lut_avx<block_iq4_nlx8>(n, s, bs, vx, vy, nr, nc, signextendlut);
+    // see ggml_gemv_q4_0_8x8_q8_0
+    _mm256_zeroupper();
 
     return;
 #endif
@@ -1703,6 +1708,8 @@ void ggml_gemv_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
 
     gemv_q4_b32_8x8_q8_0_lut_avx<block_mxfp4x8>(n, s, bs, vx, vy, nr, nc, signextendlut);
+    // see ggml_gemv_q4_0_8x8_q8_0
+    _mm256_zeroupper();
 
     return;
 #endif
@@ -2031,6 +2038,8 @@ void ggml_gemm_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
 
         gemm_q4_b32_8x8_q8_0_lut_avx<block_q4_0x8>(n, s, bs, vx, vy, nr, nc, signextendlut);
+        // see ggml_gemv_q4_0_8x8_q8_0
+        _mm256_zeroupper();
 
         return;
     }
@@ -3500,6 +3509,8 @@ void ggml_gemm_iq4_nl_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const 
         signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
 
         gemm_q4_b32_8x8_q8_0_lut_avx<block_iq4_nlx8>(n, s, bs, vx, vy, nr, nc, signextendlut);
+        // see ggml_gemv_q4_0_8x8_q8_0
+        _mm256_zeroupper();
 
         return;
     }
@@ -3515,6 +3526,8 @@ void ggml_gemm_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
         signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
 
         gemm_q4_b32_8x8_q8_0_lut_avx<block_mxfp4x8>(n, s, bs, vx, vy, nr, nc, signextendlut);
+        // see ggml_gemv_q4_0_8x8_q8_0
+        _mm256_zeroupper();
 
         return;
     }
