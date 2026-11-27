@@ -567,9 +567,12 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
     const uint vui = data_a_packed32[a_offset + ib].qs[(sub * 8u + j) / 4u];
     return vec4(bitcastExtractfe2m1EXT(unpack8(vui), shift)) * d;
 #else
-    const vec2 v0 = dequantize(ib, iqs, a_offset);
-    const vec2 v1 = dequantize(ib, iqs + 2u, a_offset);
-    return vec4(v0.x, v0.y, v1.x, v1.y);
+    // one 32-bit load for the 4 bytes that hold these nibbles; iqs is a multiple of 4, as in the OCP path
+    const uint sub = iqs >> 4;
+    const float d = ue4m3_to_fp32(data_a[a_offset + ib].d[sub]);
+    const uint vui = data_a_packed32[a_offset + ib].qs[(sub * 8u + (iqs & 7)) / 4u] >> ((iqs & 8) >> 1);
+    return vec4(float(kvalues_mxfp4[vui & 0xF]), float(kvalues_mxfp4[(vui >> 8) & 0xF]),
+                float(kvalues_mxfp4[(vui >> 16) & 0xF]), float(kvalues_mxfp4[(vui >> 24) & 0xF])) * d * 0.5;
 #endif
 }
 #endif

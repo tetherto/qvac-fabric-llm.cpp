@@ -74,6 +74,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <memory>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -546,21 +547,24 @@ static constexpr uint32_t num_topk_moe_pipelines = 10;
 
 static constexpr uint32_t num_topk_pipelines = 11;
 
+template <ggml_op NormOp>
 static constexpr std::initializer_list<ggml_op> topk_moe_early_softmax_norm{ GGML_OP_SOFT_MAX, GGML_OP_RESHAPE,  GGML_OP_ARGSORT,
                                                                              GGML_OP_VIEW,     GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
-                                                                             GGML_OP_SUM_ROWS, GGML_OP_CLAMP,    GGML_OP_DIV,
+                                                                             GGML_OP_SUM_ROWS, NormOp,           GGML_OP_DIV,
                                                                              GGML_OP_RESHAPE };
 
+template <ggml_op NormOp>
 static constexpr std::initializer_list<ggml_op> topk_moe_sigmoid_norm_bias{ GGML_OP_UNARY,    GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                             GGML_OP_ARGSORT,  GGML_OP_VIEW,     GGML_OP_GET_ROWS,
-                                                                            GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, GGML_OP_CLAMP,
+                                                                            GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, NormOp,
                                                                             GGML_OP_DIV,      GGML_OP_RESHAPE };
 
+template <ggml_op NormOp>
 static constexpr std::initializer_list<ggml_op> topk_moe_sqrt_softplus_norm_bias{ GGML_OP_UNARY,    GGML_OP_SQRT,
                                                                                   GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                                   GGML_OP_ARGSORT,  GGML_OP_VIEW,
                                                                                   GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
-                                                                                  GGML_OP_SUM_ROWS, GGML_OP_CLAMP,
+                                                                                  GGML_OP_SUM_ROWS, NormOp,
                                                                                   GGML_OP_DIV,      GGML_OP_RESHAPE };
 
 static constexpr std::initializer_list<ggml_op> topk_moe_early_softmax     { GGML_OP_SOFT_MAX, GGML_OP_RESHAPE,  GGML_OP_ARGSORT,
@@ -614,6 +618,32 @@ static constexpr std::initializer_list<ggml_op> situ_pattern {
     GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL,
 };
 
+// (res + ssm_conv(x, w)) * scale, a width-4 conv with its residual and output scale (Inkling 2)
+static constexpr std::initializer_list<ggml_op> short_conv_pattern { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+
+static constexpr std::initializer_list<std::array<int, 3>> short_conv_edges {
+    { 1, 0, 0 }, // reshape->src[0] == ssm_conv
+    { 3, 0, 2 }, // scale->src[0]   == add
+};
+
+// the short conv with its concat and recurrent state copy: CONCAT(past, cur^T), its tail VIEW, the state VIEW, the CPY,
+// then short_conv_pattern; built with views and other nodes between the CPY and the conv
+static constexpr std::initializer_list<ggml_op> short_conv_state_pattern {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+
+// (cur - tanh(f)*cur) + tanh(g)*m, the Inkling loop controller's mix; built with the gain mat-vec after the SUB
+static constexpr std::initializer_list<ggml_op> control_mix_pattern { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+static constexpr std::initializer_list<ggml_op> control_mix_built_pattern {
+    GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+
+static constexpr std::initializer_list<std::array<int, 3>> control_mix_edges {
+    { 1, 0, 0 }, // mul->src[0] == tanh(f)
+    { 2, 1, 1 }, // sub->src[1] == mul
+    { 4, 0, 3 }, // mul->src[0] == tanh(g)
+    { 5, 0, 2 }, // add->src[0] == sub
+    { 5, 1, 4 }, // add->src[1] == mul
+};
+
 static constexpr std::initializer_list<std::array<int, 3>> situ_edges {
     { 1, 0, 0 }, // tanh->src[0]  == scale
     { 2, 0, 1 }, // scale->src[0] == tanh
@@ -634,9 +664,9 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_moe_early_softma
     { 4, 1, 3 }, // get_rows->src[1] == view
     { 5, 0, 4 }, // reshape->src[0]  == get_rows
     { 6, 0, 5 }, // sum_rows->src[0] == reshape
-    { 7, 0, 6 }, // clamp->src[0]    == sum_rows
+    { 7, 0, 6 }, // denom->src[0]    == sum_rows
     { 8, 0, 5 }, // div->src[0]      == reshape
-    { 8, 1, 7 }, // div->src[1]      == clamp
+    { 8, 1, 7 }, // div->src[1]      == denom
     { 9, 0, 8 }, // reshape->src[0]  == div
 };
 
@@ -649,9 +679,9 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_moe_sigmoid_norm
     { 5, 1, 4 }, // get_rows->src[1] == view
     { 6, 0, 5 }, // reshape->src[0]  == get_rows
     { 7, 0, 6 }, // sum_rows->src[0] == reshape
-    { 8, 0, 7 }, // clamp->src[0]    == sum_rows
+    { 8, 0, 7 }, // denom->src[0]    == sum_rows
     { 9, 0, 6 }, // div->src[0]      == reshape
-    { 9, 1, 8 }, // div->src[1]      == clamp
+    { 9, 1, 8 }, // div->src[1]      == denom
     {10, 0, 9 }, // reshape->src[0]  == div
 };
 
@@ -665,9 +695,9 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_moe_sqrt_softplu
     { 6, 1, 5 }, // get_rows->src[1] == view
     { 7, 0, 6 }, // reshape->src[0]  == get_rows
     { 8, 0, 7 }, // sum_rows->src[0] == reshape
-    { 9, 0, 8 }, // clamp->src[0]    == sum_rows
+    { 9, 0, 8 }, // denom->src[0]    == sum_rows
     {10, 0, 7 }, // div->src[0]      == reshape
-    {10, 1, 9 }, // div->src[1]      == clamp
+    {10, 1, 9 }, // div->src[1]      == denom
     {11, 0,10 }, // reshape->src[0]  == div
 };
 
@@ -1158,6 +1188,9 @@ struct vk_device_struct {
     // directly, and the concat node only writes the tail columns its other readers (state copies) use
     vk_pipeline pipeline_ssm_conv_direct_silu_f32;
     vk_pipeline pipeline_ssm_conv_tail_f32;
+    vk_pipeline pipeline_short_conv_f32;
+    vk_pipeline pipeline_short_conv_state_f32;
+    vk_pipeline pipeline_control_mix_f32;
     vk_pipeline pipeline_ssm_conv_back_sx_f32;
     vk_pipeline pipeline_ssm_conv_back_c_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
@@ -1703,6 +1736,9 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_situ {};
+    bool fused_short_conv {};
+    bool fused_short_conv_state {};
+    bool fused_control_mix {};
     // GATED_DELTA_NET (or _DEFERRED) + CPY: the recurrent cache view the gdn writes its state to
     const ggml_tensor * fused_gdn_cache {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};

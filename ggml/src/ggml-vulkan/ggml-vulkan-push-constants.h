@@ -578,6 +578,7 @@ struct vk_op_topk_moe_push_constants {
     uint32_t n_expert_used;
     float clamp_min;
     float clamp_max;
+    float norm_bias;
     uint32_t gating_func;
     uint32_t has_bias;
     uint32_t with_norm;
@@ -929,6 +930,33 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+// strides in elements (see short_conv.comp)
+struct vk_op_short_conv_push_constants {
+    uint32_t x_nb1, x_nb2;
+    uint32_t w_nb1;
+    uint32_t res_nb1;
+    uint32_t dst_nb1;
+    uint32_t nr, n_t, n_s;
+    float scale, bias;
+};
+
+// short_conv.comp WITH_STATE: x_nb1 / x_nb2 are the past strides, state_nb1 the state row stride (elements)
+struct vk_op_short_conv_state_push_constants {
+    uint32_t x_nb1, x_nb2;
+    uint32_t w_nb1;
+    uint32_t res_nb1;
+    uint32_t dst_nb1;
+    uint32_t nr, n_t, n_s;
+    float scale, bias;
+    uint32_t state_nb1;
+};
+
+// control_mix.comp: every tensor is contiguous with the shape [ne0, nrows]
+struct vk_op_control_mix_push_constants {
+    uint32_t ne0;
+    uint32_t nrows;
 };
 
 struct vk_op_gru_push_constants {
