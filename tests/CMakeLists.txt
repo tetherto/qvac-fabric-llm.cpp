@@ -826,6 +826,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-col2im-1d.cpp  LABEL "main behavior backend"  LINK ggml)
     llama_build_and_test(test-conv-1d.cpp  LABEL "main behavior backend"  LINK ggml)
     llama_build_and_test(test-gelu-quick.cpp  LABEL "main behavior backend"  LINK ggml)
+    llama_build_and_test(test-repack-upper-state.cpp  LABEL "main behavior backend"  LINK ggml)
+    set_tests_properties(test-repack-upper-state PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # libmtmd
