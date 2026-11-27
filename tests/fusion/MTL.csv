@@ -56,7 +56,6 @@ chatglm             ,0   ,any     ,RMS_NORM+MUL                ,      5
 clover_moe          ,1   ,any     ,ADD+ADD                     ,      2
 clover_moe          ,1   ,any     ,GATED_DELTA_NET+CPY         ,      1
 clover_moe          ,1   ,any     ,MUL+ADD                     ,      4
-clover_moe          ,1   ,decode  ,MUL_MAT_ID+GLU              ,      2
 clover_moe          ,1   ,any     ,RMS_NORM+MUL                ,      6
 clover_moe          ,1   ,any     ,RMS_NORM+MUL+ROPE           ,      1
 clover_moe          ,1   ,any     ,RMS_NORM+MUL+ROPE+SET_ROWS  ,      1
