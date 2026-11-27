@@ -18864,6 +18864,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, false, 132, 129, 256));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 199, 67, 256));
     }
+    // int8 MUL_MAT_ID with a few rows per expert (128 experts, 8 used, 64 tokens), M not a multiple of 128
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 160, 64, 256));
+    }
 
     // CUDA few-row MMQ: 1-3 column groups, 32-row tiles (6170 rows), K = 18 units (uneven over the warps) and 9 units (one unit per ring stage)
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
@@ -21497,6 +21501,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // MoE prefill at 4 to 128 rows per expert: Qwen3-30B-A3B-like (128 experts, 8 used), gpt-oss-20b-like (32, 4), Inkling 2 Mini
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4}) {
+        for (auto [n_mats, n_used, m, k] : {std::array<int64_t, 4>{128, 8, 768, 2048}, std::array<int64_t, 4>{32, 4, 2880, 2880}}) {
+            for (int bs : {64, 512}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, bs, k));
+            }
+        }
+    }
+    for (int bs : {512, 2048}) {
+        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0}) {
+            for (int64_t k : {2304, 1152}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 2304, bs, k));
+            }
+        }
+    }
 
     // Inkling 2 Mini experts: gate + up (k 2304) and down (k 1152)
     for (int bs : {1, 4, 8}) {
