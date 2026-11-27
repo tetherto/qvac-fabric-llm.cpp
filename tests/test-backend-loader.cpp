@@ -6,8 +6,7 @@
 //   - a module reachable through two directory entries is scored once
 //   - GGML_DISABLE_CUDA stops the cuda search entirely
 //   - a module logs through the logger set with ggml_log_set, also while it is scored
-//   - outside Windows, with a static ggml-base: a module error line and its CONT lines also go to stderr,
-//     and loading again keeps a logger set on the module
+//   - modules observe logger replacement and reset through the shared ggml-base
 //   - on Windows, a cuda module's runtime DLL resolves from CUDA_PATH or CUDA_PATH_V*
 
 #include "ggml-backend.h"
@@ -18,7 +17,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <string>
 #include <vector>
 
@@ -30,6 +28,7 @@ namespace fs = std::filesystem;
 #        define NOMINMAX
 #    endif
 #    include <windows.h>
+#    include <process.h>
 
 static const char * const k_prefix = "qvac-ggml-cuda-";
 static const char * const k_ext    = ".dll";
@@ -41,10 +40,6 @@ static void set_env(const char * name, const char * value) {
     SetEnvironmentVariableA(name, value);
 }
 #else
-#    include <dlfcn.h>
-#    include <fcntl.h>
-#    include <unistd.h>
-
 static const char * const k_prefix = "libqvac-ggml-cuda-";
 static const char * const k_ext    = ".so";
 
@@ -86,32 +81,6 @@ static bool logged(ggml_log_level level, const std::string & text) {
     return false;
 }
 
-#ifndef _WIN32
-static std::vector<std::string> module_lines;
-
-static void module_log(ggml_log_level, const char * text, void *) {
-    module_lines.emplace_back(text);
-}
-
-// Run fn with stderr sent to a file, and return what was written.
-template <typename F> static std::string capture_stderr(const fs::path & file, F fn) {
-    fflush(stderr);
-    const int saved = dup(STDERR_FILENO);
-    const int fd    = open(file.string().c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (saved < 0 || fd < 0) {
-        return "<cannot capture stderr>";
-    }
-    dup2(fd, STDERR_FILENO);
-    close(fd);
-    fn();
-    fflush(stderr);
-    dup2(saved, STDERR_FILENO);
-    close(saved);
-    std::ifstream in(file);
-    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-}
-#endif
-
 static ggml_backend_reg_t find_reg(const char * name) {
     for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
         ggml_backend_reg_t reg = ggml_backend_reg_get(i);
@@ -130,6 +99,22 @@ static int count_regs(const char * name) {
     return n;
 }
 
+// Static Windows CRTs cache their own environment. Start a new process for
+// environment-dependent cases so every DLL sees the same initial values.
+static int load_count(const fs::path & path, const char * name) {
+#ifdef _WIN32
+    char executable[32768];
+    const DWORD length = GetModuleFileNameA(nullptr, executable, sizeof(executable));
+    if (length == 0 || length >= sizeof(executable)) {
+        return -1;
+    }
+    return (int) _spawnl(_P_WAIT, executable, executable, "--count-reg", path.string().c_str(), name, (char *) nullptr);
+#else
+    ggml_backend_load_all_from_path(path.string().c_str());
+    return count_regs(name);
+#endif
+}
+
 static int count_scores(const fs::path & log, const char * name) {
     std::ifstream in(log);
     std::string   line;
@@ -146,7 +131,11 @@ static void unload_all(const char * name) {
     }
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc == 4 && strcmp(argv[1], "--count-reg") == 0) {
+        ggml_backend_load_all_from_path(argv[2]);
+        return count_regs(argv[3]);
+    }
     std::error_code ec;
     const fs::path  dir =
         fs::temp_directory_path(ec) /
@@ -190,51 +179,38 @@ int main() {
         check(count_scores(log, "STUB_OK") == 1, "module behind two entries is scored once");
     }
 
-#ifndef _WIN32
-    {
-        // The module's own logger, when it links its own ggml-base.
-        using log_set_t      = void (*)(ggml_log_callback, void *);
-        using log_internal_t = void (*)(ggml_log_level, const char *, ...);
-        Dl_info            info{};
-        ggml_backend_reg_t reg    = find_reg("STUB_OK");
-        void *             handle = nullptr;
-        if (reg != nullptr && dladdr(reg, &info) != 0 && info.dli_fname != nullptr) {
-            handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
-        }
-        auto mod_log_set      = handle ? (log_set_t) dlsym(handle, "ggml_log_set") : nullptr;
-        auto mod_log_internal = handle ? (log_internal_t) dlsym(handle, "ggml_log_internal") : nullptr;
-        if (mod_log_set == nullptr || mod_log_internal == nullptr || mod_log_set == &ggml_log_set) {
-            printf("module shares ggml-base, own-logger cases skipped\n");
-        } else {
-            const std::string err = capture_stderr(dir / "stderr.log", [&] {
-                mod_log_internal(GGML_LOG_LEVEL_ERROR, "STUB_OK: error\n");
-                mod_log_internal(GGML_LOG_LEVEL_CONT, "  error detail\n");
-                mod_log_internal(GGML_LOG_LEVEL_INFO, "STUB_OK: info\n");
-                mod_log_internal(GGML_LOG_LEVEL_CONT, ".");
-            });
-            check(logged(GGML_LOG_LEVEL_ERROR, "STUB_OK: error\n"), "module error reaches the logger");
-            check(err == "STUB_OK: error\n  error detail\n",
-                  "module error and its CONT lines also go to stderr, other lines do not");
-
-            mod_log_set(module_log, nullptr);
-            ggml_backend_load_all_from_path(dir.string().c_str());
-            mod_log_internal(GGML_LOG_LEVEL_INFO, "STUB_OK: probe\n");
-            check(!module_lines.empty() && module_lines.back() == "STUB_OK: probe\n",
-                  "loading again keeps a logger set on the module");
-            mod_log_set(nullptr, nullptr);
-        }
-        if (handle != nullptr) {
-            dlclose(handle);
-        }
+    auto reg = find_reg("STUB_OK");
+    auto emit_log = reg ? (void (*)()) ggml_backend_reg_get_proc_address(reg, "test_log") : nullptr;
+    check(emit_log != nullptr, "module exposes log probe");
+    if (emit_log != nullptr) {
+        std::vector<log_line> replacement_lines;
+        ggml_log_set([](ggml_log_level level, const char * text, void * data) {
+            static_cast<std::vector<log_line> *>(data)->push_back({ level, text });
+        }, &replacement_lines);
+        ggml_backend_load_all_from_path(dir.string().c_str());
+        replacement_lines.clear();
+        emit_log();
+        check(replacement_lines.size() == 3 && replacement_lines[0].text == "STUB_OK: probe\n",
+              "loaded module observes replacement logger and userdata");
+        check(replacement_lines.size() == 3 && replacement_lines[1].level == GGML_LOG_LEVEL_ERROR &&
+              replacement_lines[1].text == "STUB_OK: error\n" &&
+              replacement_lines[2].level == GGML_LOG_LEVEL_CONT && replacement_lines[2].text == "  error detail\n",
+              "module error and continuation reach replacement logger unchanged");
+        ggml_log_set(capture_log, nullptr);
+        emit_log();
+        check(logged(GGML_LOG_LEVEL_INFO, "STUB_OK: probe\n"), "loaded module observes restored logger");
+        ggml_log_set(nullptr, nullptr);
+        emit_log();
+        check(replacement_lines.size() == 3, "reset releases replacement logger userdata");
+        ggml_log_set(capture_log, nullptr);
     }
-#endif
     unload_all("STUB_OK");
 
     fs::remove(log, ec);
     set_env("GGML_DISABLE_CUDA", "1");
-    ggml_backend_load_all_from_path(dir.string().c_str());
+    const int disabled_count = load_count(dir, "STUB_OK");
     set_env("GGML_DISABLE_CUDA", nullptr);
-    check(find_reg("STUB_OK") == nullptr, "GGML_DISABLE_CUDA keeps the cuda search off");
+    check(disabled_count == 0, "GGML_DISABLE_CUDA keeps the cuda search off");
     check(count_scores(log, "STUB_OK") == 0 && count_scores(log, "STUB_ZERO") == 0,
           "GGML_DISABLE_CUDA scores no cuda module");
 
@@ -251,27 +227,23 @@ int main() {
     check(!ec, "copy dependency into fake CUDA_PATH");
 
     set_env("CUDA_PATH", nullptr);
-    ggml_backend_load_all_from_path(dep_dir.string().c_str());
-    check(find_reg("STUB_DEP") == nullptr, "module with an unresolved runtime DLL is not registered");
+    check(load_count(dep_dir, "STUB_DEP") == 0, "module with an unresolved runtime DLL is not registered");
 
     set_env("CUDA_PATH", dir.string().c_str());
-    ggml_backend_load_all_from_path(dep_dir.string().c_str());
-    check(find_reg("STUB_DEP") == nullptr, "CUDA_PATH without bin\\x64 is not used");
+    check(load_count(dep_dir, "STUB_DEP") == 0, "CUDA_PATH without bin\\x64 is not used");
 
     set_env("CUDA_PATH", cuda_dir.string().c_str());
-    ggml_backend_load_all_from_path(dep_dir.string().c_str());
+    const int cuda_path_count = load_count(dep_dir, "STUB_DEP");
     set_env("CUDA_PATH", nullptr);
-    check(count_regs("STUB_DEP") == 1, "runtime DLL is resolved from CUDA_PATH\\bin\\x64");
-    unload_all("STUB_DEP");
+    check(cuda_path_count == 1, "runtime DLL is resolved from CUDA_PATH\\bin\\x64");
 
     // CUDA_PATH names only the last toolkit installed, which may be an older major.
     set_env("CUDA_PATH", dir.string().c_str());
     set_env("CUDA_PATH_V13_0", cuda_dir.string().c_str());
-    ggml_backend_load_all_from_path(dep_dir.string().c_str());
+    const int versioned_path_count = load_count(dep_dir, "STUB_DEP");
     set_env("CUDA_PATH", nullptr);
     set_env("CUDA_PATH_V13_0", nullptr);
-    check(count_regs("STUB_DEP") == 1, "runtime DLL is resolved from CUDA_PATH_V13_0 when CUDA_PATH has no bin\\x64");
-    unload_all("STUB_DEP");
+    check(versioned_path_count == 1, "runtime DLL is resolved from CUDA_PATH_V13_0 when CUDA_PATH has no bin\\x64");
 #endif
 
     ggml_log_set(nullptr, nullptr);
