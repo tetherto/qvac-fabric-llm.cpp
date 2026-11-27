@@ -961,6 +961,11 @@ bool Engine::is_diarization_model() const {
            pimpl_->model.model_type == ParakeetModelType::NEMOTRON_DIARIZATION;
 }
 
+bool Engine::supports_cache_aware_streaming() const {
+    return pimpl_->model.model_type == ParakeetModelType::NEMOTRON ||
+           pimpl_->model.unified_cfg.available;
+}
+
 bool Engine::is_transcription_model() const {
     return pimpl_->model.model_type == ParakeetModelType::CTC ||
            pimpl_->model.model_type == ParakeetModelType::RNNT ||

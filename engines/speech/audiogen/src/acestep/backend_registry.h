@@ -290,7 +290,7 @@ inline bool probe_gpu_matmul(SupportsOp supports_op) {
     ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
                                             GPU_MATMUL_PROBE_DIMENSION, GPU_MATMUL_PROBE_COLUMNS);
     ggml_tensor * projection = ggml_mul_mat(ctx, weights, input);
-    ggml_mul_mat_set_prec(projection, GGML_PREC_F32);
+    ggml_prec_set_acc(projection, GGML_PREC_F32);
     const bool supported = supports_op(projection);
     ggml_free(ctx);
     return supported;

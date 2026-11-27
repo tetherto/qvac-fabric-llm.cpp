@@ -20,7 +20,7 @@ namespace detail {
 // even on GPUs whose default F32 matmul multiplies in fp16 (e.g. Vulkan).
 static ggml_tensor * mul_mat_f32(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
     ggml_tensor * r = ggml_mul_mat(ctx, a, b);
-    ggml_mul_mat_set_prec(r, GGML_PREC_F32);
+    ggml_prec_set_acc(r, GGML_PREC_F32);
     return r;
 }
 

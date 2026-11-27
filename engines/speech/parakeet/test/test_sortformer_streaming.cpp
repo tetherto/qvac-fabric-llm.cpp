@@ -135,6 +135,10 @@ int run_basic(const std::string & gguf_path,
         std::fprintf(stderr, "[sf-stream-test] %s is not a Sortformer model\n", gguf_path.c_str());
         return 2;
     }
+    if (engine.supports_cache_aware_streaming()) {
+        std::fprintf(stderr, "[sf-stream-test] a diarization model reported cache-aware streaming\n");
+        return 2;
+    }
 
     DiarizationResult offline = engine.diarize_samples(
         samples.data(), (int) samples.size(), sr, {});

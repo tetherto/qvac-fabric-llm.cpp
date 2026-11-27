@@ -1,4 +1,4 @@
-// log_impl and log_set_callback; installs hook and forwards to ggml_log_set.
+// log_impl and log_set_callback; installs hook and, with PARAKEET_FORWARD_GGML_LOG, forwards to ggml_log_set.
 
 #include "parakeet_log.h"
 
@@ -58,7 +58,13 @@ void dispatch(ggml_log_level level, const char * text) {
     g_idle.notify_all();
 }
 
+#ifdef PARAKEET_FORWARD_GGML_LOG
 void forward_ggml(ggml_log_level level, const char * text, void *) { dispatch(level, text); }
+
+void route_ggml_log(bool to_sink) { ggml_log_set(to_sink ? &forward_ggml : nullptr, nullptr); }
+#else
+void route_ggml_log(bool) {}
+#endif
 
 }
 
@@ -72,7 +78,7 @@ void log_set_callback(ggml_log_callback cb, void * user_data) {
             g_sink->callback = cb;
             g_sink->user_data = user_data;
         }
-        ggml_log_set(cb ? &forward_ggml : nullptr, nullptr);
+        route_ggml_log(cb != nullptr);
         if (replaced) {
             const Sink * old = replaced.get();
             g_idle.wait(lock, [&] {

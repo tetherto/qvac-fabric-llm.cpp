@@ -106,7 +106,7 @@ static ggml_tensor * mul_mat_f32(ggml_context * ctx, ggml_tensor * a, ggml_tenso
     }
 
     ggml_tensor * r = ggml_mul_mat(ctx, ap, bp);
-    ggml_mul_mat_set_prec(r, GGML_PREC_F32);
+    ggml_prec_set_acc(r, GGML_PREC_F32);
     if (pad_a || pad_b) {
         r = ggml_view_4d(ctx, r, M, N, r->ne[2], r->ne[3],
                          r->nb[1], r->nb[2], r->nb[3], 0);

@@ -210,7 +210,7 @@ bool quantised_matmul_is_already_f32(const ggml_tensor * weight) {
 ggml_tensor * precise_mul_mat(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
     ggml_tensor * out = ggml_mul_mat(ctx, a, b);
     if (!quantised_matmul_is_already_f32(a)) {
-        ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
     }
     return out;
 }
@@ -372,7 +372,7 @@ ggml_tensor * attention(ggml_context * ctx, ggml_cgraph * graph,
             const float scale = 1.0f / std::sqrt(static_cast<float>(shape.head_dim));
             ggml_tensor * blended = ggml_flash_attn_ext(ctx, query, keys, value_heads,
                                                         nullptr, scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(blended, GGML_PREC_F32);
+            ggml_prec_set_acc(blended, GGML_PREC_F32);
             ggml_tensor * merged = ggml_reshape_2d(ctx, blended, shape.head_dim * shape.n_head, 1);
             return linear(ctx, weights.wo, merged, nullptr);
         }

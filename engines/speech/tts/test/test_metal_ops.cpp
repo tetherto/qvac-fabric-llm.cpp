@@ -1,5 +1,4 @@
 // Standalone validation for the Metal kernels we added/fixed in ggml:
-//   - GGML_OP_DIAG_MASK_INF
 //   - GGML_OP_PAD with non-zero front-pad offsets (lp0..lp3)
 //   - GGML_OP_MUL_MAT + GGML_OP_ADD(bias) [+ GGML_OP_UNARY(GELU_ERF)]
 //     fusion in kernel_mul_mm (PROGRESS §3.27, §3.28)
@@ -36,61 +35,6 @@ static std::vector<float> run_graph(ggml_backend_t backend,
     ggml_backend_tensor_get(out, res.data(), 0, ggml_nbytes(out));
     ggml_gallocr_free(allocr);
     return res;
-}
-
-static int test_diag_mask_inf(ggml_backend_t cpu, ggml_backend_t gpu) {
-    fprintf(stderr, "[diag_mask_inf] ");
-    const int N = 37, H = 5;  // 5 heads
-    const int n_past = 4;
-
-    std::mt19937 rng(1);
-    std::uniform_real_distribution<float> dist(-2.f, 2.f);
-    std::vector<float> src(N * N * H);
-    for (auto & x : src) x = dist(rng);
-
-    auto run_one = [&](ggml_backend_t backend) {
-        static size_t buf_size = 4 * 1024 * 1024;
-        std::vector<uint8_t> buf(buf_size);
-        ggml_init_params p = { buf_size, buf.data(), true };
-        ggml_context * ctx = ggml_init(p);
-        ggml_cgraph * gf = ggml_new_graph(ctx);
-        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, N, N, H);
-        ggml_set_name(x, "x"); ggml_set_input(x);
-        ggml_tensor * y = ggml_diag_mask_inf(ctx, x, n_past);
-        ggml_set_name(y, "y"); ggml_set_output(y);
-        ggml_build_forward_expand(gf, y);
-        auto * allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        ggml_gallocr_reserve(allocr, gf);
-        ggml_gallocr_alloc_graph(allocr, gf);
-        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x"),
-                                src.data(), 0, src.size() * sizeof(float));
-        ggml_backend_graph_compute(backend, gf);
-        std::vector<float> res(N * N * H);
-        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "y"),
-                                res.data(), 0, res.size() * sizeof(float));
-        ggml_gallocr_free(allocr);
-        ggml_free(ctx);
-        return res;
-    };
-
-    auto ref = run_one(cpu);
-    auto got = run_one(gpu);
-
-    int bad = 0;
-    for (size_t i = 0; i < ref.size(); ++i) {
-        if (!close_enough(got[i], ref[i])) {
-            if (bad < 8) {
-                fprintf(stderr, "\n  mismatch @ %zu: cpu=%.6g gpu=%.6g", i, ref[i], got[i]);
-            }
-            ++bad;
-        }
-    }
-    if (bad == 0) {
-        fprintf(stderr, "OK (N=%d, H=%d, n_past=%d)\n", N, H, n_past);
-        return 0;
-    }
-    fprintf(stderr, "\n[diag_mask_inf] FAIL: %d / %zu mismatched\n", bad, ref.size());
-    return 1;
 }
 
 static int test_pad_ext(ggml_backend_t cpu, ggml_backend_t gpu) {
@@ -426,7 +370,6 @@ int main() {
 
     int rc = 0;
     rc |= test_quantized_cont_unsupported(cpu, gpu);
-    rc |= test_diag_mask_inf(cpu, gpu);
     rc |= test_pad_ext(cpu, gpu);
     // HiFT-sized shapes:
     rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/130, /*IC=*/512, /*OC=*/256, /*K=*/16, /*s0=*/8,  "ups[0]");

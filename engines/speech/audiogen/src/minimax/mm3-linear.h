@@ -20,14 +20,14 @@
 static ggml_prec mm3_weight_precision(const ggml_tensor * weight, ggml_prec requested) {
     const bool float_weight =
         weight->type == GGML_TYPE_F32 || weight->type == GGML_TYPE_F16 || weight->type == GGML_TYPE_BF16;
-    return float_weight ? requested : GGML_PREC_DEFAULT;
+    return float_weight ? requested : GGML_PREC_UNDEFINED;
 }
 
 static ggml_tensor * mm3_linear_columns(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * x,
                                         ggml_prec precision) {
     const int64_t columns = ggml_nelements(x) / x->ne[0];
     ggml_tensor * y       = ggml_mul_mat(ctx, weight, ggml_reshape_2d(ctx, x, x->ne[0], columns));
-    ggml_mul_mat_set_prec(y, mm3_weight_precision(weight, precision));
+    ggml_prec_set_acc(y, mm3_weight_precision(weight, precision));
     return y;
 }
 
@@ -36,7 +36,7 @@ static ggml_tensor * mm3_restore_columns(ggml_context * ctx, ggml_tensor * y, co
 }
 
 static ggml_tensor * mm3_linear(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * x,
-                                ggml_prec precision = GGML_PREC_DEFAULT) {
+                                ggml_prec precision = GGML_PREC_UNDEFINED) {
     return mm3_restore_columns(ctx, mm3_linear_columns(ctx, weight, x, precision), x);
 }
 
@@ -44,7 +44,7 @@ static ggml_tensor * mm3_linear(ggml_context * ctx, ggml_tensor * weight, ggml_t
 // so the add consumes the product directly and a backend can fold it into the
 // product (CUDA adds it while converting its half-precision GEMM output).
 static ggml_tensor * mm3_linear_bias(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * bias, ggml_tensor * x) {
-    ggml_tensor * y = ggml_add(ctx, mm3_linear_columns(ctx, weight, x, GGML_PREC_DEFAULT), bias);
+    ggml_tensor * y = ggml_add(ctx, mm3_linear_columns(ctx, weight, x, GGML_PREC_UNDEFINED), bias);
     return mm3_restore_columns(ctx, y, x);
 }
 

@@ -19,6 +19,7 @@ option(PARAKEET_BUILD_TESTS       "parakeet: build per-stage numerical validatio
 option(PARAKEET_BUILD_EXAMPLES    "parakeet: build standalone examples (live-mic, ...)"              ${PARAKEET_STANDALONE_DEFAULT})
 option(PARAKEET_INSTALL           "parakeet: generate install rules"                                 ON)
 option(PARAKEET_USE_SYSTEM_GGML   "parakeet: use system-installed GGML library"                      OFF)
+option(PARAKEET_FORWARD_GGML_LOG  "parakeet: route the process-wide ggml log through the parakeet log callback; turn OFF when the host owns the ggml logger" ON)
 option(PARAKEET_CCACHE            "parakeet: use ccache as compiler launcher if available"           ON)
 option(PARAKEET_COREML            "parakeet: enable the Apple Core ML (Neural Engine) encoder and TDT decoder sidecars (Apple-only, additive; the FastConformer encoder runs on a <model>-encoder.mlmodelc and the TDT decoder on a <model>-decoder.mlmodelc when present, else the engine falls back to ggml)." OFF)
 
@@ -332,6 +333,9 @@ if (PARAKEET_BUILD_LIBRARY)
     target_compile_definitions(qvac-parakeet PRIVATE
         PARAKEET_VERSION="${PROJECT_VERSION}"
     )
+    if (PARAKEET_FORWARD_GGML_LOG)
+        target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_FORWARD_GGML_LOG)
+    endif()
 
     # `PARAKEET_EXPERIMENTAL_FLASH_ATTN` gates the rel-pos MHA
     # fused-attention path in `parakeet_ctc.cpp`. Per-backend defaults:
@@ -729,6 +733,7 @@ if (PARAKEET_BUILD_TESTS)
     add_executable(test-log-unregister test/test_log_unregister.cpp src/parakeet_log.cpp)
     target_link_libraries(test-log-unregister PRIVATE ggml)
     target_include_directories(test-log-unregister PRIVATE ggml/include src include)
+    target_compile_definitions(test-log-unregister PRIVATE PARAKEET_FORWARD_GGML_LOG)
     parakeet_apply_ccache(test-log-unregister)
     parakeet_register_test(test-log-unregister LABEL "unit")
 
@@ -2869,6 +2874,15 @@ if (PARAKEET_BUILD_TESTS)
     target_include_directories(test-conv-channels-view PRIVATE src ggml/include)
     parakeet_apply_ccache(test-conv-channels-view)
     parakeet_register_test(test-conv-channels-view LABEL "unit")
+
+    add_executable(test-ggml-log-ownership test/test_ggml_log_ownership.cpp)
+    target_link_libraries(test-ggml-log-ownership PRIVATE qvac-parakeet)
+    target_include_directories(test-ggml-log-ownership PRIVATE include ggml/include)
+    if (PARAKEET_FORWARD_GGML_LOG)
+        target_compile_definitions(test-ggml-log-ownership PRIVATE PARAKEET_FORWARD_GGML_LOG)
+    endif()
+    parakeet_apply_ccache(test-ggml-log-ownership)
+    parakeet_register_test(test-ggml-log-ownership LABEL "unit")
 
     # The fused LSTM cell op and the concatenated-input GEMV must both reproduce
     # the per-gate decoder graph token for token.

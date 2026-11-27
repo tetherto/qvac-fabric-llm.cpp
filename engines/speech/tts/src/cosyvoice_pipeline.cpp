@@ -504,7 +504,7 @@ static ggml_tensor * linear(ggml_context * c, ggml_tensor * w, ggml_tensor * b, 
     return y;
 }
 // f32-accumulating matmul for the LM graphs.  Backends may reduce precision
-// under GGML_PREC_DEFAULT: ggml-vulkan accumulates in f16 for f16/quantized
+// under GGML_PREC_UNDEFINED: ggml-vulkan accumulates in f16 for f16/quantized
 // weights and on coopmat2 hardware rewrites even f32 x f32 into f16 operands.
 // Greedy speech-token decode turns a single near-tie argmax flip into a fully
 // divergent trajectory, and the cross-backend parity gate on the LM is exact
@@ -512,7 +512,7 @@ static ggml_tensor * linear(ggml_context * c, ggml_tensor * w, ggml_tensor * b, 
 // CPU, Metal, and OpenCL paths (they accumulate in f32 and ignore the flag).
 static ggml_tensor * mul_mat_f32acc(ggml_context * c, ggml_tensor * a, ggml_tensor * b) {
     ggml_tensor * y = ggml_mul_mat(c, a, b);
-    ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+    ggml_prec_set_acc(y, GGML_PREC_F32);
     return y;
 }
 static ggml_tensor * ln_noaffine(ggml_context * c, ggml_tensor * x) { return ggml_norm(c, x, 1e-6f); }
@@ -735,7 +735,7 @@ bool cosyvoice_lm_replay_enabled(ggml_backend_t backend, const qwen_hp & hp) {
     ggml_tensor * kh = ggml_view_3d(c, k, hp.head_dim, kCosyLmDecodeWindow, hp.n_kv, k->nb[2], k->nb[1], 0);
     ggml_tensor * mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, kCosyLmDecodeWindow, kCosyLmMaskPad);
     ggml_tensor * attention = ggml_flash_attn_ext(c, q, kh, kh, mask, 1.0f, 0, 0);
-    ggml_flash_attn_ext_set_prec(attention, GGML_PREC_F32);
+    ggml_prec_set_acc(attention, GGML_PREC_F32);
     const bool supported = ggml_backend_supports_op(backend, write) && ggml_backend_supports_op(backend, attention);
     ggml_free(c);
     return supported;
@@ -861,7 +861,7 @@ static ggml_cgraph * build_qwen_step_graph(ggml_context * c, const model_ctx & m
             ggml_tensor * vh = ggml_view_3d(c, cache.v[i], HD, Lk, NKV,
                                       cache.v[i]->nb[2], cache.v[i]->nb[1], 0);
             o = ggml_flash_attn_ext(c, qf, kh, vh, mask, scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+            ggml_prec_set_acc(o, GGML_PREC_F32);
             o = ggml_reshape_2d(c, o, static_cast<int64_t>(HD) * NH, Lq);
         } else {
             // Naive attention.  With the FA cache layout the time-transposed V
@@ -1020,7 +1020,7 @@ bool cosyvoice_lm_fa_enabled(ggml_backend_t backend, const qwen_hp & hp) {
     ggml_tensor * k = ggml_new_tensor_4d(c, GGML_TYPE_F32, hp.head_dim, 64, hp.n_kv, 1);
     ggml_tensor * v = ggml_new_tensor_4d(c, GGML_TYPE_F32, hp.head_dim, 64, hp.n_kv, 1);
     ggml_tensor * op = ggml_flash_attn_ext(c, q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
-    if (op) ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
+    if (op) ggml_prec_set_acc(op, GGML_PREC_F32);
     const bool ok = op && ggml_backend_supports_op(backend, op);
     ggml_free(c);
     return ok;
@@ -1160,7 +1160,7 @@ static bool cosy_dit_fa_supported(ggml_backend_t backend, int head_dim, int head
     ggml_tensor * k = ggml_new_tensor_4d(c, kv_type,       head_dim, 16, heads, 2);
     ggml_tensor * v = ggml_new_tensor_4d(c, kv_type,       head_dim, 16, heads, 2);
     ggml_tensor * op = ggml_flash_attn_ext(c, q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
-    if (op) ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
+    if (op) ggml_prec_set_acc(op, GGML_PREC_F32);
     const bool ok = op && ggml_backend_supports_op(backend, op);
     ggml_free(c);
     return ok;
@@ -1299,7 +1299,7 @@ ggml_tensor * build_dit(ggml_context * c, const model_ctx & m, const dit_hp & hp
                 v = ggml_cast(c, v, fa_kv);
             }
             o = ggml_flash_attn_ext(c, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+            ggml_prec_set_acc(o, GGML_PREC_F32);
         } else {
             ggml_tensor * scores = ggml_mul_mat(c, k, q);
             scores = ggml_soft_max_ext(c, scores, nullptr, attn_scale, 0.0f);

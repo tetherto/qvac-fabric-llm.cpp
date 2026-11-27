@@ -138,7 +138,7 @@ static ggml_tensor * mm3_lm_attn_f32(ggml_context * ctx, ggml_tensor * q, ggml_t
 // kernels serve in f32 at no cost; the prefill's wide products keep the default
 // precision and its tensor-core GEMMs.
 static ggml_prec mm3_lm_linear_precision(bool decode) {
-    return decode ? GGML_PREC_F32 : GGML_PREC_DEFAULT;
+    return decode ? GGML_PREC_F32 : GGML_PREC_UNDEFINED;
 }
 
 static ggml_tensor * mm3_lm_rope(ggml_context * ctx, const MM3LmConfig & c, ggml_tensor * x, ggml_tensor * positions) {
@@ -195,7 +195,7 @@ static ggml_tensor * mm3_lm_block(ggml_context * ctx, ggml_cgraph * gf, const MM
     ggml_tensor * attn;
     if (use_flash) {
         attn = ggml_flash_attn_ext(ctx, q4, k_win, v_win, mask, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        ggml_prec_set_acc(attn, GGML_PREC_F32);
     } else {
         attn = mm3_lm_attn_f32(ctx, q4, k_win, v_win, mask, scale);
     }

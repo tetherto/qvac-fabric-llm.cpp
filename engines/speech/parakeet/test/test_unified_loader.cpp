@@ -179,6 +179,10 @@ int check_engine_stream_creation(const std::string & path) {
         std::fprintf(stderr, "Engine did not expose the RNN-T family\n");
         return 13;
     }
+    if (!engine.supports_cache_aware_streaming()) {
+        std::fprintf(stderr, "Unified engine did not report cache-aware streaming\n");
+        return 13;
+    }
     try {
         if (int rc = feed_silence_and_finalize(engine, streaming_options(1000, 2000)); rc != 0) return rc;
         if (int rc = feed_silence_and_finalize(engine, streaming_options(40, 0)); rc != 0) return rc;

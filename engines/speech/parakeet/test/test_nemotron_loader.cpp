@@ -87,6 +87,10 @@ int check_engine_stream_creation(const std::string & path) {
         std::fprintf(stderr, "Engine did not expose Nemotron family\n");
         return 8;
     }
+    if (!engine.supports_cache_aware_streaming()) {
+        std::fprintf(stderr, "Nemotron engine did not report cache-aware streaming\n");
+        return 8;
+    }
 
     parakeet::StreamingOptions streaming_options;
     streaming_options.chunk_ms = 320;

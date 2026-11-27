@@ -402,6 +402,7 @@ public:
     // "ctc", "rnnt", "tdt", "eou", "nemotron", or "sortformer", reflecting
     // the parakeet.model.type metadata of the loaded GGUF.
     std::string model_type() const;
+    bool supports_cache_aware_streaming() const;
 
     // Resolved primary compute device: CPU, GPU, or NPU (Hexagon).
     // In auto mode n_gpu_layers and GPU availability determine CPU fallback.

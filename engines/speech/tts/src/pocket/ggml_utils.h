@@ -244,7 +244,7 @@ using PocketFlowGraph = SizedPocketGraph<16384>;
 
 inline ggml_tensor * pocket_mm(ggml_context * c, ggml_tensor * w, ggml_tensor * x) {
     auto * result = ggml_mul_mat(c, w, x);
-    ggml_mul_mat_set_prec(result, GGML_PREC_F32);
+    ggml_prec_set_acc(result, GGML_PREC_F32);
     return result;
 }
 

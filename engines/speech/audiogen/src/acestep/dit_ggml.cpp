@@ -383,7 +383,7 @@ static bool backend_supports_flash_attention(ggml_backend_t backend,
     ggml_free(context);
     return false;
   }
-  ggml_flash_attn_ext_set_prec(operation, GGML_PREC_F32);
+  ggml_prec_set_acc(operation, GGML_PREC_F32);
   const bool supported = ggml_backend_supports_op(backend, operation);
   ggml_free(context);
   return supported;
@@ -399,7 +399,7 @@ static ggml_tensor * flash_attention(ggml_context * ctx, ggml_tensor * q, ggml_t
     ggml_tensor * attention =
         ggml_flash_attn_ext(ctx, q, k, v, mask, scale,
                             DIT_FLASH_ATTENTION_MAX_BIAS, DIT_FLASH_ATTENTION_LOGIT_SOFTCAP);
-    ggml_flash_attn_ext_set_prec(attention, GGML_PREC_F32);
+    ggml_prec_set_acc(attention, GGML_PREC_F32);
     return attention;
 }
 
