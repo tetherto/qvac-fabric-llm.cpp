@@ -6,6 +6,6 @@ includedir=@LLAMA_PC_INCLUDEDIR@
 Name: llama
 Description: Port of Facebook's LLaMA model in C/C++
 Version: @LLAMA_VERSION@
-Libs: -L${libdir} -lggml -lggml-base -lllama
+Libs: -L${libdir} @LLAMA_PC_GGML_LIBS@ -lllama
 Libs.private: @LLAMA_PC_LIBS_PRIVATE@
 Cflags: -I${includedir}
