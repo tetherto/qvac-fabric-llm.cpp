@@ -15,36 +15,38 @@ on:
   push:
     branches: [master]
     paths:
-      - 'parakeet/**'
-      - 'tts/**'
-      - 'audiogen/**'
-      - 'coreml/**'
-      - 'third_party/whisper.cpp/**'
-      - 'CMakeLists.txt'
-      - 'cmake/**'
-      - 'scripts/**'
-      - 'test/**'
-      - 'whisper-gpu-picker*'
-      - '.github/runners.yaml'
-      - '.github/workflows/reusable-runner-names.yml'
-      - '.github/scripts/**'
-      - '.github/workflows/engines-cross-ci.yml'
+      - 'engines/speech/parakeet/**'
+      - 'engines/speech/tts/**'
+      - 'engines/speech/audiogen/**'
+      - 'engines/speech/coreml/**'
+      - 'engines/speech/third_party/whisper.cpp/**'
+      - 'engines/speech/CMakeLists.txt'
+      - 'engines/speech/cmake/**'
+      - 'engines/speech/scripts/**'
+      - 'engines/speech/test/**'
+      - 'engines/speech/whisper-gpu-picker*'
+      - 'engines/speech/ci/runners.yaml'
+      - '.github/workflows/speech-reusable-runner-names.yml'
+      - 'engines/speech/ci/scripts/**'
+      - 'ggml/**'
+      - '.github/workflows/speech-engines-cross-ci.yml'
   pull_request:
     paths:
-      - 'parakeet/**'
-      - 'tts/**'
-      - 'audiogen/**'
-      - 'coreml/**'
-      - 'third_party/whisper.cpp/**'
-      - 'CMakeLists.txt'
-      - 'cmake/**'
-      - 'scripts/**'
-      - 'test/**'
-      - 'whisper-gpu-picker*'
-      - '.github/runners.yaml'
-      - '.github/workflows/reusable-runner-names.yml'
-      - '.github/scripts/**'
-      - '.github/workflows/engines-cross-ci.yml'
+      - 'engines/speech/parakeet/**'
+      - 'engines/speech/tts/**'
+      - 'engines/speech/audiogen/**'
+      - 'engines/speech/coreml/**'
+      - 'engines/speech/third_party/whisper.cpp/**'
+      - 'engines/speech/CMakeLists.txt'
+      - 'engines/speech/cmake/**'
+      - 'engines/speech/scripts/**'
+      - 'engines/speech/test/**'
+      - 'engines/speech/whisper-gpu-picker*'
+      - 'engines/speech/ci/runners.yaml'
+      - '.github/workflows/speech-reusable-runner-names.yml'
+      - 'engines/speech/ci/scripts/**'
+      - 'ggml/**'
+      - '.github/workflows/speech-engines-cross-ci.yml'
   workflow_dispatch:
 
 permissions:
@@ -61,15 +63,15 @@ concurrency:
   group: engines-cross-ci-${{ (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
-env:
-  GGML_REPO: https://github.com/tetherto/qvac-fabric-llm.cpp.git
-  GGML_REF: 3cefcca8107194a372f015b13f27cd1aac301b67 # the fabric ggml pin (qvac-fabric-llm.cpp, ggml/); one pin shared by every lane
+defaults:
+  run:
+    working-directory: engines/speech
 
 jobs:
   runner_names:
     permissions:
       contents: read
-    uses: ./.github/workflows/reusable-runner-names.yml
+    uses: ./.github/workflows/speech-reusable-runner-names.yml
 
   changes:
     needs: runner_names
@@ -85,10 +87,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Test engine selection
-        run: node --test .github/scripts/test/engine-matrix.test.mjs
+        run: node --test ci/scripts/test/engine-matrix.test.mjs
       - name: Select affected engines
         id: matrix
-        run: node .github/scripts/select-engine-matrix.mjs
+        run: node ci/scripts/select-engine-matrix.mjs
 
   windows:
     name: windows (${{ matrix.engine }})
@@ -100,13 +102,14 @@ jobs:
     runs-on: ${{ needs.runner_names.outputs.windows_2022 }}
     timeout-minutes: 90
     env:
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/engines/speech/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}/engines/speech
       CCACHE_COMPILERCHECK: content
       CCACHE_MAXSIZE: 500M
     defaults:
       run:
         shell: bash
+        working-directory: engines/speech
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
@@ -117,33 +120,28 @@ jobs:
       - name: Cache engine objects
         uses: actions/cache@v4
         with:
-          path: .ccache
-          key: ccache-cross-windows-msvc-ninja-v1-${{ matrix.engine }}-${{ env.GGML_REF }}-${{ github.sha }}
+          path: engines/speech/.ccache
+          key: ccache-cross-windows-msvc-ninja-v1-${{ matrix.engine }}-${{ github.sha }}
           restore-keys: |
-            ccache-cross-windows-msvc-ninja-v1-${{ matrix.engine }}-${{ env.GGML_REF }}-
+            ccache-cross-windows-msvc-ninja-v1-${{ matrix.engine }}-
             ccache-cross-windows-msvc-ninja-v1-${{ matrix.engine }}-
 
-      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Resolve the in-tree ggml revision
         id: ggml
-        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
 
       - name: Cache ggml install
         id: ggml-cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
+          path: engines/speech/ggml-install
           key: ggml-install-portable-windows-2022-msvc-static-${{ steps.ggml.outputs.sha }}
 
       # Static ggml on Windows sidesteps DLL discovery for the test exes.
       - name: Build ggml (MSVC, static, CPU-only)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          # Fetch exactly the pinned SHA the cache key was derived from.
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
-          git -C ggml-src checkout -q FETCH_HEAD
-          cmake -S ggml-src/ggml -B ggml-src/build -G Ninja \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -186,26 +184,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Resolve the in-tree ggml revision
         id: ggml
-        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
 
       - name: Cache ggml install
         id: ggml-cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
+          path: engines/speech/ggml-install
           key: ggml-install-android-arm64-${{ steps.ggml.outputs.sha }}
 
       - name: Build ggml (NDK arm64-v8a, static, CPU-only)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          # Fetch exactly the pinned SHA the cache key was derived from.
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
-          git -C ggml-src checkout -q FETCH_HEAD
-          cmake -S ggml-src/ggml -B ggml-src/build \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-28 \
@@ -244,27 +237,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Resolve the in-tree ggml revision
         id: ggml
-        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
 
       - name: Cache ggml install
         id: ggml-cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
+          path: engines/speech/ggml-install
           key: ggml-install-ios-arm64-${{ steps.ggml.outputs.sha }}
 
       # Flags mirror build-xcframework.sh's iOS-device slice (Metal embedded).
       - name: Build ggml (iOS device arm64, static, Metal embedded)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          # Fetch exactly the pinned SHA the cache key was derived from.
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
-          git -C ggml-src checkout -q FETCH_HEAD
-          cmake -S ggml-src/ggml -B ggml-src/build \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -307,27 +295,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Resolve the in-tree ggml revision
         id: ggml
-        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
 
       # Same CPU-only shared build (and cache key) as parakeet-ci's macos-14 lane.
       - name: Cache ggml install
         id: ggml-cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
+          path: engines/speech/ggml-install
           key: ggml-install-portable-macos-14-${{ steps.ggml.outputs.sha }}
 
       - name: Build ggml (CPU-only, shared)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          # Fetch exactly the pinned SHA the cache key was derived from.
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
-          git -C ggml-src checkout -q FETCH_HEAD
-          cmake -S ggml-src/ggml -B ggml-src/build \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \

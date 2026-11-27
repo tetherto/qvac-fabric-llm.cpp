@@ -20,22 +20,24 @@ on:
   push:
     branches: [master]
     paths:
-      - 'third_party/whisper.cpp/**'
-      - 'CMakeLists.txt'
-      - 'whisper-gpu-picker*'
-      - 'scripts/check-whisper-packaging.py'
-      - 'scripts/benchmarks/whisper-hexagon.cpp'
-      - 'scripts/benchmarks/whisper-hexagon/**'
-      - '.github/workflows/whisper-ci.yml'
+      - 'engines/speech/third_party/whisper.cpp/**'
+      - 'engines/speech/CMakeLists.txt'
+      - 'engines/speech/whisper-gpu-picker*'
+      - 'engines/speech/scripts/check-whisper-packaging.py'
+      - 'engines/speech/scripts/benchmarks/whisper-hexagon.cpp'
+      - 'engines/speech/scripts/benchmarks/whisper-hexagon/**'
+      - 'ggml/**'
+      - '.github/workflows/speech-whisper-ci.yml'
   pull_request:
     paths:
-      - 'third_party/whisper.cpp/**'
-      - 'CMakeLists.txt'
-      - 'whisper-gpu-picker*'
-      - 'scripts/check-whisper-packaging.py'
-      - 'scripts/benchmarks/whisper-hexagon.cpp'
-      - 'scripts/benchmarks/whisper-hexagon/**'
-      - '.github/workflows/whisper-ci.yml'
+      - 'engines/speech/third_party/whisper.cpp/**'
+      - 'engines/speech/CMakeLists.txt'
+      - 'engines/speech/whisper-gpu-picker*'
+      - 'engines/speech/scripts/check-whisper-packaging.py'
+      - 'engines/speech/scripts/benchmarks/whisper-hexagon.cpp'
+      - 'engines/speech/scripts/benchmarks/whisper-hexagon/**'
+      - 'ggml/**'
+      - '.github/workflows/speech-whisper-ci.yml'
   workflow_dispatch:
     inputs:
       run_webgpu_gpu:
@@ -57,15 +59,15 @@ concurrency:
   group: whisper-ci-${{ (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
-env:
-  GGML_REPO: https://github.com/tetherto/qvac-fabric-llm.cpp.git
-  GGML_REF: 3cefcca8107194a372f015b13f27cd1aac301b67 # the fabric ggml pin (qvac-fabric-llm.cpp, ggml/); one pin shared by every lane
+defaults:
+  run:
+    working-directory: engines/speech
 
 jobs:
   runner_names:
     permissions:
       contents: read
-    uses: ./.github/workflows/reusable-runner-names.yml
+    uses: ./.github/workflows/speech-reusable-runner-names.yml
 
   model-conversion:
     needs: runner_names
@@ -95,35 +97,30 @@ jobs:
       - name: Install ccache
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then brew install ccache; else sudo apt-get update -q && sudo apt-get install -y ccache; fi
-          echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=${{ github.workspace }}/engines/speech/.ccache" >> "$GITHUB_ENV"
 
-      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Resolve the in-tree ggml revision
         id: ggml
-        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
 
       - name: Cache ggml install
         id: ggml-cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
+          path: engines/speech/ggml-install
           key: ggml-install-portable-${{ matrix.os }}-${{ steps.ggml.outputs.sha }}
 
       - name: Cache ccache
         uses: actions/cache@v4
         with:
-          path: .ccache
+          path: engines/speech/.ccache
           key: ccache-umbrella-${{ matrix.os }}-${{ github.sha }}
           restore-keys: ccache-umbrella-${{ matrix.os }}-
 
-      - name: Build ggml (system ggml, qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Build ggml (in-tree ggml)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          # Fetch exactly the pinned SHA the cache key was derived from.
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
-          git -C ggml-src checkout -q FETCH_HEAD
-          cmake -S ggml-src/ggml -B ggml-src/build \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
@@ -150,7 +147,7 @@ jobs:
 
       - name: Check installed release version and VitisAI exports
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: python3 scripts/check-whisper-packaging.py --build-dir build --ggml-prefix ggml-install
 
       # Excludes gpu/perf (runner limits), medium/large (the committed
@@ -164,7 +161,7 @@ jobs:
       # and exercise load -> mel -> encode -> decode -> sample end to end.
       - name: Tests (non-GPU, committed fixtures only)
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: ctest --test-dir build -LE 'gpu|perf|medium|large|coreml-runtime' -E '^test-vad-full$' --output-on-failure --timeout 600
 
       # GNU --wrap observes calls in the static Whisper library. This separate
@@ -173,7 +170,7 @@ jobs:
       - name: Check failed-initialization cleanup (Linux static Whisper)
         if: runner.os == 'Linux'
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: |
           cmake -S . -B build-init-error \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
@@ -189,7 +186,7 @@ jobs:
         id: model-cache
         uses: actions/cache@v4
         with:
-          path: models-cache
+          path: engines/speech/models-cache
           key: whisper-tiny-en-v1
 
       # -f: fail on HTTP errors instead of writing the error page into the
@@ -205,8 +202,8 @@ jobs:
 
       - name: Installed native measurement consumer (contracts and transcription smoke)
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/whisper-install/lib:${{ github.workspace }}/ggml-install/lib
-          DYLD_LIBRARY_PATH: ${{ github.workspace }}/whisper-install/lib:${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/whisper-install/lib:${{ github.workspace }}/engines/speech/ggml-install/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/whisper-install/lib:${{ github.workspace }}/engines/speech/ggml-install/lib
         run: |
           cmake --install build/third_party/whisper.cpp --prefix "$PWD/whisper-install"
           cmake -S scripts/benchmarks/whisper-hexagon -B whisper-measure \
@@ -233,7 +230,7 @@ jobs:
 
       - name: whisper-cli transcription smoke (jfk.wav)
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: |
           out=$(./build/bin/whisper-cli \
             -m models-cache/ggml-tiny.en.bin \
@@ -248,7 +245,7 @@ jobs:
       # quantized decode path with no extra download.
       - name: Quantized transcription smoke (q5_0, q8_0)
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: |
           for qtype in q5_0 q8_0; do
             ./build/bin/whisper-quantize \
@@ -273,7 +270,7 @@ jobs:
       # found in both the first and a later window.
       - name: Long-audio multi-window smoke (44 s)
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: |
           python3 - <<'CONCAT'
           import wave
@@ -332,7 +329,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y ccache
-          echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=${{ github.workspace }}/engines/speech/.ccache" >> "$GITHUB_ENV"
 
       - name: Fetch prebuilt Dawn
         run: |
@@ -341,32 +338,28 @@ jobs:
           mkdir dawn
           tar -xf dawn.tar.gz -C dawn --strip-components=1
 
-      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Resolve the in-tree ggml revision
         id: ggml
-        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
 
       - name: Cache ggml install
         id: ggml-cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
+          path: engines/speech/ggml-install
           key: ggml-install-webgpu-${{ env.DAWN_VERSION }}-ubuntu-24.04-${{ steps.ggml.outputs.sha }}
 
       - name: Cache ccache
         uses: actions/cache@v4
         with:
-          path: .ccache
+          path: engines/speech/.ccache
           key: ccache-umbrella-webgpu-${{ github.sha }}
           restore-keys: ccache-umbrella-webgpu-
 
       - name: Build ggml with the WebGPU backend
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
-          git -C ggml-src checkout -q FETCH_HEAD
-          cmake -S ggml-src/ggml -B ggml-src/build \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
@@ -394,14 +387,14 @@ jobs:
       # registry carries the WebGPU backend (with zero devices on this host).
       - name: Tests (non-GPU, committed fixtures only)
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: ctest --test-dir build -LE 'gpu|perf|medium|large|coreml-runtime' -E '^test-vad-full$' --output-on-failure --timeout 900
 
       - name: Cache whisper tiny model
         id: model-cache
         uses: actions/cache@v4
         with:
-          path: models-cache
+          path: engines/speech/models-cache
           key: whisper-tiny-en-v1
 
       - name: Fetch ggml-tiny.en
@@ -417,7 +410,7 @@ jobs:
       # than computing nothing on it) and whisper must transcribe on the CPU.
       - name: whisper-cli smoke degrades to the CPU without a GPU (jfk.wav)
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: |
           ./build/bin/whisper-cli \
             -m models-cache/ggml-tiny.en.bin \
@@ -466,11 +459,7 @@ jobs:
 
       - name: Build ggml with the WebGPU backend and the whisper umbrella
         run: |
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin "$GGML_REF"
-          git -C ggml-src checkout -q FETCH_HEAD
-          cmake -S ggml-src/ggml -B ggml-src/build \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
@@ -488,7 +477,7 @@ jobs:
 
       - name: Picker unit test with a registered WebGPU device
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: ctest --test-dir build -R '^test-whisper-gpu-picker$' --output-on-failure
 
       - name: Fetch ggml-tiny.en
@@ -500,7 +489,7 @@ jobs:
 
       - name: whisper-cli transcription smoke on WebGPU (jfk.wav)
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: |
           ./build/bin/whisper-cli \
             -m models-cache/ggml-tiny.en.bin \

@@ -1,13 +1,13 @@
 # Runner label catalog
 
-CI runner labels live in one place: [`.github/runners.yaml`](./runners.yaml).
+CI runner labels live in one place: [`engines/speech/ci/runners.yaml`](./runners.yaml).
 This lets a runner-image migration (OS bump, GPU-pool rename, hosted-image
 retirement) update a single file instead of grepping every workflow.
 
 ## How it works
 
 `runners.yaml` is the source of truth. A generated reusable workflow,
-[`.github/workflows/reusable-runner-names.yml`](./workflows/reusable-runner-names.yml),
+[`.github/workflows/speech-reusable-runner-names.yml`](../../../.github/workflows/speech-reusable-runner-names.yml),
 exports each catalog entry as a job output. Callers pull the label from that
 output instead of hardcoding it, because `runs-on:` is evaluated before any step
 runs, so a composite action cannot supply the label — a reusable workflow's
@@ -42,7 +42,7 @@ jobs:
   runner_names:
     permissions:
       contents: read
-    uses: ./.github/workflows/reusable-runner-names.yml
+    uses: ./.github/workflows/speech-reusable-runner-names.yml
 
   authorize:
     uses: ./.github/workflows/reusable-authorize-self-hosted.yml
@@ -77,11 +77,11 @@ Standalone (non-matrix) jobs are simpler:
 
 ## Changing a label
 
-1. Edit `.github/runners.yaml`.
-2. Regenerate: `node .github/scripts/sync-runner-names.mjs`
-3. Test: `node --test .github/scripts/test/runner-names.test.mjs`
+1. Edit `engines/speech/ci/runners.yaml`.
+2. Regenerate: `node engines/speech/ci/scripts/sync-runner-names.mjs`
+3. Test: `node --test engines/speech/ci/scripts/test/runner-names.test.mjs`
 
 CI enforces both invariants (catalog in sync with the generated workflow, and no
 wired workflow hardcodes a catalog target) via
 [`runner-names-validate.yml`](./workflows/runner-names-validate.yml), which runs
-`node .github/scripts/validate-runner-names.mjs`.
+`node engines/speech/ci/scripts/validate-runner-names.mjs`.

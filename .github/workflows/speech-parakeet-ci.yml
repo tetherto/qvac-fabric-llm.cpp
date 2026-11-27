@@ -2,7 +2,7 @@
 # by the repo reorg QIP, PR 1).
 #
 # Scope (QIP "PR 0" lane): build the engine + every test harness against
-# system ggml (the ggml/ tree of qvac-fabric-llm.cpp at GGML_REF, the same
+# system ggml (the in-tree ggml/ of this repository, the same
 # ggml the qvac-fabric vcpkg port ships), then run the non-GPU ctest suites.
 # Tests whose model/reference
 # fixtures aren't present are registered as DISABLED by the CMakeLists and
@@ -15,16 +15,18 @@ on:
   push:
     branches: [master]
     paths:
-      - 'parakeet/**'
-      - 'coreml/**'
-      - 'test/**'
-      - '.github/workflows/parakeet-ci.yml'
+      - 'engines/speech/parakeet/**'
+      - 'engines/speech/coreml/**'
+      - 'engines/speech/test/**'
+      - 'ggml/**'
+      - '.github/workflows/speech-parakeet-ci.yml'
   pull_request:
     paths:
-      - 'parakeet/**'
-      - 'coreml/**'
-      - 'test/**'
-      - '.github/workflows/parakeet-ci.yml'
+      - 'engines/speech/parakeet/**'
+      - 'engines/speech/coreml/**'
+      - 'engines/speech/test/**'
+      - 'ggml/**'
+      - '.github/workflows/speech-parakeet-ci.yml'
   workflow_dispatch:
     inputs:
       run_gpu:
@@ -77,15 +79,15 @@ concurrency:
   group: parakeet-ci-${{ ((github.event.inputs.run_gpu == 'true' || github.event.inputs.run_mosaic == 'true' || github.ref == 'refs/heads/master') && github.run_id) || github.ref }}
   cancel-in-progress: true
 
-env:
-  GGML_REPO: https://github.com/tetherto/qvac-fabric-llm.cpp.git
-  GGML_REF: 3cefcca8107194a372f015b13f27cd1aac301b67 # the fabric ggml pin (qvac-fabric-llm.cpp, ggml/); one pin shared by every lane
+defaults:
+  run:
+    working-directory: engines/speech
 
 jobs:
   runner_names:
     permissions:
       contents: read
-    uses: ./.github/workflows/reusable-runner-names.yml
+    uses: ./.github/workflows/speech-reusable-runner-names.yml
 
   build-test:
     needs: runner_names
@@ -118,37 +120,32 @@ jobs:
       - name: Install ccache
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then brew install ccache; else sudo apt-get update -q && sudo apt-get install -y ccache; fi
-          echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=${{ github.workspace }}/engines/speech/.ccache" >> "$GITHUB_ENV"
 
-      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Resolve the in-tree ggml revision
         id: ggml
-        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
 
       - name: Cache ggml install
         id: ggml-cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
+          path: engines/speech/ggml-install
           key: ggml-install-portable-${{ matrix.os }}-${{ steps.ggml.outputs.sha }}
 
       - name: Cache ccache
         uses: actions/cache@v4
         with:
-          path: .ccache
+          path: engines/speech/.ccache
           key: ccache-parakeet-${{ matrix.os }}-${{ github.sha }}
           restore-keys: ccache-parakeet-${{ matrix.os }}-
 
       # CPU-only ggml: this lane runs `-LE gpu` tests, and hosted runners
       # have no Vulkan/OpenCL; Metal is exercised by the gpu lane instead.
-      - name: Build ggml (system ggml, qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Build ggml (in-tree ggml)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          # Fetch exactly the pinned SHA the cache key was derived from.
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
-          git -C ggml-src checkout -q FETCH_HEAD
-          cmake -S ggml-src/ggml -B ggml-src/build \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
@@ -180,13 +177,7 @@ jobs:
 
       - name: Verify bundled install and external package consumers
         run: |
-          if [ ! -d ggml-src/.git ]; then
-            git init -q ggml-src
-            git -C ggml-src remote add origin "$GGML_REPO"
-            git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
-            git -C ggml-src checkout -q FETCH_HEAD
-          fi
-          ln -s "$PWD/ggml-src" parakeet/ggml
+          ln -s "$GITHUB_WORKSPACE/ggml" parakeet/ggml
           PARAKEET_PKGTEST_CMAKE_ARGS="-DGGML_NATIVE=OFF -DGGML_METAL=OFF -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF" \
             bash parakeet/scripts/test-package-consumption.sh \
               --bundled --work-dir "$RUNNER_TEMP/parakeet-bundled-${{ github.run_id }}-${{ github.run_attempt }}" --keep
@@ -218,7 +209,7 @@ jobs:
       # needs the directory explicitly (macOS @rpath chains handle it).
       - name: Test (non-GPU)
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: ctest --test-dir build -LE 'gpu|perf|coreml-runtime|coreml-toy' --output-on-failure --timeout 600
 
       # Shared Core ML runtime (coreml): portable scheduler, lifetime
@@ -231,7 +222,7 @@ jobs:
         if: inputs.required_fixture_tests != ''
         env:
           REQUIRED_TESTS: ${{ inputs.required_fixture_tests }}
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: |
           read -r -a required_tests <<< "$REQUIRED_TESTS"
           required_options=()
@@ -271,25 +262,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Resolve the in-tree ggml revision
         id: ggml
-        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Metal ggml install
         id: ggml-cache
         uses: actions/cache@v4
         with:
-          path: coreml-ggml-install
+          path: engines/speech/coreml-ggml-install
           key: ggml-install-metal-${{ runner.os }}-${{ runner.arch }}-${{ steps.ggml.outputs.sha }}
 
-      - name: Build ggml (Metal, qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Build ggml (Metal, in-tree ggml)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          git init -q coreml-ggml-src
-          git -C coreml-ggml-src remote add origin "$GGML_REPO"
-          git -C coreml-ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
-          git -C coreml-ggml-src checkout -q FETCH_HEAD
-          cmake -S coreml-ggml-src/ggml -B coreml-ggml-build -DCMAKE_BUILD_TYPE=Release \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B coreml-ggml-build -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON -DGGML_METAL=ON -DGGML_NATIVE=OFF \
             -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF \
             -DCMAKE_INSTALL_PREFIX="$PWD/coreml-ggml-install"
@@ -303,7 +290,7 @@ jobs:
         id: nemotron-cache
         uses: actions/cache@v4
         with:
-          path: nemotron-generated
+          path: engines/speech/nemotron-generated
           key: nemotron-3-diarization-q8_0-f667ed73aee57d40cc39428eb768b4fd87a0a29e
 
       - name: Stage the Nemotron 3 Diarization q8_0 GGUF
@@ -327,7 +314,7 @@ jobs:
         id: sortformer-cache
         uses: actions/cache@v4
         with:
-          path: sortformer-generated
+          path: engines/speech/sortformer-generated
           key: sortformer-v2.1-q8_0-7fef9f1edf82f9e5c308f89509d017fb85781e03c1dc05447b617e0421f51d90
 
       - name: Stage the Sortformer v2.1 q8_0 GGUF
@@ -484,7 +471,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nemotron-memory-schedule
-          path: nemotron-memory/*.json
+          path: engines/speech/nemotron-memory/*.json
           if-no-files-found: warn
 
       # The same validation for the Sortformer v2.1 template, on this runner's
@@ -525,7 +512,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sortformer-memory-schedule
-          path: sortformer-memory/*.json
+          path: engines/speech/sortformer-memory/*.json
           if-no-files-found: warn
 
       - name: Test (background sidecars on the device, no skips)
@@ -591,7 +578,7 @@ jobs:
             ${{ env.MOSAIC_FIXTURES }}/bundle
             ${{ env.MOSAIC_FIXTURES }}/audio
             ${{ env.MOSAIC_FIXTURES }}/compact
-          key: mosaic-${{ inputs.mosaic_compact_url != '' && 'both' || 'standard' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('parakeet/scripts/*.py', 'parakeet/configs/parakeet-mosaic*.json', 'parakeet/test/mosaic-fixtures.json', 'parakeet/test/prepare_mosaic_fixtures.py') }}
+          key: mosaic-${{ inputs.mosaic_compact_url != '' && 'both' || 'standard' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('engines/speech/parakeet/scripts/*.py', 'engines/speech/parakeet/configs/parakeet-mosaic*.json', 'engines/speech/parakeet/test/mosaic-fixtures.json', 'engines/speech/parakeet/test/prepare_mosaic_fixtures.py') }}
       - name: Provision frozen Mosaic fixtures
         if: steps.mosaic-cache.outputs.cache-hit != 'true'
         env:
@@ -603,12 +590,8 @@ jobs:
             --fixtures "$MOSAIC_FIXTURES" --coreml "${compact_args[@]}"
       - name: Build normal speech dependency and Mosaic harness
         run: |
-          git init -q mosaic-ggml-src
-          git -C mosaic-ggml-src remote add origin "$GGML_REPO"
-          git -C mosaic-ggml-src fetch --depth 1 origin "$GGML_REF"
-          git -C mosaic-ggml-src checkout -q FETCH_HEAD
-          git -C mosaic-ggml-src rev-parse HEAD > mosaic-dependency-sha.txt
-          cmake -S mosaic-ggml-src/ggml -B mosaic-ggml-build -DCMAKE_BUILD_TYPE=Release \
+          git -C "$GITHUB_WORKSPACE" rev-parse HEAD > mosaic-dependency-sha.txt
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B mosaic-ggml-build -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON -DGGML_METAL=ON -DGGML_BUILD_TESTS=OFF \
             -DGGML_BUILD_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX="$PWD/mosaic-ggml-install"
           cmake --build mosaic-ggml-build -j4
@@ -643,9 +626,9 @@ jobs:
         with:
           name: mosaic-integration-${{ github.sha }}
           path: |
-            build-mosaic/mosaic-results.xml
-            build-mosaic/Testing/Temporary/LastTest.log
-            mosaic-dependency-sha.txt
+            engines/speech/build-mosaic/mosaic-results.xml
+            engines/speech/build-mosaic/Testing/Temporary/LastTest.log
+            engines/speech/mosaic-dependency-sha.txt
             ${{ env.MOSAIC_FIXTURES }}/audio/receipt.json
             ${{ env.MOSAIC_FIXTURES }}/bundle/complete.json
             ${{ env.MOSAIC_FIXTURES }}/bundle/plan.json
@@ -690,10 +673,6 @@ jobs:
         env:
           FIXTURE_ROOT: ${{ inputs.fixture_root }}
         run: |
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin "$GGML_REF"
-          git -C ggml-src checkout -q FETCH_HEAD
           CUDA_OPTION=""
           if command -v nvcc >/dev/null 2>&1 || [ -x /usr/local/cuda/bin/nvcc ]; then
             NVCC_PATH=$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)
@@ -706,7 +685,7 @@ jobs:
           # this lane runs the *engine's* ctest suite, never ggml's, so
           # compiling ggml's tests only spends runner time and couples the
           # lane to breakage in code it does not exercise.
-          cmake -S ggml-src/ggml -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
             -DGGML_VULKAN=ON \
             $CUDA_OPTION \
             -DGGML_BUILD_TESTS=OFF \
@@ -725,7 +704,7 @@ jobs:
           cmake --build build -j
       - name: Run GPU suites and require executed coverage
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
           REQUIRED_TESTS: ${{ inputs.required_gpu_tests }}
         run: |
           read -r -a required_tests <<< "$REQUIRED_TESTS"

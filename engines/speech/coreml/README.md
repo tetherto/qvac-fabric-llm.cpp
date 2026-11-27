@@ -482,7 +482,7 @@ and `meta_s` belong to a later generator version.
 
 ### Gates in CI
 
-`.github/workflows/coreml-templates-ci.yml` runs on changes to the exporters,
+`.github/workflows/speech-coreml-templates-ci.yml` runs on changes to the exporters,
 the templates, `coreml` and the venv pin, on the self-hosted
 Apple-silicon lane: the `coreml_template.py` unit checks, `report` on the toy
 templates (a harness self-check), `report --all` (the extraction and

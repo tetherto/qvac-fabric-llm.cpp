@@ -2,7 +2,7 @@
 # reorg QIP, PR 1).
 #
 # Scope (QIP "PR 0" lane): build chatterbox + supertonic + lavasr and every
-# test harness against system ggml (qvac-fabric-llm.cpp ggml/ at GGML_REF — mandatory here:
+# test harness against system ggml (the in-tree ggml/ of this repository — mandatory here:
 # TTS_CPP_USE_SYSTEM_GGML defaults ON and the bundled path is rejected in
 # this tree), then run the non-GPU ctest suites (fixture-free tests and the
 # ones with committed fixtures pass; model-dependent ones auto-DISABLE to
@@ -17,28 +17,30 @@ on:
   push:
     branches: [master]
     paths:
-      - 'tts/**'
-      - 'coreml/**'
-      - 'test/**'
-      - 'scripts/benchmarks/chatterbox-hexagon*'
-      - 'scripts/benchmarks/chatterbox-hexagon/**'
-      - 'scripts/benchmarks/fixtures/chatterbox-hexagon.json'
-      - 'scripts/benchmarks/test-chatterbox-hexagon-validation.py'
-      - 'scripts/ci/moss-gpu-e2e.py'
-      - 'scripts/ci/test_moss_gpu_e2e.py'
-      - '.github/workflows/tts-ci.yml'
+      - 'engines/speech/tts/**'
+      - 'engines/speech/coreml/**'
+      - 'engines/speech/test/**'
+      - 'engines/speech/scripts/benchmarks/chatterbox-hexagon*'
+      - 'engines/speech/scripts/benchmarks/chatterbox-hexagon/**'
+      - 'engines/speech/scripts/benchmarks/fixtures/chatterbox-hexagon.json'
+      - 'engines/speech/scripts/benchmarks/test-chatterbox-hexagon-validation.py'
+      - 'engines/speech/scripts/ci/moss-gpu-e2e.py'
+      - 'engines/speech/scripts/ci/test_moss_gpu_e2e.py'
+      - 'ggml/**'
+      - '.github/workflows/speech-tts-ci.yml'
   pull_request:
     paths:
-      - 'tts/**'
-      - 'coreml/**'
-      - 'test/**'
-      - 'scripts/benchmarks/chatterbox-hexagon*'
-      - 'scripts/benchmarks/chatterbox-hexagon/**'
-      - 'scripts/benchmarks/fixtures/chatterbox-hexagon.json'
-      - 'scripts/benchmarks/test-chatterbox-hexagon-validation.py'
-      - 'scripts/ci/moss-gpu-e2e.py'
-      - 'scripts/ci/test_moss_gpu_e2e.py'
-      - '.github/workflows/tts-ci.yml'
+      - 'engines/speech/tts/**'
+      - 'engines/speech/coreml/**'
+      - 'engines/speech/test/**'
+      - 'engines/speech/scripts/benchmarks/chatterbox-hexagon*'
+      - 'engines/speech/scripts/benchmarks/chatterbox-hexagon/**'
+      - 'engines/speech/scripts/benchmarks/fixtures/chatterbox-hexagon.json'
+      - 'engines/speech/scripts/benchmarks/test-chatterbox-hexagon-validation.py'
+      - 'engines/speech/scripts/ci/moss-gpu-e2e.py'
+      - 'engines/speech/scripts/ci/test_moss_gpu_e2e.py'
+      - 'ggml/**'
+      - '.github/workflows/speech-tts-ci.yml'
   workflow_dispatch:
     inputs:
       run_gpu:
@@ -83,15 +85,15 @@ concurrency:
   group: tts-ci-${{ ((github.event.inputs.run_gpu == 'true' || github.event.inputs.run_moss_e2e == 'true' || github.ref == 'refs/heads/master') && github.run_id) || github.ref }}
   cancel-in-progress: true
 
-env:
-  GGML_REPO: https://github.com/tetherto/qvac-fabric-llm.cpp.git
-  GGML_REF: 3cefcca8107194a372f015b13f27cd1aac301b67 # the fabric ggml pin (qvac-fabric-llm.cpp, ggml/); one pin shared by every lane
+defaults:
+  run:
+    working-directory: engines/speech
 
 jobs:
   runner_names:
     permissions:
       contents: read
-    uses: ./.github/workflows/reusable-runner-names.yml
+    uses: ./.github/workflows/speech-reusable-runner-names.yml
 
   authorize:
     permissions:
@@ -116,7 +118,6 @@ jobs:
         backend: ${{ fromJSON(inputs.moss_e2e_backends) }}
         model: ${{ fromJSON(inputs.moss_e2e_cases) }}
     env:
-      GGML_E2E_SHA: 3cefcca8107194a372f015b13f27cd1aac301b67
       MOSS_QUALITY_CONTEXT: moss-quality/${{ matrix.backend }}/${{ matrix.model }}
     steps:
       # workflow_dispatch check suites are not included in the PR check rollup.
@@ -143,7 +144,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
           aws-region: eu-central-1
-      - name: Build pinned ggml and OpenMOSS CLIs (${{ matrix.backend }})
+      - name: Build in-tree ggml and OpenMOSS CLIs (${{ matrix.backend }})
         shell: bash
         env:
           BACKEND: ${{ matrix.backend }}
@@ -153,11 +154,7 @@ jobs:
           git rev-parse HEAD > moss-e2e-results/speech-commit.txt
           nvidia-smi > moss-e2e-results/gpu.txt
           command -v aws
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin "$GGML_E2E_SHA"
-          git -C ggml-src checkout -q FETCH_HEAD
-          git -C ggml-src rev-parse HEAD > moss-e2e-results/ggml-commit.txt
+          git -C "$GITHUB_WORKSPACE" rev-parse HEAD > moss-e2e-results/ggml-commit.txt
           # One GPU backend per build, so the CLIs cannot land on the other.
           # CUDA compiles for this runner's card only: GGML_NATIVE=OFF would
           # otherwise build every architecture ggml supports.
@@ -185,7 +182,7 @@ jobs:
               exit 1
               ;;
           esac
-          cmake -S ggml-src/ggml -B ggml-src/build -DCMAKE_BUILD_TYPE=Release \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF \
             $BACKEND_OPTIONS -DGGML_METAL=OFF \
             -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF \
@@ -200,7 +197,7 @@ jobs:
       - name: Check Transcribe GPU selection and memory projection
         if: startsWith(matrix.model, 'transcribe-')
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
           BACKEND: ${{ matrix.backend }}
         run: |
           cmake --build build-moss-e2e --target test-moss-transcribe test-moss-transcribe-fit test-moss-transcribe-gpu -j4
@@ -224,7 +221,7 @@ jobs:
         # statically linked into the oracle's own process so it cannot load
         # the GPU test runtime.
         run: |
-          cmake -S ggml-src/ggml -B build-ggml-asr -DCMAKE_BUILD_TYPE=Release \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B build-ggml-asr -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF -DGGML_NATIVE=OFF \
             -DGGML_VULKAN=OFF -DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_OPENCL=OFF \
             -DGGML_WEBGPU=OFF -DGGML_HEXAGON=OFF -DGGML_BLAS=OFF \
@@ -249,14 +246,14 @@ jobs:
           MODEL_CASE: ${{ matrix.model }}
           BACKEND: ${{ matrix.backend }}
           MODEL_S3_BUCKET: ${{ secrets.MODEL_S3_BUCKET }}
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: python3 scripts/ci/moss-gpu-e2e.py --backend "$BACKEND" --case "$MODEL_CASE"
       - name: Upload generated audio, transcripts and evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: moss-${{ matrix.backend }}-${{ matrix.model }}
-          path: moss-e2e-results/
+          path: engines/speech/moss-e2e-results/
           if-no-files-found: warn
           retention-days: 7
       - name: Remove downloaded checkpoint weights
@@ -314,17 +311,17 @@ jobs:
           if [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]; then
             if [ "$RUNNER_OS" = "macOS" ]; then brew install ccache; else sudo apt-get update -q && sudo apt-get install -y ccache; fi
           fi
-          echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=${{ github.workspace }}/engines/speech/.ccache" >> "$GITHUB_ENV"
 
-      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Resolve the in-tree ggml revision
         id: ggml
-        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
 
       - name: Cache ggml install
         id: ggml-cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
+          path: engines/speech/ggml-install
           # Linux stays compatible with the portable cache shared with
           # parakeet-ci.yml. macOS carries the Metal backend that
           # test-metal-ops needs (same split as audiogen-ci.yml).
@@ -333,7 +330,7 @@ jobs:
       - name: Cache ccache
         uses: actions/cache@v4
         with:
-          path: .ccache
+          path: engines/speech/.ccache
           key: ccache-tts-${{ matrix.os }}${{ matrix.llamafile == 'ON' && '-llamafile' || '' }}-${{ github.sha }}
           restore-keys: ccache-tts-${{ matrix.os }}${{ matrix.llamafile == 'ON' && '-llamafile' || '' }}-
 
@@ -342,15 +339,10 @@ jobs:
       # silicon, unlike hosted macos-14 whose Apple Paravirtual device has
       # no simdgroup matmul and aborts Metal-touching tests at kernel
       # encode (QVAC-22775).
-      - name: Build ggml (system ggml, qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Build ggml (in-tree ggml)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          # Fetch exactly the pinned SHA the cache key was derived from.
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
-          git -C ggml-src checkout -q FETCH_HEAD
-          cmake -S ggml-src/ggml -B ggml-src/build \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
@@ -385,7 +377,7 @@ jobs:
       # needs the directory explicitly (macOS @rpath chains handle it).
       - name: Test (non-GPU)
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: ctest --test-dir build -LE 'gpu|perf|coreml-runtime|coreml-toy' --output-on-failure --timeout 600
 
       # Shared Core ML runtime (coreml): portable scheduler, lifetime
@@ -431,34 +423,30 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install ccache
-        run: echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
+        run: echo "CCACHE_DIR=${{ github.workspace }}/engines/speech/.ccache" >> "$GITHUB_ENV"
 
-      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Resolve the in-tree ggml revision
         id: ggml
-        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
 
       - name: Cache ggml install
         id: ggml-cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
+          path: engines/speech/ggml-install
           key: ggml-install-metal-macos-26-${{ steps.ggml.outputs.sha }}
 
       - name: Cache ccache
         uses: actions/cache@v4
         with:
-          path: .ccache
+          path: engines/speech/.ccache
           key: ccache-tts-macos-26-${{ github.sha }}
           restore-keys: ccache-tts-macos-26-
 
-      - name: Build ggml (system ggml, qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Build ggml (in-tree ggml)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
-          git -C ggml-src checkout -q FETCH_HEAD
-          cmake -S ggml-src/ggml -B ggml-src/build \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
@@ -487,7 +475,7 @@ jobs:
 
       - name: Test (non-GPU)
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: ctest --test-dir build -LE 'gpu|perf|coreml-runtime|coreml-toy' --output-on-failure --timeout 600
 
       # Shared Core ML runtime (coreml): portable scheduler, lifetime
@@ -575,8 +563,8 @@ jobs:
         id: chatterbox-turbo-cache
         uses: actions/cache@v4
         with:
-          path: chatterbox-turbo-fixture
-          key: chatterbox-turbo-coreml-${{ runner.os }}-${{ runner.arch }}-749d1c1a-${{ hashFiles('tts/scripts/convert-t3-turbo-to-gguf.py', 'tts/scripts/convert-s3gen-to-gguf.py', 'tts/scripts/export-chatterbox-coreml.py', 'tts/scripts/chatterbox_coreml_models.py', 'parakeet/scripts/requirements-coreml.txt') }}
+          path: engines/speech/chatterbox-turbo-fixture
+          key: chatterbox-turbo-coreml-${{ runner.os }}-${{ runner.arch }}-749d1c1a-${{ hashFiles('engines/speech/tts/scripts/convert-t3-turbo-to-gguf.py', 'engines/speech/tts/scripts/convert-s3gen-to-gguf.py', 'engines/speech/tts/scripts/export-chatterbox-coreml.py', 'engines/speech/tts/scripts/chatterbox_coreml_models.py', 'engines/speech/parakeet/scripts/requirements-coreml.txt') }}
 
       - name: Build Chatterbox Turbo Core ML fixture
         if: runner.os == 'macOS' && steps.chatterbox-turbo-cache.outputs.cache-hit != 'true'
@@ -624,9 +612,9 @@ jobs:
       - name: Test (Core ML Chatterbox runtime on staged Turbo)
         if: runner.os == 'macOS'
         env:
-          CHATTERBOX_COREML_TEST_T3: ${{ github.workspace }}/chatterbox-turbo-fixture/chatterbox-t3-turbo-q8_0.gguf
-          CHATTERBOX_COREML_TEST_S3GEN: ${{ github.workspace }}/chatterbox-turbo-fixture/chatterbox-s3gen-q8_0.gguf
-          CHATTERBOX_COREML_TEST_CLI: ${{ github.workspace }}/build/tts-cli
+          CHATTERBOX_COREML_TEST_T3: ${{ github.workspace }}/engines/speech/chatterbox-turbo-fixture/chatterbox-t3-turbo-q8_0.gguf
+          CHATTERBOX_COREML_TEST_S3GEN: ${{ github.workspace }}/engines/speech/chatterbox-turbo-fixture/chatterbox-s3gen-q8_0.gguf
+          CHATTERBOX_COREML_TEST_CLI: ${{ github.workspace }}/engines/speech/build/tts-cli
         run: |
           set -euo pipefail
           sw_vers -productVersion
@@ -705,8 +693,8 @@ jobs:
         id: parler-mini-cache
         uses: actions/cache@v4
         with:
-          path: parler-mini
-          key: parler-mini-v1-q8_0-0392b945-${{ hashFiles('tts/scripts/parler/convert-to-gguf.py') }}
+          path: engines/speech/parler-mini
+          key: parler-mini-v1-q8_0-0392b945-${{ hashFiles('engines/speech/tts/scripts/parler/convert-to-gguf.py') }}
 
       - name: Stage Parler mini q8_0
         if: runner.os == 'macOS' && steps.parler-mini-cache.outputs.cache-hit != 'true'
@@ -936,9 +924,9 @@ jobs:
         with:
           name: parler-decoder-runtime-synthetic
           path: |
-            parler-decoder-runtime-fixture/parler-tiny-f32.gguf
-            parler-decoder-runtime-fixture/per-layer/parler-tiny-decoder.mlpackage
-            parler-decoder-runtime-fixture/grouped/parler-tiny-decoder.mlpackage
+            engines/speech/parler-decoder-runtime-fixture/parler-tiny-f32.gguf
+            engines/speech/parler-decoder-runtime-fixture/per-layer/parler-tiny-decoder.mlpackage
+            engines/speech/parler-decoder-runtime-fixture/grouped/parler-tiny-decoder.mlpackage
           if-no-files-found: warn
 
       # Core ML Audio8 codec sidecar fixtures, converted and exported by the
@@ -951,9 +939,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            audio8-coreml-fixture
-            audio8-coreml-fixture-fallback
-          key: audio8-codec-coreml-${{ runner.os }}-${{ runner.arch }}-f07040f3-${{ hashFiles('tts/scripts/export-audio8-codec-coreml.py', 'tts/scripts/convert-audio8-codec-to-gguf.py', 'tts/scripts/audio8_reference.py', 'tts/test/test_export_audio8_codec_coreml.py', 'parakeet/scripts/requirements-coreml.txt') }}
+            engines/speech/audio8-coreml-fixture
+            engines/speech/audio8-coreml-fixture-fallback
+          key: audio8-codec-coreml-${{ runner.os }}-${{ runner.arch }}-f07040f3-${{ hashFiles('engines/speech/tts/scripts/export-audio8-codec-coreml.py', 'engines/speech/tts/scripts/convert-audio8-codec-to-gguf.py', 'engines/speech/tts/scripts/audio8_reference.py', 'engines/speech/tts/test/test_export_audio8_codec_coreml.py', 'engines/speech/parakeet/scripts/requirements-coreml.txt') }}
 
       - name: Build Core ML Audio8 fixture
         if: runner.os == 'macOS' && steps.audio8-coreml-cache.outputs.cache-hit != 'true'
@@ -976,7 +964,7 @@ jobs:
           .venv-coreml/bin/python tts/scripts/export-audio8-codec-coreml.py \
             --gguf audio8-coreml-fixture/audio8-codec-decoder-f16.gguf \
             --compile-dir audio8-coreml-fixture
-          ln -sf "$GITHUB_WORKSPACE/audio8-coreml-fixture/audio8-codec-decoder-f16.gguf" \
+          ln -sf "$GITHUB_WORKSPACE/engines/speech/audio8-coreml-fixture/audio8-codec-decoder-f16.gguf" \
             audio8-coreml-fixture-fallback/audio8-codec-decoder-f16.gguf
           .venv-coreml/bin/python tts/scripts/export-audio8-codec-coreml.py \
             --gguf audio8-coreml-fixture-fallback/audio8-codec-decoder-f16.gguf --window 8 \
@@ -990,12 +978,12 @@ jobs:
       - name: Test (Core ML Audio8 codec sidecar)
         if: runner.os == 'macOS'
         env:
-          AUDIO8_COREML_TEST_MODELS_DIR: ${{ github.workspace }}/audio8-coreml-fixture
-          AUDIO8_COREML_FALLBACK_MODELS_DIR: ${{ github.workspace }}/audio8-coreml-fixture-fallback
+          AUDIO8_COREML_TEST_MODELS_DIR: ${{ github.workspace }}/engines/speech/audio8-coreml-fixture
+          AUDIO8_COREML_FALLBACK_MODELS_DIR: ${{ github.workspace }}/engines/speech/audio8-coreml-fixture-fallback
         run: |
           # The fallback fixture links the GGUF by absolute path; a restored
           # cache keeps the link, so re-point it in case the workspace moved.
-          ln -sf "$GITHUB_WORKSPACE/audio8-coreml-fixture/audio8-codec-decoder-f16.gguf" \
+          ln -sf "$GITHUB_WORKSPACE/engines/speech/audio8-coreml-fixture/audio8-codec-decoder-f16.gguf" \
             audio8-coreml-fixture-fallback/audio8-codec-decoder-f16.gguf
           ./build/test-audio8-codec-coreml-parity
 
@@ -1006,7 +994,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          AUDIO8_COREML_TEST_MODELS_DIR="$GITHUB_WORKSPACE/audio8-coreml-fixture" \
+          AUDIO8_COREML_TEST_MODELS_DIR="$GITHUB_WORKSPACE/engines/speech/audio8-coreml-fixture" \
             ./build/bench-audio8-codec-coreml >> "$GITHUB_STEP_SUMMARY"
 
       # Core ML Supertonic vocoder fixture, converted and exported by the
@@ -1020,8 +1008,8 @@ jobs:
         id: supertonic-coreml-cache
         uses: actions/cache@v4
         with:
-          path: supertonic-coreml-fixture
-          key: supertonic-coreml-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tts/scripts/export-supertonic-coreml.py', 'tts/scripts/export-supertonic-encoder-coreml.py', 'tts/scripts/supertonic_coreml_gguf.py', 'tts/scripts/convert-supertonic2-to-gguf.py', 'tts/test/test_export_supertonic_coreml.py', 'tts/test/test_export_supertonic_encoder_coreml.py', 'parakeet/scripts/requirements-coreml.txt') }}
+          path: engines/speech/supertonic-coreml-fixture
+          key: supertonic-coreml-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('engines/speech/tts/scripts/export-supertonic-coreml.py', 'engines/speech/tts/scripts/export-supertonic-encoder-coreml.py', 'engines/speech/tts/scripts/supertonic_coreml_gguf.py', 'engines/speech/tts/scripts/convert-supertonic2-to-gguf.py', 'engines/speech/tts/test/test_export_supertonic_coreml.py', 'engines/speech/tts/test/test_export_supertonic_encoder_coreml.py', 'engines/speech/parakeet/scripts/requirements-coreml.txt') }}
 
       - name: Build Core ML Supertonic fixture
         if: runner.os == 'macOS' && steps.supertonic-coreml-cache.outputs.cache-hit != 'true'
@@ -1067,7 +1055,7 @@ jobs:
       - name: Test (Core ML Supertonic vocoder sidecar)
         if: runner.os == 'macOS'
         env:
-          SUPERTONIC_COREML_TEST_MODELS_DIR: ${{ github.workspace }}/supertonic-coreml-fixture
+          SUPERTONIC_COREML_TEST_MODELS_DIR: ${{ github.workspace }}/engines/speech/supertonic-coreml-fixture
         run: |
           set -o pipefail
           ./build/test-supertonic-coreml-parity 2>&1 | tee supertonic-parity.log
@@ -1106,7 +1094,7 @@ jobs:
       - name: Test (Core ML Supertonic encoder sidecar)
         if: runner.os == 'macOS'
         env:
-          SUPERTONIC_COREML_ENCODER_TEST_GGUF: ${{ github.workspace }}/supertonic-coreml-fixture/supertonic2-f16.gguf
+          SUPERTONIC_COREML_ENCODER_TEST_GGUF: ${{ github.workspace }}/engines/speech/supertonic-coreml-fixture/supertonic2-f16.gguf
         run: ./build/test-supertonic-coreml-encoder
 
       - name: Cache Core ML Supertonic 3 vector fixture
@@ -1114,8 +1102,8 @@ jobs:
         id: supertonic3-vector-cache
         uses: actions/cache@v4
         with:
-          path: supertonic3-vector-fixture
-          key: supertonic3-vector-fp16-fp32-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tts/scripts/export-supertonic-vector-coreml.py', 'tts/scripts/supertonic_coreml_vector_4d.py', 'tts/test/test_export_supertonic_vector_coreml.py', 'tts/scripts/export-supertonic-coreml.py', 'tts/scripts/export-supertonic-encoder-coreml.py', 'tts/scripts/supertonic_coreml_gguf.py', 'tts/scripts/convert-supertonic2-to-gguf.py', 'tts/test/test_supertonic_coreml_vector.cpp', 'parakeet/scripts/requirements-coreml.txt') }}
+          path: engines/speech/supertonic3-vector-fixture
+          key: supertonic3-vector-fp16-fp32-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('engines/speech/tts/scripts/export-supertonic-vector-coreml.py', 'engines/speech/tts/scripts/supertonic_coreml_vector_4d.py', 'engines/speech/tts/test/test_export_supertonic_vector_coreml.py', 'engines/speech/tts/scripts/export-supertonic-coreml.py', 'engines/speech/tts/scripts/export-supertonic-encoder-coreml.py', 'engines/speech/tts/scripts/supertonic_coreml_gguf.py', 'engines/speech/tts/scripts/convert-supertonic2-to-gguf.py', 'engines/speech/tts/test/test_supertonic_coreml_vector.cpp', 'engines/speech/parakeet/scripts/requirements-coreml.txt') }}
 
       - name: Build Core ML Supertonic 3 vector fixture
         if: runner.os == 'macOS' && steps.supertonic3-vector-cache.outputs.cache-hit != 'true'
@@ -1150,7 +1138,7 @@ jobs:
       - name: Test (Core ML Supertonic 3 FP32 numerical reference)
         if: runner.os == 'macOS'
         env:
-          SUPERTONIC_COREML_VECTOR_TEST_GGUF: ${{ github.workspace }}/supertonic3-vector-fixture/supertonic3-f16.gguf
+          SUPERTONIC_COREML_VECTOR_TEST_GGUF: ${{ github.workspace }}/engines/speech/supertonic3-vector-fixture/supertonic3-f16.gguf
           # Hosted macOS need not expose a physical GPU/ANE. This lane gates
           # Core ML math and routing; GPU timings require actual Apple silicon.
           SUPERTONIC_COREML_VECTOR_COMPUTE_UNITS: cpu_only
@@ -1159,7 +1147,7 @@ jobs:
       - name: Test (Core ML Supertonic 3 FP16 vector and vocoder combination)
         if: runner.os == 'macOS'
         env:
-          SUPERTONIC_COREML_VECTOR_TEST_GGUF: ${{ github.workspace }}/supertonic3-vector-fixture/default-fp16/supertonic3-f16.gguf
+          SUPERTONIC_COREML_VECTOR_TEST_GGUF: ${{ github.workspace }}/engines/speech/supertonic3-vector-fixture/default-fp16/supertonic3-f16.gguf
           SUPERTONIC_COREML_VECTOR_TEST_REQUIRE_VOCODER: '1'
           SUPERTONIC_COREML_COMPUTE_UNITS: cpu_only
           SUPERTONIC_COREML_STRICT: '1'
@@ -1205,10 +1193,6 @@ jobs:
       # A CPU-only ggml would skip or falsely pass the GPU suites.
       - name: Build ggml + engine (native backends) and run GPU suites
         run: |
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin "$GGML_REF"
-          git -C ggml-src checkout -q FETCH_HEAD
           CUDA_OPTION=""
           if command -v nvcc >/dev/null 2>&1 || [ -x /usr/local/cuda/bin/nvcc ]; then
             NVCC_PATH=$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)
@@ -1221,7 +1205,7 @@ jobs:
           # this lane runs the *engine's* ctest suite, never ggml's, so
           # compiling ggml's tests only spends runner time and couples the
           # lane to breakage in code it does not exercise.
-          cmake -S ggml-src/ggml -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
             -DGGML_VULKAN=ON \
             $CUDA_OPTION \
             -DGGML_BUILD_TESTS=OFF \
@@ -1286,6 +1270,6 @@ jobs:
 
       - name: Run the GPU suites
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
         run: |
           ctest --test-dir build -L gpu --output-on-failure --timeout 1200

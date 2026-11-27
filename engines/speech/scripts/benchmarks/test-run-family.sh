@@ -19,7 +19,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRIVER="$HERE/run-family.sh"
 REAL_SPEC="$HERE/families.json"
-DESKTOP_WORKFLOW="$HERE/../../.github/workflows/speech-benchmark-desktop.yml"
+DESKTOP_WORKFLOW="$HERE/../../../../.github/workflows/speech-benchmark-desktop.yml"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

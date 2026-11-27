@@ -8,12 +8,15 @@ shared engine helpers, and runner configuration, run all ten jobs. Manual runs
 and unavailable comparison commits also run the full matrix. Moves select both
 the source and destination engines. Platform job names remain stable.
 
-Selection lives in `.github/scripts/lib/engine-matrix.mjs`, alongside each
+Selection lives in `engines/speech/ci/scripts/lib/engine-matrix.mjs`, alongside each
 platform's CMake flags. Keep the workflow path filters current when adding shared
-build dependencies. Run its tests with:
+build dependencies. Every workflow that builds the in-tree `ggml/` also runs on
+`ggml/**` changes, and a ggml change selects the full matrix;
+`engines/speech/ci/scripts/lib/workflow-triggers.mjs` lists those workflows and its
+test fails when one drops the filter. Run the tests with:
 
 ```sh
-node --test .github/scripts/test/*.test.mjs
+node --test engines/speech/ci/scripts/test/*.test.mjs
 ```
 
 Windows builds use Ninja with the x64 MSVC environment and four compile workers.

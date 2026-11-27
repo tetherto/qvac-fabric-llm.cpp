@@ -3,7 +3,7 @@
  * Fail if CI workflows hardcode catalog runner targets or drift from the
  * generated reusable-runner-names workflow.
  *
- * Usage: node .github/scripts/validate-runner-names.mjs
+ * Usage: node engines/speech/ci/scripts/validate-runner-names.mjs
  */
 import {
   REUSABLE_WORKFLOW,

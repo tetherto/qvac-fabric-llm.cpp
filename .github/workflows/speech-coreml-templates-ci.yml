@@ -20,20 +20,20 @@ on:
   push:
     branches: [master]
     paths:
-      - 'coreml/**'
-      - '*/coreml-templates/**'
-      - '*/scripts/export-*-coreml.py'
-      - '*/scripts/**/export-*-coreml.py'
-      - 'parakeet/scripts/requirements-coreml.txt'
-      - '.github/workflows/coreml-templates-ci.yml'
+      - 'engines/speech/coreml/**'
+      - 'engines/speech/*/coreml-templates/**'
+      - 'engines/speech/*/scripts/export-*-coreml.py'
+      - 'engines/speech/*/scripts/**/export-*-coreml.py'
+      - 'engines/speech/parakeet/scripts/requirements-coreml.txt'
+      - '.github/workflows/speech-coreml-templates-ci.yml'
   pull_request:
     paths:
-      - 'coreml/**'
-      - '*/coreml-templates/**'
-      - '*/scripts/export-*-coreml.py'
-      - '*/scripts/**/export-*-coreml.py'
-      - 'parakeet/scripts/requirements-coreml.txt'
-      - '.github/workflows/coreml-templates-ci.yml'
+      - 'engines/speech/coreml/**'
+      - 'engines/speech/*/coreml-templates/**'
+      - 'engines/speech/*/scripts/export-*-coreml.py'
+      - 'engines/speech/*/scripts/**/export-*-coreml.py'
+      - 'engines/speech/parakeet/scripts/requirements-coreml.txt'
+      - '.github/workflows/speech-coreml-templates-ci.yml'
   workflow_dispatch:
 
 permissions:
@@ -43,15 +43,15 @@ concurrency:
   group: coreml-templates-ci-${{ (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
-env:
-  GGML_REPO: https://github.com/tetherto/qvac-fabric-llm.cpp.git
-  GGML_REF: 3cefcca8107194a372f015b13f27cd1aac301b67 # the fabric ggml pin (qvac-fabric-llm.cpp, ggml/); one pin shared by every lane
+defaults:
+  run:
+    working-directory: engines/speech
 
 jobs:
   runner_names:
     permissions:
       contents: read
-    uses: ./.github/workflows/reusable-runner-names.yml
+    uses: ./.github/workflows/speech-reusable-runner-names.yml
 
   authorize:
     permissions:
@@ -72,26 +72,22 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Resolve ggml pin (qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Resolve the in-tree ggml revision
         id: ggml
-        run: echo "sha=$GGML_REF" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
 
       # Same install and key as tts-ci.yml build-test-macos.
       - name: Cache ggml install
         id: ggml-cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
+          path: engines/speech/ggml-install
           key: ggml-install-metal-macos-26-${{ steps.ggml.outputs.sha }}
 
-      - name: Build ggml (system ggml, qvac-fabric-llm.cpp@${{ env.GGML_REF }})
+      - name: Build ggml (in-tree ggml)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          git init -q ggml-src
-          git -C ggml-src remote add origin "$GGML_REPO"
-          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
-          git -C ggml-src checkout -q FETCH_HEAD
-          cmake -S ggml-src/ggml -B ggml-src/build \
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
@@ -171,7 +167,7 @@ jobs:
         with:
           name: coreml-template-gates
           path: |
-            template-gates.json
-            template-gates-sortformer.json
-            template-py.log
+            engines/speech/template-gates.json
+            engines/speech/template-gates-sortformer.json
+            engines/speech/template-py.log
           if-no-files-found: ignore
