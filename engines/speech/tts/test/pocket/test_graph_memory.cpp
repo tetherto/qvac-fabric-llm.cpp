@@ -40,7 +40,8 @@ int main() {
         check_memory_telemetry(backend);
         {
             tts_cpp::pocket::detail::PocketGraph g(backend);
-            auto * a = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, 64, 32);
+            // CPU converts src1 to Q8_0 here, so the plan needs work scratch; F16 x F32 needs none
+            auto * a = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q8_0, 64, 32);
             auto * b = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 64, 16);
             auto * output = ggml_mul_mat(g.ctx, a, b);
             const auto bytes = g.prepare(output, true, 4);
