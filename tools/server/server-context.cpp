@@ -5384,6 +5384,23 @@ void server_context::set_video_decoder(const mtmd_helper_video_decoder * decoder
     impl->init_opt.video_params.decoder = decoder;
 }
 
+void server_context::qvac_set_media_limits(uint64_t max_image_pixels, uint64_t max_audio_seconds) {
+    impl->init_opt.max_image_pixels = max_image_pixels;
+    // mtmd counts audio in samples at the projector's rate, plus one: miniaudio
+    // reads one frame more when the input rate is a multiple of the model's
+    // (48 kHz to 16 kHz). Without an audio encoder mtmd rejects audio anyway.
+    if (max_audio_seconds > 0 && !impl->mctx) {
+        SRV_WRN("%s", "no projector loaded, the audio limit is not applied; set the media limits after load_model()\n");
+    }
+    const int rate = impl->mctx ? mtmd_get_audio_sample_rate(impl->mctx) : 0;
+    uint64_t frames = 0;
+    if (max_audio_seconds > 0 && rate > 0) {
+        const uint64_t r = (uint64_t) rate;
+        frames = max_audio_seconds > (UINT64_MAX - 1) / r ? UINT64_MAX : max_audio_seconds * r + 1;
+    }
+    impl->init_opt.max_audio_frames = frames;
+}
+
 //
 // server_routes
 //

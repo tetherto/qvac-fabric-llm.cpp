@@ -340,6 +340,13 @@ endif()
 
 llama_apply_app_manifests()
 
+# qvac: upstream's server-context library alone (no HTTP server, UI, CLI or
+# executable), for the QVAC decision addon. See the file.
+option(QVAC_FABRIC_SERVER_CONTEXT "qvac: build and install the server-context library without the HTTP server" OFF)
+if (QVAC_FABRIC_SERVER_CONTEXT)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/qvac-server-context.cmake)
+endif()
+
 endif() # NOT BUILD_LLAMA
 
 # Automatically add all files from the 'licenses' directory
