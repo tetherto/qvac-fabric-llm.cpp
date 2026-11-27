@@ -5447,8 +5447,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    // row L2 clip (Inkling 2): 8 or 9 nodes in one kernel
-    if (node->op == GGML_OP_MUL || node->op == GGML_OP_SQR) {
+    // row L2 clip (Inkling 2): 2 to 4 nodes in one kernel
+    if (node->op == GGML_OP_MUL || node->op == GGML_OP_L2_NORM) {
         ggml_cuda_l2_clip_match clip;
         if (ggml_cuda_match_l2_clip(cgraph, i, clip)) {
             ggml_cuda_op_l2_clip(*cuda_ctx, clip);

@@ -4,12 +4,15 @@
 
 #include <climits>
 
+static constexpr int L2_CLIP_MAX_COLS       = 8192;
+static constexpr int L2_CLIP_ROWS_PER_BLOCK = 4;
+
 // one warp per row; every lane reads its columns of the row before the warp reduction and writes only those columns
 // after it, so dst may be x itself (x is not __restrict__ for that reason)
-template <bool has_scale>
-static __global__ void l2_clip_f32(const float * x, const float * __restrict__ scale, float * dst,
-                                   const int ncols, const int nrows, const int scale_rows,
-                                   const float thr, const float b_scale, const float b_bias, const float lo, const float hi) {
+template <bool has_w, bool has_f>
+static __global__ void l2_clip_f32(const float * x, const float * __restrict__ w, const float * __restrict__ f, float * dst,
+                                   const int ncols, const int nrows, const int w_rows, const int ne1, const int ne2,
+                                   const int f_ne2, const int f_ne3, const float eps, const float t, const float t_bias) {
     const int row = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
     if (row >= nrows) {
         return;
@@ -18,22 +21,27 @@ static __global__ void l2_clip_f32(const float * x, const float * __restrict__ s
 
     const float * xr = x   + (int64_t) row * ncols;
     float *       dr = dst + (int64_t) row * ncols;
-    const float * sr = has_scale ? scale + (int64_t) (row % scale_rows) * ncols : nullptr;
+    const float * wr = has_w ? w + (int64_t) (row % w_rows) * ncols : nullptr;
 
     float sum = 0.0f;
     for (int c = lane; c < ncols; c += WARP_SIZE) {
-        const float v = has_scale ? xr[c] * sr[c] : xr[c];
+        const float v = has_w ? xr[c] * wr[c] : xr[c];
         sum += v * v;
     }
     sum = warp_reduce_sum(sum);
 
-    // same order of operations as the graph: sqrt, scale and bias, thr / norm, clamp
-    const float norm = sqrtf(sum) * b_scale + b_bias;
-    const float f    = fminf(fmaxf(thr / norm, lo), hi);
+    // same order of operations as the graph: the l2_norm scale, SCALE, then the per-token factor
+    const float scale = rsqrtf(fmaxf(sum, eps * eps));
+    float fv = 1.0f;
+    if constexpr (has_f) {
+        const int token = row / ne1;
+        fv = f[(token / ne2 % f_ne3) * f_ne2 + token % ne2 % f_ne2];
+    }
 
     for (int c = lane; c < ncols; c += WARP_SIZE) {
-        const float v = has_scale ? xr[c] * sr[c] : xr[c];
-        dr[c] = v * f;
+        const float v = has_w ? xr[c] * wr[c] : xr[c];
+        const float y = t * (scale * v) + t_bias;
+        dr[c] = has_f ? y * fv : y;
     }
 }
 
@@ -47,17 +55,29 @@ static bool l2_clip_overlap(const ggml_tensor * a, const ggml_tensor * b) {
     return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
 }
 
-bool ggml_cuda_match_l2_clip(const ggml_cgraph * cgraph, int i, ggml_cuda_l2_clip_match & m) {
-    const ggml_tensor * first = cgraph->nodes[i];
-    const bool has_scale = first->op == GGML_OP_MUL;
-    if (!has_scale && first->op != GGML_OP_SQR) {
-        return false;
-    }
+// a weight broadcast over whole rows of x
+static bool l2_clip_weight_ok(const ggml_tensor * w, const ggml_tensor * x) {
+    return l2_clip_f32_contiguous(w) && w->ne[0] == x->ne[0] && w->ne[2] == 1 && w->ne[3] == 1 &&
+           (w->ne[1] == x->ne[1] || w->ne[1] == 1);
+}
 
-    static const ggml_op ops_scale[] = { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
-                                         GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
-    const ggml_op * ops = has_scale ? ops_scale : ops_scale + 1;
-    const int n = has_scale ? 9 : 8;
+// one factor per token, broadcast over the rows of that token
+static bool l2_clip_factor_ok(const ggml_tensor * f, const ggml_tensor * x) {
+    return l2_clip_f32_contiguous(f) && f->ne[0] == 1 && f->ne[1] == 1 &&
+           (f->ne[2] == x->ne[2] || f->ne[2] == 1) && (f->ne[3] == x->ne[3] || f->ne[3] == 1);
+}
+
+static bool l2_clip_match_chain(const ggml_cgraph * cgraph, int i, bool has_w, bool has_f, ggml_cuda_l2_clip_match & m) {
+    ggml_op ops[4];
+    int     n = 0;
+    if (has_w) {
+        ops[n++] = GGML_OP_MUL;
+    }
+    ops[n++] = GGML_OP_L2_NORM;
+    ops[n++] = GGML_OP_SCALE;
+    if (has_f) {
+        ops[n++] = GGML_OP_MUL;
+    }
     if (i + n > cgraph->n_nodes) {
         return false;
     }
@@ -67,93 +87,90 @@ bool ggml_cuda_match_l2_clip(const ggml_cgraph * cgraph, int i, ggml_cuda_l2_cli
         }
     }
 
-    const int b = has_scale ? 1 : 0; // index of the SQR
-    const ggml_tensor * s    = has_scale ? cgraph->nodes[i] : nullptr;
-    const ggml_tensor * sqr  = cgraph->nodes[i + b + 0];
-    const ggml_tensor * sum  = cgraph->nodes[i + b + 1];
-    const ggml_tensor * sq   = cgraph->nodes[i + b + 2];
-    const ggml_tensor * sb   = cgraph->nodes[i + b + 3];
-    const ggml_tensor * fill = cgraph->nodes[i + b + 4];
-    const ggml_tensor * div  = cgraph->nodes[i + b + 5];
-    const ggml_tensor * cl   = cgraph->nodes[i + b + 6];
-    ggml_tensor *       out  = cgraph->nodes[i + b + 7];
+    const ggml_tensor * mw  = has_w ? cgraph->nodes[i] : nullptr;
+    const ggml_tensor * l2  = cgraph->nodes[i + (has_w ? 1 : 0)];
+    const ggml_tensor * sc  = cgraph->nodes[i + (has_w ? 2 : 1)];
+    ggml_tensor *       out = cgraph->nodes[i + n - 1];
 
-    const ggml_tensor * x = has_scale ? s->src[0] : sqr->src[0];
-    const ggml_tensor * v = has_scale ? s : x; // the clipped values
+    const ggml_tensor * x = has_w ? mw->src[0] : l2->src[0];
+    const ggml_tensor * w = has_w ? mw->src[1] : nullptr;
+    const ggml_tensor * f = has_f ? out->src[1] : nullptr;
 
     // topology of the chain
-    if (sqr->src[0] != v || sum->src[0] != sqr || sq->src[0] != sum || sb->src[0] != sq || fill->src[0] != sb ||
-        div->src[0] != fill || div->src[1] != sb || cl->src[0] != div) {
+    if ((has_w && l2->src[0] != mw) || sc->src[0] != l2 || (has_f && out->src[0] != sc)) {
         return false;
     }
-    if (!((out->src[0] == v && out->src[1] == cl) || (out->src[0] == cl && out->src[1] == v))) {
-        return false;
-    }
-    // no in-place intermediates: e.g. an in-place FILL overwrites the norm before the DIV reads it, which the kernel
-    // does not reproduce
-    for (const ggml_tensor * t : { s, sqr, sum, sq, sb, fill, div, cl }) {
+    // no in-place intermediates, and the intermediate nodes must not be read outside the chain
+    for (const ggml_tensor * t : { mw, l2, has_f ? sc : nullptr }) {
         if (t && t->view_src) {
             return false;
         }
     }
-
-    // the intermediate nodes must not be read outside the chain
     const int outputs[] = { i + n - 1 };
     if (!ggml_can_fuse_subgraph(cgraph, i, n, ops, outputs, 1)) {
         return false;
     }
 
-    // rows of x, one norm per row, a scale broadcast over whole rows
+    // rows of x, one norm per row
     if (!l2_clip_f32_contiguous(x) || !l2_clip_f32_contiguous(out) || !ggml_are_same_shape(x, out) ||
-        x->ne[0] > 8192 || ggml_nrows(x) > INT_MAX || ggml_nrows(sum) != ggml_nrows(x) || sum->ne[0] != 1) {
+        x->ne[0] > L2_CLIP_MAX_COLS || ggml_nrows(x) > INT_MAX || l2->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32) {
         return false;
     }
-    for (const ggml_tensor * t : { sqr, sum, sq, sb, fill, div, cl }) {
-        if (t->type != GGML_TYPE_F32) {
-            return false;
-        }
+    if (has_w && (!ggml_are_same_shape(mw, x) || mw->type != GGML_TYPE_F32 || !l2_clip_weight_ok(w, x))) {
+        return false;
     }
-    const ggml_tensor * scale = nullptr;
-    if (has_scale) {
-        scale = s->src[0] == x ? s->src[1] : s->src[0];
-        if (!l2_clip_f32_contiguous(scale) || !ggml_are_same_shape(s, x) || scale->ne[0] != x->ne[0] ||
-            scale->ne[2] != 1 || scale->ne[3] != 1 || (scale->ne[1] != x->ne[1] && scale->ne[1] != 1)) {
-            return false;
-        }
+    if (has_f && !l2_clip_factor_ok(f, x)) {
+        return false;
     }
 
-    // out may be x itself (in place), but must not overlap x otherwise or the scale
-    if ((out->data != x->data && l2_clip_overlap(out, x)) || (scale && l2_clip_overlap(out, scale))) {
+    // out may be x itself (in place), but must not overlap x otherwise or the weight and the factor
+    if ((out->data != x->data && l2_clip_overlap(out, x)) || (w && l2_clip_overlap(out, w)) || (f && l2_clip_overlap(out, f))) {
         return false;
     }
 
     m.x       = x;
-    m.scale   = scale;
+    m.w       = w;
+    m.f       = f;
     m.dst     = out;
-    m.thr     = ggml_get_op_params_f32(fill, 0);
-    m.b_scale = ggml_get_op_params_f32(sb, 0);
-    m.b_bias  = ggml_get_op_params_f32(sb, 1);
-    m.lo      = ggml_get_op_params_f32(cl, 0);
-    m.hi      = ggml_get_op_params_f32(cl, 1);
+    m.eps     = ggml_get_op_params_f32(l2, 0);
+    m.t       = ggml_get_op_params_f32(sc, 0);
+    m.t_bias  = ggml_get_op_params_f32(sc, 1);
     m.n_nodes = n;
     return true;
 }
 
+bool ggml_cuda_match_l2_clip(const ggml_cgraph * cgraph, int i, ggml_cuda_l2_clip_match & m) {
+    const ggml_op op = cgraph->nodes[i]->op;
+    if (op != GGML_OP_MUL && op != GGML_OP_L2_NORM) {
+        return false;
+    }
+    const bool has_w = op == GGML_OP_MUL;
+    // the longer chain first, so a following per-token MUL is absorbed
+    return l2_clip_match_chain(cgraph, i, has_w, true, m) || l2_clip_match_chain(cgraph, i, has_w, false, m);
+}
+
+template <bool has_w, bool has_f>
+static void l2_clip_f32_launch(const ggml_cuda_l2_clip_match & m, const dim3 grid, const dim3 block, cudaStream_t stream) {
+    const ggml_tensor * x = m.x;
+    l2_clip_f32<has_w, has_f><<<grid, block, 0, stream>>>(
+        (const float *) x->data, has_w ? (const float *) m.w->data : nullptr, has_f ? (const float *) m.f->data : nullptr,
+        (float *) m.dst->data, (int) x->ne[0], (int) ggml_nrows(x), has_w ? (int) m.w->ne[1] : 1, (int) x->ne[1],
+        (int) x->ne[2], has_f ? (int) m.f->ne[2] : 1, has_f ? (int) m.f->ne[3] : 1, m.eps, m.t, m.t_bias);
+}
+
 void ggml_cuda_op_l2_clip(ggml_backend_cuda_context & ctx, const ggml_cuda_l2_clip_match & m) {
-    const int ncols = (int) m.x->ne[0];
     const int nrows = (int) ggml_nrows(m.x);
-    const int rows_per_block = 4;
-    const dim3 block(WARP_SIZE * rows_per_block, 1, 1);
-    const dim3 grid((nrows + rows_per_block - 1) / rows_per_block, 1, 1);
+    const dim3 block(WARP_SIZE * L2_CLIP_ROWS_PER_BLOCK, 1, 1);
+    const dim3 grid((nrows + L2_CLIP_ROWS_PER_BLOCK - 1) / L2_CLIP_ROWS_PER_BLOCK, 1, 1);
     cudaStream_t stream = ctx.stream();
 
-    const float * x   = (const float *) m.x->data;
-    float *       dst = (float *) m.dst->data;
-    if (m.scale) {
-        l2_clip_f32<true><<<grid, block, 0, stream>>>(x, (const float *) m.scale->data, dst, ncols, nrows,
-            (int) m.scale->ne[1], m.thr, m.b_scale, m.b_bias, m.lo, m.hi);
+    if (m.w && m.f) {
+        l2_clip_f32_launch<true, true>(m, grid, block, stream);
+    } else if (m.w) {
+        l2_clip_f32_launch<true, false>(m, grid, block, stream);
+    } else if (m.f) {
+        l2_clip_f32_launch<false, true>(m, grid, block, stream);
     } else {
-        l2_clip_f32<false><<<grid, block, 0, stream>>>(x, nullptr, dst, ncols, nrows, 1,
-            m.thr, m.b_scale, m.b_bias, m.lo, m.hi);
+        l2_clip_f32_launch<false, false>(m, grid, block, stream);
     }
 }
