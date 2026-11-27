@@ -21,6 +21,8 @@ layout (constant_id = 13) const uint32_t FaTypeV = 0;
 layout (constant_id = 14) const uint32_t FaBlockBytesK = 2;
 layout (constant_id = 15) const uint32_t FaBlockBytesV = 2;
 #endif
+// Indexed bias: the table's bins (table->ne[0]), 0 = no bias
+layout (constant_id = 16) const uint32_t BiasBins = 0;
 const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
@@ -36,6 +38,7 @@ const bool V_TRANSPOSED     = (Flags & 64) != 0;
 const bool USE_KV_ROWS      = (Flags & 2048) != 0;
 // K/V rows are read through the index list of binding 7
 const bool KV_GATHER        = USE_SPARSE || USE_KV_ROWS;
+const bool USE_BIAS         = BiasBins != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -95,6 +98,9 @@ layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
+
+layout (binding = 8) readonly buffer BT {float data_bias_table[];};
+layout (binding = 9) readonly buffer BI {int32_t data_bias_idx[];};
 
 #define MASK_OPT_ALL_NEG_INF 1
 // a mask value at or below this (f16 -inf, or the lowest finite f16 some mask writers use for it) hides the key
@@ -318,6 +324,63 @@ bool fa_mask_index(uint lin, out uint m_col) {
     }
     m_col = lin;
     return !KV_bounds_check || lin < KV;
+}
+
+// Indexed bias of tile row r at mask column m_col, 0 for padding rows. With the GQA collapse the rows are Q heads.
+float fa_bias(const uint32_t r, const uint32_t m_col) {
+    const bool gqa = p.gqa_ratio > 1;
+    const uint32_t row = gqa ? gqa_iq1 : i * Br + r;
+    if ((gqa ? r : row) >= N) {
+        return 0.0;
+    }
+    const uint32_t query = iq3 * p.nem1 + row;
+    const uint32_t head  = gqa ? iq2 + r : iq2;
+    const uint32_t bin   = uint32_t(data_bias_idx[query * KV + m_col]);
+    return data_bias_table[(query * p.neq2 + head) * BiasBins + bin];
+}
+
+const uint32_t F32_SIGN_BITS            = 0x80000000u;
+const uint32_t F32_MAG_BITS             = 0x7FFFFFFFu;
+const uint32_t F32_INF_BITS             = 0x7F800000u;
+const uint32_t F32_MANTISSA_BITS        = 23u;
+const uint32_t F32_MANTISSA_MASK        = 0x007FFFFFu;
+const uint32_t F32_HIDDEN_BIT           = 0x00800000u;
+const uint32_t F16_OVERFLOW_BITS        = 0x477FF000u;
+const uint32_t F16_MIN_NORMAL_BITS      = 0x38800000u;
+const uint32_t F16_DROPPED_BITS         = 13u;
+const uint32_t F16_SUBNORMAL_SHIFT_BIAS = 126u;
+const uint32_t F16_SUBNORMAL_MAX_SHIFT  = 24u;
+const float    F16_SUBNORMAL_ULP        = 5.9604644775390625e-08;
+
+uint32_t fa_round_shift_rte(const uint32_t v, const uint32_t shift) {
+    return (v + (1u << (shift - 1u)) - 1u + ((v >> shift) & 1u)) >> shift;
+}
+
+// x rounded to the nearest f16 value, ties to even. Done on the bits because RADV folds an f32 -> f16 -> f32 round trip.
+float fa_round_to_f16(const float x) {
+    const uint32_t bits = floatBitsToUint(x);
+    const uint32_t sign = bits & F32_SIGN_BITS;
+    const uint32_t mag  = bits & F32_MAG_BITS;
+    if (mag >= F32_INF_BITS) {
+        return x;
+    }
+    if (mag >= F16_OVERFLOW_BITS) {
+        return uintBitsToFloat(sign | F32_INF_BITS);
+    }
+    if (mag >= F16_MIN_NORMAL_BITS) {
+        return uintBitsToFloat(sign | (fa_round_shift_rte(mag, F16_DROPPED_BITS) << F16_DROPPED_BITS));
+    }
+    const uint32_t shift = F16_SUBNORMAL_SHIFT_BIAS - (mag >> F32_MANTISSA_BITS);
+    if (shift > F16_SUBNORMAL_MAX_SHIFT) {
+        return uintBitsToFloat(sign);
+    }
+    const uint32_t k = fa_round_shift_rte((mag & F32_MANTISSA_MASK) | F32_HIDDEN_BIT, shift);
+    return uintBitsToFloat(sign | floatBitsToUint(float(k) * F16_SUBNORMAL_ULP));
+}
+
+// Mask value m plus the indexed bias, rounded to f16 as the fallback's F16 mask stores it.
+float fa_add_bias(const float m, const uint32_t r, const uint32_t m_col) {
+    return fa_round_to_f16(m + fa_bias(r, m_col));
 }
 
 // Bias applied to softmax to stay in fp16 range.

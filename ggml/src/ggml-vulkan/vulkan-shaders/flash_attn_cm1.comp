@@ -68,6 +68,15 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
 shared ACC_TYPE slope[Br];
 shared uint32_t v_visible[Bc];
 
+// Adds the indexed bias of tile rows r0 .. r0 + 3 at mask column m_col to their staged mask values
+f16vec4 fa_add_bias4(const f16vec4 m, const uint32_t r0, const uint32_t m_col) {
+    vec4 mb;
+    [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+        mb[k] = fa_add_bias(float(m[k]), r0 + k, m_col);
+    }
+    return f16vec4(mb);
+}
+
 #ifdef HAS_QJL_CORRECTION
 const uint32_t QJL_PROJ_K = QJL_FULL_PROJ ? HSK : QUANT_K;
 
@@ -219,8 +228,8 @@ void main() {
                 // skip this block
                 continue;
             }
-            // Only load if the block is not all zeros
-            if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
+            // Only load if the block is not all zeros, or it has a bias to stage
+            if (mask_opt_bits != MASK_OPT_ALL_ZERO || USE_BIAS) {
                 for (uint32_t c = tid; c < Bc; c += gl_WorkGroupSize.x) {
                     v_visible[c] = 0;
                 }
@@ -267,6 +276,9 @@ void main() {
                                 max_mask = max(max_mask, float(m[0]));
                             } else {
                                 m = f16vec4(0.0);
+                            }
+                            if (USE_BIAS) {
+                                m = fa_add_bias4(m, r * 4, mcol);
                             }
                             mask_cache[idx / WorkGroupSize] = m;
                             [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
@@ -475,7 +487,7 @@ void main() {
             barrier();
         }
 
-        if (MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+        if (MASK_ENABLE && (mask_opt_bits != MASK_OPT_ALL_ZERO || USE_BIAS)) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t c = (idx + tid) / (Br / 4);
                 uint32_t r = (idx + tid) % (Br / 4);
