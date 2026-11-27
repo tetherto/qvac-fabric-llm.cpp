@@ -1,0 +1,167 @@
+#version 450
+
+// Inkling 2's depth mix in one pass, one workgroup per token: for each query, softmax over the states of
+// scale * dot(state, query), then the weighted sum of the states, written as [n_embd, n_queries, n_tokens]
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+layout(constant_id = 1) const uint NUM_SUBGROUPS = 8;
+layout(constant_id = 2) const uint MAX_STATES = 8;
+layout(constant_id = 3) const uint MAX_QUERIES = 4;
+// channel steps per invocation whose states stay in registers between the two passes
+layout(constant_id = 4) const uint CACHED_STEPS = 5;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer S { float states[]; };   // [n_embd, n_states, n_tokens]
+layout(binding = 1) readonly buffer Q { float queries[]; };  // [n_embd, n_queries]
+layout(binding = 2) writeonly buffer D { float dst[]; };     // [n_embd, n_queries, n_tokens]
+
+layout(push_constant) uniform PushConstants {
+    uint n_embd;
+    uint n_states;
+    uint n_queries;
+    float scale;
+};
+
+shared float partial[MAX_QUERIES * MAX_STATES * NUM_SUBGROUPS];
+shared float weights[MAX_QUERIES * MAX_STATES];
+
+void load_states(const uint base, const uint e, out float s[MAX_STATES]) {
+    [[unroll]] for (uint n = 0; n < MAX_STATES; ++n) {
+        s[n] = n < n_states ? states[base + n * n_embd + e] : 0.0f;
+    }
+}
+
+void accumulate_scores(const float s[MAX_STATES], const uint e, inout float acc[MAX_QUERIES][MAX_STATES]) {
+    [[unroll]] for (uint q = 0; q < MAX_QUERIES; ++q) {
+        if (q < n_queries) {
+            const float w = queries[q * n_embd + e];
+            [[unroll]] for (uint n = 0; n < MAX_STATES; ++n) {
+                acc[q][n] += s[n] * w;
+            }
+        }
+    }
+}
+
+// the subgroup sums of every score, one slot per subgroup
+void store_partial_scores(const float acc[MAX_QUERIES][MAX_STATES]) {
+    [[unroll]] for (uint q = 0; q < MAX_QUERIES; ++q) {
+        [[unroll]] for (uint n = 0; n < MAX_STATES; ++n) {
+            if (q < n_queries && n < n_states) {
+                const float v = subgroupAdd(acc[q][n]);
+                if (subgroupElect()) {
+                    partial[(q * MAX_STATES + n) * NUM_SUBGROUPS + gl_SubgroupID] = v;
+                }
+            }
+        }
+    }
+}
+
+float score(const uint q, const uint n) {
+    float sum = 0.0f;
+    for (uint sg = 0; sg < gl_NumSubgroups; ++sg) {
+        sum += partial[(q * MAX_STATES + n) * NUM_SUBGROUPS + sg];
+    }
+    return scale * sum;
+}
+
+// as soft_max: exp(x - max), then times 1/sum
+void store_softmax(const uint q) {
+    float x[MAX_STATES];
+    [[unroll]] for (uint n = 0; n < MAX_STATES; ++n) {
+        x[n] = n < n_states ? score(q, n) : 0.0f;
+    }
+    float m = x[0];
+    [[unroll]] for (uint n = 1; n < MAX_STATES; ++n) {
+        if (n < n_states) {
+            m = max(m, x[n]);
+        }
+    }
+    float sum = 0.0f;
+    [[unroll]] for (uint n = 0; n < MAX_STATES; ++n) {
+        if (n < n_states) {
+            x[n] = exp(x[n] - m);
+            sum += x[n];
+        }
+    }
+    const float inv_sum = 1.0f / sum;
+    [[unroll]] for (uint n = 0; n < MAX_STATES; ++n) {
+        if (n < n_states) {
+            weights[q * MAX_STATES + n] = x[n] * inv_sum;
+        }
+    }
+}
+
+void load_weights(out float p[MAX_QUERIES][MAX_STATES]) {
+    [[unroll]] for (uint q = 0; q < MAX_QUERIES; ++q) {
+        [[unroll]] for (uint n = 0; n < MAX_STATES; ++n) {
+            p[q][n] = q < n_queries && n < n_states ? weights[q * MAX_STATES + n] : 0.0f;
+        }
+    }
+}
+
+void store_mix(const float s[MAX_STATES], const float p[MAX_QUERIES][MAX_STATES], const uint d_base, const uint e) {
+    [[unroll]] for (uint q = 0; q < MAX_QUERIES; ++q) {
+        if (q < n_queries) {
+            float o = 0.0f;
+            [[unroll]] for (uint n = 0; n < MAX_STATES; ++n) {
+                o += p[q][n] * s[n];
+            }
+            dst[d_base + q * n_embd + e] = o;
+        }
+    }
+}
+
+void main() {
+    const uint t      = gl_WorkGroupID.x;
+    const uint tid    = gl_LocalInvocationID.x;
+    const uint s_base = t * n_states * n_embd;
+    const uint d_base = t * n_queries * n_embd;
+
+    float s[CACHED_STEPS][MAX_STATES];
+    float acc[MAX_QUERIES][MAX_STATES];
+    [[unroll]] for (uint q = 0; q < MAX_QUERIES; ++q) {
+        [[unroll]] for (uint n = 0; n < MAX_STATES; ++n) {
+            acc[q][n] = 0.0f;
+        }
+    }
+
+    [[unroll]] for (uint i = 0; i < CACHED_STEPS; ++i) {
+        const uint e = i * BLOCK_SIZE + tid;
+        if (e < n_embd) {
+            load_states(s_base, e, s[i]);
+            accumulate_scores(s[i], e, acc);
+        }
+    }
+    for (uint e = CACHED_STEPS * BLOCK_SIZE + tid; e < n_embd; e += BLOCK_SIZE) {
+        float r[MAX_STATES];
+        load_states(s_base, e, r);
+        accumulate_scores(r, e, acc);
+    }
+
+    store_partial_scores(acc);
+    barrier();
+    if (tid < n_queries) {
+        store_softmax(tid);
+    }
+    barrier();
+
+    float p[MAX_QUERIES][MAX_STATES];
+    load_weights(p);
+
+    [[unroll]] for (uint i = 0; i < CACHED_STEPS; ++i) {
+        const uint e = i * BLOCK_SIZE + tid;
+        if (e < n_embd) {
+            store_mix(s[i], p, d_base, e);
+        }
+    }
+    for (uint e = CACHED_STEPS * BLOCK_SIZE + tid; e < n_embd; e += BLOCK_SIZE) {
+        float r[MAX_STATES];
+        load_states(s_base, e, r);
+        store_mix(r, p, d_base, e);
+    }
+}

@@ -5864,6 +5864,73 @@ struct test_control_mix : public test_case {
     }
 };
 
+// Inkling 2's depth mix as mix() builds it on a GPU: softmax(states^T queries / sqrt(n_embd)) over the states, then their
+// weighted sum per query. tail adds a node after it: the mix fuses (Vulkan DEPTH_MIX) only when it is not the last node.
+struct test_depth_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t n_states;
+    const int64_t n_queries;
+    const int64_t n_tokens;
+    const bool    tail;
+    const bool    fuses;
+    mutable bool has_fusion_counter = false;
+    mutable bool supported = false;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DEPTH_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, n_states, n_queries, n_tokens, tail);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4; // the unfused mat-muls round as in test_mul_mat
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn   = uint64_t (*)(ggml_backend_t);
+        using supported_fn = bool (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_depth_mix_fusion_count");
+        auto support = (supported_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_depth_mix_supported");
+        has_fusion_counter = counter != nullptr;
+        supported = support != nullptr && support(backend);
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return fuses && has_fusion_counter && supported; }
+
+    bool expect_no_fusion() override { return !fuses && has_fusion_counter; }
+
+    test_depth_mix(int64_t n_embd, int64_t n_states, int64_t n_queries, int64_t n_tokens, bool tail = true, bool fuses = true)
+        : n_embd(n_embd), n_states(n_states), n_queries(n_queries), n_tokens(n_tokens), tail(tail), fuses(fuses) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * states = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_states, n_tokens);
+        ggml_set_name(states, "states");
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_queries);
+        ggml_set_name(query, "query");
+
+        ggml_tensor * queries = n_tokens == 1 ? query :
+            ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_queries, n_tokens));
+
+        ggml_tensor * scores = ggml_mul_mat(ctx, states, queries);
+        scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+
+        ggml_tensor * out = ggml_mul_mat(ctx, scores, ggml_cont(ctx, ggml_transpose(ctx, states)));
+        out = n_queries == 1 ? ggml_reshape_3d(ctx, out, n_embd, 1, n_tokens) : ggml_cont(ctx, ggml_permute(ctx, out, 1, 0, 2, 3));
+        if (tail) {
+            out = ggml_scale(ctx, out, 0.5f);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -17010,6 +17077,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_control_mix(67, 33, with_mm));
     }
 
+    // Inkling 2's width, a narrow one and an odd one
+    for (int64_t n_embd : { 2304, 64, 300 }) {
+        for (int64_t n_states : { 1, 2, 5, 6 }) {
+            for (int64_t n_queries : { 1, 3, 4 }) {
+                for (int64_t n_tokens : { 1, 7, 512 }) {
+                    test_cases.emplace_back(new test_depth_mix(n_embd, n_states, n_queries, n_tokens));
+                }
+            }
+        }
+    }
+    // wider than the states the Vulkan pass keeps in registers
+    test_cases.emplace_back(new test_depth_mix(3000, 5, 3, 7));
+    test_cases.emplace_back(new test_depth_mix(3000, 2, 1, 1));
+    // no fusion: more states or queries than the Vulkan pass takes, and the mix as the last computed node
+    test_cases.emplace_back(new test_depth_mix(300, 9, 3, 7, true, false));
+    test_cases.emplace_back(new test_depth_mix(300, 5, 5, 7, true, false));
+    test_cases.emplace_back(new test_depth_mix(300, 5, 3, 7, false, false));
+    test_cases.emplace_back(new test_depth_mix(300, 5, 1, 1, false, false));
+
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)
         test_cases.emplace_back(new test_top_k_mask(type));
@@ -21235,6 +21321,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
+
+    // Inkling 2's depth mixes in decode and prefill. Perf mode repeats only the out node, so read the fused pass from
+    // GGML_VK_PERF_LOGGER (DEPTH_MIX), and the separate passes with GGML_VK_FUSE_DEPTH_MIX=0.
+    for (int64_t n_tokens : { 1, 512 }) {
+        for (auto [n_states, n_queries] : std::initializer_list<std::pair<int64_t, int64_t>>{ {2, 4}, {3, 1}, {4, 1}, {5, 1}, {3, 3} }) {
+            test_cases.emplace_back(new test_depth_mix(2304, n_states, n_queries, n_tokens));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

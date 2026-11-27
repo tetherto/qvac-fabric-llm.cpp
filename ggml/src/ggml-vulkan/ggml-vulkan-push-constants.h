@@ -959,6 +959,14 @@ struct vk_op_control_mix_push_constants {
     uint32_t nrows;
 };
 
+// depth_mix.comp: contiguous states [n_embd, n_states, n_tokens], queries [n_embd, n_queries] and dst [n_embd, n_queries, n_tokens]
+struct vk_op_depth_mix_push_constants {
+    uint32_t n_embd;
+    uint32_t n_states;
+    uint32_t n_queries;
+    float    scale;
+};
+
 struct vk_op_gru_push_constants {
     uint32_t H, B, L, reverse;
 };
