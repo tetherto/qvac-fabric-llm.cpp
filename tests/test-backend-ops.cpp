@@ -17924,6 +17924,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, 30, { 4, 70 }, { 1, 1 })); // k not a multiple of 4
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32,  2,  2, { 4, 5580 }, { 1, 1 })); // attention over 2 tokens per pixel
 
+    for (ggml_type type_b : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t k : {31, 33, 384, 1536}) {
+            for (int64_t n : {1, 3, 9}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, type_b, 7, n, k, {1, 1}, {1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, type_b, 7, 3, 384, {2, 2}, {2, 1}));
+    }
+
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
         for (bool multi_add : {false, true}) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
