@@ -2489,6 +2489,29 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
     return res;
 }
 
+// collects the non-view node indices starting at raw index idx, at most GGML_METAL_FUSION_MAX; 0-element tensors are
+// included so that empty graphs pack like their non-empty counterparts (see ggml_metal_fusion_filter_ops)
+static int ggml_metal_fusion_collect(const ggml_cgraph * gf, int idx, int * idxs) {
+    int n_idxs = 0;
+    for (int i = idx; i < gf->n_nodes && n_idxs < GGML_METAL_FUSION_MAX; i++) {
+        if (!ggml_op_is_empty(gf->nodes[i]->op)) {
+            idxs[n_idxs++] = i;
+        }
+    }
+    return n_idxs;
+}
+
+// true if a pattern of len nodes, matched at raw index idx near the end of a chained window, is the cut-short head of
+// a longer one: the encoder matches from a window that starts at idx, so it would fuse the longer pattern
+static bool ggml_metal_fusion_cut_short(const ggml_cgraph * gf, int idx, int len) {
+    int idxs[GGML_METAL_FUSION_MAX];
+    const int n_idxs = ggml_metal_fusion_collect(gf, idx, idxs);
+
+    int len_own = 1;
+    ggml_metal_fusion_next(gf, idxs, n_idxs, 0, GGML_METAL_FUSION_STRUCTURAL, &len_own);
+    return len_own > len;
+}
+
 // optimize phase: maximum number of nodes starting at idx (a raw sequential graph index) that
 // could be fused, chaining patterns back-to-back. matching runs on the same filtered (view
 // transparent) node sequence that the compute phase uses, so the returned count is the raw index
@@ -2499,15 +2522,8 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
         return 1;
     }
 
-    // collect the non-view node indices starting at idx; 0-element tensors are included so
-    // that empty graphs pack like their non-empty counterparts (see ggml_metal_fusion_filter_ops)
     int idxs[GGML_METAL_FUSION_MAX];
-    int n_idxs = 0;
-    for (int i = idx; i < gf->n_nodes && n_idxs < GGML_METAL_FUSION_MAX; i++) {
-        if (!ggml_op_is_empty(gf->nodes[i]->op)) {
-            idxs[n_idxs++] = i;
-        }
-    }
+    const int n_idxs = ggml_metal_fusion_collect(gf, idx, idxs);
     if (n_idxs == 0) {
         return 1;
     }
@@ -2521,6 +2537,9 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
         // the packed raw span (views included) is capped too: a pattern that does not fit whole is not chained, so the
         // cap never splits it and lets the reorder place other nodes inside it
         if (!fusion || total + len > GGML_METAL_FUSION_MAX || idxs[i_f + len - 1] - idx + 1 > GGML_METAL_FUSION_MAX) {
+            break;
+        }
+        if (i_f > 0 && n_idxs == GGML_METAL_FUSION_MAX && ggml_metal_fusion_cut_short(gf, idxs[i_f], len)) {
             break;
         }
 
