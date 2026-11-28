@@ -1,8 +1,8 @@
 // Register-prefetch loaders (MM_PREFETCH variants of mul_mm.comp): fetch_* load a K tile into registers, store_*_raw dequantise
 // it into LDS. pos_a is in LOAD_VEC_A units and advances by BK / LOAD_VEC_A per K step (BK = 32).
 
-#if !defined(COOPMAT) || !defined(FLOAT16) || defined(MUL_MAT_ID)
-#error "MM_PREFETCH variants are dense fp16 KHR coopmat only"
+#if !defined(COOPMAT) || !defined(FLOAT16)
+#error "MM_PREFETCH variants are fp16 KHR coopmat only"
 #endif
 
 // The q5_K qh dword and the iq4_xs d / scale words serve a whole superblock, so the prefetch loop loads them once per
@@ -155,6 +155,61 @@ void scache_refill(const uint pos_a, const uint block) {
 }
 #define SCACHE_REFILL(pos, blk) scache_refill(pos, blk);
 
+#elif defined(DATA_A_NVFP4) && LOAD_VEC_A == 16
+// 36-byte block: the 4 ue4m3 sub-block scales (dword 0), then 8 qs bytes per 16-k sub-block (low nibbles k 0..7, high
+// nibbles k 8..15). Lane row covers sub-block (pos_a % 4) + row of the block; every field is dword aligned.
+#define A_RAW_T uvec3   // xy: the sub-block's 8 qs bytes, z: the block's scale dword
+#define A_BLOCK_DWORDS 9
+uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / QUANT_K)) * A_BLOCK_DWORDS + 2 * row; }
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out A_RAW_T raw) {
+    const uint b = (pos_a / 4) * A_BLOCK_DWORDS + lane_off;
+    const uint q = b + 1 + 2 * (pos_a % 4);
+    raw = uvec3(data_a_u32[q], data_a_u32[q + 1], data_a_u32[b - 2 * row]);
+}
+// Two E2M1 nibbles (bits 0-3 and 16-19) as f16: magnitude bits at 9-11, sign at 15 give the value times 2^-14 exactly.
+f16vec2 e2m1x2(const uint v) {
+    return unpackFloat2x16(((v & 0x00070007u) << 9) | ((v & 0x00080008u) << 12)) * float16_t(16384.0);
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const A_RAW_T raw) {
+    // E2M1 times the ue4m3 scale is exact in f16 (at most 6 significant bits, at most 6 * 448)
+    const float16_t d = float16_t(ue4m3_fp32_lut[bitfieldExtract(raw.z, 8 * int(pos_a % 4 + row), 7)]);
+    [[unroll]] for (uint w = 0; w < 2; w++) {
+        const uint q = raw[w];
+        const uint q01 = (q & 0xFFu) | ((q & 0xFF00u) << 8);
+        const uint q23 = ((q >> 16) & 0xFFu) | ((q >> 8) & 0xFF0000u);
+        buf_a[sidx + 2 * w]     = FLOAT_TYPEV2(e2m1x2(q01) * d);
+        buf_a[sidx + 2 * w + 1] = FLOAT_TYPEV2(e2m1x2(q23) * d);
+        buf_a[sidx + 2 * w + 4] = FLOAT_TYPEV2(e2m1x2(q01 >> 4) * d);
+        buf_a[sidx + 2 * w + 5] = FLOAT_TYPEV2(e2m1x2(q23 >> 4) * d);
+    }
+}
+
+#elif defined(DATA_A_Q8_0) && LOAD_VEC_A == 8
+// 34-byte blocks (d, then 32 qs bytes) are only 2-byte aligned: a lane reads its 8 qs bytes at b as two dwords and a word
+// inside [b - 2, b + 8), like the q6_K loader. Lane row covers k 8 * row .. 8 * row + 7 of the block.
+#define A_RAW_T uvec4   // xyz: the dwords at b & ~3 and the word at b + 6, w: d bits | (b & 2) << 15
+#define A_BLOCK_BYTES 34
+uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / QUANT_K)) * A_BLOCK_BYTES + 2 + 8 * row; }
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out A_RAW_T raw) {
+    const uint b  = (pos_a / 4) * A_BLOCK_BYTES + lane_off;
+    const uint b4 = b & ~3u;
+    raw = uvec4(data_a_u32[b4 / 4], data_a_u32[b4 / 4 + 1], uint(data_a_u16[(b + 6) / 2]),
+                uint(data_a_u16[(b - 2 - 8 * row) / 2]) | ((b & 2u) << 15));
+}
+// Two int8 bytes (bits 0-7 and 16-23) as f16: with the byte offset by 128 in the mantissa of 1024 the value is exact.
+f16vec2 i8x2(const uint v) {
+    return unpackFloat2x16(v | 0x64006400u) - float16_t(1152.0);
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const A_RAW_T raw) {
+    const uvec2 q = (raw.w & 0x10000u) != 0 ? uvec2((raw.x >> 16) | (raw.y << 16), (raw.y >> 16) | (raw.z << 16)) : raw.xy;
+    const float16_t d = uint16BitsToFloat16(uint16_t(raw.w & 0xFFFFu));
+    [[unroll]] for (uint w = 0; w < 2; w++) {
+        const uint x = q[w] ^ 0x80808080u;
+        buf_a[sidx + 2 * w]     = FLOAT_TYPEV2(i8x2((x & 0xFFu) | ((x & 0xFF00u) << 8)) * d);
+        buf_a[sidx + 2 * w + 1] = FLOAT_TYPEV2(i8x2(((x >> 16) & 0xFFu) | ((x >> 8) & 0xFF0000u)) * d);
+    }
+}
+
 #else
 #error "MM_PREFETCH: no prefetch loader for this A type and LOAD_VEC_A"
 #endif
@@ -168,9 +223,24 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #if LOAD_VEC_B != 8
 #error "MM_PREFETCH: the B prefetch loads 8 values per lane"
 #endif
+#if defined(MUL_MAT_ID)
+float mmid_row_scale(const u16vec2 row_idx) {
+    return (p.fusion_flags & 1u) != 0 ? data_scale[uint(row_idx.y) * p.nei0 + uint(row_idx.x)] : 1.0f;
+}
+
+// B offset of tile row col; rows past _ne1 repeat the tile's last row, whose results are never stored
+uint b_row_off(const uint col) {
+    const u16vec2 row_idx = row_ids[min(col, _ne1 - 1)];
+    return row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B;
+}
+void fetch_b(const uint pos_b, const uint row, const uint row_off, out B_TYPE raw) {
+    raw = data_b[pos_b + row_off + row];
+}
+#else
 void fetch_b(const uint pos_b, const uint row, const uint col, out B_TYPE raw) {
     raw = data_b[pos_b + col * p.stride_b / LOAD_VEC_B + row];
 }
+#endif
 void store_b_raw(const uint buf_idx, const B_TYPE raw) {
     const FLOAT_TYPEV8 bb = FLOAT_TYPEV8(raw);
     buf_b[buf_idx + 0] = bb[0].xy;

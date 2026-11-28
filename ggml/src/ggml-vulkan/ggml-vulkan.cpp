@@ -2313,6 +2313,20 @@ static bool ggml_vk_mm_prefetch_type(ggml_type type) {
     }
 }
 
+// RADV GFX11 (RDNA3 and RDNA3.5), the measured family; GGML_VK_MMID_PREFETCH=0 keeps the MoE expert GEMMs of
+// ggml_vk_mmid_prefetch_route on int8 MMQ.
+static bool ggml_vk_mmid_prefetch_enabled(const vk_device & device) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MMID_PREFETCH");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on && ggml_vk_is_radv_gfx11(device) && device->coopmat_support && !device->coopmat2;
+}
+
+static bool ggml_vk_mmid_prefetch_type(ggml_type type) {
+    return type == GGML_TYPE_NVFP4 || type == GGML_TYPE_Q8_0;
+}
+
 // A shorter K cannot amortise the conversion of B to f16; a narrower N stays on int8 MMQ or the mat-vec shaders.
 static constexpr uint64_t dense_f16coopmat_min_k = 1024;
 static constexpr uint64_t dense_f16coopmat_min_n = 32;
@@ -3859,6 +3873,22 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create_mmq({GGML_TYPE_Q5_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q5_k_q8_1",   matmul_id_subgroup_q5_k_q8_1_cm1_len,   matmul_id_subgroup_q5_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count);
             cm1_create_mmq({GGML_TYPE_Q6_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_q6_k_q8_1",   matmul_id_subgroup_q6_k_q8_1_cm1_len,   matmul_id_subgroup_q6_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_NVFP4, GGML_TYPE_Q8_1, true, false}, cm1_mmid_rows_tc(tc_mmq_cm1_int_k, GGML_TYPE_NVFP4), "matmul_id_subgroup_nvfp4_q8_1",  matmul_id_subgroup_nvfp4_q8_1_cm1_len,  matmul_id_subgroup_nvfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); }
+        }
+
+        // Register-prefetch MoE expert GEMMs (ggml_vk_mmid_prefetch_route): 128 weight rows by 64 or 128 expert rows, picked
+        // by rows per expert. The small slot reuses the 64-row tile, so one tile per expert reads its weights once.
+        if (ggml_vk_mmid_prefetch_enabled(device) && cm1_use_wave32 && device->coopmat_acc_f32_support &&
+            device->coopmat_m == 16 && device->coopmat_n == 16 && device->coopmat_k == 16) {
+            static constexpr uint32_t wave32 = 32, bk = 32, bm = 128, align = bk;
+            const vk_tile_config tile_64 = {{ 256, bm,  64, bk, 32, 32, 2, 16, 16, 16, wave32 }, { bm,  64, 1 }, align};
+            const vk_tile_config tile_128 = {{ 256, bm, 128, bk, 64, 32, 2, 16, 16, 16, wave32 }, { bm, 128, 1 }, align};
+            const std::vector<vk_tile_config> tc_mmid_pf = { tile_64, tile_64, tile_128 };
+            create_mm_pipelines({GGML_TYPE_NVFP4, GGML_TYPE_F16, true, false, false, true}, tc_mmid_pf, "matmul_id_subgroup_nvfp4_f16_pf",
+                                matmul_id_subgroup_nvfp4_f16_pf_cm1_len, matmul_id_subgroup_nvfp4_f16_pf_cm1_data,
+                                sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count, cm1_spec, false, true, 0, true, true);
+            create_mm_pipelines({GGML_TYPE_Q8_0, GGML_TYPE_F16, true, false, false, true}, tc_mmid_pf, "matmul_id_subgroup_q8_0_f16_pf",
+                                matmul_id_subgroup_q8_0_f16_pf_cm1_len, matmul_id_subgroup_q8_0_f16_pf_cm1_data,
+                                sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count, cm1_spec, false, true, 0, true, true);
         }
     } else
 #endif  // defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -8306,6 +8336,60 @@ static uint32_t ggml_vk_batch_stride(const ggml_tensor * tensor) {
     return (uint32_t)(tensor->nb[2] / ggml_type_size(tensor->type) * ggml_blck_size(tensor->type));
 }
 
+// B of a MUL_MAT_ID GEMM can go to int8 MMQ as q8_1
+static bool ggml_vk_mmid_can_quantize_y(const ggml_backend_vk_context * ctx, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
+           (src1->ne[1] * src1->ne[0]) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst);
+}
+
+// The measured envelope: Inkling 2 Mini's expert GEMMs (M 2304, K 1152 and 2304) at 32 to 128 rows per expert
+static constexpr uint64_t mmid_prefetch_min_m = 2304;
+static constexpr uint64_t mmid_prefetch_min_k = 1152;
+static constexpr uint64_t mmid_prefetch_max_k = 2304;
+static constexpr uint32_t mmid_prefetch_min_rows_per_expert = 32;
+static constexpr uint32_t mmid_prefetch_max_rows_per_expert = 128;
+
+static bool ggml_vk_mmid_prefetch_shape(const ggml_tensor * src0, const ggml_tensor * ids) {
+    const uint32_t rows = ggml_vk_mul_mat_id_rows_per_expert(src0->ne[2], ids->ne[0], ids->ne[1]);
+    return (uint64_t) src0->ne[1] >= mmid_prefetch_min_m &&
+           (uint64_t) src0->ne[0] >= mmid_prefetch_min_k && (uint64_t) src0->ne[0] <= mmid_prefetch_max_k &&
+           rows >= mmid_prefetch_min_rows_per_expert && rows <= mmid_prefetch_max_rows_per_expert;
+}
+
+static const std::vector<vk_matmul_pipeline_pair> * ggml_vk_get_mmid_prefetch_pipeline_map(const vk_device & device, ggml_type type) {
+    const auto it = device->pipeline_matmul.find({ type, GGML_TYPE_F16, true, false, false, true });
+    return it == device->pipeline_matmul.end() || it->second.empty() ? nullptr : &it->second;
+}
+
+// MoE expert GEMMs that run on the register-prefetch f16 coopmat matmul instead of int8 MMQ. Only GEMMs that would quantize
+// B to q8_1 move, so GGML_VK_MMID_PREFETCH=0 restores int8 MMQ. The dispatch and the MUL epilogue fusion both ask here.
+static bool ggml_vk_mmid_prefetch_route(const ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                        const ggml_tensor * ids, const ggml_tensor * dst) {
+    return ggml_vk_mmid_prefetch_enabled(ctx->device) && ggml_vk_mmid_prefetch_type(src0->type) &&
+           ggml_vk_mmid_prefetch_shape(src0, ids) && ggml_vk_dim01_contiguous(src0) &&
+           ggml_vk_mmid_can_quantize_y(ctx, src1, dst) &&
+           ggml_vk_get_mmid_prefetch_pipeline_map(ctx->device, src0->type) != nullptr;
+}
+
+// GGML_VK_MMID_PREFETCH_LOG=1 prints the MUL_MAT_ID GEMM pipeline each time it changes
+static void ggml_vk_log_mmid_pipeline(const vk_pipeline & pipeline, uint64_t m, uint64_t k, uint32_t tile_n, bool scale) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MMID_PREFETCH_LOG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (!on) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::string last;
+    std::lock_guard<std::mutex> guard(mutex);
+    const std::string key = pipeline->name + (scale ? " scale" : "");
+    if (key != last) {
+        last = key;
+        GGML_LOG_INFO("ggml_vulkan: mmid_prefetch canary: %s m=%u k=%u tile_n=%u scale=%d\n", pipeline->name.c_str(), (uint32_t) m, (uint32_t) k, tile_n, scale ? 1 : 0);
+    }
+}
+
 vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src, const ggml_tensor * dst, ggml_type to) {
 
     // Choose "contiguous copy" shader if src/dst are contiguous
@@ -10840,20 +10924,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 #else
     const bool y_decode_vector_staging = false;
 #endif
-    const bool can_quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 &&
-                                ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst);
+    const bool mmid_prefetch = ggml_vk_mmid_prefetch_route(ctx, src0, src1, ids, dst);
+    const bool can_quantize_y = !mmid_prefetch && ggml_vk_mmid_can_quantize_y(ctx, src1, dst);
     // Intel coopmat1 matrix cores prefer f16 activations for quantized weights
     const bool prefer_f16_b = ctx->device->coopmat_support && !ctx->device->coopmat2 &&
                               ctx->device->vendor_id == VK_VENDOR_ID_INTEL &&
                               ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
-    const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
+    const ggml_type y_kernel_type = mmid_prefetch ? GGML_TYPE_F16 : ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
                                         ggml_prec_get_acc(dst), true, can_quantize_y, prefer_f16_b);
 
     const bool quantize_y   = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel = y_kernel_type == GGML_TYPE_F32;
 
-    const std::vector<vk_matmul_pipeline_pair>* mmp_map =
+    const std::vector<vk_matmul_pipeline_pair>* mmp_map = mmid_prefetch ?
+        ggml_vk_get_mmid_prefetch_pipeline_map(ctx->device, src0->type) :
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, ggml_prec_get_acc(dst), true);
 
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
@@ -10873,13 +10958,14 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                                   y_decode_vector_staging || y_needs_k_padding);
     const bool qy_needs_dequant = y_needs_reformat;
 
-    // with the 128x32 tile the tile is chosen for one expert's rows rather than all tokens
-    const bool rows_tile = quantize_y && !qx_needs_dequant && ctx->device->mul_mat_id_rows_tile[src0->type];
+    // with the 128x32 tile (and the prefetch tiles) the tile is chosen for one expert's rows rather than all tokens
+    const bool rows_tile = (quantize_y && !qx_needs_dequant && ctx->device->mul_mat_id_rows_tile[src0->type]) || mmid_prefetch;
     const uint32_t tile_n = rows_tile ? ggml_vk_mul_mat_id_rows_per_expert(n_as, nei0, nei1) : (uint32_t) nei1;
     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, tile_n, true));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, tile_n, aligned, true);
+    ggml_vk_log_mmid_pipeline(pipeline, ne01, ne10, tile_n, scale != nullptr);
 
     const uint32_t bn = pipeline->wg_denoms[1];
     const uint64_t max_tiles = ggml_vk_mul_mat_id_max_tiles(n_as, nei0 * nei1, bn);
@@ -11108,8 +11194,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     vk_subbuffer d_scale;
     if (scale != nullptr) {
-        // ggml_vk_mmid_scale_epilogue_ok admitted this node only for the int8 MMQ coopmat1 pipelines
-        GGML_ASSERT(quantize_y && !qx_needs_dequant && pipeline->parameter_count == 6);
+        // ggml_vk_mmid_scale_epilogue_ok admitted this node only for the int8 MMQ coopmat1 and the prefetch pipelines
+        GGML_ASSERT((quantize_y || mmid_prefetch) && !qx_needs_dequant && pipeline->parameter_count == 6);
         d_scale = ggml_vk_tensor_subbuffer(ctx, scale);
     }
 
@@ -19405,8 +19491,8 @@ static bool ggml_vk_mmid_epilogue_enabled() {
     return on;
 }
 
-// true when ggml_vk_mul_mat_id_q_f16 will run this MUL_MAT_ID on an int8 MMQ coopmat1 pipeline (the only MUL_MAT_ID
-// GEMM with the router-weight binding) and the MUL is a per-row scale it can apply
+// true when ggml_vk_mul_mat_id_q_f16 will run this MUL_MAT_ID on an int8 MMQ coopmat1 or a prefetch pipeline (the
+// MUL_MAT_ID GEMMs with the router-weight binding) and the MUL is a per-row scale it can apply
 static bool ggml_vk_mmid_scale_epilogue_ok(const ggml_backend_vk_context * cctx, const ggml_tensor * mmid, const ggml_tensor * mul) {
     if (!ggml_vk_mmid_epilogue_enabled()) {
         return false;
@@ -19419,16 +19505,22 @@ static bool ggml_vk_mmid_scale_epilogue_ok(const ggml_backend_vk_context * cctx,
         !ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32) {
         return false;
     }
-    // same conditions as quantize_y / !qx_needs_dequant in ggml_vk_mul_mat_id_q_f16
-    if (!ctx->device->integer_dot_product || ctx->device->coopmat2 ||
-        !ggml_vk_dim01_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_vk_dim01_contiguous(src1) ||
-        (src1->ne[0] * src1->ne[1]) % 4 != 0) {
-        return false;
+    const std::vector<vk_matmul_pipeline_pair> * mmp = nullptr;
+    // the fused node reaches ggml_vk_mul_mat_id_q_f16 with the MUL as dst
+    if (ggml_vk_mmid_prefetch_route(ctx, src0, src1, mmid->src[2], mul)) {
+        mmp = ggml_vk_get_mmid_prefetch_pipeline_map(ctx->device, src0->type);
+    } else {
+        // same conditions as quantize_y / !qx_needs_dequant in ggml_vk_mul_mat_id_q_f16
+        if (!ctx->device->integer_dot_product || ctx->device->coopmat2 ||
+            !ggml_vk_dim01_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_vk_dim01_contiguous(src1) ||
+            (src1->ne[0] * src1->ne[1]) % 4 != 0) {
+            return false;
+        }
+        if (ctx->device->coopmat_support && ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+            return false;
+        }
+        mmp = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)mmid->op_params[0], true);
     }
-    if (ctx->device->coopmat_support && ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
-        return false;
-    }
-    const std::vector<vk_matmul_pipeline_pair> * mmp = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)mmid->op_params[0], true);
     if (mmp == nullptr) {
         return false;
     }
