@@ -1334,6 +1334,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope_flux(ggml_m
     return ggml_metal_library_get_or_compile(lib, op->src[1] ? "kernel_rope_flux" : "kernel_rope_flux_permute");
 }
 
+// src1 columns per thread in the short mat-vec once all 32 lanes hold src0 rows: one column per thread launched
+// ~400k one-simdgroup threadgroups for Inkling 2's relative-position bias table
+static constexpr int GGML_METAL_MUL_MV_SHORT_NC = 8;
+
+// more columns per thread only while the smaller grid still fills the GPU: decode keeps one column per thread
+static int ggml_metal_mul_mv_short_nc(int ne01, int ne11, int ne12, int ne13) {
+    const int     nc  = GGML_METAL_MUL_MV_SHORT_NC;
+    const int64_t ntg = (int64_t) ((ne01 + 31)/32) * ((ne11 + nc - 1)/nc) * ne12 * ne13;
+
+    return ne01 >= 32 && ntg >= GGML_METAL_MIN_THREADGROUPS ? nc : 1;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op, bool add, bool norm) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1344,6 +1356,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     int nsg = 0; // number of simdgroups
     int nr0 = 0; // number of src0 rows per simdgroup
     int nr1 = 1; // number of src1 rows per threadgroup
+    int nc  = 1; // number of src1 rows per thread (short kernel)
 
     size_t smem = 0; // shared memory
 
@@ -1363,8 +1376,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 if (ne00 < 32) {
                     nsg = 1;
                     nr0 = std::min(ne01, 32);
-                    nr1 = 32/nr0;
-                    suffix = "_short";
+                    nc  = ggml_metal_mul_mv_short_nc(ne01, ne11, ne12, ne13);
+                    nr1 = (32/nr0)*nc;
+                    suffix = nc > 1 && ne00 % 4 == 0 ? "_short_4" : "_short";
                 } else {
                     nsg = std::min(4, (ne00 + 127) / 128);
                     nr0 = 2;
@@ -1565,7 +1579,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const int16_t r3 = (int16_t) (ne13 / ne03);
 
     snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d_add=%d_norm=%d", base, nsg, ne12, r2, r3, split, add, norm);
+    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d_add=%d_norm=%d_nc=%d", base, nsg, ne12, r2, r3, split, add, norm, nc);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1578,6 +1592,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         ggml_metal_cv_set_bool (cv, split,          FC_MUL_MV + 5);
         ggml_metal_cv_set_bool (cv, add,            FC_MUL_MV + 7);
         ggml_metal_cv_set_bool (cv, norm,           FC_MUL_MV + 8);
+        ggml_metal_cv_set_int16(cv, nc,             FC_MUL_MV + 9);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

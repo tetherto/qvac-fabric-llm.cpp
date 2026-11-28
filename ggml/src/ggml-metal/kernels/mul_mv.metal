@@ -267,6 +267,7 @@ constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
 constant short FC_mul_mv_id_has_scale [[function_constant(FC_MUL_MV + 6)]];
 constant bool  FC_mul_mv_add   [[function_constant(FC_MUL_MV + 7)]];
 constant bool  FC_mul_mv_norm  [[function_constant(FC_MUL_MV + 8)]];
+constant short FC_mul_mv_nc    [[function_constant(FC_MUL_MV + 9)]];
 
 // NORM: fused RMS_NORM + MUL + mat-vec. src1 is the un-normalized row x and srcw the norm weight w, and the kernel
 // computes dst = rsqrt(mean(x^2) + eps) * (src0 . (x*w)). each simdgroup reads all of x, so the sum of squares
@@ -2163,6 +2164,17 @@ template [[host_name("kernel_mul_mv_glu_f16_f32_4")]]  kernel mul_mv_glu_t_t_4 k
 template [[host_name("kernel_mul_mv_glu_bf16_f32_4")]] kernel mul_mv_glu_t_t_4 kernel_mul_mv_glu_t_t_4<bfloat, bfloat4, float, float4>;
 #endif
 
+template<typename T0, typename T1>
+float mul_mv_short_dot(device const T0 * x, device const T1 * y, int ne00) {
+    float res = 0.0f;
+
+    for (int i = 0; i < ne00; ++i) {
+        res += (float) x[i] * (float) y[i];
+    }
+
+    return res;
+}
+
 template<typename T0, typename T1, typename args_t>
 void kernel_mul_mv_t_t_short_impl(
         args_t args,
@@ -2173,9 +2185,10 @@ void kernel_mul_mv_t_t_short_impl(
         ushort tiisg) {
     const int n0 = args.nr0;
     const int n1 = 32/n0;
+    const int nc = FC_mul_mv_nc;
 
     const int r0 = tgpig.x*n0 + tiisg%n0;
-    const int r1 = tgpig.y*n1 + tiisg/n0;
+    const int r1 = (tgpig.y*n1 + tiisg/n0)*nc;
     const int im = tgpig.z;
 
     if (tiisg >= n0*n1 || r0 >= args.ne01 || r1 >= args.ne11) {
@@ -2191,17 +2204,15 @@ void kernel_mul_mv_t_t_short_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1;
 
-    const uint64_t offset1 = r1*args.nb11 + (i12   )*args.nb12 + (i13   )*args.nb13;
+    const int nc_valid = min(nc, args.ne11 - r1);
 
-    device const T1 * y = (device const T1 *) (src1 + offset1);
+    for (int c = 0; c < nc_valid; ++c) {
+        const uint64_t offset1 = (r1 + c)*args.nb11 + (i12   )*args.nb12 + (i13   )*args.nb13;
 
-    float res = 0.0f;
+        device const T1 * y = (device const T1 *) (src1 + offset1);
 
-    for (int i = 0; i < args.ne00; ++i) {
-        res += (float) x[i] * (float) y[i];
+        dst_f32[(uint64_t)(r1 + c)*args.ne0 + r0] = mul_mv_short_dot(x, y, args.ne00);
     }
-
-    dst_f32[(uint64_t)r1*args.ne0 + r0] = res;
 }
 
 template<typename T0, typename T1>
@@ -2230,6 +2241,107 @@ template [[host_name("kernel_mul_mv_f16_f16_short")]]  kernel mul_mv_t_t_short_t
 template [[host_name("kernel_mul_mv_bf16_f32_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<bfloat, float>;
 template [[host_name("kernel_mul_mv_bf16_bf16_short")]] kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<bfloat, bfloat>;
 template [[host_name("kernel_mul_mv_f32_bf16_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<float,  bfloat>;
+#endif
+
+// ne00 < 32 on the short path, so a src0 row fits in this many 4-vectors
+constant short MUL_MV_SHORT_MAX_K4 = 8;
+
+template<typename T04>
+void mul_mv_short_load_4(thread T04 * xr, device const T04 * x4, int n4) {
+    FOR_UNROLL (short j = 0; j < MUL_MV_SHORT_MAX_K4; ++j) {
+        if (j < n4) {
+            xr[j] = x4[j];
+        }
+    }
+}
+
+template<typename T04, typename T14>
+float mul_mv_short_dot_4(thread const T04 * xr, device const T14 * y4, int n4) {
+    float res = 0.0f;
+
+    FOR_UNROLL (short j = 0; j < MUL_MV_SHORT_MAX_K4; ++j) {
+        if (j < n4) {
+            const T14 yj = y4[j];
+
+            res += (float) xr[j][0] * (float) yj[0];
+            res += (float) xr[j][1] * (float) yj[1];
+            res += (float) xr[j][2] * (float) yj[2];
+            res += (float) xr[j][3] * (float) yj[3];
+        }
+    }
+
+    return res;
+}
+
+// the short kernel with several src1 columns per thread: the src0 row is loaded once and reused for every column
+template<typename T04, typename T14, typename args_t>
+void kernel_mul_mv_t_t_short_4_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig,
+        ushort tiisg) {
+    const int n0 = args.nr0;
+    const int n1 = 32/n0;
+    const int nc = FC_mul_mv_nc;
+
+    const int r0 = tgpig.x*n0 + tiisg%n0;
+    const int r1 = (tgpig.y*n1 + tiisg/n0)*nc;
+    const int im = tgpig.z;
+
+    if (tiisg >= n0*n1 || r0 >= args.ne01 || r1 >= args.ne11) {
+        return;
+    }
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = r0*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+
+    const int n4 = args.ne00/4;
+
+    T04 xr[MUL_MV_SHORT_MAX_K4];
+
+    mul_mv_short_load_4(xr, (device const T04 *) (src0 + offset0), n4);
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1;
+
+    const int nc_valid = min(nc, args.ne11 - r1);
+
+    for (int c = 0; c < nc_valid; ++c) {
+        const uint64_t offset1 = (r1 + c)*args.nb11 + (i12   )*args.nb12 + (i13   )*args.nb13;
+
+        dst_f32[(uint64_t)(r1 + c)*args.ne0 + r0] = mul_mv_short_dot_4(xr, (device const T14 *) (src1 + offset1), n4);
+    }
+}
+
+template<typename T04, typename T14>
+kernel void kernel_mul_mv_t_t_short_4(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    kernel_mul_mv_t_t_short_4_impl<T04, T14, constant ggml_metal_kargs_mul_mv &>(
+        args,
+        src0,
+        src1,
+        dst,
+        tgpig,
+        tiisg);
+}
+
+typedef decltype(kernel_mul_mv_t_t_short_4<half4, half4>) mul_mv_t_t_short_4_t;
+
+template [[host_name("kernel_mul_mv_f32_f32_short_4")]]  kernel mul_mv_t_t_short_4_t kernel_mul_mv_t_t_short_4<float4, float4>;
+template [[host_name("kernel_mul_mv_f16_f32_short_4")]]  kernel mul_mv_t_t_short_4_t kernel_mul_mv_t_t_short_4<half4,  float4>;
+template [[host_name("kernel_mul_mv_f16_f16_short_4")]]  kernel mul_mv_t_t_short_4_t kernel_mul_mv_t_t_short_4<half4,  half4>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_mul_mv_bf16_f32_short_4")]]  kernel mul_mv_t_t_short_4_t kernel_mul_mv_t_t_short_4<bfloat4, float4>;
+template [[host_name("kernel_mul_mv_bf16_bf16_short_4")]] kernel mul_mv_t_t_short_4_t kernel_mul_mv_t_t_short_4<bfloat4, bfloat4>;
+template [[host_name("kernel_mul_mv_f32_bf16_short_4")]]  kernel mul_mv_t_t_short_4_t kernel_mul_mv_t_t_short_4<float4,  bfloat4>;
 #endif
 
 template<int nr0, typename args_t>
