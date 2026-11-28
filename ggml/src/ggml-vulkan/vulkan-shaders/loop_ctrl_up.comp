@@ -1,0 +1,59 @@
+#version 450
+
+// Inkling 2 loop controller, pass 2: the gain and forget projections of the gate and the combine
+// (cur - tanh(forget) * cur) + tanh(gain) * msg. One subgroup owns one output channel.
+
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint NUM_SUBGROUPS = 4;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer C  { float cur[]; };   // [n, n_tokens]
+layout(binding = 1) readonly buffer M  { float msg[]; };   // [n, n_tokens]
+layout(binding = 2) readonly buffer G  { float gate[]; };  // [rank, n_tokens]
+layout(binding = 3) readonly buffer WG { float wg[]; };    // [rank, n]
+layout(binding = 4) readonly buffer WF { float wf[]; };    // [rank, n]
+layout(binding = 5) writeonly buffer D { float dst[]; };   // [n, n_tokens]
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+    uint rank;
+};
+
+// unary.comp's op_tanh; a function, so the precise terms below do not mark its operations
+float op_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+void main() {
+    const uint ch = gl_WorkGroupID.x * NUM_SUBGROUPS + gl_SubgroupID;
+    const uint t  = gl_WorkGroupID.y;
+
+    // the whole subgroup is past the end together, and no barrier follows
+    if (ch >= n) {
+        return;
+    }
+
+    float gain   = 0.0f;
+    float forget = 0.0f;
+    for (uint k = gl_SubgroupInvocationID; k < rank; k += gl_SubgroupSize) {
+        const float x = gate[t * rank + k];
+        gain   += wg[ch * rank + k] * x;
+        forget += wf[ch * rank + k] * x;
+    }
+    gain   = subgroupAdd(gain);
+    forget = subgroupAdd(forget);
+
+    if (subgroupElect()) {
+        const uint i = t * n + ch;
+        const float c = cur[i];
+        // each product and sum rounds on its own, as the separate MUL, SUB and ADD passes do
+        precise float forget_c = op_tanh(forget) * c;
+        precise float gain_m   = op_tanh(gain) * msg[i];
+        precise float mixed    = (c - forget_c) + gain_m;
+        dst[i] = mixed;
+    }
+}

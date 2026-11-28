@@ -5906,6 +5906,80 @@ struct test_control_mix : public test_case {
     }
 };
 
+// the Inkling 2 loop controller as control() builds it: one rms_norm of [cur; msg], the rank r down projection, the gain and
+// forget projections and (cur - tanh(forget)*cur) + tanh(gain)*msg. The Vulkan LOOP_CTRL fuses it for up to 8 tokens, and
+// only when a node follows it.
+struct test_loop_ctrl : public test_case {
+    const int64_t n, r, T;
+    const bool    tail;
+    const bool    fuses;
+    mutable bool has_fusion_counter = false;
+    mutable bool supported = false;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "LOOP_CTRL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n, r, T, tail);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4; // the gate rounds as in test_mul_mat
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn   = uint64_t (*)(ggml_backend_t);
+        using supported_fn = bool (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_loop_ctrl_fusion_count");
+        auto support = (supported_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_loop_ctrl_supported");
+        has_fusion_counter = counter != nullptr;
+        supported = support != nullptr && support(backend);
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return fuses && tail && has_fusion_counter && supported; }
+
+    bool expect_no_fusion() override { return (!fuses || !tail) && has_fusion_counter; }
+
+    test_loop_ctrl(int64_t n = 2304, int64_t r = 64, int64_t T = 1, bool tail = true, bool fuses = true)
+        : n(n), r(r), T(T), tail(tail), fuses(fuses) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T), 1.0f);
+        ggml_tensor * msg = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T), 1.0f);
+        ggml_tensor * wd  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*n, r);
+        ggml_tensor * wg  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, n);
+        ggml_tensor * wf  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, n);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(msg, "msg");
+
+        ggml_tensor * gate = ggml_concat(ctx, ggml_reshape_3d(ctx, cur, n, 1, T), ggml_reshape_3d(ctx, msg, n, 1, T), 1);
+        gate = ggml_reshape_2d(ctx, ggml_rms_norm(ctx, gate, 1e-6f), 2*n, T);
+        gate = ggml_mul_mat(ctx, wd, gate);
+
+        ggml_tensor * gain   = ggml_tanh(ctx, ggml_mul_mat(ctx, wg, gate));
+        ggml_tensor * forget = ggml_tanh(ctx, ggml_mul_mat(ctx, wf, gate));
+
+        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, cur, ggml_mul(ctx, forget, cur)), ggml_mul(ctx, gain, msg));
+        if (tail) {
+            out = ggml_scale(ctx, out, 0.5f);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.5f, 0.5f);
+        }
+    }
+};
+
 // Inkling 2's depth mix as mix() builds it on a GPU: softmax(states^T queries / sqrt(n_embd)) over the states, then their
 // weighted sum per query. tail adds a node after it: the mix fuses (Vulkan DEPTH_MIX) only when it is not the last node.
 struct test_depth_mix : public test_case {
@@ -17159,6 +17233,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_control_mix(2304, 4, with_mm));
         test_cases.emplace_back(new test_control_mix(67, 33, with_mm));
     }
+
+    for (int64_t T : { 1, 4, 8 }) {
+        test_cases.emplace_back(new test_loop_ctrl(2304, 64, T));
+    }
+    test_cases.emplace_back(new test_loop_ctrl(300, 64, 3));
+    test_cases.emplace_back(new test_loop_ctrl(256, 40, 3));
+    test_cases.emplace_back(new test_loop_ctrl(2304, 64, 1, false));
+    test_cases.emplace_back(new test_loop_ctrl(2304, 64, 16, true, false)); // above 8 tokens the nodes stay separate
 
     // Inkling 2's width, a narrow one and an odd one
     for (int64_t n_embd : { 2304, 64, 300 }) {

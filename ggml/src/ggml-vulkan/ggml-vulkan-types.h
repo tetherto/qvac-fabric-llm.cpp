@@ -645,6 +645,18 @@ static constexpr std::initializer_list<std::array<int, 3>> control_mix_edges {
     { 5, 1, 4 }, // add->src[1] == mul
 };
 
+// Inkling 2's loop controller as control() builds it: the rms_norm of [cur; msg], the down projection, the forget and gain
+// projections and the mix. Two passes run it (loop_ctrl_down.comp, loop_ctrl_up.comp) for a few tokens.
+static constexpr std::initializer_list<ggml_op> loop_ctrl_pattern {
+    GGML_OP_CONCAT, GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
+    GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+static constexpr int loop_ctrl_nodes = 12;
+// the node of the down projection (the gate, written by pass 1 and read by pass 2) and of the mix (the output)
+static constexpr int loop_ctrl_gate_node = 3;
+static constexpr int loop_ctrl_out_node  = loop_ctrl_nodes - 1;
+static constexpr uint32_t vk_loop_ctrl_max_tokens = 8;  // as the CUDA fusion; more tokens keep the separate nodes
+static constexpr uint32_t vk_loop_ctrl_block = 256;  // invocations per workgroup of both passes; pass 2 gives one subgroup to a channel
+
 // softmax(scale * states^T queries) over the states, then the weighted sum of the states: Inkling 2's depth mix.
 // The REPEAT of the queries is built for more than one token.
 static constexpr std::initializer_list<ggml_op> depth_mix_pattern {
@@ -1215,6 +1227,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_short_conv_f32;
     vk_pipeline pipeline_short_conv_state_f32;
     vk_pipeline pipeline_control_mix_f32;
+    vk_pipeline pipeline_loop_ctrl_down_f32;
+    vk_pipeline pipeline_loop_ctrl_up_f32;
     vk_pipeline pipeline_depth_mix_f32[DEPTH_MIX_LAST_COUNT];
     vk_pipeline pipeline_l2_clip_f32;
     vk_pipeline pipeline_ssm_conv_back_sx_f32;
@@ -1765,6 +1779,7 @@ struct ggml_backend_vk_context {
     bool fused_short_conv {};
     bool fused_short_conv_state {};
     bool fused_control_mix {};
+    bool fused_loop_ctrl {};
     bool fused_depth_mix {};
     bool fused_l2_clip {};
     // GATED_DELTA_NET (or _DEFERRED) + CPY: the recurrent cache view the gdn writes its state to
@@ -1793,6 +1808,7 @@ struct ggml_backend_vk_context {
     std::atomic<uint64_t> gdn_cache_fusion_count {};
     std::atomic<uint64_t> depth_mix_fusion_count {};
     std::atomic<uint64_t> l2_clip_fusion_count {};
+    std::atomic<uint64_t> loop_ctrl_fusion_count {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;

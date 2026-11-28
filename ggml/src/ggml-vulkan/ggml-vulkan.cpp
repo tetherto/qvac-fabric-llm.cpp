@@ -2417,6 +2417,11 @@ static bool ggml_vk_depth_mix_device_ok(const vk_device & device) {
     return shmem <= device->properties.limits.maxComputeSharedMemorySize;
 }
 
+// the loop controller passes reduce with subgroup operations over whole subgroups
+static bool ggml_vk_loop_ctrl_device_ok(const vk_device & device) {
+    return device->subgroup_arithmetic && device->subgroup_require_full_support && vk_loop_ctrl_block % device->subgroup_size == 0;
+}
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -5437,6 +5442,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_short_conv_f32, "short_conv_f32", short_conv_f32_len, short_conv_f32_data, "main", 4, sizeof(vk_op_short_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_short_conv_state_f32, "short_conv_state_f32", short_conv_state_f32_len, short_conv_state_f32_data, "main", 5, sizeof(vk_op_short_conv_state_push_constants), {32, 16, 1}, {32, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_control_mix_f32, "control_mix_f32", control_mix_f32_len, control_mix_f32_data, "main", 5, sizeof(vk_op_control_mix_push_constants), {256, 1, 1}, {256}, 1);
+    if (ggml_vk_loop_ctrl_device_ok(device)) {
+        const std::vector<uint32_t> loop_ctrl_spec = { vk_loop_ctrl_block, vk_loop_ctrl_block / device->subgroup_size };
+        ggml_vk_create_pipeline(device, device->pipeline_loop_ctrl_down_f32, "loop_ctrl_down_f32", loop_ctrl_down_f32_len, loop_ctrl_down_f32_data, "main", 4, sizeof(vk_op_loop_ctrl_down_push_constants), {1, 1, 1}, loop_ctrl_spec, 1, false, true, device->subgroup_size);
+        ggml_vk_create_pipeline(device, device->pipeline_loop_ctrl_up_f32, "loop_ctrl_up_f32", loop_ctrl_up_f32_len, loop_ctrl_up_f32_data, "main", 6, sizeof(vk_op_loop_ctrl_up_push_constants), {1, 1, 1}, loop_ctrl_spec, 1, false, true, device->subgroup_size);
+    }
     if (ggml_vk_depth_mix_device_ok(device)) {
         for (uint32_t mode = 0; mode < DEPTH_MIX_LAST_COUNT; ++mode) {
             ggml_vk_create_pipeline2(device, device->pipeline_depth_mix_f32[mode], "depth_mix_f32_" + std::to_string(mode), depth_mix_f32_len, depth_mix_f32_data, "main", 4,
@@ -15165,6 +15175,42 @@ static void ggml_vk_control_mix(ggml_backend_vk_context * ctx, vk_context & subc
         pc, { ne0, nrows, 1 });
 }
 
+// loop_ctrl_pattern at node_idx: pass 1 writes the gate, pass 2 reads it and writes the mix
+static void ggml_vk_loop_ctrl(ggml_backend_vk_context * ctx, vk_context & subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * const * nd = cgraph->nodes + node_idx;
+    const ggml_tensor * cur  = nd[0]->src[0]->src[0];
+    const ggml_tensor * msg  = nd[0]->src[1]->src[0];
+    const ggml_tensor * wd   = nd[3]->src[0];
+    const ggml_tensor * wf   = nd[4]->src[0];
+    const ggml_tensor * wg   = nd[8]->src[0];
+    const ggml_tensor * gate = nd[loop_ctrl_gate_node];
+    ggml_tensor       * dst  = nd[loop_ctrl_out_node];
+
+    const uint32_t n        = (uint32_t) cur->ne[0];
+    const uint32_t n_tokens = (uint32_t) cur->ne[1];
+    const uint32_t rank     = (uint32_t) wd->ne[1];
+
+    vk_pipeline down = ctx->device->pipeline_loop_ctrl_down_f32;
+    vk_pipeline up   = ctx->device->pipeline_loop_ctrl_up_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, down, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, up, 1);
+
+    const vk_op_loop_ctrl_down_push_constants pc_down = { n, rank, ggml_get_op_params_f32(nd[1], 0) };
+    ggml_vk_dispatch_pipeline(ctx, subctx, down,
+        { ggml_vk_tensor_subbuffer(ctx, cur), ggml_vk_tensor_subbuffer(ctx, msg), ggml_vk_tensor_subbuffer(ctx, wd),
+          ggml_vk_tensor_subbuffer(ctx, gate) },
+        pc_down, { rank, n_tokens, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const uint32_t channels_per_group = vk_loop_ctrl_block / ctx->device->subgroup_size;
+    const vk_op_loop_ctrl_up_push_constants pc_up = { n, rank };
+    ggml_vk_dispatch_pipeline(ctx, subctx, up,
+        { ggml_vk_tensor_subbuffer(ctx, cur), ggml_vk_tensor_subbuffer(ctx, msg), ggml_vk_tensor_subbuffer(ctx, gate),
+          ggml_vk_tensor_subbuffer(ctx, wg), ggml_vk_tensor_subbuffer(ctx, wf), ggml_vk_tensor_subbuffer(ctx, dst) },
+        pc_up, { CEIL_DIV(n, channels_per_group), n_tokens, 1 });
+    ctx->loop_ctrl_fusion_count.fetch_add(1, std::memory_order_relaxed);
+}
+
 // the nodes of a depth mix block by role; a role the block does not have is null
 struct vk_depth_mix_nodes {
     int n_nodes;
@@ -18000,6 +18046,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             ggml_vk_depth_mix(ctx, compute_ctx, cgraph, node_idx);
             break;
         }
+        if (ctx->fused_loop_ctrl) {
+            ggml_vk_loop_ctrl(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         if (ctx->fused_short_conv_state) {
             ggml_vk_short_conv_state(ctx, compute_ctx, cgraph, node_idx);
             break;
@@ -20396,6 +20446,100 @@ static int ggml_vk_can_fuse_l2_clip(const ggml_backend_vk_context * ctx, const s
     return ggml_vk_l2_clip_bindings_ok(ctx, m) ? m.n_nodes : 0;
 }
 
+// GGML_VK_FUSE_LOOP_CTRL=0 runs the loop controller as separate nodes, in the same graph order
+static bool ggml_vk_fuse_loop_ctrl_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_LOOP_CTRL");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static bool ggml_vk_loop_ctrl_supported(const ggml_backend_vk_context * ctx) {
+    return ggml_vk_fuse_loop_ctrl_enabled() && !ctx->device->disable_fusion &&
+           ctx->device->pipeline_loop_ctrl_down_f32 != nullptr && ctx->device->pipeline_loop_ctrl_up_f32 != nullptr;
+}
+
+static bool ggml_vk_loop_ctrl_ops_match(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx < 0 || node_idx + loop_ctrl_nodes > cgraph->n_nodes) {
+        return false;
+    }
+    for (int k = 0; k < loop_ctrl_nodes; ++k) {
+        if (cgraph->nodes[node_idx + k]->op != loop_ctrl_pattern.begin()[k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the edges of the block: the CONCAT joins the reshaped cur and msg, the gate feeds both projections, the mix combines them
+static bool ggml_vk_loop_ctrl_edges_ok(ggml_tensor * const * nd) {
+    const ggml_tensor * cur = nd[0]->src[0]->src[0];
+    const ggml_tensor * msg = nd[0]->src[1]->src[0];
+    return ggml_get_op_params_i32(nd[0], 0) == 1 && nd[0]->src[0]->op == GGML_OP_RESHAPE && nd[0]->src[1]->op == GGML_OP_RESHAPE &&
+           nd[1]->src[0] == nd[0] && nd[2]->src[0] == nd[1] && nd[3]->src[1] == nd[2] && nd[4]->src[1] == nd[3] &&
+           ggml_get_unary_op(nd[5]) == GGML_UNARY_OP_TANH && nd[5]->src[0] == nd[4] &&
+           nd[6]->src[0] == nd[5] && nd[6]->src[1] == cur && nd[7]->src[0] == cur && nd[7]->src[1] == nd[6] &&
+           nd[8]->src[1] == nd[3] && ggml_get_unary_op(nd[9]) == GGML_UNARY_OP_TANH && nd[9]->src[0] == nd[8] &&
+           nd[10]->src[0] == nd[9] && nd[10]->src[1] == msg && nd[11]->src[0] == nd[7] && nd[11]->src[1] == nd[10];
+}
+
+// f32 contiguous tensors of the shapes the two passes index: cur and msg [n, T], down [2n, rank], gain and forget [rank, n]
+static bool ggml_vk_loop_ctrl_shapes_ok(ggml_tensor * const * nd) {
+    const ggml_tensor * cur  = nd[0]->src[0]->src[0];
+    const ggml_tensor * msg  = nd[0]->src[1]->src[0];
+    const ggml_tensor * wd   = nd[3]->src[0];
+    const ggml_tensor * wf   = nd[4]->src[0];
+    const ggml_tensor * wg   = nd[8]->src[0];
+    const ggml_tensor * gate = nd[loop_ctrl_gate_node];
+    const ggml_tensor * dst  = nd[loop_ctrl_out_node];
+    const int64_t n = cur->ne[0], n_tokens = cur->ne[1], rank = wd->ne[1];
+
+    for (const ggml_tensor * t : { cur, msg, wd, wf, wg, gate, dst }) {
+        if (!ggml_vk_is_f32_contiguous(t) || t->ne[2] != 1 || t->ne[3] != 1) {
+            return false;
+        }
+    }
+    return n_tokens <= vk_loop_ctrl_max_tokens && ggml_are_same_shape(cur, msg) && ggml_are_same_shape(cur, dst) &&
+           wd->ne[0] == 2*n && wf->ne[0] == rank && wg->ne[0] == rank && wf->ne[1] == n && wg->ne[1] == n &&
+           gate->ne[0] == rank && gate->ne[1] == n_tokens;
+}
+
+// the block at node_idx as graph_optimize can see it: no address or context state beyond the device support
+static bool ggml_vk_loop_ctrl_block_ok(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_loop_ctrl_supported(ctx) || !ggml_vk_loop_ctrl_ops_match(cgraph, node_idx)) {
+        return false;
+    }
+    ggml_tensor * const * nd = cgraph->nodes + node_idx;
+    if (!ggml_vk_loop_ctrl_edges_ok(nd) || !ggml_vk_loop_ctrl_shapes_ok(nd)) {
+        return false;
+    }
+    std::array<int, loop_ctrl_nodes> idxs;
+    std::iota(idxs.begin(), idxs.end(), node_idx);
+    const int outputs[] = { node_idx + loop_ctrl_gate_node, node_idx + loop_ctrl_out_node };
+    return ggml_can_fuse_subgraph_ext(cgraph, idxs.data(), loop_ctrl_nodes, loop_ctrl_pattern.begin(), outputs, 2);
+}
+
+static bool ggml_vk_loop_ctrl_addresses_ok(const ggml_backend_vk_context * ctx, ggml_tensor * const * nd) {
+    const ggml_tensor * gate = nd[loop_ctrl_gate_node];
+    const ggml_tensor * dst  = nd[loop_ctrl_out_node];
+    // the passes take no per-tensor offsets and the gate must outlive the first pass
+    const ggml_tensor * tensors[] = { nd[0]->src[0]->src[0], nd[0]->src[1]->src[0], nd[3]->src[0], nd[4]->src[0], nd[8]->src[0], gate, dst };
+    for (const ggml_tensor * t : tensors) {
+        if (get_misalign_bytes(ctx, t) != 0) {
+            return false;
+        }
+    }
+    return !ggml_vk_tensors_overlap(gate, dst, false);
+}
+
+// the loop controller at node_idx as two passes. Its output must not be the last computed node: a caller that splits
+// the graph there may read the srcs of the fused nodes (eval callbacks).
+static bool ggml_vk_can_fuse_loop_ctrl(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    return ggml_vk_loop_ctrl_block_ok(ctx, cgraph, node_idx) && ggml_vk_has_compute_node_after(cgraph, node_idx + loop_ctrl_out_node) &&
+           ggml_vk_loop_ctrl_addresses_ok(ctx, cgraph->nodes + node_idx);
+}
+
 bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, int num_extra) {
     const ggml_tensor * conv = cgraph->nodes[node_idx];
@@ -21412,6 +21556,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_short_conv = false;
         ctx->fused_short_conv_state = false;
         ctx->fused_control_mix = false;
+        ctx->fused_loop_ctrl = false;
         ctx->fused_depth_mix = false;
         ctx->fused_l2_clip = false;
         ctx->fused_gdn_cache = nullptr;
@@ -21500,6 +21645,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // the conv reads 4 columns per output; the residual ADD and the SCALE are elementwise
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
                 op_srcs_fused_elementwise[0] = false;
+            } else if (ggml_vk_can_fuse_loop_ctrl(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = loop_ctrl_nodes - 1;
+                ctx->fused_loop_ctrl = true;
+                // the gate is written between the passes
+                ctx->fused_ops_write_mask |= 1 << loop_ctrl_gate_node;
+                fusion_string = "LOOP_CTRL";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse_control_mix(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = control_mix_pattern.size() - 1;
                 ctx->fused_control_mix = true;
@@ -21762,6 +21914,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_short_conv = false;
                 ctx->fused_short_conv_state = false;
                 ctx->fused_control_mix = false;
+                ctx->fused_loop_ctrl = false;
                 ctx->fused_depth_mix = false;
                 ctx->fused_l2_clip = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -22202,6 +22355,29 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return false;
         };
 
+        // a loop controller block at start, gated on the fusion's own predicate and not yet scheduled
+        auto const &is_loop_ctrl_block = [&](int start) -> bool {
+            if (start < 0 || start + loop_ctrl_nodes > graph->n_nodes || graph->nodes[start]->op != GGML_OP_CONCAT) {
+                return false;
+            }
+            for (int k = 0; k < loop_ctrl_nodes; ++k) {
+                if (used[start + k]) {
+                    return false;
+                }
+            }
+            return ggml_vk_loop_ctrl_block_ok(ctx, graph, start);
+        };
+
+        // neither the lookahead nor the view pass may pull a node out of the block
+        auto const &in_loop_ctrl_pattern = [&](int n) -> bool {
+            for (int o = 0; o < loop_ctrl_nodes; ++o) {
+                if (is_loop_ctrl_block(n - o)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         auto const &is_ready = [&](int j) -> bool {
             for (int c = first_unused; c < j; ++c) {
                 if (!used[c] && is_src_of(graph->nodes[j], graph->nodes[c])) {
@@ -22216,7 +22392,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         auto const &schedule_ready_nodes = [&](int lo) {
             for (int j = lo; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
                 if (used[j] || in_situ_pattern(j) || in_short_conv_pattern(j) || in_short_conv_state[j] || in_control_mix_pattern(j) ||
-                    in_depth_mix_pattern(j) || in_l2_clip_pattern(j) || !is_ready(j)) {
+                    in_depth_mix_pattern(j) || in_l2_clip_pattern(j) || in_loop_ctrl_pattern(j) || !is_ready(j)) {
                     continue;
                 }
                 new_order.push_back(graph->nodes[j]);
@@ -22276,6 +22452,36 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 for (uint32_t s = 0; s < GGML_MAX_SRC && params && params->add_alloc_dep; ++s) {
                     ggml_tensor * src = block[k]->src[s];
                     if (src == nullptr || std::find(block, block + n, src) != block + n) {
+                        continue;
+                    }
+                    params->add_alloc_dep(params->user_data, src, out);
+                    if (src->view_src != nullptr) {
+                        params->add_alloc_dep(params->user_data, src->view_src, out);
+                    }
+                }
+                new_order.push_back(block[k]);
+                used_node_set.insert(block[k]);
+                used[first_unused + k] = true;
+            }
+            while (first_unused < graph->n_nodes && used[first_unused]) {
+                first_unused++;
+            }
+        };
+
+        // the n nodes of the loop controller block at first_unused in graph order, after the ready window nodes
+        auto const &keep_loop_ctrl = [&]() {
+            ggml_tensor ** block = graph->nodes + first_unused;
+            ggml_tensor *  out   = block[loop_ctrl_out_node];
+            schedule_ready_nodes(first_unused + loop_ctrl_nodes);
+            // the fused passes read cur, msg and the weights while they write the gate and the mix: the gate must not
+            // share memory with the mix
+            if (params && params->add_alloc_dep) {
+                params->add_alloc_dep(params->user_data, block[loop_ctrl_gate_node], out);
+            }
+            for (int k = 0; k < loop_ctrl_nodes; ++k) {
+                for (uint32_t s = 0; s < GGML_MAX_SRC && params && params->add_alloc_dep; ++s) {
+                    ggml_tensor * src = block[k]->src[s];
+                    if (src == nullptr || std::find(block, block + loop_ctrl_nodes, src) != block + loop_ctrl_nodes) {
                         continue;
                     }
                     params->add_alloc_dep(params->user_data, src, out);
@@ -22432,6 +22638,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             keep_pattern(short_conv_pattern);
             continue;
         }
+        if (is_loop_ctrl_block(first_unused)) {
+            keep_loop_ctrl();
+            continue;
+        }
         if (int control_mix_idx[CONTROL_MIX_NODES]; control_mix_block(first_unused, control_mix_idx)) {
             keep_control_mix(control_mix_idx);
             continue;
@@ -22579,6 +22789,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 in_control_mix_pattern(j) ||
                 in_depth_mix_pattern(j) ||
                 in_l2_clip_pattern(j) ||
+                in_loop_ctrl_pattern(j) ||
                 ggml_vk_gdn_cache_cpy_offset(ctx, graph, j) > 0 ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
@@ -22749,7 +22960,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     continue;
                 }
                 if (!is_empty(graph->nodes[j]) || in_situ_pattern(j) || in_short_conv_pattern(j) || in_short_conv_state[j] ||
-                    in_control_mix_pattern(j) || in_depth_mix_pattern(j)) {
+                    in_control_mix_pattern(j) || in_depth_mix_pattern(j) || in_loop_ctrl_pattern(j)) {
                     continue;
                 }
                 bool ok = true;
@@ -24370,6 +24581,17 @@ static uint64_t ggml_backend_vk_depth_mix_fusion_count(ggml_backend_t backend) {
     return ctx->depth_mix_fusion_count.load(std::memory_order_relaxed);
 }
 
+static uint64_t ggml_backend_vk_loop_ctrl_fusion_count(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    return ctx->loop_ctrl_fusion_count.load(std::memory_order_relaxed);
+}
+
+static bool ggml_backend_vk_loop_ctrl_supported(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    return ggml_vk_loop_ctrl_supported((ggml_backend_vk_context *) backend->context);
+}
+
 static bool ggml_backend_vk_depth_mix_supported(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_vk(backend));
     return ggml_vk_depth_mix_supported((ggml_backend_vk_context *) backend->context);
@@ -24418,6 +24640,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_depth_mix_fusion_count") == 0) {
         return (void *) ggml_backend_vk_depth_mix_fusion_count;
+    }
+    if (strcmp(name, "ggml_backend_vk_loop_ctrl_fusion_count") == 0) {
+        return (void *) ggml_backend_vk_loop_ctrl_fusion_count;
+    }
+    if (strcmp(name, "ggml_backend_vk_loop_ctrl_supported") == 0) {
+        return (void *) ggml_backend_vk_loop_ctrl_supported;
     }
     if (strcmp(name, "ggml_backend_vk_depth_mix_supported") == 0) {
         return (void *) ggml_backend_vk_depth_mix_supported;

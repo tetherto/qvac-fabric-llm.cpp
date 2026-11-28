@@ -959,6 +959,19 @@ struct vk_op_control_mix_push_constants {
     uint32_t nrows;
 };
 
+// loop_ctrl_down.comp: cur and msg [n, n_tokens], the down weights [2n, rank], the gate [rank, n_tokens]
+struct vk_op_loop_ctrl_down_push_constants {
+    uint32_t n;
+    uint32_t rank;
+    float eps;
+};
+
+// loop_ctrl_up.comp: the gain and forget weights [rank, n]
+struct vk_op_loop_ctrl_up_push_constants {
+    uint32_t n;
+    uint32_t rank;
+};
+
 // depth_mix.comp: contiguous stack [n_embd, n_stack, n_tokens], last state [n_embd, 1, n_tokens], queries [n_embd, n_queries]
 // and dst [n_embd, n_queries, n_tokens]; eps is the RMS_NORM's of the last state
 struct vk_op_depth_mix_push_constants {
