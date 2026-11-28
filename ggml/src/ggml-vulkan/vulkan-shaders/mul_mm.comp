@@ -137,6 +137,10 @@ layout (binding = 3) writeonly buffer S {D_TYPE data_s[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer RowMap {uint data_row_map[];};
+#if defined(MM_PREFETCH)
+// MUL_MAT_ID + MUL(router weights) epilogue: one f32 weight per (expert slot, token), [1, nei0, nei1] contiguous
+layout (binding = 5) readonly buffer Scale {float data_scale[];};
+#endif
 #endif
 
 layout (push_constant) uniform parameter
@@ -159,6 +163,9 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint n_experts;
     uint row_ids_offset;
+#if defined(MM_PREFETCH)
+    uint fusion_flags; // bit 0: scale each output row by data_scale
+#endif
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -430,8 +437,13 @@ void main() {
     const bool bounds_check_b = ic * BN + BN > _ne1;
 #endif
 
+#if defined(MM_PREFETCH) && defined(MUL_MAT_ID)
+    if (!bounds_check_a && ALIGNED != 0) {
+#include "mul_mm_pf_k_loop.glsl"
+    } else
+#endif
     if (!bounds_check_a && !bounds_check_b) {
-#if defined(MM_PREFETCH)
+#if defined(MM_PREFETCH) && !defined(MUL_MAT_ID)
         if (ALIGNED != 0) {
 #include "mul_mm_pf_k_loop.glsl"
         } else
@@ -493,7 +505,11 @@ void main() {
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
 
                 if (dr + cm_row * TM + store_r < p.M) {
+#if defined(MM_PREFETCH)
+                    data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r] * mmid_row_scale(row_idx));
+#else
                     data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+#endif
                 }
             }
             barrier();

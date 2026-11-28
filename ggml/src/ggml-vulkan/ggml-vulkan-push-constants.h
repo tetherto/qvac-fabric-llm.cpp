@@ -959,12 +959,43 @@ struct vk_op_control_mix_push_constants {
     uint32_t nrows;
 };
 
-// depth_mix.comp: contiguous states [n_embd, n_states, n_tokens], queries [n_embd, n_queries] and dst [n_embd, n_queries, n_tokens]
+// loop_ctrl_down.comp: cur and msg [n, n_tokens], the down weights [2n, rank], the gate [rank, n_tokens]
+struct vk_op_loop_ctrl_down_push_constants {
+    uint32_t n;
+    uint32_t rank;
+    float eps;
+};
+
+// loop_ctrl_up.comp: the gain and forget weights [rank, n]
+struct vk_op_loop_ctrl_up_push_constants {
+    uint32_t n;
+    uint32_t rank;
+};
+
+// depth_mix.comp: contiguous stack [n_embd, n_stack, n_tokens], last state [n_embd, 1, n_tokens], queries [n_embd, n_queries]
+// and dst [n_embd, n_queries, n_tokens]; eps is the RMS_NORM's of the last state
 struct vk_op_depth_mix_push_constants {
     uint32_t n_embd;
-    uint32_t n_states;
+    uint32_t n_stack;
     uint32_t n_queries;
     float    scale;
+    float    eps;
+};
+
+// l2_clip.comp: contiguous x and dst [ncols, ne1, ne2, ne3], the weight [ncols, w_rows] and the factor [1, 1, f_ne2, f_ne3]
+struct vk_op_l2_clip_push_constants {
+    uint32_t ncols;
+    uint32_t nrows;
+    uint32_t w_rows;
+    uint32_t ne1;
+    uint32_t ne2;
+    uint32_t f_ne2;
+    uint32_t f_ne3;
+    uint32_t has_w;
+    uint32_t has_f;
+    float    eps;
+    float    t;
+    float    t_bias;
 };
 
 struct vk_op_gru_push_constants {

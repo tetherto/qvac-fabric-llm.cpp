@@ -1,0 +1,82 @@
+#version 450
+
+// Inkling 2 loop controller, pass 1: one workgroup per (rank row, token). The gate is the down projection of
+// [rms_norm(cur); rms_norm(msg)]: the norms scale the two half-row dot products, so the normalized rows are never written.
+
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint NUM_SUBGROUPS = 4;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer C { float cur[]; };    // [n, n_tokens]
+layout(binding = 1) readonly buffer M { float msg[]; };    // [n, n_tokens]
+layout(binding = 2) readonly buffer W { float w[]; };      // [2n, rank]
+layout(binding = 3) writeonly buffer G { float gate[]; };  // [rank, n_tokens]
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+    uint rank;
+    float eps;
+};
+
+// the subgroup sums of squares of cur and msg and of their dot products with the two halves of the weight row
+shared float part_cc[NUM_SUBGROUPS];
+shared float part_mm[NUM_SUBGROUPS];
+shared float part_wc[NUM_SUBGROUPS];
+shared float part_wm[NUM_SUBGROUPS];
+
+void store_subgroup_sums(const float cc, const float mm, const float wc, const float wm) {
+    const float s_cc = subgroupAdd(cc);
+    const float s_mm = subgroupAdd(mm);
+    const float s_wc = subgroupAdd(wc);
+    const float s_wm = subgroupAdd(wm);
+    if (subgroupElect()) {
+        part_cc[gl_SubgroupID] = s_cc;
+        part_mm[gl_SubgroupID] = s_mm;
+        part_wc[gl_SubgroupID] = s_wc;
+        part_wm[gl_SubgroupID] = s_wm;
+    }
+}
+
+void accumulate_row(const uint tid, const uint x_base, const uint w_base) {
+    float cc = 0.0f;
+    float mm = 0.0f;
+    float wc = 0.0f;
+    float wm = 0.0f;
+    for (uint i = tid; i < n; i += BLOCK_SIZE) {
+        const float c = cur[x_base + i];
+        const float m = msg[x_base + i];
+        cc += c * c;
+        mm += m * m;
+        wc += w[w_base + i] * c;
+        wm += w[w_base + n + i] * m;
+    }
+    store_subgroup_sums(cc, mm, wc, wm);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint r   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+
+    accumulate_row(tid, t * n, r * 2 * n);
+    barrier();
+
+    if (tid == 0) {
+        float cc = 0.0f;
+        float mm = 0.0f;
+        float wc = 0.0f;
+        float wm = 0.0f;
+        for (uint s = 0; s < NUM_SUBGROUPS; ++s) {
+            cc += part_cc[s];
+            mm += part_mm[s];
+            wc += part_wc[s];
+            wm += part_wm[s];
+        }
+        const float inv_n = 1.0f / float(n);
+        gate[t * rank + r] = inversesqrt(cc * inv_n + eps) * wc + inversesqrt(mm * inv_n + eps) * wm;
+    }
+}

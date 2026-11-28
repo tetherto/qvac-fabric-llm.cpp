@@ -742,11 +742,12 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         }
     }
 
-    // Register-prefetch variants of the KHR coopmat quant matmul (mul_mm_pf_funcs.glsl): dense, f16 B, f32 accumulator
-    if (coopmat && fp16 && !f16acc && matmul_id_type == MatMulIdType::NONE) {
-        for (const auto& tname : {"q4_k", "q5_k", "q6_k", "iq4_xs"}) {
-            const std::string t(tname);
-            const std::string lva = (t == "q4_k" || t == "q5_k") ? "4" : "8";
+    // Register-prefetch variants of the KHR coopmat quant matmul (mul_mm_pf_funcs.glsl): f16 B, f32 accumulator, dense or MUL_MAT_ID
+    if (coopmat && fp16 && !f16acc && (matmul_id_type == MatMulIdType::NONE || matmul_id_type == MatMulIdType::SUBGROUP)) {
+        // type, LOAD_VEC_A
+        const std::vector<std::pair<std::string, std::string>> dense_types = {{"q4_k", "4"}, {"q5_k", "4"}, {"q6_k", "8"}, {"iq4_xs", "8"}};
+        const std::vector<std::pair<std::string, std::string>> mmid_types = {{"nvfp4", "16"}, {"q8_0", "8"}};
+        for (const auto & [t, lva] : matmul_id_type == MatMulIdType::NONE ? dense_types : mmid_types) {
             const std::map<std::string, std::string> float_type_dict = {
                 {"FLOAT_TYPE",   FLOAT_TYPE(1, t)},
                 {"FLOAT_TYPEV2", FLOAT_TYPE(2, t)},
@@ -1647,7 +1648,10 @@ void process_shaders() {
     string_to_spv("short_conv_f32", "short_conv.comp", {});
     string_to_spv("short_conv_state_f32", "short_conv.comp", {{"WITH_STATE", "1"}});
     string_to_spv("control_mix_f32", "control_mix.comp", {});
+    string_to_spv("loop_ctrl_down_f32", "loop_ctrl_down.comp", {});
+    string_to_spv("loop_ctrl_up_f32", "loop_ctrl_up.comp", {});
     string_to_spv("depth_mix_f32", "depth_mix.comp", {});
+    string_to_spv("l2_clip_f32", "l2_clip.comp", {});
     string_to_spv("ssm_conv_back_sx_f32", "ssm_conv_back_sx.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_conv_back_c_f32", "ssm_conv_back_c.comp", {{"A_TYPE", "float"}});
 

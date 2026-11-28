@@ -500,6 +500,30 @@ static std::string var_to_str(ggml_flash_attn_ext_back_target target) {
     return std::to_string(target);
 }
 
+// Inkling 2's depth mix states: an input, or the CONCAT of a stack with one state that is an input or the RMS_NORM of one
+enum class depth_mix_head { states, concat, norm };
+// the node that also has a reader outside the mix: none, the states, the last state, or the one-query mix's reshape
+enum class depth_mix_shared { none, states, last, mix };
+
+static std::string var_to_str(depth_mix_head head) {
+    switch (head) {
+        case depth_mix_head::states: return "states";
+        case depth_mix_head::concat: return "concat";
+        case depth_mix_head::norm:   return "norm";
+    }
+    return "?";
+}
+
+static std::string var_to_str(depth_mix_shared shared) {
+    switch (shared) {
+        case depth_mix_shared::none:   return "none";
+        case depth_mix_shared::states: return "states";
+        case depth_mix_shared::last:   return "last";
+        case depth_mix_shared::mix:    return "mix";
+    }
+    return "?";
+}
+
 static std::string var_to_str(ggml_scale_mode mode) {
     std::string str;
     switch (mode & 0xFF) {
@@ -4717,12 +4741,16 @@ struct test_rms_norm_back : public test_case {
     }
 };
 
-// the row L2 clip of Inkling 2: [x*w ->] l2_norm(x, t)*t [-> *f with one f per token]
+// the row L2 clip of Inkling 2: [x*w ->] l2_norm(x, t)*t [-> *f with one f per token]. tail adds a node after it: the clip
+// fuses (Vulkan L2_CLIP) only when it is not the last node.
 struct test_l2_clip : public test_case {
     const std::array<int64_t, 4> ne;
     const bool  with_w;
     const bool  with_f;
     const float thr;
+    const bool  tail;
+    mutable bool has_fusion_counter = false;
+    mutable bool supported = false;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4732,11 +4760,27 @@ struct test_l2_clip : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(ne, with_w, with_f, thr);
+        return VARS_TO_STR5(ne, with_w, with_f, thr, tail);
     }
 
-    test_l2_clip(std::array<int64_t, 4> ne = {128, 24, 3, 1}, bool with_w = true, bool with_f = false, float thr = 22.6f)
-        : ne(ne), with_w(with_w), with_f(with_f), thr(thr) {}
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn   = uint64_t (*)(ggml_backend_t);
+        using supported_fn = bool (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_l2_clip_fusion_count");
+        auto support = (supported_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_l2_clip_supported");
+        has_fusion_counter = counter != nullptr;
+        supported = support != nullptr && support(backend);
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return tail && has_fusion_counter && supported; }
+
+    bool expect_no_fusion() override { return !tail && has_fusion_counter; }
+
+    test_l2_clip(std::array<int64_t, 4> ne = {128, 24, 3, 1}, bool with_w = true, bool with_f = false, float thr = 22.6f,
+                 bool tail = true)
+        : ne(ne), with_w(with_w), with_f(with_f), thr(thr), tail(tail) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -4752,6 +4796,9 @@ struct test_l2_clip : public test_case {
             ggml_tensor * f = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, ne[2], ne[3]);
             ggml_set_name(f, "f");
             cur = ggml_mul(ctx, cur, f);
+        }
+        if (tail) {
+            cur = ggml_scale(ctx, cur, 0.5f);
         }
         ggml_set_name(cur, "out");
         return cur;
@@ -5859,6 +5906,80 @@ struct test_control_mix : public test_case {
     }
 };
 
+// the Inkling 2 loop controller as control() builds it: one rms_norm of [cur; msg], the rank r down projection, the gain and
+// forget projections and (cur - tanh(forget)*cur) + tanh(gain)*msg. The Vulkan LOOP_CTRL fuses it for up to 8 tokens, and
+// only when a node follows it.
+struct test_loop_ctrl : public test_case {
+    const int64_t n, r, T;
+    const bool    tail;
+    const bool    fuses;
+    mutable bool has_fusion_counter = false;
+    mutable bool supported = false;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "LOOP_CTRL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n, r, T, tail);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4; // the gate rounds as in test_mul_mat
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn   = uint64_t (*)(ggml_backend_t);
+        using supported_fn = bool (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_loop_ctrl_fusion_count");
+        auto support = (supported_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_loop_ctrl_supported");
+        has_fusion_counter = counter != nullptr;
+        supported = support != nullptr && support(backend);
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return fuses && tail && has_fusion_counter && supported; }
+
+    bool expect_no_fusion() override { return (!fuses || !tail) && has_fusion_counter; }
+
+    test_loop_ctrl(int64_t n = 2304, int64_t r = 64, int64_t T = 1, bool tail = true, bool fuses = true)
+        : n(n), r(r), T(T), tail(tail), fuses(fuses) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T), 1.0f);
+        ggml_tensor * msg = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T), 1.0f);
+        ggml_tensor * wd  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*n, r);
+        ggml_tensor * wg  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, n);
+        ggml_tensor * wf  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, n);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(msg, "msg");
+
+        ggml_tensor * gate = ggml_concat(ctx, ggml_reshape_3d(ctx, cur, n, 1, T), ggml_reshape_3d(ctx, msg, n, 1, T), 1);
+        gate = ggml_reshape_2d(ctx, ggml_rms_norm(ctx, gate, 1e-6f), 2*n, T);
+        gate = ggml_mul_mat(ctx, wd, gate);
+
+        ggml_tensor * gain   = ggml_tanh(ctx, ggml_mul_mat(ctx, wg, gate));
+        ggml_tensor * forget = ggml_tanh(ctx, ggml_mul_mat(ctx, wf, gate));
+
+        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, cur, ggml_mul(ctx, forget, cur)), ggml_mul(ctx, gain, msg));
+        if (tail) {
+            out = ggml_scale(ctx, out, 0.5f);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.5f, 0.5f);
+        }
+    }
+};
+
 // Inkling 2's depth mix as mix() builds it on a GPU: softmax(states^T queries / sqrt(n_embd)) over the states, then their
 // weighted sum per query. tail adds a node after it: the mix fuses (Vulkan DEPTH_MIX) only when it is not the last node.
 struct test_depth_mix : public test_case {
@@ -5868,6 +5989,9 @@ struct test_depth_mix : public test_case {
     const int64_t n_tokens;
     const bool    tail;
     const bool    fuses;
+    const depth_mix_head   head;
+    const bool             view_cont;  // the one-query mix read through the CONT of a view, as an attention input
+    const depth_mix_shared shared;
     mutable bool has_fusion_counter = false;
     mutable bool supported = false;
 
@@ -5877,7 +6001,7 @@ struct test_depth_mix : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(n_embd, n_states, n_queries, n_tokens, tail);
+        return VARS_TO_STR8(n_embd, n_states, n_queries, n_tokens, tail, head, view_cont, shared);
     }
 
     bool run_whole_graph() override { return true; }
@@ -5901,12 +6025,35 @@ struct test_depth_mix : public test_case {
 
     bool expect_no_fusion() override { return !fuses && has_fusion_counter; }
 
-    test_depth_mix(int64_t n_embd, int64_t n_states, int64_t n_queries, int64_t n_tokens, bool tail = true, bool fuses = true)
-        : n_embd(n_embd), n_states(n_states), n_queries(n_queries), n_tokens(n_tokens), tail(tail), fuses(fuses) {}
+    test_depth_mix(int64_t n_embd, int64_t n_states, int64_t n_queries, int64_t n_tokens, bool tail = true, bool fuses = true,
+                   depth_mix_head head = depth_mix_head::states, bool view_cont = false, depth_mix_shared shared = depth_mix_shared::none)
+        : n_embd(n_embd), n_states(n_states), n_queries(n_queries), n_tokens(n_tokens), tail(tail), fuses(fuses),
+          head(head), view_cont(view_cont), shared(shared) {}
+
+    // the last state of the states, as the model builds it: an input or the RMS_NORM of one
+    ggml_tensor * build_last(ggml_context * ctx) {
+        if (head == depth_mix_head::concat) {
+            ggml_tensor * last = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+            ggml_set_name(last, "last");
+            return last;
+        }
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(cur, "cur");
+        return ggml_rms_norm(ctx, ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens), 1e-6f);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * states = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_states, n_tokens);
-        ggml_set_name(states, "states");
+        ggml_tensor * last   = nullptr;
+        ggml_tensor * states = nullptr;
+        if (head == depth_mix_head::states) {
+            states = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_states, n_tokens);
+            ggml_set_name(states, "states");
+        } else {
+            ggml_tensor * stack = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_states - 1, n_tokens);
+            ggml_set_name(stack, "stack");
+            last   = build_last(ctx);
+            states = ggml_concat(ctx, stack, last, 1);
+        }
         ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_queries);
         ggml_set_name(query, "query");
 
@@ -5918,6 +6065,15 @@ struct test_depth_mix : public test_case {
 
         ggml_tensor * out = ggml_mul_mat(ctx, scores, ggml_cont(ctx, ggml_transpose(ctx, states)));
         out = n_queries == 1 ? ggml_reshape_3d(ctx, out, n_embd, 1, n_tokens) : ggml_cont(ctx, ggml_permute(ctx, out, 1, 0, 2, 3));
+        ggml_tensor * mix = out;
+        if (view_cont) {
+            out = ggml_cont(ctx, ggml_view_2d(ctx, out, n_embd, n_tokens, out->nb[2], 0));
+        }
+        ggml_tensor * shared_node = shared == depth_mix_shared::states ? states : shared == depth_mix_shared::last ? last :
+                                    shared == depth_mix_shared::mix ? mix : nullptr;
+        if (shared_node) {
+            out = ggml_add(ctx, out, ggml_sum(ctx, shared_node));
+        }
         if (tail) {
             out = ggml_scale(ctx, out, 0.5f);
         }
@@ -10800,9 +10956,10 @@ struct test_mul_mat_id_fusion : public test_case {
     const uint32_t o; // number of outputs
     const bool mul;
     const bool skip; // set some ids to a negative value
+    const bool mul2; // a second MUL after the first (per-expert scale, then router weights)
 
     std::string vars() override {
-        return VARS_TO_STR11(type_a, type_b, n_mats, n_used, b, m, n, k, o, mul, skip);
+        return VARS_TO_STR11(type_a, type_b, n_mats, n_used, b, m, n, k, o, mul, skip) + (mul2 ? ",mul2=1" : "");
     }
 
     double max_nmse_err() override {
@@ -10816,10 +10973,11 @@ struct test_mul_mat_id_fusion : public test_case {
 
     test_mul_mat_id_fusion(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, uint32_t o = 1, bool mul = false, bool skip = false)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, uint32_t o = 1, bool mul = false, bool skip = false, bool mul2 = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), o(o), mul(mul), skip(skip) {
+            m(m), n(n), k(k), o(o), mul(mul), skip(skip), mul2(mul2) {
             GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(!mul2 || mul);
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -10852,6 +11010,10 @@ struct test_mul_mat_id_fusion : public test_case {
             ne[0] = 1;
             ggml_tensor * m = ggml_new_tensor(ctx, out->type, 4, ne.data());
             out = ggml_mul(ctx, out, m);
+            if (mul2) {
+                ggml_tensor * m2 = ggml_new_tensor(ctx, out->type, 4, ne.data());
+                out = ggml_mul(ctx, out, m2);
+            }
         }
 
         return out;
@@ -17072,6 +17234,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_control_mix(67, 33, with_mm));
     }
 
+    for (int64_t T : { 1, 4, 8 }) {
+        test_cases.emplace_back(new test_loop_ctrl(2304, 64, T));
+    }
+    test_cases.emplace_back(new test_loop_ctrl(300, 64, 3));
+    test_cases.emplace_back(new test_loop_ctrl(256, 40, 3));
+    test_cases.emplace_back(new test_loop_ctrl(2304, 64, 1, false));
+    test_cases.emplace_back(new test_loop_ctrl(2304, 64, 16, true, false)); // above 8 tokens the nodes stay separate
+
     // Inkling 2's width, a narrow one and an odd one
     for (int64_t n_embd : { 2304, 64, 300 }) {
         for (int64_t n_states : { 1, 2, 5, 6 }) {
@@ -17085,6 +17255,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // wider than the states the Vulkan pass keeps in registers
     test_cases.emplace_back(new test_depth_mix(3000, 5, 3, 7));
     test_cases.emplace_back(new test_depth_mix(3000, 2, 1, 1));
+    // the states as the model builds them, a CONCAT of the stack with the last state, which may be an RMS_NORM
+    for (depth_mix_head head : { depth_mix_head::concat, depth_mix_head::norm }) {
+        for (int64_t n_states : { 2, 5 }) {
+            for (int64_t n_queries : { 1, 3, 4 }) {
+                for (int64_t n_tokens : { 1, 7, 512 }) {
+                    test_cases.emplace_back(new test_depth_mix(2304, n_states, n_queries, n_tokens, true, true, head));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_depth_mix(3000, 5, 3, 7, true, true, head));
+        test_cases.emplace_back(new test_depth_mix(300, 3, 1, 1, true, true, head));
+    }
+    // a one-query mix read through the copy of a view, as an attention input
+    for (int64_t n_states : { 2, 5 }) {
+        for (int64_t n_tokens : { 1, 7, 512 }) {
+            test_cases.emplace_back(new test_depth_mix(2304, n_states, 1, n_tokens, true, true, depth_mix_head::norm, true));
+        }
+    }
+    // a second reader keeps the CONCAT, the RMS_NORM or the mix's reshape out of the pass; the mix still fuses
+    test_cases.emplace_back(new test_depth_mix(2304, 5, 1, 1, true, true, depth_mix_head::norm, false, depth_mix_shared::states));
+    test_cases.emplace_back(new test_depth_mix(2304, 2, 4, 1, true, true, depth_mix_head::norm, false, depth_mix_shared::last));
+    test_cases.emplace_back(new test_depth_mix(2304, 3, 1, 7, true, true, depth_mix_head::norm, true, depth_mix_shared::mix));
     // no fusion: more states or queries than the Vulkan pass takes, and the mix as the last computed node
     test_cases.emplace_back(new test_depth_mix(300, 9, 3, 7, true, false));
     test_cases.emplace_back(new test_depth_mix(300, 5, 5, 7, true, false));
@@ -18250,6 +18442,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // as the last node the clip keeps its separate passes
+    test_cases.emplace_back(new test_l2_clip({128, 24, 1, 1}, true, true, 22.6f, false));
+    test_cases.emplace_back(new test_l2_clip({128, 8, 7, 1}, false, false, 22.6f, false));
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
@@ -18949,6 +19144,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 160, 64, 256));
     }
+    // register-prefetch f16 MUL_MAT_ID (RADV RDNA3): Inkling 2's experts below and inside its 32-128 rows per expert,
+    // broadcast B, the router-weight MUL epilogue, skipped slots, a ragged M tile, uneven rows and strided experts
+    for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0}) {
+        for (int64_t k : {2304, 1152}) {
+            for (int n : {64, 300, 512, 768, 2048}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 2304, n, k));
+            }
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, true, 2304, 512, k));
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 128, 8, false, 2304, 512, k, 1, true));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 2304, 512, k, 0, false, true));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 2400, 600, 1216));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 2304, 1000, 2240));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 4, false, 2304, 512, 1152, 2432));
+    }
 
     // CUDA few-row MMQ: 1-3 column groups, 32-row tiles (6170 rows), K = 18 units (uneven over the warps) and 9 units (one unit per ring stage)
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
@@ -19491,6 +19701,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));
             }
         }
+    }
+
+    // MUL_MAT_ID+MUL+MUL (per-expert scale, then router weights): one token fuses on the Vulkan mat-vec, four do not
+    for (int bs : {1, 4}) {
+        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152, 1, true, false, true));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 16, false, 256, bs, 512, 1, true, true, true));
     }
 
     // MUL_MAT_ID+MUL on the GEMM path (router weights applied in the int8 MMQ epilogue on Vulkan):
@@ -21317,11 +21535,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
 
-    // Inkling 2's depth mixes in decode and prefill. Perf mode repeats only the out node, so read the fused pass from
-    // GGML_VK_PERF_LOGGER (DEPTH_MIX), and the separate passes with GGML_VK_FUSE_DEPTH_MIX=0.
+    // Inkling 2's depth mixes in decode and prefill, with the states' RMS_NORM and CONCAT in front. Perf mode repeats only
+    // the out node, so read the fused pass from GGML_VK_PERF_LOGGER (DEPTH_MIX), and the separate passes with
+    // GGML_VK_FUSE_DEPTH_MIX=0.
     for (int64_t n_tokens : { 1, 512 }) {
         for (auto [n_states, n_queries] : std::initializer_list<std::pair<int64_t, int64_t>>{ {2, 4}, {3, 1}, {4, 1}, {5, 1}, {3, 3} }) {
-            test_cases.emplace_back(new test_depth_mix(2304, n_states, n_queries, n_tokens));
+            test_cases.emplace_back(new test_depth_mix(2304, n_states, n_queries, n_tokens, true, true, depth_mix_head::norm));
         }
     }
 

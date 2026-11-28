@@ -27,12 +27,21 @@
             b_sidx[l / loadstride_b] = (loadc_b + l) * SHMEM_STRIDE + loadr_b * LOAD_VEC_B / 2;
         }
     }
+#if defined(MUL_MAT_ID)
+    uint b_off[NB_RAW];
+    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+        b_off[l / loadstride_b] = b_row_off(loadc_b + l);
+    }
+#define B_FETCH_ARG(l) b_off[(l) / loadstride_b]
+#else
+#define B_FETCH_ARG(l) loadc_b + (l)
+#endif
 #define A_LANE(l) (XL_IDX_BASE ? a_lane0 + a_lane_off(0, (l)) : a_lane[(l) / loadstride_a])
 #define A_SIDX(l) (XL_IDX_BASE ? a_sidx0 + a_shmem_index((l), 0) : a_sidx[(l) / loadstride_a])
 #define B_SIDX(l) (XL_IDX_BASE ? b_sidx0 + (l) * SHMEM_STRIDE : b_sidx[(l) / loadstride_b])
 #define PF_FETCH() \
     [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { fetch_a(pos_a, loadr_a, loadc_a + l, A_LANE(l), a_raw[l / loadstride_a]); } \
-    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); }
+    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { fetch_b(pos_b, loadr_b, B_FETCH_ARG(l), b_raw[l / loadstride_b]); }
 #define PF_STORE() \
     [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { store_a_raw(pos_a, loadr_a, loadc_a + l, A_SIDX(l), a_raw[l / loadstride_a]); } \
     [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); }
@@ -49,6 +58,23 @@
         PF_FETCH()
         barrier();
 
+#if defined(MUL_MAT_ID)
+        // the MUL_MAT_ID tiles are narrow in N: the subgroup's B fragments of a K step stay in registers
+        if (warp_c < required_warp_c) {
+            [[unroll]] for (uint i = 0; i < BK; i += TK) {
+                coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_bs[cms_per_col];
+                [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                    coopMatLoad(cache_bs[cm_col], buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                }
+                [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+                    coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
+                    [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                        sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_bs[cm_col], sums[cm_col * cms_per_row + cm_row]);
+                    }
+                }
+            }
+        }
+#else
         [[unroll]] for (uint i = 0; i < BK; i += TK) {
             [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
                 coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
@@ -59,6 +85,7 @@
                 if (XL_TILE) { subgroupMemoryBarrierShared(); }
             }
         }
+#endif
 
         barrier();
     }
@@ -67,3 +94,4 @@
 #undef A_LANE
 #undef A_SIDX
 #undef B_SIDX
+#undef B_FETCH_ARG
