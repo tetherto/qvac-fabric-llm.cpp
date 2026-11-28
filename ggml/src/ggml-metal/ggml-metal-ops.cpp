@@ -4537,8 +4537,8 @@ static bool ggml_metal_op_flash_attn_ext_sparse_eligible(const ggml_tensor * op)
         return false;
     }
 
-    // K/V row lists are handled by the dense kernels, not by the sparse path
-    if (op->src[5] != nullptr) {
+    // K/V row lists and the indexed bias are handled by the dense kernels, not by the sparse path
+    if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
         return false;
     }
 
@@ -4931,6 +4931,17 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     const bool has_mask  = op->src[3] != NULL;
     const bool has_sinks = op->src[4] != NULL;
 
+    const bool has_indexed_bias = ggml_flash_attn_ext_has_indexed_bias(op);
+
+    const ggml_tensor * bias_table   = has_indexed_bias ? op->src[6] : nullptr;
+    const ggml_tensor * bias_indices = has_indexed_bias ? op->src[7] : nullptr;
+
+    GGML_ASSERT(!has_indexed_bias || (has_mask && bias_table && bias_indices));
+
+    const int32_t bias_n_bins       = has_indexed_bias ? (int32_t) bias_table->ne[0] : 0;
+    const int32_t bias_n_keys       = has_indexed_bias ? (int32_t) bias_indices->ne[0] : 0;
+    const int32_t bias_query_stride = has_indexed_bias ? (int32_t) (bias_table->ne[0]*bias_table->ne[1]) : 0;
+
     GGML_ASSERT(!has_rows || has_mask);
     const bool has_bias  = max_bias != 0.0f;
     const bool has_scap  = logit_softcap != 0.0f;
@@ -4948,6 +4959,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_src2 = ggml_metal_get_buffer_id(op->src[2]);
     ggml_metal_buffer_id bid_src3 = has_mask  ? ggml_metal_get_buffer_id(op->src[3]) : bid_src0;
     ggml_metal_buffer_id bid_src4 = has_sinks ? ggml_metal_get_buffer_id(op->src[4]) : bid_src0;
+    ggml_metal_buffer_id bid_src6 = has_indexed_bias ? ggml_metal_get_buffer_id(bias_table)   : bid_src0;
+    ggml_metal_buffer_id bid_src7 = has_indexed_bias ? ggml_metal_get_buffer_id(bias_indices) : bid_src0;
 
     ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
 
@@ -5166,7 +5179,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         (use_kv_f16 || op->src[1]->type == GGML_TYPE_F16) &&
         ne00 == 256 && ne20 == 256 && ne11_attn % 64 == 0 && ne01 >= 32 && ne02 % ne12 == 0 && ne03 % ne13 == 0 &&
         nb10_attn == sizeof(ggml_fp16_t) && nb20_attn == sizeof(ggml_fp16_t) &&
-        has_mask && !has_sinks && !has_bias && !has_scap;
+        has_mask && !has_sinks && !has_bias && !has_scap && !has_indexed_bias;
 
     if (use_tb) {
         const char * name = "kernel_flash_attn_ext_tb_f16_dk256_bk64";
@@ -5211,6 +5224,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.m1            =*/ m1,
             /*.n_head_log2   =*/ n_head_log2,
             /*.logit_softcap =*/ logit_softcap,
+            /*.bias_n_bins       =*/ bias_n_bins,
+            /*.bias_n_keys       =*/ bias_n_keys,
+            /*.bias_query_stride =*/ bias_query_stride,
         };
 
         // staged Q (32 rows of half), S (32 x 64 floats) and the per-row rescale factors, padded as in the kernel
@@ -5301,12 +5317,15 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.m1            =*/ m1,
             /*.n_head_log2   =*/ n_head_log2,
             /*.logit_softcap =*/ logit_softcap,
+            /*.bias_n_bins       =*/ bias_n_bins,
+            /*.bias_n_keys       =*/ bias_n_keys,
+            /*.bias_query_stride =*/ bias_query_stride,
         };
 
         // shared memory layout: queries (16-bit), scores (float), probabilities (16-bit), row scale (float), rescale flag (int)
         const size_t smem = GGML_PAD(nqptg*ne00*sizeof(ggml_fp16_t) + nqptg*ncpsg*(sizeof(float) + sizeof(ggml_fp16_t)) + nqptg*sizeof(float) + sizeof(int32_t), 16);
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_tensor(lib, op, has_mask, has_sinks, has_bias, has_scap);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_tensor(lib, op, has_mask, has_sinks, has_bias, has_scap, has_indexed_bias);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
@@ -5320,6 +5339,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
         ggml_metal_encoder_set_buffer  (enc, bid_blk,  6);
         ggml_metal_encoder_set_buffer  (enc, bid_dst,  7);
+        ggml_metal_encoder_set_buffer  (enc, bid_src6, 8);
+        ggml_metal_encoder_set_buffer  (enc, bid_src7, 9);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
@@ -5463,12 +5484,15 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.m1            =*/ m1,
             /*.n_head_log2   =*/ n_head_log2,
             /*.logit_softcap =*/ logit_softcap,
+            /*.bias_n_bins       =*/ bias_n_bins,
+            /*.bias_n_keys       =*/ bias_n_keys,
+            /*.bias_query_stride =*/ bias_query_stride,
         };
 
         // workgroups: with the KV split each writes its unnormalized result to the temp buffer for the reduce kernel
         const int32_t nwg = ggml_metal_op_flash_attn_ext_use_kv_split(op) ? GGML_METAL_FA_KV_SPLIT_NWG : 1;
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, rows_direct, nsg, nwg, use_kv_f16, ns10, ns20);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, rows_direct, has_indexed_bias, nsg, nwg, use_kv_f16, ns10, ns20);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -5481,6 +5505,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_blk,  7);
         ggml_metal_encoder_set_buffer  (enc, nwg > 1 ? bid_tmp : bid_dst, 8);
         ggml_metal_encoder_set_buffer  (enc, rows_direct ? ggml_metal_get_buffer_id(kv_rows) : bid_src0, 9);
+        ggml_metal_encoder_set_buffer  (enc, bid_src6, 10);
+        ggml_metal_encoder_set_buffer  (enc, bid_src7, 11);
 
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
@@ -5692,9 +5718,12 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.n_head_log2   =*/ n_head_log2,
             /*.logit_softcap =*/ logit_softcap,
             /*.n_kv_max_padded =*/ n_kv_max_padded,
+            /*.bias_n_bins       =*/ bias_n_bins,
+            /*.bias_n_keys       =*/ bias_n_keys,
+            /*.bias_query_stride =*/ bias_query_stride,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, nhptg, use_kv_f16, ns10, ns20);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, has_indexed_bias, nqptg, cfg.NE, nsg, nwg, nhptg, use_kv_f16, ns10, ns20);
 
         GGML_ASSERT(nhptg*nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -5706,6 +5735,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
         ggml_metal_encoder_set_buffer  (enc, use_sparse ? bid_idx : (has_rows ? ggml_metal_get_buffer_id(kv_rows) : bid_src0), 8);
+        ggml_metal_encoder_set_buffer  (enc, bid_src6, 9);
+        ggml_metal_encoder_set_buffer  (enc, bid_src7, 10);
 
         const size_t smem = nhptg*fa_vec_smem(nsg, nqptg);
 

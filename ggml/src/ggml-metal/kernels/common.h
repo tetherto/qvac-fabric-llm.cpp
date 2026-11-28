@@ -124,3 +124,21 @@ template<> inline float4 elu_approx<float4>(float4 x) {
 
     return res;
 }
+
+// mask value plus the indexed bias of one (query, head, key); out-of-range bins leave the mask untouched
+static inline half fa_add_indexed_bias(
+        half m,
+        device const float * bias_table,
+        device const int   * bias_indices,
+        int64_t flat_q,
+        int32_t head,
+        int32_t key,
+        int32_t n_bins,
+        int32_t n_keys,
+        int32_t query_stride) {
+    const int bin = bias_indices[flat_q*(int64_t) n_keys + key];
+    if ((uint) bin < (uint) n_bins) {
+        return half(float(m) + bias_table[flat_q*(int64_t) query_stride + (int64_t) head*n_bins + bin]);
+    }
+    return m;
+}
