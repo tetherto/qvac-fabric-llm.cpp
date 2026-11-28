@@ -1,0 +1,84 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// causal depthwise conv (d_conv = 4) + SiLU with a deferred conv-state commit, see ggml_gdn_conv_deferred. one workgroup
+// per (head of HEAD_DIM channels, token, seq), one invocation per channel; the leading n_norm heads are L2-normalized
+
+layout(constant_id = 0) const uint HEAD_DIM = 128;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint C;
+    uint n_tokens;
+    uint K;
+    uint n_norm;
+    float eps;
+    uint sx1, sx2;
+    uint s1, s2;
+    uint s_hist;
+    uint x_off;
+};
+
+layout(binding = 0) readonly buffer XBuf    { float data_x[];    };
+layout(binding = 1) readonly buffer WBuf    { float data_w[];    };
+layout(binding = 2)          buffer HistBuf { float data_hist[]; };
+layout(binding = 3) readonly buffer IdxBuf  { int   data_idx[];  };
+layout(binding = 4)          buffer DstBuf  { float data_dst[];  };
+
+shared float sh[HEAD_DIM];
+
+void main() {
+    const uint ih = gl_WorkGroupID.x;
+    const uint t  = gl_WorkGroupID.y;
+    const uint is = gl_WorkGroupID.z;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint c  = ih * HEAD_DIM + tid;
+
+    const uint pending = uint(clamp(data_idx[3 * is], 0, int(K)));
+    const uint h_in    = uint(data_idx[3 * is + 1]) * s_hist;
+    const uint h_out   = uint(data_idx[3 * is + 2]) * s_hist;
+
+    const uint xs = x_off + is * sx2 + c;
+
+    // conv input column i: the window for i < 3, then the new inputs
+    float ci[4];
+    [[unroll]] for (uint j = 0; j < 4; ++j) {
+        const uint i = t + j;
+        ci[j] = i < 3 ? data_hist[h_in + (pending + i) * C + c] : data_x[xs + (i - 3) * sx1];
+    }
+
+    float sumf = 0.0;
+    sumf += ci[0] * data_w[4 * c + 0];
+    sumf += ci[1] * data_w[4 * c + 1];
+    sumf += ci[2] * data_w[4 * c + 2];
+    sumf += ci[3] * data_w[4 * c + 3];
+
+    float y = sumf / (1.0 + exp(-sumf));
+
+    if (ih < n_norm) {
+        sh[tid] = y * y;
+        barrier();
+        [[unroll]] for (uint s = HEAD_DIM / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sh[tid] += sh[tid + s];
+            }
+            barrier();
+        }
+        y *= 1.0 / sqrt(sh[0] + eps);
+    }
+
+    data_dst[t * s1 + is * s2 + c] = y;
+
+    // keep the last R + 3 conv input columns, i.e. column i - (n_tokens - R) for i >= n_tokens - R
+    const uint i0 = n_tokens - min(n_tokens, K);
+    if (t + 3 >= i0) {
+        data_hist[h_out + (t + 3 - i0) * C + c] = ci[3];
+    }
+    if (t == 0) {
+        for (uint i = i0; i < 3; ++i) {
+            data_hist[h_out + (i - i0) * C + c] = ci[i];
+        }
+    }
+}

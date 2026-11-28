@@ -26,6 +26,8 @@ from conversion import (
     _mistral_import_error_msg,
 )
 
+INKLING2_ARCHS = ("Inkling2ForConditionalGeneration", "Inkling2ForCausalLM", "Inkling2LoopForConditionalGeneration", "Inkling2LoopForCausalLM")
+
 
 def split_str_to_n_bytes(split_str: str) -> int:
     if split_str.endswith("K"):
@@ -136,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dspark", action="store_true",
-        help="Export only the DeepSeek-V4 or Mistral Large 4 DSpark draft tensors as a separate GGUF.",
+        help="Export only the DeepSeek-V4, Mistral Large 4 or Inkling 2 DSpark draft tensors as a separate GGUF.",
     )
     parser.add_argument(
         "--mistral-format", action="store_true",
@@ -278,6 +280,13 @@ def main() -> None:
             from conversion.mistral import MistralModel
             model_class = MistralModel
 
+        # a DFlash draft of an Inkling 2 target reads layer visits and the target's unpadded vocabulary
+        if not is_mistral_format and model_architecture in ("DFlashDraftModel", "DFlash2DraftModel") and args.target_model_dir:
+            target_hparams = ModelBase.load_hparams(Path(args.target_model_dir), False)
+            if get_model_architecture(target_hparams, ModelType.TEXT) in INKLING2_ARCHS:
+                from conversion.inkling2 import Inkling2DFlashModel
+                model_class = Inkling2DFlashModel
+
         if sum((args.mtp, args.no_mtp, args.dspark)) > 1:
             logger.error("--mtp, --no-nextn, and --dspark are mutually exclusive")
             sys.exit(1)
@@ -289,8 +298,11 @@ def main() -> None:
                     sys.exit(1)
                 from conversion.mistral4 import MistralLarge4DSparkModel
                 model_class = MistralLarge4DSparkModel
+            elif model_architecture in INKLING2_ARCHS:
+                from conversion.inkling2 import Inkling2DSparkModel
+                model_class = Inkling2DSparkModel
             elif model_architecture not in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"):
-                logger.error("--dspark is only supported for DeepseekV4ForCausalLM, DeepseekV41ForCausalLM and Mistral Large 4")
+                logger.error("--dspark is only supported for DeepseekV4ForCausalLM, DeepseekV41ForCausalLM, Mistral Large 4 and Inkling 2")
                 sys.exit(1)
             elif model_architecture == "DeepseekV41ForCausalLM":
                 from conversion.deepseek41 import DeepseekV41DSparkModel

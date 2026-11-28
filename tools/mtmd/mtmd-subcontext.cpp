@@ -52,9 +52,19 @@ static std::shared_ptr<ggml_threadpool> mtmd_threadpool_init(int n_threads) {
     return std::shared_ptr<ggml_threadpool>(threadpool, free_fn);
 }
 
-ggml_backend_dev_t mtmd_select_device(bool use_gpu, ggml_backend_dev_t device) {
+ggml_backend_dev_t mtmd_select_device(bool use_gpu, ggml_backend_dev_t device, const char * backend_name) {
     if (!use_gpu) {
         return nullptr;
+    }
+    if (backend_name == nullptr) {
+        backend_name = std::getenv("MTMD_BACKEND_DEVICE");
+    }
+    if (backend_name != nullptr) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(backend_name);
+        if (dev != nullptr) {
+            return dev;
+        }
+        LOG_WRN("%s: Warning: Failed to find \"%s\" backend, falling back to default GPU backend\n", __func__, backend_name);
     }
     if (device != nullptr) {
         return device;
@@ -176,10 +186,53 @@ mtmd_image_f32_batch mtmd_subcontext::get_dummy_batch() const {
 void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
     support_info_graph info;
 
+    // Downgrade FA to AUTO on GPU projectors that lack efficient (coopmat) flash
+    // attention. Without coopmat, Vulkan uses FA_SCALAR which is ~2.6x slower than the
+    // matmul path for CLIP encoder attention (Mali-G715: 38 vs ~100 GFLOPS/s).
+    // Coopmat-capable GPUs keep FA enabled. Resolved at runtime via proc_address — no
+    // compile-time backend dep. Acts on AUTO *and* ENABLED (the addon enables FA by
+    // default) — an inefficient scalar-FA GPU should never be forced into FA; only
+    // explicit DISABLED is left alone. AUTO (not DISABLED, QVAC-21914): a hard disable
+    // forces the explicit path whose O(n_patches^2 * n_head) score matrix OOMs at high
+    // n_pos (image_tile_mode=disabled + large image_max_tokens killed Pixel 9 Pro at
+    // ~12 GB RSS); AUTO keeps the fast explicit path for normal images via the budget
+    // heuristic in mtmd_resolve_flash_attn_type() and falls back to memory-frugal
+    // scalar FA for huge ones — slow-but-alive beats fast-but-OOM.
+    // Default when the backend can't confirm efficient FA = KEEP it. Only ggml-vulkan
+    // implements the query (returning false for Mali/non-coopmat); backends that don't
+    // answer (Metal, CUDA, and also ggml-opencl) have (or are assumed to have) efficient
+    // FA and must keep it — disabling there forces explicit attention whose QK^T
+    // overflows the clip compute buffer at high n_pos (GGML_ASSERT in ggml-backend,
+    // e.g. image_tile_mode=disabled + large image_max_tokens). ggml-opencl's own
+    // giant-encode driver fault at high n_pos is handled inside that backend
+    // (submission bounding: periodic clFlush + FA q-chunking), not via this gate.
+    if (flash_attn_type != MTMD_FLASH_ATTN_TYPE_DISABLED &&
+        backends.backend && backends.backend != backends.backend_cpu) {
+        bool efficient_fa = true;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backends.backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            typedef bool (*supports_efficient_fa_t)(ggml_backend_t);
+            auto fn = (supports_efficient_fa_t)ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_supports_efficient_fa");
+            if (fn) {
+                efficient_fa = fn(backends.backend);
+            }
+        }
+        if (!efficient_fa) {
+            flash_attn_type = MTMD_FLASH_ATTN_TYPE_AUTO;
+            fa_backend_inefficient = true;
+        }
+    }
+
     if (flash_attn_type == MTMD_FLASH_ATTN_TYPE_AUTO) {
-        // try to enable flash attention to see if it's supported
+        // Probe flash-attention support by forcing it on for the warmup
+        // graph, then restore AUTO so the per-image budget heuristic in
+        // mtmd_resolve_flash_attn_type() decides at encode time.
         flash_attn_type = MTMD_FLASH_ATTN_TYPE_ENABLED;
         info = reserve_compute_meta(batch);
+        flash_attn_supported = info.fattn;
+        flash_attn_type = MTMD_FLASH_ATTN_TYPE_AUTO;
         if (!info.fattn && info.fattn_op) {
             auto op = info.fattn_op;
             LOG_WRN("%s: *****************************************************************\n", __func__);
@@ -198,10 +251,12 @@ void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
             LOG_WRN("%s: please report this on github as an issue\n", __func__);
             LOG_WRN("%s: *****************************************************************\n", __func__);
             flash_attn_type = MTMD_FLASH_ATTN_TYPE_DISABLED;
-            reserve_compute_meta(batch);
+            // re-measure with FA now resolving to DISABLED (unsupported)
+            info = reserve_compute_meta(batch);
         }
     } else {
         info = reserve_compute_meta(batch);
+        flash_attn_supported = info.fattn;
         if (!info.fattn && flash_attn_type == MTMD_FLASH_ATTN_TYPE_ENABLED) {
             LOG_WRN("%s: flash attention is not supported by the current backend; falling back to CPU (performance will be degraded)\n", __func__);
         }
@@ -209,8 +264,11 @@ void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
 
     is_allocated = true; // mark buffers as allocated
 
-    LOG_INF("%s: flash attention is %s\n", __func__,
-        (flash_attn_type == MTMD_FLASH_ATTN_TYPE_ENABLED) ? "enabled" : "disabled");
+    const char * fa_state =
+        flash_attn_type == MTMD_FLASH_ATTN_TYPE_ENABLED  ? "enabled"  :
+        flash_attn_type == MTMD_FLASH_ATTN_TYPE_DISABLED ? "disabled" :
+        flash_attn_supported ? "auto (per-image)" : "auto -> disabled (unsupported)";
+    LOG_INF("%s: flash attention is %s\n", __func__, fa_state);
 
     // print ops that are not supported by the GPU backend (if there is one)
     if (backends.backend != backends.backend_cpu) {
@@ -242,7 +300,11 @@ void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
 
 mtmd_subcontext::support_info_graph mtmd_subcontext::reserve_compute_meta(const mtmd_image_f32_batch & batch) {
     ggml_cgraph * gf = mtmd_get_graph_builder(this, batch)->build();
-    ggml_backend_sched_reserve(backends.sched.get(), gf);
+    if (!ggml_backend_sched_reserve(backends.sched.get(), gf)) {
+        throw mtmd_backend_alloc_error(mtmd_format(
+            "%s: failed to reserve the compute buffers for the projector graph on %s\n",
+            __func__, ggml_backend_name(backends.backend)));
+    }
 
     const int n_splits = ggml_backend_sched_get_n_splits(backends.sched.get());
     const int n_nodes  = ggml_graph_n_nodes(gf);
@@ -524,10 +586,70 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
     const mtmd_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
-    // [QWEN_VIDEO] for video models, the batch dimension is used as temporal dimension for merged frames
+    if (n_batch_cur == 0) {
+        return false;
+    }
+
+    // [QWEN_VIDEO] for video models, the batch dimension is used as temporal dimension for merged frames.
     if (!support_batch && n_batch_cur > model.n_temporal_merge()) {
         LOG_ERR("%s: batch size %d exceeds maximum supported batch/temporal-merge size %d\n", __func__, n_batch_cur, model.n_temporal_merge());
         return false;
+    }
+
+    LOG_INF("%s: encoding %d tile(s), grid=%dx%d, tile_size=%dx%d\n", __func__,
+            n_batch_cur,
+            imgs.grid_x, imgs.grid_y,
+            imgs.entries[0].nx(), imgs.entries[0].ny());
+
+    // Validate that all tiles share the same dimensions; logs an error and returns false if not.
+    auto validate_tile_sizes = [&](const char * tag) -> bool {
+        const int tile_nx = imgs.entries[0].nx();
+        const int tile_ny = imgs.entries[0].ny();
+        for (int b = 1; b < n_batch_cur; b++) {
+            if (imgs.entries[b].nx() != tile_nx || imgs.entries[b].ny() != tile_ny) {
+                LOG_ERR("%s: %s tile %d size %dx%d != expected %dx%d; all tiles must be the same size\n",
+                        __func__, tag, b, imgs.entries[b].nx(), imgs.entries[b].ny(), tile_nx, tile_ny);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Encode tiles one by one. Used for SEQUENTIAL tile mode and as OOM fallback from BATCHED mode.
+    auto do_encode_sequential = [&]() -> bool {
+        if (!validate_tile_sizes("sequential mode")) { return false; }
+        const int n_tokens_per_tile = model.n_output_tokens(&imgs.entries[0]);
+        const int out_embd          = model.n_mmproj_embd();
+        const size_t tile_size      = (size_t)n_tokens_per_tile * out_embd;
+        // reused across iterations: same-size tiles, so the buffers are allocated once
+        mtmd_image_f32_batch single;
+        single.entries.resize(1);
+        single.grid_x = 1;
+        single.grid_y = 1;
+        std::vector<float> single_out;
+        const bool has_out = params->out_embd != nullptr && !params->out_embd->empty();
+        for (int b = 0; b < n_batch_cur; b++) {
+            single.entries[0] = imgs.entries[b];
+            if (has_out) {
+                single_out.resize(tile_size);
+            }
+            bool ok = encode_batch(params->n_threads, &single, single_out);
+            if (!ok) {
+                return false;
+            }
+            if (has_out) {
+                auto & out_batch_embd = *params->out_embd;
+                const size_t offset = (size_t)b * tile_size;
+                GGML_ASSERT(offset + single_out.size() <= out_batch_embd.size());
+                std::copy(single_out.begin(), single_out.end(), out_batch_embd.begin() + offset);
+            }
+        }
+        return true;
+    };
+
+    // Explicit sequential mode.
+    if (model.proj_type == PROJECTOR_TYPE_QWEN3VL && n_batch_cur > 1 && !imgs.is_video && model.hparams.image_tile_mode == MTMD_IMAGE_TILE_MODE_SEQUENTIAL) {
+        return do_encode_sequential();
     }
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
@@ -560,8 +682,43 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
     ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
 
     if (!ggml_backend_sched_alloc_graph(backends.sched.get(), gf)) {
-        LOG_ERR("%s: failed to allocate compute graph\n", __func__);
-        return false;
+        // The explicit-attention path that AUTO selects for short sequences needs
+        // O(n_patches^2) scratch and can OOM on memory-constrained devices. If
+        // flash-attention is available, rebuild this image with FA (which never
+        // materializes the full scores) and retry before falling back to slower
+        // sequential tiling. This is a no-op when FA was already the chosen path.
+        bool allocated = false;
+        if (flash_attn_type == MTMD_FLASH_ATTN_TYPE_AUTO && flash_attn_supported) {
+            LOG_WRN("%s: explicit-attention graph alloc failed (OOM); retrying with flash-attention\n", __func__);
+            const mtmd_flash_attn_type saved = flash_attn_type;
+            flash_attn_type = MTMD_FLASH_ATTN_TYPE_ENABLED; // force FA for this rebuild
+            ggml_backend_sched_reset(backends.sched.get());
+            gf = mtmd_get_graph_builder(this, imgs, params)->build();
+            // the rebuilt graph has a new output node; re-read it before scheduling
+            embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
+            allocated = ggml_backend_sched_alloc_graph(backends.sched.get(), gf);
+            flash_attn_type = saved; // restore AUTO for subsequent images
+        }
+        if (!allocated) {
+            if (model.proj_type == PROJECTOR_TYPE_QWEN3VL && n_batch_cur > 1 && !imgs.is_video) {
+                // Still failing (or FA unavailable) — fall back to sequential. We
+                // already know the batched explicit path OOMs here, so force
+                // flash-attention (the memory-frugal path) for the whole sequential
+                // run when it's supported; otherwise each tile would re-resolve to
+                // explicit, re-OOM and rebuild (up to N x2 allocations). Restore the
+                // prior mode afterwards for subsequent images.
+                LOG_WRN("%s: graph alloc failed (OOM), retrying with sequential encoding\n", __func__);
+                const mtmd_flash_attn_type saved = flash_attn_type;
+                if (flash_attn_supported) {
+                    flash_attn_type = MTMD_FLASH_ATTN_TYPE_ENABLED;
+                }
+                const bool ok = do_encode_sequential();
+                flash_attn_type = saved;
+                return ok;
+            }
+            LOG_ERR("%s: ggml_backend_sched_alloc_graph failed\n", __func__);
+            return false;
+        }
     }
 
     // set inputs
@@ -706,7 +863,7 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
     if (!imgs.is_audio) {
         size_t nelem = 0;
         for (const auto & img : imgs.entries) {
-            nelem += img.nx() * img.ny() * 3;
+            nelem += (size_t)img.nx() * (size_t)img.ny() * 3;
         }
         std::vector<float> inp_raw(nelem);
 
@@ -721,25 +878,23 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         // └─────┘ │
         //   ──────┘ x B
 
-        // IMPORTANT: [QWEN_VIDEO] the batch dim is currently used for temporal dim in Qwen-VL models
-        // All entries must have the same spatial size (enforced by can_batch_with() during merging)
-        {
-            const int nx = imgs.entries[0].nx();
-            const int ny = imgs.entries[0].ny();
-            const int n  = nx * ny;
-
-            for (int b = 0; b < n_batch_cur; b++) {
-                LOG_DBG("%s: copying image %d/%d to input buffer (nx=%d, ny=%d)\n", __func__, b+1, n_batch_cur, nx, ny);
-                const auto & buf = imgs.entries[b].get_ro_buf();
-                float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x);
-                        size_t base_dst =    y * nx + x;
-                        batch_entry[      base_dst] = buf[base_src    ];
-                        batch_entry[1*n + base_dst] = buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = buf[base_src + 2];
-                    }
+        // Layout: [nx, ny, 3, n_batch_cur] - channel-first per tile, tiles packed along last dim.
+        // All tiles must be the same size (ensured by the Qwen3VL tiling preprocessor).
+        GGML_ASSERT(n_batch_cur > 0);
+        if (!validate_tile_sizes("batched")) { return false; }
+        for (int b = 0; b < n_batch_cur; b++) {
+            const int    nx = imgs.entries[b].nx();
+            const int    ny = imgs.entries[b].ny();
+            const size_t n  = (size_t)nx * (size_t)ny;
+            const auto & buf = imgs.entries[b].get_ro_buf();
+            float * tile_entry = inp_raw.data() + (size_t)b * 3 * n;
+            for (int y = 0; y < ny; y++) {
+                for (int x = 0; x < nx; x++) {
+                    size_t base_src = 3 * (y * nx + x);
+                    size_t base_dst =      y * nx + x;
+                    tile_entry[      base_dst] = buf[base_src    ];
+                    tile_entry[1*n + base_dst] = buf[base_src + 1];
+                    tile_entry[2*n + base_dst] = buf[base_src + 2];
                 }
             }
         }
@@ -1057,7 +1212,6 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                 set_input_i32("positions", positions);
             } break;
         case PROJECTOR_TYPE_QWEN2VL:
-        case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_LING3VL:
         case PROJECTOR_TYPE_GLM4V:
         case PROJECTOR_TYPE_GLM5V:
@@ -1078,6 +1232,54 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                                 positions[2 * num_patches + ptr] = y;
                                 positions[3 * num_patches + ptr] = x;
                                 ptr++;
+                            }
+                        }
+                    }
+                }
+
+                set_input_i32("positions", positions);
+            } break;
+        case PROJECTOR_TYPE_QWEN3VL:
+            {
+                // Per-tile M-RoPE positions use *local* patch coordinates (origin at each tile's
+                // top-left). Attention is computed per-tile and RoPE scores depend only on the
+                // relative position pos_i - pos_j, so any per-tile absolute offset would cancel
+                // exactly and have no effect on the encoder. Every tile therefore gets the same
+                // local-coordinate block. Absolute tile placement reaches the LM via decoder
+                // positions (mtmd_image_tokens_get_decoder_pos in mtmd.cpp), not here.
+                const int merge_ratio  = hparams.n_merge;
+                GGML_ASSERT(merge_ratio > 0);
+                const int pw           = image_size_width  / patch_size; // per-tile width in patches
+                const int ph           = image_size_height / patch_size; // per-tile height in patches
+                GGML_ASSERT(pw % merge_ratio == 0 && ph % merge_ratio == 0 &&
+                            "tile dimensions must be divisible by n_merge");
+                const int n_pos_tile   = pw * ph; // raw patches per tile == n_patches (graph sequence length)
+                // positions layout: section-major over the FULL batched sequence. The mrope kernel
+                // reads section s of token i as positions[s * N + i], where N = n_pos_tile * n_batch_cur
+                // is the rope tensor's ne[2]. The four sections are [y, x, y, x]. Every tile gets the
+                // same local-coordinate block (per-tile absolute offsets cancel under relative
+                // attention), so each section just repeats the tile coordinates n_batch_cur times.
+                // For n_batch_cur == 1 this is identical to the old tile-major layout; for
+                // n_batch_cur > 1 (batched mode) it is the only layout the kernel reads correctly —
+                // a tile-major buffer would mis-index every section beyond the first tile.
+                // A video batch is a frame pair merged temporally into ONE tile (the graph
+                // uses batch_size = 1 for is_video), so it needs a single position block.
+                const int n_tiles = imgs.is_video ? 1 : n_batch_cur;
+                const size_t N = (size_t)n_pos_tile * (size_t)n_tiles;
+                std::vector<int32_t> positions(N * 4);
+                for (int b = 0; b < n_tiles; b++) {
+                    const size_t tile_off = (size_t)b * (size_t)n_pos_tile;
+                    int ptr = 0;
+                    for (int y = 0; y < ph; y += merge_ratio) {
+                        for (int x = 0; x < pw; x += merge_ratio) {
+                            for (int dy = 0; dy < merge_ratio; dy++) {
+                                for (int dx = 0; dx < merge_ratio; dx++) {
+                                    positions[0 * N + tile_off + ptr] = y + dy;
+                                    positions[1 * N + tile_off + ptr] = x + dx;
+                                    positions[2 * N + tile_off + ptr] = y + dy;
+                                    positions[3 * N + tile_off + ptr] = x + dx;
+                                    ptr++;
+                                }
                             }
                         }
                     }
@@ -1659,6 +1861,7 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         case PROJECTOR_TYPE_GEMMA3NV:
         case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_COHERE2V:
+        case PROJECTOR_TYPE_VISIONPSY:
         case PROJECTOR_TYPE_INTERNVL:
         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
         case PROJECTOR_TYPE_NEMOTRON_OMNI:
@@ -2265,8 +2468,8 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                 const int n           = image_side / window_side;
                 const int new_side    = n * query_side;
 
-                // Builds the raster→window permutation indices for a
-                // (side, side) grid split into (n × n) windows of (win × win)
+                // Builds the raster->window permutation indices for a
+                // (side, side) grid split into (n x n) windows of (win x win)
                 // tokens each.  dst[w * win*win + p] = source raster index.
                 auto make_win_idx = [](int side, int win) {
                     const int nn = side / win;
@@ -2349,11 +2552,11 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
     }
 
     if (embeddings != nullptr) {
-        // sanity check (assuming that all images in batch have the same number of tokens, so we only check the first one)
+        // sanity check: ne[1] = tokens per tile, ne[2] = batch size (1 for non-batched models)
         const int n_tokens_out = embeddings->ne[1];
         const int expected_n_tokens_out = model.n_output_tokens(&imgs.entries[0]);
         if (n_tokens_out != expected_n_tokens_out) {
-            LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
+            LOG_ERR("%s: expected output %d tokens (per tile), got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
             GGML_ABORT("Invalid number of output tokens");
         }
 
@@ -2688,11 +2891,12 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
     if (debug_output_embeddings && embeddings != nullptr) {
         const int64_t n_embd = embeddings->ne[0];
         const int64_t n_tokens = embeddings->ne[1];
+        const int64_t n_tiles  = embeddings->ne[2];
         std::vector<float> emb_data(ggml_nelements(embeddings));
         ggml_backend_tensor_get(embeddings, emb_data.data(), 0, ggml_nbytes(embeddings));
 
         LOG_INF("\n=== MTMD_DEBUG_EMBEDDINGS ===\n");
-        LOG_INF("Shape: [%lld, %lld]\n", (long long)n_embd, (long long)n_tokens);
+        LOG_INF("Shape: [%lld, %lld, %lld]\n", (long long)n_embd, (long long)n_tokens, (long long)n_tiles);
 
         // TEMP debugging (parity validation), will be removed before merge
         // when the env var holds a path, dump the raw data: [int32 n_tokens][int32 n_embd][f32 data]

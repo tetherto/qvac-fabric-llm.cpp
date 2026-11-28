@@ -11,9 +11,11 @@
 static_assert(MATRIX_ROW_PADDING %    CUDA_QUANTIZE_BLOCK_SIZE      == 0, "Risk of out-of-bounds access.");
 static_assert(MATRIX_ROW_PADDING % (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ) == 0, "Risk of out-of-bounds access.");
 
+// layout: see ggml_cuda_q8_1_layout_for() in common.cuh. The caller must pass the same layout the
+// consuming mat-vec kernel expects for (type_src0, ncols_dst, ids).
 void quantize_row_q8_1_cuda(
         const float * x, void * vy,
-        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        ggml_cuda_q8_1_layout layout, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
 void quantize_mmq_q8_1_cuda(
@@ -31,6 +33,30 @@ static constexpr int MMQ_FEW_Q8_1_INT4 = 4*WARP_SIZE + 4*4; // int4 per 256 valu
 void quantize_mmq_few_q8_1_cuda(
         const float * x, void * vy, mmq_q8_1_ds_layout ds_layout, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+// The same layout with e4m3 values and a float scale (D4) per 32 values, for F8_E4M3 weights.
+void quantize_mmq_few_fp8_cuda(
+        const float * x, void * vy, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+// src1 of the few-row MMQ for RDNA3 WMMA, which multiplies 16 src1 columns and needs the same A and B data in both half-warps.
+// Per channel, 256 values and group of MMQ_FEW_WMMA_NCOLS columns:
+//   qs: int4[8][16][2], [s][m][k] holds the values [16k, 16k + 16) of sub-block s of column m, the A fragments of lanes m and m + 16.
+//   ds: int4[8][2][2], [s][h][k] holds d (D4, float) or (d, sum) (DS4, half2) of sub-block s of the columns 2v + h, v = 4k .. 4k + 3.
+static constexpr int MMQ_FEW_WMMA_NCOLS     = 16;
+static constexpr int MMQ_FEW_WMMA_Q8_1_INT4 = 8*16*2 + 8*2*2;
+
+void quantize_mmq_few_wmma_q8_1_cuda(
+        const float * x, void * vy, mmq_q8_1_ds_layout ds_layout, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+// MUL_MAT_ID: a pair is an expert and one column group of up to MMQ_FEW_NCOLS of its (token, slot) entries. The src1 of pair p is channel p above, its columns past the entries are zero.
+// A pair is MMQ_FEW_PAIR_INTS ints: expert, number of entries (0 for an unused pair), then the entries token*n_expert_used + slot.
+static constexpr int MMQ_FEW_PAIR_INTS = 2 + MMQ_FEW_NCOLS;
+
+void quantize_mmq_few_id_q8_1_cuda(
+        const float * x, const int32_t * ids, void * vy, int * pairs, mmq_q8_1_ds_layout ds_layout, int64_t ne00, int64_t s11, int64_t s12,
+        int64_t ne11, int64_t n_experts, int64_t n_expert_used, int64_t n_tokens, int64_t si1, int64_t npairs_max, cudaStream_t stream);
 
 void quantize_mmq_fp4_cuda(const float *   x,
                              const int32_t * ids,
@@ -74,3 +100,23 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int64_t         nrows_dst,
                                     int             n_expert_used,
                                     cudaStream_t    stream);
+
+#ifdef GGML_CUDA_CUTLASS
+void quantize_cutlass_nvfp4_cuda(
+        const float * x, void * vy, uint8_t * block_scales, float * row_scales, bool use_aligned_float8,
+        int64_t n_cols, int64_t n_cols_padded, int64_t stride_row, int64_t n_rows, cudaStream_t stream);
+
+// returns whether glu was written, which happens only when a row does not fit in shared memory
+bool quantize_cutlass_nvfp4_swiglu_bf16_cuda(const nv_bfloat16 * gate,
+                                             const nv_bfloat16 * up,
+                                             const float *       gate_scale,
+                                             const float *       up_scale,
+                                             float *             glu,
+                                             void *              vy,
+                                             uint8_t *           block_scales,
+                                             float *             row_scales,
+                                             int64_t             n_cols,
+                                             int64_t             n_cols_padded,
+                                             int64_t             n_rows,
+                                             cudaStream_t        stream);
+#endif

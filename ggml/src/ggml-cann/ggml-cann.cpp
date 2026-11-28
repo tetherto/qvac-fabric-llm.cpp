@@ -2673,8 +2673,8 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
-                if (op->src[5] != nullptr) {
+                // K/V row lists and indexed bias are not supported
+                if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
                     return false;
                 }
 #ifdef ASCEND_310P
@@ -2841,6 +2841,7 @@ static void ggml_backend_cann_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ true,
         /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false,
     };
 }
 

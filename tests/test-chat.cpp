@@ -3497,8 +3497,76 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     }
 
     {
+        // Qwen3: a required tool call may follow the reasoning block, in either reasoning format
+        auto tst = peg_tester("models/templates/Qwen-Qwen3-0.6B.jinja");
+
+        tst.test(
+               "<tool_call>\n"
+               "{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n"
+               "</tool_call>")
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect(message_assist_call)
+            .run();
+
+        tst.test(
+               "<think>\nI'm\nthinking\n</think>\n\n"
+               "<tool_call>\n"
+               "{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect(message_assist_call_thoughts)
+            .run();
+
+        tst.test(
+               "<think>\nI'm\nthinking\n</think>\n\n"
+               "<tool_call>\n"
+               "{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect_content("<think>\nI'm\nthinking\n</think>\n\n")
+            .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
+            .run();
+
+        // Continuing a message that already holds content keeps that content before a required call
+        tst.test(
+               "world!\n"
+               "<tool_call>\n"
+               "{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_content })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\n")
+            .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
+            .run();
+    }
+
+    {
         // Qwen-QwQ-32B (reasoning model)
         auto tst = peg_tester("models/templates/Qwen-QwQ-32B.jinja");
+
+        // A required tool call after the reasoning block the generation prompt opened
+        tst.test(
+               "I'm\nthinking\n</think>\n\n"
+               "<tool_call>\n"
+               "{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect(message_assist_call_thoughts)
+            .run();
 
         // QwQ always has thinking forced open - input starts after the <think>\n in the prompt
         tst.test("Let me think about this...\n</think>\nThe answer is 42.")
@@ -5513,6 +5581,102 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 // custom delimiter: the payload itself contains )"
                 { "python", R"JSON({"code":"print('hey')"})JSON", "" },
             })
+            .run();
+    }
+
+    // Inkling 1 and 2
+    for (const int version : { 1, 2 }) {
+        auto tst = peg_tester(version == 1 ? "models/templates/thinkingmachines-Inkling.jinja" :
+                                             "models/templates/thinkingmachines-Inkling-2-Small.jinja", detailed_debug);
+
+        // Inkling 1 has the first header in the generation prompt, Inkling 2 writes it
+        const std::string H = "<|message_model|>";
+        const std::string P = version == 1 ? "" : H;
+        const std::string E = "<|end_message|>";
+        const std::string CALL = "special_function<|content_invoke_tool_json|>{\"name\":\"special_function\",\"args\":{\"arg1\":1}}" + E;
+
+        // Content only
+        tst.test(P + "<|content_text|>Hello, world!\nWhat's up?" + E)
+            .expect(message_assist)
+            .run();
+
+        // Thinking block, then content block
+        tst.test(P + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>Hello, world!\nWhat's up?" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("Hello, world!\nWhat's up?", "I'm thinking"))
+            .run();
+
+        // Without reasoning extraction, the thinking block stays in the content
+        tst.test(P + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>Hello, world!\nWhat's up?" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .expect_content("<|content_thinking|>I'm thinking" + E + "Hello, world!\nWhat's up?")
+            .run();
+
+        // Cut by the token limit, in thinking and in content
+        tst.test(P + "<|content_thinking|>I was still thinking")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("I was still thinking")
+            .run();
+        tst.test(P + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>Hello, wor")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("Hello, wor", "I'm thinking"))
+            .run();
+
+        // Single tool call
+        tst.test(P + CALL)
+            .tools({ special_function_tool })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1":1})", "" },
+            })
+            .expect_rules({ "tool-0" })
+            .run();
+
+        // Thinking, content, then a tool call
+        tst.test(P + "<|content_thinking|>I should call it" + E + H + "<|content_text|>On it." + E + H + CALL)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(simple_assist_msg("On it.", "I should call it", "special_function", R"({"arg1":1})", ""))
+            .run();
+
+        // Tools given, but the model answers with content
+        tst.test(P + "<|content_thinking|>No tool needed" + E + H + "<|content_text|>Hello, world!\nWhat's up?" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(simple_assist_msg("Hello, world!\nWhat's up?", "No tool needed"))
+            .run();
+
+        // Parallel tool calls, one block each
+        tst.test(P + CALL + H +
+                 "special_function_with_opt<|content_invoke_tool_json|>{\"name\":\"special_function_with_opt\",\"args\":{\"arg1\":1,\"arg2\":2}}" + E)
+            .parallel_tool_calls(true)
+            .tools({ special_function_tool, special_function_tool_with_optional_param })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1":1})", "" },
+                { "special_function_with_opt", R"({"arg1":1,"arg2":2})", "" },
+            })
+            .run();
+
+        // The block closer inside a string argument does not end the block
+        tst.test(P + "python<|content_invoke_tool_json|>{\"name\":\"python\",\"args\":{\"code\":\"print('<|end_message|>')\"}}" + E)
+            .tools({ python_tool })
+            .expect_tool_calls({
+                { "python", R"JSON({"code":"print('<|end_message|>')"})JSON", "" },
+            })
+            .run();
+
+        // Forced tool call
+        tst.test(P + "<|content_thinking|>I should call it" + E + H + CALL)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .tools({ special_function_tool })
+            .expect(simple_assist_msg("", "I should call it", "special_function", R"({"arg1":1})", ""))
+            .run();
+
+        // Response format
+        tst.test(P + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>{\"amount\": 123.45}" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .json_schema(invoice_schema)
+            .expect(simple_assist_msg("{\"amount\": 123.45}", "I'm thinking"))
             .run();
     }
 
@@ -8580,6 +8744,67 @@ static void test_reasoning_budget_message_per_request() {
     }
 }
 
+// Under tool_choice required the grammar accepts end of generation only after a call. Text allowed before the call lets
+// the model answer in prose and never reach it, so the grammar must accept the reasoning block and nothing else first.
+static void test_required_tool_call_grammar_rejects_content() {
+    LOG_DBG("%s\n", __func__);
+
+    const std::string call =
+        "<tool_call>\n"
+        "{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n"
+        "</tool_call>";
+
+    struct template_case {
+        std::string path;
+        bool        thinking_opened_by_prompt;
+    };
+    // Qwen3 opens its reasoning block in the output; QwQ's generation prompt already opened it.
+    for (const auto & tc : { template_case{ "models/templates/Qwen-Qwen3-0.6B.jinja", false },
+                             template_case{ "models/templates/Qwen-QwQ-32B.jinja", true } }) {
+        auto              tmpls     = read_templates(tc.path);
+        const std::string reasoning = tc.thinking_opened_by_prompt ? "I'm\nthinking\n</think>\n\n" :
+                                                                     "<think>\nI'm\nthinking\n</think>\n\n";
+
+        for (auto reasoning_format : { COMMON_REASONING_FORMAT_NONE, COMMON_REASONING_FORMAT_AUTO }) {
+            common_chat_templates_inputs inputs;
+            inputs.messages         = { message_user };
+            inputs.tools            = { special_function_tool };
+            inputs.tool_choice      = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+            inputs.reasoning_format = reasoning_format;
+
+            common_chat_session    session(tmpls.get(), nullptr, inputs, {});
+            common_params_sampling sampling;
+            session.apply_sampling(sampling);
+            const std::string what = "required tool call (" + tc.path + ", " +
+                                     common_reasoning_format_name(reasoning_format) + "): ";
+            if (sampling.grammar_lazy) {
+                throw std::runtime_error(what + "the grammar is lazy");
+            }
+
+            auto accepts = [&](const std::string & output) {
+                auto grammar = build_grammar(session.grammar());
+                if (!grammar) {
+                    throw std::runtime_error(what + "failed to build grammar: " + session.grammar());
+                }
+                return match_string(sampling.generation_prompt + output, grammar.get());
+            };
+
+            if (!tc.thinking_opened_by_prompt && !accepts(call)) {
+                throw std::runtime_error(what + "grammar rejects a bare call");
+            }
+            if (!accepts(reasoning + call)) {
+                throw std::runtime_error(what + "grammar rejects reasoning before the call");
+            }
+            if (!tc.thinking_opened_by_prompt && accepts("Hello! How can I help?\n" + call)) {
+                throw std::runtime_error(what + "grammar accepts content before the call");
+            }
+            if (accepts(reasoning + "Hello! How can I help?\n" + call)) {
+                throw std::runtime_error(what + "grammar accepts content after the reasoning");
+            }
+        }
+    }
+}
+
 static void test_reasoning_effort_caps() {
     LOG_DBG("%s\n", __func__);
 
@@ -8779,6 +9004,7 @@ int main(int argc, char ** argv) {
         test_inkling2_media_blocks();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
+        test_required_tool_call_grammar_rejects_content();
         test_prompt_parts();
         test_chat_session();
         test_chat_json_depth();

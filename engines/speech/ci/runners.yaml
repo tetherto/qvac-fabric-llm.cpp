@@ -1,0 +1,26 @@
+# Specialized GitHub Actions runner labels for the speech engines' CI.
+# Edit this file, then run: node engines/speech/ci/scripts/sync-runner-names.mjs
+#
+# ubuntu-latest / macos-latest / windows-latest are intentionally omitted; keep
+# them hardcoded as GitHub's rolling aliases.
+#
+# FORMAT CONTRACT: a flat `key: value # comment` list, one entry per line. The
+# parser (engines/speech/ci/scripts/lib/runner-names.mjs) is line-based, not YAML. A value
+# is EITHER a bare single label (`ubuntu-24.04`) OR a flow array of bare tokens
+# (`[self-hosted, Linux, X64]`) for composite self-hosted label sets. Do not
+# quote values or nest maps (the parser fails loudly).
+#
+# SCOPE: this catalog governs only where jobs RUN (runs-on / matrix.runner). It
+# does NOT manage `matrix.os` identities or `matrix.os == '...'` conditionals —
+# those are frozen logical identities decoupled from the runner label (a lane
+# pairs e.g. `os: macos-26` with the `qvac-macos26-arm64-gpu` runner). Bumping a
+# catalog label here never requires an `os` edit, and vice versa.
+
+# GitHub-hosted (pinned images)
+ubuntu_2404: ubuntu-24.04 # Ubuntu 24.04 hosted x64
+macos_14: macos-15 # macOS 15 hosted (legacy macos_14 logical lane key)
+windows_2022: windows-2022 # Windows Server 2022 hosted x64
+
+# Self-hosted
+linux_x64_gpu: qvac-ubuntu2204-x64-gpu # Self-hosted NVIDIA Linux x64 GPU
+macos_arm64_gpu: qvac-macos26-arm64-gpu # Self-hosted Apple Silicon GPU/Metal

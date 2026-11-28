@@ -1,0 +1,50 @@
+{
+  "description": "Small correctness and retrieval corpus, not a retrieval-quality benchmark. Prefixes are part of the input text.",
+  "texts": [
+    {
+      "id": "password-query",
+      "text": "task: search result | query: How can I reset a forgotten account password?"
+    },
+    {
+      "id": "password-document",
+      "text": "title: Reset your password | text: To reset a forgotten account password, select Forgot password on the login page and follow the email recovery link."
+    },
+    {
+      "id": "cooking-document",
+      "text": "title: Vegetable soup | text: Chop carrots and onions, simmer them in vegetable stock, and season the soup before serving."
+    },
+    {
+      "id": "search-query",
+      "text": "task: search result | query: How does semantic search find documents with similar meanings?"
+    },
+    {
+      "id": "search-document",
+      "text": "title: Semantic search | text: Semantic search compares text embedding vectors to retrieve documents with similar meanings even when their words differ."
+    },
+    {
+      "id": "code",
+      "text": "title: Python example | text: def cosine(a, b): return sum(x * y for x, y in zip(a, b))"
+    },
+    {
+      "id": "multilingual",
+      "text": "title: Languages | text: Bonjour le monde. Hola mundo. Namaste duniya. Guten Morgen."
+    },
+    {
+      "id": "long-context",
+      "text": "The library stores searchable documents and preserves the original order of independent queries. ",
+      "repeat": 72
+    }
+  ],
+  "retrieval": [
+    {
+      "query": "password-query",
+      "documents": ["password-document", "cooking-document", "search-document"],
+      "relevant": "password-document"
+    },
+    {
+      "query": "search-query",
+      "documents": ["password-document", "cooking-document", "search-document"],
+      "relevant": "search-document"
+    }
+  ]
+}

@@ -1,0 +1,109 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#include "mul_mat_vec_base.glsl"
+#include "tq_utils.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+#if defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
+shared float proj_b_sh[QUANT_K];
+#endif
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+    const uint tid = gl_LocalInvocationID.x;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib0 = a_offset / QUANT_K + (first_row + n) * num_blocks_per_row;
+
+        for (uint blk = 0; blk < num_blocks_per_row; ++blk) {
+            const uint ib = ib0 + blk;
+            const float norm = float(data_a[ib].d);
+
+            const FLOAT_TYPE dequant_val = FLOAT_TYPE(tbq4_dequant_raw(uint(data_a[ib].qs[tid / 2u]), tid) * norm);
+
+            [[unroll]] for (uint jcol = 0; jcol < NUM_COLS; ++jcol) {
+                temp[jcol][n] += dequant_val * FLOAT_TYPE(data_b[jcol * p.batch_stride_b + b_offset + blk * QUANT_K + tid]);
+            }
+
+#if defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
+            {
+                float d_r = float(data_a[ib].d_r);
+                float qjl_scale = d_r * sqrt(1.5707963) / float(QUANT_K);
+                bool has_qjl = d_r > 1e-15;
+
+                [[unroll]] for (uint jcol = 0; jcol < NUM_COLS; ++jcol) {
+                    proj_b_sh[tid] = float(data_b[jcol * p.batch_stride_b + b_offset + blk * QUANT_K + tid]) * qjl_get_sign(tid);
+                    barrier();
+
+                    for (uint h = 1u; h < QUANT_K; h <<= 1u) {
+                        if (tid < QUANT_K / 2u) {
+                            uint grp = tid / h;
+                            uint pos = tid % h;
+                            uint idx = grp * (h << 1u) + pos;
+                            float va = proj_b_sh[idx];
+                            float vb = proj_b_sh[idx + h];
+                            proj_b_sh[idx]     = va + vb;
+                            proj_b_sh[idx + h] = va - vb;
+                        }
+                        barrier();
+                    }
+
+                    if (has_qjl && tid == 0u) {
+                        float pos_sum = 0.0;
+                        float total_sum = 0.0;
+                        [[unroll]] for (uint w = 0u; w < QUANT_K / 32u; w++) {
+                            uint bb = w * 4u;
+                            uint bits = uint(data_a[ib].qjl[bb])
+                                      | (uint(data_a[ib].qjl[bb + 1u]) << 8u)
+                                      | (uint(data_a[ib].qjl[bb + 2u]) << 16u)
+                                      | (uint(data_a[ib].qjl[bb + 3u]) << 24u);
+                            [[unroll]] for (uint qq = 0u; qq < 8u; qq++) {
+                                uint base_idx = (w * 8u + qq) * 4u;
+                                vec4 pq = vec4(proj_b_sh[base_idx],
+                                               proj_b_sh[base_idx + 1u],
+                                               proj_b_sh[base_idx + 2u],
+                                               proj_b_sh[base_idx + 3u]);
+                                vec4 mask_v = vec4(float(bits & 1u), float((bits >> 1u) & 1u),
+                                                   float((bits >> 2u) & 1u), float((bits >> 3u) & 1u));
+                                pos_sum += dot(mask_v, pq);
+                                total_sum += pq.x + pq.y + pq.z + pq.w;
+                                bits >>= 4u;
+                            }
+                        }
+                        temp[jcol][n] += FLOAT_TYPE(qjl_scale * (2.0 * pos_sum - total_sum));
+                    }
+                    barrier();
+                }
+            }
+#endif
+        }
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

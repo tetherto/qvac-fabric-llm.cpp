@@ -16,6 +16,9 @@ void llama_model_bitnet::load_arch_tensors(llama_model_loader &) {
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+    // bitnet has tied embeddings; duplicate tok_embd so the lm_head weight is
+    // classified as an output tensor and can be offloaded
+    output      = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -151,8 +154,7 @@ llama_model_bitnet::graph::graph(const llm_graph_params & params) : llm_graph_co
     res->t_embd = cur;
 
     // lm_head
-    // FIXME: do not use model.tok_embd directly, duplicate as model.output
-    cur = build_lora_mm(model.tok_embd, cur);
+    cur = build_lora_mm(model.output, cur);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

@@ -13,13 +13,14 @@ layout (constant_id =  8) const uint32_t SubGroupSize = 32;
 layout (constant_id =  9) const uint32_t SHMEM_STAGING = 0;
 layout (constant_id = 10) const uint32_t Flags = 0;
 layout (constant_id = 11) const uint32_t LIMIT_OCCUPANCY_SHMEM = 0;
+#ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
 // ggml_type enumerant for K/V
 layout (constant_id = 12) const uint32_t FaTypeK = 0;
 layout (constant_id = 13) const uint32_t FaTypeV = 0;
 // sizeof(decode buffer): quants -> ggml block size; F32 -> 16 (decodeBufF32 vec4).
 layout (constant_id = 14) const uint32_t FaBlockBytesK = 2;
 layout (constant_id = 15) const uint32_t FaBlockBytesV = 2;
-
+#endif
 const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
@@ -30,6 +31,15 @@ const bool Q_IN_REGS       = (Flags & 32) != 0;
 // coopmat1: subgroups own Q rows, O in coopmat accumulators. K/V staged in LDS, or loaded from global memory with FLIP_DIRECT.
 const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
+// V is supplied transposed per head ([HSV][v_stride] with KV contiguous, from dequant_f16_transpose_vt), so a
+// coopmat1 P x V B-operand fragment is one contiguous 32-byte run per lane instead of 16 kv-strided halves.
+// coopmat1 only, f16 V, aligned, no shmem staging (which stages V rows from the row-major layout).
+const bool V_TRANSPOSED     = (Flags & 512) != 0;
+// kv_rows: column c of slice iq3 reads K/V row data_sparse[iq3 * KV + c] (binding 7), negative rows are padding.
+// The mask is indexed by the column like the dense mask. K/V are shared by all slices.
+const bool USE_KV_ROWS      = (Flags & 16384) != 0;
+// K/V rows are read through the index list of binding 7
+const bool KV_GATHER        = USE_SPARSE || USE_KV_ROWS;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -96,10 +106,13 @@ layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 #define NEG_FLT16_MAX -65504.0
 
 #define MASK_OPT_ALL_NEG_INF 1
+// a mask value at or below this (f16 -inf, or the lowest finite f16 some mask writers use for it) hides the key
+#define FA_MASK_DEAD (-65504.0)
 #define MASK_OPT_ALL_ZERO 2
 
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
+#ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
 
 #include "fa_types.glsl"
 
@@ -120,6 +133,13 @@ layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 // through dequantize4 / the MMQ helpers to unpack from the packed block layout.
 #define USE_DECODE_K (FaTypeK != GGML_TYPE_F16)
 #define USE_DECODE_V (FaTypeV != GGML_TYPE_F16)
+// Vocabulary bridge: the FA shaders (shared with the TBQ compile-time path) use
+// FA_BLOCK_BYTES_K/V; in the b9518 runtime model these are the spec constants.
+#define FA_BLOCK_BYTES_K FaBlockBytesK
+#define FA_BLOCK_BYTES_V FaBlockBytesV
+#else
+#include "turbo-quant/flash_attn_base.glsl"
+#endif
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
@@ -233,9 +253,13 @@ void init_indices()
         start_j = min(split_k_index * per_blocks, total_blocks);
         end_j   = min((split_k_index + 1) * per_blocks, total_blocks);
     }
+
+    if (USE_KV_ROWS) {
+        sparse_base = iq3 * KV;
+    }
 }
 
-// Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
+// Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, kv_rows padding, or dense OOB).
 bool fa_kv_index(uint lin, out uint kv_col) {
     if (USE_SPARSE) {
         if (lin >= p.split_kv) {
@@ -246,7 +270,62 @@ bool fa_kv_index(uint lin, out uint kv_col) {
         kv_col = idx >= 0 ? uint(idx) : 0;
         return idx >= 0;
     }
+    if (USE_KV_ROWS) {
+        if (KV_bounds_check && lin >= KV) {
+            kv_col = 0;
+            return false;
+        }
+        int idx = data_sparse[sparse_base + lin];
+        kv_col = idx >= 0 ? uint(idx) : 0;
+        return idx >= 0;
+    }
     kv_col = lin;
+    return !KV_bounds_check || lin < KV;
+}
+
+// kv_rows: KV block state set by fa_kv_rows_tile(), whether the rows of the block are consecutive in the cache from
+// kv_tile_r0; such a block is read like the dense cache.
+bool kv_tile_dense = false;
+uint kv_tile_r0 = 0;
+
+void fa_kv_rows_tile(uint j) {
+    // binding 7 holds the lists [neq3][KV], then the first row of every KV block with consecutive rows or -1
+    // [neq3][CEIL_DIV(KV, Bc)], written by flash_attn_kv_rows_blocks.comp
+    const int r0 = data_sparse[p.neq3 * KV + iq3 * CEIL_DIV(KV, Bc) + j];
+    kv_tile_dense = r0 >= 0;
+    kv_tile_r0 = uint(max(r0, 0));
+}
+
+// Cache row of the first column of KV block j, for loads of whole consecutive blocks.
+uint fa_kv_tile_row0(uint j) {
+    return USE_KV_ROWS ? kv_tile_r0 : j * Bc;
+}
+
+// fa_kv_index for column c of KV block j, without the index load when the block's rows are consecutive.
+bool fa_kv_index_tile(uint j, uint c, out uint kv_col) {
+    if (USE_KV_ROWS && kv_tile_dense) {
+        kv_col = kv_tile_r0 + c;
+        return true;
+    }
+    return fa_kv_index(j * Bc + c, kv_col);
+}
+
+// Column c of KV block j: through the index lists when gather, otherwise from the first row of the block (the dense
+// cache, or a kv_rows block with consecutive rows). gather is a constant in each compiled copy of the K/V loops.
+bool fa_kv_index_block(const bool gather, uint j, uint c, out uint kv_col) {
+    if (gather) {
+        return fa_kv_index(j * Bc + c, kv_col);
+    }
+    kv_col = fa_kv_tile_row0(j) + c;
+    return !KV_bounds_check || j * Bc + c < KV;
+}
+
+// Mask column of a linear KV slot: the gathered column for sparse, the slot itself otherwise (dense and kv_rows).
+bool fa_mask_index(uint lin, out uint m_col) {
+    if (USE_SPARSE) {
+        return fa_kv_index(lin, m_col);
+    }
+    m_col = lin;
     return !KV_bounds_check || lin < KV;
 }
 

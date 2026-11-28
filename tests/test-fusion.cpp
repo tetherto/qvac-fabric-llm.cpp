@@ -470,10 +470,11 @@ int main(int argc, char ** argv) {
                     if (fused == 0 && unfused == 0) {
                         continue;
                     }
+                    // several patterns may share a label, so sum their counts
                     auto & d = mdata[labels[i]][mi];
-                    d.present       = true;
-                    d.count_fused   = fused;
-                    d.count_unfused = unfused;
+                    d.present        = true;
+                    d.count_fused   += fused;
+                    d.count_unfused += unfused;
                     d.nmse_fus      = nmse_fus;
                     d.nmse_dev      = nmse_dev;
                     d.ok_nmse       = nmse_fus <= 1e-4;

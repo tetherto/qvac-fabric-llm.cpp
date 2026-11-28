@@ -1,0 +1,340 @@
+# Cross-platform lanes for the engines (parakeet/, tts/,
+# audiogen/ — parakeet/tts moved from parakeet-cpp/, tts-cpp/ by the
+# repo reorg QIP PR 1; audiogen (ACE-Step) added as its own engine folder).
+#
+# Complements parakeet-ci.yml / tts-ci.yml (linux+mac build+test):
+#   - windows: full build + non-GPU ctest (MSVC, static ggml)
+#   - android: compile smoke, arm64-v8a via NDK (no device to run tests on)
+#   - ios:     compile smoke, arm64 device slice, Metal embedded (flags
+#              mirror build-xcframework.sh)
+# On-device e2e stays downstream in tetherto/qvac; these lanes exist to
+# catch cross-compile/link breaks *before* the registry pin chain.
+name: engines cross CI
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'engines/speech/parakeet/**'
+      - 'engines/speech/tts/**'
+      - 'engines/speech/audiogen/**'
+      - 'engines/speech/coreml/**'
+      - 'engines/speech/third_party/whisper.cpp/**'
+      - 'engines/speech/CMakeLists.txt'
+      - 'engines/speech/cmake/**'
+      - 'engines/speech/scripts/**'
+      - 'engines/speech/test/**'
+      - 'engines/speech/whisper-gpu-picker*'
+      - 'engines/speech/ci/runners.yaml'
+      - '.github/workflows/speech-reusable-runner-names.yml'
+      - 'engines/speech/ci/scripts/**'
+      - 'ggml/**'
+      - '.github/workflows/speech-engines-cross-ci.yml'
+  pull_request:
+    paths:
+      - 'engines/speech/parakeet/**'
+      - 'engines/speech/tts/**'
+      - 'engines/speech/audiogen/**'
+      - 'engines/speech/coreml/**'
+      - 'engines/speech/third_party/whisper.cpp/**'
+      - 'engines/speech/CMakeLists.txt'
+      - 'engines/speech/cmake/**'
+      - 'engines/speech/scripts/**'
+      - 'engines/speech/test/**'
+      - 'engines/speech/whisper-gpu-picker*'
+      - 'engines/speech/ci/runners.yaml'
+      - '.github/workflows/speech-reusable-runner-names.yml'
+      - 'engines/speech/ci/scripts/**'
+      - 'ggml/**'
+      - '.github/workflows/speech-engines-cross-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Dedupe per PR and per branch: a re-push or re-dispatch supersedes the
+# in-flight run. The guard below previously excluded every event but
+# pull_request, so a push or a re-dispatch stacked a second run instead of
+# replacing the first.
+#
+# master is exempt on purpose — pushes to the default branch must not cancel
+# each other, or a merged commit ends with no CI verdict.
+concurrency:
+  group: engines-cross-ci-${{ (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: engines/speech
+
+jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/speech-reusable-runner-names.yml
+
+  changes:
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.ubuntu_2404 }}
+    timeout-minutes: 5
+    outputs:
+      windows: ${{ steps.matrix.outputs.windows }}
+      windows_enabled: ${{ steps.matrix.outputs.windows_enabled }}
+      android: ${{ steps.matrix.outputs.android }}
+      android_enabled: ${{ steps.matrix.outputs.android_enabled }}
+      ios: ${{ steps.matrix.outputs.ios }}
+      ios_enabled: ${{ steps.matrix.outputs.ios_enabled }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test engine selection
+        run: node --test ci/scripts/test/engine-matrix.test.mjs
+      - name: Select affected engines
+        id: matrix
+        run: node ci/scripts/select-engine-matrix.mjs
+
+  windows:
+    name: windows (${{ matrix.engine }})
+    needs: [runner_names, changes]
+    if: needs.changes.outputs.windows_enabled == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.windows) }}
+    runs-on: ${{ needs.runner_names.outputs.windows_2022 }}
+    timeout-minutes: 90
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/engines/speech/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}/engines/speech
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 500M
+    defaults:
+      run:
+        shell: bash
+        working-directory: engines/speech
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install ccache
+        run: choco install ccache --yes --no-progress
+      - name: Cache engine objects
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/.ccache
+          key: ccache-cross-windows-msvc-ninja-v1-${{ matrix.engine }}-${{ github.sha }}
+          restore-keys: |
+            ccache-cross-windows-msvc-ninja-v1-${{ matrix.engine }}-
+            ccache-cross-windows-msvc-ninja-v1-${{ matrix.engine }}-
+
+      - name: Resolve the in-tree ggml revision
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ggml install
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/ggml-install
+          key: ggml-install-portable-windows-2022-msvc-static-${{ steps.ggml.outputs.sha }}
+
+      # Static ggml on Windows sidesteps DLL discovery for the test exes.
+      - name: Build ggml (MSVC, static, CPU-only)
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build --config Release -j4
+          cmake --install ggml-src/build --config Release
+
+      - name: Configure
+        run: |
+          cmake -S ${{ matrix.src }} -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            ${{ matrix.cmake_flags }} \
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
+
+      - name: Build
+        run: cmake --build build --config Release -j4
+
+      - name: Report compiler cache statistics
+        if: always()
+        run: ccache --show-stats
+
+      - name: Test (non-GPU)
+        run: ctest --test-dir build -C Release -LE 'gpu|perf' --output-on-failure --timeout 600
+
+  android:
+    name: android (${{ matrix.engine }})
+    needs: [runner_names, changes]
+    if: needs.changes.outputs.android_enabled == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.android) }}
+    runs-on: ${{ needs.runner_names.outputs.ubuntu_2404 }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the in-tree ggml revision
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ggml install
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/ggml-install
+          key: ggml-install-android-arm64-${{ steps.ggml.outputs.sha }}
+
+      - name: Build ggml (NDK arm64-v8a, static, CPU-only)
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j4
+          cmake --install ggml-src/build
+
+      # Compile smoke only: hosted runners can't execute arm64 Android
+      # binaries. CMAKE_FIND_ROOT_PATH (not PREFIX_PATH) because the NDK
+      # toolchain restricts find_package() to the find-root.
+      - name: Configure + build engine (compile smoke)
+        run: |
+          cmake -S ${{ matrix.src }} -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            ${{ matrix.cmake_flags }} \
+            -DCMAKE_FIND_ROOT_PATH="$PWD/ggml-install"
+          cmake --build build -j4
+
+  ios:
+    name: ios (${{ matrix.engine }})
+    needs: [runner_names, changes]
+    if: needs.changes.outputs.ios_enabled == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.ios) }}
+    runs-on: ${{ needs.runner_names.outputs.macos_14 }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the in-tree ggml revision
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ggml install
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/ggml-install
+          key: ggml-install-ios-arm64-${{ steps.ggml.outputs.sha }}
+
+      # Flags mirror build-xcframework.sh's iOS-device slice (Metal embedded).
+      - name: Build ggml (iOS device arm64, static, Metal embedded)
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.4 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_METAL_USE_BF16=ON \
+            -DGGML_OPENMP=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j4
+          cmake --install ggml-src/build
+
+      # Compile smoke only (no iOS device on hosted runners).
+      - name: Configure + build engine (compile smoke)
+        run: |
+          cmake -S ${{ matrix.src }} -B build \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.4 \
+            -DCMAKE_BUILD_TYPE=Release \
+            ${{ matrix.cmake_flags }} \
+            -DCMAKE_FIND_ROOT_PATH="$PWD/ggml-install"
+          cmake --build build -j4
+
+
+  # Shared Core ML runtime (coreml): tts-cpp, qvac-parakeet and
+  # audiogen each compile their own copy in their own namespace. This builds
+  # the umbrella with all three Core ML options on; test-coreml-link links the
+  # three libraries and every runtime copy into one binary (any symbol that
+  # escaped its namespace is a duplicate), then runs each copy.
+  macos-coreml-link:
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.macos_14 }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the in-tree ggml revision
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
+
+      # Same CPU-only shared build (and cache key) as parakeet-ci's macos-14 lane.
+      - name: Cache ggml install
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/ggml-install
+          key: ggml-install-portable-macos-14-${{ steps.ggml.outputs.sha }}
+
+      - name: Build ggml (CPU-only, shared)
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_METAL=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j4
+          cmake --install ggml-src/build
+
+      - name: Configure (umbrella, Core ML on for all three engines)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSPEECH_BUILD_WHISPER=OFF \
+            -DSPEECH_BUILD_EXECUTABLES=OFF \
+            -DSPEECH_BUILD_TESTS=ON \
+            -DTTS_CPP_COREML=ON \
+            -DPARAKEET_COREML=ON \
+            -DAUDIOGEN_COREML=ON \
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
+
+      - name: Build test-coreml-link
+        run: cmake --build build -j4 --target test-coreml-link
+
+      - name: Test (test-coreml-link)
+        run: ctest --test-dir build -R '^test-coreml-link$' --no-tests=error --output-on-failure --timeout 300

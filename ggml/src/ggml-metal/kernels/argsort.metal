@@ -249,30 +249,35 @@ static inline uint ggml_top_k_f2ui(float x) {
     return y;
 }
 
-kernel void kernel_top_k_f32_i32(
-        constant   ggml_metal_kargs_top_k & args,
-        device   const char * src0,
-        device      int32_t * dst,
-        threadgroup atomic_uint * histo     [[threadgroup(0)]],
-        threadgroup        uint * sh_bucket [[threadgroup(1)]],
-        threadgroup        uint * sh_above  [[threadgroup(2)]],
-        uint3   tgpig[[threadgroup_position_in_grid]],
-        ushort3 tpitg[[thread_position_in_threadgroup]],
-        ushort3   ntg[[threads_per_threadgroup]]) {
+// the columns of a row segment starting at base
+struct ggml_top_k_row {
+    device const float * row;
+    uint base;
 
-    const uint ncols = args.ne00;
-    const uint top_k = args.top_k;
-    const uint i01   = tgpig[0];
-    const uint i02   = tgpig[1];
-    const uint i03   = tgpig[2];
+    uint    key   (uint i) const { return ggml_top_k_f2ui(row[base + i]); }
+    int32_t column(uint i) const { return (int32_t) (base + i); }
+};
 
-    device const float * src0_row = (device const float *) (src0 + args.nb01*i01 + args.nb02*i02 + args.nb03*i03);
+// candidate columns of a row, picked by the chunk pass of the chunked top-k
+struct ggml_top_k_candidates {
+    device const float   * row;
+    device const int32_t * cand;
 
-    device int32_t * dst_row = dst + top_k*(i01 + args.ne01*i02 + args.ne01*args.ne02*i03);
+    uint    key   (uint i) const { return ggml_top_k_f2ui(row[cand[i]]); }
+    int32_t column(uint i) const { return cand[i]; }
+};
 
-    const uint tid = tpitg.x;
-    const uint ntg_x = ntg.x;
-
+template<typename Src, bool col_order>
+inline void ggml_top_k_radix_select(
+        Src src,
+        uint ncols,
+        uint top_k,
+        device int32_t * dst_row,
+        threadgroup atomic_uint * histo,
+        threadgroup        uint * sh_bucket,
+        threadgroup        uint * sh_above,
+        uint tid,
+        uint ntg_x) {
     uint prefix  = 0;     // fixed high bits of the threshold key
     uint desired = top_k; // count still needed from the candidate range
 
@@ -286,7 +291,7 @@ kernel void kernel_top_k_f32_i32(
         const uint prefix_hi = prefix & hi_mask;
 
         for (uint i = tid; i < ncols; i += ntg_x) {
-            const uint key = ggml_top_k_f2ui(src0_row[i]);
+            const uint key = src.key(i);
             if ((key & hi_mask) == prefix_hi) {
                 atomic_fetch_add_explicit(&histo[(key >> uint(shift)) & 0xFFu], 1u, memory_order_relaxed);
             }
@@ -346,7 +351,7 @@ kernel void kernel_top_k_f32_i32(
     uint ca = 0; // elements above the threshold in this lane's substream
     uint ct = 0; // elements tied with the threshold in this lane's substream
     for (uint i = wlo + lane; i < whi; i += 32u) {
-        const uint key = ggml_top_k_f2ui(src0_row[i]);
+        const uint key = src.key(i);
         ca += (key >  threshold) ? 1u : 0u;
         ct += (key == threshold) ? 1u : 0u;
     }
@@ -392,24 +397,46 @@ kernel void kernel_top_k_f32_i32(
     const uint excl_a = simd_prefix_exclusive_sum(ca);
     const uint excl_t = simd_prefix_exclusive_sum(ct);
 
-    if (tie_total <= top_k - above_total) {
+    if (col_order) {
+        const uint n_free  = top_k - above_total;
+        const uint prior_t = base_wt - above_total;
+        const uint base_wk = base_wa + MIN(prior_t, n_free);
+
+        uint tt = 0;
+        uint nk = 0;
+        for (uint s = 0; s < nstep; ++s) {
+            const uint i    = wlo + 32u*s + lane;
+            const bool ok   = i < whi;
+            const uint key  = ok ? src.key(i) : 0u;
+            const bool a    = ok && key >  threshold;
+            const bool t    = ok && key == threshold;
+            const uint post = prior_t + tt + simd_prefix_exclusive_sum((uint) t);
+            const bool keep = a || (t && post < n_free);
+            const uint pos  = base_wk + nk + simd_prefix_exclusive_sum((uint) keep);
+            if (keep) {
+                dst_row[pos] = src.column(i);
+            }
+            tt += simd_sum((uint) t);
+            nk += simd_sum((uint) keep);
+        }
+    } else if (tie_total <= top_k - above_total) {
         uint na = 0;
         uint nt = 0;
         for (uint i = wlo + lane; i < whi; i += 32u) {
-            const uint key = ggml_top_k_f2ui(src0_row[i]);
+            const uint key = src.key(i);
             if (key > threshold) {
-                dst_row[base_wa + excl_a + na] = (int32_t) i;
+                dst_row[base_wa + excl_a + na] = src.column(i);
                 ++na;
             } else if (key == threshold) {
-                dst_row[base_wt + excl_t + nt] = (int32_t) i;
+                dst_row[base_wt + excl_t + nt] = src.column(i);
                 ++nt;
             }
         }
     } else {
         uint na = 0;
         for (uint i = wlo + lane; i < whi; i += 32u) {
-            if (ggml_top_k_f2ui(src0_row[i]) > threshold) {
-                dst_row[base_wa + excl_a + na] = (int32_t) i;
+            if (src.key(i) > threshold) {
+                dst_row[base_wa + excl_a + na] = src.column(i);
                 ++na;
             }
         }
@@ -418,14 +445,83 @@ kernel void kernel_top_k_f32_i32(
         for (uint s = 0; s < nstep; ++s) {
             const uint i   = wlo + 32u*s + lane;
             const bool ok  = i < whi;
-            const bool t   = ok && ggml_top_k_f2ui(src0_row[i]) == threshold;
+            const bool t   = ok && src.key(i) == threshold;
             const uint pos = base_wt + tt + simd_prefix_exclusive_sum((uint) t);
             if (t && pos < top_k) {
-                dst_row[pos] = (int32_t) i;
+                dst_row[pos] = src.column(i);
             }
             tt += simd_sum((uint) t);
         }
     }
+}
+
+inline device const float * ggml_top_k_src_row(constant ggml_metal_kargs_top_k & args, device const char * src0, uint i01, uint i02, uint i03) {
+    return (device const float *) (src0 + args.nb01*i01 + args.nb02*i02 + args.nb03*i03);
+}
+
+inline uint ggml_top_k_row_index(constant ggml_metal_kargs_top_k & args, uint i01, uint i02, uint i03) {
+    return i01 + args.ne01*i02 + args.ne01*args.ne02*i03;
+}
+
+kernel void kernel_top_k_f32_i32(
+        constant   ggml_metal_kargs_top_k & args,
+        device   const char * src0,
+        device      int32_t * dst,
+        threadgroup atomic_uint * histo     [[threadgroup(0)]],
+        threadgroup        uint * sh_bucket [[threadgroup(1)]],
+        threadgroup        uint * sh_above  [[threadgroup(2)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const ggml_top_k_row src = { ggml_top_k_src_row(args, src0, tgpig[0], tgpig[1], tgpig[2]), 0 };
+
+    device int32_t * dst_row = dst + args.top_k*ggml_top_k_row_index(args, tgpig[0], tgpig[1], tgpig[2]);
+
+    ggml_top_k_radix_select<ggml_top_k_row, false>(src, args.ne00, args.top_k, dst_row, histo, sh_bucket, sh_above, tpitg.x, ntg.x);
+}
+
+// chunked top-k, pass 1: the top_k columns of each chunk of a row (the last chunk also takes the remainder)
+kernel void kernel_top_k_chunk_f32_i32(
+        constant   ggml_metal_kargs_top_k & args,
+        device   const char * src0,
+        device      int32_t * cand,
+        threadgroup atomic_uint * histo     [[threadgroup(0)]],
+        threadgroup        uint * sh_bucket [[threadgroup(1)]],
+        threadgroup        uint * sh_above  [[threadgroup(2)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const uint chunk = tgpig[0] % args.n_chunks;
+    const uint i01   = tgpig[0] / args.n_chunks;
+
+    const uint c0 = chunk*args.chunk;
+    const uint n  = chunk == uint(args.n_chunks - 1) ? args.ne00 - c0 : args.chunk;
+
+    const ggml_top_k_row src = { ggml_top_k_src_row(args, src0, i01, tgpig[1], tgpig[2]), c0 };
+
+    device int32_t * cand_row = cand + args.top_k*(chunk + args.n_chunks*ggml_top_k_row_index(args, i01, tgpig[1], tgpig[2]));
+
+    ggml_top_k_radix_select<ggml_top_k_row, true>(src, n, args.top_k, cand_row, histo, sh_bucket, sh_above, tpitg.x, ntg.x);
+}
+
+// chunked top-k, pass 2: the top_k columns of a row among the n_chunks*top_k candidates of pass 1
+kernel void kernel_top_k_merge_chunks_f32_i32(
+        constant   ggml_metal_kargs_top_k & args,
+        device   const char * src0,
+        device      int32_t * dst,
+        device const int32_t * cand,
+        threadgroup atomic_uint * histo     [[threadgroup(0)]],
+        threadgroup        uint * sh_bucket [[threadgroup(1)]],
+        threadgroup        uint * sh_above  [[threadgroup(2)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const uint row = ggml_top_k_row_index(args, tgpig[0], tgpig[1], tgpig[2]);
+    const uint n   = args.n_chunks*args.top_k;
+
+    const ggml_top_k_candidates src = { ggml_top_k_src_row(args, src0, tgpig[0], tgpig[1], tgpig[2]), cand + n*row };
+
+    ggml_top_k_radix_select<ggml_top_k_candidates, false>(src, n, args.top_k, dst + args.top_k*row, histo, sh_bucket, sh_above, tpitg.x, ntg.x);
 }
 
 // fused SOFT_MAX or sqrt(softplus) + top-k + GET_ROWS (+ optional norm/scale) for MoE routing.

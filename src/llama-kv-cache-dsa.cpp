@@ -98,6 +98,10 @@ llama_pos llama_kv_cache_dsa::seq_pos_max(llama_seq_id seq_id) const {
     return kv_mla->seq_pos_max(seq_id);
 }
 
+uint32_t llama_kv_cache_dsa::seq_token_count(llama_seq_id seq_id) const {
+    return kv_mla->seq_token_count(seq_id);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsa::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = kv_mla->memory_breakdown();
     for (const auto & buft_size : kv_lid->memory_breakdown()) {
@@ -170,16 +174,20 @@ void llama_kv_cache_dsa::state_write(llama_io_write_i & io, llama_seq_id seq_id,
 }
 
 void llama_kv_cache_dsa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    kv_mla->state_read(io, seq_id, flags);
-
     try {
+        kv_mla->state_read(io, seq_id, flags);
         kv_lid->state_read(io, seq_id, flags);
     } catch (...) {
-        // the MLA part is already restored - undo it, so that a failed restore leaves nothing behind
-        kv_mla->state_clear(seq_id);
+        // a failed restore drops the sequence from every cache
+        state_clear(seq_id);
 
         throw;
     }
+}
+
+void llama_kv_cache_dsa::state_clear(llama_seq_id seq_id) {
+    kv_mla->state_clear(seq_id);
+    kv_lid->state_clear(seq_id);
 }
 
 llama_kv_cache * llama_kv_cache_dsa::get_mla() const {

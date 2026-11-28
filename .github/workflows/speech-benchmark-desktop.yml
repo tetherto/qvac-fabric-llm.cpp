@@ -1,0 +1,831 @@
+# Desktop-only speech benchmark workflow.
+#
+# workflow_dispatch only — never on push/PR. The full matrix downloads
+# several GB of GGUFs and pulls a self-hosted macOS runner, so it must be
+# human-driven.
+#
+# The per-family bench spec (S3 paths, build target, CLI args) lives in
+# scripts/benchmarks/families.json so editing a family doesn't touch this YAML.
+
+name: speech-benchmark-desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_families:
+        description: >-
+          Comma-separated family names, or "all". Families:
+          whisper, parakeet (TDT), parakeet-unified, parakeet-eou, parakeet-nemotron
+          (Core ML vs Metal on macOS), parakeet-ctc, parakeet-indic, sortformer,
+          sortformer-streaming, nemotron-diarization, moss-transcribe, vad, vad-v6,
+          chatterbox, chatterbox-multilingual, supertonic, supertonic1, supertonic2,
+          parler, parler-indic, cosyvoice, audio8, audio8-tts, lavasr, acestep, minimax.
+          Opt-in families (large downloads, macOS only) are left out of "all" and must
+          be named: moss-tts, moss-sfx, moss-speech.
+        required: false
+        default: "all"
+        type: string
+      runners:
+        description: >-
+          Comma-separated runner labels. Supported: linux, macos.
+          (Linux = ubuntu-24.04 hosted; macos = qvac-macos26-arm64-gpu self-hosted.)
+        required: false
+        default: "linux,macos"
+        type: string
+      whisper_sizes:
+        description: >-
+          Comma-separated whisper model sizes to benchmark (tiny, base, small).
+          Larger sizes are excluded per the task to preserve runner minutes.
+        required: false
+        default: "tiny,base,small"
+        type: string
+      music_alignment:
+        description: "Opt-in CLAP music diagnostics (longer generation with retained WAVs; no quality gate)"
+        required: false
+        default: false
+        type: boolean
+      minimax_model_dir:
+        description: "Optional prepared MiniMax q4_k_m bundle directory on the runner (including provenance.json). Empty: prepare/cache from pinned Hugging Face sources."
+        required: false
+        default: ""
+        type: string
+      minimax_artifact_run_id:
+        description: "Optional workflow run ID containing minimax-models-q4_k_m-macos; downloads and verifies that bundle on this runner."
+        required: false
+        default: ""
+        type: string
+      publish_minimax_models:
+        description: "Publish the verified MiniMax bundle from macOS for reuse by another benchmark run (large artifact)."
+        required: false
+        default: false
+        type: boolean
+      audio8_pcm_streaming:
+        description: "Compare Audio8 batch and incremental PCM latency; retain logs, codes and WAVs (select audio8-tts)."
+        required: false
+        default: false
+        type: boolean
+      runs_per_bench:
+        description: "Timed iterations per bench (median reported). Positive integer, max 20."
+        required: false
+        default: "3"
+        type: string
+
+# Default to least-privilege at workflow level; the bench job elevates
+# id-token: write for AWS OIDC only where it's needed.
+permissions:
+  contents: read
+
+# Serialize dispatches. `concurrency` only orders whole dispatches — the
+# matrix fan-out inside one dispatch is still parallel, but GHA queues
+# same-label jobs on the self-hosted runner sequentially anyway. The
+# guarantee this provides is that the workspace-wipe step at the start of
+# each dispatch can't overlap with another dispatch's bench in progress.
+# cancel-in-progress: false so a running dispatch always finishes —
+# reviewers relying on a result won't have it silently cancelled by the
+# next person hitting Run.
+concurrency:
+  group: speech-benchmark-desktop
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-central-1
+  # Whitelist of every family in scripts/benchmarks/families.json, opt-in ones
+  # included. The plan job derives the "all" expansion, per-family runner
+  # restrictions and timeouts from families.json itself;
+  # scripts/benchmarks/test-run-family.sh pins this list to the spec's keys.
+  ALL_FAMILIES: "whisper,parakeet,parakeet-unified,parakeet-eou,parakeet-nemotron,parakeet-ctc,parakeet-indic,sortformer,sortformer-streaming,nemotron-diarization,moss-transcribe,vad,vad-v6,chatterbox,chatterbox-multilingual,supertonic,supertonic1,supertonic2,parler,parler-indic,cosyvoice,audio8,audio8-tts,moss-tts,moss-sfx,moss-speech,lavasr,acestep,minimax"
+  FAMILIES_SPEC: scripts/benchmarks/families.json
+
+defaults:
+  run:
+    working-directory: engines/speech
+
+jobs:
+  # ---------- 1. Expand inputs into a matrix ------------------------------
+  # SECURITY: every input token is whitelisted against ALL_FAMILIES /
+  # {linux,macos} / {tiny,base,small} / positive-int before it enters
+  # the matrix. Values in the matrix are later interpolated into shell
+  # (see the bench job's steps), so untrusted strings could otherwise
+  # become command injection.
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.expand.outputs.matrix }}
+      runs_per_bench: ${{ steps.expand.outputs.runs_per_bench }}
+      expected_count: ${{ steps.expand.outputs.expected_count }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Fail the whole dispatch before any runner minutes are spent when the
+      # bench driver or the family spec regressed — the suite runs the driver
+      # against stub binaries, so it needs neither models nor engines.
+      - name: Bench driver self-check
+        run: |
+          scripts/benchmarks/test-run-family.sh
+          python3 -B scripts/benchmarks/test_tts_intelligibility.py
+          python3 -B scripts/benchmarks/test-tts-intelligibility-driver.py
+          python3 -B scripts/benchmarks/test_audio_quality.py
+          python3 -B scripts/benchmarks/test-audio-quality-driver.py
+          python3 -B scripts/benchmarks/test_minimax_preparation.py
+          python3 -B scripts/benchmarks/test_music_model_validation.py
+          python3 -B scripts/benchmarks/test_audio8_streaming.py
+          scripts/benchmarks/desktop-weekly/test-desktop-weekly.sh
+
+      - id: expand
+        env:
+          IN_FAMILIES: ${{ inputs.model_families }}
+          IN_RUNNERS:  ${{ inputs.runners }}
+          IN_WHISPER:  ${{ inputs.whisper_sizes }}
+          IN_RUNS:     ${{ inputs.runs_per_bench }}
+          IN_MINIMAX_DIR: ${{ inputs.minimax_model_dir }}
+          IN_MINIMAX_RUN: ${{ inputs.minimax_artifact_run_id }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$IN_MINIMAX_RUN" ]] && ! [[ "$IN_MINIMAX_RUN" =~ ^[1-9][0-9]*$ ]]; then
+            echo "minimax_artifact_run_id must be a positive workflow run ID" >&2; exit 1
+          fi
+          if [[ -n "$IN_MINIMAX_RUN" && -n "$IN_MINIMAX_DIR" ]]; then
+            echo "choose minimax_model_dir or minimax_artifact_run_id, not both" >&2; exit 1
+          fi
+
+          # runs_per_bench: strict positive-int with a small cap so a fat-finger
+          # ("1e999" / "3;echo") can't derail --runs / jq --argjson downstream.
+          if ! [[ "$IN_RUNS" =~ ^[1-9][0-9]*$ ]] || (( IN_RUNS > 20 )); then
+            echo "rejected runs_per_bench=$IN_RUNS (must be a positive integer <= 20)" >&2
+            exit 1
+          fi
+          echo "runs_per_bench=$IN_RUNS" >> "$GITHUB_OUTPUT"
+
+          # "all" (or empty, since the dispatch UI can save an empty string as
+          # a default) → every family the spec does not mark opt_in; otherwise
+          # split the comma list. Opt-in families stay in the whitelist so
+          # they can be named explicitly.
+          if [[ "$IN_FAMILIES" == "all" || -z "$IN_FAMILIES" ]]; then
+            families="$(jq -r '[to_entries[] | select(.key | startswith("_") | not)
+              | select(.value.opt_in != true) | .key] | join(",")' "$FAMILIES_SPEC")"
+          else
+            families="$IN_FAMILIES"
+          fi
+          # Empty runners / whisper_sizes: default to the same value the
+          # workflow_dispatch input shows so a Run-with-defaults dispatch
+          # never expands to an empty matrix (which passes the
+          # `matrix != ''` guard and then fails bench).
+          if [[ -z "$IN_RUNNERS" ]]; then IN_RUNNERS="linux,macos";     fi
+          if [[ -z "$IN_WHISPER" ]]; then IN_WHISPER="tiny,base,small"; fi
+
+          valid_family() {
+            case ",$ALL_FAMILIES," in
+              *",$1,"*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          # Runner labels a family accepts: its `runners` list in
+          # families.json, or every label when the field is absent.
+          family_accepts_runner() {
+            local allowed
+            allowed="$(jq -r --arg f "$1" '.[$f].runners // [] | join(",")' "$FAMILIES_SPEC")"
+            [[ -z "$allowed" ]] && return 0
+            case ",$allowed," in
+              *",$2,"*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          family_timeout_minutes() {
+            jq -r --arg f "$1" '.[$f].timeout_minutes // 60' "$FAMILIES_SPEC"
+          }
+          valid_size() {
+            case "$1" in tiny|base|small) return 0 ;; *) return 1 ;; esac
+          }
+
+          # Map runner labels -> matrix entries. `os` is the GHA `runs-on`
+          # value; `label` is the friendly name we surface in the summary table.
+          runners_json="[]"
+          IFS=',' read -ra rlabels <<< "$IN_RUNNERS"
+          for r in "${rlabels[@]}"; do
+            r_trim="$(echo "$r" | xargs)"
+            case "$r_trim" in
+              linux) runners_json="$(echo "$runners_json" | jq -c '. + [{"label":"linux","os":"ubuntu-24.04"}]')" ;;
+              macos) runners_json="$(echo "$runners_json" | jq -c '. + [{"label":"macos","os":"qvac-macos26-arm64-gpu"}]')" ;;
+              *) echo "rejected runner label: $r_trim (allowed: linux, macos)" >&2; exit 1 ;;
+            esac
+          done
+
+          IFS=',' read -ra raw_sizes <<< "$IN_WHISPER"
+          whisper_sizes_json="[]"
+          for s in "${raw_sizes[@]}"; do
+            s_trim="$(echo "$s" | xargs)"
+            [[ -z "$s_trim" ]] && continue
+            if ! valid_size "$s_trim"; then
+              echo "rejected whisper size: $s_trim (allowed: tiny, base, small)" >&2; exit 1
+            fi
+            whisper_sizes_json="$(echo "$whisper_sizes_json" | jq -c --arg s "$s_trim" '. + [$s]')"
+          done
+
+          cells="[]"
+          IFS=',' read -ra flist <<< "$families"
+          for f in "${flist[@]}"; do
+            f_trim="$(echo "$f" | xargs)"
+            [[ -z "$f_trim" ]] && continue
+            if ! valid_family "$f_trim"; then
+              echo "rejected family: $f_trim (allowed: $ALL_FAMILIES)" >&2; exit 1
+            fi
+            timeout_minutes="$(family_timeout_minutes "$f_trim")"
+            for r in $(echo "$runners_json" | jq -c '.[]'); do
+              r_label="$(echo "$r" | jq -r '.label')"
+              if ! family_accepts_runner "$f_trim" "$r_label"; then
+                echo "::notice::$f_trim is restricted to $(jq -r --arg f "$f_trim" '.[$f].runners | join(",")' "$FAMILIES_SPEC"); skipping the $r_label cell"
+                continue
+              fi
+              if [[ "$f_trim" == "whisper" ]]; then
+                for s in $(echo "$whisper_sizes_json" | jq -r '.[]'); do
+                  cells="$(echo "$cells" | jq -c --arg fam "$f_trim" --arg size "$s" --argjson r "$r" --argjson t "$timeout_minutes" \
+                    '. + [{"family":$fam,"whisper_size":$size,"runner_label":$r.label,"runner_os":$r.os,"timeout_minutes":$t}]')"
+                done
+              else
+                cells="$(echo "$cells" | jq -c --arg fam "$f_trim" --argjson r "$r" --argjson t "$timeout_minutes" \
+                  '. + [{"family":$fam,"whisper_size":"","runner_label":$r.label,"runner_os":$r.os,"timeout_minutes":$t}]')"
+              fi
+            done
+          done
+
+          # A selection whose families accept none of the requested runners
+          # (model_families=moss-tts with runners=linux) would emit an empty
+          # include list; the bench job's `matrix != ''` guard only catches
+          # an unset output, and GitHub rejects an empty matrix at expansion
+          # time with an opaque error. Refuse it here, naming the cause.
+          if [[ "$(echo "$cells" | jq 'length')" -eq 0 ]]; then
+            echo "no benchmark cells: families '$families' accept none of the requested runners ($IN_RUNNERS); check their 'runners' field in $FAMILIES_SPEC" >&2
+            exit 1
+          fi
+          matrix="$(jq -c -n --argjson include "$cells" '{include: $include}')"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          # expected_count feeds summarize.py's absent-row check. A cell that
+          # dies before its pre-flight seed writes result.json contributes no
+          # artifact — comparing against the plan count lets summarize.py
+          # notice the gap instead of finishing green with a half-empty table.
+          expected="$(echo "$cells" | jq 'length')"
+          echo "expected_count=$expected" >> "$GITHUB_OUTPUT"
+          echo "planned matrix ($expected cells):"
+          echo "$matrix" | jq .
+
+  # ---------- 2. Bench a single (family, runner) cell ---------------------
+  # 60-minute default timeout: a cold cache cell on macos does a full ggml
+  # build (~15 min) + all-engine cmake configure (~2 min) + up to 5 GB of S3
+  # downloads (~10 min on typical bandwidth) + ~3x 60 s bench iterations
+  # for the heaviest default family (acestep). 60 minutes gives headroom
+  # without inviting runaway hangs. A family whose download alone eats that
+  # budget (the opt-in MOSS checkpoints) raises `timeout_minutes` in
+  # families.json, which the plan job copies into its cells. Opt-in MiniMax
+  # gets 180 minutes for its larger checkpoint preparation and generation;
+  # resource preflight runs first.
+  bench:
+    needs: plan
+    if: ${{ needs.plan.outputs.matrix != '' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner_os }}
+    continue-on-error: true
+    timeout-minutes: ${{ inputs.music_alignment && matrix.family == 'minimax' && 180 || matrix.timeout_minutes }}
+    # id-token: write scoped to the one job that actually consumes it
+    # (aws-actions/configure-aws-credentials for the S3 model fetch).
+    # plan and summarize inherit the workflow-level contents: read only.
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    # Every step that touches user-influenced matrix values reads them via
+    # env instead of ${{ ... }} interpolation, so a malformed family/size
+    # never lands unquoted inside a shell string. (plan already whitelists,
+    # this is defence in depth.)
+    env:
+      FAMILY:       ${{ matrix.family }}
+      WHISPER_SIZE: ${{ matrix.whisper_size }}
+      RUNNER_LABEL: ${{ matrix.runner_label }}
+    steps:
+      # Hardened-runner audit mode. Actual coverage is narrower than it
+      # looks: harden-runner is a no-op on self-hosted runners without a
+      # StepSecurity Enterprise plan, and audit-only on hosted macOS —
+      # so the egress baseline it collects here is effectively the
+      # hosted-Linux lane. Still worth including; flip to
+      # egress-policy: block once the Linux-lane baseline is stable.
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      # Wipe the whole workspace on self-hosted so stale cmake caches /
+      # GGUFs from a prior dispatch can never bleed into the current run.
+      # `runner.environment` is the GitHub-provided marker; `runner.name`
+      # varies across hosted images (`GitHub Actions 1`, `GitHub Actions 2`
+      # etc.) and is brittle to gate on.
+      - name: Manual workspace cleanup (self-hosted only)
+        if: runner.environment != 'github-hosted'
+        working-directory: .
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # jq is used by every step from Pre-flight seed onwards. Neither
+      # runner image is guaranteed to ship it (contrary to the previous
+      # comment: macOS does NOT ship jq by default), so install
+      # unconditionally with the per-OS package manager, no-op if present.
+      - name: Install jq
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if ! command -v jq >/dev/null; then
+              echo "jq must be preinstalled on the self-hosted macOS benchmark runner" >&2
+              exit 1
+            fi
+          else
+            command -v jq >/dev/null || (sudo apt-get update -q && sudo apt-get install -y jq)
+          fi
+
+      # Seed a fallback result.json BEFORE the infrastructure steps run.
+      # If any of them (AWS OIDC, ggml build, cmake configure) fails, the
+      # upload-artifact step at the end still finds a row — otherwise the
+      # cell would silently disappear from the summary and a reader could
+      # not tell "we tried and failed" from "we skipped this family".
+      - name: Pre-flight seed result.json
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [[ "$FAMILY" == "whisper" ]]; then
+            model_label="whisper-$WHISPER_SIZE"
+          else
+            model_label="$FAMILY"
+          fi
+          jq -n \
+            --arg family "$FAMILY" \
+            --arg model  "$model_label" \
+            --arg runner "$RUNNER_LABEL" \
+            --arg os     "$(uname -s)" \
+            '{family:$family, model:$model, runner:$runner, os:$os,
+              backend:"unknown",
+              encoder_backend:"unknown", encoder_coreml_all_runs:null,
+              encoder_ms_median:null, baseline_encoder_ms_median:null,
+              baseline_inference_ms_median:null,
+              encoder_speedup:null, inference_speedup:null,
+              wall_ms_median:null, wall_ms_min:null, wall_ms_max:null,
+              rtf_median:null, peak_rss_mib:null,
+              runs:0, status:"infrastructure-failed",
+              notes:"pre-flight seed — an infrastructure step (AWS OIDC, ggml build, cmake configure) did not complete; the row was never overwritten by run-family.sh."}' \
+            > artifacts/result.json
+
+      # The F16 GGUF and compiled bundle are generated on the benchmark machine.
+      # Cache them independently: if Core ML export fails after GGUF conversion,
+      # the next run can reuse the GGUF while retrying only the sidecar export.
+      - name: Cache generated Parakeet F16 GGUF
+        if: runner.os == 'macOS' && matrix.family == 'parakeet'
+        id: parakeet-f16-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: engines/speech/bench-models/parakeet/parakeet-tdt-0.6b-v3.f16.gguf
+          key: parakeet-tdt-f16-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('engines/speech/parakeet/scripts/convert-nemo-to-gguf.py', 'engines/speech/parakeet/scripts/converter_args.py', 'engines/speech/parakeet/scripts/requirements-coreml.txt') }}
+
+      - name: Cache generated Parakeet Core ML sidecar
+        if: runner.os == 'macOS' && matrix.family == 'parakeet'
+        id: parakeet-coreml-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: engines/speech/bench-models/parakeet/parakeet-tdt-0.6b-v3-encoder.mlmodelc
+          key: parakeet-tdt-f16-coreml-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('engines/speech/parakeet/scripts/convert-nemo-to-gguf.py', 'engines/speech/parakeet/scripts/converter_args.py', 'engines/speech/parakeet/scripts/export-encoder-coreml.py', 'engines/speech/parakeet/scripts/ref-encoder-from-gguf.py', 'engines/speech/parakeet/scripts/requirements-coreml.txt') }}
+
+      - name: Cache generated Parakeet EOU Core ML sidecar
+        if: runner.os == 'macOS' && matrix.family == 'parakeet-eou'
+        id: parakeet-eou-coreml-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: engines/speech/bench-models/parakeet-eou/parakeet_realtime_eou_120m-v1-encoder.mlmodelc
+          key: parakeet-eou-f16-coreml-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('engines/speech/parakeet/scripts/export-encoder-coreml.py', 'engines/speech/parakeet/scripts/ref-encoder-from-gguf.py', 'engines/speech/parakeet/scripts/requirements-coreml.txt') }}
+
+      - name: Cache generated Unified Parakeet Core ML sidecar
+        if: runner.os == 'macOS' && matrix.family == 'parakeet-unified'
+        id: parakeet-unified-coreml-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: engines/speech/bench-models/parakeet-unified/parakeet-unified-en-0.6b-encoder.mlmodelc
+          # families.json pins coreml_source_gguf (including its dated S3 key).
+          # Hash it so a checkpoint change cannot restore a sidecar compiled
+          # from stale encoder weights.
+          key: parakeet-unified-q8-coreml-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('engines/speech/scripts/benchmarks/families.json', 'engines/speech/parakeet/scripts/export-encoder-coreml.py', 'engines/speech/parakeet/scripts/ref-encoder-from-gguf.py', 'engines/speech/parakeet/scripts/requirements-coreml.txt') }}
+
+      - name: Cache generated Nemotron Core ML sidecar
+        if: runner.os == 'macOS' && matrix.family == 'parakeet-nemotron'
+        id: parakeet-nemotron-coreml-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: engines/speech/bench-models/parakeet-nemotron/nemotron-3.5-asr-streaming-0.6b-encoder.mlmodelc
+          key: parakeet-nemotron-f16-coreml-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('engines/speech/scripts/benchmarks/families.json', 'engines/speech/parakeet/scripts/export-encoder-coreml.py', 'engines/speech/parakeet/scripts/ref-encoder-from-gguf.py', 'engines/speech/parakeet/scripts/requirements-coreml.txt') }}
+
+      - name: Install Core ML exporter dependencies
+        if: runner.os == 'macOS' && ((matrix.family == 'parakeet' && (steps.parakeet-f16-cache.outputs.cache-hit != 'true' || steps.parakeet-coreml-cache.outputs.cache-hit != 'true')) || (matrix.family == 'parakeet-unified' && steps.parakeet-unified-coreml-cache.outputs.cache-hit != 'true') || (matrix.family == 'parakeet-eou' && steps.parakeet-eou-coreml-cache.outputs.cache-hit != 'true') || (matrix.family == 'parakeet-nemotron' && steps.parakeet-nemotron-coreml-cache.outputs.cache-hit != 'true'))
+        run: |
+          set -euo pipefail
+          coreml_python="$(command -v python3.11 || true)"
+          if [[ -z "$coreml_python" ]]; then
+            coreml_python="$(command -v python3 || true)"
+          fi
+          if [[ -z "$coreml_python" ]]; then
+            echo "python3 is required to generate the Core ML sidecar" >&2
+            exit 1
+          fi
+          "$coreml_python" -c 'import sys; assert sys.version_info >= (3, 9), sys.version'
+          "$coreml_python" -m venv .venv-coreml
+          .venv-coreml/bin/python -m pip install --upgrade pip
+          .venv-coreml/bin/python -m pip install \
+            -r parakeet/scripts/requirements-coreml.txt
+
+      - name: Generate Parakeet F16 GGUF
+        if: runner.os == 'macOS' && matrix.family == 'parakeet' && steps.parakeet-f16-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p bench-models/parakeet
+          nemo_checkpoint="$RUNNER_TEMP/parakeet-tdt-0.6b-v3.nemo"
+          curl --fail --location --retry 3 \
+            --output "$nemo_checkpoint" \
+            https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/parakeet-tdt-0.6b-v3.nemo
+          .venv-coreml/bin/python parakeet/scripts/convert-nemo-to-gguf.py \
+            --ckpt "$nemo_checkpoint" \
+            --hf-repo nvidia/parakeet-tdt-0.6b-v3 \
+            --quant f16 \
+            --out bench-models/parakeet/parakeet-tdt-0.6b-v3.f16.gguf
+
+      - name: Install ccache
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if ! command -v ccache >/dev/null; then
+              echo "::notice::ccache is not installed; continuing without compiler caching"
+            fi
+          else
+            command -v ccache >/dev/null || (sudo apt-get update -q && sudo apt-get install -y ccache)
+          fi
+          echo "CCACHE_DIR=${{ github.workspace }}/engines/speech/.ccache" >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials (OIDC)
+        if: matrix.family != 'minimax'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve the in-tree ggml revision
+        id: ggml
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD:ggml)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ggml install
+        id: ggml-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: engines/speech/ggml-install
+          # Safe to share across the hosted ubuntu-24.04 runner pool ONLY
+          # because GGML_NATIVE=OFF there (see the ggml build step below) —
+          # the artefact carries no -march=native codegen, so a save from
+          # CPU A can restore on CPU B. If you ever enable native codegen
+          # on hosted Linux, you MUST add a CPU-model component to this
+          # key or restore-on-older-CPU will SIGILL. The `runner.environment`
+          # component below is defence in depth against a hosted/self-hosted
+          # mixup, NOT a per-silicon separator (all hosted Linux is
+          # `github-hosted` regardless of the underlying CPU generation).
+          key: ggml-install-perf-${{ matrix.runner_os }}-${{ runner.environment }}-${{ steps.ggml.outputs.sha }}
+
+      - name: Cache ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        env:
+          CACHE_FAMILY: ${{ matrix.family }}
+        with:
+          path: engines/speech/.ccache
+          key: ccache-benchmark-${{ matrix.runner_os }}-${{ env.CACHE_FAMILY }}-${{ github.sha }}
+          restore-keys: |
+            ccache-benchmark-${{ matrix.runner_os }}-${{ env.CACHE_FAMILY }}-
+            ccache-benchmark-${{ matrix.runner_os }}-
+
+      # This is a perf workflow, not correctness-CI — so unlike the sibling
+      # *-ci.yml lanes we want the runner-optimal ggml build where it's safe:
+      #   * GGML_METAL=ON on macOS runners: Metal is the whole point of
+      #     the qvac-macos26-arm64-gpu label; a Metal-less bench would
+      #     duplicate the linux CPU numbers.
+      #   * GGML_NATIVE=ON only on self-hosted (single-machine). `-march=native`
+      #     bakes the build host's ISA into the artefact, and the hosted
+      #     `ubuntu-24.04` label is a POOL spanning CPU generations —
+      #     a later cell restoring that cache on an older CPU would SIGILL.
+      #     Hosted Linux stays on the portable ggml default.
+      - name: Build ggml (in-tree ggml)
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        env:
+          GGML_METAL_FLAG:  ${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
+          GGML_NATIVE_FLAG: ${{ runner.environment != 'github-hosted' && 'ON' || 'OFF' }}
+        run: |
+          set -euo pipefail
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE="$GGML_NATIVE_FLAG" \
+            -DGGML_METAL="$GGML_METAL_FLAG" \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j4
+          cmake --install ggml-src/build
+
+      - name: Configure umbrella build
+        env:
+          STREAMING_TESTS: ${{ inputs.audio8_pcm_streaming && matrix.family == 'audio8-tts' && 'ON' || 'OFF' }}
+          PARAKEET_COREML_FLAG: ${{ runner.os == 'macOS' && (matrix.family == 'parakeet' || matrix.family == 'parakeet-unified' || matrix.family == 'parakeet-eou' || matrix.family == 'parakeet-nemotron') && 'ON' || 'OFF' }}
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSPEECH_BUILD_TESTS="$STREAMING_TESTS" \
+            -DSPEECH_BUILD_EXECUTABLES=ON \
+            -DPARAKEET_COREML="$PARAKEET_COREML_FLAG" \
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
+
+      - name: Cache reference ASR model
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: engines/speech/bench-models/reference-asr
+          key: tts-reference-asr-${{ hashFiles('engines/speech/scripts/benchmarks/families.json') }}
+
+      - name: Build reference ASR
+        continue-on-error: true
+        run: |
+          if [[ "$(jq -r --arg f "$FAMILY" '.[$f].correctness.kind // ""' scripts/benchmarks/families.json)" == "tts_intelligibility" ]]; then
+            cmake --build build --target whisper-cli -j4
+          fi
+
+      - name: Build bench target
+        id: build
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # $FAMILY is validated by the plan job (whitelist) and comes in via
+          # env, so jq can lookup the target safely.
+          target="$(jq -r --arg f "$FAMILY" '.[$f].cmake_target' scripts/benchmarks/families.json)"
+          if [[ -z "$target" || "$target" == "null" ]]; then
+            echo "no cmake_target for family '$FAMILY'" >&2; exit 1
+          fi
+          echo "building target: $target"
+          # shellcheck disable=SC2086
+          cmake --build build --target $target -j4
+
+      # LD_LIBRARY_PATH points the Linux loader at the shared ggml install
+      # directory — Linux binaries linked against libggml.so otherwise fail
+      # to load at bench time. Not set on macOS: SIP strips DYLD_* env vars
+      # when spawning through /bin/bash, so a `DYLD_LIBRARY_PATH:` env here
+      # would silently be a no-op. The macOS binaries resolve libggml via
+      # RPATH baked in at link time.
+      - name: Select audio quality Python
+        if: matrix.family == 'audio8' || matrix.family == 'lavasr'
+        continue-on-error: true
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Prepare audio quality Python
+        continue-on-error: true
+        if: matrix.family == 'audio8' || matrix.family == 'lavasr'
+        run: |
+          python3 -m venv .venv-audio-quality
+          echo "AUDIO_QUALITY_PYTHON=$PWD/.venv-audio-quality/bin/python" >> "$GITHUB_ENV"
+          .venv-audio-quality/bin/python -m pip install -r scripts/benchmarks/requirements-audio-quality.txt
+
+      - name: Select music alignment Python
+        if: inputs.music_alignment && (matrix.family == 'acestep' || matrix.family == 'minimax')
+        continue-on-error: true
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: engines/speech/scripts/benchmarks/requirements-music-alignment.txt
+
+      - name: Cache CLAP model
+        if: inputs.music_alignment && (matrix.family == 'acestep' || matrix.family == 'minimax')
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: engines/speech/bench-models/reference-clap
+          key: clap-${{ hashFiles('engines/speech/scripts/benchmarks/music-alignment-model.json') }}
+
+      - name: Prepare music alignment Python
+        id: music-python
+        if: inputs.music_alignment && (matrix.family == 'acestep' || matrix.family == 'minimax')
+        continue-on-error: true
+        run: |
+          python3 -m venv .venv-music-alignment
+          echo "MUSIC_ALIGNMENT_PYTHON=$PWD/.venv-music-alignment/bin/python" >> "$GITHUB_ENV"
+          .venv-music-alignment/bin/python -m pip install -r scripts/benchmarks/requirements-music-alignment.txt
+          .venv-music-alignment/bin/python -m pip check
+
+      - name: Test music scoring policy
+        if: inputs.music_alignment && (matrix.family == 'acestep' || matrix.family == 'minimax') && steps.music-python.outcome == 'success'
+        run: .venv-music-alignment/bin/python scripts/benchmarks/test_music_alignment.py
+
+      # Conversion retains the F32 LM and requires a high-memory host. An
+      # existing prepared bundle lets smaller inference hosts bypass conversion.
+      # Only the portable q4 GGUF bundle is cached, not the 24 GB checkpoint.
+      - name: Resolve MiniMax preparation identity
+        id: minimax-identity
+        if: inputs.music_alignment && matrix.family == 'minimax' && inputs.minimax_model_dir == '' && inputs.minimax_artifact_run_id == ''
+        continue-on-error: true
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: |
+          set -euo pipefail
+          echo "MINIMAX_PREPARATION_REPORT=$PWD/artifacts/minimax-preparation.json" >> "$GITHUB_ENV"
+          exec 2> >(tee artifacts/minimax-identity.log >&2)
+          python3 -m venv .venv-minimax
+          .venv-minimax/bin/python -m pip install \
+            -r scripts/benchmarks/requirements-minimax.txt >&2
+          .venv-minimax/bin/python -m pip check >&2
+          cmake --build build --target acestep-quantize -j4 >&2
+          quantizer_libraries=()
+          while IFS= read -r library; do
+            quantizer_libraries+=(--quantizer-library "$library")
+          done < <(find "$PWD/ggml-install/lib" -maxdepth 1 \( -name 'libggml*' -o -name 'libqvac-speech-ggml*' \) \( -name '*.so*' -o -name '*.dylib' \))
+          .venv-minimax/bin/python scripts/benchmarks/prepare-minimax.py \
+            --models-root "$PWD/bench-models" --quant q4_k_m --cache-key-only \
+            --quantizer "$PWD/build/audiogen/acestep-quantize" \
+            ${quantizer_libraries[@]+"${quantizer_libraries[@]}"} \
+            > artifacts/minimax-preparation.json
+          echo "cache_key=$(jq -r '.cache_key' artifacts/minimax-preparation.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore prepared MiniMax GGUFs
+        id: minimax-cache
+        if: steps.minimax-identity.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: engines/speech/bench-models/minimax
+          # Includes exact Python, installed GGUF sources, native build metadata,
+          # executable and linked libraries: the same identity as the inner cache.
+          key: minimax-${{ steps.minimax-identity.outputs.cache_key }}
+
+      - name: Download prepared MiniMax bundle
+        if: inputs.music_alignment && matrix.family == 'minimax' && inputs.minimax_artifact_run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: minimax-models-q4_k_m-macos
+          path: engines/speech/bench-models/minimax-import
+          run-id: ${{ inputs.minimax_artifact_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Prepare MiniMax models
+        id: minimax-models
+        if: inputs.music_alignment && matrix.family == 'minimax' && (inputs.minimax_model_dir != '' || inputs.minimax_artifact_run_id != '' || steps.minimax-identity.outcome == 'success')
+        continue-on-error: true
+        env:
+          PREPARED_MINIMAX_DIR: ${{ inputs.minimax_model_dir }}
+          MINIMAX_ARTIFACT_RUN: ${{ inputs.minimax_artifact_run_id }}
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: |
+          set -euo pipefail
+          echo "MINIMAX_PREPARATION_REPORT=$PWD/artifacts/minimax-preparation.json" >> "$GITHUB_ENV"
+          # Keep setup/conversion logs even if dependencies or conversion fail.
+          exec 2> >(tee artifacts/minimax-preparation.log >&2)
+          if [[ -n "$MINIMAX_ARTIFACT_RUN" ]]; then
+            PREPARED_MINIMAX_DIR="$PWD/bench-models/minimax-import"
+          fi
+          if [[ -n "$PREPARED_MINIMAX_DIR" ]]; then
+            python3 scripts/benchmarks/prepare-minimax.py \
+              --models-root "$PWD/bench-models" --quant q4_k_m \
+              --prepared-dir "$PREPARED_MINIMAX_DIR" \
+              > artifacts/minimax-preparation.json
+          else
+            quantizer_libraries=()
+            while IFS= read -r library; do
+              quantizer_libraries+=(--quantizer-library "$library")
+            done < <(find "$PWD/ggml-install/lib" -maxdepth 1 \( -name 'libggml*' -o -name 'libqvac-speech-ggml*' \) \( -name '*.so*' -o -name '*.dylib' \))
+            .venv-minimax/bin/python scripts/benchmarks/prepare-minimax.py \
+              --models-root "$PWD/bench-models" --quant q4_k_m \
+              --quantizer "$PWD/build/audiogen/acestep-quantize" \
+              ${quantizer_libraries[@]+"${quantizer_libraries[@]}"} \
+              > artifacts/minimax-preparation.json
+          fi
+          echo "model_dir=$(jq -r '.model_dir' artifacts/minimax-preparation.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Save prepared MiniMax GGUFs
+        if: steps.minimax-identity.outcome == 'success' && steps.minimax-models.outcome == 'success' && steps.minimax-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: engines/speech/bench-models/minimax
+          key: minimax-${{ steps.minimax-identity.outputs.cache_key }}
+
+      - name: Publish prepared MiniMax bundle
+        if: inputs.publish_minimax_models && inputs.music_alignment && matrix.family == 'minimax' && runner.os == 'macOS' && steps.minimax-models.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: minimax-models-q4_k_m-macos
+          path: ${{ steps.minimax-models.outputs.model_dir }}/
+          compression-level: 0
+          retention-days: 7
+
+      - name: Run bench
+        env:
+          MUSIC_ALIGNMENT: ${{ inputs.music_alignment && '1' || '0' }}
+          # The scorer remains CPU-only; the macOS generator explicitly uses Metal.
+          MUSIC_DEVICE: ${{ matrix.family == 'minimax' && runner.os == 'macOS' && 'gpu' || 'cpu' }}
+          MODEL_S3_BUCKET: ${{ secrets.MODEL_S3_BUCKET }}
+          RUNS_PER_BENCH:  ${{ needs.plan.outputs.runs_per_bench }}
+          PARAKEET_COREML_PYTHON: ${{ github.workspace }}/engines/speech/.venv-coreml/bin/python
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: |
+          set -euo pipefail
+          extra_args=()
+          warmup_runs=1
+          if [[ -n "$WHISPER_SIZE" ]]; then
+            extra_args+=(--whisper-size "$WHISPER_SIZE")
+          fi
+          if [[ ("$FAMILY" == "parakeet" || "$FAMILY" == "parakeet-unified" || "$FAMILY" == "parakeet-eou") && "$RUNNER_OS" == "macOS" ]]; then
+            warmup_runs=3
+          fi
+          # run-family.sh handles all failure paths (missing binary, fetch
+          # error, warmup/run failure) by writing a result.json with the
+          # right `status` field — no post-hoc override needed here.
+          #
+          # `${extra_args[@]+"${extra_args[@]}"}` is the bash-3.2-safe way
+          # to expand an empty array under set -u — macOS system bash treats
+          # an empty `"${arr[@]}"` as an unbound-variable error.
+          scripts/benchmarks/run-family.sh \
+            --family "$FAMILY" \
+            --runs "$RUNS_PER_BENCH" \
+            --warmup "$warmup_runs" \
+            --build-dir build \
+            --models-root "$PWD/bench-models" \
+            --audio-dir parakeet/test/samples \
+            --runner "$RUNNER_LABEL" \
+            ${extra_args[@]+"${extra_args[@]}"} \
+            --out "artifacts/result.json"
+
+      - name: Audio8 streaming API and latency comparison
+        if: inputs.audio8_pcm_streaming && matrix.family == 'audio8-tts'
+        env:
+          RUNS_PER_BENCH: ${{ needs.plan.outputs.runs_per_bench }}
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: |
+          set -euo pipefail
+          cmake --build build --target test-audio8-streaming -j4
+          ./build/tts/test-audio8-streaming \
+            bench-models/audio8-tts/audio8-lm-q8_0.gguf \
+            bench-models/audio8-tts/audio8-codec-decoder-q8_0.gguf
+          python3 -B scripts/benchmarks/audio8-streaming.py \
+            --binary "$PWD/build/tts/audio8-cli" \
+            --lm "$PWD/bench-models/audio8-tts/audio8-lm-q8_0.gguf" \
+            --decoder "$PWD/bench-models/audio8-tts/audio8-codec-decoder-q8_0.gguf" \
+            --backend auto --gpu-layers 999 --runs "$RUNS_PER_BENCH" \
+            --out-dir "$PWD/artifacts/audio8-streaming" >> "$GITHUB_STEP_SUMMARY"
+
+      # Include the whisper size in the artifact name so the fan-out cells
+      # don't clobber each other's uploads. Uploads the whole `artifacts/`
+      # directory (not just result.json) so run-family.sh's optional
+      # `result.hypothesis.<ext>` sibling — the raw per-segment output the
+      # correctness scorer consumed — rides along for post-hoc DER/WER
+      # debugging. The summarize job only reads result.json, so siblings
+      # are transparent to the aggregate.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: bench-${{ matrix.family }}${{ matrix.whisper_size && format('-{0}', matrix.whisper_size) || '' }}-${{ matrix.runner_label }}
+          path: engines/speech/artifacts/
+          retention-days: 14
+
+  # ---------- 3. Aggregate + render summary table -------------------------
+  summarize:
+    # `plan` in needs is not just for ordering — summarize reads
+    # `needs.plan.outputs.expected_count`, and GHA's `needs.*` context only
+    # exposes DIRECT dependencies. Without `plan` here, that output
+    # interpolates to the empty string and summarize.py's absent-row
+    # loudness gate goes silently dead.
+    needs: [plan, bench]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Download all bench artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bench-*
+          path: engines/speech/all-results
+
+      - name: Render summary table
+        env:
+          EXPECTED_COUNT: ${{ needs.plan.outputs.expected_count }}
+        run: |
+          set -euo pipefail
+          python3 scripts/benchmarks/summarize.py \
+            --results-dir all-results \
+            --expected-count "$EXPECTED_COUNT" \
+            --out speech-benchmark-findings.md
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: speech-benchmark-findings
+          path: engines/speech/speech-benchmark-findings.md
+          retention-days: 90

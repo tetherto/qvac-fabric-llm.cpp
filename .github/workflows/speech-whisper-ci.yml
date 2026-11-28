@@ -1,0 +1,503 @@
+# CI for the vendored whisper engine (third_party/whisper.cpp — git subtree
+# + QVAC delta, see PATCHES.md there) and the root umbrella superbuild.
+#
+# Replaces the useful slice of upstream's build.yml (which went inert when
+# the upstream tree moved under third_party/ — GitHub only runs root
+# .github/workflows). Two jobs per OS:
+#   - umbrella: configure the root superbuild with ALL engines against one
+#     system ggml — proves the shared-ggml invariant — then whisper-cli
+#     transcription smoke on the bundled jfk.wav with ggml-tiny.en.
+#   - umbrella-webgpu (Linux only): the same superbuild against a ggml that
+#     carries the WebGPU backend, the model-free suite, and the whisper-cli
+#     smoke. The hosted runner has no GPU, so this lane proves the backend
+#     registers no device there (Dawn's Null adapter is refused) and whisper
+#     degrades to the CPU; umbrella-webgpu-gpu, opt-in on the self-hosted
+#     NVIDIA runner, runs the same smoke on a real WebGPU device.
+# Cross-platform coverage for the engines lives in engines-cross-ci.yml.
+name: whisper CI
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'engines/speech/third_party/whisper.cpp/**'
+      - 'engines/speech/CMakeLists.txt'
+      - 'engines/speech/whisper-gpu-picker*'
+      - 'engines/speech/scripts/check-whisper-packaging.py'
+      - 'engines/speech/scripts/benchmarks/whisper-hexagon.cpp'
+      - 'engines/speech/scripts/benchmarks/whisper-hexagon/**'
+      - 'ggml/**'
+      - '.github/workflows/speech-whisper-ci.yml'
+  pull_request:
+    paths:
+      - 'engines/speech/third_party/whisper.cpp/**'
+      - 'engines/speech/CMakeLists.txt'
+      - 'engines/speech/whisper-gpu-picker*'
+      - 'engines/speech/scripts/check-whisper-packaging.py'
+      - 'engines/speech/scripts/benchmarks/whisper-hexagon.cpp'
+      - 'engines/speech/scripts/benchmarks/whisper-hexagon/**'
+      - 'ggml/**'
+      - '.github/workflows/speech-whisper-ci.yml'
+  workflow_dispatch:
+    inputs:
+      run_webgpu_gpu:
+        description: 'Also run the whisper WebGPU smoke on the self-hosted NVIDIA Linux runner'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Dedupe per PR and per branch: a re-push or re-dispatch supersedes the
+# in-flight run. The guard below previously excluded every event but
+# pull_request, so a push or a re-dispatch stacked a second run instead of
+# replacing the first.
+#
+# master is exempt on purpose — pushes to the default branch must not cancel
+# each other, or a merged commit ends with no CI verdict.
+concurrency:
+  group: whisper-ci-${{ (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: engines/speech
+
+jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/speech-reusable-runner-names.yml
+
+  model-conversion:
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.ubuntu_2404 }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install serializer test dependency
+        run: python -m pip install numpy==1.26.4
+      - name: Check checkpoint conversion shapes, dtypes and values
+        run: python third_party/whisper.cpp/tests/test-whisper-model-conversion.py -v
+
+  umbrella:
+    needs: runner_names
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os == 'macos-14' && needs.runner_names.outputs.macos_14 || needs.runner_names.outputs.ubuntu_2404 }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ccache
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install ccache; else sudo apt-get update -q && sudo apt-get install -y ccache; fi
+          echo "CCACHE_DIR=${{ github.workspace }}/engines/speech/.ccache" >> "$GITHUB_ENV"
+
+      - name: Resolve the in-tree ggml revision
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ggml install
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/ggml-install
+          key: ggml-install-portable-${{ matrix.os }}-${{ steps.ggml.outputs.sha }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/.ccache
+          key: ccache-umbrella-${{ matrix.os }}-${{ github.sha }}
+          restore-keys: ccache-umbrella-${{ matrix.os }}-
+
+      - name: Build ggml (in-tree ggml)
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_METAL=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j4
+          cmake --install ggml-src/build
+
+      # All engines + whisper in one configure: the shared-ggml invariant.
+      # SPEECH_BUILD_WHISPER_TESTS also builds whisper's test harnesses —
+      # the fixture-only ones (logits-slice, VAD contract tests) run below.
+      - name: Configure umbrella (all engines, one ggml)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSPEECH_BUILD_TESTS=ON \
+            -DSPEECH_BUILD_WHISPER_TESTS=ON \
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
+
+      - name: Build
+        run: cmake --build build -j4
+
+      - name: Check installed release version and VitisAI exports
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: python3 scripts/check-whisper-packaging.py --build-dir build --ggml-prefix ggml-install
+
+      # Excludes gpu/perf (runner limits), medium/large (the committed
+      # weightless stubs still burn minutes of zero-weight encode at those
+      # sizes), coreml-runtime (the shared Core ML runtime tests run once per
+      # lane in the engine workflows, which filter on coreml/**), and
+      # test-vad-full (the one whisper test that needs a real
+      # downloaded model, ggml-base.en.bin). The tiny/base/small
+      # test-whisper-cli-* arms need NO download: their for-tests-ggml-*.bin
+      # fixtures are committed (correct hparams + vocab, zero tensor payload)
+      # and exercise load -> mel -> encode -> decode -> sample end to end.
+      - name: Tests (non-GPU, committed fixtures only)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: ctest --test-dir build -LE 'gpu|perf|medium|large|coreml-runtime' -E '^test-vad-full$' --output-on-failure --timeout 600
+
+      # GNU --wrap observes calls in the static Whisper library. This separate
+      # target exercises cleanup after failed backend initialization without
+      # changing the umbrella's existing shared-library coverage.
+      - name: Check failed-initialization cleanup (Linux static Whisper)
+        if: runner.os == 'Linux'
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: |
+          cmake -S . -B build-init-error \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-install" \
+            -DSPEECH_BUILD_PARAKEET=OFF -DSPEECH_BUILD_TTS=OFF \
+            -DSPEECH_BUILD_AUDIOGEN=OFF -DSPEECH_BUILD_TESTS=ON \
+            -DSPEECH_BUILD_WHISPER_TESTS=ON -DSPEECH_BUILD_EXECUTABLES=ON \
+            -DWHISPER_BUILD_SERVER=OFF
+          cmake --build build-init-error --target test-whisper-fit-init-error -j4
+          ctest --test-dir build-init-error -R '^test-whisper-fit-init-error$' --output-on-failure
+
+      - name: Cache whisper tiny model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/models-cache
+          key: whisper-tiny-en-v1
+
+      # -f: fail on HTTP errors instead of writing the error page into the
+      # model file. URL pinned to a fixed HF revision + sha256-verified so
+      # the smoke can't silently drift with upstream re-uploads.
+      - name: Fetch ggml-tiny.en
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models-cache
+          curl -fL -o models-cache/ggml-tiny.en.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.en.bin
+          echo "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f  models-cache/ggml-tiny.en.bin" | shasum -a 256 -c -
+
+      - name: Installed native measurement consumer (contracts and transcription smoke)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/whisper-install/lib:${{ github.workspace }}/engines/speech/ggml-install/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/whisper-install/lib:${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: |
+          cmake --install build/third_party/whisper.cpp --prefix "$PWD/whisper-install"
+          cmake -S scripts/benchmarks/whisper-hexagon -B whisper-measure \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PWD/whisper-install;$PWD/ggml-install"
+          cmake --build whisper-measure -j4
+          python3 scripts/benchmarks/whisper-hexagon/test-driver.py \
+            --binary "$PWD/whisper-measure/whisper-hexagon"
+          ./whisper-measure/whisper-hexagon --model models-cache/ggml-tiny.en.bin \
+            --audio third_party/whisper.cpp/samples/jfk.wav --no-gpu \
+            --warmup 1 --runs 1 > native-measure-smoke.jsonl
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          records = [json.loads(line) for line in Path("native-measure-smoke.jsonl").read_text().splitlines()]
+          runs = [r for r in records if r.get("kind") == "run"]
+          assert len(runs) == 2, records
+          assert {r["phase"] for r in runs} == {"warmup", "measure"}, runs
+          # Whisper retains automatic host BLAS initialization on macOS.
+          # The driver permits CPU/known host BLAS, never arbitrary ACCEL.
+          assert all(r["whisper_full_rc"] == 0 and r["actual_primary_backend"] in ("CPU", "BLAS") for r in runs), runs
+          assert all("ask not what your country can do for you" in r["transcript"].lower() for r in runs), runs
+          PY
+
+      - name: whisper-cli transcription smoke (jfk.wav)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: |
+          out=$(./build/bin/whisper-cli \
+            -m models-cache/ggml-tiny.en.bin \
+            -f third_party/whisper.cpp/samples/jfk.wav -nt 2>/dev/null | tr '[:upper:]' '[:lower:]')
+          echo "$out"
+          echo "$out" | grep -q "ask not what your country can do for you" \
+            || { echo "::error::expected JFK transcript not found"; exit 1; }
+
+      # Quantization round-trip: quantize the cached f16 tiny.en to each
+      # README-documented tiny-class format and require the quantized model
+      # to still transcribe the smoke clip. Covers whisper-quantize and the
+      # quantized decode path with no extra download.
+      - name: Quantized transcription smoke (q5_0, q8_0)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: |
+          for qtype in q5_0 q8_0; do
+            ./build/bin/whisper-quantize \
+              models-cache/ggml-tiny.en.bin \
+              "models-cache/ggml-tiny.en-$qtype.bin" "$qtype"
+            f16_size=$(wc -c < models-cache/ggml-tiny.en.bin)
+            q_size=$(wc -c < "models-cache/ggml-tiny.en-$qtype.bin")
+            [ "$q_size" -lt "$f16_size" ] \
+              || { echo "::error::$qtype model is not smaller than f16"; exit 1; }
+            out=$(./build/bin/whisper-cli \
+              -m "models-cache/ggml-tiny.en-$qtype.bin" \
+              -f third_party/whisper.cpp/samples/jfk.wav -nt 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            echo "[$qtype] $out"
+            echo "$out" | grep -q "ask not what your country can do for you" \
+              || { echo "::error::expected JFK transcript not found with $qtype"; exit 1; }
+            rm -f "models-cache/ggml-tiny.en-$qtype.bin"
+          done
+
+      # Long-audio smoke: tile the 11 s smoke clip to ~44 s so whisper_full
+      # must run several 30 s mel windows (seek loop + prompt carry-over) —
+      # a path a single-window clip never reaches. The sentence must be
+      # found in both the first and a later window.
+      - name: Long-audio multi-window smoke (44 s)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: |
+          python3 - <<'CONCAT'
+          import wave
+
+          SRC = "third_party/whisper.cpp/samples/jfk.wav"
+          DST = "models-cache/jfk-x4.wav"
+          REPEATS = 4
+
+          with wave.open(SRC, "rb") as src:
+              params = src.getparams()
+              frames = src.readframes(src.getnframes())
+          with wave.open(DST, "wb") as dst:
+              dst.setparams(params)
+              for _ in range(REPEATS):
+                  dst.writeframes(frames)
+          CONCAT
+          out=$(./build/bin/whisper-cli \
+            -m models-cache/ggml-tiny.en.bin \
+            -f models-cache/jfk-x4.wav 2>/dev/null | tr '[:upper:]' '[:lower:]')
+          echo "$out"
+          # The 4th repeat (33-44 s) sits fully inside the second mel window,
+          # so a healthy decode carries the phrase in a segment starting at
+          # >= 30 s. Compare start times numerically rather than by regex so
+          # the check survives resegmentation and >= 60 s timestamps.
+          last_start=$(echo "$out" | grep "ask not what your country" \
+            | sed -nE 's/^\[([0-9]{2}):([0-9]{2}):([0-9]{2}).*/\1 \2 \3/p' \
+            | awk '{ s = $1*3600 + $2*60 + $3; if (s > max) max = s } END { print max+0 }')
+          first_start=$(echo "$out" | grep "ask not what your country" \
+            | sed -nE 's/^\[([0-9]{2}):([0-9]{2}):([0-9]{2}).*/\1 \2 \3/p' \
+            | awk 'NR==1 { print $1*3600 + $2*60 + $3 }')
+          echo "phrase segments: first starts at ${first_start:-none} s, last at ${last_start:-none} s"
+          [ -n "$first_start" ] && [ "$first_start" -lt 30 ] \
+            || { echo "::error::JFK sentence missing from the first mel window"; exit 1; }
+          [ "$last_start" -ge 30 ] \
+            || { echo "::error::JFK sentence missing past 30 s — the seek loop never reached the second mel window"; exit 1; }
+          rm -f models-cache/jfk-x4.wav
+
+
+  # WebGPU lane: every engine plus whisper against a ggml built with
+  # GGML_WEBGPU=ON (prebuilt Dawn from the google/dawn releases, the pin the
+  # former ggml-speech CI used). The hosted runner has no GPU and Dawn
+  # never hands out a software (fallback) adapter unless asked, so the backend
+  # must register no device here and whisper must land on the CPU: that is
+  # what the smoke at the end asserts.
+  umbrella-webgpu:
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.ubuntu_2404 }}
+    timeout-minutes: 120
+    env:
+      DAWN_VERSION: v20260317.182325
+      DAWN_ASSET_NAME: Dawn-18eb229ef5f707c1464cc581252e7603c73a3ef0-ubuntu-latest-Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ccache
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ccache
+          echo "CCACHE_DIR=${{ github.workspace }}/engines/speech/.ccache" >> "$GITHUB_ENV"
+
+      - name: Fetch prebuilt Dawn
+        run: |
+          curl -fL -o dawn.tar.gz \
+            "https://github.com/google/dawn/releases/download/${DAWN_VERSION}/${DAWN_ASSET_NAME}.tar.gz"
+          mkdir dawn
+          tar -xf dawn.tar.gz -C dawn --strip-components=1
+
+      - name: Resolve the in-tree ggml revision
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ggml install
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/ggml-install
+          key: ggml-install-webgpu-${{ env.DAWN_VERSION }}-ubuntu-24.04-${{ steps.ggml.outputs.sha }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/.ccache
+          key: ccache-umbrella-webgpu-${{ github.sha }}
+          restore-keys: ccache-umbrella-webgpu-
+
+      - name: Build ggml with the WebGPU backend
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_WEBGPU=ON \
+            -DGGML_METAL=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DDawn_DIR="$PWD/dawn/lib64/cmake/Dawn" \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j4
+          cmake --install ggml-src/build
+
+      - name: Configure umbrella (all engines, one WebGPU ggml)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSPEECH_BUILD_TESTS=ON \
+            -DSPEECH_BUILD_WHISPER_TESTS=ON \
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
+
+      - name: Build
+        run: cmake --build build -j4
+
+      # Same filter as the umbrella job, now linked against a ggml whose
+      # registry carries the WebGPU backend (with zero devices on this host).
+      - name: Tests (non-GPU, committed fixtures only)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: ctest --test-dir build -LE 'gpu|perf|medium|large|coreml-runtime' -E '^test-vad-full$' --output-on-failure --timeout 900
+
+      - name: Cache whisper tiny model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/models-cache
+          key: whisper-tiny-en-v1
+
+      - name: Fetch ggml-tiny.en
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models-cache
+          curl -fL -o models-cache/ggml-tiny.en.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.en.bin
+          echo "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f  models-cache/ggml-tiny.en.bin" | shasum -a 256 -c -
+
+      # A GPU-less host: the backend must say why it registered no device
+      # (Dawn offers only its Null adapter, which the backend refuses rather
+      # than computing nothing on it) and whisper must transcribe on the CPU.
+      - name: whisper-cli smoke degrades to the CPU without a GPU (jfk.wav)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: |
+          ./build/bin/whisper-cli \
+            -m models-cache/ggml-tiny.en.bin \
+            -f third_party/whisper.cpp/samples/jfk.wav -nt > smoke.txt 2> smoke.log
+          grep -i -E "ggml_webgpu|backend|no GPU" smoke.log || true
+          grep -q "ggml_webgpu: .*backend disabled" smoke.log \
+            || { echo "::error::the WebGPU backend did not report why it registered no device"; exit 1; }
+          if grep -q "using WebGPU backend" smoke.log; then
+            echo "::error::whisper ran on a WebGPU device on a runner that has no GPU"; exit 1
+          fi
+          out=$(tr '[:upper:]' '[:lower:]' < smoke.txt)
+          echo "$out"
+          echo "$out" | grep -q "ask not what your country can do for you" \
+            || { echo "::error::expected JFK transcript not found"; exit 1; }
+
+  # Opt-in GPU lane (workflow_dispatch with run_webgpu_gpu): the same WebGPU
+  # ggml and umbrella on the self-hosted NVIDIA Linux runner, where Dawn
+  # drives the card through Vulkan, so the whisper-cli smoke must run on the
+  # WebGPU backend and still produce the reference transcript.
+  umbrella-webgpu-gpu:
+    needs: runner_names
+    if: github.event_name == 'workflow_dispatch' && inputs.run_webgpu_gpu
+    runs-on: ${{ needs.runner_names.outputs.linux_x64_gpu }}
+    timeout-minutes: 120
+    env:
+      DAWN_VERSION: v20260317.182325
+      DAWN_ASSET_NAME: Dawn-18eb229ef5f707c1464cc581252e7603c73a3ef0-ubuntu-latest-Release
+    steps:
+      - name: Manual Workspace Cleanup
+        run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+        shell: bash
+        working-directory: .
+      - uses: actions/checkout@v4
+
+      - name: Show what this runner has
+        run: |
+          nvidia-smi || echo "no NVIDIA driver"
+          command -v vulkaninfo && vulkaninfo --summary 2>/dev/null | head -20 || echo "no vulkaninfo"
+
+      - name: Fetch prebuilt Dawn
+        run: |
+          curl -fL -o dawn.tar.gz \
+            "https://github.com/google/dawn/releases/download/${DAWN_VERSION}/${DAWN_ASSET_NAME}.tar.gz"
+          mkdir dawn
+          tar -xf dawn.tar.gz -C dawn --strip-components=1
+
+      - name: Build ggml with the WebGPU backend and the whisper umbrella
+        run: |
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_WEBGPU=ON \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DDawn_DIR="$PWD/dawn/lib64/cmake/Dawn" \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j && cmake --install ggml-src/build
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DSPEECH_BUILD_PARAKEET=OFF -DSPEECH_BUILD_TTS=OFF -DSPEECH_BUILD_AUDIOGEN=OFF \
+            -DSPEECH_BUILD_TESTS=ON \
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
+          cmake --build build -j
+
+      - name: Picker unit test with a registered WebGPU device
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: ctest --test-dir build -R '^test-whisper-gpu-picker$' --output-on-failure
+
+      - name: Fetch ggml-tiny.en
+        run: |
+          mkdir -p models-cache
+          curl -fL -o models-cache/ggml-tiny.en.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.en.bin
+          echo "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f  models-cache/ggml-tiny.en.bin" | shasum -a 256 -c -
+
+      - name: whisper-cli transcription smoke on WebGPU (jfk.wav)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: |
+          ./build/bin/whisper-cli \
+            -m models-cache/ggml-tiny.en.bin \
+            -f third_party/whisper.cpp/samples/jfk.wav -nt > smoke.txt 2> smoke.log
+          grep -i -E "ggml_webgpu|backend" smoke.log || true
+          grep -q "using WebGPU backend" smoke.log \
+            || { echo "::error::whisper did not run on the WebGPU backend"; exit 1; }
+          out=$(tr '[:upper:]' '[:lower:]' < smoke.txt)
+          echo "$out"
+          echo "$out" | grep -q "ask not what your country can do for you" \
+            || { echo "::error::expected JFK transcript not found"; exit 1; }

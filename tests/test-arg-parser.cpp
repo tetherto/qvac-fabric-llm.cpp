@@ -239,6 +239,12 @@ static void test(void) {
     argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // draft vocabulary ranges are B:E pairs of integers (llama_set_draft_vocab checks their order and bounds)
+    for (const char * ranges : {"0:10:20", "7", "a:5", "5:9x", "0:10,"}) {
+        argv = {"binary_name", "--spec-draft-vocab", ranges};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    }
+
     printf("test-arg-parser: test valid usage\n\n");
 
     argv = {"binary_name", "-m", "model_file.gguf"};
@@ -285,6 +291,107 @@ static void test(void) {
     assert(params.speculative.draft.n_max == 123);
 
     {
+        common_params dflash_params;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-type", "draft-dflash"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dflash_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(dflash_params.speculative.draft.n_max == common_params_speculative_draft::n_max_dflash);
+    }
+
+    {
+        common_params dflash_params;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-type", "draft-dflash", "--spec-draft-n-max", "3"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dflash_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(dflash_params.speculative.draft.n_max == 3);
+    }
+
+    {
+        common_params dflash_params;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-draft-n-max", "3", "--spec-type", "draft-dflash"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dflash_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(dflash_params.speculative.draft.n_max == 3);
+    }
+
+    {
+        common_params mtp_params;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-type", "draft-mtp"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mtp_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(mtp_params.speculative.draft.n_max == common_params_speculative_draft{}.n_max);
+    }
+
+    {
+        common_params dspark_params;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-type", "draft-dspark"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dspark_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(dspark_params.speculative.draft.n_max == common_params_speculative_draft{}.n_max);
+    }
+
+    // DFlash2 and LiliCorr drafts ran as draft-dflash before they had their own types
+    for (const char * type : {"draft-dflash2", "draft-lilicorr"}) {
+        common_params lattice_params;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-type", type};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), lattice_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(lattice_params.speculative.draft.n_max == common_params_speculative_draft::n_max_dflash);
+    }
+
+    {
+        // the server resolves the default after parsing, once it has resolved the models
+        common_params server_params;
+        argv = {"binary_name", "--spec-type", "draft-dflash"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), server_params, LLAMA_EXAMPLE_SERVER));
+        assert(server_params.speculative.draft.n_max == common_params_speculative_draft{}.n_max);
+
+        common_models_handler handler = common_models_handler_init(server_params, LLAMA_EXAMPLE_SERVER);
+        common_models_handler_apply(handler, server_params);
+        assert(server_params.speculative.draft.n_max == common_params_speculative_draft::n_max_dflash);
+    }
+
+    {
+        // an explicit n_max is kept
+        common_params_speculative spec;
+        spec.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        common_speculative_set_default_n_max(spec);
+        assert(spec.draft.n_max == common_params_speculative_draft::n_max_dflash);
+
+        spec.draft.n_max          = 7;
+        spec.draft.n_max_explicit = true;
+        common_speculative_set_default_n_max(spec);
+        assert(spec.draft.n_max == 7);
+
+        for (auto type : { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2, COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR }) {
+            common_params_speculative spec_type;
+            spec_type.types = { type };
+            common_speculative_set_default_n_max(spec_type);
+            assert(spec_type.draft.n_max == common_params_speculative_draft::n_max_dflash);
+        }
+
+        common_params_speculative spec_dspark;
+        spec_dspark.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+        common_speculative_set_default_n_max(spec_dspark);
+        assert(spec_dspark.draft.n_max == common_params_speculative_draft{}.n_max);
+    }
+
+    argv = {"binary_name", "--spec-draft-n-short", "7", "--spec-draft-long-cost", "1.4"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.draft.n_short == 7);
+    assert(params.speculative.draft.long_cost == 1.4f);
+
+    argv = {"binary_name", "--spec-draft-long-cost", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    {
+        common_params short_params;
+        argv = {"binary_name", "--spec-draft-n-min", "8", "--spec-draft-n-short", "7"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), short_params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    {
+        common_params short_params;
+        argv = {"binary_name", "--spec-draft-n-min", "7", "--spec-draft-n-short", "7"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), short_params, LLAMA_EXAMPLE_SERVER));
+        assert(short_params.speculative.draft.n_short == 7);
+    }
+
+    {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-len", "3.4"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
@@ -303,6 +410,10 @@ static void test(void) {
         argv = {"binary_name", "--spec-synth-len", "3.4x"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
     }
+
+    argv = {"binary_name", "--spec-draft-vocab", "0:98304,248032:248320"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert((params.speculative.draft.vocab_ranges == std::vector<int32_t>{0, 98304, 248032, 248320}));
 
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -324,6 +435,20 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
 
+    {
+        common_params cache_params;
+        cache_params.model.path = "model_file.gguf";
+        assert(cache_params.moe_cache_auto && !cache_params.moe_cache_auto_explicit);
+        for (const char * value : {"auto", "0", "128", "auto"}) {
+            argv = {"binary_name", "--moe-cache-mib", value};
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+            const bool automatic = std::string(value) == "auto";
+            assert(cache_params.moe_cache_auto == automatic);
+            assert(cache_params.moe_cache_auto_explicit == automatic);
+            assert(cache_params.moe_cache_size == (std::string(value) == "128" ? 128 * 1024 * 1024 : 0));
+        }
+    }
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -338,6 +463,30 @@ static void test(void) {
     printf("test-arg-parser: skip on windows build\n");
 #else
     printf("test-arg-parser: test environment variables (valid + invalid usages)\n\n");
+
+    {
+        common_params cache_params;
+        cache_params.model.path = "model_file.gguf";
+        setenv("LLAMA_ARG_MOE_CACHE_MIB", "auto", true);
+        argv = {"binary_name"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+        assert(cache_params.moe_cache_auto && cache_params.moe_cache_auto_explicit);
+        argv = {"binary_name", "--moe-cache-mib", "0"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+        assert(!cache_params.moe_cache_auto && !cache_params.moe_cache_auto_explicit);
+        assert(cache_params.moe_cache_size == 0);
+        unsetenv("LLAMA_ARG_MOE_CACHE_MIB");
+    }
+
+    {
+        common_params dflash_params;
+        dflash_params.model.path = "model_file.gguf";
+        setenv("LLAMA_ARG_SPEC_DRAFT_N_MAX", "7", true);
+        argv = {"binary_name", "--spec-type", "draft-dflash"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), dflash_params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(dflash_params.speculative.draft.n_max == 7);
+        unsetenv("LLAMA_ARG_SPEC_DRAFT_N_MAX");
+    }
 
     setenv("LLAMA_ARG_THREADS", "blah", true);
     argv = {"binary_name"};

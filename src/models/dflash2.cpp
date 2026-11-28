@@ -10,7 +10,9 @@ void llama_model_dflash::load_tensors_dflash2() {
             hparams.dflash_conv_kernel_size <= 0 || hparams.dflash_conv_group_size <= 0) {
         throw std::runtime_error("DFlash2 model is missing conv/selector metadata");
     }
-    if (n_embd < hparams.dflash_selector_top_k * (hparams.dflash_selector_top_k + 1)) {
+    // exact in uint64 for any uint32 top_k; int64 overflows at UINT32_MAX
+    const uint64_t top_k = hparams.dflash_selector_top_k;
+    if ((uint64_t) n_embd < top_k * (top_k + 1)) {
         throw std::runtime_error("DFlash2 hidden size is too small for the selector lattice");
     }
 
@@ -78,12 +80,10 @@ ggml_tensor * llama_model_dflash::build_dflash2_conv(
     }
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
     ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
-    ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
-            coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
+    ggml_tensor * coeffs_side = ggml_view_4d(ctx0, coeffs, 1, n_groups, kernel_size, n_tokens,
+            coeffs->nb[0], coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
 
-    ggml_tensor * coeff_all = ggml_cont(ctx0, coeffs_side);
-    coeff_all = ggml_reshape_4d(ctx0, coeff_all, 1, n_groups, kernel_size, n_tokens);
-    coeff_all = ggml_repeat_4d(ctx0, coeff_all, group_size, n_groups, kernel_size, n_tokens);
+    ggml_tensor * coeff_all = ggml_repeat_4d(ctx0, coeffs_side, group_size, n_groups, kernel_size, n_tokens);
 
     ggml_tensor * base_side = ggml_reshape_4d(ctx0,
             ggml_view_1d(ctx0, base, hidden_size * kernel_size, side * base->nb[2]),
@@ -102,14 +102,12 @@ ggml_tensor * llama_model_dflash::build_dflash2_conv(
                     blocks->nb[1], blocks->nb[2], 0);
             values = ggml_pad_ext(ctx0, previous, 0, 0, tap, 0, 0, 0, 0, 0);
         }
-        values = ggml_reshape_2d(ctx0, values, hidden_size, n_tokens);
+        values = ggml_reshape_4d(ctx0, values, group_size, n_groups, 1, n_tokens);
 
-        ggml_tensor * weight = ggml_reshape_2d(ctx0,
-                ggml_cont(ctx0, ggml_view_4d(ctx0, weight_all, group_size, n_groups, 1, n_tokens,
-                        weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap * weight_all->nb[2])),
-                hidden_size, n_tokens);
+        ggml_tensor * weight = ggml_view_4d(ctx0, weight_all, group_size, n_groups, 1, n_tokens,
+                weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap * weight_all->nb[2]);
 
-        ggml_tensor * term = ggml_mul(ctx0, weight, values);
+        ggml_tensor * term = ggml_reshape_2d(ctx0, ggml_mul(ctx0, values, weight), hidden_size, n_tokens);
         result = result ? ggml_add(ctx0, result, term) : term;
     }
     return result;
@@ -117,7 +115,8 @@ ggml_tensor * llama_model_dflash::build_dflash2_conv(
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens,
+        ggml_tensor * logits, ggml_tensor * draft_ids) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -129,7 +128,7 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t rank     = hparams.dflash_selector_rank;
     const int64_t n_blocks = g.ubatch.n_seqs_unq;
     GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
-    GGML_ASSERT(res->t_logits->ne[1] == n_tokens);
+    GGML_ASSERT(logits->ne[1] == n_tokens);
     if (!tokens) {
         return;
     }
@@ -138,10 +137,14 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
     const int64_t row_used   = top_k + top_k * top_k;
 
-    ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
+    ggml_tensor * cand_cols   = ggml_top_k(ctx0, logits, top_k);
+    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], n_tokens);
     ggml_tensor * unary       = ggml_reshape_2d(ctx0,
-            ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
+            ggml_get_rows(ctx0, logits_rows, cand_cols), top_k, n_tokens);
+    // with draft_ids, the logit columns are the draft vocabulary and draft_ids maps them to token ids
+    ggml_tensor * candidates  = !draft_ids ? cand_cols : ggml_reshape_2d(ctx0,
+            ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, draft_ids, 1, draft_ids->ne[0]), ggml_reshape_1d(ctx0, cand_cols, top_k * n_tokens)),
+            top_k, n_tokens);
     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
 
     // Everything below indexes [.., tokens_per_block, n_blocks]: the block
@@ -177,6 +180,11 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
         }
         ggml_tensor * unary_bcast = ggml_reshape_4d(ctx0, unary_run, top_k, 1, n_pos, n_blocks);
         score = ggml_add(ctx0, score, ggml_repeat(ctx0, unary_bcast, score));
+        // drafts trained with the softcap after the transition correction (Inkling2) cap the score, not the logits
+        if (hparams.dflash_selector_softcap_after && hparams.f_final_logit_softcapping > 0.0f) {
+            const float cap = hparams.f_final_logit_softcapping;
+            score = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, score, 1.0f/cap)), cap);
+        }
 
         ggml_tensor * row = ggml_concat(ctx0,
                 ggml_cast(ctx0, cand_run, GGML_TYPE_F32),
@@ -220,5 +228,5 @@ llama_model_dflash::graph_dflash2::graph_dflash2(const llm_graph_params & params
 
     build_logits(cur);
 
-    build_dflash2_selector(*this, model, inp_tokens);
+    build_dflash2_selector(*this, model, inp_tokens, draft_ids ? logits_draft : res->t_logits, draft_ids);
 }

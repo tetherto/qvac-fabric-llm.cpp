@@ -1,5 +1,14 @@
 #include "models.h"
 
+// K is normalized after RoPE; the M-RoPE K-shift has to undo the norm weight like hunyuan-dense
+llama_rope_params llama_model_hunyuan_vl::get_rope_params(const llama_cparams & cparams, int il) const {
+    auto res = llama_model::get_rope_params(cparams, il);
+
+    res.k_norm = layers[il].attn_k_norm;
+
+    return res;
+}
+
 void llama_model_hunyuan_vl::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);

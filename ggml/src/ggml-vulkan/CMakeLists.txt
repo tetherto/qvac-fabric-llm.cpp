@@ -11,7 +11,14 @@ find_package(Vulkan COMPONENTS glslc REQUIRED)
 if (DEFINED ENV{VULKAN_SDK})
     list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
 endif()
-find_package(SPIRV-Headers CONFIG REQUIRED)
+# Desktop builds get SPIRV-Headers (and Vulkan-Hpp) from the Vulkan SDK. The
+# Android NDK ships neither, so on Android they are fetched in the ANDROID block
+# below; don't hard-require the system package there.
+if (ANDROID)
+    find_package(SPIRV-Headers CONFIG QUIET)
+else()
+    find_package(SPIRV-Headers CONFIG REQUIRED)
+endif()
 
 if (GGML_VULKAN_SPIRV_INCLUDE_DIR)
     set_property(TARGET SPIRV-Headers::SPIRV-Headers PROPERTY
@@ -22,6 +29,10 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     # Parallel build object files
     add_definitions(/MP)
 endif()
+
+# Add options to disable cooperative matrix support
+option(GGML_VULKAN_DISABLE_COOPMAT "Disable VK_KHR_cooperative_matrix support" OFF)
+option(GGML_VULKAN_DISABLE_COOPMAT2 "Disable VK_NV_cooperative_matrix2 support" OFF)
 
 function(detect_host_compiler)
     if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
@@ -61,6 +72,27 @@ function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VA
     endif()
 endfunction()
 
+# Function to test that glslc compiles a shader, for features that need more than a supported #extension
+# Parameters:
+#  TEST_SHADER_FILE - Path to the test shader file
+#  RESULT_VARIABLE - Name of the variable to set (ON/OFF) and forward to vulkan-shaders-gen
+function(test_shader_compiles TEST_SHADER_FILE RESULT_VARIABLE)
+    execute_process(
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
+        RESULT_VARIABLE glslc_result
+        OUTPUT_QUIET
+        ERROR_QUIET
+    )
+
+    if (glslc_result EQUAL 0)
+        set(${RESULT_VARIABLE} ON PARENT_SCOPE)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -D${RESULT_VARIABLE}=ON)
+        set(VULKAN_SHADER_GEN_CMAKE_ARGS "${VULKAN_SHADER_GEN_CMAKE_ARGS}" PARENT_SCOPE)
+    else()
+        set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
+    endif()
+endfunction()
+
 if (Vulkan_FOUND)
     message(STATUS "Vulkan found")
 
@@ -83,17 +115,25 @@ if (Vulkan_FOUND)
     set(VULKAN_SHADER_GEN_CMAKE_ARGS "")
 
     # Test all shader extensions
-    test_shader_extension_support(
-        "GL_KHR_cooperative_matrix"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat.comp"
-        "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
-    )
+    if (NOT GGML_VULKAN_DISABLE_COOPMAT)
+        test_shader_extension_support(
+            "GL_KHR_cooperative_matrix"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat.comp"
+            "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
+        )
+    else()
+        message(STATUS "VK_KHR_cooperative_matrix support disabled by GGML_VULKAN_DISABLE_COOPMAT")
+    endif()
 
-    test_shader_extension_support(
-        "GL_NV_cooperative_matrix2"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
-        "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
-    )
+    if (NOT GGML_VULKAN_DISABLE_COOPMAT2)
+        test_shader_extension_support(
+            "GL_NV_cooperative_matrix2"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
+            "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
+        )
+    else()
+        message(STATUS "VK_NV_cooperative_matrix2 support disabled by GGML_VULKAN_DISABLE_COOPMAT2")
+    endif()
 
     test_shader_extension_support(
         "GL_NV_cooperative_matrix_decode_vector"
@@ -106,6 +146,20 @@ if (Vulkan_FOUND)
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot.comp"
         "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
     )
+
+    # without GL_EXT_integer_dot_product, emit the same dot product instructions through GL_EXT_spirv_intrinsics
+    if (NOT GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+        test_shader_compiles(
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot_spirv.comp"
+            "GGML_VULKAN_INTEGER_DOT_SPIRV_INTRINSICS"
+        )
+        if (GGML_VULKAN_INTEGER_DOT_SPIRV_INTRINSICS)
+            message(STATUS "GL_EXT_integer_dot_product emulated with GL_EXT_spirv_intrinsics")
+            set(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT ON)
+            add_compile_definitions(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+            list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT=ON)
+        endif()
+    endif()
 
     test_shader_extension_support(
         "GL_EXT_bfloat16"
@@ -125,9 +179,54 @@ if (Vulkan_FOUND)
         "GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT"
     )
 
-    target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan SPIRV-Headers::SPIRV-Headers)
-    target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
+    if (TARGET SPIRV-Headers::SPIRV-Headers)
+        # SPIRV-Headers is only needed to compile ggml-vulkan.cpp. As a static
+        # lib, a plain PRIVATE link would leak into the installed ggml-targets
+        # export and break downstream find_package(ggml); BUILD_INTERFACE keeps
+        # it out. Android fetches the headers as a plain include dir below.
+        target_link_libraries(ggml-vulkan PRIVATE $<BUILD_INTERFACE:SPIRV-Headers::SPIRV-Headers>)
+    endif()
+    target_include_directories(ggml-vulkan
+        PRIVATE
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ../../../vendor
 
+    )
+    if (ANDROID)
+        # The Android NDK ships only the C Vulkan headers (vulkan/vulkan.h). The
+        # ggml Vulkan backend additionally needs the C++ bindings
+        # (vulkan/vulkan.hpp) and SPIRV-Headers (spirv/unified1/spirv.hpp), which
+        # the NDK does not provide. Fetch pinned, header-only copies so the
+        # Android Vulkan build works out of the box.
+        include(FetchContent)
+        # SOURCE_SUBDIR points at a directory without a CMakeLists.txt so that
+        # FetchContent only downloads the headers and does NOT add_subdirectory()
+        # their projects (Vulkan-Headers would otherwise re-declare the
+        # Vulkan::Headers target already created by find_package(Vulkan)).
+        FetchContent_Declare(
+            vulkan_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+            GIT_TAG        vulkan-sdk-1.4.350.1
+            GIT_SHALLOW    TRUE
+            SOURCE_SUBDIR  headers-only-no-build
+        )
+        FetchContent_Declare(
+            spirv_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
+            GIT_TAG        vulkan-sdk-1.4.350.1
+            GIT_SHALLOW    TRUE
+            SOURCE_SUBDIR  headers-only-no-build
+        )
+        FetchContent_MakeAvailable(vulkan_headers spirv_headers)
+        target_include_directories(ggml-vulkan PRIVATE
+            "${vulkan_headers_SOURCE_DIR}/include"
+            "${spirv_headers_SOURCE_DIR}/include")
+    endif()
+
+    if (FORCE_GGML_VK_PERF_LOGGER)
+      add_compile_definitions(FORCE_GGML_VK_PERF_LOGGER)
+    endif()
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
     # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
     if (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -143,6 +242,11 @@ if (Vulkan_FOUND)
 
     if (GGML_VULKAN_DEBUG)
         add_compile_definitions(GGML_VULKAN_DEBUG)
+    endif()
+
+    if (GGML_VULKAN_BUILD_ADRENO_SHADERS)
+        add_compile_definitions(GGML_VULKAN_BUILD_ADRENO_SHADERS)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_BUILD_ADRENO_SHADERS=ON)
     endif()
 
     if (GGML_VULKAN_MEMORY_DEBUG)
@@ -230,16 +334,19 @@ if (Vulkan_FOUND)
               CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.cpp"
                                 "${_ggml_vk_input_dir}/*.h")
 
+    set (_ggml_vk_common_cpp "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders-common.cpp")
+
     add_custom_command(
-        OUTPUT ${_ggml_vk_header}
+        OUTPUT ${_ggml_vk_header} ${_ggml_vk_common_cpp}
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
+            --target-common-cpp ${_ggml_vk_common_cpp}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
                 vulkan-shaders-gen
-        COMMENT "Generate vulkan shaders header"
+        COMMENT "Generate vulkan shaders header and common cpp"
     )
-    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_header})
+    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_header} ${_ggml_vk_common_cpp})
 
     foreach (file_full ${_ggml_vk_shader_files})
         get_filename_component(file ${file_full} NAME)

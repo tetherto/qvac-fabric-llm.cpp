@@ -4,6 +4,7 @@
 #include "llama-cparams.h"
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <cassert>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <iterator>
 #include <limits>
 #include <set>
+#include <type_traits>
 #include <vector>
 
 #if defined(__GNUC__)
@@ -71,6 +73,33 @@ struct llama_kv_rows_slice {
     llama_pos p_min = -1;
 };
 
+struct llama_kv_cell_shift {
+    std::array<llama_pos, 4> v = {}; // [t, y, x, other]
+
+    llama_pos & t()     { return v[0]; }
+    llama_pos & y()     { return v[1]; }
+    llama_pos & x()     { return v[2]; }
+    llama_pos & other() { return v[3]; }
+
+    llama_pos t()     const { return v[0]; }
+    llama_pos y()     const { return v[1]; }
+    llama_pos x()     const { return v[2]; }
+    llama_pos other() const { return v[3]; }
+
+    llama_pos axis(uint32_t dim) const {
+        assert(dim < v.size());
+        return v[dim];
+    }
+
+    bool is_zero() const {
+        return v == std::array<llama_pos, 4>{};
+    }
+
+    void reset() {
+        v = {};
+    }
+};
+
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
@@ -81,7 +110,7 @@ public:
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
-            shift[i] =  0;
+            shift[i].reset();
             seq[i].reset();
         }
 
@@ -99,7 +128,7 @@ public:
         has_shift = false;
 
         for (uint32_t i = 0; i < shift.size(); ++i) {
-            shift[i] = 0;
+            shift[i].reset();
         }
     }
 
@@ -182,7 +211,7 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
 
         return res;
@@ -201,7 +230,7 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
 
         return res;
@@ -234,7 +263,7 @@ public:
                 seq_pos_add(i + j);
             }
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
     }
 
@@ -265,7 +294,7 @@ public:
                 seq_pos_add(idx);
             }
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
     }
 
@@ -279,7 +308,7 @@ public:
 
         pos[i] = -1;
         ext[i].reset();
-        shift[i] = 0;
+        shift[i].reset();
 
         used.erase(i);
     }
@@ -298,7 +327,7 @@ public:
         if (seq[i].none()) {
             pos[i] = -1;
             ext[i].reset();
-            shift[i] = 0;
+            shift[i].reset();
 
             used.erase(i);
 
@@ -328,7 +357,7 @@ public:
 
             pos[i] = -1;
             ext[i].reset();
-            shift[i] = 0;
+            shift[i].reset();
 
             used.erase(i);
 
@@ -389,6 +418,22 @@ public:
         return ext[(--it)->second].tok;
     }
 
+    // number of cache cells that contain seq_id.
+    // seq_id < 0 counts all non-empty cells.
+    uint32_t seq_token_count(llama_seq_id seq_id) const {
+        if (seq_id < 0) {
+            return get_used();
+        }
+
+        uint32_t result = 0;
+        for (const uint32_t i : used) {
+            if (seq[i].test(seq_id)) {
+                ++result;
+            }
+        }
+        return result;
+    }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
@@ -432,11 +477,15 @@ public:
     }
 
     // get the lists of the cells that contain any of the sequences of each slice, in cell order
-    // one list of max `n_per_seq` for each slice, padded with -1
+    // one list of max `n_per_seq` for each slice, padded with the cells that follow its last cell, below `n_kv`, then with -1
+    // `n_kv` is the number of rows of the K/V views the lists index
     // the cells of slice s at a position below slices[s].p_min are skipped
     LLAMA_ATTRIBUTE_NOINLINE
-    void get_seq_cells(const std::vector<llama_kv_rows_slice> & slices, int32_t * data, int64_t n_per_seq) const {
+    void get_seq_cells(const std::vector<llama_kv_rows_slice> & slices, int32_t * data, int64_t n_per_seq, uint32_t n_kv) const {
         assert(slices.size() >= 1);
+
+        // the listed cells are below used_max_p1()
+        GGML_ASSERT(used_max_p1() <= n_kv && n_kv <= size());
 
         const int64_t n_slices = (int64_t) slices.size();
 
@@ -464,6 +513,14 @@ public:
                         *dst++ = i;
                     }
                 }
+            }
+
+            // pad with the cells after the last one: the mask hides them (the list holds every cell the slice attends to, in
+            // cell order), and the end of the list stays consecutive, which backends read like the dense cache; -1 from
+            // n_kv on, as some backends copy only the n_kv rows of the K/V views
+            int32_t next = dst > data + s*n_per_seq ? dst[-1] + 1 : 0;
+            for (; dst < end && next < (int32_t) n_kv; ++dst, ++next) {
+                *dst = next;
             }
 
             std::fill(dst, end, -1);
@@ -516,6 +573,20 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        return shift[i].t();
+    }
+
+    llama_pos get_shift(uint32_t i, uint32_t dim) const {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
+        return shift[i].axis(dim);
+    }
+
+    const llama_kv_cell_shift & get_shift_ext(uint32_t i) const {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
         return shift[i];
     }
 
@@ -545,23 +616,44 @@ public:
     }
 
     // pos[i] = pos[i] + d
+    // for decoder M-RoPE/iM-RoPE, ext holds the active spatial axes and the 4th axis is unused
     // sets "has_shift" to true
     // note: call only if the cell is not empty
-    bool pos_add(uint32_t i, llama_pos d) {
+    bool pos_add(uint32_t i, llama_pos d, bool shift_ext = false) {
+        llama_kv_cell_shift delta;
+        delta.t() = d;
+
+        if (shift_ext) {
+            // Move the shared M-RoPE origin while preserving relative image-grid offsets.
+            delta.y() = d;
+            delta.x() = d;
+        }
+
+        return pos_shift(i, delta);
+    }
+
+    bool pos_shift(uint32_t i, const llama_kv_cell_shift & d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
 
         seq_pos_rm(i);
 
-        pos[i]   += d;
-        shift[i] += d;
+        pos[i]     += d.t();
+        ext[i].y   += d.y();
+        ext[i].x   += d.x();
+
+        shift[i].t()     += d.t();
+        shift[i].y()     += d.y();
+        shift[i].x()     += d.x();
+        shift[i].other() += d.other();
 
         has_shift = true;
 
         if (pos[i] < 0) {
             seq[i].reset();
             pos[i] = -1;
-            shift[i] = 0;
+            ext[i].reset();
+            shift[i].reset();
 
             used.erase(i);
 
@@ -576,16 +668,17 @@ public:
     // pos[i] = pos[i] / d
     // sets "has_shift" to true
     // note: call only if the cell is not empty
-    void pos_div(uint32_t i, int d) {
+    void pos_div(uint32_t i, int d, bool shift_ext = false) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+        GGML_ASSERT(!shift_ext && "pos_div() is not supported for multi-axis M-RoPE shifts");
 
         const llama_pos p_old = pos[i];
 
         seq_pos_rm(i);
 
         pos[i]   /= d;
-        shift[i] += p_old - pos[i];
+        shift[i].t() += p_old - pos[i];
 
         seq_pos_add(i);
 
@@ -618,7 +711,7 @@ private:
     //      cells.reset_shift();
     //   }
     //
-    std::vector<llama_pos> shift;
+    std::vector<llama_kv_cell_shift> shift;
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;

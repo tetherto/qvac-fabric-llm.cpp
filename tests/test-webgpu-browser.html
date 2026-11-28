@@ -1,0 +1,71 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebGPU benchmark test</title>
+<label>GGUF model <input id="model" type="file" accept=".gguf"></label>
+<button id="run" disabled>Run benchmark</button>
+<pre id="output"></pre>
+<script>
+var Module;
+(() => {
+    const output = document.getElementById("output");
+    const run = document.getElementById("run");
+    const write = text => {
+        output.textContent += String(text) + "\n";
+        console.log(String(text));
+    };
+
+    Module = {
+        noInitialRun: true,
+        print: write,
+        printErr: write,
+        onAbort: reason => write("ABORT: " + reason),
+        onExit: code => write("EXIT: " + code),
+        onRuntimeInitialized: () => {
+            run.disabled = false;
+            write("Runtime ready");
+        }
+    };
+
+    run.onclick = async () => {
+        const file = document.getElementById("model").files[0];
+        if (!file) {
+            write("Select a GGUF model first");
+            return;
+        }
+
+        run.disabled = true;
+        try {
+            const adapter = await navigator.gpu?.requestAdapter({
+                powerPreference: "high-performance"
+            });
+            write("Probe shader-f16: " +
+                Boolean(adapter?.features.has("shader-f16")));
+
+            Module.FS.writeFile("/model.gguf",
+                new Uint8Array(await file.arrayBuffer()));
+            await Module.callMain([
+                "-v",
+                "-m", "/model.gguf",
+                "--load-mode", "none",
+                "--device", "WebGPU",
+                "-ngl", "999",
+                "-fa", "on",
+                "-t", "1",
+                "-p", "128",
+                "-n", "16",
+                "-r", "3"
+            ]);
+        } catch (error) {
+            const detail = typeof WebAssembly.Exception === "function" && error instanceof WebAssembly.Exception && typeof Module.getExceptionMessage === "function"
+                ? Module.getExceptionMessage(error).join(": ")
+                : String(error);
+            write("ERROR: " + detail);
+        }
+    };
+
+    const script = document.createElement("script");
+    script.src = "../build-webgpu-wasm/bin/llama-bench.js";
+    script.onerror = () => write("ERROR: benchmark script could not load");
+    document.head.appendChild(script);
+})();
+</script>

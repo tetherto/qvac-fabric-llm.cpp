@@ -1,0 +1,85 @@
+#version 450
+
+#include "types.glsl"
+
+// Fused LSTM cell: gates [4H, N] as i | f | g | o -> dst [2H, N] as h_new | c_new.
+// Unmasked prev is c_prev [H, N]; MASKED prev is hc_prev [2H, N], zero mask holds the column.
+
+#define LSTM_GATE_INPUT  0
+#define LSTM_GATE_FORGET 1
+#define LSTM_GATE_CELL   2
+#define LSTM_GATE_OUTPUT 3
+#define LSTM_N_GATES     4
+#define LSTM_OUT_H       0
+#define LSTM_OUT_C       1
+#define LSTM_N_OUTS      2
+
+layout (push_constant) uniform parameter
+{
+    uint H;
+    uint N;
+    uint prev_row;      // elements per column of prev (H unmasked, 2H masked)
+    uint c_base;        // where c starts inside a prev column (0 unmasked, H masked)
+    uint mask_stride;   // 0 for a broadcast mask entry, 1 for one entry per column
+    uint gates_offset;  // buffer misalignment, in elements
+    uint prev_offset;
+    uint mask_offset;
+    uint dst_offset;
+} p;
+
+layout (binding = 0) readonly buffer G {float data_gates[];};
+layout (binding = 1) readonly buffer P {float data_prev[];};
+#ifdef MASKED
+layout (binding = 2) readonly  buffer M {int data_mask[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+#else
+layout (binding = 2) writeonly buffer D {float data_d[];};
+#endif
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+// Spelled exactly as sigmoid.comp and tanh.comp spell them, so the fused cell
+// matches the decomposed graph.
+float lstm_sigmoid(float x) {
+    return 1. / (1 + exp(-1. * x));
+}
+
+float lstm_tanh(float x) {
+    return 1. - 2. / (exp(2. * x) + 1.);
+}
+
+void main() {
+    const uint k = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    if (k >= p.H * p.N) {
+        return;
+    }
+
+    const uint n = k / p.H;
+    const uint j = k - n * p.H;
+
+    const uint pbase = p.prev_offset + n * p.prev_row;
+    const uint obase = p.dst_offset  + n * LSTM_N_OUTS * p.H;
+
+#ifdef MASKED
+    // A held column is a bit-for-bit copy, so it stays exact for non-finite values.
+    if (data_mask[p.mask_offset + n * p.mask_stride] == 0) {
+        data_d[obase + LSTM_OUT_H * p.H + j] = data_prev[pbase + j];
+        data_d[obase + LSTM_OUT_C * p.H + j] = data_prev[pbase + p.c_base + j];
+        return;
+    }
+#endif
+
+    const uint gbase = p.gates_offset + n * LSTM_N_GATES * p.H;
+
+    const float gi = lstm_sigmoid(data_gates[gbase + LSTM_GATE_INPUT  * p.H + j]);
+    const float gf = lstm_sigmoid(data_gates[gbase + LSTM_GATE_FORGET * p.H + j]);
+    const float gg = lstm_tanh   (data_gates[gbase + LSTM_GATE_CELL   * p.H + j]);
+    const float go = lstm_sigmoid(data_gates[gbase + LSTM_GATE_OUTPUT * p.H + j]);
+
+    // precise: the decomposed mul/mul/add graph rounds each product, so the two
+    // products here must not contract into an FMA.
+    precise float c_new = gf * data_prev[pbase + p.c_base + j] + gi * gg;
+
+    data_d[obase + LSTM_OUT_H * p.H + j] = go * lstm_tanh(c_new);
+    data_d[obase + LSTM_OUT_C * p.H + j] = c_new;
+}

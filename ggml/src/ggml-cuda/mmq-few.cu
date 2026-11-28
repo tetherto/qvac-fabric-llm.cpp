@@ -1,18 +1,22 @@
 #include "mmq-few.cuh"
 #include "cp-async.cuh"
 #include "mma.cuh"
+#include "mmvq.cuh"
 #include "quantize.cuh"
+#include "repack-cutlass-blockscaled.cuh"
 #include "vecdotq.cuh"
 
 #include <type_traits>
 
-// NVIDIA only: the kernel uses the NVIDIA int8 MMA fragment layout and cp.async.
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// NVIDIA Ampere+ (int8 MMA, cp.async) and RDNA3 (WMMA); other GPUs keep MMVQ and MMQ.
+#if !defined(GGML_USE_MUSA)
 
 using namespace ggml_cuda_mma;
 
 // Few-row MMQ: int8 MMA mat-mul for 2-24 src1 columns. A CUDA block has 16 src0 rows (32 for 2 column groups on large matrices).
 // Its warps split K in units of 256 values and copy raw src0 rows into their own cp.async ring, src1 is quantized to the MMA fragment layout.
+// MUL_MAT_ID: one column group per expert and CUDA block, for short rows the warps split the rows instead of K (64 rows per block).
+// Rows that are not a whole number of ring stages or not 16 byte aligned, and Q8_0/IQ4_NL rows that end with half a unit, take the edge variant.
 
 static constexpr int MMQ_FEW_MAX_NCG = 3;  // max. number of column groups
 static constexpr int MMQ_FEW_NROWS   = 16; // src0 rows of one MMA tile
@@ -34,8 +38,15 @@ static constexpr __host__ __device__ int mmq_few_unit_size(const ggml_type type)
         case GGML_TYPE_IQ3_S:  return mmq_few_unit_size_of<GGML_TYPE_IQ3_S>();
         case GGML_TYPE_IQ4_NL: return mmq_few_unit_size_of<GGML_TYPE_IQ4_NL>();
         case GGML_TYPE_IQ4_XS: return mmq_few_unit_size_of<GGML_TYPE_IQ4_XS>();
+        case GGML_TYPE_F8_E4M3: return QK_K;
+        case GGML_TYPE_NVFP4:  return QK_K/2 + QK_K/QK_NVFP4_SUB; // CUTLASS repacked: 128 bytes of values + 16 scales
         default:               return 0;
     }
+}
+
+// src0 bytes per 256 values in the rows of x, the NVFP4 scales are in a separate array
+static constexpr __host__ __device__ int mmq_few_x_unit_size(const ggml_type type) {
+    return type == GGML_TYPE_NVFP4 ? QK_K/2 : mmq_few_unit_size(type);
 }
 
 // Q4_K and Q5_K also need the src1 sums for their mins.
@@ -54,30 +65,50 @@ static constexpr __host__ __device__ int mmq_few_nstages(const ggml_type type) {
 }
 
 // The src0 data of a ring stage does not fill whole 16 byte chunks, it is copied from the preceding 16 byte boundary.
-static constexpr __host__ __device__ bool mmq_few_unaligned(const ggml_type type, const int nunits_stage) {
-    return (nunits_stage*mmq_few_unit_size(type)) % 16 != 0;
+// edge: the kernel for rows that are not whole ring stages or not 16 byte aligned (see mul_mat_q_few) always copies this way.
+static constexpr __host__ __device__ bool mmq_few_unaligned(const ggml_type type, const int nunits_stage, const bool edge = false) {
+    return edge || (nunits_stage*mmq_few_unit_size(type)) % 16 != 0;
 }
 
 // for unaligned data the max. over the 8 possible start offsets
-static constexpr __host__ __device__ int mmq_few_nchunks(const ggml_type type, const int nunits_stage) {
+static constexpr __host__ __device__ int mmq_few_nchunks(const ggml_type type, const int nunits_stage, const bool edge = false) {
     const int nbytes = nunits_stage*mmq_few_unit_size(type);
-    return mmq_few_unaligned(type, nunits_stage) ? (14 + nbytes + 15)/16 : nbytes/16;
+    return mmq_few_unaligned(type, nunits_stage, edge) ? (14 + nbytes + 15)/16 : nbytes/16;
 }
 
 // Unaligned rows are padded to an odd number of 16 byte chunks against bank conflicts, for aligned rows the padding costs more than it saves.
-static constexpr __host__ __device__ int mmq_few_sram_stride(const ggml_type type, const int nunits_stage) {
-    const int nchunks = mmq_few_nchunks(type, nunits_stage);
-    return mmq_few_unaligned(type, nunits_stage) && nchunks % 2 == 0 ? 16*(nchunks + 1) : 16*nchunks;
+static constexpr __host__ __device__ int mmq_few_sram_stride(const ggml_type type, const int nunits_stage, const bool edge = false) {
+    const int nchunks = mmq_few_nchunks(type, nunits_stage, edge);
+    return mmq_few_unaligned(type, nunits_stage, edge) && nchunks % 2 == 0 ? 16*(nchunks + 1) : 16*nchunks;
 }
 
-static constexpr __host__ __device__ int mmq_few_nbytes_shared(const ggml_type type, const int ncg, const int nmt) {
-    return MMQ_FEW_NWARPS*mmq_few_nstages(type)*nmt*MMQ_FEW_NROWS*mmq_few_sram_stride(type, mmq_few_nunits_stage(type, ncg, nmt));
+static constexpr __host__ __device__ int mmq_few_nbytes_shared(const ggml_type type, const int nmt, const int nunits_stage, const bool edge = false) {
+    return MMQ_FEW_NWARPS*mmq_few_nstages(type)*nmt*MMQ_FEW_NROWS*mmq_few_sram_stride(type, nunits_stage, edge);
+}
+
+// Q8_0 and IQ4_NL rows may end with half a unit (128 values), of which the edge kernel decodes the first 4 blocks.
+static constexpr __host__ __device__ bool mmq_few_half_units(const ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL;
+}
+
+// F8_E4M3 has no MUL_MAT_ID quantizer. The CUTLASS repacked NVFP4 (scales in their own array) has no MUL_MAT_ID and no edge kernel.
+static constexpr __host__ __device__ bool mmq_few_ids_supported(const ggml_type type) {
+    return type != GGML_TYPE_F8_E4M3 && type != GGML_TYPE_NVFP4;
+}
+
+static constexpr __host__ __device__ bool mmq_few_edge_supported(const ggml_type type) {
+    return type != GGML_TYPE_NVFP4;
 }
 
 // With Q6_K and Q8_0 two CUDA blocks with 32-row tiles would not fit into an SM.
 static constexpr __host__ __device__ bool mmq_few_tall_supported(const ggml_type type) {
     return type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
-           type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS;
+           type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_NVFP4;
+}
+
+// MUL_MAT_ID with fewer than 2 units of 256 values per warp: the warps split the rows, each warp has its own 16 rows.
+static constexpr __host__ __device__ bool mmq_few_ksplit(const bool has_ids, const int nunits) {
+    return !has_ids || nunits >= 2*MMQ_FEW_NWARPS;
 }
 
 #if defined(CP_ASYNC_AVAILABLE)
@@ -396,13 +427,13 @@ static __device__ __forceinline__ void mmq_few_vec_dot_iq4_xs(const char * const
     mmq_few_add_scaled(sum, d, sum_d);
 }
 
-// Q8_0 and IQ4_NL have a block with its own scale per 32 values.
-template <ggml_type type, int ncg>
+// Q8_0 and IQ4_NL have a block with its own scale per 32 values. nsub: blocks of the unit, 4 for a half unit.
+template <ggml_type type, int ncg, int nsub>
 static __device__ __forceinline__ void mmq_few_vec_dot_q8_0_iq4_nl(const char * const (&x)[2], const mmq_few_y_frag (&yf)[ncg], float (&sum)[ncg][4]) {
     const int t = threadIdx.x % 4;
 
 #pragma unroll
-    for (int s = 0; s < 8; ++s) {
+    for (int s = 0; s < nsub; ++s) {
         int   lo[2];
         int   hi[2];
         float d[2];
@@ -463,10 +494,101 @@ static __device__ __forceinline__ void mmq_few_vec_dot_iq3_s(const char * const 
     mmq_few_add_scaled(sum, d, sum_d);
 }
 
-template <ggml_type type, int ncg>
+// byte i of the result is nibble i of v
+static __device__ __forceinline__ int mmq_few_expand_nibbles(const uint32_t v) {
+    return (v & 0x000F) | ((v & 0x00F0) << 4) | ((v & 0x0F00) << 8) | ((v & 0xF000) << 12);
+}
+
+// NVFP4 (CUTLASS repacked) unit: 128 bytes of values, value 2i in the low nibble of byte i, then the 16 UE4M3 scales,
+// one per 16 values. The halves of a sub-block have their own scales: one k=16 MMA per half.
+template <int ncg>
+static __device__ __forceinline__ void mmq_few_vec_dot_nvfp4(const char * const (&x)[2], const mmq_few_y_frag (&yf)[ncg], float (&sum)[ncg][4]) {
+    const int t = threadIdx.x % 4;
+
+    int sc[2][4];
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sc[r][j] = get_int_b4(x[r] + QK_K/2, j);
+        }
+    }
+
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        int   lo[2];
+        int   hi[2];
+        float d_lo[2];
+        float d_hi[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const uint32_t v_lo = *(const uint16_t *) (x[r] + 16*s + 2*t);
+            const uint32_t v_hi = *(const uint16_t *) (x[r] + 16*s + 8 + 2*t);
+            const int2 v = get_int_from_table_16(mmq_few_expand_nibbles(v_lo) | (mmq_few_expand_nibbles(v_hi) << 4), kvalues_mxfp4);
+            lo[r] = v.x;
+            hi[r] = v.y;
+            d_lo[r] = ggml_cuda_ue4m3_to_fp32((sc[r][s/2] >> (16*(s % 2)))     & 0xFF);
+            d_hi[r] = ggml_cuda_ue4m3_to_fp32((sc[r][s/2] >> (16*(s % 2) + 8)) & 0xFF);
+        }
+#pragma unroll
+        for (int c = 0; c < ncg; ++c) {
+            const int2 b = mmq_few_get_b(yf[c], s);
+            const tile<16, 8, int> C_lo = mmq_few_mma_k16(lo, b.x);
+            const tile<16, 8, int> C_hi = mmq_few_mma_k16(hi, b.y);
+
+            const float2 d = mmq_few_get_d<MMQ_Q8_1_DS_LAYOUT_D4>(yf[c], s);
+            sum[c][0] += d.x*(C_lo.x[0]*d_lo[0] + C_hi.x[0]*d_hi[0]);
+            sum[c][1] += d.y*(C_lo.x[1]*d_lo[0] + C_hi.x[1]*d_hi[0]);
+            sum[c][2] += d.x*(C_lo.x[2]*d_lo[1] + C_hi.x[2]*d_hi[1]);
+            sum[c][3] += d.y*(C_lo.x[3]*d_lo[1] + C_hi.x[3]*d_hi[1]);
+        }
+    }
+}
+
+// F8_E4M3: the raw values are the A fragments of an e4m3 MMA, src1 holds e4m3 values with a float scale per 32 values.
+// The per-tensor weight scale is applied by the graph.
+template <int ncg>
+static __device__ __forceinline__ void mmq_few_vec_dot_f8(const char * const (&x)[2], const mmq_few_y_frag (&yf)[ncg], float (&sum)[ncg][4]) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE
+    const int t = threadIdx.x % 4;
+
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        const int a0 = get_int_b4(x[0] + 32*s,      t);
+        const int a1 = get_int_b4(x[1] + 32*s,      t);
+        const int a2 = get_int_b4(x[0] + 32*s + 16, t);
+        const int a3 = get_int_b4(x[1] + 32*s + 16, t);
+#pragma unroll
+        for (int c = 0; c < ncg; ++c) {
+            const int2 b = mmq_few_get_b(yf[c], s);
+            float C[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b.x), "r"(b.y));
+
+            const float2 d = mmq_few_get_d<MMQ_Q8_1_DS_LAYOUT_D4>(yf[c], s);
+            sum[c][0] += d.x*C[0];
+            sum[c][1] += d.y*C[1];
+            sum[c][2] += d.x*C[2];
+            sum[c][3] += d.y*C[3];
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, yf, sum);
+    NO_DEVICE_CODE;
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE
+}
+
+// half: the half unit at the end of a row, only its first 128 values
+template <ggml_type type, int ncg, bool half = false>
 static __device__ __forceinline__ void mmq_few_vec_dot(const char * const (&x)[2], const mmq_few_y_frag (&yf)[ncg], float (&sum)[ncg][4]) {
-    if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL) {
-        mmq_few_vec_dot_q8_0_iq4_nl<type, ncg>(x, yf, sum);
+    static_assert(!half || mmq_few_half_units(type), "no half units for this type");
+    if constexpr (type == GGML_TYPE_F8_E4M3) {
+        mmq_few_vec_dot_f8<ncg>(x, yf, sum);
+    } else if constexpr (type == GGML_TYPE_NVFP4) {
+        mmq_few_vec_dot_nvfp4<ncg>(x, yf, sum);
+    } else if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL) {
+        mmq_few_vec_dot_q8_0_iq4_nl<type, ncg, half ? 4 : 8>(x, yf, sum);
     } else if constexpr (type == GGML_TYPE_Q3_K) {
         mmq_few_vec_dot_q3_K<ncg>(x, yf, sum);
     } else if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
@@ -484,25 +606,33 @@ static __device__ __forceinline__ void mmq_few_vec_dot(const char * const (&x)[2
 
 #endif // defined(CP_ASYNC_AVAILABLE)
 
-template <ggml_type type, int ncg, int nmt>
+// has_ids: MUL_MAT_ID, blockIdx.y is a pair of quantize_mmq_few_id_q8_1, its expert is the src0 channel and dst dims 1 and 2 are slot and token.
+// edge: rows that are not a whole number of ring stages or not 16 byte aligned. The units past the row are skipped, a half unit
+// at the end (Q8_0, IQ4_NL) is decoded as such, and the stages are copied from the 16 byte boundary before each row.
+// nunits counts a half unit, nbytes_row is the size of the src0 data of a row.
+template <ggml_type type, int ncg, int nmt, bool has_ids, bool edge, int nus = mmq_few_nunits_stage(type, ncg, nmt)>
 __launch_bounds__(MMQ_FEW_NWARPS*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_q_few(
         const char * x, const int4 * y_ptr, float * dst,
-        const int nunits, const int nrows_x, const int ncols_dst, const int64_t stride_row_x, const int stride_col_dst,
+        const int nunits, const int nbytes_row, const int nrows_x, const int ncols_dst, const int64_t stride_row_x, const int stride_col_dst,
         const int channel_ratio, const int64_t stride_channel_x, const int stride_channel_dst,
-        const int sample_ratio, const int64_t stride_sample_x, const int stride_sample_dst, const bool x_is_constant) {
+        const int sample_ratio, const int64_t stride_sample_x, const int stride_sample_dst, const bool x_is_constant,
+        const char * x_scales, const int64_t stride_row_scales, const int * pairs) {
 #if defined(CP_ASYNC_AVAILABLE)
     constexpr int nwarps    = MMQ_FEW_NWARPS;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     static_assert(warp_size == WARP_SIZE, "unsupported warp size");
+    static_assert(!has_ids || (ncg == 1 && nmt == 1 && mmq_few_ids_supported(type)), "unsupported MUL_MAT_ID config");
+    static_assert(!edge || (nmt == 1 && mmq_few_edge_supported(type)), "unsupported edge config");
 
     constexpr int  unit_size    = mmq_few_unit_size(type);
+    constexpr int  x_unit_size  = mmq_few_x_unit_size(type);
     constexpr int  nrows        = nmt*MMQ_FEW_NROWS;
-    constexpr int  nunits_stage = mmq_few_nunits_stage(type, ncg, nmt);
+    constexpr int  nunits_stage = nus;
     constexpr int  nstages      = mmq_few_nstages(type);
-    constexpr bool unaligned    = mmq_few_unaligned(type, nunits_stage);
-    constexpr int  nchunks      = mmq_few_nchunks(type, nunits_stage);
-    constexpr int  sram_stride  = mmq_few_sram_stride(type, nunits_stage);
+    constexpr bool unaligned    = mmq_few_unaligned(type, nunits_stage, edge);
+    constexpr int  nchunks      = mmq_few_nchunks(type, nunits_stage, edge);
+    constexpr int  sram_stride  = mmq_few_sram_stride(type, nunits_stage, edge);
     constexpr int  nbytes_stage = nrows*sram_stride;
     constexpr int  ncopies      = nrows*nchunks;
     static_assert(unit_size > 0, "unsupported type");
@@ -510,16 +640,33 @@ static __global__ void mul_mat_q_few(
     extern __shared__ char data_mmq_few[];
     char * ring = data_mmq_few + threadIdx.y*nstages*nbytes_stage;
 
-    const int row0        = blockIdx.x*nrows;
+    const bool ksplit   = mmq_few_ksplit(has_ids, nunits);
+    const int  row0_blk = blockIdx.x*(ksplit ? nrows : nwarps*nrows);
+    const int  row0     = ksplit ? row0_blk : row0_blk + threadIdx.y*nrows;
+    const int  iu_begin = ksplit ? nunits_stage*threadIdx.y : 0;
+    const int  iu_step  = ksplit ? nunits_stage*nwarps : nunits_stage;
+
     const int channel_dst = blockIdx.y;
     const int sample_dst  = blockIdx.z;
     const int nchannels   = gridDim.y;
 
-    x   += int64_t(sample_dst/sample_ratio)*stride_sample_x + int64_t(channel_dst/channel_ratio)*stride_channel_x;
-    dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
+    int ncols = ncols_dst;
+    [[maybe_unused]] const int * pair = nullptr;
+    if constexpr (has_ids) {
+        ggml_cuda_pdl_sync(); // the pairs come from the preceding kernel
+        pair  = pairs + channel_dst*MMQ_FEW_PAIR_INTS;
+        ncols = pair[1];
+        if (ncols == 0) {
+            return;
+        }
+        x += int64_t(pair[0])*stride_channel_x;
+    } else {
+        x   += int64_t(sample_dst/sample_ratio)*stride_sample_x + int64_t(channel_dst/channel_ratio)*stride_channel_x;
+        dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
+    }
     const int4 * GGML_CUDA_RESTRICT y = y_ptr + (int64_t(sample_dst)*nchannels + channel_dst)*nunits*ncg*MMQ_FEW_Q8_1_INT4;
 
-    // No bounds check for the units, the gate makes nunits a multiple of nunits_stage.
+    // Without edge no bounds check for the units, the gate makes nunits a multiple of nunits_stage.
     // The extra bytes of unaligned data are inside the allocation, which ggml aligns and pads to 128 bytes.
     auto load_stage = [&](const int stage, const int iu0) {
         const unsigned int dst_stage = ggml_cuda_cvta_generic_to_shared(ring + stage*nbytes_stage);
@@ -531,9 +678,17 @@ static __global__ void mul_mat_q_few(
             if (ncopies % warp_size == 0 || c < ncopies) {
                 const int row = min(row0 + i, nrows_x - 1);
                 const char * src = x + int64_t(row)*stride_row_x + int64_t(iu0)*unit_size;
-                if constexpr (unaligned) {
-                    const int off = (uintptr_t) src % 16;
-                    if (16*ic < off + nunits_stage*unit_size) {
+                if constexpr (type == GGML_TYPE_NVFP4) {
+                    // per unit 8 chunks of values, then 1 chunk of scales from their own array
+                    const int u  = ic / 9;
+                    const int cu = ic % 9;
+                    src = cu < 8 ? x + int64_t(row)*stride_row_x + int64_t(iu0 + u)*x_unit_size + 16*cu :
+                                   x_scales + int64_t(row)*stride_row_scales + int64_t(iu0 + u)*(QK_K/QK_NVFP4_SUB);
+                    cp_async_cg_16<0>(dst_stage + i*sram_stride + 16*ic, src);
+                } else if constexpr (unaligned) {
+                    const int off    = (uintptr_t) src % 16;
+                    const int nbytes = edge ? min(nunits_stage*unit_size, nbytes_row - iu0*unit_size) : nunits_stage*unit_size;
+                    if (16*ic < off + nbytes) {
                         cp_async_cg_16<0>(dst_stage + i*sram_stride + 16*ic, src - off + 16*ic);
                     }
                 } else {
@@ -562,11 +717,11 @@ static __global__ void mul_mat_q_few(
     // DGX Spark DRAM serves the short row pieces of the stage copies slowly, so the rows of the block are first prefetched into L2 in address order.
     {
         const int     tid       = threadIdx.y*warp_size + threadIdx.x;
-        const int     nrows_blk = min(nrows, nrows_x - row0);
-        const int64_t row_bytes = int64_t(nunits)*unit_size;
+        const int     nrows_blk = min(ksplit ? nrows : nwarps*nrows, nrows_x - row0_blk);
+        const int64_t row_bytes = edge ? int64_t(nbytes_row) : int64_t(nunits)*x_unit_size;
         const bool    contig    = stride_row_x == row_bytes;
         for (int ir = 0; ir < (contig ? 1 : nrows_blk); ++ir) {
-            const uintptr_t p0 = (uintptr_t) (x + int64_t(row0 + ir)*stride_row_x);
+            const uintptr_t p0 = (uintptr_t) (x + int64_t(row0_blk + ir)*stride_row_x);
             const uintptr_t p1 = p0 + (contig ? nrows_blk*row_bytes : row_bytes);
             for (uintptr_t p = (p0 & ~uintptr_t(127)) + 128*tid; p < p1; p += 128*nwarps*warp_size) {
                 ggml_cuda_prefetch_l2((const void *) p);
@@ -575,11 +730,9 @@ static __global__ void mul_mat_q_few(
     }
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
 
-    const int iu_step = nunits_stage*nwarps;
-
 #pragma unroll
     for (int stage = 0; stage < nstages - 1; ++stage) {
-        const int iu0 = nunits_stage*threadIdx.y + stage*iu_step;
+        const int iu0 = iu_begin + stage*iu_step;
         if (iu0 < nunits) {
             load_stage(stage, iu0);
         }
@@ -598,16 +751,16 @@ static __global__ void mul_mat_q_few(
 
     // The next src1 fragments are loaded right after the MMAs that use the current ones, an earlier load is slower.
     mmq_few_y_frag yf[nunits_stage][ncg];
-    if (nunits_stage*threadIdx.y < nunits) {
 #pragma unroll
-        for (int k = 0; k < nunits_stage; ++k) {
-            load_y(yf[k], nunits_stage*threadIdx.y + k);
+    for (int k = 0; k < nunits_stage; ++k) {
+        if (edge ? iu_begin + k < nunits : iu_begin < nunits) {
+            load_y(yf[k], iu_begin + k);
         }
     }
 
     float sum[nmt][ncg][4] = {{{0.0f}}};
 
-    for (int iter = 0, iu0 = nunits_stage*threadIdx.y; iu0 < nunits; ++iter, iu0 += iu_step) {
+    for (int iter = 0, iu0 = iu_begin; iu0 < nunits; ++iter, iu0 += iu_step) {
         const int iu_load = iu0 + (nstages - 1)*iu_step;
         if (iu_load < nunits) {
             load_stage((iter + nstages - 1) % nstages, iu_load);
@@ -623,15 +776,24 @@ static __global__ void mul_mat_q_few(
         const int off_stage = unaligned ? (iu0*unit_size) % 16 : 0;
 #pragma unroll
         for (int k = 0; k < nunits_stage; ++k) {
+            if (edge && iu0 + k >= nunits) {
+                break;
+            }
 #pragma unroll
             for (int m = 0; m < nmt; ++m) {
                 const char * const xr[2] = {
                     xs + (MMQ_FEW_NROWS*m + threadIdx.x/4 + 0)*sram_stride + (off_row[2*m + 0] + off_stage) % 16 + k*unit_size,
                     xs + (MMQ_FEW_NROWS*m + threadIdx.x/4 + 8)*sram_stride + (off_row[2*m + 1] + off_stage) % 16 + k*unit_size,
                 };
+                if constexpr (edge && mmq_few_half_units(type)) {
+                    if ((iu0 + k + 1)*unit_size > nbytes_row) {
+                        mmq_few_vec_dot<type, ncg, true>(xr, yf[k], sum[m]);
+                        continue;
+                    }
+                }
                 mmq_few_vec_dot<type, ncg>(xr, yf[k], sum[m]);
             }
-            if (has_next) {
+            if (has_next && (!edge || iu0 + iu_step + k < nunits)) {
                 load_y(yf[k], iu0 + iu_step + k);
             }
         }
@@ -643,11 +805,351 @@ static __global__ void mul_mat_q_few(
     ggml_cuda_pdl_lc();
 
     // reduce the sums over the warps as one flat array
-    constexpr int nsum = nmt*ncg*4;
-    float * sum_flat = &sum[0][0][0];
+    if (ksplit) {
+        constexpr int nsum = nmt*ncg*4;
+        float * sum_flat = &sum[0][0][0];
 
-    float * buf_sum = (float *) data_mmq_few;
-    __syncthreads();
+        float * buf_sum = (float *) data_mmq_few;
+        __syncthreads();
+        if (threadIdx.y > 0) {
+#pragma unroll
+            for (int i = 0; i < nsum; ++i) {
+                buf_sum[((threadIdx.y - 1)*nsum + i)*warp_size + threadIdx.x] = sum_flat[i];
+            }
+        }
+        __syncthreads();
+        if (threadIdx.y > 0) {
+            return;
+        }
+#pragma unroll
+        for (int w = 0; w < nwarps - 1; ++w) {
+#pragma unroll
+            for (int i = 0; i < nsum; ++i) {
+                sum_flat[i] += buf_sum[(w*nsum + i)*warp_size + threadIdx.x];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < nmt; ++m) {
+#pragma unroll
+        for (int c = 0; c < ncg; ++c) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int i = row0 + MMQ_FEW_NROWS*m + tile<16, 8, int>::get_i(l);
+                const int j = c*MMQ_FEW_NCOLS + tile<16, 8, int>::get_j(l);
+                if (i < nrows_x && j < ncols) {
+                    if constexpr (has_ids) {
+                        const int e = pair[2 + j]; // token*n_expert_used + slot
+                        dst[int64_t(e / ncols_dst)*stride_channel_dst + int64_t(e % ncols_dst)*stride_col_dst + i] = sum[m][c][l];
+                    } else {
+                        dst[int64_t(j)*stride_col_dst + i] = sum[m][c][l];
+                    }
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, y_ptr, dst, nunits, nbytes_row, nrows_x, ncols_dst, stride_row_x, stride_col_dst,
+        channel_ratio, stride_channel_x, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_dst, x_is_constant, x_scales, stride_row_scales, pairs);
+    NO_DEVICE_CODE;
+#endif // defined(CP_ASYNC_AVAILABLE)
+}
+
+// RDNA3 version with WMMA. A WMMA multiplies 16x16 int8 matrices and both half-warps must hold the same A and B data:
+//   A = src1, lane l holds 16 consecutive values of column l%16.
+//   B = src0, lane l holds 16 consecutive values of row l%16.
+//   C: lane l holds the columns 2v + l/16, v = 0..7, of row l%16.
+// So the src0 scales of a row stay in the lane that decodes it, the src1 scales of the C columns come with the layout in quantize.cuh.
+// The lanes decode their rows straight from global memory. A ring as in mul_mat_q_few, filled through registers without cp.async, was slower.
+
+static constexpr __host__ __device__ bool mmq_few_wmma_supported(const ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+}
+
+// the reduction over the warps
+static constexpr __host__ __device__ int mmq_few_wmma_nbytes_shared(const int ncg) {
+    return (MMQ_FEW_NWARPS - 1)*ncg*8*WARP_SIZE*sizeof(float);
+}
+
+#if defined(RDNA3)
+
+typedef int mmq_few_int32x4_t __attribute__((__vector_size__(4*sizeof(int))));
+typedef int mmq_few_int32x8_t __attribute__((__vector_size__(8*sizeof(int))));
+
+// The src1 fragments of a lane for one sub-block of a column group, see quantize.cuh.
+struct mmq_few_wmma_y {
+    int4 qs[2];
+    int  ds[8];
+};
+
+// half: only the first 8 columns of the group are used, the others are zero and the C values v >= 4 are not needed.
+static __device__ __forceinline__ mmq_few_wmma_y mmq_few_wmma_load_y(const int4 * y, const int s, const bool half) {
+    const int m = threadIdx.x % 16;
+    const int h = threadIdx.x / 16;
+    mmq_few_wmma_y yf;
+    if (half && m >= MMQ_FEW_WMMA_NCOLS/2) {
+        yf.qs[0] = make_int4(0, 0, 0, 0);
+        yf.qs[1] = make_int4(0, 0, 0, 0);
+    } else {
+        yf.qs[0] = y[(s*MMQ_FEW_WMMA_NCOLS + m)*2 + 0];
+        yf.qs[1] = y[(s*MMQ_FEW_WMMA_NCOLS + m)*2 + 1];
+    }
+    const int4 ds0 = y[8*MMQ_FEW_WMMA_NCOLS*2 + (s*2 + h)*2 + 0];
+    const int4 ds1 = half ? make_int4(0, 0, 0, 0) : y[8*MMQ_FEW_WMMA_NCOLS*2 + (s*2 + h)*2 + 1];
+    yf.ds[0] = ds0.x; yf.ds[1] = ds0.y; yf.ds[2] = ds0.z; yf.ds[3] = ds0.w;
+    yf.ds[4] = ds1.x; yf.ds[5] = ds1.y; yf.ds[6] = ds1.z; yf.ds[7] = ds1.w;
+    return yf;
+}
+
+template <mmq_q8_1_ds_layout ds_layout>
+static __device__ __forceinline__ float mmq_few_wmma_get_d(const mmq_few_wmma_y & yf, const int v) {
+    if constexpr (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
+        return __int_as_float(yf.ds[v]);
+    } else {
+        return __low2float(*(const half2 *) &yf.ds[v]);
+    }
+}
+
+static __device__ __forceinline__ float mmq_few_wmma_get_sum(const mmq_few_wmma_y & yf, const int v) {
+    return __high2float(*(const half2 *) &yf.ds[v]);
+}
+
+// n ints at the even byte offset o of the 4 byte aligned p, with whole 4 byte loads. In the unrolled decoders o is a constant.
+template <int n>
+static __device__ __forceinline__ void mmq_few_wmma_get_ints_b2(const char * p, const int o, int * dst) {
+    const int * w = (const int *) (p + (o & ~3));
+    if (o % 4 == 0) {
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            dst[i] = w[i];
+        }
+    } else {
+        int lo = w[0];
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            const int hi = w[i + 1];
+            dst[i] = __builtin_amdgcn_alignbyte(hi, lo, 2);
+            lo = hi;
+        }
+    }
+}
+
+static __device__ __forceinline__ mmq_few_int32x8_t mmq_few_wmma(const int4 a, const int * b, const mmq_few_int32x8_t c) {
+    const mmq_few_int32x4_t va = {a.x, a.y, a.z, a.w};
+    const mmq_few_int32x4_t vb = {b[0], b[1], b[2], b[3]};
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, va, true, vb, c, false);
+}
+
+// vec_dot: one unit of 256 values of row l%16, x points to its data in the ring, y to the src1 fragments of the unit.
+// b[8] is sub-block s of the row: b[0..3] are the values [0, 16), b[4..7] the values [16, 32).
+
+template <ggml_type type, int ncg, bool half_last>
+static __device__ __forceinline__ void mmq_few_wmma_vec_dot_q45_K(const char * x, const int4 * y, float (&sum)[ncg][8]) {
+    using block_t = std::conditional_t<type == GGML_TYPE_Q4_K, block_q4_K, block_q5_K>;
+    const block_t * bx = (const block_t *) __builtin_assume_aligned(x, 16);
+
+    const int4  hdr       = *(const int4 *) bx; // dm and the 12 scale bytes
+    const int   scales[3] = {hdr.y, hdr.z, hdr.w};
+    const int   sc[2]     = {unpack_scales_q45_K(scales, 0), unpack_scales_q45_K(scales, 1)};
+    const int   mn[2]     = {unpack_scales_q45_K(scales, 2), unpack_scales_q45_K(scales, 3)};
+    const float2 dm       = __half22float2(bx->dm);
+
+    [[maybe_unused]] int qh[8]; // Q5_K: bit s holds the high bit of sub-block s
+    if constexpr (type == GGML_TYPE_Q5_K) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            qh[i] = get_int_b4(bx->qh, i);
+        }
+    }
+
+    float sum_d[ncg][8] = {{0.0f}};
+    float sum_m[ncg][8] = {{0.0f}};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        int qs[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            qs[i] = get_int_b4(bx->qs + 32*j, i);
+        }
+#pragma unroll
+        for (int s = 2*j; s < 2*j + 2; ++s) {
+            int b[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                b[i] = (qs[i] >> (4*(s % 2))) & 0x0F0F0F0F;
+                if constexpr (type == GGML_TYPE_Q5_K) {
+                    b[i] |= ((qh[i] >> s) & 0x01010101) << 4;
+                }
+            }
+            const int   ls = (sc[s/4] >> (8*(s % 4))) & 0xFF;
+            const float m  = (mn[s/4] >> (8*(s % 4))) & 0xFF;
+#pragma unroll
+            for (int c = 0; c < ncg; ++c) {
+                const bool half = half_last && c == ncg - 1;
+                const mmq_few_wmma_y yf = mmq_few_wmma_load_y(y + c*MMQ_FEW_WMMA_Q8_1_INT4, s, half);
+                mmq_few_int32x8_t C = {0};
+                C = mmq_few_wmma(yf.qs[0], b + 0, C);
+                C = mmq_few_wmma(yf.qs[1], b + 4, C);
+#pragma unroll
+                for (int v = 0; v < (half ? 4 : 8); ++v) {
+                    sum_d[c][v] += mmq_few_wmma_get_d<MMQ_Q8_1_DS_LAYOUT_DS4>(yf, v) * float(C[v]*ls);
+                    sum_m[c][v] += m * mmq_few_wmma_get_sum(yf, v);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < ncg; ++c) {
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            sum[c][v] += dm.x*sum_d[c][v] - dm.y*sum_m[c][v];
+        }
+    }
+}
+
+// Q6_K has a scale per 16 values, one WMMA per half of a sub-block.
+template <int ncg, bool half_last>
+static __device__ __forceinline__ void mmq_few_wmma_vec_dot_q6_K(const char * x, const int4 * y, float (&sum)[ncg][8]) {
+    const block_q6_K * bx = (const block_q6_K *) x;
+    const float d = __half2float(bx->d);
+
+    float sum_d[ncg][8] = {{0.0f}};
+#pragma unroll
+    for (int n = 0; n < 2; ++n) {
+        int ql[2][8]; // [ql offset 0 or 32]
+        int qh[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            ql[0][i] = get_int_b2(bx->ql + 64*n,      i);
+            ql[1][i] = get_int_b2(bx->ql + 64*n + 32, i);
+            qh[i]    = get_int_b2(bx->qh + 32*n,      i);
+        }
+        const int sc[2] = {get_int_b2(bx->scales + 8*n, 0), get_int_b2(bx->scales + 8*n, 1)};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int s = 4*n + j;
+            int b[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                b[i] = __vsub4(((ql[j % 2][i] >> (4*(j/2))) & 0x0F0F0F0F) | (((qh[i] >> (2*j)) & 0x03030303) << 4), 0x20202020);
+            }
+            const int sc_lo = (int8_t) (sc[j/2] >> (16*(j % 2) + 0)); // scale of the values [0, 16)
+            const int sc_hi = (int8_t) (sc[j/2] >> (16*(j % 2) + 8)); // scale of the values [16, 32)
+#pragma unroll
+            for (int c = 0; c < ncg; ++c) {
+                const bool half = half_last && c == ncg - 1;
+                const mmq_few_wmma_y yf = mmq_few_wmma_load_y(y + c*MMQ_FEW_WMMA_Q8_1_INT4, s, half);
+                const mmq_few_int32x8_t zero = {0};
+                const mmq_few_int32x8_t C_lo = mmq_few_wmma(yf.qs[0], b + 0, zero);
+                const mmq_few_int32x8_t C_hi = mmq_few_wmma(yf.qs[1], b + 4, zero);
+#pragma unroll
+                for (int v = 0; v < (half ? 4 : 8); ++v) {
+                    sum_d[c][v] += mmq_few_wmma_get_d<MMQ_Q8_1_DS_LAYOUT_D4>(yf, v) * float(C_lo[v]*sc_lo + C_hi[v]*sc_hi);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < ncg; ++c) {
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            sum[c][v] += d*sum_d[c][v];
+        }
+    }
+}
+
+// Q8_0 and IQ4_NL have a block with its own scale per 32 values.
+template <ggml_type type, int ncg, bool half_last>
+static __device__ __forceinline__ void mmq_few_wmma_vec_dot_q8_0_iq4_nl(const char * x, const int4 * y, float (&sum)[ncg][8]) {
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        // a unit starts 16 byte aligned, the qs of every second block 2 bytes off a 4 byte boundary
+        const char * xa = (const char *) __builtin_assume_aligned(x, 16);
+        int   b[8];
+        float d;
+        if constexpr (type == GGML_TYPE_Q8_0) {
+            mmq_few_wmma_get_ints_b2<8>(xa, int(sizeof(block_q8_0))*s + 2, b);
+            d = __half2float(((const block_q8_0 *) xa + s)->d);
+        } else {
+            int q4[4];
+            mmq_few_wmma_get_ints_b2<4>(xa, int(sizeof(block_iq4_nl))*s + 2, q4);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int2 v = get_int_from_table_16(q4[i], kvalues_iq4nl);
+                b[i + 0] = v.x;
+                b[i + 4] = v.y;
+            }
+            d = __half2float(((const block_iq4_nl *) xa + s)->d);
+        }
+#pragma unroll
+        for (int c = 0; c < ncg; ++c) {
+            const bool half = half_last && c == ncg - 1;
+            const mmq_few_wmma_y yf = mmq_few_wmma_load_y(y + c*MMQ_FEW_WMMA_Q8_1_INT4, s, half);
+            mmq_few_int32x8_t C = {0};
+            C = mmq_few_wmma(yf.qs[0], b + 0, C);
+            C = mmq_few_wmma(yf.qs[1], b + 4, C);
+#pragma unroll
+            for (int v = 0; v < (half ? 4 : 8); ++v) {
+                sum[c][v] += d*mmq_few_wmma_get_d<MMQ_Q8_1_DS_LAYOUT_D4>(yf, v) * float(C[v]);
+            }
+        }
+    }
+}
+
+template <ggml_type type, int ncg, bool half_last>
+static __device__ __forceinline__ void mmq_few_wmma_vec_dot(const char * x, const int4 * y, float (&sum)[ncg][8]) {
+    if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL) {
+        mmq_few_wmma_vec_dot_q8_0_iq4_nl<type, ncg, half_last>(x, y, sum);
+    } else if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
+        mmq_few_wmma_vec_dot_q45_K<type, ncg, half_last>(x, y, sum);
+    } else if constexpr (type == GGML_TYPE_Q6_K) {
+        mmq_few_wmma_vec_dot_q6_K<ncg, half_last>(x, y, sum);
+    } else {
+        static_assert(type == GGML_TYPE_COUNT, "unsupported type");
+    }
+}
+
+#endif // defined(RDNA3)
+
+// The warps split K in units of 256 values, a block has 16 src0 rows. half_last: the last column group has at most 8 columns.
+template <ggml_type type, int ncg, bool half_last>
+__launch_bounds__(MMQ_FEW_NWARPS*WARP_SIZE, 1)
+static __global__ void mul_mat_q_few_wmma(
+        const char * x, const int4 * y_ptr, float * dst,
+        const int nunits, const int nrows_x, const int ncols_dst, const int64_t stride_row_x, const int stride_col_dst,
+        const int channel_ratio, const int64_t stride_channel_x, const int stride_channel_dst,
+        const int sample_ratio, const int64_t stride_sample_x, const int stride_sample_dst) {
+#if defined(RDNA3)
+    constexpr int nwarps    = MMQ_FEW_NWARPS;
+    constexpr int warp_size = WARP_SIZE;
+    constexpr int unit_size = mmq_few_unit_size(type);
+    static_assert(mmq_few_wmma_supported(type), "unsupported type");
+
+    extern __shared__ float buf_sum_mmq_few_wmma[];
+
+    const int row0        = blockIdx.x*MMQ_FEW_NROWS;
+    const int channel_dst = blockIdx.y;
+    const int sample_dst  = blockIdx.z;
+    const int nchannels   = gridDim.y;
+
+    x   += int64_t(sample_dst/sample_ratio)*stride_sample_x + int64_t(channel_dst/channel_ratio)*stride_channel_x;
+    dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
+    const int4 * GGML_CUDA_RESTRICT y = y_ptr + (int64_t(sample_dst)*nchannels + channel_dst)*nunits*ncg*MMQ_FEW_WMMA_Q8_1_INT4;
+
+    const char * xr = x + int64_t(min(row0 + int(threadIdx.x) % 16, nrows_x - 1))*stride_row_x;
+
+    float sum[ncg][8] = {{0.0f}};
+    for (int iu = threadIdx.y; iu < nunits; iu += nwarps) {
+        mmq_few_wmma_vec_dot<type, ncg, half_last>(xr + int64_t(iu)*unit_size, y + int64_t(iu)*ncg*MMQ_FEW_WMMA_Q8_1_INT4, sum);
+    }
+
+    // reduce the sums over the warps as one flat array
+    constexpr int nsum = ncg*8;
+    float * sum_flat = &sum[0][0];
+
+    float * buf_sum = buf_sum_mmq_few_wmma;
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < nsum; ++i) {
@@ -666,26 +1168,23 @@ static __global__ void mul_mat_q_few(
         }
     }
 
+    const int i = row0 + threadIdx.x % 16;
 #pragma unroll
-    for (int m = 0; m < nmt; ++m) {
+    for (int c = 0; c < ncg; ++c) {
 #pragma unroll
-        for (int c = 0; c < ncg; ++c) {
-#pragma unroll
-            for (int l = 0; l < 4; ++l) {
-                const int i = row0 + MMQ_FEW_NROWS*m + tile<16, 8, int>::get_i(l);
-                const int j = c*MMQ_FEW_NCOLS + tile<16, 8, int>::get_j(l);
-                if (i < nrows_x && j < ncols_dst) {
-                    dst[int64_t(j)*stride_col_dst + i] = sum[m][c][l];
-                }
+        for (int v = 0; v < (half_last && c == ncg - 1 ? 4 : 8); ++v) {
+            const int j = c*MMQ_FEW_WMMA_NCOLS + 2*v + threadIdx.x/16;
+            if (i < nrows_x && j < ncols_dst) {
+                dst[int64_t(j)*stride_col_dst + i] = sum[c][v];
             }
         }
     }
 #else
     GGML_UNUSED_VARS(x, y_ptr, dst, nunits, nrows_x, ncols_dst, stride_row_x, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_dst, x_is_constant);
+        sample_ratio, stride_sample_x, stride_sample_dst);
     NO_DEVICE_CODE;
-#endif // defined(CP_ASYNC_AVAILABLE)
+#endif // defined(RDNA3)
 }
 
 // ggml_is_constant (static in ggml.c) on the tensor that a view points to
@@ -695,28 +1194,41 @@ static bool mmq_few_is_constant(const ggml_tensor * src0) {
         !(x_root->flags & GGML_TENSOR_FLAG_PARAM);
 }
 
-template <ggml_type type, int ncg, int nmt>
+// src0 with its scales in a separate array (CUTLASS repacked NVFP4)
+struct mmq_few_split_x {
+    const char * values;
+    int64_t      stride_row;
+    const char * scales;
+    int64_t      stride_row_scales;
+};
+
+// MUL_MAT_ID: grid y is the pairs, the kernel takes the expert from the pair and does not use the channel and sample ratios.
+template <ggml_type type, int ncg, int nmt, bool has_ids = false, bool edge = false, int nus = mmq_few_nunits_stage(type, ncg, nmt)>
 static void launch_mul_mat_q_few(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-        const int4 * src1_q, cudaStream_t stream) {
+        const int4 * src1_q, cudaStream_t stream, const mmq_few_split_x * split = nullptr, const int * pairs = nullptr, const int npairs_max = 0) {
     GGML_TENSOR_BINARY_OP_LOCALS;
 
-    const int nunits = ne00 / QK_K;
-    GGML_ASSERT(nunits % mmq_few_nunits_stage(type, ncg, nmt) == 0);
+    const int nunits     = (ne00 + QK_K - 1) / QK_K;
+    const int nbytes_row = (int) ggml_row_size(type, ne00);
+    GGML_ASSERT(edge || ne00 % (nus*QK_K) == 0);
+    GGML_ASSERT((type == GGML_TYPE_NVFP4) == (split != nullptr));
 
     const int warp_size     = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    const int nbytes_shared = mmq_few_nbytes_shared(type, ncg, nmt);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_few<type, ncg, nmt>), nbytes_shared);
+    const int nbytes_shared = mmq_few_nbytes_shared(type, nmt, nus, edge);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_few<type, ncg, nmt, has_ids, edge, nus>), nbytes_shared);
 
     const bool x_is_constant = mmq_few_is_constant(src0);
 
-    const dim3 block_nums((ne01 + nmt*MMQ_FEW_NROWS - 1) / (nmt*MMQ_FEW_NROWS), ne12, ne13);
+    const int  nrows_blk = (mmq_few_ksplit(has_ids, nunits) ? 1 : MMQ_FEW_NWARPS)*nmt*MMQ_FEW_NROWS;
+    const dim3 block_nums((ne01 + nrows_blk - 1) / nrows_blk, has_ids ? npairs_max : ne12, ne13);
     const dim3 block_dims(warp_size, MMQ_FEW_NWARPS, 1);
     const ggml_cuda_kernel_launch_params params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_q_few<type, ncg, nmt>, params,
-        (const char *) src0->data, src1_q, (float *) dst->data,
-        nunits, (int) ne01, (int) ne1, (int64_t) nb01, (int) (nb1/sizeof(float)),
+    ggml_cuda_kernel_launch(mul_mat_q_few<type, ncg, nmt, has_ids, edge, nus>, params,
+        split ? split->values : (const char *) src0->data, src1_q, (float *) dst->data,
+        nunits, nbytes_row, (int) ne01, (int) ne1, split ? split->stride_row : (int64_t) nb01, (int) (nb1/sizeof(float)),
         (int) (ne12/ne02), (int64_t) nb02, (int) (nb2/sizeof(float)),
-        (int) (ne13/ne03), (int64_t) nb03, (int) (nb3/sizeof(float)), x_is_constant);
+        (int) (ne13/ne03), (int64_t) nb03, (int) (nb3/sizeof(float)), x_is_constant,
+        split ? split->scales : nullptr, split ? split->stride_row_scales : int64_t(0), pairs);
 }
 
 static int mmq_few_ncg(const int64_t ncols) {
@@ -729,37 +1241,171 @@ static int mmq_few_nmt(const ggml_type type, const int ncg, const int64_t nrows_
     return mmq_few_tall_supported(type) && ncg == 2 && nrows_x >= int64_t(nsm)*2*MMQ_FEW_NROWS ? 2 : 1;
 }
 
+// Column groups, row tiles and the edge kernel (see mul_mat_q_few) for src0 and ncols src1 columns (MUL_MAT_ID: tokens).
+// The edge kernel takes the rows that are not a whole number of ring stages and the rows that the aligned copies cannot read.
+struct mmq_few_config {
+    int  ncg;
+    int  nmt;
+    bool edge;
+};
+
+static mmq_few_config mmq_few_get_config(const ggml_tensor * src0, const int64_t ncols, const bool has_ids) {
+    const ggml_type type         = src0->type;
+    const int       ncg          = has_ids ? 1 : mmq_few_ncg(ncols);
+    const int       nmt          = has_ids ? 1 : mmq_few_nmt(type, ncg, src0->ne[1]);
+    const int       nunits_stage = mmq_few_nunits_stage(type, ncg, nmt);
+    const bool      edge         = src0->ne[0] % (nunits_stage*QK_K) != 0 ||
+                                   (!mmq_few_unaligned(type, nunits_stage) && !ggml_cuda_is_aligned(src0, 16));
+    return { ncg, edge ? 1 : nmt, edge };
+}
+
 template <ggml_type type>
 static void launch_mul_mat_q_few_tall(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-        const int4 * src1_q, cudaStream_t stream) {
+        const int4 * src1_q, cudaStream_t stream, const mmq_few_split_x * split = nullptr) {
     if constexpr (mmq_few_tall_supported(type)) {
         if (mmq_few_nmt(type, 2, src0->ne[1]) == 2) {
-            launch_mul_mat_q_few<type, 2, 2>(src0, src1, dst, src1_q, stream);
+            // DGX Spark: 16-row tiles with the stages of the 32-row kernel are faster and sum in the same order
+            if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK) {
+                launch_mul_mat_q_few<type, 2, 1, false, false, mmq_few_nunits_stage(type, 2, 2)>(src0, src1, dst, src1_q, stream, split);
+                return;
+            }
+            launch_mul_mat_q_few<type, 2, 2>(src0, src1, dst, src1_q, stream, split);
             return;
         }
     }
-    launch_mul_mat_q_few<type, 2, 1>(src0, src1, dst, src1_q, stream);
+    launch_mul_mat_q_few<type, 2, 1>(src0, src1, dst, src1_q, stream, split);
 }
 
 template <ggml_type type>
 static void launch_mul_mat_q_few_switch_ncg(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-        const int4 * src1_q, const int ncg, cudaStream_t stream) {
-    switch (ncg) {
+        const int4 * src1_q, const int * pairs, const int npairs_max, const mmq_few_config cfg, cudaStream_t stream,
+        const mmq_few_split_x * split = nullptr) {
+    if constexpr (mmq_few_ids_supported(type)) {
+        if (pairs) {
+            if (cfg.edge) {
+                launch_mul_mat_q_few<type, 1, 1, true, true>(src0, src1, dst, src1_q, stream, nullptr, pairs, npairs_max);
+            } else {
+                launch_mul_mat_q_few<type, 1, 1, true, false>(src0, src1, dst, src1_q, stream, nullptr, pairs, npairs_max);
+            }
+            return;
+        }
+    }
+    if constexpr (mmq_few_edge_supported(type)) {
+        if (cfg.edge) {
+            switch (cfg.ncg) {
+                case 1:
+                    launch_mul_mat_q_few<type, 1, 1, false, true>(src0, src1, dst, src1_q, stream);
+                    break;
+                case 2:
+                    launch_mul_mat_q_few<type, 2, 1, false, true>(src0, src1, dst, src1_q, stream);
+                    break;
+                case 3:
+                    launch_mul_mat_q_few<type, 3, 1, false, true>(src0, src1, dst, src1_q, stream);
+                    break;
+                default:
+                    GGML_ABORT("fatal error");
+            }
+            return;
+        }
+    }
+    GGML_ASSERT(pairs == nullptr && !cfg.edge);
+    switch (cfg.ncg) {
         case 1:
-            launch_mul_mat_q_few<type, 1, 1>(src0, src1, dst, src1_q, stream);
+            launch_mul_mat_q_few<type, 1, 1>(src0, src1, dst, src1_q, stream, split);
             break;
         case 2:
-            launch_mul_mat_q_few_tall<type>(src0, src1, dst, src1_q, stream);
+            launch_mul_mat_q_few_tall<type>(src0, src1, dst, src1_q, stream, split);
             break;
         case 3:
-            launch_mul_mat_q_few<type, 3, 1>(src0, src1, dst, src1_q, stream);
+            launch_mul_mat_q_few<type, 3, 1>(src0, src1, dst, src1_q, stream, split);
             break;
         default:
             GGML_ABORT("fatal error");
     }
 }
 
-void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+template <ggml_type type, int ncg, bool half_last>
+static void launch_mul_mat_q_few_wmma(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const int4 * src1_q, cudaStream_t stream) {
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    const int nunits        = ne00 / QK_K;
+    const int nbytes_shared = mmq_few_wmma_nbytes_shared(ncg);
+
+    const dim3 block_nums((ne01 + MMQ_FEW_NROWS - 1) / MMQ_FEW_NROWS, ne12, ne13);
+    const dim3 block_dims(WARP_SIZE, MMQ_FEW_NWARPS, 1);
+    const ggml_cuda_kernel_launch_params params(block_nums, block_dims, nbytes_shared, stream);
+    ggml_cuda_kernel_launch(mul_mat_q_few_wmma<type, ncg, half_last>, params,
+        (const char *) src0->data, src1_q, (float *) dst->data,
+        nunits, (int) ne01, (int) ne1, (int64_t) nb01, (int) (nb1/sizeof(float)),
+        (int) (ne12/ne02), (int64_t) nb02, (int) (nb2/sizeof(float)),
+        (int) (ne13/ne03), (int64_t) nb03, (int) (nb3/sizeof(float)));
+}
+
+template <ggml_type type>
+static void launch_mul_mat_q_few_wmma_switch_ncols(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const int4 * src1_q, cudaStream_t stream) {
+    const int64_t ncols = src1->ne[1];
+    if (ncols <= MMQ_FEW_WMMA_NCOLS/2) {
+        launch_mul_mat_q_few_wmma<type, 1, true>(src0, src1, dst, src1_q, stream);
+    } else if (ncols <= MMQ_FEW_WMMA_NCOLS) {
+        launch_mul_mat_q_few_wmma<type, 1, false>(src0, src1, dst, src1_q, stream);
+    } else {
+        GGML_ASSERT(ncols <= MMQ_FEW_WMMA_NCOLS + MMQ_FEW_WMMA_NCOLS/2);
+        launch_mul_mat_q_few_wmma<type, 2, true>(src0, src1, dst, src1_q, stream);
+    }
+}
+
+// Min. and max. number of src1 columns for RDNA3, 0 if the type is not used. Tuned on the Radeon 8060S (gfx1151) in full
+// decode graphs: MMVQ is faster below the min., MMQ above the max. With 2 column groups all types spill registers.
+static int2 mmq_few_wmma_ncols_range(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_K:   return make_int2( 4, 16);
+        case GGML_TYPE_Q5_K:   return make_int2( 4,  8);
+        case GGML_TYPE_Q6_K:   return make_int2( 6, 16);
+        case GGML_TYPE_IQ4_NL: return make_int2( 7,  8);
+        default:               return make_int2( 0,  0);
+    }
+}
+
+static bool mmq_few_use_wmma(const int cc) {
+    return GGML_CUDA_CC_IS_RDNA3(cc);
+}
+
+static void ggml_cuda_mul_mat_q_few_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    cudaStream_t stream = ctx.stream();
+
+    const int nunits = ne00 / QK_K;
+    const int ncg    = (ne11 + MMQ_FEW_WMMA_NCOLS - 1) / MMQ_FEW_WMMA_NCOLS;
+
+    ggml_cuda_pool_alloc<int4> src1_q(ctx.pool(), int64_t(ne12)*ne13*nunits*ncg*MMQ_FEW_WMMA_Q8_1_INT4);
+    quantize_mmq_few_wmma_q8_1_cuda((const float *) src1->data, src1_q.get(), mmq_few_ds_layout(src0->type), ne10, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
+        ne11, ne12, ne13, stream);
+
+    switch (src0->type) {
+        case GGML_TYPE_Q8_0:
+            launch_mul_mat_q_few_wmma_switch_ncols<GGML_TYPE_Q8_0>(src0, src1, dst, src1_q.get(), stream);
+            break;
+        case GGML_TYPE_Q4_K:
+            launch_mul_mat_q_few_wmma_switch_ncols<GGML_TYPE_Q4_K>(src0, src1, dst, src1_q.get(), stream);
+            break;
+        case GGML_TYPE_Q5_K:
+            launch_mul_mat_q_few_wmma_switch_ncols<GGML_TYPE_Q5_K>(src0, src1, dst, src1_q.get(), stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            launch_mul_mat_q_few_wmma_switch_ncols<GGML_TYPE_Q6_K>(src0, src1, dst, src1_q.get(), stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            launch_mul_mat_q_few_wmma_switch_ncols<GGML_TYPE_IQ4_NL>(src0, src1, dst, src1_q.get(), stream);
+            break;
+        default:
+            GGML_ABORT("unsupported type for few-row MMQ with WMMA");
+    }
+}
+
+void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
@@ -767,54 +1413,96 @@ void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(nb00 == ggml_type_size(src0->type));
     GGML_ASSERT(nb10 == sizeof(float));
     GGML_ASSERT(nb0  == sizeof(float));
-    GGML_ASSERT(ne11 <= MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS);
-    GGML_ASSERT(ne00 % QK_K == 0);
-    GGML_ASSERT(ne12 % ne02 == 0 && ne13 % ne03 == 0);
+    GGML_ASSERT(ne00 % (mmq_few_half_units(src0->type) ? QK_K/2 : QK_K) == 0);
+
+    if (mmq_few_use_wmma(ggml_cuda_info().devices[ctx.device].cc)) {
+        GGML_ASSERT(ids == nullptr);
+        ggml_cuda_mul_mat_q_few_wmma(ctx, src0, src1, dst);
+        return;
+    }
 
     cudaStream_t stream = ctx.stream();
 
-    const int nunits = ne00 / QK_K;
-    const int ncg    = mmq_few_ncg(ne11);
+    const int            nunits = (ne00 + QK_K - 1) / QK_K; // with a half unit at the end
+    const mmq_few_config cfg    = mmq_few_get_config(src0, ids ? ids->ne[1] : ne11, ids != nullptr);
+    const int            ncg    = cfg.ncg;
 
-    ggml_cuda_pool_alloc<int4> src1_q(ctx.pool(), int64_t(ne12)*ne13*nunits*ncg*MMQ_FEW_Q8_1_INT4);
-    quantize_mmq_few_q8_1_cuda((const float *) src1->data, src1_q.get(), mmq_few_ds_layout(src0->type), ne10, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
-        ne11, ne12, ne13, stream);
+    ggml_cuda_pool_alloc<int>  pairs(ctx.pool());
+    ggml_cuda_pool_alloc<int4> src1_q(ctx.pool());
+    int npairs_max = 0;
+    if (ids) {
+        GGML_ASSERT(mmq_few_ids_supported(src0->type));
+        GGML_ASSERT(ids->type == GGML_TYPE_I32);
+        GGML_ASSERT(ids->nb[0] == ggml_type_size(ids->type));
+        GGML_ASSERT(ne1 == ids->ne[0] && ne13 == 1 && ne3 == 1);
+
+        const int64_t n_expert_used = ids->ne[0];
+        const int64_t n_tokens      = ids->ne[1];
+        const int64_t nentries      = n_tokens*n_expert_used;
+        const int64_t nused         = std::min(ne02, nentries);
+        // an expert with c > 0 entries (at most one per token) has ceil(c/MMQ_FEW_NCOLS) pairs
+        npairs_max = (int) std::min(nused + (nentries - nused)/MMQ_FEW_NCOLS, ne02*((n_tokens + MMQ_FEW_NCOLS - 1) / MMQ_FEW_NCOLS));
+
+        pairs.alloc(int64_t(npairs_max)*MMQ_FEW_PAIR_INTS);
+        src1_q.alloc(int64_t(npairs_max)*nunits*MMQ_FEW_Q8_1_INT4);
+        quantize_mmq_few_id_q8_1_cuda((const float *) src1->data, (const int32_t *) ids->data, src1_q.get(), pairs.get(), mmq_few_ds_layout(src0->type),
+            ne00, nb11/sizeof(float), nb12/sizeof(float), ne11, ne02, n_expert_used, n_tokens, ids->nb[1]/sizeof(int32_t), npairs_max, stream);
+    } else {
+        GGML_ASSERT(ne11 <= MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS);
+        GGML_ASSERT(ne12 % ne02 == 0 && ne13 % ne03 == 0);
+
+        src1_q.alloc(int64_t(ne12)*ne13*nunits*ncg*MMQ_FEW_Q8_1_INT4);
+        if (src0->type == GGML_TYPE_F8_E4M3) {
+            quantize_mmq_few_fp8_cuda((const float *) src1->data, src1_q.get(), ne10, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
+                ne11, ne12, ne13, stream);
+        } else {
+            quantize_mmq_few_q8_1_cuda((const float *) src1->data, src1_q.get(), mmq_few_ds_layout(src0->type), ne10, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
+                ne11, ne12, ne13, stream);
+        }
+    }
 
     switch (src0->type) {
+        case GGML_TYPE_F8_E4M3:
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_F8_E4M3>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, cfg, stream);
+            break;
         case GGML_TYPE_Q8_0:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q8_0>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q8_0>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, cfg, stream);
             break;
         case GGML_TYPE_Q3_K:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q3_K>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q3_K>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, cfg, stream);
             break;
         case GGML_TYPE_Q4_K:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q4_K>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q4_K>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, cfg, stream);
             break;
         case GGML_TYPE_Q5_K:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q5_K>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q5_K>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, cfg, stream);
             break;
         case GGML_TYPE_Q6_K:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q6_K>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q6_K>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, cfg, stream);
             break;
         case GGML_TYPE_IQ3_S:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ3_S>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ3_S>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, cfg, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ4_NL>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ4_NL>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, cfg, stream);
             break;
         case GGML_TYPE_IQ4_XS:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ4_XS>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ4_XS>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, cfg, stream);
             break;
         default:
             GGML_ABORT("unsupported type for few-row MMQ");
     }
 }
 
-// Min. number of src1 columns for the few-row MMQ, 0 if it is not used for this type, GPU and row length.
-static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const int64_t ne00) {
+// Min. number of src1 columns (MUL_MAT_ID: tokens) for the few-row MMQ, 0 if it is not used for this type, GPU and row length.
+int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const int64_t ne00, const bool has_ids) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return 0;
 #endif // GGML_CUDA_FORCE_CUBLAS
+
+    if (mmq_few_use_wmma(cc)) { // no MUL_MAT_ID with WMMA
+        return has_ids || !mmq_few_wmma_supported(type) || ne00 < 8*QK_K || ne00 % QK_K != 0 ? 0 : mmq_few_wmma_ncols_range(type).x;
+    }
 
     // NVIDIA Ampere to Blackwell
     if (!ampere_mma_available(cc) || cc >= GGML_CUDA_CC_RUBIN) {
@@ -824,12 +1512,29 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
     if (cc == GGML_CUDA_CC_DGX_SPARK && ggml_cuda_highest_compiled_arch(cc) != GGML_CUDA_CC_DGX_SPARK) {
         return 0;
     }
-    // with fewer than 8 units of 256 values per row the warps idle, MMVQ and MMQ are better there
-    if (mmq_few_unit_size(type) == 0 || ne00 < 8*QK_K) {
+    // with fewer than 8 units of 256 values per row the warps idle, MMVQ and MMQ are better there (MUL_MAT_ID splits the rows instead)
+    if (mmq_few_unit_size(type) == 0 || (!has_ids && ne00 < 8*QK_K)) {
         return 0;
     }
-    if (cc == GGML_CUDA_CC_DGX_SPARK) { // tuned on DGX Spark GB10
-        return type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL ? 8 : 2;
+    if (has_ids && !mmq_few_ids_supported(type)) {
+        return 0;
+    }
+    // NVFP4 only in the CUTLASS repacked layout, see ggml_cuda_should_use_mmq_few_repacked
+    if (type == GGML_TYPE_NVFP4) {
+        return 0;
+    }
+    // F8_E4M3 needs the e4m3 MMA, tuned on DGX Spark only: faster than MMVF and cuBLASLt at 2-24 columns
+    if (type == GGML_TYPE_F8_E4M3) {
+        return cc == GGML_CUDA_CC_DGX_SPARK ? 2 : 0;
+    }
+    if (cc == GGML_CUDA_CC_DGX_SPARK) { // tuned on DGX Spark GB10, also for MUL_MAT_ID
+        if (type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL) {
+            return has_ids ? 3 : 8; // MUL_MAT_ID from 3 tokens: Inkling 2 Mini IQ4_NL experts
+        }
+        return 2;
+    }
+    if (has_ids) { // after MMVQ, which is faster up to its max. batch size
+        return get_mmvq_mmid_max_batch(type, cc) + 1;
     }
     switch (type) { // all GPUs except DGX Spark, tuned on RTX 5090
         case GGML_TYPE_Q3_K:   return 3;
@@ -844,33 +1549,107 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
     }
 }
 
-bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * src1, const int cc) {
-    const int min_ncols = ggml_cuda_mmq_few_min_ncols(src0->type, cc, src0->ne[0]);
-    if (min_ncols == 0 || src1->ne[1] < min_ncols || src1->ne[1] > MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS) {
+bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const int cc) {
+    const int64_t ncols     = ids ? ids->ne[1] : src1->ne[1];
+    const int     min_ncols = ggml_cuda_mmq_few_min_ncols(src0->type, cc, src0->ne[0], ids != nullptr);
+    if (min_ncols == 0 || ncols < min_ncols || ncols > MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS) {
         return false;
     }
-    // the row must hold a whole number of ring stages of the launched kernel
-    const int ncg          = mmq_few_ncg(src1->ne[1]);
-    const int nmt          = mmq_few_nmt(src0->type, ncg, src0->ne[1]);
-    const int nunits_stage = mmq_few_nunits_stage(src0->type, ncg, nmt);
-    if (src0->ne[0] % (nunits_stage*QK_K) != 0) {
+    // MUL_MAT_ID: the pairs are built in shared memory
+    if (ids && (2*src0->ne[2] + 1)*sizeof(int) > ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
         return false;
     }
-    // unaligned data needs the alignment of the decoder loads
-    const int x_alignment = mmq_few_unaligned(src0->type, nunits_stage) ? (ggml_type_size(src0->type) % 4 == 0 ? 4 : 2) : 16;
+    if (mmq_few_use_wmma(cc)) {
+        if (src1->ne[1] > mmq_few_wmma_ncols_range(src0->type).y) {
+            return false;
+        }
+        // the decoders read whole 4 byte values from 16 byte aligned units, Q6_K values 2 bytes at a time
+        const int x_alignment = mmq_few_unaligned(src0->type, 1) ? 2 : 16;
+        return ggml_cuda_is_aligned(src0, x_alignment) && ggml_cuda_is_aligned(src1, 16);
+    }
+    // whole units of 256 values, Q8_0 and IQ4_NL also with a half unit at the end of the row
+    if (src0->ne[0] % (mmq_few_half_units(src0->type) ? QK_K/2 : QK_K) != 0) {
+        return false;
+    }
+    // unaligned data needs the alignment of the decoder loads, F8_E4M3 reads 4 bytes at a time
+    const mmq_few_config cfg          = mmq_few_get_config(src0, ncols, ids != nullptr);
+    const int            nunits_stage = mmq_few_nunits_stage(src0->type, cfg.ncg, cfg.nmt);
+    const int x_alignment = mmq_few_unaligned(src0->type, nunits_stage, cfg.edge) ?
+        (ggml_type_size(src0->type) % 4 == 0 || src0->type == GGML_TYPE_F8_E4M3 ? 4 : 2) : 16;
     return ggml_cuda_is_aligned(src0, x_alignment) && ggml_cuda_is_aligned(src1, 16);
 }
 
-#else // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-
-void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_UNUSED_VARS(ctx, src0, src1, dst);
-    GGML_ABORT("few-row MMQ is not supported on HIP or MUSA");
+bool ggml_cuda_should_use_mmq_few_repacked(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc) {
+    // tuned on DGX Spark only, the kernel needs its L2 prefetch there
+    if (src0->type != GGML_TYPE_NVFP4 || cc != GGML_CUDA_CC_DGX_SPARK || ggml_cuda_highest_compiled_arch(cc) != GGML_CUDA_CC_DGX_SPARK) {
+        return false;
+    }
+    // up to its 16 columns the wide MMVQ is faster, above them the CUTLASS GEMM is slower
+    const int64_t ncols = src1->ne[1];
+    if (ncols <= MMVQ_MAX_BATCH_SIZE_WIDE || ncols > MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    const int ncg          = mmq_few_ncg(ncols);
+    const int nmt          = mmq_few_nmt(GGML_TYPE_NVFP4, ncg, src0->ne[1]);
+    const int nunits_stage = mmq_few_nunits_stage(GGML_TYPE_NVFP4, ncg, nmt);
+    if (src0->ne[0] < 8*QK_K || src0->ne[0] % (nunits_stage*QK_K) != 0) {
+        return false;
+    }
+    ggml_cuda_cutlass_weight w;
+    if (!ggml_cuda_cutlass_weight_from_tensor(src0, w) || w.scales_linear == nullptr || w.k != src0->ne[0]) {
+        return false;
+    }
+    return ggml_cuda_is_aligned(src1, 16) && (uintptr_t) w.values % 16 == 0 && (uintptr_t) w.scales_linear % 16 == 0;
 }
 
-bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * src1, const int cc) {
-    GGML_UNUSED_VARS(src0, src1, cc);
+void ggml_cuda_mul_mat_q_few_repacked(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    ggml_cuda_cutlass_weight w;
+    GGML_ASSERT(ggml_cuda_cutlass_weight_from_tensor(src0, w) && w.scales_linear != nullptr);
+    const mmq_few_split_x split = { w.values, w.k/2, (const char *) w.scales_linear, ne00/QK_NVFP4_SUB };
+
+    cudaStream_t stream = ctx.stream();
+
+    const int            nunits = ne00 / QK_K;
+    const int            ncg    = mmq_few_ncg(ne11);
+    const mmq_few_config cfg    = { ncg, mmq_few_nmt(GGML_TYPE_NVFP4, ncg, ne01), false };
+
+    ggml_cuda_pool_alloc<int4> src1_q(ctx.pool(), int64_t(ne12)*ne13*nunits*ncg*MMQ_FEW_Q8_1_INT4);
+    quantize_mmq_few_q8_1_cuda((const float *) src1->data, src1_q.get(), MMQ_Q8_1_DS_LAYOUT_D4, ne10, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
+        ne11, ne12, ne13, stream);
+    launch_mul_mat_q_few_switch_ncg<GGML_TYPE_NVFP4>(src0, src1, dst, src1_q.get(), nullptr, 0, cfg, stream, &split);
+}
+
+#else // !defined(GGML_USE_MUSA)
+
+bool ggml_cuda_should_use_mmq_few_repacked(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc) {
+    GGML_UNUSED_VARS(src0, src1, dst, cc);
     return false;
 }
 
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+void ggml_cuda_mul_mat_q_few_repacked(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_UNUSED_VARS(ctx, src0, src1, dst);
+    GGML_ABORT("fatal error");
+}
+
+int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const int64_t ne00, const bool has_ids) {
+    GGML_UNUSED_VARS(type, cc, ne00, has_ids);
+    return 0;
+}
+
+void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    GGML_UNUSED_VARS(ctx, src0, src1, ids, dst);
+    GGML_ABORT("few-row MMQ is not supported on HIP or MUSA");
+}
+
+bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const int cc) {
+    GGML_UNUSED_VARS(src0, src1, ids, cc);
+    return false;
+}
+
+#endif // !defined(GGML_USE_MUSA)

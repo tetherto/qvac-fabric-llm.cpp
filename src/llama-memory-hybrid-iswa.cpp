@@ -185,6 +185,12 @@ llama_pos llama_memory_hybrid_iswa::seq_pos_max(llama_seq_id seq_id) const {
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
 }
 
+uint32_t llama_memory_hybrid_iswa::seq_token_count(llama_seq_id seq_id) const {
+    return std::max(
+        mem_attn->seq_token_count(seq_id),
+        mem_recr->seq_token_count(seq_id));
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
     for (const auto & buft_size : mem_recr->memory_breakdown()) {
@@ -199,8 +205,16 @@ void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id s
 }
 
 void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    mem_attn->state_read(io, seq_id, flags);
-    mem_recr->state_read(io, seq_id, flags);
+    try {
+        mem_attn->state_read(io, seq_id, flags);
+        mem_recr->state_read(io, seq_id, flags);
+    } catch (...) {
+        // a failed restore drops the sequence from every cache
+        mem_attn->state_clear(seq_id);
+        mem_recr->state_clear(seq_id);
+
+        throw;
+    }
 }
 
 llama_kv_cache_iswa * llama_memory_hybrid_iswa::get_mem_attn() const {

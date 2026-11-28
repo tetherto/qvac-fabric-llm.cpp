@@ -162,7 +162,7 @@ struct ffmpeg_video {
             ffprobe_bin.c_str(),
             "-v", "quiet",
             "-show_entries", "stream=width,height,sample_aspect_ratio,r_frame_rate,nb_frames,duration,start_time:stream_side_data=rotation",
-            "-select_streams", "v:0",
+            "-select_streams", "V:0", // V: not an attached picture (cover art)
             "-of", "default=noprint_wrappers=1",
         };
         if (is_buf_input()) {
@@ -287,6 +287,10 @@ struct ffmpeg_video {
         // cache:pipe:0 wraps stdin with a seekable in-memory cache, letting ffmpeg seek
         // backwards for container headers (e.g. MP4 moov atom at end of file)
         cmd.push_back(is_buf_input() ? "cache:pipe:0" : path.c_str());
+
+        // decode the stream that probe() sized (and checked against max_pixels), not the one ffmpeg would pick
+        cmd.push_back("-map");
+        cmd.push_back("0:V:0");
 
         const bool scale = width != src_width || height != src_height;
         char vf[160] = "";

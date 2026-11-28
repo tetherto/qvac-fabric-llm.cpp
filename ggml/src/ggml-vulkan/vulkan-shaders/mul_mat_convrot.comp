@@ -1,0 +1,67 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint k;
+    uint ne02;
+    uint a_offset;
+    uint w_offset;
+    uint s_offset;
+    uint d_offset;
+};
+
+layout(binding = 0, std430) readonly buffer A { uint data_a[]; };
+layout(binding = 1, std430) readonly buffer W { uint data_w[]; };
+layout(binding = 2, std430) readonly buffer S { float data_s[]; };
+layout(binding = 3, std430) writeonly buffer D { float data_d[]; };
+
+shared float values[256];
+shared float transformed[256];
+
+float activation(uint index) {
+#ifdef ACT_F16
+    const uint packed = data_a[(a_offset + index) / 2];
+    return ((a_offset + index) & 1) == 0 ? unpackHalf2x16(packed).x : unpackHalf2x16(packed).y;
+#else
+    return uintBitsToFloat(data_a[a_offset + index]);
+#endif
+}
+
+int weight(uint index) {
+    const uint packed = data_w[(w_offset + index) / 4];
+    const uint shift = ((w_offset + index) & 3) * 8;
+    int value = int((packed >> shift) & 255u);
+    return value >= 128 ? value - 256 : value;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.x;
+    const uint i1 = gl_WorkGroupID.y;
+    const uint i2 = gl_WorkGroupID.z % ne02;
+    const uint i3 = gl_WorkGroupID.z / ne02;
+    const uint column = i1 + i2 * gl_NumWorkGroups.y + i3 * gl_NumWorkGroups.y * ne02;
+    const float scale = data_s[s_offset + row];
+    float sum = 0.0;
+    for (uint k0 = 0; k0 < k; k0 += 256) {
+        values[tid] = float(weight(row*k + k0 + tid)) * scale;
+        barrier();
+        for (uint stride = 1; stride < 256; stride *= 4) {
+            const uint block = (tid / (4*stride)) * (4*stride);
+            const uint lane = (tid / stride) % 4;
+            const uint offset = tid % stride;
+            const float a = values[block + 0*stride + offset];
+            const float b = values[block + 1*stride + offset];
+            const float c = values[block + 2*stride + offset];
+            const float d = values[block + 3*stride + offset];
+            transformed[tid] = lane == 0 ? ( a + b + c - d)*0.5 : lane == 1 ? ( a + b - c + d)*0.5 : lane == 2 ? ( a - b + c + d)*0.5 : (-a + b + c + d)*0.5;
+            barrier(); values[tid] = transformed[tid]; barrier();
+        }
+        sum += values[tid] * activation(column*k + k0 + tid);
+        barrier();
+    }
+    values[tid] = sum; barrier();
+    for (uint stride = 128; stride > 0; stride /= 2) { if (tid < stride) values[tid] += values[tid + stride]; barrier(); }
+    if (tid == 0) data_d[d_offset + row + column*gl_NumWorkGroups.x] = values[0];
+}

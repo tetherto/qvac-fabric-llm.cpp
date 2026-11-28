@@ -5,13 +5,19 @@
 #include "mtmd-audio.h"
 #include "mtmd-subcontext.h"
 #include "mtmd-helper.h"
+#include "mtmd-helper-impl.h"
 #include "mtmd-image.h"
 #include "mtmd-internal.h"
+#include "ggml-cpp.h"
+#include "gguf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -879,6 +885,300 @@ MAKE_TEST(test_helper_resampler) {
     }
 
     t.assert_true("invalid rate", mtmd_helper_resampler_init(0, rate_out) == nullptr);
+}
+
+MAKE_TEST(test_sam_relpos_quantization) {
+    struct temp_files {
+        std::string input;
+        std::string output;
+        ~temp_files() {
+            std::remove(input.c_str());
+            std::remove(output.c_str());
+        }
+    };
+    const std::string prefix = "test-mtmd-sam-relpos-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    temp_files files{prefix + "-input.gguf", prefix + "-output.gguf"};
+    ggml_context_ptr ctx(ggml_init({4*1024*1024, nullptr, false}));
+    gguf_context_ptr source(gguf_init_empty());
+    gguf_set_val_str(source.get(), "general.architecture", "clip");
+    gguf_set_val_u32(source.get(), "general.file_type", LLAMA_FTYPE_ALL_F32);
+
+    const char * names[] = {
+        "v.sam.blk.0.attn.pos_h.weight", "v.sam.blk.0.attn.pos_w.weight",
+        "v.sam.blk.2.attn.pos_h.weight", "v.sam.blk.2.attn.pos_w.weight",
+        "v.blk.0.attn_q.weight",
+    };
+    std::vector<ggml_tensor *> tensors;
+    for (int i = 0; i < 5; ++i) {
+        ggml_tensor * tensor = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, i == 4 ? 256 : 64, i == 4 ? 256 : (i < 2 ? 27 : 127));
+        ggml_set_name(tensor, names[i]);
+        auto * data = static_cast<float *>(tensor->data);
+        for (int64_t j = 0; j < ggml_nelements(tensor); ++j) {
+            data[j] = std::sin(0.13f*j) + 0.1f*std::cos(0.07f*j);
+        }
+        gguf_add_tensor(source.get(), tensor);
+        tensors.push_back(tensor);
+    }
+    if (!t.assert_true("write SAM fixture", gguf_write_to_file(source.get(), files.input.c_str(), false))) {
+        return;
+    }
+    const llama_ftype types[] = {
+        LLAMA_FTYPE_MOSTLY_F16, LLAMA_FTYPE_MOSTLY_BF16, LLAMA_FTYPE_MOSTLY_Q8_0,
+        LLAMA_FTYPE_MOSTLY_Q3_K_S, LLAMA_FTYPE_MOSTLY_Q3_K_M,
+        LLAMA_FTYPE_MOSTLY_Q4_0, LLAMA_FTYPE_MOSTLY_Q4_K_M,
+    };
+    for (llama_ftype type : types) {
+        llama_model_quantize_params params = llama_model_quantize_default_params();
+        params.ftype = type;
+        params.nthread = 1;
+        if (!t.assert_equal("quantize SAM fixture", 0u, llama_model_quantize(files.input.c_str(), files.output.c_str(), &params))) {
+            continue;
+        }
+        ggml_context * output_ctx = nullptr;
+        gguf_context_ptr output(gguf_init_from_file(files.output.c_str(), {false, &output_ctx}));
+        ggml_context_ptr data_ctx(output_ctx);
+        if (!t.assert_true("read quantized SAM fixture", output != nullptr && data_ctx != nullptr)) {
+            continue;
+        }
+        ggml_tensor * matrix = ggml_get_tensor(data_ctx.get(), names[4]);
+        if (t.assert_true("ordinary matrix exists", matrix != nullptr)) {
+            t.assert_true("ordinary matrix changes type", matrix->type != GGML_TYPE_F32);
+        }
+        for (int i = 0; i < 4; ++i) {
+            ggml_tensor * tensor = ggml_get_tensor(data_ctx.get(), names[i]);
+            if (!t.assert_true("SAM relative position exists", tensor != nullptr) ||
+                !t.assert_equal("SAM relative position remains F32", GGML_TYPE_F32, tensor->type)) {
+                continue;
+            }
+            t.assert_true("SAM relative position values unchanged", ggml_nbytes(tensor) == ggml_nbytes(tensors[i]) &&
+                std::memcmp(tensor->data, tensors[i]->data, ggml_nbytes(tensor)) == 0);
+            // DeepSeek OCR resizes these tables before gathering attention positions.
+            ggml_tensor * cur = ggml_cont(ctx.get(), ggml_permute(ctx.get(), tensor, 1, 0, 2, 3));
+            cur = ggml_reshape_3d(ctx.get(), cur, tensor->ne[1], 1, tensor->ne[0]);
+            cur = ggml_interpolate(ctx.get(), cur, tensor->ne[1] + 3, 1, tensor->ne[0], 1, GGML_SCALE_MODE_BILINEAR);
+            t.assert_equal("SAM interpolation graph type", GGML_TYPE_F32, cur->type);
+        }
+    }
+}
+
+//
+// mtmd_helper decode limits
+//
+
+static void put_le16(std::vector<unsigned char> & out, uint32_t v) {
+    out.push_back(v & 0xff);
+    out.push_back((v >> 8) & 0xff);
+}
+
+static void put_le32(std::vector<unsigned char> & out, uint32_t v) {
+    put_le16(out, v & 0xffff);
+    put_le16(out, v >> 16);
+}
+
+static void put_tag(std::vector<unsigned char> & out, const char * tag) {
+    out.insert(out.end(), tag, tag + 4);
+}
+
+struct decoded_media {
+    mtmd_helper_bitmap_status status;
+    uint32_t nx = 0; // samples for audio
+    uint32_t ny = 0;
+};
+
+static decoded_media decode_media(const std::vector<unsigned char> & buf, int audio_sample_rate,
+                                  uint64_t max_audio_frames, uint64_t max_image_pixels) {
+    mtmd_helper_init_opt opt = mtmd_helper_init_opt_default();
+    opt.max_audio_frames = max_audio_frames;
+    opt.max_image_pixels = max_image_pixels;
+    // no model: the image and audio paths only need the sample rate from the context
+    auto res = mtmd_helper_bitmap_init_from_buf_impl(nullptr, audio_sample_rate, buf.data(), buf.size(), false, opt);
+    mtmd::bitmap_ptr bitmap(res.bitmap);
+    decoded_media out = { res.status, 0, 0 };
+    if (bitmap) {
+        out.nx = mtmd_bitmap_get_nx(bitmap.get());
+        out.ny = mtmd_bitmap_get_ny(bitmap.get());
+    }
+    return out;
+}
+
+static const char * status_name(mtmd_helper_bitmap_status status) {
+    switch (status) {
+        case MTMD_HELPER_BITMAP_OK:              return "ok";
+        case MTMD_HELPER_BITMAP_FAILED:          return "failed";
+        case MTMD_HELPER_BITMAP_AUDIO_TOO_LONG:  return "audio too long";
+        case MTMD_HELPER_BITMAP_IMAGE_TOO_LARGE: return "image too large";
+    }
+    return "unknown";
+}
+
+// mono 16-bit PCM; claimed_data_bytes is what the data chunk header says it holds
+static std::vector<unsigned char> make_wav(uint32_t sample_rate, uint32_t n_samples, uint32_t claimed_data_bytes) {
+    std::vector<unsigned char> wav;
+    put_tag(wav, "RIFF");
+    put_le32(wav, 36 + claimed_data_bytes);
+    put_tag(wav, "WAVE");
+    put_tag(wav, "fmt ");
+    put_le32(wav, 16);
+    put_le16(wav, 1); // PCM
+    put_le16(wav, 1); // mono
+    put_le32(wav, sample_rate);
+    put_le32(wav, sample_rate * 2);
+    put_le16(wav, 2);  // block align
+    put_le16(wav, 16); // bits per sample
+    put_tag(wav, "data");
+    put_le32(wav, claimed_data_bytes);
+    for (uint32_t i = 0; i < n_samples; i++) {
+        put_le16(wav, (i * 1000) & 0xffff);
+    }
+    return wav;
+}
+
+// MPEG-1 Layer III, 44.1 kHz mono, bitrate index 0 (free format): the frame size is not in the header
+static std::vector<unsigned char> make_mp3_free_format(int n_frames) {
+    const size_t frame_bytes = 418; // ~128 kbps: 144 * 128000 / 44100 = 417.96 bytes per frame
+    std::vector<unsigned char> mp3;
+    for (int i = 0; i < n_frames; i++) {
+        const size_t start = mp3.size();
+        mp3.push_back(0xff);
+        mp3.push_back(0xfb); // MPEG-1, Layer III, no CRC
+        mp3.push_back(0x00); // bitrate index 0, 44.1 kHz, no padding
+        mp3.push_back(0xc0); // mono
+        mp3.resize(start + frame_bytes, 0); // empty side info and main data: silence
+    }
+    return mp3;
+}
+
+// 24-bit BMP; only the header is written when with_pixels is false
+static std::vector<unsigned char> make_bmp(int32_t width, int32_t height, bool with_pixels) {
+    const uint32_t ppm_72_dpi  = 2835; // 72 DPI in pixels per metre
+    const uint32_t row_bytes   = ((uint32_t) width * 3 + 3) & ~3u;
+    const uint32_t pixel_bytes = row_bytes * (uint32_t) std::abs(height);
+    std::vector<unsigned char> bmp;
+    bmp.push_back('B');
+    bmp.push_back('M');
+    put_le32(bmp, 54 + pixel_bytes);
+    put_le32(bmp, 0);
+    put_le32(bmp, 54); // pixel data offset
+    put_le32(bmp, 40); // BITMAPINFOHEADER
+    put_le32(bmp, (uint32_t) width);
+    put_le32(bmp, (uint32_t) height);
+    put_le16(bmp, 1);  // planes
+    put_le16(bmp, 24); // bits per pixel
+    put_le32(bmp, 0);  // BI_RGB
+    put_le32(bmp, pixel_bytes);
+    put_le32(bmp, ppm_72_dpi); // horizontal resolution
+    put_le32(bmp, ppm_72_dpi); // vertical resolution
+    put_le32(bmp, 0);
+    put_le32(bmp, 0);
+    if (with_pixels) {
+        bmp.resize(bmp.size() + pixel_bytes, 0x80);
+    }
+    return bmp;
+}
+
+MAKE_TEST(test_helper_audio_limit_wav_data_chunk) {
+    // the header claims just under 2 GB (~1 billion 16-bit samples), the file holds 1600: the decoder measures what it holds
+    const uint32_t sample_rate   = 16000;
+    const uint32_t n_samples     = 1600;
+    const uint32_t claimed_bytes = 0x7ffffff0;
+    const auto wav = make_wav(sample_rate, n_samples, claimed_bytes);
+
+    auto res = decode_media(wav, sample_rate, n_samples, 0);
+    t.assert_equal("status at the limit", std::string("ok"), std::string(status_name(res.status)));
+    t.assert_equal("samples", n_samples, res.nx);
+
+    res = decode_media(wav, sample_rate, n_samples - 1, 0);
+    t.assert_equal("status over the limit", std::string("audio too long"), std::string(status_name(res.status)));
+}
+
+MAKE_TEST(test_helper_audio_limit_wav_sample_rate) {
+    const uint32_t model_rate   = 16000;
+    const uint64_t ten_minutes  = 600 * model_rate;
+
+    // 1000 samples declared at 1 Hz (a 2 KB file) resample to 1000 s at the model's rate (64 MB of floats); the same at 64 KB would be 4 GB
+    auto res = decode_media(make_wav(1, 1000, 2000), model_rate, ten_minutes, 0);
+    t.assert_equal("status", std::string("audio too long"), std::string(status_name(res.status)));
+
+    // 10 samples at 1 Hz are 10 s, ~160000 samples at the model's rate
+    const auto wav = make_wav(1, 10, 20);
+    res = decode_media(wav, model_rate, 0, 0);
+    if (!t.assert_equal("status without a limit", std::string("ok"), std::string(status_name(res.status)))) {
+        return;
+    }
+    const uint32_t n_samples = res.nx;
+    t.assert_true("resampled to ~160000 samples, got " + std::to_string(n_samples), n_samples > 150000);
+
+    res = decode_media(wav, model_rate, n_samples, 0);
+    t.assert_equal("status at the limit", std::string("ok"), std::string(status_name(res.status)));
+
+    res = decode_media(wav, model_rate, n_samples - 1, 0);
+    t.assert_equal("status over the limit", std::string("audio too long"), std::string(status_name(res.status)));
+}
+
+MAKE_TEST(test_helper_audio_limit_mp3_free_format) {
+    const auto mp3 = make_mp3_free_format(200);
+
+    // no limit: the decoder counts the frames by decoding them
+    auto res = decode_media(mp3, 16000, 0, 0);
+    if (!t.assert_equal("status without a limit", std::string("ok"), std::string(status_name(res.status)))) {
+        return;
+    }
+    const uint32_t n_samples = res.nx;
+    t.assert_true("decodes several seconds, got " + std::to_string(n_samples), n_samples > 5 * 16000);
+
+    res = decode_media(mp3, 16000, n_samples, 0);
+    t.assert_equal("status at the limit", std::string("ok"), std::string(status_name(res.status)));
+    t.assert_equal("samples at the limit", n_samples, res.nx);
+
+    res = decode_media(mp3, 16000, n_samples - 1, 0);
+    t.assert_equal("status over the limit", std::string("audio too long"), std::string(status_name(res.status)));
+}
+
+MAKE_TEST(test_helper_audio_limit_counts_at_model_rate) {
+    // the limit is in the model's samples: 1600 samples at 16 kHz are 2400 at 24 kHz
+    const uint32_t file_rate     = 16000;
+    const uint32_t model_rate    = 24000;
+    const uint32_t file_samples  = 1600;
+    const uint32_t model_samples = file_samples * model_rate / file_rate;
+    const auto wav = make_wav(file_rate, file_samples, file_samples * 2);
+
+    auto res = decode_media(wav, model_rate, model_samples, 0);
+    t.assert_equal("status at the limit", std::string("ok"), std::string(status_name(res.status)));
+    t.assert_equal("samples", model_samples, res.nx);
+
+    res = decode_media(wav, model_rate, model_samples - 1, 0);
+    t.assert_equal("status over the limit", std::string("audio too long"), std::string(status_name(res.status)));
+}
+
+MAKE_TEST(test_helper_image_limit) {
+    const int32_t  width    = 4;
+    const int32_t  height   = 2;
+    const uint64_t n_pixels = width * height;
+    const auto small_bmp = make_bmp(width, height, true);
+
+    auto res = decode_media(small_bmp, -1, 0, 0);
+    t.assert_equal("status without a limit", std::string("ok"), std::string(status_name(res.status)));
+
+    res = decode_media(small_bmp, -1, 0, n_pixels);
+    t.assert_equal("status at the limit", std::string("ok"), std::string(status_name(res.status)));
+    t.assert_equal("width", (uint32_t) width, res.nx);
+    t.assert_equal("height", (uint32_t) height, res.ny);
+
+    res = decode_media(small_bmp, -1, 0, n_pixels - 1);
+    t.assert_equal("status over the limit", std::string("image too large"), std::string(status_name(res.status)));
+
+    // a top-down BMP stores a negative height, which must not turn the size negative and let it through
+    const auto top_down_bmp = make_bmp(width, -height, true);
+    res = decode_media(top_down_bmp, -1, 0, n_pixels);
+    t.assert_equal("top-down status at the limit", std::string("ok"), std::string(status_name(res.status)));
+
+    res = decode_media(top_down_bmp, -1, 0, n_pixels - 1);
+    t.assert_equal("top-down status over the limit", std::string("image too large"), std::string(status_name(res.status)));
+
+    // only a header, which claims 20000x20000 (1.2 GB of RGB): rejected from the header, so nothing is allocated
+    const int32_t claimed_side = 20000;
+    res = decode_media(make_bmp(claimed_side, claimed_side, false), -1, 0, (uint64_t) claimed_side * claimed_side - 1);
+    t.assert_equal("oversized header", std::string("image too large"), std::string(status_name(res.status)));
 }
 
 //

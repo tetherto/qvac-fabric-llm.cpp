@@ -81,12 +81,15 @@ public:
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
 
-    // Whether pools are kpool consecutive cells in sequence order (qwen4exp) instead of kpool consecutive positions.
+    // pool kpool consecutive cells instead of kpool consecutive positions
     bool get_kpool_by_order() const { return hparams_idx.indexer_kpool_by_order; }
 
+    // idx K rows for pooled keys: all cells, then the spare streams
+    uint64_t get_kpool_n_rows() const { return (uint64_t) mem_idx->get_size()*mem_idx->get_n_stream() + n_kpool_spare; }
+
     // Which cells of a sequence make up which pool of kpool consecutive positions (or cells, in order mode).
-    // It is kept here because it outlives the batch: pools are fixed by the positions relative to the
-    // sequence's first one, so a ubatch only ever appends to it. Sequence edits drop it, see mem_idx_stale.
+    // It lives here because it outlives the batch: a ubatch only appends to it and an edit
+    // drops it (mem_idx_stale). It also holds the idx K row of each pooled key.
     struct kpool_layout;
 
     const kpool_layout & kpool_layout_update();
@@ -117,6 +120,12 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    // private pooled rows, past kv_size*n_stream
+    const uint32_t n_kpool_priv;
+
+    // spare idx K rows (whole streams); padded pools scatter here too
+    const uint32_t n_kpool_spare;
 
     // unique_ptr because kpool_layout is incomplete here
     std::unique_ptr<kpool_layout> kpool_lay;

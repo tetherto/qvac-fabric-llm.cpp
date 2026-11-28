@@ -1,0 +1,334 @@
+# CI for the audiogen engine (audiogen/ — ACE-Step music generation,
+# added alongside the repo reorg QIP that moved engines under engines/).
+#
+# Scope: build the audiogen-cpp library + its unit tests against
+# system ggml (the in-tree ggml/ of this repository — mandatory here:
+# AUDIOGEN_USE_SYSTEM_GGML defaults ON and the engine needs the custom snake /
+# col2im_1d ops that live in that tree), then run the non-GPU ctest suite on both lanes and the
+# weight-free MiniMax Metal parity test on the self-hosted Apple-silicon
+# runner. The macOS lane also requires real ACE-Step and MiniMax generation
+# with pinned fixtures; direct invocations fail on skipped coverage.
+name: audiogen CI
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'engines/speech/audiogen/**'
+      - 'engines/speech/coreml/**'
+      - 'ggml/**'
+      - '.github/workflows/speech-audiogen-ci.yml'
+  pull_request:
+    paths:
+      - 'engines/speech/audiogen/**'
+      - 'engines/speech/coreml/**'
+      - 'ggml/**'
+      - '.github/workflows/speech-audiogen-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Dedupe per PR and per branch: a re-push or re-dispatch supersedes the
+# in-flight run. The guard below previously excluded every event but
+# pull_request, so a push or a re-dispatch stacked a second run instead of
+# replacing the first.
+#
+# master is exempt on purpose — pushes to the default branch must not cancel
+# each other, or a merged commit ends with no CI verdict.
+concurrency:
+  group: audiogen-ci-${{ (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: engines/speech
+
+jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/speech-reusable-runner-names.yml
+
+  authorize:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
+  build-test:
+    needs: runner_names
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+    runs-on: ${{ needs.runner_names.outputs.ubuntu_2404 }}
+    timeout-minutes: 60
+    steps:
+      # Self-hosted runners are persistent, so a previous run's tree can survive
+      # into this one. See docs/ci/SELF-HOSTED-RUNNERS.md in the qvac monorepo.
+      - name: Manual Workspace Cleanup
+        run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+        shell: bash
+        working-directory: .
+        if: runner.environment != 'github-hosted'
+
+      - uses: actions/checkout@v4
+
+      - name: Install ccache
+        run: |
+          if [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]; then
+            if [ "$RUNNER_OS" = "macOS" ]; then brew install ccache; else sudo apt-get update -q && sudo apt-get install -y ccache; fi
+          fi
+          echo "CCACHE_DIR=${{ github.workspace }}/engines/speech/.ccache" >> "$GITHUB_ENV"
+
+      # Without numpy + gguf the converter test silently drops its real
+      # safetensors -> GGUF round-trip cases (@skipUnless) and only the
+      # dependency-free classes assert anything. Hosted-only: the persistent
+      # self-hosted runner's Python environment is not ours to mutate.
+      - name: Install converter-test Python deps (numpy, gguf)
+        if: runner.environment == 'github-hosted' && runner.os == 'Linux'
+        run: python3 -m pip install --user numpy gguf
+
+      - name: Resolve the in-tree ggml revision
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ggml install
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/ggml-install
+          # Linux remains compatible with the shared portable cache. macOS
+          # carries the Metal backend needed by the MiniMax GPU parity test.
+          key: ggml-install-${{ runner.os == 'macOS' && 'metal' || 'portable' }}-${{ matrix.os }}-${{ steps.ggml.outputs.sha }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/.ccache
+          key: ccache-audiogen-${{ matrix.os }}-${{ github.sha }}
+          restore-keys: ccache-audiogen-${{ matrix.os }}-
+
+      # macOS builds with Metal for the parity test; Linux stays portable CPU-only.
+      - name: Build ggml (in-tree ggml)
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_METAL=${{ runner.os == 'macOS' && 'ON' || 'OFF' }} \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j4
+          cmake --install ggml-src/build
+
+      # AUDIOGEN_COREML on macOS: the Apple lane builds the Core ML VAE decoder
+      # sidecar wrapper and runs the parity test against a staged VAE + exported
+      # sidecar (see the "Core ML VAE sidecar" steps below), so the feature is
+      # functionally covered on every PR, not just compiled.
+      - name: Configure
+        run: |
+          cmake -S audiogen -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAUDIOGEN_BUILD_TESTS=ON \
+            ${{ runner.os == 'macOS' && '-DAUDIOGEN_COREML=ON' || '' }} \
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
+
+      - name: Build
+        run: cmake --build build -j4
+
+      # Excludes gpu (no GPU on hosted runners) and perf (timing gates are
+      # meaningless on shared runners). LD_LIBRARY_PATH: the ggml install ships
+      # libqvac-speech-ggml.so whose dependency on the ggml-cpu/base siblings is
+      # resolved transitively — Linux RUNPATH doesn't apply to transitive loads,
+      # so the loader needs the directory explicitly (macOS @rpath handles it).
+      - name: Test (non-GPU)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: ctest --test-dir build -LE 'gpu|perf|coreml-runtime|coreml-toy' --output-on-failure --timeout 600
+
+      # Shared Core ML runtime (coreml): portable scheduler, lifetime
+      # and option tests with fake loaders. --no-tests=error fails the step
+      # when the test is not registered; the test has no skip path.
+      - name: Test (Core ML runtime, portable)
+        run: ctest --test-dir build -L coreml-runtime --no-tests=error --output-on-failure --timeout 300
+
+  # Self-hosted Apple silicon, not hosted macOS. GitHub's hosted macOS runners
+  # expose an Apple Paravirtual device without simdgroup matmul (QVAC-22775).
+  # Job-level `if` cannot see `matrix.os`, so this lane is a separate job
+  # gated on fork-ci.
+  build-test-macos:
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: ${{ needs.runner_names.outputs.macos_arm64_gpu }}
+    timeout-minutes: 180
+    steps:
+      - name: Manual Workspace Cleanup
+        run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+        shell: bash
+        working-directory: .
+
+      - uses: actions/checkout@v4
+
+      - name: Install ccache
+        run: echo "CCACHE_DIR=${{ github.workspace }}/engines/speech/.ccache" >> "$GITHUB_ENV"
+
+      - name: Resolve the in-tree ggml revision
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ggml install
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/ggml-install
+          key: ggml-install-metal-macos-26-${{ steps.ggml.outputs.sha }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: engines/speech/.ccache
+          key: ccache-audiogen-macos-26-${{ github.sha }}
+          restore-keys: ccache-audiogen-macos-26-
+
+      - name: Build ggml (in-tree ggml)
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S "$GITHUB_WORKSPACE/ggml" -B ggml-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j4
+          cmake --install ggml-src/build
+
+      - name: Configure
+        run: |
+          cmake -S audiogen -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAUDIOGEN_BUILD_TESTS=ON \
+            -DAUDIOGEN_COREML=ON \
+            -DAUDIOGEN_MINIMAX_COREML=ON \
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
+
+      - name: Build
+        run: cmake --build build -j4
+
+      - name: Test (non-GPU)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/engines/speech/ggml-install/lib
+        run: ctest --test-dir build -LE 'gpu|perf|coreml-runtime|coreml-toy' --output-on-failure --timeout 600
+
+      # Shared Core ML runtime (coreml): portable scheduler, lifetime
+      # and option tests with fake loaders. --no-tests=error fails the step
+      # when the test is not registered; the test has no skip path.
+      - name: Test (Core ML runtime, portable)
+        run: ctest --test-dir build -L coreml-runtime --no-tests=error --output-on-failure --timeout 300
+
+      - name: Test (Metal)
+        run: |
+          set -o pipefail
+          ctest --test-dir build -R '^test-minimax-metal-ops$' -V --timeout 600 2>&1 | tee metal-test.log
+          if grep -q "SKIP Metal backend is unavailable" metal-test.log; then
+            echo "::error::Metal backend absent on the Apple-silicon runner — the parity test never ran"
+            exit 1
+          fi
+          if grep -q "SKIP Metal device cannot run MUL_MAT" metal-test.log; then
+            echo "::error::Metal device lacks simdgroup reduction, so MUL_MAT is unsupported — this runner was expected to expose an Apple7+ GPU"
+            exit 1
+          fi
+
+      - name: Install Python test dependencies
+        run: |
+          coreml_python="$(command -v python3.11 || command -v python3)"
+          "$coreml_python" -m venv .venv-coreml
+          .venv-coreml/bin/python -m pip install -r parakeet/scripts/requirements-coreml.txt
+
+      - name: Test (Core ML Python suites)
+        run: |
+          .venv-coreml/bin/python audiogen/test/test_export_vae_coreml.py
+          .venv-coreml/bin/python audiogen/test/test_export_minimax_conditioner_coreml.py
+          .venv-coreml/bin/python audiogen/test/test_minimax_ane_models.py
+          .venv-coreml/bin/python audiogen/test/test_minimax_ane_export.py
+          .venv-coreml/bin/python audiogen/test/test_convert_minimax_roundtrip.py
+          .venv-coreml/bin/python audiogen/test/test_minimax_ane_cli.py --executable build/mm3-replay
+
+      - name: Stage generation fixtures
+        run: |
+          .venv-coreml/bin/python audiogen/scripts/prepare-ci-models.py \
+            --cache-dir "$HOME/.cache/qvac-audiogen-ci-models" \
+            --build-dir "$PWD/build" --output-env "$GITHUB_ENV"
+
+      - name: Test (real generation and fit)
+        env:
+          AUDIOGEN_TEST_GPU: '1'
+          MM3_DEVICE: gpu
+        run: |
+          ./build/test-acestep-integration
+          ./build/test-acestep-fit-params
+          ./build/test-minimax-integration
+          ./build/test-minimax-fit-models
+          ./build/test-minimax-quality
+          ./build/test-minimax-quality --q4
+
+      - name: Cache Core ML VAE fixture
+        id: coreml-fixture-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            engines/speech/coreml-fixture
+            engines/speech/coreml-fixture-p8
+          key: acestep-vae-coreml-${{ runner.os }}-${{ runner.arch }}-0599862a-${{ hashFiles('engines/speech/audiogen/scripts/export-vae-coreml.py', 'engines/speech/audiogen/test/test_export_vae_coreml.py', 'engines/speech/parakeet/scripts/requirements-coreml.txt') }}
+
+      - name: Build Core ML VAE fixture
+        if: steps.coreml-fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p coreml-fixture coreml-fixture-p8
+          curl -sSfL --retry 3 -o coreml-fixture/vae-BF16.gguf \
+            https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF/resolve/9b3707625776cc4cf775e9b12ab82f9fe48335ff/vae-BF16.gguf
+          echo "0599862ac5d15cd308e1d2e368373aea6c02e25ebd1737ad4a4562a0901b0ef8  coreml-fixture/vae-BF16.gguf" | shasum -a 256 -c -
+          .venv-coreml/bin/python audiogen/scripts/export-vae-coreml.py \
+            --gguf coreml-fixture/vae-BF16.gguf \
+            --out coreml-fixture/vae-decoder.mlpackage --compile-dir coreml-fixture
+          rm -rf coreml-fixture/vae-decoder.mlpackage
+          .venv-coreml/bin/python audiogen/scripts/export-vae-coreml.py \
+            --gguf coreml-fixture/vae-BF16.gguf --palettize 8 \
+            --out coreml-fixture-p8/vae-decoder.mlpackage --compile-dir coreml-fixture-p8
+          rm -rf coreml-fixture-p8/vae-decoder.mlpackage
+
+      - name: Test (Core ML VAE sidecar)
+        env:
+          AUDIOGEN_TEST_MODELS_DIR: ${{ github.workspace }}/engines/speech/coreml-fixture
+        run: ./build/test-vae-coreml-parity
+
+      - name: Test (Core ML VAE sidecar, 8-bit palettized)
+        env:
+          AUDIOGEN_TEST_MODELS_DIR: ${{ github.workspace }}/engines/speech/coreml-fixture-p8
+        run: |
+          ln -sf "$GITHUB_WORKSPACE/engines/speech/coreml-fixture/vae-BF16.gguf" coreml-fixture-p8/vae-BF16.gguf
+          ./build/test-vae-coreml-parity
+
+      - name: Benchmark (Core ML VAE vs Metal)
+        run: |
+          set -euo pipefail
+          AUDIOGEN_TEST_MODELS_DIR="$GITHUB_WORKSPACE/engines/speech/coreml-fixture" \
+            ./build/bench-vae-coreml >> "$GITHUB_STEP_SUMMARY"
+          echo "(float16 sidecar above; 8-bit palettized below)" >> "$GITHUB_STEP_SUMMARY"
+          AUDIOGEN_TEST_MODELS_DIR="$GITHUB_WORKSPACE/engines/speech/coreml-fixture-p8" \
+            ./build/bench-vae-coreml >> "$GITHUB_STEP_SUMMARY"
+
+  # No opt-in GPU job here: audiogen's only gpu-labeled test is the Metal
+  # parity check (SKIP_RETURN_CODE 77 without Metal), which the build-test
+  # macOS lane already runs — and skip-guards — in its "Test (Metal)" step.
+  # On a non-Apple runner `ctest -L gpu` could only ever skip it and report a
+  # hollow pass. When audiogen grows a Vulkan/CUDA gpu-labeled test, add the
+  # lane back mirroring tts-ci.yml's gpu job (qvac-ubuntu2204-x64-gpu +
+  # runnable-arms reporter).
+

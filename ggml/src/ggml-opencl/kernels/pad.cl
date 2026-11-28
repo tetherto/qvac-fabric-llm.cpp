@@ -1,3 +1,7 @@
+inline uint fastdiv(uint n, uint4 v) {
+    return (mul_hi(n, v.s0) + n) >> v.s1;
+}
+
 kernel void kernel_pad(
         global void * src0,
         ulong offset0,
@@ -10,15 +14,19 @@ kernel void kernel_pad(
         int lp0, int rp0,
         int lp1, int rp1,
         int lp2, int rp2,
-        int lp3, int rp3
+        int lp3, int rp3,
+        uint4 ne2_fd
 ) {
     src0 = (global float*)((global char*)src0 + offset0);
     dst  = (global float*)((global char*)dst  + offsetd);
 
     int i0 = get_global_id(0);
     int i1 = get_group_id(1);
-    int i2 = get_group_id(2) % ne2;
-    int i3 = get_group_id(2) / ne2;
+    // fastdiv instead of / and % by ne2: the plain division made this kernel ~50x slower
+    // on Adreno 740 (E031.41)
+    const uint g2 = get_group_id(2);
+    int i3 = fastdiv(g2, ne2_fd);
+    int i2 = g2 - i3 * ne2;
 
     if (i0 >= ne0 || i1 >= ne1 || i2 >= ne2 || i3 >= ne3) {
         return;

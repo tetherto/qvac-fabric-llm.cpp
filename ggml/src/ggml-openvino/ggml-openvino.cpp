@@ -1141,6 +1141,7 @@ static void ggml_backend_openvino_device_get_props(ggml_backend_dev_t dev, ggml_
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ false,
         /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false,
     };
 }
 
@@ -1526,6 +1527,10 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
             return {false, "FLASH_ATTN_EXT gemma3n pattern on GPU is not supported"};
         }
 
+        if (ggml_flash_attn_ext_has_indexed_bias(op)) {
+            return {false, "FLASH_ATTN_EXT with indexed bias is not supported"};
+        }
+
         // K/V row lists (ggml_flash_attn_ext_rows) are not supported
         if (op->src[5] != nullptr) {
             return {false, "FLASH_ATTN_EXT with K/V row lists is not supported"};
@@ -1636,11 +1641,10 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         if (ggml_openvino_is_gpu() && op->src[0] != nullptr && op->src[0]->buffer == nullptr) {
             return {false, "MUL_MAT_ID with unbound expert tensors on GPU is not supported"};
         }
-        // Only MXFP4 still needs the large-temporary guard; every other quantized type goes
-        // through GatherMatmul, which never materializes the selected expert weights.
-        if (ggml_openvino_is_gpu() && op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_MXFP4 &&
+        // Only MXFP4 materializes the selected expert weights on either device.
+        if (op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_MXFP4 &&
             mul_mat_id_requires_large_tmp(op)) {
-            return {false, "MUL_MAT_ID with MXFP4 weights requires large temporary on GPU"};
+            return {false, "MUL_MAT_ID with MXFP4 weights requires large temporary"};
         }
         break;
     }

@@ -1,0 +1,58 @@
+MIT License
+
+Copyright (c) 2026 QVAC contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+Third-party components
+================================================================================
+
+This project ports, bundles, or builds against the following third-party
+software, under permissive licenses (MIT or Apache-2.0). NOTICE carries the
+complete list, including the file-by-file mapping of the acestep.cpp ports and
+the optional Python packages used by scripts/.
+
+* ggml (MIT License), Copyright (c) 2023-2026 The ggml authors.
+  Consumed as a system package through the qvac-fabric vcpkg port (the ggml
+  tree of tetherto/qvac-fabric-llm.cpp); no ggml sources are vendored here.
+  Source: https://github.com/ggml-org/ggml
+
+* acestep.cpp (MIT License), Copyright (c) 2023-2026 The acestep.cpp authors.
+  Most of the C++ inference path under src/acestep/ is ported from this
+  project's ggml implementation, parts of it verbatim.
+  Source: https://github.com/ServeurpersoCom/acestep.cpp
+
+* ACE-Step 1.5 (MIT License), model architecture and weights.
+  The 5 Hz LM, FSQ detokenizer, DiT flow-matching transformer, and Oobleck VAE
+  stages implement this architecture. The weights are ACE Studio's and
+  StepFun's and carry the terms of their own model cards.
+  Source: https://github.com/ace-step/ACE-Step-1.5
+
+* Qwen3-Embedding (Apache License 2.0), weights for the text-encoder stage.
+  Source: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
+
+* HOT-Step-CPP (MIT License), Copyright (c) 2023-2026 The acestep.cpp authors.
+  The MiniMax-Music3 inference core and GGUF converter are adapted from this
+  implementation.
+  Source: https://github.com/scragnog/HOT-Step-CPP
+
+* MiniMax-Music3 model weights are distributed under the MiniMax-Music3
+  Community License. The full upstream license must accompany converted GGUFs.
+  Source: https://huggingface.co/MiniMaxAI/MiniMax-Music3

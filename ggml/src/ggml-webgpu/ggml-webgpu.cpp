@@ -90,7 +90,7 @@ static inline uint32_t ggml_webgpu_u32_from_f32(float value) {
 #define WEBGPU_NUM_PARAM_SLOT_SAFETY_MARGIN      10u
 #define WEBGPU_RUNTIME_WAIT_TIMEOUT_MS           30000u
 #define WEBGPU_RUNTIME_WAIT_TIMEOUT_NS           (WEBGPU_RUNTIME_WAIT_TIMEOUT_MS * 1e6)
-#define WEBGPU_PARAMS_BUF_SIZE_BYTES             128  // enough for 32 parameters
+#define WEBGPU_PARAMS_BUF_SIZE_BYTES             256  // enough for 64 parameters
 #define WEBGPU_SET_ROWS_ERROR_BUF_SIZE_BYTES     4
 #define WEBGPU_STORAGE_BUF_BINDING_MULT          4    // a storage buffer binding size must be a multiple of 4
 
@@ -1690,7 +1690,7 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
 
     // use MMVQ path for mat-vec
     bool use_mmvq = ggml_webgpu_can_use_mmvq(
-        src0, src1, src1->ne[1], ctx->global_ctx->capabilities.supports_dot_product, ctx->global_ctx->vendor);
+        src0, src1, dst, src1->ne[1], ctx->global_ctx->capabilities.supports_dot_product, ctx->global_ctx->vendor);
 
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
 
@@ -2104,8 +2104,11 @@ static ggml_webgpu_flash_attn_op ggml_webgpu_flash_attn_prepare(webgpu_context &
         (uint32_t) (V->nb[2] / ggml_type_size(V->type)),  // stride (elements/blocks) of V in dimension 2
         (uint32_t) (V->nb[3] / ggml_type_size(V->type)),  // stride (elements/blocks) of V in dimension 3
         op.has_mask ? (uint32_t) (mask->nb[3] / ggml_type_size(mask->type)) : 0,  // stride of mask dim 3
-        (uint32_t) (Q->ne[2] / K->ne[2]),  // repeat factor for K/V in dim 2 (MHA/MQA/GQA)
-        ggml_webgpu_u32_from_f32(scale),   // scale (possibly adjusted for logit softcap)
+        op.has_mask ? (uint32_t) (mask->nb[2] / ggml_type_size(mask->type)) : 0,  // stride of mask dim 2
+        op.has_mask ? (uint32_t) mask->ne[2] : 1u,  // mask heads, broadcast over the Q heads
+        op.has_mask ? (uint32_t) mask->ne[3] : 1u,  // mask batches, broadcast over the Q batches
+        (uint32_t) (Q->ne[2] / K->ne[2]),           // repeat factor for K/V in dim 2 (MHA/MQA/GQA)
+        ggml_webgpu_u32_from_f32(scale),            // scale (possibly adjusted for logit softcap)
         ggml_webgpu_u32_from_f32(max_bias),
         ggml_webgpu_u32_from_f32(logit_softcap),
         ggml_webgpu_u32_from_f32(n_head_log2),
@@ -2211,7 +2214,9 @@ static webgpu_encoded_op ggml_webgpu_flash_attn_vec(webgpu_context &          ct
         blk_nblk1                   = (uint32_t) Q->ne[1];
         blk_buf                     = ggml_webgpu_tensor_buf(dst);
         const uint32_t stride_mask3 = (uint32_t) (mask->nb[3] / ggml_type_size(mask->type));
-        blk_batch_count             = stride_mask3 > 0 ? (uint32_t) Q->ne[3] : 1u;
+        const uint32_t stride_mask2 = (uint32_t) (mask->nb[2] / ggml_type_size(mask->type));
+        const uint32_t mask_ne2     = (uint32_t) mask->ne[2];
+        blk_batch_count             = (uint32_t) (mask->ne[3] * mask_ne2);
         const uint64_t blk_elems    = (uint64_t) blk_nblk0 * blk_nblk1 * blk_batch_count;
         blk_size_bytes              = ROUNDUP_POW2(blk_elems * sizeof(uint32_t), WEBGPU_STORAGE_BUF_BINDING_MULT);
         const ggml_webgpu_shader_lib_context blk_shader_ctx = op.shader_lib_ctx;
@@ -2222,6 +2227,8 @@ static webgpu_encoded_op ggml_webgpu_flash_attn_vec(webgpu_context &          ct
             (uint32_t) Q->ne[1],                                                                   // seq_len_q
             (uint32_t) K->ne[1],                                                                   // seq_len_kv
             stride_mask3,                                                                          // stride_mask3
+            stride_mask2,                                                                          // stride_mask2
+            mask_ne2,                                                                              // mask_ne2
             blk_nblk0,                                                                             // nblk0
             blk_nblk1,                                                                             // nblk1
         };
@@ -3413,7 +3420,10 @@ static bool ggml_webgpu_can_fuse_rms_norm_mul(const struct ggml_cgraph * cgraph,
     return true;
 }
 
-static bool ggml_webgpu_can_fuse_gdn_cache(const struct ggml_cgraph * cgraph, int node_idx, int & num_encoded_ops) {
+static bool ggml_webgpu_can_fuse_gdn_cache(const webgpu_global_context & global_ctx,
+                                           const struct ggml_cgraph *    cgraph,
+                                           int                           node_idx,
+                                           int &                         num_encoded_ops) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
 
     // the kernel skips the snapshot tail, so the gdn output must not be a graph output
@@ -3466,6 +3476,12 @@ static bool ggml_webgpu_can_fuse_gdn_cache(const struct ggml_cgraph * cgraph, in
     if (cpy_dst->op != GGML_OP_VIEW || cpy_dst->type != GGML_TYPE_F32 || cpy_dst->data == nullptr ||
         !std::equal(expected_ne.begin(), expected_ne.end(), cpy_dst->ne) ||
         cpy_dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || cpy_dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        return false;
+    }
+
+    // a state read in place from the cache rows overlaps the cache write, and WebGPU does not allow a writable
+    // binding to alias another binding of the same dispatch: those take the unfused path
+    if (ggml_webgpu_tensor_binding_overlap(global_ctx, gdn->src[5], cpy_dst)) {
         return false;
     }
 
@@ -3615,7 +3631,7 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
             return ggml_webgpu_ssm_scan(ctx, src0, src1, src2, node->src[3], node->src[4], node->src[5], node->src[6],
                                         node);
         case GGML_OP_GATED_DELTA_NET:
-            if (ggml_webgpu_can_fuse_gdn_cache(cgraph, node_idx, num_encoded_ops)) {
+            if (ggml_webgpu_can_fuse_gdn_cache(ctx->global_ctx, cgraph, node_idx, num_encoded_ops)) {
                 ggml_tensor * dst_fuse = cgraph->nodes[node_idx + num_encoded_ops - 1]->src[1];
                 return ggml_webgpu_gated_delta_net(ctx, src0, src1, src2, node->src[3], node->src[4], node->src[5],
                                                    node, dst_fuse);
@@ -4381,12 +4397,11 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
                 // longest vec batch and the size stays monotonic in the batch length
                 const int64_t       n_q = std::min<int64_t>(Q->ne[1], GGML_WEBGPU_FLASH_ATTN_VEC_MAX_SEQ_LEN - 1);
                 if (ggml_webgpu_flash_attn_use_vec_path(ctx->webgpu_global_ctx, Q, K, V, n_q)) {
-                    const bool kv_direct =
-                        ggml_webgpu_flash_attn_k_direct(Q, K, GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH) ||
-                        ggml_webgpu_flash_attn_v_direct(Q, V, GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH);
                     const uint32_t kv_tile = ggml_webgpu_flash_attn_get_vec_kv_tile(
                         capabilities.limits.maxComputeWorkgroupStorageSize, (uint32_t) Q->ne[0], (uint32_t) V->ne[0],
-                        mask != nullptr, kv_direct);
+                        mask != nullptr,
+                        ggml_webgpu_flash_attn_k_direct(Q, K, GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH),
+                        ggml_webgpu_flash_attn_v_direct(Q, V, GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH));
 
                     const uint32_t vec_nwg_cap = capabilities.min_subgroup_size;
                     uint32_t       nwg = ggml_webgpu_flash_attn_vec_nwg(vec_nwg_cap, kv_tile, (uint32_t) K->ne[1]);
@@ -4405,8 +4420,7 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
                     if (mask != nullptr) {
                         const uint32_t blk_nblk0       = CEIL_DIV((uint32_t) K->ne[1], kv_tile);
                         const uint32_t blk_nblk1       = (uint32_t) n_q;
-                        const uint32_t stride_mask3    = (uint32_t) (mask->nb[3] / ggml_type_size(mask->type));
-                        const uint32_t blk_batch_count = stride_mask3 > 0 ? (uint32_t) Q->ne[3] : 1u;
+                        const uint32_t blk_batch_count = (uint32_t) Q->ne[3] * (uint32_t) mask->ne[2];
                         const uint64_t blk_elems       = (uint64_t) blk_nblk0 * blk_nblk1 * blk_batch_count;
                         const size_t   blk_size_bytes =
                             ROUNDUP_POW2(blk_elems * sizeof(uint32_t), WEBGPU_STORAGE_BUF_BINDING_MULT);
@@ -4425,7 +4439,7 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
                 // mmvq batch and the size stays monotonic in the batch length
                 const int64_t n_rows   = std::min<int64_t>(src1->ne[1], GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS);
                 const bool    use_mmvq = ggml_webgpu_can_use_mmvq(
-                    src0, src1, n_rows, ctx->webgpu_global_ctx->capabilities.supports_dot_product,
+                    src0, src1, tensor, n_rows, ctx->webgpu_global_ctx->capabilities.supports_dot_product,
                     ctx->webgpu_global_ctx->vendor);
                 if (use_mmvq) {
                     const size_t q8_src1_size = src1->ne[3] * src1->ne[2] * n_rows *
@@ -4502,6 +4516,7 @@ static void ggml_backend_webgpu_device_get_props(ggml_backend_dev_t dev, struct 
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ false,
         /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false,
     };
 }
 
@@ -4525,8 +4540,54 @@ static void ggml_webgpu_init_scatter_write_pipeline(webgpu_global_context & ctx)
     ctx->set_tensor_n_pipeline = ggml_webgpu_create_pipeline(ctx->device, wgsl_set_tensor_n, "set_tensor_n", constants);
 }
 
-static void ggml_backend_webgpu_request_adapter(wgpu::Instance & instance, wgpu::Adapter & adapter) {
+// Dawn's Null backend accepts every feature and executes nothing, so a host
+// without a usable GPU would otherwise return invalid results.
+static bool ggml_webgpu_adapter_is_null_backend(const wgpu::Adapter & adapter) {
+    wgpu::AdapterInfo info;
+    adapter.GetInfo(&info);
+    return info.backendType == wgpu::BackendType::Null;
+}
+
+static bool ggml_webgpu_adapter_is_compatible(const wgpu::Adapter & adapter) {
+    if (ggml_webgpu_adapter_is_null_backend(adapter)) {
+        GGML_LOG_WARN("ggml_webgpu: skipping Dawn's Null adapter\n");
+        return false;
+    }
+    if (!adapter.HasFeature(wgpu::FeatureName::ShaderF16)) {
+        GGML_LOG_WARN("ggml_webgpu: skipping adapter without shader-f16\n");
+#ifdef __EMSCRIPTEN__
+        GGML_LOG_WARN(
+            "ggml_webgpu: on affected Chromium NVIDIA/Vulkan configurations, try "
+            "--enable-dawn-features=vulkan_enable_f16_on_nvidia\n");
+#endif
+        return false;
+    }
+#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+    if (!adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)) {
+        GGML_LOG_WARN("ggml_webgpu: skipping adapter without implicit device synchronization\n");
+        return false;
+    }
+#endif
+    return true;
+}
+
+static bool ggml_webgpu_adapters_are_same(const wgpu::Adapter & first, const wgpu::Adapter & second) {
+    wgpu::AdapterInfo first_info;
+    wgpu::AdapterInfo second_info;
+    first.GetInfo(&first_info);
+    second.GetInfo(&second_info);
+    return first_info.backendType == second_info.backendType && first_info.vendorID == second_info.vendorID &&
+           first_info.deviceID == second_info.deviceID &&
+           std::string(first_info.vendor) == std::string(second_info.vendor) &&
+           std::string(first_info.architecture) == std::string(second_info.architecture) &&
+           std::string(first_info.device) == std::string(second_info.device) &&
+           std::string(first_info.description) == std::string(second_info.description);
+}
+
+static std::string ggml_backend_webgpu_request_adapter(wgpu::Instance & instance, wgpu::Adapter & adapter) {
     wgpu::RequestAdapterOptions options = {};
+    std::string                 last_failure;
+    wgpu::Adapter               rejected_adapter;
 
 #if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
     // TODO: track need for these toggles: https://issues.chromium.org/issues/42251215
@@ -4537,21 +4598,40 @@ static void ggml_backend_webgpu_request_adapter(wgpu::Instance & instance, wgpu:
     options.nextInChain                   = &adapterTogglesDesc;
 #endif
 
-    instance.WaitAny(
-        instance.RequestAdapter(
-            &options, wgpu::CallbackMode::AllowSpontaneous,
-            [&adapter](wgpu::RequestAdapterStatus status, wgpu::Adapter _adapter, wgpu::StringView message) {
-                if (status != wgpu::RequestAdapterStatus::Success) {
-                    GGML_LOG_ERROR("ggml_webgpu: Failed to get an adapter: %s\n", std::string(message).c_str());
-                    return;
-                }
-                adapter = std::move(_adapter);
-            }),
-        UINT64_MAX);
+    const wgpu::PowerPreference preferences[] = {
+        wgpu::PowerPreference::HighPerformance,
+        wgpu::PowerPreference::LowPower,
+    };
+    for (wgpu::PowerPreference preference : preferences) {
+        options.powerPreference = preference;
+        wgpu::Adapter candidate;
+        instance.WaitAny(
+            instance.RequestAdapter(&options, wgpu::CallbackMode::AllowSpontaneous,
+                                    [&candidate, &last_failure](wgpu::RequestAdapterStatus status,
+                                                                wgpu::Adapter requested, wgpu::StringView message) {
+                                        if (status != wgpu::RequestAdapterStatus::Success) {
+                                            last_failure = std::string(message);
+                                            return;
+                                        }
+                                        candidate = std::move(requested);
+                                    }),
+            UINT64_MAX);
+        if (candidate != nullptr) {
+            last_failure.clear();
+            if (rejected_adapter != nullptr && ggml_webgpu_adapters_are_same(candidate, rejected_adapter)) {
+                continue;
+            }
+            if (ggml_webgpu_adapter_is_compatible(candidate)) {
+                adapter = std::move(candidate);
+                return {};
+            }
+            rejected_adapter = std::move(candidate);
+        }
+    }
+    return last_failure;
 }
 
 static void create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
-    ggml_backend_webgpu_request_adapter(ctx->webgpu_global_ctx->instance, ctx->webgpu_global_ctx->adapter);
     GGML_ASSERT(ctx->webgpu_global_ctx->adapter != nullptr);
 
     ctx->webgpu_global_ctx->adapter.GetLimits(&ctx->webgpu_global_ctx->capabilities.limits);
@@ -4965,13 +5045,19 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             {
                 // conservative support checks for whether the more resource-intensive shader paths
                 // can be used, to avoid cases where flash_attn is assigned to the CPU later on
-                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
-                supports_op = op->src[5] == nullptr && src0->type == GGML_TYPE_F32 &&
+                // K/V row lists and indexed bias are not supported
+                supports_op = op->src[5] == nullptr && !ggml_flash_attn_ext_has_indexed_bias(op) &&
+                              src0->type == GGML_TYPE_F32 &&
                               (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 ||
                                src1->type == GGML_TYPE_Q4_0 || src1->type == GGML_TYPE_Q8_0) &&
                               (src2->type == GGML_TYPE_F32 || src2->type == GGML_TYPE_F16 ||
                                src2->type == GGML_TYPE_Q4_0 || src2->type == GGML_TYPE_Q8_0) &&
                               op->type == GGML_TYPE_F32;
+                // the shaders read one mask plane per sequence: a mask with a plane per head (or head group,
+                // ne[2] > 1, e.g. Inkling 2's relative-position bias) is not supported
+                if (op->src[3] != nullptr && op->src[3]->ne[2] > 1) {
+                    supports_op = false;
+                }
                 if (!supports_op) {
                     break;
                 }
@@ -4985,7 +5071,8 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
 
                 // subgroup matrix path requirements
                 const bool use_subgroup_matrix = ggml_webgpu_flash_attn_can_use_subgroup_matrix_path(
-                    capabilities.supports_subgroup_matrix, capabilities.sg_mat_k, capabilities.sg_mat_n, src0, src2);
+                    capabilities.supports_subgroup_matrix, capabilities.sg_mat_k, capabilities.sg_mat_n, src0, src2,
+                    op);
 
                 // tile path requirements
                 const bool float_vec4_aligned =
@@ -5004,8 +5091,9 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                 const bool tile_can_dispatch_all_q_rows =
                     capabilities.limits.maxComputeInvocationsPerWorkgroup >=
                     GGML_WEBGPU_FLASH_ATTN_TILE_Q_TILE * capabilities.max_subgroup_size;
-                const bool use_tile = !use_subgroup_matrix && capabilities.supports_subgroups && float_vec4_aligned &&
-                                      tile_kv_head_dims_aligned && tile_can_dispatch_all_q_rows;
+                const bool tile_requirements = capabilities.supports_subgroups && float_vec4_aligned &&
+                                               tile_kv_head_dims_aligned && tile_can_dispatch_all_q_rows;
+                const bool use_tile          = !use_subgroup_matrix && tile_requirements;
 
                 if (!use_subgroup_matrix && !use_tile) {
                     supports_op = false;
@@ -5014,14 +5102,23 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                 const uint32_t q_tile =
                     use_subgroup_matrix ? capabilities.sg_mat_m : GGML_WEBGPU_FLASH_ATTN_TILE_Q_TILE;
                 const uint32_t kv_granularity = use_subgroup_matrix ? capabilities.sg_mat_n : 1u;
-                const bool     kv_direct = use_subgroup_matrix ?
-                                               ggml_webgpu_flash_attn_k_direct(src0, src1, capabilities.sg_mat_k) ||
-                                                   ggml_webgpu_flash_attn_v_direct(src0, src2, capabilities.sg_mat_k) :
-                                               false;
-                const uint32_t max_kv_tile = ggml_webgpu_flash_attn_max_kv_tile(
+                // same direct read rule as get_flash_attn_pipeline: F16 only, on the subgroup matrix path
+                const bool     kv_direct      = use_subgroup_matrix && src1->type == GGML_TYPE_F16 &&
+                                                src2->type == GGML_TYPE_F16 &&
+                                                ggml_webgpu_flash_attn_k_direct(src0, src1, capabilities.sg_mat_k) &&
+                                                ggml_webgpu_flash_attn_v_direct(src0, src2, capabilities.sg_mat_k);
+                const uint32_t max_kv_tile    = ggml_webgpu_flash_attn_max_kv_tile(
                     capabilities.limits.maxComputeWorkgroupStorageSize, q_tile, kv_granularity, (uint32_t) src0->ne[0],
                     (uint32_t) src2->ne[0], op->src[3] != nullptr, kv_direct);
-                supports_op = max_kv_tile > 0;
+                // get_flash_attn_pipeline falls back to the register tile path when the subgroup matrix tile does not fit
+                // and needs what use_tile needs (vec4 K/V loads, all Q rows in one workgroup)
+                const uint32_t fallback_kv_tile =
+                    use_subgroup_matrix && tile_requirements ?
+                        ggml_webgpu_flash_attn_max_kv_tile(
+                            capabilities.limits.maxComputeWorkgroupStorageSize, GGML_WEBGPU_FLASH_ATTN_TILE_Q_TILE, 1u,
+                            (uint32_t) src0->ne[0], (uint32_t) src2->ne[0], op->src[3] != nullptr, false) :
+                        0u;
+                supports_op = max_kv_tile > 0 || fallback_kv_tile > 0;
                 break;
             }
         case GGML_OP_GROUP_NORM:
@@ -5268,7 +5365,9 @@ static ggml_backend_dev_t ggml_backend_webgpu_reg_get_device(ggml_backend_reg_t 
 
     ggml_backend_webgpu_reg_context * reg_ctx = static_cast<ggml_backend_webgpu_reg_context *>(reg->context);
 
-    create_webgpu_device(reg_ctx);
+    if (reg_ctx->webgpu_global_ctx->device == nullptr) {
+        create_webgpu_device(reg_ctx);
+    }
 
     static ggml_backend_webgpu_device_context device_ctx;
     device_ctx.device_name            = GGML_WEBGPU_NAME;
@@ -5307,15 +5406,14 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
         /* .context     = */ ctx,
     };
 
-    ctx->name         = GGML_WEBGPU_NAME;
-    ctx->device_count = 0;
+    ctx->name = GGML_WEBGPU_NAME;
 
-    // Keep one Dawn/WebGPU instance alive for the lifetime of the static backend
-    // registry. Recreating it on repeated registry lookups can invalidate
-    // adapter/device references that are still held by the backend/device layer.
-    if (ctx->webgpu_global_ctx != nullptr && ctx->webgpu_global_ctx->instance != nullptr) {
+    // Cache setup failures too, so repeated lookups do not retry or repeat diagnostics.
+    if (ctx->webgpu_global_ctx != nullptr) {
         return &reg;
     }
+
+    ctx->device_count = 0;
 
     wgpu::InstanceDescriptor               instance_descriptor{};
     std::vector<wgpu::InstanceFeatureName> instance_features = { wgpu::InstanceFeatureName::TimedWaitAny };
@@ -5334,18 +5432,20 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
     ctx->webgpu_global_ctx           = webgpu_global_context(new webgpu_global_context_struct());
     ctx->webgpu_global_ctx->instance = std::move(inst);
 
-    // Probe for adapter support
-    wgpu::Adapter adapter;
+    wgpu::Adapter & adapter = ctx->webgpu_global_ctx->adapter;
+    std::string     adapter_failure;
     if (ctx->webgpu_global_ctx->instance != nullptr) {
-        ggml_backend_webgpu_request_adapter(ctx->webgpu_global_ctx->instance, adapter);
+        adapter_failure = ggml_backend_webgpu_request_adapter(ctx->webgpu_global_ctx->instance, adapter);
     }
 
-    // WebGPU backend requires f16 support and, on native, implicit device synchronization.
-    if (adapter != nullptr && adapter.HasFeature(wgpu::FeatureName::ShaderF16)
-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
-        && adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)
-#endif
-    ) {
+    if (adapter == nullptr) {
+        if (adapter_failure.empty()) {
+            GGML_LOG_WARN("ggml_webgpu: no compatible adapter available, backend disabled\n");
+        } else {
+            GGML_LOG_WARN("ggml_webgpu: no compatible adapter available, backend disabled: %s\n",
+                          adapter_failure.c_str());
+        }
+    } else {
         ctx->device_count = 1;
     }
 

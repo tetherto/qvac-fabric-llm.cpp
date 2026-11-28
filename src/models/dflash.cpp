@@ -1,8 +1,11 @@
 #include "models.h"
 
+#include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+
+#include <cmath>
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
@@ -35,12 +38,17 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_TOP_K,   hparams.dflash_selector_top_k,   false);
+    ml.get_key(LLM_KV_DFLASH_SELECTOR_SOFTCAP_AFTER_CORRECTION, hparams.dflash_selector_softcap_after, false);
 
     const bool has_markov   = ml.get_tensor_meta("markov_w1.weight")       != nullptr;
     const bool has_selector = ml.get_tensor_meta("selector_hidden.weight") != nullptr;
     const bool has_lilicorr = ml.get_key(LLM_KV_LILICORR_HIDDEN_SIZE, hparams.lilicorr_hidden_size, false);
     if (has_markov) {
         variant = VARIANT_DSPARK;
+        ml.get_key(LLM_KV_DFLASH_HAS_MARKOV_CONTEXT, hparams.dspark_f_rnn, false);
+        if (!hparams.dspark_f_rnn && ml.get_tensor_meta("markov_ctx_norm.weight")) {
+            throw std::runtime_error("DSpark model has 'markov_ctx_norm.weight' but 'has_markov_context' is not true in GGUF metadata");
+        }
     } else if (has_selector) {
         variant = VARIANT_DFLASH2;
     } else if (has_lilicorr) {
@@ -48,8 +56,30 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         load_hparams_lilicorr(ml);
     }
 
+    // DSpine packs [top_k candidates, top_k x top_k transition scores] into one n_embd row per block position
+    if (ml.get_key(LLM_KV_DSPINE_HEAD_TOPK, hparams.dspine_head_topk, false)) {
+        ml.get_key(LLM_KV_DSPINE_EPS, hparams.dspine_eps, false);
+        bool causal = false;
+        ml.get_key(LLM_KV_ATTENTION_CAUSAL, causal, false);
+        const uint32_t top_k = hparams.dspine_head_topk;
+        if (!causal || !std::isfinite(hparams.dspine_eps) || !(hparams.dspine_eps > 0.0f) || top_k < 2 || top_k > 64 || (top_k & (top_k - 1)) != 0 || hparams.dflash_block_size < 2 || has_lilicorr ||
+                hparams.dflash_selector_top_k > 0 || (uint64_t) top_k * (top_k + 1) > hparams.n_embd) {
+            throw std::runtime_error("invalid DSpine DFlash metadata");
+        }
+    }
+
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
+    }
+
+    // looped targets (Inkling2) visit a physical layer more than once: target_layers then names the physical layers,
+    // target_visits the layer visits the target extracts (the last one, n_visits, is its final norm output)
+    std::vector<int32_t> target_visits;
+    if (ml.get_arr(LLM_KV_TARGET_VISITS, target_visits, false)) {
+        if (target_visits.empty() || target_visits.size() != target_layer_ids.size()) {
+            throw std::runtime_error("DFlash 'target_visits' must have the same nonzero length as 'target_layers'");
+        }
+        target_layer_ids = std::move(target_visits);
     }
 
     hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
@@ -107,11 +137,46 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         case VARIANT_DFLASH:                                       break;
     }
 
-    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
+    if (hparams.dspine_head_topk > 0) {
+        const struct ggml_tensor * codebook_meta = ml->get_tensor_meta("dspine_codebook.weight");
+        const struct ggml_tensor * gate_meta     = ml->get_tensor_meta("dspine_gate.weight");
+        // the bridge and lattice are built by the plain DFlash decoder only
+        if (!codebook_meta || !gate_meta || d2t_meta || variant != VARIANT_DFLASH ||
+                hparams.dsv4_hc_mult > 0 || hparams.n_lora_kv > 0) {
+            throw std::runtime_error("DSpine draft needs its code bridge, a plain DFlash decoder and the full target vocabulary");
+        }
+        const int64_t code_size = codebook_meta->ne[0];
+        const int64_t rank      = gate_meta->ne[1];
+        // checked before any tensor is created: the buffer probe of a zero-size weight aborts
+        if (code_size <= 0 || rank <= 0 || n_vocab < (int64_t) hparams.dspine_head_topk) {
+            throw std::runtime_error("invalid DSpine code bridge size");
+        }
+
+        dspine_codebook  = create_tensor(tn(LLM_TENSOR_DSPINE_CODEBOOK,  "weight"), { code_size, n_vocab }, 0);
+        dspine_gate      = create_tensor(tn(LLM_TENSOR_DSPINE_GATE,      "weight"), { code_size, rank }, 0);
+        dspine_gate_b    = create_tensor(tn(LLM_TENSOR_DSPINE_GATE,      "bias"),   { rank }, 0);
+        dspine_pred_gate = create_tensor(tn(LLM_TENSOR_DSPINE_PRED_GATE, "weight"), { code_size, rank }, 0);
+        dspine_prev      = create_tensor(tn(LLM_TENSOR_DSPINE_PREV,      "weight"), { code_size, rank }, 0);
+        for (int i = 0; i < n_layer; ++i) {
+            layers[i].dspine_read  = create_tensor(tn(LLM_TENSOR_DSPINE_READ,  "weight", i), { n_embd, code_size }, 0);
+            layers[i].dspine_write = create_tensor(tn(LLM_TENSOR_DSPINE_WRITE, "weight", i), { rank, n_embd }, 0);
+        }
+
+        LLAMA_LOG_INFO("%s: DSpine code bridge: code size = %lld, rank = %lld, head top-k = %u\n", __func__,
+                (long long) code_size, (long long) rank, hparams.dspine_head_topk);
+    }
+
+    // drafts with per-layer context K/V (ctx_mix) have no shared fc
+    const int fc_flags = ml->get_tensor_meta("blk.0.ctx_mix.weight") ? TENSOR_NOT_REQUIRED : 0;
+
+    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, fc_flags);
     fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
     fc_in_s         = create_tensor(tn(LLM_TENSOR_FC,              "input_scale"), { 1 }, TENSOR_NOT_REQUIRED);
-    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
+    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, fc_flags); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
+
+    // optional: norm of the anchor embedding
+    tok_norm        = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD_NORM, "weight", 0), { n_embd }, TENSOR_NOT_REQUIRED);
 
     // optional: reduced-vocab drafts ship their own lm head, full-vocab drafts can share the target's via ctx_other
     // a draft with its own embeddings + head references no target tensors and can run on devices the target does not use (e.g. -devd with a tensor-split target)
@@ -127,6 +192,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
 void llama_model_dflash::load_tensors_layers_base() {
     LLAMA_LOAD_LOCALS;
+
+    const bool has_ctx_mix = ml->get_tensor_meta("blk.0.ctx_mix.weight") != nullptr;
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -153,6 +220,15 @@ void llama_model_dflash::load_tensors_layers_base() {
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
+
+        // optional: context K/V from this layer's own mix of the target features
+        if (has_ctx_mix) {
+            layer.dflash_ctx_mix         = create_tensor(tn(LLM_TENSOR_DFLASH_CTX_MIX,         "weight", i), { (int64_t) target_layer_ids.size() }, 0);
+            layer.dflash_ctx_norm        = create_tensor(tn(LLM_TENSOR_DFLASH_CTX_NORM,        "weight", i), { n_embd }, 0);
+            layer.dflash_wk_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_K_CTX,      "weight", i), { n_embd, n_embd_k_gqa }, 0);
+            layer.dflash_wv_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_V_CTX,      "weight", i), { n_embd, n_embd_v_gqa }, 0);
+            layer.dflash_attn_k_ctx_norm = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_K_CTX_NORM, "weight", i), { n_embd_head_k }, 0);
+        }
     }
 }
 
@@ -233,6 +309,35 @@ ggml_tensor * llama_model_dflash::get_tok_embd(const llm_graph_context & g, cons
     return model_other->tok_embd;
 }
 
+// a Hadamard-latent table (also the target's, borrowed) stores rotated rows; restore the primal basis
+ggml_tensor * llama_model_dflash::get_tok_rows(const llm_graph_context & g, const llama_model & model, ggml_tensor * ids) {
+    ggml_tensor * tok_embd = get_tok_embd(g, model);
+    ggml_tensor * cur = ggml_get_rows(g.ctx0, tok_embd, ids);
+    if (g.hdmd) {
+        if (const auto it = g.hdmd->inv.find(tok_embd); it != g.hdmd->inv.end()) {
+            cur = llama_mul_mat_hadamard(g.ctx0, cur, it->second.rot);
+            if (it->second.signs) {
+                cur = ggml_mul(g.ctx0, cur, it->second.signs);
+            }
+        }
+    }
+    // norm of the input embedding: the draft's own, or the one Inkling2 applies to its token embeddings
+    ggml_tensor * tok_norm     = model.tok_norm;
+    float         tok_norm_eps = g.hparams.f_norm_rms_eps;
+    if (!tok_norm && !model.tok_embd) {
+        const auto * model_other = llama_get_model(g.cparams.ctx_other);
+        if (model_other->arch == LLM_ARCH_INKLING2 || model_other->arch == LLM_ARCH_INKLING2_LOOP) {
+            GGML_ASSERT(model_other->tok_norm != nullptr);
+            tok_norm     = model_other->tok_norm;
+            tok_norm_eps = model_other->hparams.f_norm_rms_eps;
+        }
+    }
+    if (tok_norm) {
+        cur = ggml_mul(g.ctx0, ggml_rms_norm(g.ctx0, cur, tok_norm_eps), tok_norm);
+    }
+    return cur;
+}
+
 // lm_head and its scale from the target model (shared via ctx_other) when the draft has none
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_dflash::get_lm_head(const llm_graph_context & g, const llama_model & model) {
     if (model.output) {
@@ -281,8 +386,46 @@ ggml_tensor * llama_model_dflash::graph_base::build_rope(ggml_tensor * cur, ggml
                 ext_factor, attn_factor, beta_fast, beta_slow);
 }
 
+// write one layer's injected K/V to its (sub-)cache
+void llama_model_dflash::graph_base::store_inject_kv(ggml_tensor * Kcur, ggml_tensor * Vcur, int il) {
+    if (use_iswa) {
+        // route each layer's K/V to its sub-cache: SWA layers -> sliding cache, full -> dense
+        const bool    is_swa = hparams.is_swa(il);
+        const auto  * kv     = is_swa ? inp_attn_iswa->mctx->get_swa() : inp_attn_iswa->mctx->get_base();
+        ggml_tensor * k_idxs = is_swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs();
+        ggml_tensor * v_idxs = is_swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs();
+        // rotate K/V into the cache's rotated space
+        ggml_tensor * k_rot  = is_swa ? inp_attn_iswa->self_k_rot_swa[il] : inp_attn_iswa->self_k_rot[il];
+        ggml_tensor * v_rot  = is_swa ? inp_attn_iswa->self_v_rot_swa[il] : inp_attn_iswa->self_v_rot[il];
+        if (k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, k_rot);
+        }
+        if (v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, v_rot);
+        }
+        ggml_build_forward_expand(gf, kv->cpy_k(ctx0, Kcur, k_idxs, il));
+        ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, v_idxs, il));
+    } else {
+        // rotate K/V into the cache's rotated space
+        if (inp_attn->self_k_rot[il]) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot[il]);
+        }
+        if (inp_attn->self_v_rot[il]) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot[il]);
+        }
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+    }
+}
+
 // KV cache injection
 ggml_tensor * llama_model_dflash::graph_base::build_inject() {
+    // drafts without fc: each layer mixes the raw target features itself
+    if (!model.fc && model.layers[0].dflash_ctx_mix) {
+        build_inject_ctx_mix();
+        return nullptr;
+    }
+
     ggml_tensor * inp_g = build_inject_inp(*this, model);
     cb(inp_g, "inp_g_embeddings", -1);
 
@@ -304,34 +447,7 @@ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
         cb(Kcur, "Kcur_injected", il);
         cb(Vcur, "Vcur_injected", il);
 
-        if (use_iswa) {
-            // route each layer's K/V to its sub-cache: SWA layers -> sliding cache, full -> dense
-            const bool    is_swa = hparams.is_swa(il);
-            const auto  * kv     = is_swa ? inp_attn_iswa->mctx->get_swa() : inp_attn_iswa->mctx->get_base();
-            ggml_tensor * k_idxs = is_swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs();
-            ggml_tensor * v_idxs = is_swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs();
-            // rotate K/V into the cache's rotated space
-            ggml_tensor * k_rot  = is_swa ? inp_attn_iswa->self_k_rot_swa[il] : inp_attn_iswa->self_k_rot[il];
-            ggml_tensor * v_rot  = is_swa ? inp_attn_iswa->self_v_rot_swa[il] : inp_attn_iswa->self_v_rot[il];
-            if (k_rot) {
-                Kcur = llama_mul_mat_hadamard(ctx0, Kcur, k_rot);
-            }
-            if (v_rot) {
-                Vcur = llama_mul_mat_hadamard(ctx0, Vcur, v_rot);
-            }
-            ggml_build_forward_expand(gf, kv->cpy_k(ctx0, Kcur, k_idxs, il));
-            ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, v_idxs, il));
-        } else {
-            // rotate K/V into the cache's rotated space
-            if (inp_attn->self_k_rot[il]) {
-                Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot[il]);
-            }
-            if (inp_attn->self_v_rot[il]) {
-                Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot[il]);
-            }
-            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
-            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
-        }
+        store_inject_kv(Kcur, Vcur, il);
     }
 
     res->t_embd = inp_g;
@@ -339,6 +455,50 @@ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
     ggml_build_forward_expand(gf, inp_g);
 
     return inp_g;
+}
+
+// KV cache injection with per-layer context K/V (Inkling2 DSpark): rms_norm(sum_i ctx_mix[i] * target_i) * ctx_norm -> k_ctx / v_ctx
+// also outputs f_rnn (the same mix for the markov head) as h_nextn
+void llama_model_dflash::graph_base::build_inject_ctx_mix() {
+    const int64_t n_embd_inp = hparams.n_embd_inp_enc();
+    const int64_t n_target   = n_embd_inp / n_embd;
+
+    auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    ggml_tensor * feats = build_inp_target_features(*this, *inp, n_embd_inp);
+    res->add_input(std::move(inp));
+
+    // [n_target, n_embd, n_tokens]: the mix is a matmul over the target taps
+    feats = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, feats, n_embd, n_target, n_tokens), 1, 0, 2, 3));
+    cb(feats, "inp_target_features", -1);
+
+    const auto build_mix = [&](ggml_tensor * mix, ggml_tensor * norm, int il) {
+        ggml_tensor * cur = ggml_reshape_2d(ctx0, ggml_mul_mat(ctx0, mix, feats), n_embd, n_tokens);
+        return build_norm(cur, norm, nullptr, LLM_NORM_RMS, il);
+    };
+
+    // the driver keeps the f_rnn rows of the context positions
+    if (model.dspark_markov_ctx_mix) {
+        res->t_h_nextn = build_mix(model.dspark_markov_ctx_mix, model.dspark_markov_ctx_norm, -1);
+        cb(res->t_h_nextn, "f_rnn", -1);
+        ggml_build_forward_expand(gf, res->t_h_nextn);
+    }
+
+    for (int il = 0; il < n_layer; ++il) {
+        const auto & layer = model.layers[il];
+        GGML_ASSERT(layer.dflash_ctx_mix && "DFlash draft without fc requires per-layer ctx_mix");
+
+        ggml_tensor * cur = build_mix(layer.dflash_ctx_mix, layer.dflash_ctx_norm, il);
+
+        ggml_tensor * Kcur = ggml_reshape_3d(ctx0, build_lora_mm(layer.dflash_wk_ctx, cur), n_embd_head, n_head_kv, n_tokens);
+        ggml_tensor * Vcur = ggml_reshape_3d(ctx0, build_lora_mm(layer.dflash_wv_ctx, cur), n_embd_head, n_head_kv, n_tokens);
+
+        Kcur = build_norm(Kcur, layer.dflash_attn_k_ctx_norm, NULL, LLM_NORM_RMS, il);
+        Kcur = build_rope(Kcur, inp_pos, il);
+        cb(Kcur, "Kcur_injected", il);
+        cb(Vcur, "Vcur_injected", il);
+
+        store_inject_kv(Kcur, Vcur, il);
+    }
 }
 
 ggml_tensor * llama_model_dflash::graph_base::build_inp_tokens() {
@@ -353,14 +513,154 @@ ggml_tensor * llama_model_dflash::graph_base::build_inp_tokens() {
     return inp_tokens;
 }
 
+// DSpine: the last layer's state before its code write, reused by the refinement
+struct dspine_write_state {
+    ggml_tensor * raw   = nullptr; // [n_embd, n_tokens]
+    ggml_tensor * rms   = nullptr; // [1, n_tokens]
+    ggml_tensor * query = nullptr; // [rank, n_tokens]
+};
+
+// rows [beg, beg + n) of every block of a [ne0, n_rows, n_blocks] tensor
+static ggml_tensor * dspine_block_rows(ggml_context * ctx0, ggml_tensor * x, int64_t beg, int64_t n) {
+    return ggml_cont(ctx0, ggml_view_3d(ctx0, x, x->ne[0], n, x->ne[2], x->nb[1], x->nb[2], beg * x->nb[1]));
+}
+
+// sqrt(code_size) * codebook[anchor] for every block: [code_size, n_blocks]
+static ggml_tensor * build_dspine_anchor_codes(ggml_context * ctx0, const llama_model & model, ggml_tensor * tokens, int64_t n_rows, int64_t n_blocks) {
+    ggml_tensor * anchors = ggml_cont_1d(ctx0, ggml_view_2d(ctx0, tokens, 1, n_blocks, n_rows * tokens->nb[0], 0), n_blocks);
+    return ggml_scale(ctx0, ggml_get_rows(ctx0, model.dspine_codebook, anchors), sqrtf((float) model.dspine_codebook->ne[0]));
+}
+
+// DSpine code write after a layer: block row t > 0 gets a message gated by its own code and the code of row t - 1
+static ggml_tensor * build_dspine_write(llm_graph_context & g, const llama_model & model, ggml_tensor * raw,
+        ggml_tensor * anchor_codes, int il, dspine_write_state & state) {
+    ggml_context * ctx0 = g.ctx0;
+
+    const auto & layer = model.layers[il];
+
+    const int64_t n_embd    = raw->ne[0];
+    const int64_t n_tokens  = raw->ne[1];
+    const int64_t code_size = anchor_codes->ne[0];
+    const int64_t n_blocks  = anchor_codes->ne[1];
+    const int64_t n_rows    = n_tokens / n_blocks;
+    const int64_t rank      = model.dspine_gate->ne[1];
+    const float   eps       = g.hparams.dspine_eps;
+
+    // the reference adds eps after the square root, so this is neither ggml_rms_norm nor ggml_l2_norm
+    ggml_tensor * rms        = ggml_sqrt(ctx0, ggml_scale(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, raw)), 1.0f / n_embd));
+    ggml_tensor * normalized = ggml_div(ctx0, raw, ggml_scale_bias(ctx0, rms, 1.0f, eps));
+
+    ggml_tensor * proj  = g.build_lora_mm(layer.dspine_read, normalized);
+    ggml_tensor * codes = ggml_div(ctx0, ggml_scale(ctx0, proj, sqrtf((float) code_size)),
+            ggml_scale_bias(ctx0, ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, proj))), 1.0f, eps));
+
+    // row 0 of each block carries the exact code of the anchor token
+    codes = ggml_concat(ctx0, ggml_reshape_3d(ctx0, anchor_codes, code_size, 1, n_blocks),
+            dspine_block_rows(ctx0, ggml_reshape_3d(ctx0, codes, code_size, n_rows, n_blocks), 1, n_rows - 1), 1);
+
+    ggml_tensor * query  = g.build_lora_mm(model.dspine_gate,      codes);
+    ggml_tensor * sender = g.build_lora_mm(model.dspine_pred_gate, codes);
+    ggml_tensor * value  = g.build_lora_mm(model.dspine_prev,      codes);
+
+    // move the sender terms one row down inside each block: row 0 gets a zero message
+    const auto shift = [&](ggml_tensor * x) {
+        return ggml_pad_ext(ctx0, dspine_block_rows(ctx0, x, 0, n_rows - 1), 0, 0, 1, 0, 0, 0, 0, 0);
+    };
+    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_add(ctx0, ggml_add(ctx0, query, shift(sender)), model.dspine_gate_b));
+    ggml_tensor * msg  = ggml_reshape_2d(ctx0, ggml_mul(ctx0, gate, shift(value)), rank, n_tokens);
+
+    ggml_tensor * delta = g.build_lora_mm(layer.dspine_write, msg);
+
+    state.raw   = raw;
+    state.rms   = rms;
+    state.query = ggml_reshape_2d(ctx0, query, rank, n_tokens);
+
+    return ggml_add(ctx0, raw, ggml_mul(ctx0, delta, rms));
+}
+
+// DSpine refinement: redo the last code write with the exact code of each predecessor candidate, then score
+// the top_k candidates of each block row. Packed as [candidates, top_k x top_k scores] for the CPU-side walk.
+static void build_dspine_lattice(llm_graph_context & g, const llama_model & model, ggml_tensor * output,
+        ggml_tensor * output_s, ggml_tensor * anchor_codes, const dspine_write_state & state) {
+    ggml_context * ctx0 = g.ctx0;
+    auto         & res  = g.res;
+
+    const auto & last = model.layers[g.hparams.n_layer() - 1];
+
+    const int64_t n_embd    = g.n_embd;
+    const int64_t n_tokens  = g.n_tokens;
+    const int64_t code_size = anchor_codes->ne[0];
+    const int64_t n_blocks  = anchor_codes->ne[1];
+    const int64_t n_rows    = n_tokens / n_blocks;
+    const int64_t n_pos     = n_rows - 1; // block rows 1..n_rows-1 are drafts
+    const int64_t rank      = model.dspine_gate->ne[1];
+    const int64_t top_k     = g.hparams.dspine_head_topk;
+
+    ggml_tensor * cand     = ggml_reshape_3d(ctx0, ggml_top_k(ctx0, res->t_logits, top_k), top_k, n_rows, n_blocks);
+    ggml_tensor * cand_pos = dspine_block_rows(ctx0, cand, 1, n_pos);
+
+    // predecessor codes: the anchor for row 1, the candidates of row t - 1 for row t
+    ggml_tensor * codes = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, anchor_codes, code_size, 1, 1, n_blocks), code_size, top_k, 1, n_blocks);
+    if (n_pos > 1) {
+        ggml_tensor * ids  = ggml_reshape_1d(ctx0, dspine_block_rows(ctx0, cand, 1, n_pos - 1), top_k * (n_pos - 1) * n_blocks);
+        ggml_tensor * prev = ggml_scale(ctx0, ggml_get_rows(ctx0, model.dspine_codebook, ids), sqrtf((float) code_size));
+        codes = ggml_concat(ctx0, codes, ggml_reshape_4d(ctx0, prev, code_size, top_k, n_pos - 1, n_blocks), 2);
+    }
+
+    ggml_tensor * query = ggml_reshape_4d(ctx0, dspine_block_rows(ctx0, ggml_reshape_3d(ctx0, state.query, rank, n_rows, n_blocks), 1, n_pos), rank, 1, n_pos, n_blocks);
+    ggml_tensor * raw   = ggml_reshape_4d(ctx0, dspine_block_rows(ctx0, ggml_reshape_3d(ctx0, state.raw, n_embd, n_rows, n_blocks), 1, n_pos), n_embd, 1, n_pos, n_blocks);
+    ggml_tensor * rms   = ggml_reshape_4d(ctx0, dspine_block_rows(ctx0, ggml_reshape_3d(ctx0, state.rms, 1, n_rows, n_blocks), 1, n_pos), 1, 1, n_pos, n_blocks);
+
+    // the CPU repack kernels take no 4D src1; merging only the position and block dims keeps ne11 = top_k for the GPU kernels
+    const int64_t n_mats   = n_pos * n_blocks;
+    ggml_tensor * codes_3d = ggml_reshape_3d(ctx0, codes, code_size, top_k, n_mats);
+    ggml_tensor * sender   = ggml_reshape_4d(ctx0, g.build_lora_mm(model.dspine_pred_gate, codes_3d), rank, top_k, n_pos, n_blocks);
+    ggml_tensor * value    = ggml_reshape_4d(ctx0, g.build_lora_mm(model.dspine_prev,      codes_3d), rank, top_k, n_pos, n_blocks);
+
+    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_add(ctx0, ggml_add(ctx0, sender, query), model.dspine_gate_b));
+    ggml_tensor * msg  = ggml_reshape_3d(ctx0, ggml_mul(ctx0, gate, value), rank, top_k, n_mats);
+
+    ggml_tensor * delta   = ggml_reshape_4d(ctx0, g.build_lora_mm(last.dspine_write, msg), n_embd, top_k, n_pos, n_blocks);
+    ggml_tensor * refined = ggml_add(ctx0, ggml_mul(ctx0, delta, rms), raw);
+    refined = g.build_norm(refined, model.output_norm, NULL, LLM_NORM_RMS, -1);
+
+    ggml_tensor * head = ggml_get_rows(ctx0, output, ggml_reshape_1d(ctx0, cand_pos, top_k * n_pos * n_blocks));
+    head = ggml_reshape_4d(ctx0, head, n_embd, top_k, n_pos, n_blocks);
+
+    // scores[candidate, predecessor] of each draft row, computed like the logits in build_lora_mm
+    ggml_tensor * scores = ggml_mul_mat(ctx0, head, g.build_hadamard_input(output, refined));
+    if (output_s) {
+        scores = ggml_mul(ctx0, scores, output_s);
+    }
+
+    ggml_tensor * packed = ggml_concat(ctx0, ggml_cast(ctx0, cand_pos, GGML_TYPE_F32),
+            ggml_reshape_3d(ctx0, scores, top_k * top_k, n_pos, n_blocks), 0);
+    packed = ggml_pad_ext(ctx0, packed, 0, n_embd - top_k * (top_k + 1), 1, 0, 0, 0, 0, 0);
+    packed = ggml_reshape_2d(ctx0, packed, n_embd, n_tokens);
+    g.cb(packed, "dspine_lattice", -1);
+    res->t_h_nextn = packed;
+    ggml_build_forward_expand(g.gf, packed);
+}
+
 ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tokens) {
     const float kq_scale = hparams.f_attention_scale != 0.0f ? hparams.f_attention_scale : 1.0f/sqrtf(float(n_embd_head));
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, get_tok_embd(*this, model), inp_tokens);
+    ggml_tensor * inpL = model.dspark_mask_embd
+        ? build_dspark_inp_block(*this, model, inp_tokens)
+        : get_tok_rows(*this, model, inp_tokens);
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
     cb(inpL, "inp_noise_embd", -1);
+
+    // DSpine writes run on whole [anchor, mask...] blocks only, so graph reservation keeps the plain decoder
+    const int64_t n_blocks    = ubatch.n_seqs_unq;
+    const int64_t n_blk_rows  = n_blocks > 0 ? n_tokens / n_blocks : 0;
+    const bool    use_dspine  = model.dspine_codebook && n_blocks > 0 && n_tokens % n_blocks == 0 &&
+            n_blk_rows >= 2 && n_blk_rows <= (int64_t) hparams.dflash_block_size;
+
+    dspine_anchor_codes = use_dspine ? build_dspine_anchor_codes(ctx0, model, inp_tokens, n_blk_rows, n_blocks) : nullptr;
+    dspine_write_state dspine_state;
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -453,8 +753,17 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
         }
         cb(cur, "l_out", il);
 
+        if (use_dspine) {
+            cur = build_dspine_write(*this, model, cur, dspine_anchor_codes, il, dspine_state);
+            cb(cur, "dspine_out", il);
+        }
+
         inpL = cur;
     }
+
+    dspine_raw   = dspine_state.raw;
+    dspine_rms   = dspine_state.rms;
+    dspine_query = dspine_state.query;
 
     ggml_tensor * cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
@@ -464,9 +773,101 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
     return cur;
 }
 
+// the target token ids of the draft vocabulary, in draft-logit column order
+class llm_graph_input_draft_vocab : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_draft_vocab(const std::vector<int32_t> & ranges) : ids_host(llama_draft_vocab_ids(ranges)) {}
+    virtual ~llm_graph_input_draft_vocab() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        ggml_backend_tensor_set(ids, ids_host.data(), 0, ggml_nbytes(ids));
+    }
+
+    ggml_tensor * ids = nullptr; // I32 [n_draft_vocab]
+
+    const std::vector<int32_t> ids_host;
+};
+
+static ggml_tensor * build_inp_draft_vocab(llm_graph_context & g, const std::vector<int32_t> & ranges) {
+    auto inp = std::make_unique<llm_graph_input_draft_vocab>(ranges);
+
+    inp->ids = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, (int64_t) inp->ids_host.size());
+    ggml_set_input(inp->ids);
+
+    ggml_tensor * ids = inp->ids;
+    g.res->add_input(std::move(inp));
+
+    return ids;
+}
+
+// build_draft_vocab_logits views row ranges of the stored head: its owner must keep the row layout, and the view
+// skips the input rotation and LoRA delta of build_lora_mm
+static bool dflash_head_rows_viewable(const llm_graph_context & g, const llama_model & owner, ggml_tensor * output) {
+    if (owner.has_backend_layout(output)) {
+        return false;
+    }
+    if (g.hdmd && g.hdmd->rot.count(output) > 0) {
+        return false;
+    }
+    for (const auto & lora : *g.loras) {
+        if (lora.first->get_weight(output) != nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// logits over the draft vocabulary: one mat-mul per row range of the head
+static ggml_tensor * build_draft_vocab_logits(ggml_context * ctx, ggml_tensor * output, ggml_tensor * output_s,
+        ggml_tensor * cur, const std::vector<int32_t> & ranges) {
+    ggml_tensor * logits = nullptr;
+    for (size_t r = 0; r < ranges.size(); r += 2) {
+        ggml_tensor * w = ggml_view_2d(ctx, output, output->ne[0], ranges[r + 1] - ranges[r], output->nb[1], ranges[r]*output->nb[1]);
+        ggml_tensor * l = ggml_mul_mat(ctx, w, cur);
+        logits = logits ? ggml_concat(ctx, logits, l, 0) : l;
+    }
+    return output_s ? ggml_mul(ctx, logits, output_s) : logits;
+}
+
+// logits over a reduced vocabulary placed at their target token ids of an n_vocab-wide -inf row
+static ggml_tensor * build_vocab_scatter(ggml_context * ctx, ggml_tensor * logits, ggml_tensor * ids, int64_t n_vocab) {
+    const int64_t n_draft_vocab = logits->ne[0];
+    const int64_t n_rows        = logits->ne[1];
+
+    GGML_ASSERT(ids->ne[0] == n_draft_vocab);
+
+    ggml_tensor * full = ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_vocab, n_rows), -INFINITY);
+    full = ggml_set_rows(ctx, full,
+            ggml_reshape_3d(ctx, logits, 1,             n_draft_vocab, n_rows),
+            ggml_reshape_3d(ctx, ids,    n_draft_vocab, 1,             1));
+
+    return ggml_reshape_2d(ctx, full, n_vocab, n_rows);
+}
+
 ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
     const auto [output, output_s] = get_lm_head(*this, model);
-    cur = build_lora_mm(output, cur, output_s);
+    const llama_model * head_owner = model.output ? &model : llama_get_model(cparams.ctx_other);
+
+    // DSpine looks up the codebook rows of the head's candidates
+    if (model.dspine_codebook && output->ne[1] != model.dspine_codebook->ne[1]) {
+        throw std::runtime_error("DSpine draft codebook does not match the target vocabulary");
+    }
+    // the lattice reads head rows with get_rows, which a repacked or row-split buffer does not store in row order
+    if (model.dspine_codebook && head_owner->has_backend_layout(output)) {
+        throw std::runtime_error("DSpine draft needs the target output head in a plain buffer, not a repacked or row-split one (load the target with --no-repack and without -sm row)");
+    }
+
+    // DFlash2 draft vocabulary: logits over row ranges of the head only
+    const bool use_draft_vocab = !cparams.draft_vocab.empty() && dflash_head_rows_viewable(*this, *head_owner, output);
+    draft_ids = use_draft_vocab ? build_inp_draft_vocab(*this, cparams.draft_vocab) : nullptr;
+
+    cur = use_draft_vocab ? build_draft_vocab_logits(ctx0, output, output_s, cur, cparams.draft_vocab) : build_lora_mm(output, cur, output_s);
+
+    // a padded lm head (e.g. shared from the target): drop the rows past the vocabulary
+    if (!model.d2t && cur->ne[0] > (int64_t) model.vocab.n_tokens()) {
+        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, model.vocab.n_tokens(), cur->ne[1], cur->nb[1], 0));
+    }
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead
@@ -474,30 +875,31 @@ ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
         if (hparams.f_logit_scale != 0.0f) {
             cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
         }
-        if (hparams.f_final_logit_softcapping > 0.0f) {
+        if (hparams.f_final_logit_softcapping > 0.0f && !hparams.dflash_selector_softcap_after) {
             cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
             cur = ggml_tanh(ctx0, cur);
             cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
         }
     }
 
+    logits_draft = cur;
+
     // reduced-draft-vocab exports: scatter the draft logits to the target vocabulary via d2t
     if (model.d2t) {
-        const int64_t n_draft_vocab = cur->ne[0];
-        const int64_t n_outputs     = cur->ne[1];
-        const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
-
         GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
-        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
-
-        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
-        cur = ggml_set_rows(ctx0, logits,
-                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
-                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
+        cur = build_vocab_scatter(ctx0, cur, model.d2t, model.vocab.n_tokens());
+    }
+    // requested logits keep the target vocabulary width, with -inf outside the draft vocabulary
+    if (draft_ids && n_outputs > 0) {
+        cur = build_vocab_scatter(ctx0, cur, draft_ids, model.vocab.n_tokens());
     }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    // DSpine: the refined candidate lattice of the code bridge, on whole-block token batches only
+    if (dspine_anchor_codes) {
+        build_dspine_lattice(*this, model, output, output_s, dspine_anchor_codes, { dspine_raw, dspine_rms, dspine_query });
+    }
 
     return cur;
 }

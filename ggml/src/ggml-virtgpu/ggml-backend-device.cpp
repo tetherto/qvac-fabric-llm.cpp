@@ -30,6 +30,10 @@ static void ggml_backend_remoting_device_get_memory(ggml_backend_dev_t dev, size
 }
 
 static bool ggml_backend_remoting_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (ggml_flash_attn_ext_has_indexed_bias(op)) {
+        return false;
+    }
+
     if ((op->op == GGML_OP_ROPE || op->op == GGML_OP_ROPE_BACK) &&
         !ggml_rope_get_truncate(op)) {
         return false;
@@ -73,6 +77,7 @@ static void ggml_backend_remoting_device_get_props(ggml_backend_dev_t dev, ggml_
     props->caps.buffer_from_host_ptr = false;
     props->caps.async                = false;
     props->caps.events               = false;
+    props->caps.copy_stream          = false;
 }
 
 ggml_backend_buffer_type_t ggml_backend_remoting_device_get_buffer_type(ggml_backend_dev_t dev) {

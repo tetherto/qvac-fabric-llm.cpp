@@ -1,0 +1,214 @@
+{
+  "version": "music-pilot-v1",
+  "review_status": "engineering corpus; human caption and listening review pending",
+  "seeds": [
+    17,
+    42,
+    123
+  ],
+  "generation": {
+    "acestep": {
+      "duration_seconds": 20
+    },
+    "minimax": {
+      "max_frames": 300,
+      "duration_seconds": null,
+      "duration_note": "Frame cap only; no exact duration guarantee."
+    }
+  },
+  "bootstrap": {
+    "seed": 24846,
+    "replicates": 10000
+  },
+  "prompts": [
+    {
+      "id": "p01",
+      "category": "acoustic",
+      "subset": "primary",
+      "caption": "A solo acoustic guitar plays gentle fingerpicked folk music.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p02",
+      "category": "acoustic",
+      "subset": "primary",
+      "caption": "A solo grand piano plays a quiet reflective melody.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p03",
+      "category": "acoustic",
+      "subset": "primary",
+      "caption": "A string quartet performs lively chamber music with short bowed notes.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p04",
+      "category": "acoustic",
+      "subset": "primary",
+      "caption": "A harp plays flowing arpeggios in a soft intimate recording.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p05",
+      "category": "jazz",
+      "subset": "primary",
+      "caption": "A jazz trio with upright bass, brushed drums and piano plays a relaxed groove.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p06",
+      "category": "jazz",
+      "subset": "primary",
+      "caption": "A brass big band plays bright energetic swing music.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p07",
+      "category": "jazz",
+      "subset": "primary",
+      "caption": "A mellow saxophone melody floats over soft jazz guitar chords.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p08",
+      "category": "jazz",
+      "subset": "primary",
+      "caption": "A vibraphone leads a sparse jazz ensemble with a walking bass.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p09",
+      "category": "electronic",
+      "subset": "primary",
+      "caption": "An electronic dance track features a deep pulsing bass and bright synthesizers.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p10",
+      "category": "electronic",
+      "subset": "primary",
+      "caption": "A slow ambient synthesizer drone creates a spacious calm atmosphere.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p11",
+      "category": "electronic",
+      "subset": "primary",
+      "caption": "A chiptune melody plays over playful electronic bleeps and a simple drum beat.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p12",
+      "category": "electronic",
+      "subset": "primary",
+      "caption": "A drum and bass track has rapid breakbeats and a heavy electronic bass line.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p13",
+      "category": "rock",
+      "subset": "primary",
+      "caption": "A distorted electric guitar riff leads a loud rock band with powerful drums.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p14",
+      "category": "rock",
+      "subset": "primary",
+      "caption": "A clean electric guitar plays a slow blues melody over bass and drums.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p15",
+      "category": "rock",
+      "subset": "primary",
+      "caption": "A punk band plays fast raw guitar chords with energetic drums.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p16",
+      "category": "rock",
+      "subset": "primary",
+      "caption": "A soft instrumental rock ballad combines clean guitar, piano and restrained drums.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p17",
+      "category": "world",
+      "subset": "primary",
+      "caption": "A solo flute plays a breathy pastoral melody without percussion.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p18",
+      "category": "world",
+      "subset": "primary",
+      "caption": "Hand drums and shakers create a dense interlocking percussion groove.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p19",
+      "category": "world",
+      "subset": "primary",
+      "caption": "A sitar melody unfolds above a steady tabla rhythm.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p20",
+      "category": "world",
+      "subset": "primary",
+      "caption": "An accordion leads a cheerful acoustic waltz with plucked bass.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "p21",
+      "category": "vocal",
+      "subset": "primary",
+      "caption": "A female singer performs a gentle folk song with acoustic guitar.",
+      "lyrics": "[Verse]\nThe morning light is on the sea\nA quiet song comes back to me"
+    },
+    {
+      "id": "p22",
+      "category": "vocal",
+      "subset": "primary",
+      "caption": "A male singer performs a soulful ballad over piano and soft drums.",
+      "lyrics": "[Verse]\nThe morning light is on the sea\nA quiet song comes back to me"
+    },
+    {
+      "id": "p23",
+      "category": "vocal",
+      "subset": "primary",
+      "caption": "A choir sings sustained warm harmonies without instruments.",
+      "lyrics": "[Verse]\nThe morning light is on the sea\nA quiet song comes back to me"
+    },
+    {
+      "id": "p24",
+      "category": "vocal",
+      "subset": "primary",
+      "caption": "A singer delivers upbeat pop vocals over bright synthesizers and drums.",
+      "lyrics": "[Verse]\nThe morning light is on the sea\nA quiet song comes back to me"
+    },
+    {
+      "id": "s01",
+      "category": "stress",
+      "subset": "stress",
+      "caption": "Silent music with a loud drum solo.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "s02",
+      "category": "stress",
+      "subset": "stress",
+      "caption": "A piano changes from sadness to joy exactly halfway through.",
+      "lyrics": "[Instrumental]"
+    },
+    {
+      "id": "s03",
+      "category": "stress",
+      "subset": "stress",
+      "caption": "A guitar plays precisely 123 beats per minute in F sharp minor.",
+      "lyrics": "[Instrumental]"
+    }
+  ]
+}

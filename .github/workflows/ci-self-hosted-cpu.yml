@@ -23,6 +23,9 @@ on:
       'ci/run.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
+      'ggml/include/**',
+      'src/**',
+      'tests/**',
       'ggml/src/*',
       'ggml/src/ggml-cpu/**'
     ]
@@ -31,8 +34,12 @@ cache-mode: none
 permissions:
   contents: read
 
+# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
+# re-dispatch supersedes the in-flight run. The default branch deliberately
+# keeps upstream's run_id behaviour - master pushes must not cancel each other,
+# or a merged commit can end with no CI verdict. See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -45,26 +52,31 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
-  cpu-x64-high-perf:
-    runs-on: hf-jobs-cpu-upgrade:ubuntu26_04
+  authorize:
+    permissions: {}
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
+  cpu-x64-high-perf:    
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    # runs-on: hf-jobs-cpu-upgrade:ubuntu26_04
+
+    # upstream pins the test thread counts for its hf-jobs runner only:
     # note: this runner has 8 CPUs, but std::thread::hardware_concurrency reports the cores of the
     #   host (https://github.com/ggml-org/llama.cpp/pull/31439#issuecomment-6683386059)
-    env:
-      TEST_ARG_HARDWARE_CONCURRENCY: 8
-      TEST_ARG_PARALLEL_WORKERS: 4
+    # env:
+    #   TEST_ARG_HARDWARE_CONCURRENCY: 8
+    #   TEST_ARG_PARALLEL_WORKERS: 4
+    runs-on: qvac-ubuntu2204-x64
+    timeout-minutes: 180
 
     steps:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
 
-      - name: Dependencies
-        id: depends
-        run: |
-          sudo apt update
-          sudo apt install -y build-essential cmake libssl-dev time unzip wget python3 python3-venv python3-dev
-
+      # No `sudo apt install` step: the self-hosted runners are de-sudoed, and these
+      # packages are already provisioned fleet-wide on the runners.
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
@@ -81,6 +93,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp/$RUNNER_NAME ~/mnt/llama.cpp
 
       - name: ccache-buckets-save
@@ -95,7 +108,38 @@ jobs:
           hf_bucket: ggml-org/cache
           save: true
 
+      - name: Diagnose k-pool with AMX disabled
+        if: ${{ failure() && !cancelled() }}
+        shell: bash
+        run: |
+          if ! grep -q 'FAIL: GLM5 k-pool' build-ci-debug/Testing/Temporary/LastTest.log; then
+            exit 0
+          fi
+          mkdir -p build-ci-noamx
+          cat > build-ci-noamx/no-amx <<'EOF'
+          #!/bin/bash
+          exec "$@" -mno-amx-tile -mno-amx-int8 -mno-amx-bf16
+          EOF
+          chmod +x build-ci-noamx/no-amx
+          cmake -S . -B build-ci-noamx -DCMAKE_BUILD_TYPE=Debug \
+            -DLLAMA_OPENSSL=OFF -DGGML_SCHED_NO_REALLOC=ON -DGGML_NATIVE=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER="$PWD/build-ci-noamx/no-amx" \
+            -DCMAKE_CXX_COMPILER_LAUNCHER="$PWD/build-ci-noamx/no-amx"
+          cmake --build build-ci-noamx --target test-llama-archs -j "$(nproc)"
+          ctest --test-dir build-ci-noamx --output-on-failure -R '^test-glm5-kpool-sequences$'
+
+      - name: Preserve failing CPU logs
+        if: ${{ failure() && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: cpu-failure-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 7
+          path: |
+            build-ci-*/CMakeCache.txt
+            build-ci-*/Testing/Temporary/*.log
+
   cpu-arm64-high-perf-graviton4:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: ah-ubuntu_24_04-c8g_8x
 
     steps:
@@ -111,6 +155,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
           apt-get install -y \
           build-essential \
+          coreutils \
           python3-venv \
           gpg \
           wget \
@@ -129,6 +174,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake
 
+          command -v nproc
+
       - name: Test
         id: ggml-ci
         run: |
@@ -140,6 +187,8 @@ jobs:
 
   # TODO: provision AMX-compatible machine
   #cpu-amx:
+  #  needs: authorize
+  #  if: needs.authorize.outputs.allowed == 'true'
   #  runs-on: [self-hosted, Linux, CPU, AMX]
 
   #  steps:

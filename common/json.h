@@ -35,6 +35,12 @@ struct common_json_item;
 
 struct common_json_error : std::runtime_error {
     using std::runtime_error::runtime_error;
+
+    // qvac: defined in json.cpp, so the type_info and vtable are emitted there only. Code built into another module
+    // than the one that throws (an addon linking server-context against the shared runtime) then catches the
+    // runtime's type instead of a local copy, which libc++'s address comparison of type_info (Linux, x86-64 macOS)
+    // misses.
+    ~common_json_error() override;
 };
 
 // one value, tagged so that this header stays free of the backing library

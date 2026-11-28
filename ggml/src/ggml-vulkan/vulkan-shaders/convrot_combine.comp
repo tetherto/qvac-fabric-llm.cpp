@@ -1,0 +1,13 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform parameter { uint count; uint rows; uint dst_offset; uint scale_offset; };
+layout(binding = 0, std430) buffer D { float data_d[]; };
+layout(binding = 1, std430) readonly buffer L { float data_l[]; };
+layout(binding = 2, std430) readonly buffer S { float data_s[]; };
+void main() {
+    const uint i = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256 + gl_LocalInvocationID.x;
+    if (i < count) {
+        precise float value = data_d[dst_offset + i] + data_l[i] * (1.0 / 4096.0);
+        data_d[dst_offset + i] = value * data_s[scale_offset + i % rows];
+    }
+}

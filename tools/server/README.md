@@ -155,6 +155,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-j, --json-schema SCHEMA` | JSON schema to constrain generations (https://json-schema.org/), e.g. `{"type": "object"}` for any JSON object |
 | `-jf, --json-schema-file FILE` | File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{"type": "object"}` for any JSON object |
 | `-bs, --backend-sampling` | enable backend sampling (experimental) (default: disabled)<br/>(env: LLAMA_ARG_BACKEND_SAMPLING) |
+| `--backend-sampling-auto, --no-backend-sampling-auto` | sample greedy requests on the backend when this picks the same token as the CPU samplers (default: enabled) |
 
 
 ### Server-specific params
@@ -185,11 +186,15 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--image-min-tokens N` | minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)<br/>(env: LLAMA_ARG_IMAGE_MIN_TOKENS) |
 | `--image-max-tokens N` | maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)<br/>(env: LLAMA_ARG_IMAGE_MAX_TOKENS) |
 | `--mtmd-batch-max-tokens N` | maximum number of image tokens per batch when encoding images (default: 1024)<br/>(env: LLAMA_ARG_MTMD_BATCH_MAX_TOKENS) |
+| `--image-tile-mode MODE` | tile encoding mode for multi-tile vision models (e.g. Qwen3VL):<br/>  batched    - all tiles in one forward pass<br/>  sequential - tiles encoded one-by-one (default)<br/>  disabled   - tiling disabled, single tile only<br/>(env: LLAMA_ARG_IMAGE_TILE_MODE) |
 | `--video-fps N` | target video frame rate (default: 4.0)<br/>(env: LLAMA_ARG_VIDEO_FPS) |
 | `--video-timestamp-interval N` | interval in milliseconds between text timestamps (default: 5000)<br/>(env: LLAMA_ARG_VIDEO_TIMESTAMP_INTERVAL) |
 | `--video-ffmpeg-dir DIR` | path to the directory containing ffmpeg and ffprobe (default: search in PATH)<br/>(env: LLAMA_ARG_VIDEO_FFMPEG_DIR) |
+| `--image-max-tiles N` | maximum number of tiles for multi-tile vision models (e.g. Qwen3VL), overrides the<br/>value from the GGUF; use when the GGUF lacks the key or the model default is wrong<br/>for your model size (Qwen3VL defaults to 4, too low for 8B+ variants)<br/>(env: LLAMA_ARG_IMAGE_MAX_TILES) |
+| `--image-no-upscale on\|off` | in idefics3-style preprocessing, round an image's long side up to a whole number of<br/>slices and cap it, instead of always stretching it to the cap; overrides the value<br/>from the GGUF. Small images then stay small and become far fewer slices. This is<br/>what separates the VisionPsy Flash checkpoint from the base one, whose mmprojs are<br/>otherwise indistinguishable, so a Flash checkpoint run without it is silently<br/>running base preprocessing<br/>(env: LLAMA_ARG_IMAGE_NO_UPSCALE) |
 | `-a, --alias STRING` | set model name aliases, comma-separated (to be used by API)<br/>(env: LLAMA_ARG_ALIAS) |
 | `--tags STRING` | set model tags, comma-separated (informational, not used for routing)<br/>(env: LLAMA_ARG_TAGS) |
+| `--coreml-model DIR` | optional EmbeddingGemma 2 Core ML sidecar with raw pooled output; unsupported batches use ggml (env: `LLAMA_ARG_COREML_MODEL`) |
 | `--embd-normalize N` | normalisation for embeddings (default: 2) (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm) |
 | `--host HOST` | IP addresses to listen on, comma-separated, or UNIX socket paths ending in .sock; with multiple TCP addresses, :: binds IPv6 only; overlapping addresses result in undefined behavior (default: 127.0.0.1)<br/>(env: LLAMA_ARG_HOST) |
 | `--port PORT` | port to listen (default: 9931)<br/>(env: LLAMA_ARG_PORT) |
@@ -265,13 +270,17 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-override-tensor, -otd, --override-tensor-draft <tensor name pattern>=<buffer type>,...` | override tensor buffer type for draft model |
 | `--spec-draft-cpu-moe, -cmoed, --cpu-moe-draft` | keep all Mixture of Experts (MoE) weights in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_CPU_MOE) |
 | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
-| `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
-| `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
+| `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3, 5 with --spec-type draft-dflash, draft-dflash2 or draft-lilicorr)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
+| `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding; greedy drafts only, a draft sampled with<br/>--spec-draft-sampling probabilistic is kept at any length (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
 | `--spec-draft-n-ubatch N` | physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH) |
 | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
 | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
 | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
 | `--spec-draft-p-min, --draft-p-min P` | minimum speculative decoding probability (greedy) (default: 0.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_MIN) |
+| `--spec-draft-n-short N` | lattice drafters (DFlash2, DSpine, LiliCorr): keep only N drafts in a step unless the expected accepted tokens of<br/>the full draft pay for --spec-draft-long-cost; greedy drafts only, a DFlash2 draft sampled with<br/>--spec-draft-sampling probabilistic is never shortened (default: 0, 0 = off)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_SHORT) |
+| `--spec-draft-long-cost R` | time of a step with more than --spec-draft-n-short drafts relative to one with --spec-draft-n-short drafts<br/>(default: 1.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_LONG_COST) |
+| `--spec-draft-vocab B:E[,B:E...]` | token id ranges [B, E) a DFlash2 drafter may propose; the target still verifies over the full vocabulary<br/>(default: full vocabulary)<br/>(env: LLAMA_ARG_SPEC_DRAFT_VOCAB) |
+| `--spec-draft-n-auto, --no-spec-draft-n-auto` | pick the draft length (up to --spec-draft-n-max) per step from measured step times and acceptance, so that slots draft less when many generate at once (default: disabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_AUTO) |
 | `--spec-draft-backend-sampling, --no-spec-draft-backend-sampling` | offload draft sampling to the backend (default: enabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING) |
 | `--spec-draft-sampling {greedy,probabilistic}` | how the draft is sampled: greedy takes its argmax, probabilistic samples it and has the target verify by rejection sampling (default: greedy)<br/>(env: LLAMA_ARG_SPEC_DRAFT_SAMPLING) |
 | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
@@ -612,6 +621,8 @@ These words will not be included in the completion, so make sure to add them to 
 `sse_ping_interval`: Interval in seconds between SSE comment pings emitted while the stream stays silent, keeping the connection observable during long prompt processing. Overrides the server `--sse-ping-interval` setting for this request, `-1` disables pings. Default: server setting
 
 `post_sampling_probs`: Returns the probabilities of top `n_probs` tokens after applying sampling chain.
+
+`backend_sampling`: Run the sampler chain on the backend (GPU). Default: `false`, or `true` with `--backend-sampling`. If the request does not set it to `false`, the server samples a greedy request on the backend (`--backend-sampling-auto`, on by default) when every sampler of the chain keeps the most likely token: temperature 0, no logit bias, no penalties, DRY, typical-p or XTC, no grammar, reasoning budget or `n_probs`, and no speculative decoding. The token is the same as with the CPU samplers, except that an exact tie of the top logits can pick another of the tied tokens. `generation_settings.backend_sampling` in the response is `true` when the request was sampled on the backend.
 
 `response_fields`: A list of response fields, for example: `"response_fields": ["content", "generation_settings/n_predict"]`. If the specified field is missing, it will simply be omitted from the response without triggering an error. Note that fields with a slash will be unnested; for example, `generation_settings/n_predict` will move the field `n_predict` from the `generation_settings` object to the root of the response and give it a new name.
 

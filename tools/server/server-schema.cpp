@@ -187,7 +187,13 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("If greater than 0, force samplers to return at least N possible tokens"));
 
     add((new field_bool("backend_sampling", params.sampling.backend_sampling))
-        ->set_desc("Use backend sampling instead of llama.cpp sampling"));
+        ->set_handler([](field_eval_context & ctx, const json & data) {
+            auto & sampling = ctx.params.sampling;
+            sampling.backend_sampling      = data.at("backend_sampling").get<bool>();
+            sampling.backend_sampling_auto = sampling.backend_sampling_auto && sampling.backend_sampling;
+        })
+        ->set_desc("Use backend sampling instead of llama.cpp sampling; false also keeps a greedy request off the "
+                   "automatic backend sampling"));
 
     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));

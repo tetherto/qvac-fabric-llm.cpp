@@ -7248,6 +7248,7 @@ static void ggml_backend_sycl_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ events,
         /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false,
     };
 }
 
@@ -7451,7 +7452,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
         case GGML_OP_LIGHTNING_INDEXER:
-            return op->src[0]->type == GGML_TYPE_F32 &&
+            return op->src[4] == nullptr && // no K row list (ggml_lightning_indexer_rows)
+                op->src[0]->type == GGML_TYPE_F32 &&
                 (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32 ||
                  op->src[1]->type == GGML_TYPE_BF16 || op->src[1]->type == GGML_TYPE_Q8_0 ||
                  op->src[1]->type == GGML_TYPE_Q5_1 || op->src[1]->type == GGML_TYPE_Q5_0 ||
@@ -7708,8 +7710,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_FLASH_ATTN_EXT:
-            // K/V row lists (ggml_flash_attn_ext_rows) are not supported
-            return op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);
+            // K/V row lists and indexed bias are not supported
+            return op->src[5] == nullptr && !ggml_flash_attn_ext_has_indexed_bias(op) && ggml_sycl_flash_attn_ext_supported(device, op);
         default:
             return false;
     }

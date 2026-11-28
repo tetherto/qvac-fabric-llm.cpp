@@ -13,6 +13,7 @@ set(UI_BINARY_DIR     "" CACHE STRING "UI binary directory (to store generated f
 set(LLAMA_SOURCE_DIR  "" CACHE STRING "Project source root (to resolve version from git)")
 set(HF_BUCKET         "" CACHE STRING "Hugging Face bucket name")
 set(HF_VERSION        "" CACHE STRING "Version to download (empty = resolve from git)")
+set(HF_FALLBACK_VERSION "" CACHE STRING "Version to try before latest when HF_VERSION is not published")
 set(HF_ENABLED        "" CACHE STRING "Whether to allow HF Bucket download (ON/OFF)")
 set(BUILD_UI          "" CACHE STRING "Build UI via npm (ON/OFF)")
 set(LLAMA_UI_GZIP     "" CACHE STRING "Apply gzip compress to assets to save bandwidth")
@@ -145,6 +146,14 @@ endfunction()
 # it has no index.html), gzip-compressed when LLAMA_UI_GZIP is enabled.
 function(emit_files dist_dir)
     set(UI_TEMPLATE_DIR "${LLAMA_SOURCE_DIR}/tools/ui")
+
+    # A downloaded/prebuilt dist can lag the source and omit static files that a
+    # from-source `vite build` copies verbatim (notably loading.html). Overlay the
+    # source static/ tree so every path (npm build, prebuilt dir, HF download) gets
+    # the complete set, however stale the prebuilt dist.tar.gz is.
+    if(IS_DIRECTORY "${UI_SOURCE_DIR}/static")
+        file(COPY "${UI_SOURCE_DIR}/static/" DESTINATION "${dist_dir}")
+    endif()
 
     # Collect the asset list once and reuse it for the fingerprint,
     # validation, compression and embedding.
@@ -443,6 +452,11 @@ function(hf_download version out_var out_resolved)
     set(candidates "")
     if(NOT "${version}" STREQUAL "")
         list(APPEND candidates "${version}")
+    endif()
+    # a known-good version before 'latest', whose layout can move ahead of this tree's embedder
+    if(NOT "${HF_FALLBACK_VERSION}" STREQUAL "" AND NOT "${HF_FALLBACK_VERSION}" STREQUAL "${version}" AND
+       HF_FALLBACK_VERSION MATCHES "^[A-Za-z0-9._-]+$")
+        list(APPEND candidates "${HF_FALLBACK_VERSION}")
     endif()
     list(APPEND candidates "latest")
 

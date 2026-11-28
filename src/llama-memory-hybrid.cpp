@@ -87,7 +87,12 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                if (unified && mem_recr->rs_ragged) {
+                    // sequences of different lengths share a ubatch (the attention cache takes any ubatch when unified)
+                    ubatch = balloc.split_ragged(n_ubatch);
+                } else {
+                    ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                }
             }
 
             if (ubatch.n_tokens == 0) {
@@ -136,6 +141,11 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+bool llama_memory_hybrid::get_ragged() const {
+    // see init_batch: the ragged split needs a unified attention cache
+    return mem_attn->get_n_stream() == 1 && mem_recr->rs_ragged;
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
@@ -180,6 +190,12 @@ llama_pos llama_memory_hybrid::seq_pos_max(llama_seq_id seq_id) const {
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
 }
 
+uint32_t llama_memory_hybrid::seq_token_count(llama_seq_id seq_id) const {
+    return std::max(
+        mem_attn->seq_token_count(seq_id),
+        mem_recr->seq_token_count(seq_id));
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
     for (const auto & buft_size : mem_recr->memory_breakdown()) {
@@ -194,13 +210,13 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    mem_attn->state_read(io, seq_id, flags);
-
     try {
+        mem_attn->state_read(io, seq_id, flags);
         mem_recr->state_read(io, seq_id, flags);
     } catch (...) {
-        // a failed restore leaves the sequence empty in both caches
+        // a failed restore drops the sequence from every cache
         mem_attn->state_clear(seq_id);
+        mem_recr->state_clear(seq_id);
 
         throw;
     }

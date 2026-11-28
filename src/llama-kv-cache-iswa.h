@@ -75,6 +75,7 @@ public:
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+    uint32_t  seq_token_count(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
@@ -89,6 +90,9 @@ public:
 
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_swa () const;
+
+    // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
+    void state_clear(llama_seq_id seq_id);
 
 private:
     const bool unified;

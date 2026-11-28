@@ -913,13 +913,21 @@ namespace ggml_cuda_mma {
     static __device__ __forceinline__ void load_ldmatrix_trans(
             tile<I, 8, T, dl> & t, const T * __restrict__ xs0, const int stride) {
 #ifdef TURING_MMA_AVAILABLE
-        static_assert(I == 16, "bad tile width");
+        static_assert(I == 8 || I == 16, "bad tile width");
         static_assert(dl == DATA_LAYOUT_I_MAJOR, "bad data layout");
+        const int i = threadIdx.x % 16;
+        const int j = I == 16 ? (threadIdx.x / 16) * (t.J / 2) : 0;
         int * xi = (int *) t.x;
-        const int * xs = (const int *) xs0 + (threadIdx.x % t.I) * stride + (threadIdx.x / t.I) * (t.J / 2);
-        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0, %1, %2, %3}, [%4];"
-            : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
-            : "l"(xs));
+        const int * xs = (const int *) xs0 + i * stride + j;
+        if constexpr (I == 16) {
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0, %1, %2, %3}, [%4];"
+                : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
+                : "l"(xs));
+        } else {
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0, %1}, [%2];"
+                : "=r"(xi[0]), "=r"(xi[1])
+                : "l"(xs));
+        }
 #elif defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         static_assert(dl == DATA_LAYOUT_I_MAJOR || dl == DATA_LAYOUT_I_MAJOR_MIRRORED, "bad data layout");
         if constexpr (I == 32) {

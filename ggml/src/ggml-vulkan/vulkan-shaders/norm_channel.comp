@@ -1,0 +1,78 @@
+#version 450
+
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter {
+    uint L;
+    uint C;
+    uint B;
+    uint layout_id;
+    float eps;
+} p;
+
+layout (binding = 0) readonly buffer X { float data_x[]; };
+layout (binding = 1) readonly buffer G { float data_g[]; };
+layout (binding = 2) readonly buffer B { float data_b[]; };
+layout (binding = 3) writeonly buffer D { float data_d[]; };
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+shared float partial[512];
+
+uint offset_tc(uint t, uint c, uint batch) {
+    return batch * p.L * p.C + (p.layout_id == 0u ? t + c * p.L : c + t * p.C);
+}
+
+float reduce_sum(uint lane, float value) {
+    partial[lane] = value;
+    barrier();
+    [[unroll]] for (uint stride = 256u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        barrier();
+    }
+    const float total = partial[0];
+    // every lane has read the total before the buffer is reused by the next reduction
+    barrier();
+    return total;
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint batch = gl_WorkGroupID.z;
+    if (t >= p.L || batch >= p.B) {
+        return;
+    }
+
+    // Shifted two-pass: sums run over x - pivot so a large shared offset does not
+    // swallow the channel variation (E[x^2] - E[x]^2 cancels catastrophically there).
+    const float pivot = data_x[offset_tc(t, 0u, batch)];
+
+    float shifted_sum = 0.0f;
+    [[unroll]] for (uint c = lane; c < p.C; c += 512u) {
+        shifted_sum += data_x[offset_tc(t, c, batch)] - pivot;
+    }
+    const float delta = reduce_sum(lane, shifted_sum) / float(p.C);
+
+    float sq_sum = 0.0f;
+    [[unroll]] for (uint c = lane; c < p.C; c += 512u) {
+        const float d = (data_x[offset_tc(t, c, batch)] - pivot) - delta;
+        sq_sum = fma(d, d, sq_sum);
+    }
+    const float variance = reduce_sum(lane, sq_sum) / float(p.C);
+    const float inv_std = inversesqrt(variance + p.eps);
+    const float mean = pivot + delta;
+
+    [[unroll]] for (uint c = lane; c < p.C; c += 512u) {
+        const uint idx = offset_tc(t, c, batch);
+        // Match the three stock dispatches' F32 rounding boundaries:
+        // NORM stores first, then MUL, then ADD.
+        precise float normalized = (data_x[idx] - mean) * inv_std;
+        precise float scaled = normalized * data_g[c];
+        precise float shifted = scaled + data_b[c];
+        data_d[idx] = shifted;
+    }
+}

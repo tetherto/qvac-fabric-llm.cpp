@@ -29,6 +29,7 @@
 #include <climits>
 #include <map>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -39,19 +40,34 @@ std::string mtmd_format(const char * fmt, ...) {
     va_copy(ap2, ap);
     int size = vsnprintf(NULL, 0, fmt, ap);
     GGML_ASSERT(size >= 0 && size < INT_MAX); // NOLINT
-    std::vector<char> buf(size + 1);
-    int size2 = vsnprintf(buf.data(), size + 1, fmt, ap2);
+    if (size == 0) {
+        va_end(ap2);
+        va_end(ap);
+        return std::string();
+    }
+    // Formatted straight into the result, sized to the formatted length, so the terminating NUL
+    // vsnprintf writes lands on the byte past the end that std::string already reserves for it
+    // and never becomes part of the string. Returning std::string(buf.data(), size) over a
+    // std::vector<char> did the same thing correctly, but it let GCC duplicate the size == 0
+    // path, where the buffer is one byte, and then report -Wformat-truncation against it for
+    // every caller with a long literal in its format string. The early return above and the
+    // unknown extent of a std::string buffer both remove that.
+    std::string out((size_t) size, '\0');
+    int size2 = vsnprintf(out.data(), (size_t) size + 1, fmt, ap2);
     GGML_ASSERT(size2 == size);
     va_end(ap2);
     va_end(ap);
-    return std::string(buf.data(), size);
+    return out;
 }
 
 // remember to bump this if the serialization format changes
-#define MTMD_SERIALIZATION_VERSION 5
+// 5 names three layouts: upstream b12429's (audio_n_ctx), the b12032 fork's
+// (grid_x/grid_y in the image tokens) and this line's before the bump (both).
+// 6 is this line's layout; no 5 can be told apart, so none is loaded.
+#define MTMD_SERIALIZATION_VERSION 6
 
 // oldest compat version that can be loaded
-#define MTMD_SERIALIZATION_VERSION_MIN 2
+#define MTMD_SERIALIZATION_VERSION_MIN 6
 
 struct mtmd_serialization {
     // note: using 64-bit here for future-proofing
@@ -283,6 +299,8 @@ struct mtmd_image_tokens {
     mtmd_pos_type pos = MTMD_POS_TYPE_NORMAL;
     uint32_t image_idx = 0; // 0-based position of this image among image chunks in the prompt(used by pos == MTMD_POS_TYPE_HUNYUANVL)
     uint32_t n_temporal_merge = 1; // for qwen-vl style temporal merge
+    uint32_t grid_x = 1;
+    uint32_t grid_y = 1;
     uint32_t n_tokens() const {
         if (pos == MTMD_POS_TYPE_HUNYUANVL) {
             // [BOI] [row0 tokens + newline] ... [row(ny-1) tokens + newline] [EOI]
@@ -296,6 +314,9 @@ struct mtmd_image_tokens {
             }
             return n;
         }
+        if (pos == MTMD_POS_TYPE_MROPE && (grid_x > 1 || grid_y > 1)) {
+            return nx * ny;
+        }
         uint32_t nz = batch_f32.entries.size();
         if (n_temporal_merge > 1) {
             // [QWEN_VIDEO] this logic is quite ugly, it's mostly to make qwen-vl temporal merge work, can be improved in the future
@@ -308,7 +329,7 @@ struct mtmd_image_tokens {
         }
         return nx * ny * nz;
     }
-    mtmd_image_f32_batch batch_f32; // preprocessed image patches
+    mtmd_image_f32_batch batch_f32; // preprocessed image patches (one entry per tile)
     std::string id; // optional user-defined ID, useful for KV cache tracking
 
     // true if one of entries in batch_f32 is a placeholder
@@ -341,6 +362,8 @@ struct mtmd_image_tokens {
             pos,
             image_idx,
             n_temporal_merge,
+            grid_x,
+            grid_y,
             batch_f32.clone(),
             id
         };
@@ -353,6 +376,8 @@ struct mtmd_image_tokens {
         ser.write((uint32_t)pos);
         ser.write(image_idx);
         ser.write(n_temporal_merge);
+        ser.write(grid_x);
+        ser.write(grid_y);
         ser.write(id);
         batch_f32.serialize(ser);
     }
@@ -366,6 +391,8 @@ struct mtmd_image_tokens {
         pos = (mtmd_pos_type)pos_raw;
         image_idx = ser.read<uint32_t>();
         n_temporal_merge = ser.read<uint32_t>();
+        grid_x = ser.read<uint32_t>();
+        grid_y = ser.read<uint32_t>();
         id = ser.read<std::string>();
         batch_f32.deserialize(ser);
     }
@@ -604,6 +631,11 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* backend_device    */ nullptr,
+        /* image_tile_mode   */ 1, // 0=batched, 1=sequential (default, matches common_params), 2=disabled
+        /* image_max_tiles   */ -1,
+        /* image_no_upscale  */ -1, // -1=model default, 0=off, 1=on
+        /* skip_audio        */ false,
     };
     return params;
 }
@@ -660,6 +692,9 @@ struct mtmd_context {
     std::vector<llama_token> tok_row_end;       // end of row
     bool tok_row_end_trail = false;
     bool ov_img_first      = false;
+    // When the slice grid is 1x1 the overview and the single slice are the same
+    // crop, so emit the overview alone instead of the image twice.
+    bool skip_slices_if_single_tile = false;
 
     // MiniCPM-V 4.6/4.7 prepends an <image_id>N</image_id> tag before <image>
     bool has_prompt_img_id = false;
@@ -669,6 +704,11 @@ struct mtmd_context {
 
     // string template for slice image delimiters with row/col (idefics3)
     std::string sli_img_start_tmpl;
+
+    // string template labelling each image with its ordinal, emitted only when a prompt
+    // carries more than one image. Plain text, not a special token, so it is tokenized
+    // the same way the reference processor's f-string is.
+    std::string ord_img_tmpl;
 
     std::unique_ptr<mtmd_audio_preprocessor> audio_preproc;
     std::unique_ptr<mtmd_image_preprocessor> image_preproc;
@@ -717,49 +757,92 @@ struct mtmd_context {
             }
         }
 
-        ggml_backend_dev_t device = mtmd_select_device(ctx_params.use_gpu, ctx_params.device);
+        ggml_backend_dev_t device = mtmd_select_device(ctx_params.use_gpu, ctx_params.device, ctx_params.backend_device);
 
         mtmd_model_params model_params;
         model_params.image_min_tokens            = ctx_params.image_min_tokens;
         model_params.image_max_tokens            = ctx_params.image_max_tokens;
+        model_params.image_tile_mode             = ctx_params.image_tile_mode;
+        model_params.image_max_tiles             = ctx_params.image_max_tiles;
+        model_params.image_no_upscale            = ctx_params.image_no_upscale;
         model_params.no_alloc                    = no_alloc;
+        model_params.skip_audio                  = ctx_params.skip_audio;
         model_params.progress_callback           = ctx_params.progress_callback;
         model_params.progress_callback_user_data = ctx_params.progress_callback_user_data;
 
-        ggml_backend_buffer_type_t buft = device
-            ? ggml_backend_dev_buffer_type(device)
-            : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
-        models = mtmd_model_load(mmproj_fname, model_params, buft);
-
-        // soprano and pocket-tts without voice cloning have no encoder
-        if (!models.v && !models.a && !models.gen_a) {
-            throw std::runtime_error(mtmd_format("Failed to load mmproj model from %s\n", mmproj_fname));
+        // When the GPU device can't host bf16 weights (e.g. Metal on M1 / older
+        // GPUs without bfloat support), convert bf16 tensors to f16 on load.
+        // This keeps the projector running on the GPU instead of falling back
+        // to CPU. Without this, ggml_backend_sched_reserve aborts on the first
+        // bf16 leaf tensor with "buffer that cannot run the operation (NONE)".
+        if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_init_params probe_params = { /*.mem_size=*/ ggml_tensor_overhead(), /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+            ggml_context_ptr probe_ctx(ggml_init(probe_params));
+            ggml_tensor * probe = ggml_new_tensor_1d(probe_ctx.get(), GGML_TYPE_BF16, 1);
+            model_params.convert_bf16_to_f16 = !ggml_backend_dev_supports_op(device, probe);
         }
 
-        int max_nodes = 0;
-        for (const auto * m : { models.v.get(), models.a.get(), models.gen_a.get() }) {
-            if (m) {
-                max_nodes = std::max(max_nodes, m->max_nodes);
+        // Loads the weights and runs the warmups (which reserve the compute buffers) on
+        // dev, nullptr meaning CPU. When the accelerated backend cannot hold the projector
+        // (a GPU with little free memory, iOS Metal next to a large text model), it is
+        // rebuilt on the CPU backend with the same parameters, so the projector keeps
+        // working, only slower. The failed attempt is freed first so its buffers don't
+        // compete with the retry on unified memory. The modalities share one backend and
+        // scheduler, so they fall back together.
+        auto load_on = [&](ggml_backend_dev_t dev) {
+            ggml_backend_buffer_type_t buft = dev
+                ? ggml_backend_dev_buffer_type(dev)
+                : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+            models = mtmd_model_load(mmproj_fname, model_params, buft);
+
+            // soprano and pocket-tts without voice cloning have no encoder
+            if (!models.v && !models.a && !models.gen_a) {
+                throw std::runtime_error(mtmd_format("Failed to load mmproj model from %s\n", mmproj_fname));
             }
-        }
 
-        // no_alloc only measures memory, nothing is computed
-        backends = std::make_unique<mtmd_backends>(device, no_alloc ? 1 : ctx_params.n_threads, max_nodes,
-                                                   ctx_params.cb_eval, ctx_params.cb_eval_user_data);
+            int max_nodes = 0;
+            for (const auto * m : { models.v.get(), models.a.get(), models.gen_a.get() }) {
+                if (m) {
+                    max_nodes = std::max(max_nodes, m->max_nodes);
+                }
+            }
 
-        // like llama_context::sched_reserve(), each warmup reserves its graph on the shared scheduler
-        mtmd_subctx_params sctx_params {
-            /* flash_attn_type   */ mtmd_to_flash_attn_type(ctx_params.flash_attn_type),
-            /* warmup            */ ctx_params.warmup,
+            // no_alloc only measures memory, nothing is computed
+            backends = std::make_unique<mtmd_backends>(dev, no_alloc ? 1 : ctx_params.n_threads, max_nodes,
+                                                       ctx_params.cb_eval, ctx_params.cb_eval_user_data);
+
+            // like llama_context::sched_reserve(), each warmup reserves its graph on the shared scheduler
+            mtmd_subctx_params sctx_params {
+                /* flash_attn_type   */ mtmd_to_flash_attn_type(ctx_params.flash_attn_type),
+                /* warmup            */ ctx_params.warmup,
+            };
+            if (models.v) {
+                ctx_v = std::make_unique<mtmd_subcontext>(*models.v, *backends, sctx_params);
+            }
+            if (models.a) {
+                ctx_a = std::make_unique<mtmd_subcontext>(*models.a, *backends, sctx_params);
+            }
+            if (models.gen_a) {
+                ctx_gen_a = std::make_unique<mtmd_subcontext>(*models.gen_a, *backends, sctx_params);
+            }
         };
-        if (models.v) {
-            ctx_v = std::make_unique<mtmd_subcontext>(*models.v, *backends, sctx_params);
-        }
-        if (models.a) {
-            ctx_a = std::make_unique<mtmd_subcontext>(*models.a, *backends, sctx_params);
-        }
-        if (models.gen_a) {
-            ctx_gen_a = std::make_unique<mtmd_subcontext>(*models.gen_a, *backends, sctx_params);
+        try {
+            load_on(device);
+        } catch (const mtmd_backend_alloc_error & e) {
+            if (device == nullptr || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                throw;
+            }
+            LOG_WRN("%s: %s", __func__, e.what());
+            LOG_WRN("%s: not enough memory on %s for the projector, loading it on CPU instead\n",
+                    __func__, ggml_backend_dev_name(device));
+            // the subcontexts point into the models and the backends
+            ctx_gen_a.reset();
+            ctx_a.reset();
+            ctx_v.reset();
+            backends.reset();
+            models = mtmd_models{};
+            model_params.convert_bf16_to_f16 = false; // the CPU backend runs bf16 weights
+            load_on(nullptr);
         }
         for (size_t i = 0; i < backends->ptrs.size(); ++i) {
             const size_t size = ggml_backend_sched_get_buffer_size(backends->sched.get(), backends->ptrs[i]);
@@ -782,7 +865,9 @@ struct mtmd_context {
 
         // since we already validate n_embd of vision and audio mmproj,
         // we can safely assume that they are the same
-        // a gen-only mmproj is validated below
+        // a projector can be gen-audio only: soprano has no speaker encoder, and any other
+        // gen-audio mmproj loses its audio encoder when the caller sets skip_audio
+        // (a gen-only mmproj is validated below)
         int n_embd_mmproj = ctx_v || ctx_a ? (ctx_v ? ctx_v : ctx_a)->model.n_mmproj_embd() : n_embd_text;
         if (n_embd_text > 0 && n_embd_text != n_embd_mmproj) {
             throw std::runtime_error(mtmd_format(
@@ -881,13 +966,6 @@ struct mtmd_context {
                         image_preproc = std::make_unique<mtmd_image_preprocessor_minicpmv>(models.v.get());
                     }
                 } break;
-            case PROJECTOR_TYPE_QWEN3VL:
-                {
-                    // <|vision_start|> ... (image embeddings) ... <|vision_end|>
-                    img_beg = "<|vision_start|>";
-                    img_end = "<|vision_end|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_qwen3vl>(models.v.get());
-                } break;
             case PROJECTOR_TYPE_QWEN2VL:
             case PROJECTOR_TYPE_QWEN25VL:
             case PROJECTOR_TYPE_LING3VL:
@@ -933,6 +1011,23 @@ struct mtmd_context {
                     vid_end = img_end;
                     image_preproc = std::make_unique<mtmd_image_preprocessor_lfm3vl>(models.v.get());
                 } break;
+            case PROJECTOR_TYPE_QWEN3VL:
+                {
+                    // <|vision_start|> ... (image embeddings) ... <|vision_end|>
+                    img_beg = "<|vision_start|>";
+                    img_end = "<|vision_end|>";
+                    // disabled mode replicates pre-PR behaviour: whole image resized to fit
+                    // image_max_pixels (dyn_size), no tiling.
+                    const mtmd_image_tile_mode tile_mode_val = models.v->hparams.image_tile_mode;
+                    if (tile_mode_val == MTMD_IMAGE_TILE_MODE_DISABLED) {
+                        LOG_INF("%s: image_tile_mode: disabled\n", __func__);
+                        image_preproc = std::make_unique<mtmd_image_preprocessor_qwen3vl>(models.v.get());
+                    } else {
+                        LOG_INF("%s: image_tile_mode: %s\n", __func__,
+                                tile_mode_val == MTMD_IMAGE_TILE_MODE_BATCHED ? "batched" : "sequential");
+                        image_preproc = std::make_unique<mtmd_image_preprocessor_qwen3vl_tiled>(models.v.get());
+                    }
+                } break;
             case PROJECTOR_TYPE_YOUTUVL:
                 {
                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>
@@ -969,6 +1064,32 @@ struct mtmd_context {
                     tok_ov_img_end     = {lookup_token("<fake_token_around_image>")};
                     tok_row_end        = {lookup_token("\n")};
                     sli_img_start_tmpl = "<fake_token_around_image><row_%d_col_%d>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_idefics3>(models.v.get());
+                } break;
+            case PROJECTOR_TYPE_VISIONPSY:
+                {
+                    // Same llava-uhd slicing as idefics3, but the overview image comes
+                    // first and there are no fake_token / row-end delimiters.
+                    slice_tmpl         = MTMD_SLICE_TMPL_IDEFICS3;
+                    // lookup_token() returns LLAMA_TOKEN_NULL on a miss, which would
+                    // silently splice a garbage id into the prompt. Fail loudly instead,
+                    // but only when there is a vocab to look in: mtmd_get_memory_usage
+                    // builds a context with no text model, and every token misses there.
+                    const llama_token tok_global_image = lookup_token("<|global_image|>");
+                    if (tok_global_image == LLAMA_TOKEN_NULL) {
+                        if (vocab != nullptr) {
+                            throw std::runtime_error("visionpsy: text model vocab is missing <|global_image|>");
+                        }
+                    } else {
+                        tok_ov_img_start = { tok_global_image };
+                    }
+                    sli_img_start_tmpl = "<row_%d_col_%d>";
+                    // get_image_string() prefixes every image with its 0-based ordinal once
+                    // a prompt carries more than one, so a question can still refer to "the
+                    // second image". Not in the vocab, so it goes through BPE as text.
+                    ord_img_tmpl       = "<image: %zu>";
+                    ov_img_first       = true;
+                    skip_slices_if_single_tile = true;
                     image_preproc = std::make_unique<mtmd_image_preprocessor_idefics3>(models.v.get());
                 } break;
             case PROJECTOR_TYPE_PIXTRAL:
@@ -1431,6 +1552,10 @@ std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::
     return output;
 }
 
+void mtmd_log_set_llama_callback(ggml_log_callback llama_cb, void * llama_user_data) {
+    mtmd_log_set(llama_cb, llama_user_data);
+}
+
 struct mtmd_tokenizer {
     const mtmd_context * ctx;
 
@@ -1601,6 +1726,11 @@ struct mtmd_tokenizer {
                             __func__, merged_bitmaps.size(), parts.size() - 1);
                     return 1;
                 }
+                // Ordinal label before the image, matching the reference processor, which
+                // only emits it when the call carries more than one image.
+                if (!ctx->ord_img_tmpl.empty() && merged_bitmaps.size() > 1) {
+                    add_text(mtmd_format(ctx->ord_img_tmpl.c_str(), i_bm), false);
+                }
                 auto bmps = merged_bitmaps[i_bm++];
                 int32_t res = add_media(bmps);
                 if (res != 0) {
@@ -1741,6 +1871,7 @@ struct mtmd_tokenizer {
                     preproc_out.grid_x = tmp_preproc_out.grid_x;
                     preproc_out.grid_y = tmp_preproc_out.grid_y;
                     preproc_out.overview = std::move(tmp_preproc_out.overview);
+                    preproc_out.overview_in_entries = tmp_preproc_out.overview_in_entries;
                 }
             }
 
@@ -1750,8 +1881,7 @@ struct mtmd_tokenizer {
 
             // handle llava-uhd style preprocessing
             // (output either a grid, or overview-only)
-            const bool has_tiling_grid = (preproc_out.grid_x > 0 && preproc_out.grid_y > 0)
-                || preproc_out.has_overview();
+            const bool has_tiling_grid = preproc_out.has_overview();
 
             if (has_tiling_grid && ctx->proj_type_v() == PROJECTOR_TYPE_MINICPMV4_7) {
                 GGML_ASSERT(bitmaps.size() == 1);
@@ -1775,11 +1905,29 @@ struct mtmd_tokenizer {
                 // NOTE: preproc_out is invalidated after this point, do not use it anymore
 
                 // split_batch_to_chunk must always put the overview image first
+                const bool single_tile = ctx->skip_slices_if_single_tile && n_row == 1 && n_col == 1;
+
+                // On a 1x1 grid the overview and the lone slice cover the same crop at the
+                // same size, so only one of the two is sent. Send the SLICE. The reference
+                // pipeline returns the split patch untouched for this grid
+                // (GlobalAndSplitImages.forward returns early, before it resizes a global
+                // patch), and the two paths do not share a resize kernel: the slice is
+                // rendered with image_resize_algo_rf (bicubic) and the overview with
+                // image_resize_algo_ov (bilinear).
+                if (single_tile && chunks.size() > 1) {
+                    std::swap(chunks[0], chunks[1]);
+                }
+
                 auto ov_chunk = std::move(chunks.front());
                 chunks.erase(chunks.begin());
 
                 // add overview image (first)
                 if (ctx->ov_img_first) {
+                    // Logged because the delimiters around it are token ids, not text, so this is
+                    // the only trace of where the overview went. On a 1x1 grid this chunk is the
+                    // refined slice, swapped in above.
+                    LOG_DBG("%s: adding %s image first\n", __func__,
+                            single_tile ? "single-tile refined" : "overview");
                     if (ctx->has_prompt_img_id) {
                         add_text("<image_id>" + std::to_string(n_images_added) + "</image_id>", true);
                     }
@@ -1789,7 +1937,7 @@ struct mtmd_tokenizer {
                 }
 
                 // add slices (or tiles)
-                if (!chunks.empty()) {
+                if (!chunks.empty() && !single_tile) {
                     LOG_DBG("%s: adding %d slices (%d rows x %d cols)\n", __func__, (int)chunks.size(), n_row, n_col);
                     GGML_ASSERT((int)chunks.size() == n_row * n_col);
                     add_text(ctx->tok_slices_start);
@@ -1829,6 +1977,8 @@ struct mtmd_tokenizer {
 
                 // add overview image (last)
                 if (!ctx->ov_img_first) {
+                    LOG_DBG("%s: adding %s image last\n", __func__,
+                            single_tile ? "single-tile refined" : "overview");
                     add_text(ctx->tok_ov_img_start);
                     cur.entries.emplace_back(std::move(ov_chunk));
                     add_text(ctx->tok_ov_img_end);
@@ -1852,64 +2002,91 @@ struct mtmd_tokenizer {
                     preproc_out.entries[0].lead_pad = align - 1 - (int32_t)(n_past % align);
                 }
 
-                size_t n_tokens = 0;
-                for (auto & e : preproc_out.entries) {
-                    n_tokens += ctx->ctx_v->model.n_output_tokens(&e);
-                    if (ctx->ctx_v->model.n_temporal_merge() == 2) {
-                        // [QWEN_VIDEO] pair input is merged to the same embd, so only count as one image
-                        break;
-                    }
-                }
-
-                mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
-
-                // [QWEN_VIDEO] improve this in the future
-                image_tokens->n_temporal_merge = ctx->ctx_v->model.n_temporal_merge();
-
-                if (mtmd_decode_use_mrope(ctx)) {
-                    // for Qwen2VL, we need this information for M-RoPE decoding positions
-                    image_tokens->nx = ctx->ctx_v->model.n_output_tokens_x(&preproc_out.entries[0]);
-                    image_tokens->ny = ctx->ctx_v->model.n_output_tokens_y(&preproc_out.entries[0]);
-                } else {
-                    // other models, we only need the total number of tokens
-                    image_tokens->nx = n_tokens;
-                    image_tokens->ny = 1;
-                }
-                image_tokens->pos = ctx->pos_type;
-                // U1 uses M-RoPE, but unlike Qwen its image H/W coordinates are
-                // zero-based and the whole image occupies one temporal position.
-                if (ctx->proj_type_v() == PROJECTOR_TYPE_SENSENOVA_U1) {
-                    image_tokens->pos = MTMD_POS_TYPE_SENSENOVA_U1;
-                }
-                // HunyuanVL wraps the image grid with BOI/EOI and adds one newline per row,
-                // and uses XD-RoPE (dim-3 = image index). Override the position type so that
-                // n_tokens() and mtmd_image_tokens_get_decoder_pos pick the HunyuanVL layout.
-                else if (ctx->proj_type_v() == PROJECTOR_TYPE_HUNYUANVL) {
-                    image_tokens->pos       = MTMD_POS_TYPE_HUNYUANVL;
-                    image_tokens->image_idx = n_images_added;
-                    GGML_ASSERT(n_tokens == (size_t)image_tokens->n_tokens());
-                }
-
                 mtmd_image_f32_batch batch_f32;
                 batch_f32.is_audio = false;
                 batch_f32.is_video = bitmaps[0]->is_video_frame();
+                batch_f32.grid_x = preproc_out.grid_x;
+                batch_f32.grid_y = preproc_out.grid_y;
+                // qwen3vl multi-tile: the preprocessor prepends the overview thumbnail as entries[0]
+                const bool has_overview_entry = preproc_out.overview_in_entries;
                 batch_f32.entries = std::move(preproc_out.entries);
-                // do NOT use preproc_out from this point on, it's moved
+                // do NOT use preproc_out from this point on, it is moved
 
-                image_tokens->batch_f32 = std::move(batch_f32);
-                image_tokens->id = bitmaps[0]->id; // optional
+                // Build one image chunk from a batch with explicit grid dims, then append it.
+                auto emit_image_chunk = [&](mtmd_image_f32_batch && b, int gx, int gy) {
+                    GGML_ASSERT(!b.entries.empty());
+                    size_t n_tokens = 0;
+                    for (const auto & entry : b.entries) {
+                        n_tokens += ctx->ctx_v->model.n_output_tokens(&entry);
+                        if (ctx->ctx_v->model.n_temporal_merge() == 2 && gx == 1 && gy == 1) {
+                            // [QWEN_VIDEO] pair input is merged to the same embd, so only count as one image
+                            break;
+                        }
+                    }
 
-                LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
-                LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
-                LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
+                    mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+                    // [QWEN_VIDEO] improve this in the future
+                    image_tokens->n_temporal_merge = ctx->ctx_v->model.n_temporal_merge();
 
-                mtmd_input_chunk chunk{
-                    MTMD_INPUT_CHUNK_TYPE_IMAGE,
-                    {}, // text tokens
-                    std::move(image_tokens),
-                    nullptr, // audio tokens
+                    if (mtmd_decode_use_mrope(ctx)) {
+                        // for Qwen2VL/Qwen3VL, set full-image grid dims for M-RoPE decoding
+                        const int tile_nx = ctx->ctx_v->model.n_output_tokens_x(&b.entries[0]);
+                        const int tile_ny = ctx->ctx_v->model.n_output_tokens_y(&b.entries[0]);
+                        image_tokens->nx     = tile_nx * gx;
+                        image_tokens->ny     = tile_ny * gy;
+                        image_tokens->grid_x = gx;
+                        image_tokens->grid_y = gy;
+                    } else {
+                        // other models, we only need the total number of tokens
+                        image_tokens->nx = n_tokens;
+                        image_tokens->ny = 1;
+                    }
+                    image_tokens->pos = ctx->pos_type;
+                    // U1 uses M-RoPE, but unlike Qwen its image H/W coordinates are
+                    // zero-based and the whole image occupies one temporal position.
+                    if (ctx->proj_type_v() == PROJECTOR_TYPE_SENSENOVA_U1) {
+                        image_tokens->pos = MTMD_POS_TYPE_SENSENOVA_U1;
+                    }
+                    // HunyuanVL wraps the image grid with BOI/EOI and adds one newline per row,
+                    // and uses XD-RoPE (dim-3 = image index). Override the position type so that
+                    // n_tokens() and mtmd_image_tokens_get_decoder_pos pick the HunyuanVL layout.
+                    else if (ctx->proj_type_v() == PROJECTOR_TYPE_HUNYUANVL) {
+                        image_tokens->pos       = MTMD_POS_TYPE_HUNYUANVL;
+                        image_tokens->image_idx = n_images_added;
+                        GGML_ASSERT(n_tokens == (size_t)image_tokens->n_tokens());
+                    }
+                    image_tokens->batch_f32 = std::move(b);
+                    image_tokens->id = bitmaps[0]->id; // optional
+
+                    LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
+                    LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
+                    LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
+
+                    mtmd_input_chunk chunk{
+                        MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                        {}, // text tokens
+                        std::move(image_tokens),
+                        nullptr, // audio tokens
+                    };
+                    cur.entries.emplace_back(std::move(chunk));
                 };
-                cur.entries.emplace_back(std::move(chunk));
+
+                const int gx = batch_f32.grid_x > 0 ? batch_f32.grid_x : 1;
+                const int gy = batch_f32.grid_y > 0 ? batch_f32.grid_y : 1;
+                if (has_overview_entry) {
+                    // Qwen3VL multi-tile with a global overview: emit the downscaled full image
+                    // (entries[0]) as its own 1x1 chunk first, then the tile grid as a second chunk.
+                    GGML_ASSERT(!batch_f32.entries.empty());
+                    mtmd_image_f32_batch ov_batch;
+                    ov_batch.entries.push_back(std::move(batch_f32.entries.front()));
+                    batch_f32.entries.erase(batch_f32.entries.begin());
+                    GGML_ASSERT((int) batch_f32.entries.size() == gx * gy &&
+                                "overview split left an unexpected tile count");
+                    emit_image_chunk(std::move(ov_batch), 1, 1);
+                    emit_image_chunk(std::move(batch_f32), gx, gy);
+                } else {
+                    emit_image_chunk(std::move(batch_f32), gx, gy);
+                }
             }
 
             if (!ctx->img_end.empty()) {
@@ -3851,10 +4028,38 @@ mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * ima
     switch (image_tokens->pos) {
         case MTMD_POS_TYPE_MROPE:
             {
-                pos.t = pos_0;
-                pos.x = pos_0 + (i % image_tokens->nx);
-                pos.y = pos_0 + (i / image_tokens->nx);
-                pos.z = 0; // unused for now
+                pos.t = static_cast<uint32_t>(pos_0);
+                pos.z = 0;
+                if (image_tokens->grid_x <= 1 && image_tokens->grid_y <= 1) {
+                    // no tiling - simple scan-line order
+                    pos.x = static_cast<uint32_t>(pos_0) + static_cast<uint32_t>(i % image_tokens->nx);
+                    pos.y = static_cast<uint32_t>(pos_0) + static_cast<uint32_t>(i / image_tokens->nx);
+                } else {
+                    // tile-major order: tokens are laid out as all tokens of tile 0, then tile 1, etc.
+                    // tile 0 = (row=0,col=0), tile 1 = (row=0,col=1), ..., tile grid_x = (row=1,col=0)
+                    if (image_tokens->grid_x == 0 || image_tokens->grid_y == 0) {
+                        GGML_ABORT("image token grid is zero: grid_x=%u grid_y=%u",
+                                   image_tokens->grid_x, image_tokens->grid_y);
+                    }
+                    if (image_tokens->nx % image_tokens->grid_x != 0 || image_tokens->ny % image_tokens->grid_y != 0) {
+                        GGML_ABORT("image token grid mismatch: nx=%u grid_x=%u, ny=%u grid_y=%u",
+                                   image_tokens->nx, image_tokens->grid_x, image_tokens->ny, image_tokens->grid_y);
+                    }
+                    const uint32_t pw = image_tokens->nx / image_tokens->grid_x; // merged patches per tile in X
+                    const uint32_t ph = image_tokens->ny / image_tokens->grid_y; // merged patches per tile in Y
+                    const uint32_t n_per_tile = pw * ph;
+                    if (n_per_tile == 0) {
+                        GGML_ABORT("image tile has zero tokens: pw=%u ph=%u", pw, ph);
+                    }
+                    const uint32_t tile_idx   = i / n_per_tile;
+                    const uint32_t local_idx  = i % n_per_tile;
+                    const uint32_t tr = tile_idx / image_tokens->grid_x;
+                    const uint32_t tc = tile_idx % image_tokens->grid_x;
+                    const uint32_t ly = local_idx / pw;
+                    const uint32_t lx = local_idx % pw;
+                    pos.y = static_cast<uint32_t>(pos_0) + tr * ph + ly;
+                    pos.x = static_cast<uint32_t>(pos_0) + tc * pw + lx;
+                }
             } break;
         case MTMD_POS_TYPE_NORMAL:
             {
@@ -3964,6 +4169,10 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
     mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
     image_tokens->nx = 4;
     image_tokens->ny = 4;
+    // The test fixture mtmd_test_create_input_chunks() never sets a position
+    // type, so it defaults to MTMD_POS_TYPE_NORMAL, where the last token gets
+    // pos.t = 15.
+    image_tokens->pos = MTMD_POS_TYPE_MROPE;
     image_tokens->batch_f32.entries.resize(16);
     image_tokens->id = "image_1";
     mtmd_input_chunk chunk_image{
@@ -3973,6 +4182,19 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
         nullptr, // audio tokens
     };
     chunks->entries.emplace_back(std::move(chunk_image));
+
+    for (const auto & grid : std::vector<std::pair<uint32_t, uint32_t>>{{1, 1}, {2, 1}, {3, 1}, {2, 2}}) {
+        mtmd_image_tokens_ptr tiled(new mtmd_image_tokens);
+        tiled->nx = 24 * grid.first;
+        tiled->ny = 24 * grid.second;
+        tiled->pos = MTMD_POS_TYPE_MROPE;
+        tiled->grid_x = grid.first;
+        tiled->grid_y = grid.second;
+        tiled->n_temporal_merge = 2;
+        tiled->batch_f32.entries.resize(std::max(2u, grid.first * grid.second));
+        tiled->id = "tiled_image";
+        chunks->entries.push_back({MTMD_INPUT_CHUNK_TYPE_IMAGE, {}, std::move(tiled), nullptr});
+    }
 
     return chunks;
 }
@@ -4003,7 +4225,12 @@ struct mtmd_caps mtmd_get_cap_from_file(const char * fname) {
 //
 
 static void mtmd_debug_encode_impl(mtmd_context * ctx, mtmd_subcontext * sctx, mtmd_image_f32 & image) {
-    sctx->debug_output_embeddings = true;
+    // Dumping the final embeddings (and the per-op cb_eval in mtmd-debug) makes the
+    // measured wall-clock dominated by formatting/printing rather than the encoder.
+    // For a clean Vulkan encoder baseline keep dumps off by default; opt in via env.
+    const char * dump_env = std::getenv("MTMD_DEBUG_DUMP_EMBEDDINGS");
+    sctx->debug_output_embeddings = dump_env && dump_env[0] == '1';
+
     int n_mmproj_embd = sctx->model.n_mmproj_embd();
     int n_tokens = sctx->model.n_output_tokens(&image);
     std::vector<float> embd_output(n_tokens * n_mmproj_embd, 0.0f);

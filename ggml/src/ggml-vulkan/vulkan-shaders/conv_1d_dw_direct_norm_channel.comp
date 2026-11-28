@@ -1,0 +1,142 @@
+#version 450
+
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter {
+    uint L;
+    uint C;
+    uint B;
+    uint K;
+    uint dilation;
+    uint layout_id;
+    uint causal;
+    uint seg_len;
+    uint has_bias;
+    float eps;
+} p;
+
+layout (binding = 0) readonly buffer X { float data_x[]; };
+layout (binding = 1) readonly buffer W { float data_w[]; };
+layout (binding = 2) readonly buffer Bias { float data_bias[]; };
+layout (binding = 3) readonly buffer G { float data_g[]; };
+layout (binding = 4) readonly buffer Beta { float data_beta[]; };
+layout (binding = 5) writeonly buffer D { float data_d[]; };
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+#define DW_LN_VALUES_PER_LANE 8
+
+shared float partial[512];
+
+float reduce_sum(uint lane, float value) {
+    partial[lane] = value;
+    barrier();
+    [[unroll]] for (uint stride = 256u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        barrier();
+    }
+    const float total = partial[0];
+    // every lane has read the total before the buffer is reused by the next reduction
+    barrier();
+    return total;
+}
+
+uint offset_tc(uint t, uint c, uint batch) {
+    return batch * p.L * p.C + (p.layout_id == 0u ? t + c * p.L : c + t * p.C);
+}
+
+float depthwise_value(uint t, uint c, uint batch) {
+    const int lo = p.seg_len != 0u ? int((t / p.seg_len) * p.seg_len) : 0;
+    const int hi = p.seg_len != 0u ? lo + int(p.seg_len) : int(p.L);
+    const int k_off = p.causal != 0u ? -(int(p.K) - 1) : -(int(p.K) / 2);
+
+    // Keep the same two-taps-per-lane accumulation tree as the standalone
+    // depthwise conv shader so the value entering layer norm has identical F32 rounding.
+    precise float pair0 = 0.0f;
+    precise float pair1 = 0.0f;
+    precise float pair2 = 0.0f;
+    precise float pair3 = 0.0f;
+    [[unroll]] for (uint k = 0u; k < 8u; ++k) {
+        if (k < p.K) {
+            int src_t = int(t) + (int(k) + k_off) * int(p.dilation);
+            src_t = clamp(src_t, lo, hi - 1);
+            const float xv = data_x[offset_tc(uint(src_t), c, batch)];
+            const float wv = data_w[c * p.K + k];
+            if (k < 2u) {
+                pair0 = fma(xv, wv, pair0);
+            } else if (k < 4u) {
+                pair1 = fma(xv, wv, pair1);
+            } else if (k < 6u) {
+                pair2 = fma(xv, wv, pair2);
+            } else {
+                pair3 = fma(xv, wv, pair3);
+            }
+        }
+    }
+    precise float left = pair0 + pair1;
+    precise float right = pair2 + pair3;
+    precise float sum = left + right;
+    precise float result = p.has_bias != 0u ? sum + data_bias[c] : sum;
+    return result;
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint batch = gl_WorkGroupID.z;
+    if (t >= p.L || batch >= p.B) {
+        return;
+    }
+
+    float values[DW_LN_VALUES_PER_LANE];
+    [[unroll]] for (uint i = 0u; i < DW_LN_VALUES_PER_LANE; ++i) {
+        const uint c = lane + i * 512u;
+        if (c < p.C) {
+            values[i] = depthwise_value(t, c, batch);
+        }
+    }
+
+    // Shifted two-pass over the register-resident values: sums run over value - pivot
+    // so a large shared offset does not swallow the channel variation.
+    if (lane == 0u) {
+        partial[0] = values[0];
+    }
+    barrier();
+    const float pivot = partial[0];
+    barrier();
+
+    float shifted_sum = 0.0f;
+    [[unroll]] for (uint i = 0u; i < DW_LN_VALUES_PER_LANE; ++i) {
+        if (lane + i * 512u < p.C) {
+            shifted_sum += values[i] - pivot;
+        }
+    }
+    const float delta = reduce_sum(lane, shifted_sum) / float(p.C);
+
+    float sq_sum = 0.0f;
+    [[unroll]] for (uint i = 0u; i < DW_LN_VALUES_PER_LANE; ++i) {
+        if (lane + i * 512u < p.C) {
+            const float d = (values[i] - pivot) - delta;
+            sq_sum = fma(d, d, sq_sum);
+        }
+    }
+    const float variance = reduce_sum(lane, sq_sum) / float(p.C);
+    const float inv_std = inversesqrt(variance + p.eps);
+    const float mean = pivot + delta;
+
+    [[unroll]] for (uint i = 0u; i < DW_LN_VALUES_PER_LANE; ++i) {
+        const uint c = lane + i * 512u;
+        if (c < p.C) {
+            const uint idx = offset_tc(t, c, batch);
+            // Preserve the standalone layer-norm shader's F32 affine boundaries.
+            precise float normalized = (values[i] - mean) * inv_std;
+            precise float scaled = normalized * data_g[c];
+            precise float shifted = scaled + data_beta[c];
+            data_d[idx] = shifted;
+        }
+    }
+}

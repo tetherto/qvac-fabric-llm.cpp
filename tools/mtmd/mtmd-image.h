@@ -15,6 +15,8 @@ struct mtmd_image_preproc_out {
     mtmd_image_f32 overview; // overview image (downscaled image)
     int grid_x = 0;
     int grid_y = 0;
+    // when true, entries[0] is an overview thumbnail and entries[1..] are the grid_x*grid_y tiles
+    bool overview_in_entries = false;
 
     void append(const mtmd_hparams & hparams, const mtmd_image_u8 & img, bool normalized = true);
     void append(const mtmd_hparams & hparams, const std::vector<mtmd_image_u8> & imgs, bool normalized = true);
@@ -132,6 +134,8 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
     mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const override;
 };
 
+mtmd_image_size mtmd_calc_dynamic_image_size(const mtmd_image_size & size, int align_size, int min_pixels, int max_pixels);
+
 // resize image to multiple of patch_size*n_merge, while preserving aspect ratio
 // if image_resize_pad is true, the resized image will be padded, otherwise it will be either stretched or center-cropped depending on image_resize_pad
 // this is used by models with native support for dynamic image size, for example: Qwen-VL, Pixtral, Kimi-VL, etc
@@ -171,6 +175,21 @@ struct mtmd_image_preprocessor_lfm3vl : mtmd_image_preprocessor_qwen3vl {
 // GLM 5.3 flash, similar to dyn_size, but each edge is aligned up to patch_size*n_merge, and max budget is met by a search over the height with the width scaled proportionally
 struct mtmd_image_preprocessor_glm5v : mtmd_image_preprocessor {
     mtmd_image_preprocessor_glm5v(const mtmd_model * model) : mtmd_image_preprocessor(model) {}
+    mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const override;
+};
+
+// Qwen3VL tiling preprocessor: splits image into an NxM grid of equal-size tiles
+// (tile size = hparams.image_size), packed row-major into the batch. Falls back to
+// the qwen3vl (dyn_size) path when the image fits in one tile. Video frames keep the
+// inherited qwen3vl sizing and stay a single untiled entry.
+struct mtmd_image_preprocessor_qwen3vl_tiled : mtmd_image_preprocessor_qwen3vl {
+    int max_tiles;
+
+    mtmd_image_preprocessor_qwen3vl_tiled(const mtmd_model * model)
+        : mtmd_image_preprocessor_qwen3vl(model),
+          max_tiles(hparams.preproc_max_tiles > 0 ? hparams.preproc_max_tiles : 4) {
+        GGML_ASSERT(hparams.image_tile_mode != MTMD_IMAGE_TILE_MODE_DISABLED);
+    }
     mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const override;
 };
 
@@ -263,6 +282,24 @@ private:
             int width, int height);
     static std::vector<mtmd_image_size> get_target_ratios(const mtmd_hparams & hparams);
 };
+
+// What an image becomes under the idefics3-family sizing rule, before any pixel is touched.
+// The slice grid follows from the refined size, so these three travel together.
+struct mtmd_idefics3_sizing {
+    mtmd_image_size refined_size;
+    mtmd_image_size grid_size;
+    int n_slices;
+};
+
+// The sizing rule on its own, so it can be checked against the reference processor without a
+// model: `no_upscale` picks the Flash rule (round the long side up to whole slices and cap it)
+// over the base one (always stretch the long side to the cap).
+mtmd_idefics3_sizing mtmd_calc_idefics3_sizing(const mtmd_image_size & original_size,
+                                               int image_size,
+                                               int image_longest_edge,
+                                               bool no_upscale,
+                                               int min_pixels = 0,
+                                               int max_pixels = 0);
 
 struct mtmd_image_preprocessor_idefics3 : mtmd_image_preprocessor_llava_uhd {
     mtmd_image_preprocessor_idefics3(const mtmd_model * model) : mtmd_image_preprocessor_llava_uhd(model) {}

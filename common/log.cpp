@@ -14,6 +14,10 @@
 #include <vector>
 #include <algorithm>
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#    define COMMON_LOG_SYNC
+#endif
+
 int common_log_verbosity_thold = LOG_DEFAULT_LLAMA;
 
 int common_log_get_verbosity_thold(void) {
@@ -88,7 +92,13 @@ struct common_log_entry {
 
     common_log_entry(size_t size = 256) : msg(size) { }
 
-    void print(FILE * file = nullptr) const {
+    void print(FILE * file = nullptr, ggml_log_callback callback = nullptr, void * callback_user_data = nullptr) const {
+        // if callback is provided, use it instead of printing
+        if (callback != nullptr) {
+            callback(level, msg.data(), callback_user_data);
+            return;
+        }
+
         FILE * fcur = file;
         if (!fcur) {
             // stderr displays DBG messages only when their verbosity level is not higher than the threshold
@@ -161,13 +171,15 @@ struct common_log_entry {
 struct common_log {
     // default capacity
     common_log(size_t capacity = 512) {
-        file       = nullptr;
-        stdo       = true;
-        colors     = false;
-        prefix     = false;
-        timestamps = false;
-        running    = false;
-        t_start    = t_us();
+        file               = nullptr;
+        stdo               = true;
+        colors             = false;
+        prefix             = false;
+        timestamps         = false;
+        running            = false;
+        t_start            = t_us();
+        callback           = nullptr;
+        callback_user_data = nullptr;
 
         queue.resize(capacity, common_log_entry(256));
         head = 0;
@@ -203,12 +215,16 @@ private:
     std::vector<common_log_entry> queue;
     size_t head;
     size_t tail;
+#ifdef COMMON_LOG_SYNC
+    bool flushing{ false };
+#endif
 
-    bool print_entry(const common_log_entry & e) const {
+    bool print_entry(const common_log_entry & e, ggml_log_callback cb, void * cb_user_data) const {
         if (e.is_end) return true;
 
+        // the callback, when set, replaces the stdout/stderr sink that stdo enables
         if (stdo) {
-            e.print();
+            e.print(nullptr, cb, cb_user_data);
         }
         if (file) {
             e.print(file);
@@ -216,18 +232,47 @@ private:
         return false;
     }
 
-    bool flush_queue(size_t start_head, size_t end_tail, size_t & out_head) const {
+    bool flush_queue(size_t start_head, size_t end_tail, size_t & out_head,
+                     ggml_log_callback cb, void * cb_user_data) const {
         bool stop = false;
         size_t h = start_head;
         while (h != end_tail && !stop) {
-            stop = print_entry(queue[h]);
+            stop = print_entry(queue[h], cb, cb_user_data);
             h = (h + 1) % queue.size();
         }
         out_head = h;
         return stop;
     }
 
-public:
+    // custom callback for log messages
+    ggml_log_callback callback;
+    void * callback_user_data;
+
+    void notify_or_print(std::unique_lock<std::mutex> & lock) {
+#ifdef COMMON_LOG_SYNC
+        if (flushing) {
+            return;
+        }
+
+        flushing = true;
+        while (!is_empty()) {
+            common_log_entry entry         = queue[head];
+            head                           = (head + 1) % queue.size();
+            ggml_log_callback cb           = callback;
+            void *            cb_user_data = callback_user_data;
+            cv_full.notify_all();
+            lock.unlock();
+            print_entry(entry, cb, cb_user_data);
+            lock.lock();
+        }
+        flushing = false;
+#else
+        GGML_UNUSED(lock);
+        cv_new.notify_one();
+#endif
+    }
+
+  public:
     bool is_full() const {
         return ((tail + 1) % queue.size()) == head;
     }
@@ -293,7 +338,7 @@ public:
         }
 
         tail = (tail + 1) % queue.size();
-        cv_new.notify_one();
+        notify_or_print(lock);
     }
 
     void add_json(const char * type, const common_json & obj) {
@@ -329,7 +374,7 @@ public:
         entry.timestamp = 0;
 
         tail = (tail + 1) % queue.size();
-        cv_new.notify_one();
+        notify_or_print(lock);
     }
 
     void resume() {
@@ -341,10 +386,16 @@ public:
 
         running = true;
 
+#ifdef COMMON_LOG_SYNC
+        return;
+#else
         thrd = std::thread([this]() {
             while (true) {
                 std::unique_lock<std::mutex> lock(mtx);
                 cv_new.wait(lock, [this]() { return !is_empty(); });
+
+                ggml_log_callback cb = callback;
+                void * cb_user_data = callback_user_data;
 
                 size_t cached_head = head;
                 size_t cached_tail = tail;
@@ -352,7 +403,7 @@ public:
                 lock.unlock(); // drop the lock during flush
 
                 size_t next_head;
-                bool stop = flush_queue(cached_head, cached_tail, next_head);
+                bool stop = flush_queue(cached_head, cached_tail, next_head, cb, cb_user_data);
 
                 lock.lock();
                 head = next_head;
@@ -363,9 +414,14 @@ public:
                 }
             }
         });
+#endif
     }
 
     void pause() {
+#ifdef COMMON_LOG_SYNC
+        std::lock_guard<std::mutex> lock(mtx);
+        running = false;
+#else
         {
             std::lock_guard<std::mutex> lock(mtx);
 
@@ -386,6 +442,7 @@ public:
         }
 
         thrd.join();
+#endif
     }
 
     void set_file(const char * path) {
@@ -450,6 +507,15 @@ public:
         std::lock_guard<std::mutex> lock(mtx);
 
         this->timestamps = timestamps;
+    }
+
+    void set_callback(ggml_log_callback cb, void * user_data) {
+        pause();
+
+        this->callback = cb;
+        this->callback_user_data = user_data;
+
+        resume();
     }
 };
 
@@ -563,4 +629,8 @@ void common_log_default_callback(enum ggml_log_level level, const char * text, v
     if (verbosity <= common_log_verbosity_thold) {
         common_log_add(common_log_main(), level, "%s", text);
     }
+}
+
+void common_log_set_callback(struct common_log * log, ggml_log_callback callback, void * user_data) {
+    log->set_callback(callback, user_data);
 }

@@ -1,0 +1,49 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "convrot_f16.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform parameter { uint count; uint src_offset; };
+layout(binding = 0, std430) readonly buffer A { uint data_a[]; };
+layout(binding = 1, std430) writeonly buffer H { uint data_h[]; };
+layout(binding = 2, std430) writeonly buffer L { uint data_l[]; };
+layout(binding = 3, std430) buffer F { uint unsafe; };
+shared precise float values[256];
+shared precise float transformed[256];
+shared float highs[256];
+shared float lows[256];
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256;
+    if (base >= count) return;
+#ifdef SRC_F16
+    const vec2 pair = unpackHalf2x16(data_a[(src_offset + base + tid) / 2]);
+    values[tid] = ((src_offset + base + tid) & 1) == 0 ? pair.x : pair.y;
+#else
+    values[tid] = uintBitsToFloat(data_a[src_offset + base + tid]);
+#endif
+    barrier();
+    for (uint stride = 1; stride < 256; stride *= 4) {
+        const uint block = (tid / (4 * stride)) * (4 * stride);
+        const uint lane = (tid / stride) % 4;
+        const uint index = tid % stride;
+        const float a = values[block + index];
+        const float b = values[block + stride + index];
+        const float c = values[block + 2 * stride + index];
+        const float d = values[block + 3 * stride + index];
+        transformed[tid] = lane == 0 ? ( a + b + c - d) * 0.5 :
+                           lane == 1 ? ( a + b - c + d) * 0.5 :
+                           lane == 2 ? ( a - b + c + d) * 0.5 :
+                                       (-a + b + c + d) * 0.5;
+        barrier(); values[tid] = transformed[tid]; barrier();
+    }
+    const float raw = values[tid];
+    highs[tid] = unpackHalf2x16(convrot_f16_rne(raw)).x;
+    lows[tid] = unpackHalf2x16(convrot_f16_rne((raw - highs[tid]) * 4096.0)).x;
+    if (isnan(raw) || isinf(raw) || isinf(highs[tid]) || isinf(lows[tid]) ||
+        (raw != 0.0 && highs[tid] == 0.0 && lows[tid] == 0.0)) atomicOr(unsafe, 1u);
+    barrier();
+    if (tid < 128) {
+        data_h[base / 2 + tid] = convrot_pack_f16_rne(vec2(highs[2*tid], highs[2*tid+1]));
+        data_l[base / 2 + tid] = convrot_pack_f16_rne(vec2(lows[2*tid], lows[2*tid+1]));
+    }
+}

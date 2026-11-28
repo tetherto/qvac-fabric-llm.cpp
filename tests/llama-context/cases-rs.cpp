@@ -11,8 +11,22 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <string>
+#include <utility>
 #include <vector>
+
+// LLAMA_GDN_DEFERRED is set for an arch that implements it; init can still turn it off
+static bool gdn_deferred_requested(const llama_model * model) {
+    char arch_name[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch_name, sizeof(arch_name));
+    const llm_arch arch = llama_arch_from_string(arch_name);
+    const char * env = getenv("LLAMA_GDN_DEFERRED");
+    return (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) && env && atoi(env) != 0;
+}
 
 // roll back multiple sequences, then replay them in a single batch whose per-seq token count exceeds n_ubatch: each
 // seq's replay spans several ubatches while its rollback restore is still pending. Compared against a reference context
@@ -255,8 +269,10 @@ struct case_rollback : ctx_test {
         ckpt.update_tgt(ctx_src.get(), 0, 0);
         ckpt.load_tgt(ctx_dst.get(), 0, 0);
 
-        // exact match - the same context configuration replaying the same tokens
-        constexpr float nmse_eps = 0.0;
+        // exact match - the same context configuration replaying the same tokens.
+        // the deferred gdn commit saves the state through a host replay that sums in another order
+        // than the op, so the restored state matches the source only to rounding
+        const float nmse_eps = gdn_deferred_requested(mr.model) ? 1e-10f : 0.0f;
 
         std::vector<std::vector<float>> logits_src_replay(n_rollback);
         for (uint32_t i = 0; i < n_rollback; ++i) {
@@ -277,6 +293,10 @@ struct case_rollback : ctx_test {
             logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
 
             const logits_diff diff = compare_logits(logits_src, logits_dst, n_vocab);
+            if (!(diff.nmse() <= nmse_eps)) {
+                TLOG_ERR("%s: replay position %d: max diff %.9e, nmse %.9e, first index %lld, non-finite %zu\n",
+                         __func__, pos, (double) diff.diff_max, diff.nmse(), (long long) diff.i_first, diff.n_nan);
+            }
             CTX_REQUIRE(diff.nmse() <= nmse_eps,
                     "replay logits mismatch at position " + std::to_string(pos) + ", nmse " + std::to_string(diff.nmse()));
         }
@@ -326,6 +346,10 @@ struct case_rollback : ctx_test {
             }
 
             const logits_diff diff = compare_logits(logits_src_replay[i].data(), logits_dirty, n_vocab);
+            if (!(diff.nmse() <= nmse_eps)) {
+                TLOG_ERR("%s: dirty replay position %d: max diff %.9e, nmse %.9e, first index %lld, non-finite %zu\n",
+                         __func__, pos, (double) diff.diff_max, diff.nmse(), (long long) diff.i_first, diff.n_nan);
+            }
             CTX_REQUIRE(diff.nmse() <= nmse_eps,
                     "dirty-ctx logits mismatch at position " + std::to_string(pos) + ", nmse " + std::to_string(diff.nmse()));
         }
@@ -358,7 +382,9 @@ struct case_rollback_bound : ctx_test {
 
         // the DSV4 cache rebuilds snapshot d from the state before the ubatch, so d <= n is exact;
         // the recurrent memory gets snapshots 0..n-1 from ggml_gated_delta_net, only for n <= n_rs_seq + 1
-        const bool from_ubatch_start = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41;
+        // the deferred gated delta net commit (LLAMA_GDN_DEFERRED) keeps the state before the ubatch too
+        const bool gdn_deferred = gdn_deferred_requested(mr.model);
+        const bool from_ubatch_start = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || gdn_deferred;
 
         const auto make_ctx = [&]() {
             ctx_opts opts;
@@ -487,13 +513,484 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// start three seqs, then decode a ubatch with only two of them: the cells get swapped so that the
+// ubatch's cells are contiguous, and the seq left out moves to an extra cell that receives a copy of
+// its state. The seq that moved, then the seq in the extra cell (optionally with a pending rollback),
+// are compared with a fresh context that decodes only the history of that seq.
+struct case_multi_seq_cell_swap : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "swap"; }
+
+    const char * description() const override {
+        return "seqs whose cells are swapped for a partial multi-seq ubatch, against a reference context";
+    }
+
+    std::string skip_reason(model_run & mr) const override {
+        if (arch_reserves_single_seq(mr.model)) {
+            return "its reserve uses n_seqs = 1";
+        }
+
+        return ctx_test::skip_reason(mr);
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prompt = 16;
+        constexpr llama_pos n_draft  = 3;
+        constexpr llama_pos n_keep   = 1;
+        constexpr double    nmse_eps = 1e-4; // see case_multi_seq_split_replay
+
+        // the reserved graph has no extra cells (n_rs == n_seqs), so the first ubatch with one grows the extra
+        // state copies and re-reserves, with or without the deferred gdn commit. how much it grows depends on the
+        // backend, so the contexts of this case skip the realloc check
+        const auto make_ctx_seqs = [&](bool unified) {
+            ctx_opts opts;
+            opts.n_ctx         = 256;
+            opts.n_batch       = 64;
+            opts.n_ubatch      = 64;
+            opts.n_seq_max     = 3;
+            opts.n_rs_seq      = 8;
+            opts.kv_unified    = unified ? 1 : 0;
+            opts.realloc_check = false;
+            return mr.ctx(opts);
+        };
+
+        // decodes [p0, p1) of each seq in one batch, returns the logits of the last token of the last seq
+        const auto decode_seqs = [&](llama_context * ctx, const std::vector<llama_seq_id> & seqs, llama_pos p0, llama_pos p1) -> const float * {
+            common_batch batch(ctx);
+            for (llama_seq_id s : seqs) {
+                for (llama_pos pos = p0; pos < p1; ++pos) {
+                    batch.add(gen_token(n_vocab, s, pos), pos, s, pos + 1 == p1);
+                }
+            }
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                return nullptr;
+            }
+            return llama_get_logits_ith(ctx, -1);
+        };
+
+        // the logits of the last decode and the recurrent state of a seq. the logits of the generated test
+        // models barely depend on the recurrent state, so the state is compared too
+        struct seq_out {
+            std::vector<float>   logits;
+            std::vector<uint8_t> state;
+        };
+
+        const auto capture = [&](llama_context * ctx, llama_seq_id seq, const float * logits) {
+            seq_out res;
+            if (logits && get_seq_state(ctx, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, res.state)) {
+                res.logits.assign(logits, logits + n_vocab);
+            }
+            return res;
+        };
+
+        // a fresh context that decodes only the given chunks of the history of seq
+        const auto reference = [&](bool unified, llama_seq_id seq, const std::vector<std::pair<llama_pos, llama_pos>> & chunks) {
+            llama_context_ptr ctx = make_ctx_seqs(unified);
+            const float * logits = nullptr;
+            for (const auto & [p0, p1] : chunks) {
+                logits = ctx ? decode_seqs(ctx.get(), { seq }, p0, p1) : nullptr;
+            }
+            return ctx ? capture(ctx.get(), seq, logits) : seq_out();
+        };
+
+        const auto check = [&](const char * name, llama_seq_id seq, const seq_out & got, const seq_out & ref) -> case_result {
+            if (got.logits.empty() || ref.logits.empty()) {
+                return case_result::fail(std::string(name) + ": decode of seq " + std::to_string(seq) + " failed");
+            }
+            const double nmse_logits = compare_logits(ref.logits.data(), got.logits.data(), n_vocab).nmse();
+            // compared as floats: the headers of the two states are the same
+            const double nmse_state = got.state.size() != ref.state.size() ? std::numeric_limits<double>::infinity() :
+                compare_logits((const float *) ref.state.data(), (const float *) got.state.data(), ref.state.size()/sizeof(float)).nmse();
+            if (nmse_logits > nmse_eps || nmse_state > nmse_eps) {
+                TLOG_ERR("%s: %s: seq %d mismatch (logits nmse %g, state nmse %g)\n", __func__, name, seq, nmse_logits, nmse_state);
+                return case_result::fail(std::string(name) + ": seq " + std::to_string(seq) + " mismatch");
+            }
+            TLOG_INF("%s: %s: seq %d matched (logits nmse %g, state nmse %g)\n", __func__, name, seq, nmse_logits, nmse_state);
+            return case_result::pass();
+        };
+
+        struct swap_case {
+            const char * name;
+            bool         unified;
+            llama_seq_id order[3]; // the seqs take their cells in this order
+            llama_seq_id a;        // the seqs of the ubatch that swaps the cells,
+            llama_seq_id b;        // b moves to the cell of the seq left out
+            bool         rollback; // the seq left out has a pending rollback when its cell moves
+        };
+
+        const swap_case cases[] = {
+            { "unified swap",     true,  { 0, 1, 2 }, 0, 2, false },
+            { "split swap",       false, { 0, 2, 1 }, 0, 1, false },
+            { "unified rollback", true,  { 0, 1, 2 }, 0, 2, true  },
+            { "split rollback",   false, { 0, 2, 1 }, 0, 1, true  },
+        };
+
+        bool ran = false;
+        for (const auto & c : cases) {
+            llama_context_ptr ctx = make_ctx_seqs(c.unified);
+            if (!ctx) {
+                return case_result::fail(std::string(c.name) + ": failed to init context");
+            }
+            if (c.rollback && llama_n_rs_seq(ctx.get()) < (uint32_t) (n_draft - n_keep)) {
+                continue;
+            }
+            ran = true;
+
+            const llama_seq_id left = 3 - c.a - c.b;
+
+            bool ok = true;
+            for (llama_seq_id s : c.order) {
+                ok = ok && decode_seqs(ctx.get(), { s }, 0, n_prompt) != nullptr;
+            }
+
+            std::vector<std::pair<llama_pos, llama_pos>> chunks_left = { { 0, n_prompt } };
+            if (c.rollback) {
+                ok = ok && decode_seqs(ctx.get(), { left }, n_prompt, n_prompt + n_draft) != nullptr;
+                ok = ok && llama_memory_seq_rm(llama_get_memory(ctx.get()), left, n_prompt + n_keep, -1);
+                chunks_left.push_back({ n_prompt, n_prompt + n_keep });
+            }
+            CTX_REQUIRE(ok, std::string(c.name) + ": prompt decode or rollback failed");
+
+            const float * logits = decode_seqs(ctx.get(), { c.a, c.b }, n_prompt, n_prompt + 1);
+            case_result res = check(c.name, c.b, capture(ctx.get(), c.b, logits), reference(c.unified, c.b, { { 0, n_prompt }, { n_prompt, n_prompt + 1 } }));
+            if (res.status != test_status::PASS) {
+                return res;
+            }
+
+            const llama_pos pos = chunks_left.back().second;
+            chunks_left.push_back({ pos, pos + 1 });
+            logits = decode_seqs(ctx.get(), { left }, pos, pos + 1);
+            res = check(c.name, left, capture(ctx.get(), left, logits), reference(c.unified, left, chunks_left));
+            if (res.status != test_status::PASS) {
+                return res;
+            }
+        }
+
+        return ran ? case_result::pass() : case_result::skip("n_rs_seq is too small");
+    }
+};
+
+// sequences of different lengths decoded in one batch, with a ubatch smaller than the batch so that the
+// sequences of a ubatch differ in length and some are split across ubatches (ragged ubatches on hybrid
+// models, see llama_batch_allocr::split_ragged). Each seq must match a fresh context that decodes it alone.
+struct case_multi_seq_ragged : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "ragged"; }
+
+    const char * description() const override {
+        return "seqs of different lengths decoded in one batch, against a context per seq";
+    }
+
+    std::string skip_reason(model_run & mr) const override {
+        if (!llama_model_is_hybrid(mr.model)) {
+            return "not a hybrid model";
+        }
+
+        // plamo2 fails this with the equal split as well (its first seq differs from the alone run on CPU and CUDA)
+        char arch_str[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_str, sizeof(arch_str));
+        if (strcmp(arch_str, "plamo2") == 0) {
+            return "differs from the alone run with the equal split too";
+        }
+
+        return ctx_test::skip_reason(mr);
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr double nmse_eps = 1e-4; // see case_multi_seq_split_replay
+
+        // the steps mix ragged, equal-split and decode ubatches, whose graphs the reserve must all cover. the check is for
+        // the archs with ragged ubatches: the graphs of others (f.ex. the dsv4 cache) change with the layouts of the steps
+        char arch_str[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_str, sizeof(arch_str));
+        const bool realloc_check = strcmp(arch_str, "qwen35") == 0 || strcmp(arch_str, "qwen35moe") == 0;
+
+        const auto make_ctx_ragged = [&]() {
+            ctx_opts opts;
+            opts.n_ctx         = 256;
+            opts.n_batch       = 64;
+            opts.n_ubatch      = 16;
+            opts.n_seq_max     = 3;
+            opts.kv_unified    = 1;
+            opts.realloc_check = realloc_check;
+            return mr.ctx(opts);
+        };
+
+        // per step and seq the positions [p0, p1) to decode
+        using range = std::pair<llama_pos, llama_pos>;
+        const std::vector<std::vector<range>> steps = {
+            { {  0, 13 }, {  0,  2 }, { 0,  7 } },
+            { { 13, 14 }, {  2, 11 }, { 7,  8 } },
+            { { 14, 20 }, { 11, 12 }, { 8, 30 } },
+        };
+
+        // decodes the given ranges of the given seqs in one batch, returns the logits of the last token of each seq
+        const auto decode = [&](llama_context * ctx, const std::vector<llama_seq_id> & seqs, const std::vector<range> & r) {
+            common_batch batch(ctx);
+            std::vector<int32_t> last(3, -1);
+            int32_t n_tokens = 0;
+            for (llama_seq_id s : seqs) {
+                for (llama_pos pos = r[s].first; pos < r[s].second; ++pos) {
+                    last[s] = n_tokens++;
+                    batch.add(gen_token(n_vocab, s, pos), pos, s, pos + 1 == r[s].second);
+                }
+            }
+            const bool ok = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+            std::vector<std::vector<float>> res(3);
+            for (llama_seq_id s : seqs) {
+                if (ok) {
+                    const float * l = llama_get_logits_ith(ctx, last[s]);
+                    res[s].assign(l, l + n_vocab);
+                }
+            }
+            return res;
+        };
+
+        llama_context_ptr ctx = make_ctx_ragged();
+        std::vector<llama_context_ptr> refs;
+        for (int s = 0; s < 3; ++s) {
+            refs.push_back(make_ctx_ragged());
+        }
+        CTX_REQUIRE(ctx && refs[0] && refs[1] && refs[2], "failed to init context");
+
+        for (size_t i = 0; i < steps.size(); ++i) {
+            const auto got = decode(ctx.get(), { 0, 1, 2 }, steps[i]);
+            for (llama_seq_id s = 0; s < 3; ++s) {
+                const auto ref = decode(refs[s].get(), { s }, steps[i]);
+                CTX_REQUIRE(!got[s].empty() && !ref[s].empty(),
+                        "step " + std::to_string(i) + ": decode of seq " + std::to_string(s) + " failed");
+
+                std::vector<uint8_t> st_got;
+                std::vector<uint8_t> st_ref;
+                CTX_REQUIRE(get_seq_state(ctx.get(), s, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, st_got) &&
+                            get_seq_state(refs[s].get(), s, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, st_ref),
+                        "step " + std::to_string(i) + ": state of seq " + std::to_string(s) + " failed");
+
+                const double nmse_logits = compare_logits(ref[s].data(), got[s].data(), n_vocab).nmse();
+                // compared as floats: the headers of the two states are the same
+                const double nmse_state = st_got.size() != st_ref.size() ? std::numeric_limits<double>::infinity() :
+                    compare_logits((const float *) st_ref.data(), (const float *) st_got.data(), st_ref.size()/sizeof(float)).nmse();
+                if (nmse_logits > nmse_eps || nmse_state > nmse_eps) {
+                    TLOG_ERR("%s: step %zu: seq %d mismatch (logits nmse %g, state nmse %g)\n", __func__, i, s, nmse_logits, nmse_state);
+                    return case_result::fail("step " + std::to_string(i) + ": seq " + std::to_string(s) + " mismatch");
+                }
+                TLOG_INF("%s: step %zu: seq %d matched (logits nmse %g, state nmse %g)\n", __func__, i, s, nmse_logits, nmse_state);
+            }
+        }
+
+        return case_result::pass();
+    }
+};
+
+// decodes a prefill, then a short ubatch of n_short tokens, and rolls back to keep only the short ubatch's first token
+static bool decode_short_ubatch_and_roll_back(llama_context * ctx,
+                                              int32_t         n_vocab,
+                                              llama_pos       n_prefill,
+                                              llama_pos       n_short) {
+    return decode_gen(ctx, n_vocab, 0, 0, n_prefill) && decode_gen(ctx, n_vocab, 0, n_prefill, n_prefill + n_short) &&
+           llama_memory_seq_rm(llama_get_memory(ctx), 0, n_prefill + 1, -1);
+}
+
+// replays tokens of another sequence on both contexts from p0 and accumulates their logits difference
+static bool replay_logits_diff(llama_context * ctx_a,
+                               llama_context * ctx_b,
+                               int32_t         n_vocab,
+                               llama_pos       p0,
+                               uint32_t        n_replay,
+                               logits_diff &   diff) {
+    for (uint32_t i = 0; i < n_replay; ++i) {
+        const llama_pos   pos = p0 + (llama_pos) i;
+        const llama_token tok = gen_token(n_vocab, 1, pos);
+        if (!decode_one(ctx_a, tok, pos) || !decode_one(ctx_b, tok, pos)) {
+            return false;
+        }
+        const float * l_a = llama_get_logits_ith(ctx_a, 0);
+        const float * l_b = llama_get_logits_ith(ctx_b, 0);
+        if (l_a == nullptr || l_b == nullptr) {
+            return false;
+        }
+        diff.add(l_a, l_b, n_vocab);
+    }
+    return true;
+}
+
+// the deepest rollback inside a ubatch shorter than n_rs_seq + 1 must restore the same state as in a context whose
+// n_rs_seq + 1 rollback slots that ubatch fills exactly
+struct case_short_ubatch_rollback : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "rollback_short"; }
+
+    const char * description() const override {
+        return "rolling back inside a ubatch shorter than n_rs_seq + 1 replays exactly like a context it fills";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prefill = 16;
+        constexpr llama_pos n_short   = 4;
+        constexpr uint32_t  n_rs_fill = n_short - 1;  // n_rs_seq + 1 = n_short
+        constexpr uint32_t  n_rs_wide = 8;            // n_rs_seq + 1 > n_short
+        constexpr uint32_t  n_replay  = 3;
+
+        // reserve for the prefill, the widest ubatch this case decodes
+        const auto make_ctx = [&](uint32_t n_rs_seq) {
+            ctx_opts opts;
+            opts.n_batch   = (uint32_t) n_prefill;
+            opts.n_ubatch  = (uint32_t) n_prefill;
+            opts.n_seq_max = 1;
+            opts.n_rs_seq  = n_rs_seq;
+            return mr.ctx(opts);
+        };
+
+        llama_context_ptr ctx_fill = make_ctx(n_rs_fill);
+        llama_context_ptr ctx_wide = make_ctx(n_rs_wide);
+        if (!ctx_fill || !ctx_wide) {
+            return case_result::fail();
+        }
+        if (llama_n_rs_seq(ctx_fill.get()) != n_rs_fill || llama_n_rs_seq(ctx_wide.get()) != n_rs_wide) {
+            return case_result::skip("partial rollback is disabled");
+        }
+
+        CTX_REQUIRE(decode_short_ubatch_and_roll_back(ctx_fill.get(), n_vocab, n_prefill, n_short) &&
+                        decode_short_ubatch_and_roll_back(ctx_wide.get(), n_vocab, n_prefill, n_short),
+                    "the prefill, short ubatch or rollback failed");
+
+        logits_diff diff;
+        CTX_REQUIRE(replay_logits_diff(ctx_fill.get(), ctx_wide.get(), n_vocab, n_prefill + 1, n_replay, diff),
+                    "the replay after the rollback failed");
+
+        // both contexts run the same arithmetic on the same tokens
+        CTX_REQUIRE(diff.nmse() == 0.0,
+                    string_format("replay logits differ (max diff %g, nmse %g)", (double) diff.diff_max, diff.nmse()));
+
+        return case_result::pass();
+    }
+};
+
+// archs whose graphs read recurrent states in place through s_copy_moved (build_rs with in_place), so that their
+// topology depends on the moved range of the ubatch
+static bool arch_reads_states_in_place(const llama_model * model) {
+    char arch_name[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch_name, sizeof(arch_name));
+    const llm_arch arch = llama_arch_from_string(arch_name);
+    return arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE;
+}
+
+// a partial rollback restores the state of the seq from a snapshot cell, which changes the moved range of the next
+// ubatch while its shape stays the same. a graph that gathers the states through s_copy fits any moved range and is
+// reused, a graph that reads them in place is rebuilt. both replay like a context that never rolled back
+struct case_rollback_graph_reuse : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "rollback_reuse"; }
+
+    const char * description() const override {
+        return "after a rollback the graph is reused unless it reads the states in place, and the replay matches";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prefill = 16;
+        constexpr llama_pos n_step    = 4;
+        constexpr llama_pos n_keep    = 2; // tokens of the last step kept by the rollback
+        constexpr double    nmse_eps  = 1e-4; // the reference splits the history into other ubatches
+
+        // with the deferred gdn commit the moved range only looks at plane 0, where the rolled back seq keeps its own
+        // cell, so the rollback leaves the range empty and the graph is reused
+        const bool in_place = arch_reads_states_in_place(mr.model) && !gdn_deferred_requested(mr.model);
+
+        // a graph that reads the states in place is rebuilt after the rollback for a non-empty moved range, which the
+        // reservation (made with an empty range) does not cover: the scheduler grows its buffers there, by an amount
+        // that depends on the backend (CUDA, Metal and Vulkan, not the CPU), so only those contexts skip the realloc
+        // check. the reused graphs keep it
+        const auto make_ctx = [&]() {
+            ctx_opts opts;
+            opts.n_batch       = (uint32_t) n_prefill;
+            opts.n_ubatch      = (uint32_t) n_prefill;
+            opts.n_seq_max     = 1;
+            opts.n_rs_seq      = 8;
+            opts.realloc_check = !in_place;
+            return mr.ctx(opts);
+        };
+
+        llama_context_ptr ctx     = make_ctx();
+        llama_context_ptr ctx_ref = make_ctx();
+        if (!ctx || !ctx_ref) {
+            return case_result::fail();
+        }
+        if (llama_n_rs_seq(ctx.get()) < (uint32_t) n_step) {
+            return case_result::skip("partial rollback is disabled");
+        }
+
+        const llama_pos p_roll = n_prefill + n_step + n_keep;
+
+        llama_tokens tokens(p_roll + n_step);
+        for (llama_pos pos = 0; pos < (llama_pos) tokens.size(); ++pos) {
+            tokens[pos] = gen_token(n_vocab, 0, pos);
+        }
+
+        const auto n_reused = [](llama_context * c) { return llama_perf_context(c).n_reused; };
+
+        // two steps whose states stay in their own cells: the second one reuses the graph of the first
+        CTX_REQUIRE(decode_seq(ctx.get(), tokens, 0, n_prefill, 0, true) &&
+                    decode_seq(ctx.get(), tokens, n_prefill, n_prefill + n_step, 0, true),
+                "the prefill or the first step failed");
+        const int32_t n_reused_0 = n_reused(ctx.get());
+        CTX_REQUIRE(decode_seq(ctx.get(), tokens, n_prefill + n_step, n_prefill + 2*n_step, 0, true),
+                "the second step failed");
+        if (n_reused(ctx.get()) == n_reused_0) {
+            return case_result::skip("the graph of an identical step is not reused");
+        }
+
+        // keep n_keep tokens of the second step, then decode a step of the same shape
+        CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, p_roll, -1), "the rollback failed");
+        const int32_t n_reused_1 = n_reused(ctx.get());
+        CTX_REQUIRE(decode_seq(ctx.get(), tokens, p_roll, p_roll + n_step, 0, true), "the step after the rollback failed");
+        const bool reused = n_reused(ctx.get()) > n_reused_1;
+
+        CTX_REQUIRE(decode_seq(ctx_ref.get(), tokens, 0, n_prefill, 0, true) &&
+                    decode_seq(ctx_ref.get(), tokens, n_prefill, n_prefill + n_step, 0, true) &&
+                    decode_seq(ctx_ref.get(), tokens, n_prefill + n_step, p_roll, 0, true) &&
+                    decode_seq(ctx_ref.get(), tokens, p_roll, p_roll + n_step, 0, true),
+                "the reference decode failed");
+
+        const float * logits     = llama_get_logits_ith(ctx.get(), -1);
+        const float * logits_ref = llama_get_logits_ith(ctx_ref.get(), -1);
+        CTX_REQUIRE(logits != nullptr && logits_ref != nullptr, "missing logits");
+
+        const logits_diff diff = compare_logits(logits_ref, logits, n_vocab);
+        TLOG_INF("%s: in place %d, graph reused %d, nmse %g\n", __func__, in_place, reused, diff.nmse());
+
+        CTX_REQUIRE(diff.nmse() <= nmse_eps,
+                string_format("replay logits differ (max diff %g, nmse %g)", (double) diff.diff_max, diff.nmse()));
+        CTX_REQUIRE(reused != in_place,
+                in_place ? "a graph that reads the states in place was reused for another moved range"
+                         : "a graph that does not depend on the moved range was rebuilt");
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_rollback_bound>());
+    cases.push_back(std::make_unique<case_short_ubatch_rollback>());
+    cases.push_back(std::make_unique<case_rollback_graph_reuse>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
+    cases.push_back(std::make_unique<case_multi_seq_cell_swap>());
+    cases.push_back(std::make_unique<case_multi_seq_ragged>());
 
     return cases;
 }

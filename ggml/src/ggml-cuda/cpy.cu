@@ -41,6 +41,41 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
+// GGML_CUDA_DISABLE_SAME_SHAPE_CPY=1 keeps every strided copy on cpy_scalar, to A/B cpy_scalar_same_shape
+static bool ggml_cuda_same_shape_cpy_disabled() {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SAME_SHAPE_CPY");
+    return disabled;
+}
+
+// cpy_scalar for src and dst of the same shape and fewer than 2^32 elements: the flat index is split once for both
+// sides and with 32-bit divisions. The 64-bit divisions of cpy_scalar cost more than the copy itself.
+template <cpy_kernel_t cpy_1>
+static __global__ void cpy_scalar_same_shape(const char * cx, char * cdst, const int64_t ne,
+                                             const uint32_t ne00, const uint32_t ne01, const uint32_t ne02,
+                                             const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+                                             const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    ggml_cuda_pdl_lc();
+    const int64_t i64 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i64 >= ne) {
+        return;
+    }
+
+    const uint32_t i   = (uint32_t) i64;
+    const uint32_t i3  = i / (ne00*ne01*ne02);
+    const uint32_t r3  = i - i3*(ne00*ne01*ne02);
+    const uint32_t i2  = r3 / (ne00*ne01);
+    const uint32_t r2  = r3 - i2*(ne00*ne01);
+    const uint32_t i1  = r2 / ne00;
+    const uint32_t i0  = r2 - i1*ne00;
+
+    const int64_t x_offset   = i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03;
+    const int64_t dst_offset = i0*nb10 + i1*nb11 + i2*nb12 + i3*nb13;
+
+    ggml_cuda_pdl_sync();
+    cpy_1(cx + x_offset, cdst + dst_offset);
+}
+
 template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -212,6 +247,11 @@ static void ggml_cpy_scalar_cuda(
         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         GGML_ASSERT(num_blocks <= INT_MAX);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
+        if (ne00 == ne10 && ne01 == ne11 && ne02 == ne12 && ne <= UINT32_MAX && !ggml_cuda_same_shape_cpy_disabled()) {
+            ggml_cuda_kernel_launch(cpy_scalar_same_shape<cpy_1_scalar<src_t, dst_t>>, launch_params,
+                cx, cdst, ne, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne02, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13);
+            return;
+        }
         ggml_cuda_kernel_launch(cpy_scalar<cpy_1_scalar<src_t, dst_t>>, launch_params,
             cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
     };

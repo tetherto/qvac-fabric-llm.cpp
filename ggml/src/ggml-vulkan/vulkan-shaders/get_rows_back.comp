@@ -12,14 +12,19 @@ void main() {
         return;
     }
 
-    for (uint row = gl_GlobalInvocationID.y; row < p.ne21; row += gl_WorkGroupSize.y * gl_NumWorkGroups.y) {
-        float sum = 0.0f;
-        for (uint i = 0; i < p.ne10; ++i) {
-            if (data_b[get_boffset() + i*p.nb10] == int(row)) {
-                sum += data_a[get_aoffset() + i*p.nb01 + col*p.nb00];
-            }
-        }
+    for (uint iz = gl_GlobalInvocationID.z; iz < p.ne22*p.ne23; iz += gl_NumWorkGroups.z) {
+        const uint i3 = iz / p.ne22;
+        const uint i2 = iz - i3*p.ne22;
 
-        data_d[get_doffset() + row*p.nb21 + col*p.nb20] = sum;
+        for (uint row = gl_GlobalInvocationID.y; row < p.ne21; row += gl_WorkGroupSize.y * gl_NumWorkGroups.y) {
+            float sum = 0.0f;
+            for (uint i = 0; i < p.ne10; ++i) {
+                if (data_b[get_boffset() + i*p.nb10 + i2*p.nb11 + i3*p.nb12] == int(row)) {
+                    sum += data_a[get_aoffset() + col*p.nb00 + i*p.nb01 + i2*p.nb02 + i3*p.nb03];
+                }
+            }
+
+            data_d[get_doffset() + col*p.nb20 + row*p.nb21 + i2*p.nb22 + i3*p.nb23] = sum;
+        }
     }
 }

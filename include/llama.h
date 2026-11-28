@@ -159,6 +159,8 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_F8_E4M3       = 42, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_PQ2_0         = 141, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_PTQ1_0        = 143, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -364,6 +366,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool training;        // load the model for training (keeps the output projection mirrored under tensor split)
     };
 
     struct llama_sampler_seq_config {
@@ -426,6 +429,9 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
+        bool prefetch_weights; // prefetch weight transfers to overlap CPU->GPU copies with compute
+        bool moe_cache_auto;   // MoE cache size was selected automatically by --fit
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
@@ -435,6 +441,11 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+        // Share MTP compute buffers with ctx_other when compatible (default: false).
+        // The caller must serialize all sharing contexts, including asynchronous work.
+        // Synchronize the previous context before decoding, reserving, or changing another context.
+        bool ctx_other_share_compute;
+        bool training;    // if true, the context is built for training (see llama_opt_init)
     };
 
     struct llama_model_tensor_override {
@@ -545,6 +556,11 @@ extern "C" {
                                  size_t    n_paths,
               struct llama_model_params    params);
 
+    LLAMA_API struct llama_model * llama_model_load_from_split_futures(const char ** paths, size_t n_paths,
+                                                                       const char *              context,
+                                                                       const char *              tensor_list_file,
+                                                                       struct llama_model_params params);
+
     LLAMA_API void llama_model_save_to_file(
             const struct llama_model * model,
                         const char * path_model);
@@ -595,6 +611,9 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
+
+    // Positions every layer attends back from a query when all layers use a standard sliding window, else 0
+    LLAMA_API int32_t llama_model_attn_window(const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
@@ -820,6 +839,15 @@ extern "C" {
     // Note that all positions in the range [pos_min, pos_max] are guaranteed to be present in the memory
     // Return -1 if the sequence is empty
     LLAMA_API llama_pos llama_memory_seq_pos_max(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    // Returns the number of memory cells currently associated with the
+    // specified sequence. This differs from pos_max - pos_min + 1 for models
+    // that can map multiple cache cells to the same logical position, such as
+    // M-RoPE multimodal image embeddings.
+    // seq_id < 0 : count all non-empty cells
+    LLAMA_API uint32_t llama_memory_seq_token_count(
             llama_memory_t mem,
               llama_seq_id seq_id);
 
@@ -1101,6 +1129,14 @@ extern "C" {
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
 
+    // Whether Core ML support was compiled into this library.
+    LLAMA_API bool llama_supports_coreml(void);
+
+    // Configure an optional EmbeddingGemma 2 text embedding sidecar (macOS 15 / iOS 18). NULL disables it.
+    // Requires matching weights, default RoPE, mean pooling, and embedding_raw outputs. Unsupported batches use ggml.
+    // max_inflight is 1..8. Returns false on failure and leaves the current configuration unchanged.
+    LLAMA_API bool llama_set_coreml_model(struct llama_context * ctx, const char * directory, int32_t max_inflight);
+
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
@@ -1175,6 +1211,10 @@ extern "C" {
     // Set whether the context outputs the input embeddings of a specific layer
     LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+    // Output the layer input rows of each ubatch only from its first row at a position >= pos_min of the row's sequence (-1 = all rows)
+    // The skipped rows keep stale data and must not be read
+    LLAMA_API void llama_set_embeddings_layer_inp_pos_min(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos_min);
+
     // Get the input embeddings of a specific layer, mirroring llama_get_embeddings()
     LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
@@ -1202,6 +1242,12 @@ extern "C" {
 
     // The paired context (llama_context_params::ctx_other), e.g. the target context of a draft context; may be nullptr
     LLAMA_API struct llama_context * llama_get_ctx_other(struct llama_context * ctx);
+
+    // Restrict the tokens a DFlash2 drafter proposes to n_ranges ascending, disjoint [ranges[2*i], ranges[2*i + 1]) token id ranges.
+    // n_ranges == 0 restores the full vocabulary and succeeds for any model. Otherwise returns false and leaves the context unchanged
+    // for a model other than DFlash2, a DFlash2 drafter with a reduced (d2t) vocabulary, or invalid ranges, including ranges that
+    // cover fewer ids than the drafter's selector top-k.
+    LLAMA_API bool llama_set_draft_vocab(struct llama_context * ctx, const int32_t * ranges, int32_t n_ranges);
 
     //
     // backend sampling API [EXPERIMENTAL]
@@ -1445,6 +1491,10 @@ extern "C" {
     // attach a sampler to the context
     // note: prefer initializing the context with llama_context_params.samplers when possible
     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
+
+    // [EXPERIMENTAL] pause or resume the sampler attached to seq_id, without a new reserve: a paused sampler samples
+    // nothing and the sequence gets raw logits; returns false if no sampler is attached
+    LLAMA_API bool llama_set_sampler_active(struct llama_context * ctx, llama_seq_id seq_id, bool active);
 
     // mirror of llama_sampler_i:
     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
@@ -1729,7 +1779,19 @@ extern "C" {
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
 
         enum ggml_opt_optimizer_type optimizer_type;
+
+        // Optional checkpoint loading
+        const char * checkpoint_path;        // path to checkpoint file to load optimizer state from (nullptr = don't load)
+        bool load_optimizer_state;          // whether to load optimizer state from checkpoint_path
+
+        bool assistant_loss_only;
+
+        // keep flash attention enabled during training; every backend in use needs
+        // FLASH_ATTN_EXT_BACK, otherwise the scheduler runs those nodes on the CPU
+        bool flash_attn;
     };
+
+    LLAMA_API struct llama_opt_params llama_opt_default_params(void);
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
 
@@ -1741,6 +1803,84 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    LLAMA_API void llama_opt_epoch_resume(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result_train,
+            ggml_opt_result_t         result_eval,
+            int64_t                   idata_split,
+            ggml_opt_epoch_callback   callback_train,
+            ggml_opt_epoch_callback   callback_eval,
+            int64_t                   resume_from_batch);
+
+    // Optimizer state persistence
+    LLAMA_API bool llama_opt_save_state(struct llama_context * lctx, const char * filename);
+    LLAMA_API bool llama_opt_load_state(struct llama_context * lctx, const char * filename);
+
+    // Clean up optimizer context to free memory and allow reinitialization
+    // Call this before calling llama_opt_init() again on the same context
+    LLAMA_API void llama_opt_cleanup(struct llama_context * lctx);
+
+    // Request early exit from training epoch (thread-safe)
+    // Call this from a callback or another thread to stop training after the current batch
+    LLAMA_API void llama_opt_request_stop(struct llama_context * lctx);
+
+    // Reset the stop flag to allow training to continue
+    // Call this before resuming training after a pause
+    LLAMA_API void llama_opt_reset_stop(struct llama_context * lctx);
+
+    // LoRA training parameters
+    enum llama_lora_target_module {
+        LLAMA_LORA_TARGET_ATTN_Q            = 1 << 0,
+        LLAMA_LORA_TARGET_ATTN_K            = 1 << 1,
+        LLAMA_LORA_TARGET_ATTN_V            = 1 << 2,
+        LLAMA_LORA_TARGET_ATTN_O            = 1 << 3,
+        LLAMA_LORA_TARGET_FFN_GATE          = 1 << 4,
+        LLAMA_LORA_TARGET_FFN_UP            = 1 << 5,
+        LLAMA_LORA_TARGET_FFN_DOWN          = 1 << 6,
+        LLAMA_LORA_TARGET_OUTPUT            = 1 << 7,
+        LLAMA_LORA_TARGET_FFN_GATE_EXPS     = 1 << 8,
+        LLAMA_LORA_TARGET_FFN_UP_EXPS       = 1 << 9,
+        LLAMA_LORA_TARGET_FFN_DOWN_EXPS     = 1 << 10,
+        LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS  = 1 << 11,
+        LLAMA_LORA_TARGET_ALL               = -1
+    };
+
+    struct llama_lora_training_params {
+        uint32_t target_modules;
+        int32_t  rank;
+        float    alpha;
+        float    dropout;    // reserved, not yet implemented
+        float    init_std;
+        uint32_t seed;       // seed for reproducible weight initialization (0 = non-deterministic)
+    };
+
+    // Initialize LoRA training with the given parameters
+    // Creates LoRA tensors and adds them to the model context
+    LLAMA_API struct llama_adapter_lora * llama_lora_training_init(
+            struct llama_context * ctx,
+            struct llama_model * model,
+            const struct llama_lora_training_params * params
+    );
+
+    // LoRA parameter filter (returns true for LoRA tensors only)
+    LLAMA_API bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userdata);
+
+    LLAMA_API int64_t llama_opt_get_iter(struct llama_context * ctx);
+
+    LLAMA_API bool llama_lora_save_adapter(
+        const struct llama_adapter_lora * adapter,
+        const char * filename,
+        const struct llama_model * model
+    );
+
+    LLAMA_API bool llama_lora_save_checkpoint(
+        const struct llama_adapter_lora * adapter,
+        const char * filename,
+        const struct llama_model * model,
+        struct llama_context * ctx
+    );
 
 #ifdef __cplusplus
 }

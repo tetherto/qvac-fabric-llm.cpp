@@ -148,6 +148,12 @@ llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {
     return kv_swa->seq_pos_max(seq_id);
 }
 
+uint32_t llama_kv_cache_iswa::seq_token_count(llama_seq_id seq_id) const {
+    return std::max(
+        kv_base->seq_token_count(seq_id),
+        kv_swa->seq_token_count(seq_id));
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = kv_base->memory_breakdown();
     for (const auto & buft_size : kv_swa->memory_breakdown()) {
@@ -260,8 +266,20 @@ void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    kv_base->state_read(io, seq_id, flags);
-    kv_swa ->state_read(io, seq_id, flags);
+    try {
+        kv_base->state_read(io, seq_id, flags);
+        kv_swa ->state_read(io, seq_id, flags);
+    } catch (...) {
+        // a failed restore drops the sequence from every cache
+        state_clear(seq_id);
+
+        throw;
+    }
+}
+
+void llama_kv_cache_iswa::state_clear(llama_seq_id seq_id) {
+    kv_base->state_clear(seq_id);
+    kv_swa ->state_clear(seq_id);
 }
 
 llama_kv_cache * llama_kv_cache_iswa::get_base() const {

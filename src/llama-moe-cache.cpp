@@ -399,7 +399,7 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool automatic) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -519,6 +519,12 @@ struct llama_moe_cache::impl {
             n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot maps and CPU map
         }
         if (n_tensors_host == 0) {
+            if (automatic) {
+                // an inactive cache: no layer is bound, so get_slot_map() and copy() find nothing
+                LLAMA_LOG_INFO("%s: fitted budget is too small to hold the experts of one token, MoE cache is inactive\n", __func__);
+                groups.clear();
+                return;
+            }
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
         }
 
@@ -878,8 +884,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
-    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool automatic) :
+    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share, automatic)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

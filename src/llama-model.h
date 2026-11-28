@@ -8,6 +8,8 @@
 #include "llama-vocab.h"
 
 #include <map>
+#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -320,6 +322,14 @@ struct llama_layer {
     struct ggml_tensor * attn_v_gate_b = nullptr;
     struct ggml_tensor * attn_v_exps   = nullptr;
 
+    // attention biases (qvac-restored; upstream b9341 dropped these flat names in favor
+    // of class-per-arch loaders that hold their own bias state)
+    struct ggml_tensor * bq        = nullptr;
+    struct ggml_tensor * bk        = nullptr;
+    struct ggml_tensor * bv        = nullptr;
+    struct ggml_tensor * bo        = nullptr;
+    struct ggml_tensor * bqkv      = nullptr;
+
     // relative position bias
     struct ggml_tensor * attn_rel_b       = nullptr;
     struct ggml_tensor * attn_rel_b_enc   = nullptr;
@@ -407,6 +417,13 @@ struct llama_layer {
     struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
     struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
 
+    // per-layer context K/V from mixed target features (Inkling2 DSpark)
+    struct ggml_tensor * dflash_ctx_mix         = nullptr;
+    struct ggml_tensor * dflash_ctx_norm        = nullptr;
+    struct ggml_tensor * dflash_wk_ctx          = nullptr;
+    struct ggml_tensor * dflash_wv_ctx          = nullptr;
+    struct ggml_tensor * dflash_attn_k_ctx_norm = nullptr;
+
     struct ggml_tensor * lilicorr_attn_norm       = nullptr;
     struct ggml_tensor * lilicorr_mlp_norm        = nullptr;
     struct ggml_tensor * lilicorr_attn_in_proj    = nullptr;
@@ -420,6 +437,9 @@ struct llama_layer {
     struct ggml_tensor * lilicorr_mlp_2           = nullptr;
     struct ggml_tensor * lilicorr_mlp_2_b         = nullptr;
     struct ggml_tensor * lilicorr_mlp_2_s         = nullptr;
+
+    struct ggml_tensor * dspine_read  = nullptr;
+    struct ggml_tensor * dspine_write = nullptr;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -783,11 +803,23 @@ struct llama_rope_params {
     ggml_tensor * k_norm  = nullptr; // K norm weight applied after RoPE, a K-shift has to undo it
 };
 
+// define a comparator for the buft -> ctx map to ensure that the order is well-defined:
+struct ggml_backend_buft_comparator {
+    bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+        return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+    }
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
     std::string name = "n/a";
+
+    // Disk source identity for derived runtime caches. Empty for buffers or split GGUFs.
+    std::string source_path;
+    uint64_t source_size = 0;
+    int64_t source_mtime = 0;
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
@@ -906,6 +938,9 @@ struct llama_model {
     struct ggml_tensor * dspark_joint_proj   = nullptr; // rnn markov head
     struct ggml_tensor * dspark_joint_proj_b = nullptr;
     struct ggml_tensor * dspark_mask_embd    = nullptr; // per-slot mask embeddings
+    struct ggml_tensor * dspark_markov_w2_b      = nullptr;
+    struct ggml_tensor * dspark_markov_ctx_mix   = nullptr; // rnn markov head: f_rnn from target features
+    struct ggml_tensor * dspark_markov_ctx_norm  = nullptr;
 
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
@@ -939,6 +974,12 @@ struct llama_model {
     struct ggml_tensor * lilicorr_in_head_b           = nullptr;
     struct ggml_tensor * lilicorr_anchor_out_head     = nullptr;
     struct ggml_tensor * lilicorr_anchor_out_head_b   = nullptr;
+
+    struct ggml_tensor * dspine_codebook  = nullptr;
+    struct ggml_tensor * dspine_gate      = nullptr;
+    struct ggml_tensor * dspine_gate_b    = nullptr;
+    struct ggml_tensor * dspine_pred_gate = nullptr;
+    struct ggml_tensor * dspine_prev      = nullptr;
 
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
@@ -977,6 +1018,21 @@ struct llama_model {
     explicit llama_model(const llama_model_params & params);
     virtual ~llama_model();
 
+    /// @brief Create backend buffers for all tensors
+    bool create_backend_buffers(std::size_t size_data,
+                                llama_model_loader & ml,
+                                bool use_mmap_buffer,
+                                bool use_mlock,
+                                int32_t n_gpu_layers,
+                                bool do_print_backend_buffers_info = true);
+
+    /// @brief Create backend buffers for tensors on a split file idenfified by `idx`. Removes the split from the map.
+    bool create_split_backend_buffers(
+        uint16_t idx, std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context_ptr> & ctx_split_map,
+        llama_model_loader & ml, bool use_mmap_buffer, bool use_mlock, int32_t n_gpu_layers);
+
+    void print_backend_buffers_info(int32_t n_gpu_layers);
+
     std::string arch_name() const;
     std::string type_name() const;
 
@@ -992,6 +1048,7 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
     bool no_alloc() const;
+    bool training() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -1006,6 +1063,9 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+
+    // true if the loader stored the weight in a backend-specific layout (repacked or split), so views of its rows are not valid
+    bool has_backend_layout(const struct ggml_tensor * weight) const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
@@ -1024,15 +1084,30 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
-    virtual void load_stats  (llama_model_loader & ml) = 0;
-    virtual void load_hparams(llama_model_loader & ml) = 0;
-    virtual void load_vocab  (llama_model_loader & ml) = 0;
-    virtual bool load_tensors(llama_model_loader & ml) = 0; // returns false if cancelled by progress_callback
+    // qvac: kept these as overridable but not pure virtual — the qvac fork uses a
+    // monolithic llama_model with switch(arch) dispatch in load_hparams/load_tensors,
+    // while upstream b9341 moved to a per-architecture subclass model. The default
+    // no-op overrides below let qvac compile against the new polymorphic interface
+    // without requiring every architecture to be split into its own subclass yet.
+    virtual void load_stats  (llama_model_loader & ml) { (void)ml; }
+    virtual void load_hparams(llama_model_loader & ml) { (void)ml; }
+    virtual void load_vocab  (llama_model_loader & ml) { (void)ml; }
+    virtual bool load_tensors(llama_model_loader & ml) { (void)ml; return true; } // returns false if cancelled by progress_callback
 
-    // model must define these
-    virtual void load_arch_hparams(llama_model_loader & ml) = 0;
-    virtual void load_arch_tensors(llama_model_loader & ml) = 0;
-    virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+    // qvac: unified arch loader - used by llama.cpp to fault-in architecture metadata
+    // before load_hparams. Upstream split this into load_arch_hparams + load_arch_tensors
+    // when it switched to polymorphic models; the unified entry is kept for qvac's
+    // monolithic dispatch.
+    virtual void load_arch(llama_model_loader & ml) { (void)ml; }
+
+    // model must define these (upstream b9341 polymorphic interface; qvac stubs them
+    // out by default since the monolithic load_arch + arch-switch already covers it)
+    virtual void load_arch_hparams(llama_model_loader & ml) { (void)ml; }
+    virtual void load_arch_tensors(llama_model_loader & ml) { (void)ml; }
+    virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const { (void)params; return nullptr; }
+
+    // optional, runs after the scale pass
+    virtual void post_arch_tensors(llama_model_loader &) {}
 
 protected:
     llama_model_params params;
@@ -1090,6 +1165,9 @@ struct llama_model_base : public llama_model {
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
 
+    // helper: give FP8 weights their checkpoint's static input scale (op_params, read by the CUDA backend)
+    void load_fp8_input_scales();
+
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
 
@@ -1098,10 +1176,12 @@ struct llama_model_base : public llama_model {
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
 
-    // model must define these
-    void load_arch_hparams(llama_model_loader & ml) override = 0;
-    void load_arch_tensors(llama_model_loader & ml) override = 0;
-    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override = 0;
+    // qvac: drop the pure-virtual constraint — derived classes can opt in to
+    // per-arch load/build methods, but the qvac monolithic dispatch path doesn't
+    // need them.
+    void load_arch_hparams(llama_model_loader & ml) override { (void)ml; }
+    void load_arch_tensors(llama_model_loader & ml) override { (void)ml; }
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override { (void)params; return nullptr; }
 };
 
 const char * llm_type_name(llm_type type);

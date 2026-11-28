@@ -51,10 +51,26 @@ kernel void kernel_transpose_8_buf(
     const int ldi,
     const int ldo
 ) {
-    const int x = get_global_id(0);
-    const int y = get_global_id(1);
+    __local uchar tile[32][33];
 
-    output[x*ldo + y] = input[y*ldi + x];
+    const int bx = get_group_id(0) * 32;
+    const int by = get_group_id(1) * 32;
+    const int tx = get_local_id(0);
+    const int ty = get_local_id(1);
+
+    for (int k = 0; k < 32; k += 8) {
+        if (bx + tx < ldi && by + ty + k < ldo) {
+            tile[ty + k][tx] = input[(by + ty + k)*ldi + bx + tx];
+        }
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int k = 0; k < 32; k += 8) {
+        if (by + tx < ldo && bx + ty + k < ldi) {
+            output[(bx + ty + k)*ldo + by + tx] = tile[tx][ty + k];
+        }
+    }
 }
 
 // Transpose treating each element as 16-bit using buffer
@@ -64,10 +80,26 @@ kernel void kernel_transpose_16_buf(
     const int ldi,
     const int ldo
 ) {
-    const int x = get_global_id(0);
-    const int y = get_global_id(1);
+    __local ushort tile[32][33];
 
-    output[x*ldo + y] = input[y*ldi + x];
+    const int bx = get_group_id(0) * 32;
+    const int by = get_group_id(1) * 32;
+    const int tx = get_local_id(0);
+    const int ty = get_local_id(1);
+
+    for (int k = 0; k < 32; k += 8) {
+        if (bx + tx < ldi && by + ty + k < ldo) {
+            tile[ty + k][tx] = input[(by + ty + k)*ldi + bx + tx];
+        }
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int k = 0; k < 32; k += 8) {
+        if (by + tx < ldo && bx + ty + k < ldi) {
+            output[(bx + ty + k)*ldo + by + tx] = tile[tx][ty + k];
+        }
+    }
 }
 
 // Transpose treating each element as 32-bit using buffer
@@ -77,10 +109,26 @@ kernel void kernel_transpose_32_buf(
     const int ldi,
     const int ldo
 ) {
-    const int x = get_global_id(0);
-    const int y = get_global_id(1);
+    __local uint tile[32][33];
 
-    output[x*ldo + y] = input[y*ldi + x];
+    const int bx = get_group_id(0) * 32;
+    const int by = get_group_id(1) * 32;
+    const int tx = get_local_id(0);
+    const int ty = get_local_id(1);
+
+    for (int k = 0; k < 32; k += 8) {
+        if (bx + tx < ldi && by + ty + k < ldo) {
+            tile[ty + k][tx] = input[(by + ty + k)*ldi + bx + tx];
+        }
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int k = 0; k < 32; k += 8) {
+        if (by + tx < ldo && bx + ty + k < ldi) {
+            output[(bx + ty + k)*ldo + by + tx] = tile[tx][ty + k];
+        }
+    }
 }
 
 // 32-bit transpose, loading/storing a 4x4 tile of elements

@@ -1,0 +1,72 @@
+#pragma once
+
+// Prefill attention on the mmul (kernels/attn_mm.py): GGML_OP_FLASH_ATTN_EXT
+// with 2 KV heads of 256 a call (Qwen3.5's full-attention layers, the 4B's and
+// 9B's 4 KV heads as two calls; EmbeddingGemma 2's sliding-window layers), f32
+// Q and f16 K and V in llama's own layouts, and
+// a mask that shows each row one run of keys: a causal or bidirectional or
+// banded one, packed sequences, the cache rows before a ubatch. Which calls
+// are worth it is a size rule (xdna-attn-mm.cpp); GGML_XDNA_FA_MM=0 leaves
+// them all to the host.
+
+#include <stddef.h>
+
+struct ggml_tensor;
+struct xdna_kernel_pool;
+struct xdna_pfx_row_job;
+struct xdna_pfx_row_tables;
+
+// True when `node` is an attention the design covers (the mask is checked,
+// not assumed), large enough to repay the call, and the artifact is present.
+bool xdna_attn_mm_supported(const struct ggml_tensor * node);
+
+// Run it to completion and write the f32 output.
+bool xdna_attn_mm_run(struct xdna_kernel_pool * pool, struct ggml_tensor * node);
+
+enum class xdna_attn_rows_result {
+    done,     // the output is written
+    refused,  // nothing is written: the node still runs as xdna_attn_mm_run runs it
+    failed,   // the attention failed on the inputs the row command wrote
+};
+
+// The same with Q, K and V^T written by the row command (xdna-pfx-row.h) from row's projections, its q, k and v not
+// read: on the merged design, when the keys the rows see end at the last token (the command's key tiles are the tokens').
+xdna_attn_rows_result xdna_attn_mm_run_rows(struct xdna_kernel_pool *      pool,
+                                            struct ggml_tensor *           node,
+                                            const struct xdna_pfx_row_job & row,
+                                            struct xdna_pfx_row_tables &   tables);
+
+// The output left where the array wrote it, for a reader that takes its
+// rows from there (xdna_pgemm_run_gate): planned per graph with
+// xdna_attn_mm_keep, the run of such a node of one KV head group writes
+// nothing into its node.
+// Token t, head h's 256 values are two halves of 128 (xdna_attn_mm_row, the
+// second O_OBJ = 4096 floats after the first) until the next run;
+// xdna_attn_mm_materialize
+// writes it into the node (for a reader that falls back to the host).
+struct xdna_attn_rows {
+    const float * base     = nullptr;
+    size_t        o_col    = 0;  // floats a column
+    long long     n_tokens = 0;
+};
+
+// the two 128-value halves of token t, head h (the second 4096 floats on)
+static inline const float * xdna_attn_mm_row(const struct xdna_attn_rows * r, long long t, int h) {
+    const int p = (int) (t / 64), pos = (int) (t % 64), pidx = pos / 8, g = h / 4;
+    const int c = 4 * g + pidx / 2, i0 = 2 * (pidx % 2), row = (h % 4) * 8 + pos % 8;
+    return r->base + (size_t) c * r->o_col + ((size_t) p * 4 + i0) * 4096 + (size_t) row * 128;
+}
+
+// A new graph: its mask may be the last one's memory rewritten.
+void xdna_attn_mm_graph_begin(void);
+void xdna_attn_mm_keep_clear(void);
+void xdna_attn_mm_keep(const struct ggml_tensor * node);
+bool xdna_attn_mm_rows(const struct ggml_tensor * node, struct xdna_attn_rows * rows);
+bool xdna_attn_mm_materialize(const struct ggml_tensor * node);
+
+// Drop what the route keeps across graphs: the K/V copy's buffer and the last
+// kept output. Called with the model's last context.
+void xdna_attn_mm_release(void);
+
+// Test hook (ggml_backend_xdna_test_attn_kv_copies): the K/V copies the route holds.
+int xdna_attn_mm_kv_copies(void);

@@ -18,6 +18,7 @@
 #define CUDA_COS_BLOCK_SIZE 256
 #define CUDA_GLU_BLOCK_SIZE 256
 #define CUDA_XIELU_BLOCK_SIZE 256
+#define CUDA_GELU_BACK_BLOCK_SIZE 256
 
 void ggml_cuda_op_abs(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
@@ -32,6 +33,8 @@ void ggml_cuda_op_gelu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_silu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_silu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+void ggml_cuda_op_gelu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_gelu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
@@ -104,6 +107,14 @@ __device__ __forceinline__ float ggml_cuda_op_gelu_single(float x) {
     const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
 
     return 0.5f * x * (1.0f + tanhf(SQRT_2_OVER_PI * x * (1.0f + GELU_COEF_A * x * x)));
+}
+
+// Shared by the GELU_ERF op and by the kernels that fuse it, so that both compile this one expression
+// and give the same bits.
+__device__ __forceinline__ float ggml_cuda_op_gelu_erf_single(float x) {
+    const float SQRT_2_INV = 0.70710678118654752440084436210484f;
+
+    return 0.5f*x*(1.0f + erff(x*SQRT_2_INV));
 }
 
 __device__ __forceinline__ float ggml_cuda_op_swiglu_oai_single(float x, float g, float alpha = 1.702f, float limit = 7.0f) {

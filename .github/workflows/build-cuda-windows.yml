@@ -27,7 +27,7 @@ env:
 
 jobs:
   cuda:
-    name: windows-cuda (${{ matrix.cuda }}, ${{ matrix.arch }})
+    name: windows-cuda (${{ matrix.cuda }}, ${{ matrix.arch }}${{ matrix.variant && format(', {0}', matrix.variant) || '' }})
     runs-on: windows-2022
 
     permissions:
@@ -43,6 +43,13 @@ jobs:
           - cuda: '13.5'
             arch: x64
             defines: ''
+          # QVAC divergence from upstream: build the NVRTC fusion pass with MSVC. A separate entry, so that
+          # the release's 13.5 x64 build and its ccache key stay unchanged (release.yml builds without it).
+          # The variant leads its ccache key: keys are matched by prefix when restored and cleared.
+          - cuda: '13.5'
+            arch: x64
+            variant: 'nvrtc'
+            defines: '-DGGML_CUDA_NVRTC_FUSION=ON'
           - cuda: '13.5'
             arch: arm64
             defines: '-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake'
@@ -55,7 +62,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: release-windows-2022-${{ matrix.arch }}-cuda-${{ matrix.cuda }}
+          key: ${{ matrix.variant && format('{0}-', matrix.variant) || '' }}release-windows-2022-${{ matrix.arch }}-cuda-${{ matrix.cuda }}
 
       - name: Install Cuda Toolkit
         uses: ./.github/actions/windows-setup-cuda
@@ -85,7 +92,7 @@ jobs:
       - name: ccache-clear
         uses: ./.github/actions/ccache-clear
         with:
-          key: release-windows-2022-${{ matrix.arch }}-cuda-${{ matrix.cuda }}
+          key: ${{ matrix.variant && format('{0}-', matrix.variant) || '' }}release-windows-2022-${{ matrix.arch }}-cuda-${{ matrix.cuda }}
 
   hip:
     runs-on: windows-2022

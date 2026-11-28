@@ -11,11 +11,25 @@
 #include <unordered_set>
 #include <cstdint>
 #include <cmath>
+#include <stdexcept>
 
 enum mtmd_modality {
     MTMD_MODALITY_VISION,
     MTMD_MODALITY_AUDIO,
     MTMD_MODALITY_GEN_AUDIO,
+};
+
+// WARNING: value 0 is BATCHED, which is NOT the default mode (sequential is).
+// A zero-initialized mtmd_model_params/mtmd_context_params (`{}`, memset, calloc)
+// therefore selects BATCHED — the one-forward-pass path whose ne[3] batching is not
+// yet verified on every backend (see the NOTE in models/qwen3vl.cpp). Do not rely on
+// zero-init for the default: initialize via mtmd_context_params_default() (sets
+// sequential) or set image_tile_mode explicitly. These values are part of the shipped
+// API (string "0"/"1"/"2" in consumers), so they are intentionally not renumbered.
+enum mtmd_image_tile_mode {
+    MTMD_IMAGE_TILE_MODE_BATCHED    = 0, // NOT the default; zero-init lands here — see warning above
+    MTMD_IMAGE_TILE_MODE_SEQUENTIAL = 1, // the default (via mtmd_context_params_default)
+    MTMD_IMAGE_TILE_MODE_DISABLED   = 2,
 };
 
 // gen-side voice reference (chatterbox): speech tokens, mel-rate features and the speaker vector
@@ -93,6 +107,12 @@ struct mtmd_hparams {
     std::array<uint8_t, 3> image_pad_color = {0, 0, 0};
 
     // (preprocessor) for llava-uhd style models
+    // no_upscale: round the long side up to a whole number of slices and cap it at
+    // image_longest_edge, instead of always stretching it to image_longest_edge. An image
+    // below the cap then keeps its own resolution and becomes fewer slices. This is what
+    // distinguishes the VisionPsy Flash checkpoint from the base one; their mmprojs declare
+    // identical vision hparams, so it cannot be inferred from anything else in the GGUF.
+    bool image_no_upscale = false;
     std::vector<mtmd_image_size> image_res_candidates;
     int32_t preproc_min_tiles = 0;
     int32_t preproc_max_tiles = 0;
@@ -246,6 +266,7 @@ struct mtmd_hparams {
     // custom value provided by user, can be undefined if not set
     int32_t custom_image_min_tokens = -1;
     int32_t custom_image_max_tokens = -1;
+    mtmd_image_tile_mode image_tile_mode = MTMD_IMAGE_TILE_MODE_SEQUENTIAL;
 
     void set_image_resize_algo(resize_algo algo, bool torch = false) {
         GGML_ASSERT(!(torch && algo == RESIZE_ALGO_LANCZOS) && "torchvision has no lanczos");
@@ -960,6 +981,7 @@ struct mtmd_model {
     // weights
     ggml_context_ptr        ctx_data;
     ggml_backend_buffer_ptr buf;
+    ggml_backend_buffer_ptr buf_repack; // CPU repack buffer for quantized weights
     std::map<ggml_backend_dev_t, size_t> mem_weights;
 
     // embeddings
@@ -1383,7 +1405,23 @@ struct mtmd_model_params {
     // custom value provided by user, -1 if not set
     int32_t image_min_tokens = -1;
     int32_t image_max_tokens = -1;
+    int image_tile_mode = MTMD_IMAGE_TILE_MODE_SEQUENTIAL; // 0=batched, 1=sequential (default), 2=disabled. NOTE: 0 (batched) is the zero value but NOT the default — init via mtmd_context_params_default() or set explicitly.
+    int image_max_tiles = -1; // override preproc_max_tiles; -1 or 0 = use GGUF/model default (only a positive value overrides)
+    // override preproc_no_upscale (idefics3-style preprocessing); -1 = use GGUF/model
+    // default, 0 = off, 1 = on. WARNING: a zero-initialized struct lands on 0 (off), not
+    // -1 (model default), the one case that silently forces base-style preprocessing
+    // on a Flash-style model. Do not rely on zero-init: use mtmd_context_params_default()
+    // or set this field explicitly.
+    int image_no_upscale = -1;
     bool no_alloc = false; // only create the tensors, do not read their data
+    // the device can't use bf16 weights: declare them as f16 and convert on load
+    bool convert_bf16_to_f16 = false;
+    // skip the audio encoder even when the GGUF declares one. The projector still
+    // loads its vision and audio-generation encoders, so mtmd_model_load() returns no
+    // audio model and mtmd_support_audio() reports false. Lets a caller that
+    // never feeds audio avoid paying for those weights and their warmup compute
+    // buffers.
+    bool skip_audio = false;
     mtmd_progress_callback progress_callback = nullptr;
     void * progress_callback_user_data = nullptr;
 };
@@ -1395,7 +1433,15 @@ struct mtmd_models {
     std::unique_ptr<mtmd_model> gen_a;
 };
 
+// Thrown when the accelerated backend cannot hold an encoder: its weight buffer or
+// its warmup compute buffers failed to allocate. mtmd_context catches it and reloads
+// the projector on the CPU backend instead of failing the load.
+struct mtmd_backend_alloc_error : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // the weights are allocated in buft, throws on error
+// (mtmd_backend_alloc_error when buft cannot hold them)
 mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params, ggml_backend_buffer_type_t buft);
 
 struct mtmd_model_caps {
