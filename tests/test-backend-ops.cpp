@@ -4717,13 +4717,12 @@ struct test_rms_norm_back : public test_case {
     }
 };
 
-// GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
-// Row L2 clip of Inkling 2: x [* scale] * clamp(thr / (||x [* scale]|| + eps), 0, 1)
+// the row L2 clip of Inkling 2: [x*w ->] l2_norm(x, t)*t [-> *f with one f per token]
 struct test_l2_clip : public test_case {
     const std::array<int64_t, 4> ne;
-    const bool  with_scale;
+    const bool  with_w;
+    const bool  with_f;
     const float thr;
-    const int   mode; // 0: out of place, 1: in-place FILL (must not fuse), 2: the output written in place
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4733,33 +4732,29 @@ struct test_l2_clip : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(ne, with_scale, thr, mode);
+        return VARS_TO_STR4(ne, with_w, with_f, thr);
     }
 
-    test_l2_clip(std::array<int64_t, 4> ne = {128, 24, 3, 1}, bool with_scale = true, float thr = 22.6f, int mode = 0)
-        : ne(ne), with_scale(with_scale), thr(thr), mode(mode) {}
+    test_l2_clip(std::array<int64_t, 4> ne = {128, 24, 3, 1}, bool with_w = true, bool with_f = false, float thr = 22.6f)
+        : ne(ne), with_w(with_w), with_f(with_f), thr(thr) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
-        if (mode == 0) {
-            ggml_set_param(a);
-        }
         ggml_set_name(a, "a");
-        ggml_tensor * cur = a;
-        if (with_scale) {
-            ggml_tensor * scale = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
-            ggml_set_name(scale, "scale");
-            cur = ggml_mul(ctx, cur, scale);
+        ggml_tensor * cur = ggml_scale(ctx, a, 1.0f);
+        if (with_w) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            ggml_set_name(w, "w");
+            cur = ggml_mul(ctx, cur, w);
         }
-        ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur)));
-        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
-        ggml_tensor * fill = mode == 1 ? ggml_fill_inplace(ctx, norm, thr) : ggml_fill(ctx, norm, thr);
-        ggml_tensor * factor = ggml_div(ctx, fill, norm);
-        ggml_tensor * clamp  = ggml_clamp(ctx, factor, 0.0f, 1.0f);
-        // mode 2 without a scale writes the output over the input
-        ggml_tensor * out = mode == 2 ? ggml_mul_inplace(ctx, cur, clamp) : ggml_mul(ctx, cur, clamp);
-        ggml_set_name(out, "out");
-        return out;
+        cur = ggml_scale(ctx, ggml_l2_norm(ctx, cur, thr), thr);
+        if (with_f) {
+            ggml_tensor * f = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, ne[2], ne[3]);
+            ggml_set_name(f, "f");
+            cur = ggml_mul(ctx, cur, f);
+        }
+        ggml_set_name(cur, "out");
+        return cur;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -18246,13 +18241,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
     // Inkling 2 clips of Q (128 x 24 heads), K (128 x 8) and the relative-position queries (16 x 24)
-    for (bool with_scale : { false, true }) {
-        for (std::array<int64_t, 4> ne : { std::array<int64_t, 4>{128, 24, 1, 1}, std::array<int64_t, 4>{128, 8, 7, 1},
-                                           std::array<int64_t, 4>{16, 24, 5, 1}, std::array<int64_t, 4>{128, 24, 512, 1} }) {
-            test_cases.emplace_back(new test_l2_clip(ne, with_scale, ne[0] == 16 ? 8.0f : 22.6f));
-        }
-        for (int mode : { 1, 2 }) {
-            test_cases.emplace_back(new test_l2_clip({128, 24, 3, 1}, with_scale, 22.6f, mode));
+    for (bool with_w : { false, true }) {
+        for (bool with_f : { false, true }) {
+            for (std::array<int64_t, 4> ne : { std::array<int64_t, 4>{128, 24, 1, 1}, std::array<int64_t, 4>{128, 8, 7, 1},
+                                               std::array<int64_t, 4>{16, 24, 5, 1}, std::array<int64_t, 4>{128, 24, 512, 1},
+                                               std::array<int64_t, 4>{1500, 2, 3, 2} }) {
+                test_cases.emplace_back(new test_l2_clip(ne, with_w, with_f, ne[0] == 16 ? 8.0f : 22.6f));
+            }
         }
     }
 
