@@ -20077,6 +20077,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_concat(GGML_TYPE_Q8_0, {8192, 2, 1, 1}, dim == 0 ? 4096 : 1, dim, 0));
     }
 
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        test_cases.emplace_back(new test_concat(type, {64, 4, 512, 1}, 512, 2, 0));
+        test_cases.emplace_back(new test_concat(type, {66, 4, 512, 1}, 512, 2, 0));
+        test_cases.emplace_back(new test_concat(type, {128, 4, 512, 1}, 512, 2, 1));
+
+        for (int dim : { 0, 1, 3 }) {
+            test_cases.emplace_back(new test_concat(type, {300, 4, 5, 1}, 300, dim, 0));
+        }
+        test_cases.emplace_back(new test_concat(type, {1025, 4, 512, 1}, 1025, 0, 0));
+        test_cases.emplace_back(new test_concat(type, {3, 4, 512, 1}, 5, 0, 0));
+    }
+
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98306, 8, 1, 1}, 286, 0, 0));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {98306, 8, 1, 1}, 286, 0, 0));
+
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
             test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}));
