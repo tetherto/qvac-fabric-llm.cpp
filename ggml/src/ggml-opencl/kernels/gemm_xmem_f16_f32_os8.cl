@@ -229,12 +229,13 @@ __kernel void adreno_xmem_store_dst_f32(
     }
 
     __global float * dst = (__global float *)((__global char *)dst_void + offset);
-    const half4 hv = read_imageh(dst_img, smp_zero, (int2)(x, y));
+    // dst_img is half or float, read_imagef is exact for both
+    const float4 hv = read_imagef(dst_img, smp_zero, (int2)(x, y));
     const int m = y*4;
-    if (m + 0 < M) dst[x*M + m + 0] = (float)hv.s0;
-    if (m + 1 < M) dst[x*M + m + 1] = (float)hv.s1;
-    if (m + 2 < M) dst[x*M + m + 2] = (float)hv.s2;
-    if (m + 3 < M) dst[x*M + m + 3] = (float)hv.s3;
+    if (m + 0 < M) dst[x*M + m + 0] = hv.s0;
+    if (m + 1 < M) dst[x*M + m + 1] = hv.s1;
+    if (m + 2 < M) dst[x*M + m + 2] = hv.s2;
+    if (m + 3 < M) dst[x*M + m + 3] = hv.s3;
 }
 
 __kernel void adreno_xmem_pack_src_f16(

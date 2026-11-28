@@ -26101,11 +26101,19 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
     cl_mem src_img = clCreateImage(backend_ctx->context, CL_MEM_READ_WRITE, &fmt, &desc_src, nullptr, &err);
     CL_CHECK(err);
 
+    // half accumulators lose precision over the K terms of a weight matmul, accumulate in F32 by default
+    // GGML_OPENCL_ADRENO_XMEM_GEMM_F32ACC=0 restores the half accumulators
+    static const char * xmem_f32acc_env = getenv("GGML_OPENCL_ADRENO_XMEM_GEMM_F32ACC");
+    static const bool   xmem_f32acc     = (xmem_f32acc_env == nullptr || xmem_f32acc_env[0] != '0');
+
+    cl_image_format fmt_dst = fmt;
+    fmt_dst.image_channel_data_type = xmem_f32acc ? CL_FLOAT : CL_HALF_FLOAT;
+
     cl_image_desc desc_dst = {};
     desc_dst.image_type = CL_MEM_OBJECT_IMAGE2D;
     desc_dst.image_width = static_cast<size_t>(N);
     desc_dst.image_height = static_cast<size_t>(npack);
-    cl_mem dst_img = clCreateImage(backend_ctx->context, CL_MEM_READ_WRITE, &fmt, &desc_dst, nullptr, &err);
+    cl_mem dst_img = clCreateImage(backend_ctx->context, CL_MEM_READ_WRITE, &fmt_dst, &desc_dst, nullptr, &err);
     CL_CHECK(err);
 
     cl_mem weights = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, weight_bytes, nullptr, &err);
@@ -26141,7 +26149,8 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
     };
     backend_ctx->enqueue_ndrange_kernel(pack_src, 2, pack_src_gws, pack_src_lws, dst);
 
-    cl_kernel gemm = backend_ctx->kernel_gemm_xmem_f16_f32_os8;
+    cl_kernel gemm = xmem_f32acc ? backend_ctx->kernel_gemm_xmem_f16_f32_os8_f32acc
+                                 : backend_ctx->kernel_gemm_xmem_f16_f32_os8;
     CL_CHECK(clSetKernelArg(gemm, 0, sizeof(cl_mem), &weights));
     CL_CHECK(clSetKernelArg(gemm, 1, sizeof(cl_mem), &backend_ctx->prealloc_adreno_xmem_const.buffer));
     CL_CHECK(clSetKernelArg(gemm, 2, sizeof(cl_mem), &src_img));
