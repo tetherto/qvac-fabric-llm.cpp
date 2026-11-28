@@ -1,0 +1,79 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// [x*w ->] l2_norm(x, eps) -> *t + t_bias [-> *f] in one pass over contiguous rows. The sums, the tree and each product
+// are those of l2_norm.comp, mul.comp and scale.comp, so the output bytes equal the separate passes.
+#define BLOCK_SIZE 512
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer W { float w[]; };
+layout(binding = 2) readonly buffer F { float f[]; };
+layout(binding = 3) writeonly buffer D { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ncols;
+    uint nrows;
+    uint w_rows;
+    uint ne1;
+    uint ne2;
+    uint f_ne2;
+    uint f_ne3;
+    uint has_w;
+    uint has_f;
+    float eps;
+    float t;
+    float t_bias;
+} p;
+
+shared float sum[BLOCK_SIZE];
+
+// the MUL by the weight, as mul.comp writes it
+float clip_input(const uint x_base, const uint w_base, const uint col) {
+    return p.has_w != 0 ? x[x_base + col] * w[w_base + col] : x[x_base + col];
+}
+
+// one factor per token: rows [ncols] of ne1 per token, tokens [ne2, ne3] broadcast over a [f_ne2, f_ne3] factor
+float token_factor(const uint row) {
+    const uint token = row / p.ne1;
+    return f[(token / p.ne2 % p.f_ne3) * p.f_ne2 + token % p.ne2 % p.f_ne2];
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    // the dispatch is padded up to a multiple of 512 workgroups when nrows > 512
+    if (row >= p.nrows) {
+        return;
+    }
+
+    const uint x_base = row * p.ncols;
+    const uint w_base = (row % p.w_rows) * p.ncols;
+
+    sum[tid] = 0.0f;
+
+    [[unroll]] for (uint i0 = tid; i0 < p.ncols; i0 += BLOCK_SIZE) {
+        const float xi = clip_input(x_base, w_base, i0);
+        sum[tid] += xi * xi;
+    }
+
+    barrier();
+    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum[tid] += sum[tid + s];
+        }
+        barrier();
+    }
+
+    const float scale = 1.0f / max(sqrt(sum[0]), p.eps);
+    const float fv = p.has_f != 0 ? token_factor(row) : 1.0f;
+
+    [[unroll]] for (uint i0 = tid; i0 < p.ncols; i0 += BLOCK_SIZE) {
+        const float normed = scale * clip_input(x_base, w_base, i0);
+        const float clipped = normed * p.t + p.t_bias;
+        dst[x_base + i0] = p.has_f != 0 ? clipped * fv : clipped;
+    }
+}

@@ -5442,6 +5442,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             { vk_depth_mix_block_size, vk_depth_mix_block_size / device->subgroup_size, vk_depth_mix_max_states, vk_depth_mix_max_queries, vk_depth_mix_cached_steps },
             1, false, true, device->subgroup_size);
     }
+    ggml_vk_create_pipeline(device, device->pipeline_l2_clip_f32, "l2_clip_f32", l2_clip_f32_len, l2_clip_f32_data, "main", 4, sizeof(vk_op_l2_clip_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_sx_f32, "ssm_conv_back_sx_f32", ssm_conv_back_sx_f32_len, ssm_conv_back_sx_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_sx_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_c_f32, "ssm_conv_back_c_f32", ssm_conv_back_c_f32_len, ssm_conv_back_c_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_c_push_constants), {32, 1, 1}, {}, 1);
 
@@ -15235,6 +15236,71 @@ static void ggml_vk_depth_mix(ggml_backend_vk_context * ctx, vk_context & subctx
     ctx->depth_mix_fusion_count.fetch_add(1, std::memory_order_relaxed);
 }
 
+// the nodes of an L2 clip, [MUL by a weight ->] L2_NORM -> SCALE [-> MUL by a per-token factor], by role
+static constexpr int vk_l2_clip_max_nodes = 4;
+
+struct vk_l2_clip_nodes {
+    int n_nodes;
+    const ggml_tensor * mul_w; // null without a weight
+    const ggml_tensor * l2;
+    const ggml_tensor * scale;
+    const ggml_tensor * mul_f; // null without a factor
+    ggml_tensor       * out;
+
+    const ggml_tensor * x() const { return mul_w ? mul_w->src[0] : l2->src[0]; }
+    const ggml_tensor * w() const { return mul_w ? mul_w->src[1] : nullptr; }
+    const ggml_tensor * f() const { return mul_f ? mul_f->src[1] : nullptr; }
+};
+
+// the L2 clip at node_idx, with or without the factor MUL, or n_nodes = 0; checks the op types and the chain edges only
+static vk_l2_clip_nodes ggml_vk_l2_clip_find(const struct ggml_cgraph * cgraph, int node_idx, bool with_f) {
+    const bool has_w = cgraph->nodes[node_idx]->op == GGML_OP_MUL;
+    const int  i_l2  = node_idx + (has_w ? 1 : 0);
+    const int  i_sc  = i_l2 + 1;
+    const int  last  = with_f ? i_sc + 1 : i_sc;
+    if (last >= cgraph->n_nodes || cgraph->nodes[i_l2]->op != GGML_OP_L2_NORM || cgraph->nodes[i_sc]->op != GGML_OP_SCALE ||
+        (with_f && cgraph->nodes[last]->op != GGML_OP_MUL)) {
+        return {};
+    }
+    vk_l2_clip_nodes m {};
+    m.n_nodes = last - node_idx + 1;
+    m.mul_w   = has_w ? cgraph->nodes[node_idx] : nullptr;
+    m.l2      = cgraph->nodes[i_l2];
+    m.scale   = cgraph->nodes[i_sc];
+    m.mul_f   = with_f ? cgraph->nodes[last] : nullptr;
+    m.out     = cgraph->nodes[last];
+    const bool edges = (!has_w || m.l2->src[0] == m.mul_w) && m.scale->src[0] == m.l2 && (!with_f || m.mul_f->src[0] == m.scale);
+    return edges ? m : vk_l2_clip_nodes {};
+}
+
+// the L2 clip at node_idx as one pass: reads x, the weight and the factor, writes the block's last node
+static void ggml_vk_l2_clip(ggml_backend_vk_context * ctx, vk_context & subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    vk_l2_clip_nodes m = ggml_vk_l2_clip_find(cgraph, node_idx, true);
+    if (m.n_nodes != ctx->num_additional_fused_ops + 1) {
+        m = ggml_vk_l2_clip_find(cgraph, node_idx, false);
+    }
+    GGML_ASSERT(m.n_nodes == ctx->num_additional_fused_ops + 1);
+    const ggml_tensor * x = m.x();
+    const ggml_tensor * w = m.w();
+    const ggml_tensor * f = m.f();
+
+    vk_pipeline pipeline = ctx->device->pipeline_l2_clip_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t nrows = (uint32_t) ggml_nrows(x);
+    const vk_op_l2_clip_push_constants pc = {
+        (uint32_t) x->ne[0], nrows, w ? (uint32_t) w->ne[1] : 1u, (uint32_t) x->ne[1], (uint32_t) x->ne[2],
+        f ? (uint32_t) f->ne[2] : 1u, f ? (uint32_t) f->ne[3] : 1u, w != nullptr, f != nullptr,
+        ggml_get_op_params_f32(m.l2, 0), ggml_get_op_params_f32(m.scale, 0), ggml_get_op_params_f32(m.scale, 1),
+    };
+    // an absent weight or factor binds x, which the shader then does not read
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, x), ggml_vk_tensor_subbuffer(ctx, w ? w : x), ggml_vk_tensor_subbuffer(ctx, f ? f : x),
+          ggml_vk_tensor_subbuffer(ctx, m.out) },
+        pc, ggml_vk_elementwise_dispatch(nrows));
+    ctx->l2_clip_fusion_count.fetch_add(1, std::memory_order_relaxed);
+}
+
 void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (ctx->fused_ssm_conv_direct >= 0) {
         GGML_ASSERT(ctx->num_additional_fused_ops == 1);
@@ -17861,7 +17927,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_MUL:
-        if (ctx->fused_fwht_signed) {
+        if (ctx->fused_l2_clip) {
+            ggml_vk_l2_clip(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_fwht_signed) {
             ggml_vk_fwht_signed(ctx, compute_ctx, cgraph, node_idx);
         } else if (ctx->num_additional_fused_ops) {
             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
@@ -18011,6 +18079,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_L2_NORM:
+        if (ctx->fused_l2_clip) {
+            ggml_vk_l2_clip(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         ggml_vk_l2_norm(ctx, compute_ctx, src0, node);
 
         break;
@@ -20138,6 +20210,98 @@ static int ggml_vk_can_fuse_depth_mix(const ggml_backend_vk_context * ctx, const
     return m.states()->ne[2] <= limits.maxComputeWorkGroupCount[0] ? m.n_nodes : 0;
 }
 
+// GGML_VK_FUSE_L2_CLIP=0 runs the L2 clips as separate passes, in the same graph order
+static bool ggml_vk_fuse_l2_clip_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_L2_CLIP");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static bool ggml_vk_l2_clip_supported(const ggml_backend_vk_context * ctx) {
+    return ggml_vk_fuse_l2_clip_enabled() && !ctx->device->disable_fusion && ctx->device->pipeline_l2_clip_f32 != nullptr;
+}
+
+// x, the nodes and dst share one contiguous f32 shape; the weight repeats over the tokens, the factor over a token's rows
+static bool ggml_vk_l2_clip_shapes_ok(const vk_l2_clip_nodes & m) {
+    const ggml_tensor * x = m.x();
+    const ggml_tensor * w = m.w();
+    const ggml_tensor * f = m.f();
+    if (!ggml_vk_is_f32_contiguous(x) || !ggml_vk_is_f32_contiguous(m.out) || m.l2->type != GGML_TYPE_F32 ||
+        m.scale->type != GGML_TYPE_F32 || !ggml_are_same_shape(x, m.l2) || !ggml_are_same_shape(x, m.out)) {
+        return false;
+    }
+    const bool w_ok = w == nullptr || (ggml_vk_is_f32_contiguous(w) && m.mul_w->type == GGML_TYPE_F32 && w->ne[0] == x->ne[0] &&
+                                       (w->ne[1] == x->ne[1] || w->ne[1] == 1) && w->ne[2] == 1 && w->ne[3] == 1);
+    const bool f_ok = f == nullptr || (ggml_vk_is_f32_contiguous(f) && f->ne[0] == 1 && f->ne[1] == 1 &&
+                                       (f->ne[2] == x->ne[2] || f->ne[2] == 1) && (f->ne[3] == x->ne[3] || f->ne[3] == 1));
+    return w_ok && f_ok;
+}
+
+// no node of the clip but the last is read outside it or writes into another tensor
+static bool ggml_vk_l2_clip_subgraph_ok(const struct ggml_cgraph * cgraph, int node_idx, const vk_l2_clip_nodes & m) {
+    if ((m.mul_w && m.mul_w->view_src) || m.l2->view_src || (m.mul_f && m.scale->view_src)) {
+        return false;
+    }
+    ggml_op ops[vk_l2_clip_max_nodes];
+    int n = 0;
+    if (m.mul_w) {
+        ops[n++] = GGML_OP_MUL;
+    }
+    ops[n++] = GGML_OP_L2_NORM;
+    ops[n++] = GGML_OP_SCALE;
+    if (m.mul_f) {
+        ops[n++] = GGML_OP_MUL;
+    }
+    const int outputs[] = { node_idx + m.n_nodes - 1 };
+    return ggml_can_fuse_subgraph(cgraph, node_idx, n, ops, outputs, 1);
+}
+
+// with no SCALE bias, the pass rounds as scale.comp does whether or not a compiler contracts its multiply-add
+static bool ggml_vk_l2_clip_nodes_ok(const struct ggml_cgraph * cgraph, int node_idx, const vk_l2_clip_nodes & m) {
+    return m.n_nodes > 0 && ggml_get_op_params_f32(m.scale, 1) == 0.0f && ggml_vk_l2_clip_shapes_ok(m) &&
+           ggml_vk_l2_clip_subgraph_ok(cgraph, node_idx, m);
+}
+
+// the L2 clip at node_idx one pass can run, the longer chain first so a following per-token MUL is absorbed, else
+// n_nodes = 0. It reads no address, switch or context state, so graph_optimize orders by it and the switch keeps the order.
+static vk_l2_clip_nodes ggml_vk_l2_clip_block(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->device->pipeline_l2_clip_f32 == nullptr) {
+        return {};
+    }
+    const vk_l2_clip_nodes with_f = ggml_vk_l2_clip_find(cgraph, node_idx, true);
+    if (ggml_vk_l2_clip_nodes_ok(cgraph, node_idx, with_f)) {
+        return with_f;
+    }
+    const vk_l2_clip_nodes without_f = ggml_vk_l2_clip_find(cgraph, node_idx, false);
+    return ggml_vk_l2_clip_nodes_ok(cgraph, node_idx, without_f) ? without_f : vk_l2_clip_nodes {};
+}
+
+// the shader takes no per-tensor offsets and indexes each binding with 32 bits
+static bool ggml_vk_l2_clip_bindings_ok(const ggml_backend_vk_context * ctx, const vk_l2_clip_nodes & m) {
+    const auto & limits = ctx->device->properties.limits;
+    for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ m.x(), m.w(), m.f(), m.out }) {
+        if (t != nullptr && (get_misalign_bytes(ctx, t) != 0 || ggml_nbytes(t) > limits.maxStorageBufferRange)) {
+            return false;
+        }
+    }
+    return ggml_nelements(m.x()) <= UINT32_MAX;
+}
+
+// the node count when the L2 clip at node_idx runs as one pass, or 0. Its output must not be the last computed node: a
+// caller that splits the graph there may read its srcs (eval callbacks).
+static int ggml_vk_can_fuse_l2_clip(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_l2_clip_supported(ctx)) {
+        return 0;
+    }
+    const vk_l2_clip_nodes m = ggml_vk_l2_clip_block(ctx, cgraph, node_idx);
+    if (m.n_nodes == 0 || !ggml_vk_has_compute_node_after(cgraph, node_idx + m.n_nodes - 1)) {
+        return 0;
+    }
+    return ggml_vk_l2_clip_bindings_ok(ctx, m) ? m.n_nodes : 0;
+}
+
 bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, int num_extra) {
     const ggml_tensor * conv = cgraph->nodes[node_idx];
@@ -21155,6 +21319,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_short_conv_state = false;
         ctx->fused_control_mix = false;
         ctx->fused_depth_mix = false;
+        ctx->fused_l2_clip = false;
         ctx->fused_gdn_cache = nullptr;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_fwht_signed = false;
@@ -21251,6 +21416,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_depth_mix = true;
                 fusion_string = "DEPTH_MIX";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (const int l2_clip_nodes = ggml_vk_can_fuse_l2_clip(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = l2_clip_nodes - 1;
+                ctx->fused_l2_clip = true;
+                fusion_string = "L2_CLIP";
+                // one workgroup per row reads the row before it writes it, each thread only its own columns
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
             } else if (const int gdn_cpy_offset = ggml_vk_can_fuse_gdn_cache(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = gdn_cpy_offset;
                 ctx->fused_gdn_cache = cgraph->nodes[i + gdn_cpy_offset]->src[1];
@@ -21498,6 +21669,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_short_conv_state = false;
                 ctx->fused_control_mix = false;
                 ctx->fused_depth_mix = false;
+                ctx->fused_l2_clip = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
                 ctx->fused_fwht_signed = false;
@@ -21913,6 +22085,28 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return false;
         };
 
+        // the node count of an L2 clip block at start, gated on the fusion's structure so GGML_VK_FUSE_L2_CLIP=0 keeps the
+        // order, or 0
+        auto const &l2_clip_block = [&](int start) -> int {
+            const int n = ggml_vk_l2_clip_block(ctx, graph, start).n_nodes;
+            for (int k = 0; k < n; ++k) {
+                if (used[start + k]) {
+                    return 0;
+                }
+            }
+            return n;
+        };
+
+        // the lookahead may not pull the clip's head into an earlier set, nor put other nodes between its nodes
+        auto const &in_l2_clip_pattern = [&](int n) -> bool {
+            for (int o = 0; o < vk_l2_clip_max_nodes; ++o) {
+                if (n - o >= 0 && l2_clip_block(n - o) > o) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         auto const &is_ready = [&](int j) -> bool {
             for (int c = first_unused; c < j; ++c) {
                 if (!used[c] && is_src_of(graph->nodes[j], graph->nodes[c])) {
@@ -21927,7 +22121,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         auto const &schedule_ready_nodes = [&](int lo) {
             for (int j = lo; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
                 if (used[j] || in_situ_pattern(j) || in_short_conv_pattern(j) || in_short_conv_state[j] || in_control_mix_pattern(j) ||
-                    in_depth_mix_pattern(j) || !is_ready(j)) {
+                    in_depth_mix_pattern(j) || in_l2_clip_pattern(j) || !is_ready(j)) {
                     continue;
                 }
                 new_order.push_back(graph->nodes[j]);
@@ -21977,13 +22171,13 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
         };
 
-        // the n nodes of the depth mix block at first_unused in graph order, after the ready window nodes
-        auto const &keep_depth_mix = [&](int n) {
+        // the n nodes of a one-pass block (depth mix, L2 clip) at first_unused in graph order, after the ready window nodes
+        auto const &keep_fused_block = [&](int n) {
             ggml_tensor ** block = graph->nodes + first_unused;
             ggml_tensor *  out   = block[n - 1];
             schedule_ready_nodes(first_unused + n);
             for (int k = 0; k < n; ++k) {
-                // the fused pass reads the states and the queries while it writes the last node
+                // the fused pass reads the block's inputs while it writes the last node
                 for (uint32_t s = 0; s < GGML_MAX_SRC && params && params->add_alloc_dep; ++s) {
                     ggml_tensor * src = block[k]->src[s];
                     if (src && std::find(block, block + n, src) == block + n) {
@@ -22144,7 +22338,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
         if (const int depth_mix_nodes = depth_mix_block(first_unused)) {
-            keep_depth_mix(depth_mix_nodes);
+            keep_fused_block(depth_mix_nodes);
+            continue;
+        }
+        if (const int l2_clip_nodes = l2_clip_block(first_unused)) {
+            keep_fused_block(l2_clip_nodes);
             continue;
         }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
@@ -22281,6 +22479,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 in_short_conv_state[j] ||
                 in_control_mix_pattern(j) ||
                 in_depth_mix_pattern(j) ||
+                in_l2_clip_pattern(j) ||
                 ggml_vk_gdn_cache_cpy_offset(ctx, graph, j) > 0 ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
@@ -24077,6 +24276,17 @@ static bool ggml_backend_vk_depth_mix_supported(ggml_backend_t backend) {
     return ggml_vk_depth_mix_supported((ggml_backend_vk_context *) backend->context);
 }
 
+static uint64_t ggml_backend_vk_l2_clip_fusion_count(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    return ctx->l2_clip_fusion_count.load(std::memory_order_relaxed);
+}
+
+static bool ggml_backend_vk_l2_clip_supported(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    return ggml_vk_l2_clip_supported((ggml_backend_vk_context *) backend->context);
+}
+
 static bool ggml_backend_vk_glu_mul_mat_supported(ggml_backend_t backend, ggml_type w_type) {
     GGML_ASSERT(ggml_backend_is_vk(backend));
     return ggml_vk_glu_mul_mat_device_ok((ggml_backend_vk_context *) backend->context, w_type, GGML_PREC_DEFAULT);
@@ -24112,6 +24322,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_depth_mix_supported") == 0) {
         return (void *) ggml_backend_vk_depth_mix_supported;
+    }
+    if (strcmp(name, "ggml_backend_vk_l2_clip_fusion_count") == 0) {
+        return (void *) ggml_backend_vk_l2_clip_fusion_count;
+    }
+    if (strcmp(name, "ggml_backend_vk_l2_clip_supported") == 0) {
+        return (void *) ggml_backend_vk_l2_clip_supported;
     }
     // exported only while the fusion is on, so a test expects the fusion only then
     if (strcmp(name, "ggml_backend_vk_gdn_cache_fusion_count") == 0 && ggml_vk_fuse_gdn_cache_enabled()) {

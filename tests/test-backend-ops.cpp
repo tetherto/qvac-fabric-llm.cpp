@@ -4717,12 +4717,16 @@ struct test_rms_norm_back : public test_case {
     }
 };
 
-// the row L2 clip of Inkling 2: [x*w ->] l2_norm(x, t)*t [-> *f with one f per token]
+// the row L2 clip of Inkling 2: [x*w ->] l2_norm(x, t)*t [-> *f with one f per token]. tail adds a node after it: the clip
+// fuses (Vulkan L2_CLIP) only when it is not the last node.
 struct test_l2_clip : public test_case {
     const std::array<int64_t, 4> ne;
     const bool  with_w;
     const bool  with_f;
     const float thr;
+    const bool  tail;
+    mutable bool has_fusion_counter = false;
+    mutable bool supported = false;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4732,11 +4736,27 @@ struct test_l2_clip : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(ne, with_w, with_f, thr);
+        return VARS_TO_STR5(ne, with_w, with_f, thr, tail);
     }
 
-    test_l2_clip(std::array<int64_t, 4> ne = {128, 24, 3, 1}, bool with_w = true, bool with_f = false, float thr = 22.6f)
-        : ne(ne), with_w(with_w), with_f(with_f), thr(thr) {}
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn   = uint64_t (*)(ggml_backend_t);
+        using supported_fn = bool (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_l2_clip_fusion_count");
+        auto support = (supported_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_l2_clip_supported");
+        has_fusion_counter = counter != nullptr;
+        supported = support != nullptr && support(backend);
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return tail && has_fusion_counter && supported; }
+
+    bool expect_no_fusion() override { return !tail && has_fusion_counter; }
+
+    test_l2_clip(std::array<int64_t, 4> ne = {128, 24, 3, 1}, bool with_w = true, bool with_f = false, float thr = 22.6f,
+                 bool tail = true)
+        : ne(ne), with_w(with_w), with_f(with_f), thr(thr), tail(tail) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -4752,6 +4772,9 @@ struct test_l2_clip : public test_case {
             ggml_tensor * f = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, ne[2], ne[3]);
             ggml_set_name(f, "f");
             cur = ggml_mul(ctx, cur, f);
+        }
+        if (tail) {
+            cur = ggml_scale(ctx, cur, 0.5f);
         }
         ggml_set_name(cur, "out");
         return cur;
@@ -18256,6 +18279,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // as the last node the clip keeps its separate passes
+    test_cases.emplace_back(new test_l2_clip({128, 24, 1, 1}, true, true, 22.6f, false));
+    test_cases.emplace_back(new test_l2_clip({128, 8, 7, 1}, false, false, 22.6f, false));
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));

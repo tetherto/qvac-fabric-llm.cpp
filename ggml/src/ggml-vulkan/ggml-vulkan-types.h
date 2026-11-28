@@ -1206,6 +1206,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_short_conv_state_f32;
     vk_pipeline pipeline_control_mix_f32;
     vk_pipeline pipeline_depth_mix_f32;
+    vk_pipeline pipeline_l2_clip_f32;
     vk_pipeline pipeline_ssm_conv_back_sx_f32;
     vk_pipeline pipeline_ssm_conv_back_c_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
@@ -1755,6 +1756,7 @@ struct ggml_backend_vk_context {
     bool fused_short_conv_state {};
     bool fused_control_mix {};
     bool fused_depth_mix {};
+    bool fused_l2_clip {};
     // GATED_DELTA_NET (or _DEFERRED) + CPY: the recurrent cache view the gdn writes its state to
     const ggml_tensor * fused_gdn_cache {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
@@ -1780,6 +1782,7 @@ struct ggml_backend_vk_context {
     std::atomic<uint64_t> glu_mul_mat_fusion_count {};
     std::atomic<uint64_t> gdn_cache_fusion_count {};
     std::atomic<uint64_t> depth_mix_fusion_count {};
+    std::atomic<uint64_t> l2_clip_fusion_count {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
