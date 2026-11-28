@@ -2200,6 +2200,79 @@ static bool ggml_metal_fusion_check_unary_mul(
     return true;
 }
 
+// situ(gate, up) as build_moe_ffn emits it: the gate chain and its sigmoid product, the VIEW of the up half, the up
+// chain and the final product
+static const std::vector<ggml_op> ops_situ = {
+    GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+    GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL,
+};
+
+static bool ggml_metal_fusion_is_mul_of(const ggml_tensor * mul, const ggml_tensor * a, const ggml_tensor * b) {
+    return (mul->src[0] == a && mul->src[1] == b) || (mul->src[0] == b && mul->src[1] == a);
+}
+
+static bool ggml_metal_fusion_situ_edges_ok(const ggml_tensor * const * nodes) {
+    const ggml_tensor * gate_in  = nodes[0];
+    const ggml_tensor * gate_th  = nodes[1];
+    const ggml_tensor * gate_out = nodes[2];
+    const ggml_tensor * gate_sg  = nodes[3];
+    const ggml_tensor * gate_act = nodes[4];
+    const ggml_tensor * up_in    = nodes[5];
+    const ggml_tensor * up_th    = nodes[6];
+    const ggml_tensor * up_out   = nodes[7];
+    const ggml_tensor * out      = nodes[8];
+
+    return ggml_get_unary_op(gate_th) == GGML_UNARY_OP_TANH && gate_th->src[0] == gate_in && gate_out->src[0] == gate_th &&
+        ggml_get_unary_op(gate_sg) == GGML_UNARY_OP_SIGMOID && gate_sg->src[0] == gate_in->src[0] &&
+        ggml_metal_fusion_is_mul_of(gate_act, gate_out, gate_sg) &&
+        ggml_get_unary_op(up_th) == GGML_UNARY_OP_TANH && up_th->src[0] == up_in && up_out->src[0] == up_th &&
+        ggml_metal_fusion_is_mul_of(out, gate_act, up_out);
+}
+
+static bool ggml_metal_fusion_all_f32_like(const ggml_tensor * const * nodes, int n_nodes, const ggml_tensor * ref) {
+    for (int j = 0; j < n_nodes; ++j) {
+        if (nodes[j]->type != GGML_TYPE_F32 || !ggml_are_same_shape(nodes[j], ref)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the fused kernel reads F32 gate and up rows and writes the last MUL: every node keeps the gate's shape
+static bool ggml_metal_fusion_situ_layout_ok(const ggml_tensor * const * nodes, int n_nodes) {
+    const ggml_tensor * gate = nodes[0]->src[0];
+    const ggml_tensor * up   = nodes[5]->src[0];
+
+    return gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && ggml_are_same_shape(gate, up) &&
+        ggml_is_contiguous_rows(gate) && ggml_is_contiguous_rows(up) && ggml_is_contiguous_rows(nodes[n_nodes - 1]) &&
+        ggml_metal_fusion_all_f32_like(nodes, n_nodes, gate);
+}
+
+static bool ggml_metal_fusion_check_situ(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(mode);
+
+    const int n_nodes = (int) fusion->ops.size();
+
+    if (!ggml_metal_fusion_situ_edges_ok(nodes) || !ggml_metal_fusion_situ_layout_ok(nodes, n_nodes)) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    if (ggml_metal_fusion_raw_span(fusion, gf, node_idxs, idx, raw_idxs) == 0) {
+        return false;
+    }
+
+    // the VIEW of the up half reads an outside tensor, so only the non-empty nodes are checked for consumers
+    const int outputs[1] = { node_idxs[idx + n_nodes - 1] };
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n_nodes, fusion->ops.data(), outputs, 1);
+}
+
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_norm_mul_add,           {},     false, ggml_metal_fusion_check_norm },
@@ -2256,6 +2329,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_RMS_NORM_ROPE,   ops_rms_norm_rope_vw_set,  {},     true,  ggml_metal_fusion_check_rms_norm_rope },
     { GGML_METAL_FUSION_RMS_NORM_ROPE,   ops_rms_norm_rope_set,     {},     true,  ggml_metal_fusion_check_rms_norm_rope },
     { GGML_METAL_FUSION_RMS_NORM_ROPE,   ops_rms_norm_rope,         {},     true,  ggml_metal_fusion_check_rms_norm_rope },
+    { GGML_METAL_FUSION_SITU,            ops_situ,                  {},     true,  ggml_metal_fusion_check_situ },
 };
 
 ggml_metal_fusion_id ggml_metal_fusion_id_at(int idx) {

@@ -265,6 +265,31 @@ typedef struct {
     float    max;
 } ggml_metal_kargs_unary;
 
+// situ(gate, up) = s1*tanh(s0*gate)*sigmoid(gate) * s3*tanh(s2*up): the scale and bias of the four SCALE nodes
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    gate_in_scale;
+    float    gate_in_bias;
+    float    gate_out_scale;
+    float    gate_out_bias;
+    float    up_in_scale;
+    float    up_in_bias;
+    float    up_out_scale;
+    float    up_out_bias;
+} ggml_metal_kargs_situ;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

@@ -308,6 +308,50 @@ template [[host_name("kernel_unary_mul_f32_f32_4")]] kernel kernel_unary_mul_t k
 template [[host_name("kernel_unary_mul_f16_f16")]]   kernel kernel_unary_mul_t kernel_unary_mul_impl<half,   half,   float>;
 template [[host_name("kernel_unary_mul_f16_f16_4")]] kernel kernel_unary_mul_t kernel_unary_mul_impl<half4,  half4,  float4>;
 
+// situ(gate, up) = s1*tanh(s0*gate)*sigmoid(gate) * s3*tanh(s2*up), one row of gate and up per threadgroup; every step
+// is the float expression of the SCALE, TANH, SIGMOID or MUL kernel, so the output matches the separate nodes
+template <typename T>
+kernel void kernel_situ_impl(
+        constant ggml_metal_kargs_situ & args,
+        device const char * gate,
+        device const char * up,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    // the separate kernels round each product on its own
+#pragma clang fp reassociate(off)
+    const int i1 = tgpig.x;
+    const int i2 = tgpig.y;
+    const int i3 = tgpig.z;
+
+    device const T * gate_row = (device const T *) (gate + i3*args.nb03 + i2*args.nb02 + i1*args.nb01);
+    device const T * up_row   = (device const T *) (up   + i3*args.nb13 + i2*args.nb12 + i1*args.nb11);
+    device       T * dst_row  = (device       T *) (dst  + i3*args.nb3  + i2*args.nb2  + i1*args.nb1);
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        const T g = gate_row[i0];
+        const T u = up_row[i0];
+
+        const T gate_in  = args.gate_in_scale * g + args.gate_in_bias;
+        const T gate_th  = precise::tanh(gate_in);
+        const T gate_out = args.gate_out_scale * gate_th + args.gate_out_bias;
+        const T gate_sg  = 1 / (1 + exp(-g));
+        const T gate_act = gate_out * gate_sg;
+
+        const T up_in  = args.up_in_scale * u + args.up_in_bias;
+        const T up_th  = precise::tanh(up_in);
+        const T up_out = args.up_out_scale * up_th + args.up_out_bias;
+
+        dst_row[i0] = gate_act * up_out;
+    }
+}
+
+typedef decltype(kernel_situ_impl<float>) kernel_situ_t;
+
+template [[host_name("kernel_situ_f32")]]   kernel kernel_situ_t kernel_situ_impl<float>;
+template [[host_name("kernel_situ_f32_4")]] kernel kernel_situ_t kernel_situ_impl<float4>;
+
 kernel void kernel_silu_back_f32(
         constant ggml_metal_kargs_silu_back & args,
         device const float * dy,

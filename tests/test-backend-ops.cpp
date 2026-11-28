@@ -5723,6 +5723,11 @@ struct test_situ : public test_case {
     const float beta;
     const float lb;
 
+    // the Metal fusion label, from the generic fusion debugging API
+    static constexpr const char * fusion_label = "SCALE+UNARY+SCALE+UNARY+MUL+SCALE+UNARY+SCALE+MUL";
+
+    mutable bool has_fusion_label = false;
+
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "SITU";
@@ -5733,6 +5738,14 @@ struct test_situ : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const int64_t count = backend_fusion_label_count(backend, fusion_label);
+        has_fusion_label = count >= 0;
+        return has_fusion_label ? (uint64_t) count : 0;
+    }
+
+    bool expect_fusion() override { return has_fusion_label; }
 
     test_situ(std::array<int64_t, 3> ne = {1152, 8, 4}, float beta = 4.0f, float lb = 25.0f)
         : ne(ne), beta(beta), lb(lb) {}

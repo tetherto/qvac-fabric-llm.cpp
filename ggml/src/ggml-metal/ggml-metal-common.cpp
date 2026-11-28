@@ -389,6 +389,9 @@ bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
 struct node_info {
     ggml_tensor * node;
 
+    // position of node in the graph before the reorder; the fused tensors follow it
+    int idx;
+
     std::vector<ggml_tensor *> fused;
 
     ggml_op op() const {
@@ -420,7 +423,48 @@ struct node_info {
     }
 };
 
-static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node_info> & nodes) {
+static int ggml_metal_graph_optimize_next_pending(const std::vector<node_info> & nodes, const std::vector<bool> & used, int i) {
+    for (int j = i + 1; j < (int) nodes.size(); j++) {
+        if (!used[j] && !nodes[j].is_empty()) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+// appends the graph positions of the unit's non-empty nodes (a packed unit spans consecutive positions)
+static int ggml_metal_graph_optimize_append_unit_idxs(const ggml_cgraph * gf, const node_info & unit, int * idxs, int n_idxs) {
+    for (int k = 0; k <= (int) unit.fused.size() && n_idxs < GGML_METAL_FUSION_MAX; k++) {
+        const int raw = unit.idx + k;
+        if (!ggml_op_is_empty(gf->nodes[raw]->op)) {
+            idxs[n_idxs++] = raw;
+        }
+    }
+    return n_idxs;
+}
+
+// true if nodes[i] is a single node that fuses with the next pending unit: hoisting it would split the pair,
+// because the partner reads it and so cannot join the same concurrent set
+static bool ggml_metal_graph_optimize_has_pending_partner(
+        const ggml_cgraph * gf, const std::vector<node_info> & nodes, const std::vector<bool> & used, int i) {
+    if (!nodes[i].fused.empty() || nodes[i].is_empty()) {
+        return false;
+    }
+
+    const int next = ggml_metal_graph_optimize_next_pending(nodes, used, i);
+    if (next < 0) {
+        return false;
+    }
+
+    int idxs[GGML_METAL_FUSION_MAX];
+    idxs[0] = nodes[i].idx;
+    const int n_idxs = ggml_metal_graph_optimize_append_unit_idxs(gf, nodes[next], idxs, 1);
+
+    int len = 1;
+    return ggml_metal_fusion_next(gf, idxs, n_idxs, 0, GGML_METAL_FUSION_STRUCTURAL, &len) != nullptr;
+}
+
+static std::vector<int> ggml_metal_graph_optimize_reorder(const ggml_cgraph * gf, const std::vector<node_info> & nodes) {
     // helper to add node src and dst ranges
     const auto & h_add = [](ggml_mem_ranges_t mrs, const node_info & node) {
         // only external sources matter: sources produced by the fused group are internal
@@ -579,7 +623,9 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
                 // to reorder a node and add it to the concurrent set, it has to be:
                 //   + empty or concurrent with all nodes in the existing concurrent set (mrs0)
                 //   + concurrent with all nodes prior to it that haven't been processed yet (mrs1)
-                if ((is_empty || h_check(mrs0, node1)) && h_check(mrs1, node1)) {
+                //   + not the head of a fusion with the next pending unit
+                if ((is_empty || h_check(mrs0, node1)) && h_check(mrs1, node1) &&
+                        !ggml_metal_graph_optimize_has_pending_partner(gf, nodes, used, i1)) {
                     // add the node to the existing concurrent set (i.e. reorder it for early execution)
                     h_add(mrs0, node1);
                     res.push_back(i1);
@@ -623,7 +669,8 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
     // packing here is driven by the same patterns that the op encoders will later use
     for (int i = 0; i < n; i++) {
         node_info node = {
-            /*.node =*/ gf->nodes[i],
+            /*.node  =*/ gf->nodes[i],
+            /*.idx   =*/ i,
             /*.fused =*/ {},
         };
 
@@ -642,7 +689,7 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
 
 #if 1
     // reorder to improve concurrency
-    const auto order = ggml_metal_graph_optimize_reorder(nodes);
+    const auto order = ggml_metal_graph_optimize_reorder(gf, nodes);
 #else
     std::vector<int> order(nodes.size());
     for (size_t i = 0; i < nodes.size(); i++) {

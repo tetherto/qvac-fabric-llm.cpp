@@ -379,6 +379,35 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary_mul(ggml_m
     return res;
 }
 
+// true if every row of t starts 16-byte aligned, so a kernel can read it as float4
+static bool ggml_metal_situ_float4_rows(const ggml_tensor * t) {
+    constexpr int64_t width = 4;
+    constexpr size_t  align = width*sizeof(float);
+
+    return t->ne[0] % width == 0 && (uintptr_t) t->data % align == 0 && t->nb[1] % align == 0 && t->nb[2] % align == 0 && t->nb[3] % align == 0;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_situ(ggml_metal_library_t lib, const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * dst) {
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    char base[256];
+    char name[256];
+
+    const bool is_c4 = ggml_metal_situ_float4_rows(gate) && ggml_metal_situ_float4_rows(up) && ggml_metal_situ_float4_rows(dst);
+
+    snprintf(base, 256, "kernel_situ_f32%s", is_c4 ? "_4" : "");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    res.c4 = is_c4;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_ASSERT(ggml_is_contiguous_1(op->src[0]));
 

@@ -1239,6 +1239,75 @@ static int ggml_metal_op_unary_mul(ggml_metal_op_t ctx, int idx, int n_fuse) {
     return n_fuse;
 }
 
+static constexpr int GGML_METAL_SITU_NTH_MAX = 256;
+
+// smallest power of two covering ne0, capped at nth_max
+static int ggml_metal_op_situ_nth(int ne0, int nth_max) {
+    int nth = 1;
+    while (nth < ne0 && nth < nth_max) {
+        nth *= 2;
+    }
+    return nth;
+}
+
+// situ(gate, up) in one pass over the gate and up rows (see GGML_METAL_FUSION_SITU)
+static int ggml_metal_op_situ(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_metal_op_fusion_concurrency(ctx, idx, n_fuse);
+
+    const ggml_tensor * gate_in  = ctx->node(idx);
+    const ggml_tensor * gate_out = ctx->node(idx + 2);
+    const ggml_tensor * up_in    = ctx->node(idx + 5);
+    const ggml_tensor * up_out   = ctx->node(idx + 7);
+    const ggml_tensor * dst      = ctx->node(idx + n_fuse - 1);
+
+    const ggml_tensor * gate = gate_in->src[0];
+    const ggml_tensor * up   = up_in->src[0];
+
+    auto pipeline = ggml_metal_library_get_pipeline_situ(lib, gate, up, dst);
+
+    const int ne0 = pipeline.c4 ? (int) dst->ne[0]/4 : (int) dst->ne[0];
+
+    ggml_metal_kargs_situ args = {
+        /*.ne0            =*/ ne0,
+        /*.ne1            =*/ (int32_t) dst->ne[1],
+        /*.ne2            =*/ (int32_t) dst->ne[2],
+        /*.ne3            =*/ (int32_t) dst->ne[3],
+        /*.nb01           =*/ gate->nb[1],
+        /*.nb02           =*/ gate->nb[2],
+        /*.nb03           =*/ gate->nb[3],
+        /*.nb11           =*/ up->nb[1],
+        /*.nb12           =*/ up->nb[2],
+        /*.nb13           =*/ up->nb[3],
+        /*.nb1            =*/ dst->nb[1],
+        /*.nb2            =*/ dst->nb[2],
+        /*.nb3            =*/ dst->nb[3],
+        /*.gate_in_scale  =*/ ggml_get_op_params_f32(gate_in,  0),
+        /*.gate_in_bias   =*/ ggml_get_op_params_f32(gate_in,  1),
+        /*.gate_out_scale =*/ ggml_get_op_params_f32(gate_out, 0),
+        /*.gate_out_bias  =*/ ggml_get_op_params_f32(gate_out, 1),
+        /*.up_in_scale    =*/ ggml_get_op_params_f32(up_in,    0),
+        /*.up_in_bias     =*/ ggml_get_op_params_f32(up_in,    1),
+        /*.up_out_scale   =*/ ggml_get_op_params_f32(up_out,   0),
+        /*.up_out_bias    =*/ ggml_get_op_params_f32(up_out,   1),
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(gate), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(up),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),  3);
+
+    const int nth_max = MIN(GGML_METAL_SITU_NTH_MAX, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    const int nth     = ggml_metal_op_situ_nth(ne0, nth_max);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, dst->ne[1], dst->ne[2], dst->ne[3], nth, 1, 1);
+
+    return n_fuse;
+}
+
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     if (ctx->use_fusion()) {
         int n = 1;
@@ -1247,6 +1316,11 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
 
             return ggml_metal_op_unary_mul(ctx, idx, n);
+        }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SITU) {
+            ctx->count_fusions(fusion);
+
+            return ggml_metal_op_situ(ctx, idx, n);
         }
     }
 

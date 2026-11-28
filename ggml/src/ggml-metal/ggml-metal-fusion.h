@@ -58,6 +58,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_SSM_CONV_STATE_NORM, // SSM_CONV_STATE + (RMS_NORM + SCALE) x 2 (the q/k L2 norms of the conv output)
     GGML_METAL_FUSION_SSM_CONV_STATE_RESID, // CONCAT + CPY + SSM_CONV + ADD + SCALE (the decode short conv with a residual, as Inkling builds it)
     GGML_METAL_FUSION_GDN_GATES,       // ADD + UNARY(softplus) + MUL + UNARY(sigmoid) + GDN_CACHE (gates activated in the gdn kernel)
+    GGML_METAL_FUSION_SITU,            // (SCALE + UNARY(tanh) + SCALE) x 2 + UNARY(sigmoid) + MUL x 2 (MoE situ on the gate_up halves)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
