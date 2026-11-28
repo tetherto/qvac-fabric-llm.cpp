@@ -10800,9 +10800,10 @@ struct test_mul_mat_id_fusion : public test_case {
     const uint32_t o; // number of outputs
     const bool mul;
     const bool skip; // set some ids to a negative value
+    const bool mul2; // a second MUL after the first (per-expert scale, then router weights)
 
     std::string vars() override {
-        return VARS_TO_STR11(type_a, type_b, n_mats, n_used, b, m, n, k, o, mul, skip);
+        return VARS_TO_STR11(type_a, type_b, n_mats, n_used, b, m, n, k, o, mul, skip) + (mul2 ? ",mul2=1" : "");
     }
 
     double max_nmse_err() override {
@@ -10816,10 +10817,11 @@ struct test_mul_mat_id_fusion : public test_case {
 
     test_mul_mat_id_fusion(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, uint32_t o = 1, bool mul = false, bool skip = false)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, uint32_t o = 1, bool mul = false, bool skip = false, bool mul2 = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), o(o), mul(mul), skip(skip) {
+            m(m), n(n), k(k), o(o), mul(mul), skip(skip), mul2(mul2) {
             GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(!mul2 || mul);
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -10852,6 +10854,10 @@ struct test_mul_mat_id_fusion : public test_case {
             ne[0] = 1;
             ggml_tensor * m = ggml_new_tensor(ctx, out->type, 4, ne.data());
             out = ggml_mul(ctx, out, m);
+            if (mul2) {
+                ggml_tensor * m2 = ggml_new_tensor(ctx, out->type, 4, ne.data());
+                out = ggml_mul(ctx, out, m2);
+            }
         }
 
         return out;
@@ -19491,6 +19497,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));
             }
         }
+    }
+
+    // MUL_MAT_ID+MUL+MUL (per-expert scale, then router weights): one token fuses on the Vulkan mat-vec, four do not
+    for (int bs : {1, 4}) {
+        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152, 1, true, false, true));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 16, false, 256, bs, 512, 1, true, true, true));
     }
 
     // MUL_MAT_ID+MUL on the GEMM path (router weights applied in the int8 MMQ epilogue on Vulkan):

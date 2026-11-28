@@ -19214,6 +19214,15 @@ static bool ggml_vk_can_fuse_unary_mul_pair(const struct ggml_cgraph * cgraph, i
            ggml_vk_can_fuse_unary_mul(cgraph, node_idx, node_idx + 1);
 }
 
+// GGML_VK_FUSE_MMID_MUL_MUL=0 runs the second MUL after a mat-vec MUL_MAT_ID+MUL as its own pass, in the same graph order
+static bool ggml_vk_fuse_mmid_mul_mul_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_MMID_MUL_MUL");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 // MUL_MAT_ID+MUL(router weights) on the GEMM path: the int8 MMQ coopmat1 epilogue multiplies each output row by
 // its (expert slot, token) weight before the store, so the f32 expert outputs are written once and never re-read.
 // GGML_VK_MMID_EPILOGUE=0 disables (mat-vec MUL_MAT_ID+MUL fusion is unaffected).
@@ -19799,6 +19808,18 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
         const ggml_tensor *mul = cgraph->nodes[node_idx + 1];
 
         if (!mmid_mul_ok(mmid, mul)) {
+            return false;
+        }
+    }
+
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_MUL_MAT_ID && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_MUL) {
+        // mat-vec only: the second MUL is the epilogue's second scale
+        const ggml_tensor *mmid = cgraph->nodes[node_idx];
+        const ggml_tensor *mul0 = cgraph->nodes[node_idx + 1];
+        const ggml_tensor *mul1 = cgraph->nodes[node_idx + 2];
+
+        if (!ggml_vk_fuse_mmid_mul_mul_enabled() || !ggml_vk_use_mul_mat_vec_id(cgraph, node_idx) ||
+            !mmid_mul_ok(mmid, mul0) || !mmid_mul_ok(mul0, mul1)) {
             return false;
         }
     }
@@ -21170,6 +21191,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ID_ADD_ID";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_MUL })) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "MUL_MAT_ID_MUL_MUL";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ID_MUL";
@@ -22279,6 +22306,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     !(j == c+1 && c == current_set.back() && ggml_vk_glu_mul_mat_pair_ok(ctx, graph, c)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[j]->op == GGML_OP_MUL &&
+                      graph->nodes[c]->src[0]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY) &&
