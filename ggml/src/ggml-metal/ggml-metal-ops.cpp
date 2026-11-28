@@ -221,8 +221,17 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
     return ggml_mem_ranges_add(ctx->mem_ranges, node);
 }
 
-// encode_impl checks only the first and the last of n_fuse fused nodes; the nodes between read their own sources,
-// which a pending producer may still be writing
+// every node of a fused group contributes sources and destinations, so all of them are checked
+static bool ggml_metal_op_group_concurrent(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    for (int i = 0; i < n_fuse; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// re-checks the nodes between the first and the last of a fused group from inside its encoder
 static void ggml_metal_op_fusion_concurrency(ggml_metal_op_t ctx, int idx, int n_fuse) {
     for (int i = 1; i < n_fuse - 1; ++i) {
         if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
@@ -284,8 +293,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             int n_fuse = 1;
             const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n_fuse);
             if (fusion) {
-                // fused kernels write to the last node of the group, not necessarily to the first node's dst
-                is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + n_fuse - 1));
+                is_concurrent = ggml_metal_op_group_concurrent(ctx, idx, n_fuse);
             }
         }
 
