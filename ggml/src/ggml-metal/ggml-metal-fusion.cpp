@@ -421,11 +421,29 @@ static int ggml_metal_fusion_find_raw(const ggml_cgraph * gf, int lo, int hi, gg
     return -1;
 }
 
+static bool ggml_metal_tensor_is_weight(const struct ggml_tensor * t);
+
+// the operand of add2 that is not the scale output, when it is an f32 [C, n_seqs] row block the kernel can read
+static const ggml_tensor * ggml_metal_fusion_resid_second(const ggml_tensor * add2, const ggml_tensor * scale) {
+    if (add2->op != GGML_OP_ADD || add2->type != GGML_TYPE_F32 || add2->src[0] == add2->src[1] ||
+        (add2->src[0] != scale && add2->src[1] != scale)) {
+        return nullptr;
+    }
+
+    const ggml_tensor * r = add2->src[0] == scale ? add2->src[1] : add2->src[0];
+
+    const bool ok = r->type == GGML_TYPE_F32 && ggml_are_same_shape(r, scale) && r->nb[0] == sizeof(float) &&
+        ggml_is_contiguous(r) && !ggml_metal_tensor_is_weight(r);
+
+    return ok ? r : nullptr;
+}
+
 static bool ggml_metal_fusion_resid_memory_ok(
         const ggml_tensor * cc,
         const ggml_tensor * cpy,
         const ggml_tensor * conv,
-        const ggml_tensor * scale) {
+        const ggml_tensor * out,
+        const ggml_tensor * res) {
     const ggml_tensor * st = cc->src[0];
     const ggml_tensor * x  = cc->src[1];
     const ggml_tensor * ds = cpy->src[1];
@@ -436,13 +454,16 @@ static bool ggml_metal_fusion_resid_memory_ok(
         return false;
     }
 
-    // the output may overwrite the input column it was computed from, element by element
-    if (ggml_metal_fusion_overlap(scale, x) && !(scale->data == x->data && ggml_metal_fusion_same_linear_layout(scale, x))) {
-        return false;
+    // the output may overwrite the input column or the residual it was computed from, element by element
+    for (const ggml_tensor * in : { x, res }) {
+        if (in && ggml_metal_fusion_overlap(out, in) && !(out->data == in->data && ggml_metal_fusion_same_linear_layout(out, in))) {
+            return false;
+        }
     }
 
-    return !ggml_metal_fusion_overlap(scale, st) && !ggml_metal_fusion_overlap(scale, ds) && !ggml_metal_fusion_overlap(scale, w) &&
-        !ggml_metal_fusion_overlap(ds, x) && !ggml_metal_fusion_overlap(ds, w);
+    return !ggml_metal_fusion_overlap(out, st) && !ggml_metal_fusion_overlap(out, ds) && !ggml_metal_fusion_overlap(out, w) &&
+        !ggml_metal_fusion_overlap(ds, x) && !ggml_metal_fusion_overlap(ds, w) &&
+        !(res && (ggml_metal_fusion_overlap(ds, res) || ggml_metal_fusion_overlap(res, st)));
 }
 
 static bool ggml_metal_fusion_check_ssm_conv_state_resid(
@@ -460,11 +481,21 @@ static bool ggml_metal_fusion_check_ssm_conv_state_resid(
     const ggml_tensor * add   = nodes[3];
     const ggml_tensor * scale = nodes[4];
 
+    // the optional trailing ADD of a second residual; the group ends in it
+    const bool          has_add2 = fusion->ops.size() == 6;
+    const ggml_tensor * add2     = has_add2 ? nodes[5] : nullptr;
+    const ggml_tensor * out      = has_add2 ? add2 : scale;
+
     if (add->op != GGML_OP_ADD || scale->op != GGML_OP_SCALE || scale->src[0] != add || scale->src[1] || add->type != GGML_TYPE_F32) {
         return false;
     }
 
-    if (!ggml_metal_fusion_resid_shapes_ok(cc, conv, scale, mode) || !ggml_metal_fusion_resid_cpy_ok(cc, cpy)) {
+    if (!ggml_metal_fusion_resid_shapes_ok(cc, conv, out, mode) || !ggml_metal_fusion_resid_cpy_ok(cc, cpy)) {
+        return false;
+    }
+
+    const ggml_tensor * res = has_add2 ? ggml_metal_fusion_resid_second(add2, scale) : nullptr;
+    if (has_add2 && res == nullptr) {
         return false;
     }
 
@@ -486,14 +517,15 @@ static bool ggml_metal_fusion_check_ssm_conv_state_resid(
     }
 
     // the concat and the views are elided: they may have no consumers outside the group
-    const int raw_idxs[7] = { idx_cc, idx_tail, idx_cpy, idx_conv, idx_rs, idx_add, node_idxs[idx + 4] };
-    static const ggml_op ops[7] = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
-    const int outputs[2] = { idx_cpy, raw_idxs[6] };
-    if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, 7, ops, outputs, 2)) {
+    const int n_raw = has_add2 ? 8 : 7;
+    const int raw_idxs[8] = { idx_cc, idx_tail, idx_cpy, idx_conv, idx_rs, idx_add, node_idxs[idx + 4], has_add2 ? node_idxs[idx + 5] : -1 };
+    static const ggml_op ops[8] = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD };
+    const int outputs[2] = { idx_cpy, raw_idxs[n_raw - 1] };
+    if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, n_raw, ops, outputs, 2)) {
         return false;
     }
 
-    return mode != GGML_METAL_FUSION_FULL || ggml_metal_fusion_resid_memory_ok(cc, cpy, conv, scale);
+    return mode != GGML_METAL_FUSION_FULL || ggml_metal_fusion_resid_memory_ok(cc, cpy, conv, out, res);
 }
 
 // SSM_CONV_STATE + (VIEW + RMS_NORM + SCALE) x 2: the L2 norms of the q and k heads at the start of the conv output, as
@@ -1996,6 +2028,8 @@ static const std::vector<ggml_op> ops_ssm_conv_state = { GGML_OP_CONCAT, GGML_OP
 // the conv output reaches the add through a reshape
 static const std::vector<ggml_op> ops_ssm_conv_state_resid = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_ssm_conv_state_resid_add = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_ssm_conv_state_norm = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_UNARY,
     GGML_OP_VIEW, GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_VIEW, GGML_OP_RMS_NORM, GGML_OP_SCALE };
@@ -2201,6 +2235,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SSM_CONV_STATE, ops_ssm_conv_state,         {1},    true,  ggml_metal_fusion_check_ssm_conv_state },
     { GGML_METAL_FUSION_SSM_CONV_STATE_NORM, ops_ssm_conv_state_norm, {1, 3, 5}, true, ggml_metal_fusion_check_ssm_conv_state_norm },
     { GGML_METAL_FUSION_SSM_CONV_STATE_RESID, ops_ssm_conv_state_resid, {1}, true, ggml_metal_fusion_check_ssm_conv_state_resid },
+    { GGML_METAL_FUSION_SSM_CONV_STATE_RESID, ops_ssm_conv_state_resid_add, {1}, true, ggml_metal_fusion_check_ssm_conv_state_resid },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
     { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_glu,             {},     true,  ggml_metal_fusion_check_mul_mv_glu },
     { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_id_glu,          {},     true,  ggml_metal_fusion_check_mul_mv_glu },

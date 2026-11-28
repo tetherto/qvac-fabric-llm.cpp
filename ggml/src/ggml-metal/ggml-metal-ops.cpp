@@ -834,6 +834,13 @@ static int ggml_metal_op_ssm_conv_state_resid(ggml_metal_op_t ctx, int idx, int 
     const ggml_tensor * conv  = ctx->node(idx + 2);
     const ggml_tensor * scale = ctx->node(idx + 4);
 
+    // with the trailing ADD the group ends in it, and its other operand is the residual
+    const ggml_tensor * out = ctx->node(idx + n_fuse - 1);
+    const ggml_tensor * res = nullptr;
+    if (n_fuse == 6) {
+        res = out->src[0] == scale ? out->src[1] : out->src[0];
+    }
+
     const ggml_tensor * st = cc->src[0];
     const ggml_tensor * x  = cc->src[1];
     const ggml_tensor * ds = cpy->src[1];
@@ -849,25 +856,29 @@ static int ggml_metal_op_ssm_conv_state_resid(ggml_metal_op_t ctx, int idx, int 
         /*.nb02  =*/ st->nb[2],
         /*.nb11  =*/ x->nb[1],
         /*.nb12  =*/ x->nb[2],
-        /*.nb2   =*/ scale->nb[1],
+        /*.nb2   =*/ out->nb[1],
         /*.nbs1  =*/ ds->nb[1],
+        /*.nbr   =*/ res ? res->nb[1] : 0,
     };
 
-    auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_state_resid(lib);
+    auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_state_resid(lib, res != nullptr);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(st),           1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),            2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(conv->src[1]), 3);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(scale),        4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(out),          4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ds),           5);
+    if (res) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(res),        6);
+    }
 
     const int nth = 128;
     ggml_metal_encoder_dispatch_threadgroups(enc, (C + nth - 1)/nth, n_seqs, 1, nth, 1, 1);
 
     if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
-        GGML_LOG_DEBUG("%s: fuse: CONCAT + CPY + SSM_CONV + ADD + SCALE\n", __func__);
+        GGML_LOG_DEBUG("%s: fuse: CONCAT + CPY + SSM_CONV + ADD + SCALE%s\n", __func__, res ? " + ADD" : "");
     }
 
     return n_fuse;

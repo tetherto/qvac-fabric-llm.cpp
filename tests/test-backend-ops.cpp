@@ -7435,10 +7435,11 @@ struct test_ssm_conv_state : public test_case {
     const int64_t n_norm;
     const int64_t hd;
     const bool resid;
+    const bool res_add; // with resid: a second residual added after the scale
 
     const char * fusion_label() const {
         if (resid) {
-            return "CONCAT+CPY+SSM_CONV+ADD+SCALE";
+            return res_add ? "CONCAT+CPY+SSM_CONV+ADD+SCALE+ADD" : "CONCAT+CPY+SSM_CONV+ADD+SCALE";
         }
         return n_norm > 0 ? "CONCAT+CPY+SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE" : "CONCAT+CPY+SSM_CONV+UNARY";
     }
@@ -7456,7 +7457,7 @@ struct test_ssm_conv_state : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
 
     std::string vars() override {
-        return VARS_TO_STR7(channels, n_t, n_s, inplace, extra_reader, n_norm, hd) + (resid ? ",resid=1" : "");
+        return VARS_TO_STR7(channels, n_t, n_s, inplace, extra_reader, n_norm, hd) + (resid ? ",resid=1" : "") + (res_add ? ",res_add=1" : "");
     }
 
     uint64_t fusion_count(ggml_backend_t backend) override {
@@ -7469,8 +7470,8 @@ struct test_ssm_conv_state : public test_case {
     bool expect_no_fusion() override { return has_fusion_label && !(n_t == 1 && !extra_reader); }
 
     test_ssm_conv_state(int64_t channels = 64, int64_t n_t = 1, int64_t n_s = 1, bool inplace = false, bool extra_reader = false,
-            int64_t n_norm = 0, int64_t hd = 128, bool resid = false)
-        : channels(channels), n_t(n_t), n_s(n_s), inplace(inplace), extra_reader(extra_reader), n_norm(n_norm), hd(hd), resid(resid) {}
+            int64_t n_norm = 0, int64_t hd = 128, bool resid = false, bool res_add = false)
+        : channels(channels), n_t(n_t), n_s(n_s), inplace(inplace), extra_reader(extra_reader), n_norm(n_norm), hd(hd), resid(resid), res_add(res_add) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         verify.clear();
@@ -7495,6 +7496,17 @@ struct test_ssm_conv_state : public test_case {
         ggml_tensor * kern = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
         ggml_set_name(kern, "kernel");
 
+        // the residual stream is computed before the conv step
+        ggml_tensor * res = nullptr;
+        if (resid && res_add) {
+            ggml_tensor * res_src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n_t*n_s);
+            ggml_set_name(res_src, "res_src");
+            res = ggml_scale(ctx, res_src, 0.25f);
+            if (gf) {
+                ggml_build_forward_expand(gf, res);
+            }
+        }
+
         ggml_tensor * cc   = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
         ggml_tensor * tail = ggml_view_3d(ctx, cc, 3, C, n_s, cc->nb[1], cc->nb[2], ggml_row_size(cc->type, n_t));
         ggml_tensor * cpy  = ggml_cpy(ctx, tail, dst);
@@ -7507,6 +7519,9 @@ struct test_ssm_conv_state : public test_case {
         ggml_tensor * out  = resid ?
             ggml_scale(ctx, ggml_add(ctx, cur, ggml_reshape_2d(ctx, conv, C, n_t*n_s)), 1.0f/sqrtf(9.0f)) :
             ggml_silu(ctx, conv);
+        if (res) {
+            out = ggml_add(ctx, res, out);
+        }
         ggml_set_name(out, "out");
         if (gf) {
             ggml_build_forward_expand(gf, out);
@@ -21263,6 +21278,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_ssm_conv_state(130, 2, 1, inplace, false, 0, 128, true)); // two new columns: no fusion
         test_cases.emplace_back(new test_ssm_conv_state(130, 1, 1, inplace, true,  0, 128, true)); // another concat reader: no fusion
+        // with the trailing residual ADD
+        for (int64_t ns : {1, 2, 5}) {
+            test_cases.emplace_back(new test_ssm_conv_state(130,  1, ns, inplace, false, 0, 128, true, true));
+            test_cases.emplace_back(new test_ssm_conv_state(2304, 1, ns, inplace, false, 0, 128, true, true));
+        }
+        test_cases.emplace_back(new test_ssm_conv_state(130, 2, 1, inplace, false, 0, 128, true, true)); // two new columns: no fusion
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));

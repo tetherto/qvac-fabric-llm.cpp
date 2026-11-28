@@ -110,17 +110,20 @@ kernel void kernel_ssm_conv_state_f32(
     so[2] = v[3];
 }
 
-// kernel_ssm_conv_state_f32 with the residual of the new input and a scale instead of the silu: y = scale*(x + w . window) + bias
-kernel void kernel_ssm_conv_state_resid_f32(
+// kernel_ssm_conv_state_f32 with the residual of the new input and a scale instead of the silu: y = scale*(x + w . window) + bias,
+// plus a second residual (the trailing ADD) when ADD is set
+template<bool ADD>
+static void ssm_conv_state_resid_impl(
         constant ggml_metal_kargs_ssm_conv_state_resid & args,
         device const char * src0,
         device const char * src1,
         device const char * src2,
         device       char * dst,
         device       char * dst_s,
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tpitg[[thread_index_in_threadgroup]],
-        ushort3  ntg[[threads_per_threadgroup]]) {
+        device const char * res,
+        uint3  tgpig,
+        ushort tpitg,
+        ushort3  ntg) {
     const int c  = tgpig.x*ntg.x + tpitg;
     const int is = tgpig.y;
 
@@ -135,12 +138,45 @@ kernel void kernel_ssm_conv_state_resid_f32(
     float sumf = 0.0f;
     sumf += dot(v, ((device const float4 *) src2)[c]);
 
-    ((device float *) (dst + is*args.nb2))[c] = args.scale*(v[3] + sumf) + args.bias;
+    // an explicit fma: the compiler may not fold the trailing add into the scale step
+    float y = fma(args.scale, v[3] + sumf, args.bias);
+    if (ADD) {
+        y = y + ((device const float *) (res + is*args.nbr))[c];
+    }
+
+    ((device float *) (dst + is*args.nb2))[c] = y;
 
     device float * so = (device float *) (dst_s + is*args.nbs1) + 3*c;
     so[0] = v[1];
     so[1] = v[2];
     so[2] = v[3];
+}
+
+kernel void kernel_ssm_conv_state_resid_f32(
+        constant ggml_metal_kargs_ssm_conv_state_resid & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * src2,
+        device       char * dst,
+        device       char * dst_s,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tpitg[[thread_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+    ssm_conv_state_resid_impl<false>(args, src0, src1, src2, dst, dst_s, nullptr, tgpig, tpitg, ntg);
+}
+
+kernel void kernel_ssm_conv_state_resid_add_f32(
+        constant ggml_metal_kargs_ssm_conv_state_resid & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * src2,
+        device       char * dst,
+        device       char * dst_s,
+        device const char * res,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tpitg[[thread_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+    ssm_conv_state_resid_impl<true>(args, src0, src1, src2, dst, dst_s, res, tgpig, tpitg, ntg);
 }
 
 // kernel_ssm_conv_state_f32 followed by the L2 norms of the q and k heads (RMS_NORM + SCALE). one simdgroup per head of

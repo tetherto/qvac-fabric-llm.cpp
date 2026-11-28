@@ -1316,6 +1316,7 @@ typedef struct {
     uint64_t nb12;
     uint64_t nb2;   // dst [C, n_seqs] row stride
     uint64_t nbs1;  // new conv state [3*C, n_seqs] row stride
+    uint64_t nbr;   // trailing residual [C, n_seqs] row stride
 } ggml_metal_kargs_ssm_conv_state_resid;
 
 typedef struct {
