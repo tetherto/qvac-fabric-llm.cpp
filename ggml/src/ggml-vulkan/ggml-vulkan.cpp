@@ -2413,7 +2413,7 @@ static bool ggml_vk_depth_mix_device_ok(const vk_device & device) {
         return false;
     }
     const size_t n_scores = (size_t) vk_depth_mix_max_queries * vk_depth_mix_max_states;
-    const size_t shmem    = sizeof(float) * n_scores * (vk_depth_mix_block_size / device->subgroup_size + 1);
+    const size_t shmem    = sizeof(float) * (n_scores + 1) * (vk_depth_mix_block_size / device->subgroup_size);
     return shmem <= device->properties.limits.maxComputeSharedMemorySize;
 }
 
@@ -5438,9 +5438,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_short_conv_state_f32, "short_conv_state_f32", short_conv_state_f32_len, short_conv_state_f32_data, "main", 5, sizeof(vk_op_short_conv_state_push_constants), {32, 16, 1}, {32, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_control_mix_f32, "control_mix_f32", control_mix_f32_len, control_mix_f32_data, "main", 5, sizeof(vk_op_control_mix_push_constants), {256, 1, 1}, {256}, 1);
     if (ggml_vk_depth_mix_device_ok(device)) {
-        ggml_vk_create_pipeline(device, device->pipeline_depth_mix_f32, "depth_mix_f32", depth_mix_f32_len, depth_mix_f32_data, "main", 3, sizeof(vk_op_depth_mix_push_constants), {1, 1, 1},
-            { vk_depth_mix_block_size, vk_depth_mix_block_size / device->subgroup_size, vk_depth_mix_max_states, vk_depth_mix_max_queries, vk_depth_mix_cached_steps },
-            1, false, true, device->subgroup_size);
+        for (uint32_t mode = 0; mode < DEPTH_MIX_LAST_COUNT; ++mode) {
+            ggml_vk_create_pipeline2(device, device->pipeline_depth_mix_f32[mode], "depth_mix_f32_" + std::to_string(mode), depth_mix_f32_len, depth_mix_f32_data, "main", 4,
+                sizeof(vk_op_depth_mix_push_constants), {1, 1, 1},
+                { vk_depth_mix_block_size, vk_depth_mix_block_size / device->subgroup_size, vk_depth_mix_max_states, vk_depth_mix_max_queries, vk_depth_mix_cached_steps, mode },
+                1, false, true, device->subgroup_size);
+        }
     }
     ggml_vk_create_pipeline(device, device->pipeline_l2_clip_f32, "l2_clip_f32", l2_clip_f32_len, l2_clip_f32_data, "main", 4, sizeof(vk_op_l2_clip_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_sx_f32, "ssm_conv_back_sx_f32", ssm_conv_back_sx_f32_len, ssm_conv_back_sx_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_sx_push_constants), {32, 1, 1}, {}, 1);
@@ -15162,77 +15165,115 @@ static void ggml_vk_control_mix(ggml_backend_vk_context * ctx, vk_context & subc
         pc, { ne0, nrows, 1 });
 }
 
-// the PERMUTE + CONT that turn the [n_queries, n_embd, n_tokens] mix into [n_embd, n_queries, n_tokens]
-static constexpr int vk_depth_mix_tail_nodes = 2;
-
-// the nodes of depth_mix_pattern by role; repeat and permute are null when the graph has no such node
+// the nodes of a depth mix block by role; a role the block does not have is null
 struct vk_depth_mix_nodes {
     int n_nodes;
+    const ggml_tensor * norm;     // RMS_NORM of the last state
+    const ggml_tensor * concat;   // CONCAT(stack, last state): the states
     const ggml_tensor * repeat;
-    const ggml_tensor * scores;  // MUL_MAT(states, queries)
+    const ggml_tensor * scores;   // MUL_MAT(states, queries)
     const ggml_tensor * softmax;
-    const ggml_tensor * trans;   // TRANSPOSE(states)
+    const ggml_tensor * trans;    // TRANSPOSE(states)
     const ggml_tensor * cont;
-    const ggml_tensor * mix;     // MUL_MAT(softmax, cont)
-    const ggml_tensor * permute;
+    const ggml_tensor * mix;      // MUL_MAT(softmax, cont)
+    const ggml_tensor * permute;  // PERMUTE + CONT tail
+    const ggml_tensor * reshape;  // RESHAPE + VIEW + CONT tail
+    const ggml_tensor * view;
     ggml_tensor       * out;
 
     const ggml_tensor * states() const { return scores->src[0]; }
     const ggml_tensor * queries() const { return repeat ? repeat->src[0] : scores->src[1]; }
+    const ggml_tensor * stack() const { return concat ? concat->src[0] : states(); }
+    const ggml_tensor * last() const { return norm ? norm->src[0] : concat ? concat->src[1] : nullptr; }
+    vk_depth_mix_last last_mode() const { return norm ? DEPTH_MIX_LAST_NORM : concat ? DEPTH_MIX_LAST_READ : DEPTH_MIX_LAST_NONE; }
 };
 
-// the count nodes at node_idx have the ops of depth_mix_pattern from its index first
-static bool ggml_vk_depth_mix_ops_match(const struct ggml_cgraph * cgraph, int node_idx, int first, int count) {
+// the count nodes at node_idx have the ops of pattern from its index first
+static bool ggml_vk_ops_match(const struct ggml_cgraph * cgraph, int node_idx, const std::initializer_list<ggml_op> & pattern, int first, int count) {
     if (node_idx + count > cgraph->n_nodes) {
         return false;
     }
     for (int k = 0; k < count; ++k) {
-        if (cgraph->nodes[node_idx + k]->op != depth_mix_pattern.begin()[first + k]) {
+        if (cgraph->nodes[node_idx + k]->op != pattern.begin()[first + k]) {
             return false;
         }
     }
     return true;
 }
 
-// the depth mix ops at node_idx by role, with n_nodes = 0 if there are none; checks the op types only
-static vk_depth_mix_nodes ggml_vk_depth_mix_find(const struct ggml_cgraph * cgraph, int node_idx) {
-    const int first  = cgraph->nodes[node_idx]->op == GGML_OP_REPEAT ? 0 : 1;
-    const int n_core = (int) depth_mix_pattern.size() - vk_depth_mix_tail_nodes - first;
-    if (!ggml_vk_depth_mix_ops_match(cgraph, node_idx, first, n_core)) {
+// 2 for RMS_NORM + CONCAT at node_idx, 1 for a CONCAT, else 0
+static int ggml_vk_depth_mix_head_nodes(const struct ggml_cgraph * cgraph, int node_idx) {
+    const int n_head = (int) depth_mix_head_pattern.size();
+    if (ggml_vk_ops_match(cgraph, node_idx, depth_mix_head_pattern, 0, n_head)) {
+        return n_head;
+    }
+    return ggml_vk_ops_match(cgraph, node_idx, depth_mix_head_pattern, n_head - 1, 1) ? 1 : 0;
+}
+
+static int ggml_vk_depth_mix_tail_nodes(const struct ggml_cgraph * cgraph, int node_idx, bool view_tail) {
+    const int n_permute = (int) depth_mix_permute_tail_pattern.size();
+    const int n_view    = (int) depth_mix_view_tail_pattern.size();
+    if (ggml_vk_ops_match(cgraph, node_idx, depth_mix_permute_tail_pattern, 0, n_permute)) {
+        return n_permute;
+    }
+    return view_tail && ggml_vk_ops_match(cgraph, node_idx, depth_mix_view_tail_pattern, 0, n_view) ? n_view : 0;
+}
+
+// the depth mix ops at node_idx by role, with n_nodes = 0 if there are none; checks the op types only. Without
+// view_tail a one-query mix ends at its MUL_MAT.
+static vk_depth_mix_nodes ggml_vk_depth_mix_find(const struct ggml_cgraph * cgraph, int node_idx, bool view_tail = true) {
+    const int n_head = ggml_vk_depth_mix_head_nodes(cgraph, node_idx);
+    const int core   = node_idx + n_head;
+    if (core >= cgraph->n_nodes) {
         return {};
     }
-    const bool tail = ggml_vk_depth_mix_ops_match(cgraph, node_idx + n_core, first + n_core, vk_depth_mix_tail_nodes);
-    ggml_tensor * const * nodes = cgraph->nodes + node_idx + 1 - first;
+    const int first  = cgraph->nodes[core]->op == GGML_OP_REPEAT ? 0 : 1;
+    const int n_core = (int) depth_mix_pattern.size() - first;
+    if (!ggml_vk_ops_match(cgraph, core, depth_mix_pattern, first, n_core)) {
+        return {};
+    }
+    const int n_tail = ggml_vk_depth_mix_tail_nodes(cgraph, core + n_core, view_tail);
+    ggml_tensor * const * nodes = cgraph->nodes + core + 1 - first;
+    ggml_tensor * const * tail  = cgraph->nodes + core + n_core;
 
     vk_depth_mix_nodes m {};
-    m.n_nodes = n_core + (tail ? vk_depth_mix_tail_nodes : 0);
-    m.repeat  = first == 0 ? cgraph->nodes[node_idx] : nullptr;
+    m.n_nodes = n_head + n_core + n_tail;
+    m.norm    = n_head == 2 ? cgraph->nodes[node_idx] : nullptr;
+    m.concat  = n_head > 0 ? cgraph->nodes[core - 1] : nullptr;
+    m.repeat  = first == 0 ? cgraph->nodes[core] : nullptr;
     m.scores  = nodes[0];
     m.softmax = nodes[1];
     m.trans   = nodes[2];
     m.cont    = nodes[3];
     m.mix     = nodes[4];
-    m.permute = tail ? nodes[5] : nullptr;
+    m.permute = n_tail == (int) depth_mix_permute_tail_pattern.size() ? tail[0] : nullptr;
+    m.reshape = n_tail == (int) depth_mix_view_tail_pattern.size() ? tail[0] : nullptr;
+    m.view    = m.reshape ? tail[1] : nullptr;
     m.out     = cgraph->nodes[node_idx + m.n_nodes - 1];
     return m;
 }
 
-// depth_mix_pattern at node_idx as one pass: reads the states and the queries, writes the block's last node
+static vk_depth_mix_nodes ggml_vk_depth_mix_block(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
+
+// a depth mix block at node_idx as one pass: reads the stack, the last state and the queries, writes the block's last node
 static void ggml_vk_depth_mix(ggml_backend_vk_context * ctx, vk_context & subctx, const struct ggml_cgraph * cgraph, int node_idx) {
-    const vk_depth_mix_nodes m = ggml_vk_depth_mix_find(cgraph, node_idx);
+    const vk_depth_mix_nodes m = ggml_vk_depth_mix_block(ctx, cgraph, node_idx);
     GGML_ASSERT(m.n_nodes == ctx->num_additional_fused_ops + 1);
-    const ggml_tensor * states  = m.states();
+    const ggml_tensor * stack   = m.stack();
+    const ggml_tensor * last    = m.last() ? m.last() : stack;
     const ggml_tensor * queries = m.queries();
 
-    vk_pipeline pipeline = ctx->device->pipeline_depth_mix_f32;
+    vk_pipeline pipeline = ctx->device->pipeline_depth_mix_f32[m.last_mode()];
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const vk_op_depth_mix_push_constants pc = {
-        (uint32_t) states->ne[0], (uint32_t) states->ne[1], (uint32_t) queries->ne[1], ggml_get_op_params_f32(m.softmax, 0),
+        (uint32_t) stack->ne[0], (uint32_t) stack->ne[1], (uint32_t) queries->ne[1], ggml_get_op_params_f32(m.softmax, 0),
+        m.norm ? ggml_get_op_params_f32(m.norm, 0) : 0.0f,
     };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { ggml_vk_tensor_subbuffer(ctx, states), ggml_vk_tensor_subbuffer(ctx, queries), ggml_vk_tensor_subbuffer(ctx, m.out) },
-        pc, { (uint32_t) states->ne[2], 1, 1 });
+        { ggml_vk_tensor_subbuffer(ctx, stack), ggml_vk_tensor_subbuffer(ctx, last), ggml_vk_tensor_subbuffer(ctx, queries),
+          ggml_vk_tensor_subbuffer(ctx, m.out) },
+        pc, { (uint32_t) stack->ne[2], 1, 1 });
     ctx->depth_mix_fusion_count.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -17955,6 +17996,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_CONCAT:
+        if (ctx->fused_depth_mix) {
+            ggml_vk_depth_mix(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         if (ctx->fused_short_conv_state) {
             ggml_vk_short_conv_state(ctx, compute_ctx, cgraph, node_idx);
             break;
@@ -18072,6 +18117,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_RMS_NORM:
+        if (ctx->fused_depth_mix) {
+            ggml_vk_depth_mix(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         ggml_vk_rms_norm(ctx, compute_ctx, cgraph, node_idx, (float *)node->op_params);
         break;
     case GGML_OP_RMS_NORM_BACK:
@@ -20112,8 +20161,13 @@ static bool ggml_vk_fuse_depth_mix_enabled() {
     return on;
 }
 
+// the device has the pass; graph_optimize orders by this alone, so the switches change the kernels and not the order
+static bool ggml_vk_depth_mix_device_has(const ggml_backend_vk_context * ctx) {
+    return ctx->device->pipeline_depth_mix_f32[DEPTH_MIX_LAST_NONE] != nullptr;
+}
+
 static bool ggml_vk_depth_mix_supported(const ggml_backend_vk_context * ctx) {
-    return ggml_vk_fuse_depth_mix_enabled() && !ctx->device->disable_fusion && ctx->device->pipeline_depth_mix_f32 != nullptr;
+    return ggml_vk_fuse_depth_mix_enabled() && !ctx->device->disable_fusion && ggml_vk_depth_mix_device_has(ctx);
 }
 
 static bool ggml_vk_is_f32_contiguous(const ggml_tensor * t) {
@@ -20125,10 +20179,34 @@ static bool ggml_vk_is_swap01_permute(const ggml_tensor * permute) {
     return axes[0] == 1 && axes[1] == 0 && axes[2] == 2 && axes[3] == 3;
 }
 
+static bool ggml_vk_depth_mix_head_edges_ok(const vk_depth_mix_nodes & m) {
+    return (m.concat == nullptr || m.scores->src[0] == m.concat) && (m.norm == nullptr || m.concat->src[1] == m.norm);
+}
+
+static bool ggml_vk_depth_mix_tail_edges_ok(const vk_depth_mix_nodes & m) {
+    if (m.permute) {
+        return m.permute->src[0] == m.mix && m.out->src[0] == m.permute;
+    }
+    return m.reshape == nullptr || (m.reshape->src[0] == m.mix && m.view->src[0] == m.reshape && m.out->src[0] == m.view);
+}
+
 static bool ggml_vk_depth_mix_edges_ok(const vk_depth_mix_nodes & m) {
-    return (m.repeat == nullptr || m.scores->src[1] == m.repeat) && m.softmax->src[0] == m.scores &&
-           m.trans->src[0] == m.states() && m.cont->src[0] == m.trans && m.mix->src[0] == m.softmax && m.mix->src[1] == m.cont &&
-           (m.permute == nullptr || (m.permute->src[0] == m.mix && m.out->src[0] == m.permute));
+    return ggml_vk_depth_mix_head_edges_ok(m) && (m.repeat == nullptr || m.scores->src[1] == m.repeat) &&
+           m.softmax->src[0] == m.scores && m.trans->src[0] == m.states() && m.cont->src[0] == m.trans &&
+           m.mix->src[0] == m.softmax && m.mix->src[1] == m.cont && ggml_vk_depth_mix_tail_edges_ok(m);
+}
+
+// a CONCAT along the states of a stack and one state, normalized over the channels by the RMS_NORM if there is one
+static bool ggml_vk_depth_mix_head_ok(const vk_depth_mix_nodes & m) {
+    if (m.concat == nullptr) {
+        return true;
+    }
+    const ggml_tensor * states = m.states();
+    const ggml_tensor * stack  = m.stack();
+    const ggml_tensor * last   = m.last();
+    return ggml_get_op_params_i32(m.concat, 0) == 1 && ggml_vk_is_f32_contiguous(stack) && ggml_vk_is_f32_contiguous(last) &&
+           stack->ne[0] == states->ne[0] && stack->ne[1] >= 1 && stack->ne[1] + 1 == states->ne[1] && stack->ne[2] == states->ne[2] &&
+           last->ne[0] == states->ne[0] && last->ne[1] == 1 && last->ne[2] == states->ne[2] && stack->ne[3] == 1 && last->ne[3] == 1;
 }
 
 // states [n_embd, n_states, n_tokens] and queries [n_embd, n_queries], repeated over the tokens when there are several
@@ -20137,7 +20215,7 @@ static bool ggml_vk_depth_mix_inputs_ok(const vk_depth_mix_nodes & m) {
     const ggml_tensor * queries = m.queries();
     if (!ggml_vk_is_f32_contiguous(states) || !ggml_vk_is_f32_contiguous(queries) || states->ne[3] != 1 ||
         states->ne[1] > vk_depth_mix_max_states || queries->ne[1] > vk_depth_mix_max_queries ||
-        queries->ne[0] != states->ne[0] || queries->ne[2] != 1 || queries->ne[3] != 1) {
+        queries->ne[0] != states->ne[0] || queries->ne[2] != 1 || queries->ne[3] != 1 || !ggml_vk_depth_mix_head_ok(m)) {
         return false;
     }
     if (m.repeat == nullptr) {
@@ -20147,6 +20225,11 @@ static bool ggml_vk_depth_mix_inputs_ok(const vk_depth_mix_nodes & m) {
            m.repeat->ne[2] == states->ne[2] && m.repeat->ne[3] == 1;
 }
 
+// the CONT of a view that covers the whole one-query mix from its start: a plain copy
+static bool ggml_vk_depth_mix_view_tail_ok(const vk_depth_mix_nodes & m) {
+    return m.reshape == nullptr || (m.view->view_offs == 0 && ggml_is_contiguous(m.view) && ggml_nelements(m.view) == ggml_nelements(m.mix));
+}
+
 // a softmax without mask, sinks or ALiBi, and the mix written as [n_embd, n_queries, n_tokens]
 static bool ggml_vk_depth_mix_outputs_ok(const vk_depth_mix_nodes & m) {
     if (m.softmax->src[1] != nullptr || m.softmax->src[2] != nullptr || ggml_get_op_params_f32(m.softmax, 1) != 0.0f) {
@@ -20154,55 +20237,66 @@ static bool ggml_vk_depth_mix_outputs_ok(const vk_depth_mix_nodes & m) {
     }
     const ggml_tensor * states    = m.states();
     const int64_t       n_queries = m.queries()->ne[1];
-    // without the tail the [1, n_embd, n_tokens] mix has that layout already
+    // without the PERMUTE tail the [1, n_embd, n_tokens] mix has that layout already
     if (m.permute == nullptr ? n_queries != 1 : !ggml_vk_is_swap01_permute(m.permute)) {
         return false;
     }
     return ggml_are_same_shape(m.cont, m.trans) && m.mix->type == GGML_TYPE_F32 && m.mix->ne[0] == n_queries &&
            m.mix->ne[1] == states->ne[0] && m.mix->ne[2] == states->ne[2] && ggml_vk_is_f32_contiguous(m.out) &&
-           ggml_nelements(m.out) == ggml_nelements(m.mix);
+           ggml_nelements(m.out) == ggml_nelements(m.mix) && ggml_vk_depth_mix_view_tail_ok(m);
 }
 
-// no compute node of the block has a reader outside it. ggml_can_fuse_subgraph refuses the TRANSPOSE, a view of the
-// states from before the block, so the edges check it.
-static bool ggml_vk_depth_mix_subgraph_ok(const struct ggml_cgraph * cgraph, int node_idx, int n_nodes) {
-    std::array<int, depth_mix_pattern.size()>     idxs;
-    std::array<ggml_op, depth_mix_pattern.size()> ops;
+// no compute node of the block has a reader outside it. Without the CONCAT, ggml_can_fuse_subgraph refuses the
+// TRANSPOSE, a view of the states from before the block, so the edges check it.
+static bool ggml_vk_depth_mix_subgraph_ok(const struct ggml_cgraph * cgraph, const vk_depth_mix_nodes & m, int node_idx) {
+    std::array<int, vk_depth_mix_max_nodes>     idxs;
+    std::array<ggml_op, vk_depth_mix_max_nodes> ops;
     int count = 0;
-    for (int k = 0; k < n_nodes; ++k) {
+    for (int k = 0; k < m.n_nodes; ++k) {
         const ggml_tensor * node = cgraph->nodes[node_idx + k];
-        if (node->op != GGML_OP_TRANSPOSE) {
+        if (node != m.trans || m.concat != nullptr) {
             idxs[count] = node_idx + k;
             ops[count]  = node->op;
             ++count;
         }
     }
-    const int outputs[] = { node_idx + n_nodes - 1 };
+    const int outputs[] = { node_idx + m.n_nodes - 1 };
     return ggml_can_fuse_subgraph_ext(cgraph, idxs.data(), count, ops.data(), outputs, 1);
 }
 
-// the depth mix at node_idx if the device can fuse it, else n_nodes = 0. It reads no address or context state, so
-// graph_optimize orders by it.
+static bool ggml_vk_depth_mix_nodes_ok(const struct ggml_cgraph * cgraph, const vk_depth_mix_nodes & m, int node_idx) {
+    return m.n_nodes > 0 && ggml_vk_depth_mix_edges_ok(m) && ggml_vk_depth_mix_inputs_ok(m) && ggml_vk_depth_mix_outputs_ok(m) &&
+           ggml_vk_depth_mix_subgraph_ok(cgraph, m, node_idx);
+}
+
+// the depth mix block at node_idx, with the copy of a view of a one-query mix if the copy is its only reader, else
+// n_nodes = 0. It reads no address, context state or fusion switch, so graph_optimize orders by it.
 static vk_depth_mix_nodes ggml_vk_depth_mix_block(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
-    if (!ggml_vk_depth_mix_supported(ctx)) {
+    if (!ggml_vk_depth_mix_device_has(ctx)) {
         return {};
     }
     const vk_depth_mix_nodes m = ggml_vk_depth_mix_find(cgraph, node_idx);
-    const bool ok = m.n_nodes > 0 && ggml_vk_depth_mix_edges_ok(m) && ggml_vk_depth_mix_inputs_ok(m) &&
-                    ggml_vk_depth_mix_outputs_ok(m) && ggml_vk_depth_mix_subgraph_ok(cgraph, node_idx, m.n_nodes);
-    return ok ? m : vk_depth_mix_nodes {};
+    if (ggml_vk_depth_mix_nodes_ok(cgraph, m, node_idx)) {
+        return m;
+    }
+    const vk_depth_mix_nodes core = m.reshape ? ggml_vk_depth_mix_find(cgraph, node_idx, false) : vk_depth_mix_nodes {};
+    return ggml_vk_depth_mix_nodes_ok(cgraph, core, node_idx) ? core : vk_depth_mix_nodes {};
 }
 
 // the node count when the depth mix at node_idx runs as one pass, or 0. Its output must not be the last computed node:
 // a caller that splits the graph there may read its srcs (eval callbacks).
 static int ggml_vk_can_fuse_depth_mix(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_depth_mix_supported(ctx)) {
+        return 0;
+    }
     const vk_depth_mix_nodes m = ggml_vk_depth_mix_block(ctx, cgraph, node_idx);
     if (m.n_nodes == 0 || !ggml_vk_has_compute_node_after(cgraph, node_idx + m.n_nodes - 1)) {
         return 0;
     }
     const auto & limits = ctx->device->properties.limits;
+    const ggml_tensor * last = m.last() ? m.last() : m.stack();
     // the shader takes no per-tensor offsets, indexes each binding with 32 bits and runs one workgroup per token
-    for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ m.states(), m.queries(), m.out }) {
+    for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ m.stack(), last, m.queries(), m.out }) {
         if (get_misalign_bytes(ctx, t) != 0 || ggml_nbytes(t) > limits.maxStorageBufferRange) {
             return 0;
         }
@@ -22075,9 +22169,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return n;
         };
 
-        // the REPEAT reads only the queries and the TRANSPOSE only the states; neither pass may pull them out
+        // the REPEAT reads only the queries, the TRANSPOSE only the states, and a CONCAT of old states is ready early;
+        // the lookahead and the view pass must not pull them out
         auto const &in_depth_mix_pattern = [&](int n) -> bool {
-            for (int o = 0; o < (int) depth_mix_pattern.size(); ++o) {
+            for (int o = 0; o < vk_depth_mix_max_nodes; ++o) {
                 if (n - o >= 0 && depth_mix_block(n - o) > o) {
                     return true;
                 }
@@ -22180,8 +22275,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 // the fused pass reads the block's inputs while it writes the last node
                 for (uint32_t s = 0; s < GGML_MAX_SRC && params && params->add_alloc_dep; ++s) {
                     ggml_tensor * src = block[k]->src[s];
-                    if (src && std::find(block, block + n, src) == block + n) {
-                        params->add_alloc_dep(params->user_data, src, out);
+                    if (src == nullptr || std::find(block, block + n, src) != block + n) {
+                        continue;
+                    }
+                    params->add_alloc_dep(params->user_data, src, out);
+                    if (src->view_src != nullptr) {
+                        params->add_alloc_dep(params->user_data, src->view_src, out);
                     }
                 }
                 new_order.push_back(block[k]);

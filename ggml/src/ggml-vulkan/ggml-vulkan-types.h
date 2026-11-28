@@ -646,9 +646,19 @@ static constexpr std::initializer_list<std::array<int, 3>> control_mix_edges {
 };
 
 // softmax(scale * states^T queries) over the states, then the weighted sum of the states: Inkling 2's depth mix.
-// The REPEAT of the queries is built for more than one token, the PERMUTE + CONT tail for more than one query.
+// The REPEAT of the queries is built for more than one token.
 static constexpr std::initializer_list<ggml_op> depth_mix_pattern {
-    GGML_OP_REPEAT, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_MUL_MAT, GGML_OP_PERMUTE, GGML_OP_CONT };
+    GGML_OP_REPEAT, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_MUL_MAT };
+// in front: the RMS_NORM of the last state and the CONCAT of the stack with it
+static constexpr std::initializer_list<ggml_op> depth_mix_head_pattern { GGML_OP_RMS_NORM, GGML_OP_CONCAT };
+// after: the [n_embd, n_queries, n_tokens] layout of several queries, or the copy of a one-query mix
+static constexpr std::initializer_list<ggml_op> depth_mix_permute_tail_pattern { GGML_OP_PERMUTE, GGML_OP_CONT };
+static constexpr std::initializer_list<ggml_op> depth_mix_view_tail_pattern { GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_CONT };
+static constexpr int vk_depth_mix_max_nodes = (int) (depth_mix_head_pattern.size() + depth_mix_pattern.size() + depth_mix_view_tail_pattern.size());
+
+// depth_mix.comp's LAST_MODE: the states are the stack only, or the stack and a last state read as is (the CONCAT is
+// fused) or RMS-normalized in the pass (the RMS_NORM is fused too)
+enum vk_depth_mix_last { DEPTH_MIX_LAST_NONE, DEPTH_MIX_LAST_READ, DEPTH_MIX_LAST_NORM, DEPTH_MIX_LAST_COUNT };
 
 // depth_mix.comp: one workgroup of vk_depth_mix_block_size per token; more states or queries keep the separate nodes
 static constexpr uint32_t vk_depth_mix_block_size   = 512;
@@ -1205,7 +1215,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_short_conv_f32;
     vk_pipeline pipeline_short_conv_state_f32;
     vk_pipeline pipeline_control_mix_f32;
-    vk_pipeline pipeline_depth_mix_f32;
+    vk_pipeline pipeline_depth_mix_f32[DEPTH_MIX_LAST_COUNT];
     vk_pipeline pipeline_l2_clip_f32;
     vk_pipeline pipeline_ssm_conv_back_sx_f32;
     vk_pipeline pipeline_ssm_conv_back_c_f32;

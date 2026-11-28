@@ -500,6 +500,30 @@ static std::string var_to_str(ggml_flash_attn_ext_back_target target) {
     return std::to_string(target);
 }
 
+// Inkling 2's depth mix states: an input, or the CONCAT of a stack with one state that is an input or the RMS_NORM of one
+enum class depth_mix_head { states, concat, norm };
+// the node that also has a reader outside the mix: none, the states, the last state, or the one-query mix's reshape
+enum class depth_mix_shared { none, states, last, mix };
+
+static std::string var_to_str(depth_mix_head head) {
+    switch (head) {
+        case depth_mix_head::states: return "states";
+        case depth_mix_head::concat: return "concat";
+        case depth_mix_head::norm:   return "norm";
+    }
+    return "?";
+}
+
+static std::string var_to_str(depth_mix_shared shared) {
+    switch (shared) {
+        case depth_mix_shared::none:   return "none";
+        case depth_mix_shared::states: return "states";
+        case depth_mix_shared::last:   return "last";
+        case depth_mix_shared::mix:    return "mix";
+    }
+    return "?";
+}
+
 static std::string var_to_str(ggml_scale_mode mode) {
     std::string str;
     switch (mode & 0xFF) {
@@ -5891,6 +5915,9 @@ struct test_depth_mix : public test_case {
     const int64_t n_tokens;
     const bool    tail;
     const bool    fuses;
+    const depth_mix_head   head;
+    const bool             view_cont;  // the one-query mix read through the CONT of a view, as an attention input
+    const depth_mix_shared shared;
     mutable bool has_fusion_counter = false;
     mutable bool supported = false;
 
@@ -5900,7 +5927,7 @@ struct test_depth_mix : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(n_embd, n_states, n_queries, n_tokens, tail);
+        return VARS_TO_STR8(n_embd, n_states, n_queries, n_tokens, tail, head, view_cont, shared);
     }
 
     bool run_whole_graph() override { return true; }
@@ -5924,12 +5951,35 @@ struct test_depth_mix : public test_case {
 
     bool expect_no_fusion() override { return !fuses && has_fusion_counter; }
 
-    test_depth_mix(int64_t n_embd, int64_t n_states, int64_t n_queries, int64_t n_tokens, bool tail = true, bool fuses = true)
-        : n_embd(n_embd), n_states(n_states), n_queries(n_queries), n_tokens(n_tokens), tail(tail), fuses(fuses) {}
+    test_depth_mix(int64_t n_embd, int64_t n_states, int64_t n_queries, int64_t n_tokens, bool tail = true, bool fuses = true,
+                   depth_mix_head head = depth_mix_head::states, bool view_cont = false, depth_mix_shared shared = depth_mix_shared::none)
+        : n_embd(n_embd), n_states(n_states), n_queries(n_queries), n_tokens(n_tokens), tail(tail), fuses(fuses),
+          head(head), view_cont(view_cont), shared(shared) {}
+
+    // the last state of the states, as the model builds it: an input or the RMS_NORM of one
+    ggml_tensor * build_last(ggml_context * ctx) {
+        if (head == depth_mix_head::concat) {
+            ggml_tensor * last = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+            ggml_set_name(last, "last");
+            return last;
+        }
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(cur, "cur");
+        return ggml_rms_norm(ctx, ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens), 1e-6f);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * states = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_states, n_tokens);
-        ggml_set_name(states, "states");
+        ggml_tensor * last   = nullptr;
+        ggml_tensor * states = nullptr;
+        if (head == depth_mix_head::states) {
+            states = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_states, n_tokens);
+            ggml_set_name(states, "states");
+        } else {
+            ggml_tensor * stack = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_states - 1, n_tokens);
+            ggml_set_name(stack, "stack");
+            last   = build_last(ctx);
+            states = ggml_concat(ctx, stack, last, 1);
+        }
         ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_queries);
         ggml_set_name(query, "query");
 
@@ -5941,6 +5991,15 @@ struct test_depth_mix : public test_case {
 
         ggml_tensor * out = ggml_mul_mat(ctx, scores, ggml_cont(ctx, ggml_transpose(ctx, states)));
         out = n_queries == 1 ? ggml_reshape_3d(ctx, out, n_embd, 1, n_tokens) : ggml_cont(ctx, ggml_permute(ctx, out, 1, 0, 2, 3));
+        ggml_tensor * mix = out;
+        if (view_cont) {
+            out = ggml_cont(ctx, ggml_view_2d(ctx, out, n_embd, n_tokens, out->nb[2], 0));
+        }
+        ggml_tensor * shared_node = shared == depth_mix_shared::states ? states : shared == depth_mix_shared::last ? last :
+                                    shared == depth_mix_shared::mix ? mix : nullptr;
+        if (shared_node) {
+            out = ggml_add(ctx, out, ggml_sum(ctx, shared_node));
+        }
         if (tail) {
             out = ggml_scale(ctx, out, 0.5f);
         }
@@ -17114,6 +17173,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // wider than the states the Vulkan pass keeps in registers
     test_cases.emplace_back(new test_depth_mix(3000, 5, 3, 7));
     test_cases.emplace_back(new test_depth_mix(3000, 2, 1, 1));
+    // the states as the model builds them, a CONCAT of the stack with the last state, which may be an RMS_NORM
+    for (depth_mix_head head : { depth_mix_head::concat, depth_mix_head::norm }) {
+        for (int64_t n_states : { 2, 5 }) {
+            for (int64_t n_queries : { 1, 3, 4 }) {
+                for (int64_t n_tokens : { 1, 7, 512 }) {
+                    test_cases.emplace_back(new test_depth_mix(2304, n_states, n_queries, n_tokens, true, true, head));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_depth_mix(3000, 5, 3, 7, true, true, head));
+        test_cases.emplace_back(new test_depth_mix(300, 3, 1, 1, true, true, head));
+    }
+    // a one-query mix read through the copy of a view, as an attention input
+    for (int64_t n_states : { 2, 5 }) {
+        for (int64_t n_tokens : { 1, 7, 512 }) {
+            test_cases.emplace_back(new test_depth_mix(2304, n_states, 1, n_tokens, true, true, depth_mix_head::norm, true));
+        }
+    }
+    // a second reader keeps the CONCAT, the RMS_NORM or the mix's reshape out of the pass; the mix still fuses
+    test_cases.emplace_back(new test_depth_mix(2304, 5, 1, 1, true, true, depth_mix_head::norm, false, depth_mix_shared::states));
+    test_cases.emplace_back(new test_depth_mix(2304, 2, 4, 1, true, true, depth_mix_head::norm, false, depth_mix_shared::last));
+    test_cases.emplace_back(new test_depth_mix(2304, 3, 1, 7, true, true, depth_mix_head::norm, true, depth_mix_shared::mix));
     // no fusion: more states or queries than the Vulkan pass takes, and the mix as the last computed node
     test_cases.emplace_back(new test_depth_mix(300, 9, 3, 7, true, false));
     test_cases.emplace_back(new test_depth_mix(300, 5, 5, 7, true, false));
@@ -21357,11 +21438,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
 
-    // Inkling 2's depth mixes in decode and prefill. Perf mode repeats only the out node, so read the fused pass from
-    // GGML_VK_PERF_LOGGER (DEPTH_MIX), and the separate passes with GGML_VK_FUSE_DEPTH_MIX=0.
+    // Inkling 2's depth mixes in decode and prefill, with the states' RMS_NORM and CONCAT in front. Perf mode repeats only
+    // the out node, so read the fused pass from GGML_VK_PERF_LOGGER (DEPTH_MIX), and the separate passes with
+    // GGML_VK_FUSE_DEPTH_MIX=0.
     for (int64_t n_tokens : { 1, 512 }) {
         for (auto [n_states, n_queries] : std::initializer_list<std::pair<int64_t, int64_t>>{ {2, 4}, {3, 1}, {4, 1}, {5, 1}, {3, 3} }) {
-            test_cases.emplace_back(new test_depth_mix(2304, n_states, n_queries, n_tokens));
+            test_cases.emplace_back(new test_depth_mix(2304, n_states, n_queries, n_tokens, true, true, depth_mix_head::norm));
         }
     }
 

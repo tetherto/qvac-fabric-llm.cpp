@@ -959,12 +959,14 @@ struct vk_op_control_mix_push_constants {
     uint32_t nrows;
 };
 
-// depth_mix.comp: contiguous states [n_embd, n_states, n_tokens], queries [n_embd, n_queries] and dst [n_embd, n_queries, n_tokens]
+// depth_mix.comp: contiguous stack [n_embd, n_stack, n_tokens], last state [n_embd, 1, n_tokens], queries [n_embd, n_queries]
+// and dst [n_embd, n_queries, n_tokens]; eps is the RMS_NORM's of the last state
 struct vk_op_depth_mix_push_constants {
     uint32_t n_embd;
-    uint32_t n_states;
+    uint32_t n_stack;
     uint32_t n_queries;
     float    scale;
+    float    eps;
 };
 
 // l2_clip.comp: contiguous x and dst [ncols, ne1, ne2, ne3], the weight [ncols, w_rows] and the factor [1, 1, f_ne2, f_ne3]
