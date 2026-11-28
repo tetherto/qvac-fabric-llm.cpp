@@ -14137,19 +14137,27 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
 }
 
-void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// bcast: src0 is read with zero dim-2 and dim-3 strides (a skipped REPEAT's source in place of the repeated tensor)
+static void ggml_vk_get_rows_strided(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                     ggml_tensor * dst, bool bcast) {
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = ggml_type_size(src1->type);
     const uint32_t dst_type_size = ggml_type_size(dst->type);
+    const uint32_t nb02 = bcast ? 0 : (uint32_t)(src0->nb[2] / src0_type_size);
+    const uint32_t nb03 = bcast ? 0 : (uint32_t)(src0->nb[3] / src0_type_size);
 
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GET_ROWS, {
         (uint32_t)ggml_nelements(src0),
-        (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],(uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / src0_type_size, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
+        (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],(uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / src0_type_size, (uint32_t)src0->nb[1] / src0_type_size, nb02, nb03,
         (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
         0.0f, 0.0f, 0,
     });
+}
+
+void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_vk_get_rows_strided(ctx, subctx, src0, src1, dst, false);
 }
 
 void ggml_vk_get_rows_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -18099,6 +18107,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_GET_ROWS:
         if (ctx->fused_topk_qsa) {
             ggml_vk_topk_qsa(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_get_rows_bcast) {
+            ggml_vk_get_rows_strided(ctx, compute_ctx, ctx->fused_get_rows_bcast, src1, node, true);
+            ctx->get_rows_bcast_fusion_count.fetch_add(1, std::memory_order_relaxed);
         } else {
             ggml_vk_get_rows(ctx, compute_ctx, src0, src1, node);
         }
@@ -21341,6 +21352,10 @@ static bool ggml_vk_ssm_conv_direct_at_conv(ggml_backend_vk_context * ctx, const
 }
 
 
+static bool ggml_vk_is_skipped(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
+    return std::find(ctx->skipped_nodes.begin(), ctx->skipped_nodes.end(), t) != ctx->skipped_nodes.end();
+}
+
 static bool ggml_vk_fa_bias_sub_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_VK_FA_BIAS_SUB");
@@ -21432,7 +21447,7 @@ static bool ggml_vk_fa_bias_sub_at_sub(ggml_backend_vk_context * ctx, const ggml
     if (!ggml_vk_fa_bias_sub_enabled() || ggml_vk_fa_bias_sub_check(ctx, cgraph, i, true) < 0) {
         return false;
     }
-    ctx->fa_bias_subs.push_back(cgraph->nodes[i]);
+    ctx->skipped_nodes.push_back(cgraph->nodes[i]);
     ctx->fused_skip_node = true;
     return true;
 }
@@ -21443,12 +21458,67 @@ static bool ggml_vk_fa_bias_sub_at_fa(ggml_backend_vk_context * ctx, const ggml_
         return false;
     }
     const ggml_tensor * sub = att->src[6];
-    if (std::find(ctx->fa_bias_subs.begin(), ctx->fa_bias_subs.end(), sub) == ctx->fa_bias_subs.end()) {
+    if (!ggml_vk_is_skipped(ctx, sub)) {
         return false;
     }
     ctx->fused_fa_bias_sub = sub;
     ctx->fused_extra_srcs[0] = sub->src[0];
     ctx->fused_extra_srcs[1] = sub->src[1];
+    return true;
+}
+
+static bool ggml_vk_get_rows_bcast_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_VK_GET_ROWS_BCAST");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// A REPEAT of a [ne0, ne1, 1, 1] source along dim 2 whose only reader is a GET_ROWS taking it as src[0]: returns the
+// GET_ROWS node index, else -1. The GET_ROWS can read the source with zero dim-2 and dim-3 strides instead. With
+// runtime = true nothing from the REPEAT through the GET_ROWS may write the source, else the REPEAT runs.
+static int ggml_vk_get_rows_bcast_check(const ggml_cgraph * cgraph, int i, bool runtime) {
+    const ggml_tensor * rep = cgraph->nodes[i];
+    if (rep->op != GGML_OP_REPEAT || rep->type != GGML_TYPE_F32 || (rep->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    const ggml_tensor * x = rep->src[0];
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1 ||
+        rep->ne[0] != x->ne[0] || rep->ne[1] != x->ne[1] || rep->ne[3] != 1) {
+        return -1;
+    }
+    const int g = ggml_vk_only_reader(cgraph, i);
+    if (g < 0) {
+        return -1;
+    }
+    const ggml_tensor * gr = cgraph->nodes[g];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || gr->src[1]->type != GGML_TYPE_I32 ||
+        !ggml_vk_reads_only_as(gr, rep, 0) || (gr->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return -1;
+    }
+    if (runtime && (!x->buffer || ggml_vk_written_between(cgraph, i + 1, g, x, x))) {
+        return -1;
+    }
+    return g;
+}
+
+static bool ggml_vk_get_rows_bcast_at_repeat(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_vk_get_rows_bcast_enabled() || ggml_vk_get_rows_bcast_check(cgraph, i, true) < 0) {
+        return false;
+    }
+    ctx->skipped_nodes.push_back(cgraph->nodes[i]);
+    ctx->fused_skip_node = true;
+    return true;
+}
+
+static bool ggml_vk_get_rows_bcast_at_get_rows(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * gr = cgraph->nodes[i];
+    if (gr->op != GGML_OP_GET_ROWS || gr->src[0]->op != GGML_OP_REPEAT || !ggml_vk_is_skipped(ctx, gr->src[0])) {
+        return false;
+    }
+    ctx->fused_get_rows_bcast = gr->src[0]->src[0];
+    ctx->fused_extra_srcs[0] = gr->src[0]->src[0];
     return true;
 }
 
@@ -21652,7 +21722,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
     ctx->ssm_conv_direct_matches.clear();
-    ctx->fa_bias_subs.clear();
+    ctx->skipped_nodes.clear();
 
     int last_node = cgraph->n_nodes - 1;
 
@@ -21819,6 +21889,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_extra_srcs[0] = ctx->fused_extra_srcs[1] = nullptr;
         ctx->fused_skip_node = false;
         ctx->fused_fa_bias_sub = nullptr;
+        ctx->fused_get_rows_bcast = nullptr;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -21826,6 +21897,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "FA_BIAS_SUB";  // the SUB is not dispatched
             } else if (ggml_vk_fa_bias_sub_at_fa(ctx, cgraph, i)) {
                 fusion_string = "FA_BIAS_SUB";
+            } else if (ggml_vk_get_rows_bcast_at_repeat(ctx, cgraph, i)) {
+                fusion_string = "GET_ROWS_BCAST";  // the REPEAT is not dispatched
+            } else if (ggml_vk_get_rows_bcast_at_get_rows(ctx, cgraph, i)) {
+                fusion_string = "GET_ROWS_BCAST";
             } else if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
@@ -24935,6 +25010,12 @@ static uint64_t ggml_backend_vk_fa_bias_sub_fusion_count(ggml_backend_t backend)
     return ctx->fa_bias_sub_fusion_count.load(std::memory_order_relaxed);
 }
 
+static uint64_t ggml_backend_vk_get_rows_bcast_fusion_count(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    return ctx->get_rows_bcast_fusion_count.load(std::memory_order_relaxed);
+}
+
 static bool ggml_backend_vk_l2_clip_supported(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_vk(backend));
     return ggml_vk_l2_clip_supported((ggml_backend_vk_context *) backend->context);
@@ -24994,6 +25075,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_fa_bias_sub_fusion_count") == 0 && ggml_vk_fa_bias_sub_enabled()) {
         return (void *) ggml_backend_vk_fa_bias_sub_fusion_count;
+    }
+    if (strcmp(name, "ggml_backend_vk_get_rows_bcast_fusion_count") == 0 && ggml_vk_get_rows_bcast_enabled()) {
+        return (void *) ggml_backend_vk_get_rows_bcast_fusion_count;
     }
     return NULL;
 }

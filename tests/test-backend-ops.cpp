@@ -2696,6 +2696,65 @@ struct test_geglu_back : public test_case {
 };
 
 // GGML_OP_GET_ROWS
+// GET_ROWS of a REPEAT along dim 2, as llama-graph gathers per-expert scales (Vulkan reads the REPEAT's source)
+struct test_get_rows_repeat : public test_case {
+    const int64_t n;      // cols
+    const int64_t m;      // rows
+    const int64_t r;      // rows to get per token
+    const int64_t tokens;
+    mutable bool has_fusion_counter = false;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GET_ROWS_REPEAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n, m, r, tokens);
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn = uint64_t (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_get_rows_bcast_fusion_count");
+        has_fusion_counter = counter != nullptr;
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return has_fusion_counter; }
+
+    test_get_rows_repeat(int64_t n = 1, int64_t m = 128, int64_t r = 8, int64_t tokens = 7)
+        : n(n), m(m), r(r), tokens(tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, m, 1);
+        ggml_set_name(in, "in");
+        ggml_tensor * rep = ggml_repeat_4d(ctx, in, n, m, tokens, 1);
+        ggml_set_name(rep, "rep");
+        ggml_tensor * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r, tokens);
+        ggml_set_name(rows, "rows");
+        ggml_tensor * out = ggml_get_rows(ctx, rep, rows);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (auto & d : data) {
+                    d = rand() % m;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_get_rows : public test_case {
     const ggml_type type;
     const int n; // cols
@@ -17401,6 +17460,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q4_K, 4096, 5, 4, 1, 1, false, false, 0, 0.03f));
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // per-expert scales: 128 experts, 8 used, decode to prefill; and wider rows
+    for (int64_t tokens : {1, 7, 512}) {
+        test_cases.emplace_back(new test_get_rows_repeat(1, 128, 8, tokens));
+    }
+    test_cases.emplace_back(new test_get_rows_repeat(67, 16, 4, 33));
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                           GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
         test_cases.emplace_back(new test_get_rows_after_mul_mat(type));

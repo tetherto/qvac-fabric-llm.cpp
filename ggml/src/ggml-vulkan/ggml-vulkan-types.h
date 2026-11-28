@@ -1799,13 +1799,15 @@ struct ggml_backend_vk_context {
     std::vector<ssm_conv_direct_match> ssm_conv_direct_matches;
     int fused_concat_tail {-1};      // current CONCAT writes only its tail (index into ssm_conv_direct_matches)
     int fused_ssm_conv_direct {-1};  // current SSM_CONV (+SILU) runs direct (index into ssm_conv_direct_matches)
-    // set while the current node reads srcs outside node->src (direct conv: x, state; FA_BIAS_SUB: the SUB's inputs)
+    // set while the current node reads srcs outside node->src (direct conv: x, state; a skipped producer's inputs)
     // for the sync tracking
     const ggml_tensor * fused_extra_srcs[2] {};
-    // bias-table SUBs of this graph that were not dispatched: their flash attention reads the SUB's inputs
-    std::vector<const ggml_tensor *> fa_bias_subs;
+    // nodes of this graph that were not dispatched because their only reader reads their inputs instead
+    // (a bias-table SUB read by its flash attention, a REPEAT read by its GET_ROWS)
+    std::vector<const ggml_tensor *> skipped_nodes;
     bool fused_skip_node {};                   // the current node is one of them
-    const ggml_tensor * fused_fa_bias_sub {};  // the current flash attention reads this one's inputs
+    const ggml_tensor * fused_fa_bias_sub {};  // the current flash attention reads this skipped SUB's inputs
+    const ggml_tensor * fused_get_rows_bcast {};  // the current GET_ROWS reads this skipped REPEAT's source
     bool fused_fwht_signed {};
     // GLU whose result the next MUL_MAT writes as its B straight from the GLU inputs (GLU_MUL_MAT: q8_1, or f16 for XL)
     ggml_tensor * fused_glu_q8_1 {};
@@ -1816,6 +1818,7 @@ struct ggml_backend_vk_context {
     std::atomic<uint64_t> l2_clip_fusion_count {};
     std::atomic<uint64_t> loop_ctrl_fusion_count {};
     std::atomic<uint64_t> fa_bias_sub_fusion_count {};
+    std::atomic<uint64_t> get_rows_bcast_fusion_count {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
