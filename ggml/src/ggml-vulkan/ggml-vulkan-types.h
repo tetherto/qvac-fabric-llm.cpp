@@ -645,6 +645,17 @@ static constexpr std::initializer_list<std::array<int, 3>> control_mix_edges {
     { 5, 1, 4 }, // add->src[1] == mul
 };
 
+// softmax(scale * states^T queries) over the states, then the weighted sum of the states: Inkling 2's depth mix.
+// The REPEAT of the queries is built for more than one token, the PERMUTE + CONT tail for more than one query.
+static constexpr std::initializer_list<ggml_op> depth_mix_pattern {
+    GGML_OP_REPEAT, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_MUL_MAT, GGML_OP_PERMUTE, GGML_OP_CONT };
+
+// depth_mix.comp: one workgroup of vk_depth_mix_block_size per token; more states or queries keep the separate nodes
+static constexpr uint32_t vk_depth_mix_block_size   = 512;
+static constexpr uint32_t vk_depth_mix_max_states   = 8;
+static constexpr uint32_t vk_depth_mix_max_queries  = 4;
+static constexpr uint32_t vk_depth_mix_cached_steps = 5; // states of up to 2560 channels stay in registers (Inkling 2: 2304)
+
 static constexpr std::initializer_list<std::array<int, 3>> situ_edges {
     { 1, 0, 0 }, // tanh->src[0]  == scale
     { 2, 0, 1 }, // scale->src[0] == tanh
@@ -1194,6 +1205,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_short_conv_f32;
     vk_pipeline pipeline_short_conv_state_f32;
     vk_pipeline pipeline_control_mix_f32;
+    vk_pipeline pipeline_depth_mix_f32;
     vk_pipeline pipeline_ssm_conv_back_sx_f32;
     vk_pipeline pipeline_ssm_conv_back_c_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
@@ -1742,6 +1754,7 @@ struct ggml_backend_vk_context {
     bool fused_short_conv {};
     bool fused_short_conv_state {};
     bool fused_control_mix {};
+    bool fused_depth_mix {};
     // GATED_DELTA_NET (or _DEFERRED) + CPY: the recurrent cache view the gdn writes its state to
     const ggml_tensor * fused_gdn_cache {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
@@ -1766,6 +1779,7 @@ struct ggml_backend_vk_context {
     std::atomic<uint64_t> fwht_fusion_count {};
     std::atomic<uint64_t> glu_mul_mat_fusion_count {};
     std::atomic<uint64_t> gdn_cache_fusion_count {};
+    std::atomic<uint64_t> depth_mix_fusion_count {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
