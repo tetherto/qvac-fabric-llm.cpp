@@ -5,6 +5,7 @@
 // (res + ssm_conv(x, w)) * scale + bias in one pass: a width-4 conv with its residual and output scale (Inkling 2).
 // WITH_STATE: the concat is not materialised. The window comes from the past columns and from res, which is also
 // the conv input, and the last 3 columns of each channel go to the recurrent state, as the concat's copy would.
+// DYNAMIC (with WITH_STATE): the conv also adds window column 3 - lag times the per-head tap lag, for lag 0..3.
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
@@ -22,6 +23,9 @@ layout(binding = 3) writeonly buffer D { float dst[]; };
 #ifdef WITH_STATE
 layout(binding = 4) writeonly buffer S { float state[]; };
 #endif
+#ifdef DYNAMIC
+layout(binding = 5) readonly buffer DY { float taps[]; };
+#endif
 
 // strides in elements: x is the concat [3 + n_t, nr, n_s] (WITH_STATE: past [3, nr, n_s]), w [4, nr],
 // res and dst [nr, n_t * n_s], state [3 * nr, n_s]
@@ -34,6 +38,11 @@ layout(push_constant) uniform PushConstants {
     float scale; float bias;
 #ifdef WITH_STATE
     uint state_nb1;
+#endif
+#ifdef DYNAMIC
+    // taps [4, n_heads, n_t * n_s]: taps_nb1 is the token stride, head_size the channels per head
+    uint taps_nb1;
+    uint head_size;
 #endif
 };
 
@@ -66,8 +75,24 @@ void main() {
 #endif
 
     const uint tok = s * n_t + t;
+#ifdef DYNAMIC
+    // each tap's MUL and ADD round on their own, in lag order, as the separate passes do; spelled out, because an
+    // unrolled loop copy can drop its NoContraction (spirv-tools 2025.1)
+    precise float o = conv4(window, c * w_nb1);
+    const uint tb = tok * taps_nb1 + (c / head_size) * 4;
+    precise float t0 = window[3] * taps[tb];
+    o = o + t0;
+    precise float t1 = window[2] * taps[tb + 1];
+    o = o + t1;
+    precise float t2 = window[1] * taps[tb + 2];
+    o = o + t2;
+    precise float t3 = window[0] * taps[tb + 3];
+    o = o + t3;
+    precise float sum = res[tok * res_nb1 + c] + o;
+#else
     // precise: the residual ADD rounds on its own, as the separate ADD pass does; the scale matches scale.comp
     precise float sum = res[tok * res_nb1 + c] + conv4(window, c * w_nb1);
+#endif
     dst[tok * dst_nb1 + c] = sum * scale + bias;
 
 #ifdef WITH_STATE

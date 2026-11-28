@@ -1647,6 +1647,7 @@ void process_shaders() {
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
     string_to_spv("short_conv_f32", "short_conv.comp", {});
     string_to_spv("short_conv_state_f32", "short_conv.comp", {{"WITH_STATE", "1"}});
+    string_to_spv("short_conv_dyn_f32", "short_conv.comp", {{"WITH_STATE", "1"}, {"DYNAMIC", "1"}});
     string_to_spv("control_mix_f32", "control_mix.comp", {});
     string_to_spv("loop_ctrl_down_f32", "loop_ctrl_down.comp", {});
     string_to_spv("loop_ctrl_up_f32", "loop_ctrl_up.comp", {});

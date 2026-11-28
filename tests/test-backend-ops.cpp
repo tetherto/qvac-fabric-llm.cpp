@@ -2696,6 +2696,65 @@ struct test_geglu_back : public test_case {
 };
 
 // GGML_OP_GET_ROWS
+// GET_ROWS of a REPEAT along dim 2, as llama-graph gathers per-expert scales (Vulkan reads the REPEAT's source)
+struct test_get_rows_repeat : public test_case {
+    const int64_t n;      // cols
+    const int64_t m;      // rows
+    const int64_t r;      // rows to get per token
+    const int64_t tokens;
+    mutable bool has_fusion_counter = false;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GET_ROWS_REPEAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n, m, r, tokens);
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn = uint64_t (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_get_rows_bcast_fusion_count");
+        has_fusion_counter = counter != nullptr;
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return has_fusion_counter; }
+
+    test_get_rows_repeat(int64_t n = 1, int64_t m = 128, int64_t r = 8, int64_t tokens = 7)
+        : n(n), m(m), r(r), tokens(tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, m, 1);
+        ggml_set_name(in, "in");
+        ggml_tensor * rep = ggml_repeat_4d(ctx, in, n, m, tokens, 1);
+        ggml_set_name(rep, "rep");
+        ggml_tensor * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r, tokens);
+        ggml_set_name(rows, "rows");
+        ggml_tensor * out = ggml_get_rows(ctx, rep, rows);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (auto & d : data) {
+                    d = rand() % m;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_get_rows : public test_case {
     const ggml_type type;
     const int n; // cols
@@ -5798,11 +5857,14 @@ struct test_short_conv : public test_case {
     }
 };
 
-// test_short_conv with the conv's state copy: the last 3 concat columns of each channel go to the recurrent state rows
+// test_short_conv with the conv's state copy: the last 3 concat columns of each channel go to the recurrent state rows.
+// n_heads > 0 adds Inkling 2's input-dependent taps, one per head and lag, as its full-attention K and V convs build them.
 struct test_short_conv_state : public test_case {
     const int64_t n_channels;
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
+    const int64_t n_heads;
+    mutable bool has_fusion_counter = false;
 
     std::vector<ggml_tensor *> verify;
 
@@ -5812,14 +5874,39 @@ struct test_short_conv_state : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR3(n_channels, n_seq_tokens, n_seqs);
+        return n_heads ? VARS_TO_STR4(n_channels, n_seq_tokens, n_seqs, n_heads) : VARS_TO_STR3(n_channels, n_seq_tokens, n_seqs);
     }
 
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
 
-    test_short_conv_state(int64_t n_channels = 1024, int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
-        : n_channels(n_channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn = uint64_t (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_short_conv_dyn_fusion_count");
+        has_fusion_counter = counter != nullptr;
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return n_heads > 0 && has_fusion_counter; }
+
+    test_short_conv_state(int64_t n_channels = 1024, int64_t n_seq_tokens = 1, int64_t n_seqs = 1, int64_t n_heads = 0)
+        : n_channels(n_channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), n_heads(n_heads) {}
+
+    ggml_tensor * add_dynamic_taps(ggml_context * ctx, ggml_tensor * out, ggml_tensor * x) {
+        const int64_t n_tokens = n_seq_tokens * n_seqs;
+        ggml_tensor * taps = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4 * n_heads, n_tokens);
+        ggml_set_name(taps, "taps");
+        ggml_tensor * dynamic = ggml_reshape_3d(ctx, taps, 4, n_heads, n_tokens);
+        for (int64_t lag = 0; lag < 4; ++lag) {
+            ggml_tensor * tap    = ggml_view_3d(ctx, dynamic, 1, n_heads, n_tokens, dynamic->nb[1], dynamic->nb[2], lag * dynamic->nb[0]);
+            ggml_tensor * window = ggml_view_3d(ctx, x, n_seq_tokens, n_channels, n_seqs, x->nb[1], x->nb[2], (3 - lag) * x->nb[0]);
+            window = ggml_cont(ctx, ggml_transpose(ctx, window));
+            window = ggml_reshape_3d(ctx, window, n_channels / n_heads, n_heads, n_tokens);
+            out = ggml_add(ctx, out, ggml_reshape_2d(ctx, ggml_mul(ctx, window, tap), n_channels, n_tokens));
+        }
+        return out;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         verify.clear();
@@ -5845,7 +5932,10 @@ struct test_short_conv_state : public test_case {
         verify.push_back(cpy);
 
         ggml_tensor * conv = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, x, w), n_channels, n_seq_tokens * n_seqs);
-        ggml_tensor * out  = ggml_scale(ctx, ggml_add(ctx, cur, conv), 1.0f / sqrtf(5.0f));
+        if (n_heads) {
+            conv = add_dynamic_taps(ctx, conv, x);
+        }
+        ggml_tensor * out  = ggml_scale(ctx, ggml_add(ctx, cur, conv), 1.0f / sqrtf(n_heads ? 9.0f : 5.0f));
         ggml_set_name(out, "out");
         verify.push_back(out);
         return out;
@@ -15204,13 +15294,29 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
     const ggml_type type_KV;
     const bool causal;      // prefix of 0 per query, -inf after, distance bins
     const int64_t n_kv_max; // sparse hint
+    const bool sub_sinks;   // the table is SUB(table, per-query value), as Inkling 2 builds it
+    mutable bool has_fusion_counter = false;
 
     std::vector<int32_t> rows;
     std::vector<int64_t> visible;
 
     std::string vars() override {
-        return VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_bins, kv_rows, sinks, type_KV, causal, n_kv_max);
+        const std::string v = VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_bins, kv_rows, sinks, type_KV, causal, n_kv_max);
+        return sub_sinks ? v + ",sub_sinks=1" : v;
     }
+
+    // whole graph, so a backend can fold the SUB into the attention
+    bool run_whole_graph() override { return sub_sinks; }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn = uint64_t (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fa_bias_sub_fusion_count");
+        has_fusion_counter = counter != nullptr;
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return sub_sinks && has_fusion_counter; }
 
     double max_nmse_err() override {
         return 5e-4;
@@ -15218,9 +15324,9 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
 
     test_flash_attn_ext_indexed_bias(int64_t hs = 128, int64_t nh = 2, int64_t gqa = 3, int64_t kv = 768, int64_t nb = 7, int64_t n_stream = 2,
                                      int64_t n_bins = 17, bool kv_rows = false, bool sinks = true, ggml_type type_KV = GGML_TYPE_F16,
-                                     bool causal = false, int64_t n_kv_max = 0)
+                                     bool causal = false, int64_t n_kv_max = 0, bool sub_sinks = false)
         : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), n_bins(n_bins), kv_rows(kv_rows), sinks(sinks), type_KV(type_KV),
-          causal(causal), n_kv_max(n_kv_max) {}
+          causal(causal), n_kv_max(n_kv_max), sub_sinks(sub_sinks) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_stream);
@@ -15242,6 +15348,12 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
 
         ggml_tensor * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_bins, nh*gqa, nb*n_stream);
         ggml_set_name(table, "table");
+        if (sub_sinks) {
+            ggml_tensor * qsink = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, nh*gqa, nb*n_stream);
+            ggml_set_name(qsink, "qsink");
+            table = ggml_sub(ctx, table, qsink);
+            ggml_set_name(table, "table_sub");
+        }
 
         ggml_tensor * indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, nb*n_stream);
         ggml_set_name(indices, "indices");
@@ -15328,7 +15440,7 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
                 ggml_backend_tensor_set(t, idx.data(), 0, idx.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "table") == 0) {
                 init_tensor_uniform(t, -4.0f, 4.0f);
-            } else if (strcmp(t->name, "s") == 0) {
+            } else if (strcmp(t->name, "s") == 0 || strcmp(t->name, "qsink") == 0) {
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else {
                 init_tensor_uniform(t);
@@ -17227,6 +17339,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_short_conv_state(2304, 1, 1));
     test_cases.emplace_back(new test_short_conv_state(2304, 4, 1));
     test_cases.emplace_back(new test_short_conv_state(1024, 33, 2));
+    for (int64_t n_seqs : { 1, 2 }) {
+        for (int64_t n_seq_tokens : { 1, 4, 33 }) {
+            test_cases.emplace_back(new test_short_conv_state(1024, n_seq_tokens, n_seqs, 8));
+        }
+    }
+    test_cases.emplace_back(new test_short_conv_state(84, 5, 3, 7));
 
     for (bool with_mm : { true, false }) {
         test_cases.emplace_back(new test_control_mix(2304, 1, with_mm));
@@ -17379,6 +17497,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q4_K, 4096, 5, 4, 1, 1, false, false, 0, 0.03f));
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // per-expert scales: 128 experts, 8 used, decode to prefill; and wider rows
+    for (int64_t tokens : {1, 7, 512}) {
+        test_cases.emplace_back(new test_get_rows_repeat(1, 128, 8, tokens));
+    }
+    test_cases.emplace_back(new test_get_rows_repeat(67, 16, 4, 33));
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                           GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
         test_cases.emplace_back(new test_get_rows_after_mul_mat(type));
@@ -19703,9 +19826,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // MUL_MAT_ID+MUL+MUL (per-expert scale, then router weights): one token fuses on the Vulkan mat-vec, four do not
-    for (int bs : {1, 4}) {
-        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
+    // MUL_MAT_ID+MUL+MUL (per-expert scale, then router weights): one token fuses on the Vulkan mat-vec, four do not;
+    // 129 and 512 tokens fuse in the GEMM epilogue (prefetch for NVFP4 and Q8_0, int8 MMQ for Q4_0)
+    for (int bs : {1, 4, 129, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152, 1, true, false, true));
         }
         test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 16, false, 256, bs, 512, 1, true, true, true));
@@ -20696,8 +20820,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t kv : {1536, 4608}) {
         for (int64_t nb : {1, 512}) {
             test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, kv, nb, 1, 1025, false, true, GGML_TYPE_F16, true));
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, kv, nb, 1, 1025, false, true, GGML_TYPE_F16, true, 0, true));
         }
     }
+    // the table as Inkling 2 builds it: a SUB of the per-query sink value
+    for (bool kv_rows : {false, true}) {
+        for (int64_t nb : {1, 7, 65}) {
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768, nb, 2, 17, kv_rows, true, GGML_TYPE_F16, false, 0, true));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 1100, 7, 2, 33, false, false, GGML_TYPE_Q8_0, false, 0, true));
 
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));

@@ -953,6 +953,18 @@ struct vk_op_short_conv_state_push_constants {
     uint32_t state_nb1;
 };
 
+// short_conv.comp WITH_STATE + DYNAMIC: taps_nb1 the taps' token stride, head_size the channels per head (elements)
+struct vk_op_short_conv_dyn_push_constants {
+    uint32_t x_nb1, x_nb2;
+    uint32_t w_nb1;
+    uint32_t res_nb1;
+    uint32_t dst_nb1;
+    uint32_t nr, n_t, n_s;
+    float scale, bias;
+    uint32_t state_nb1;
+    uint32_t taps_nb1, head_size;
+};
+
 // control_mix.comp: every tensor is contiguous with the shape [ne0, nrows]
 struct vk_op_control_mix_push_constants {
     uint32_t ne0;

@@ -460,6 +460,7 @@ static constexpr uint32_t FA_FLAG_MR_LAZY      = 256;   // multi-row: skip ident
 static constexpr uint32_t FA_FLAG_MR_NOEB      = 512;   // multi-row: no loop-end barrier
 static constexpr uint32_t FA_FLAG_MR_VPOST     = 1024;  // multi-row: V^T loads before the softmax barrier
 static constexpr uint32_t FA_FLAG_KV_ROWS      = 2048;  // K/V rows are read through the kv_rows lists (binding 7)
+static constexpr uint32_t FA_FLAG_BIAS_SUB     = 4096;  // the bias table is read minus a per-query value (binding 10)
 
 struct vk_fa_pipeline_state {
     uint32_t HSK, HSV;
@@ -1226,6 +1227,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_tail_f32;
     vk_pipeline pipeline_short_conv_f32;
     vk_pipeline pipeline_short_conv_state_f32;
+    vk_pipeline pipeline_short_conv_dyn_f32;
     vk_pipeline pipeline_control_mix_f32;
     vk_pipeline pipeline_loop_ctrl_down_f32;
     vk_pipeline pipeline_loop_ctrl_up_f32;
@@ -1798,8 +1800,30 @@ struct ggml_backend_vk_context {
     std::vector<ssm_conv_direct_match> ssm_conv_direct_matches;
     int fused_concat_tail {-1};      // current CONCAT writes only its tail (index into ssm_conv_direct_matches)
     int fused_ssm_conv_direct {-1};  // current SSM_CONV (+SILU) runs direct (index into ssm_conv_direct_matches)
-    // set while the current node is a direct conv: srcs read outside node->src (x, state) for the sync tracking
-    const ggml_tensor * fused_extra_srcs[2] {};
+    // set while the current node reads or writes tensors outside node->src and node (direct conv: x, state; a skipped
+    // producer's inputs; the dynamic-tap conv: past, cur, w, taps and the state it writes) for the sync tracking
+    const ggml_tensor * fused_extra_srcs[4] {};
+    const ggml_tensor * fused_extra_dst {};
+    // nodes of this graph that were not dispatched because their only reader reads their inputs instead
+    // (a bias-table SUB read by its flash attention, a REPEAT read by its GET_ROWS)
+    std::vector<const ggml_tensor *> skipped_nodes;
+    bool fused_skip_node {};                   // the current node is one of them
+    const ggml_tensor * fused_fa_bias_sub {};  // the current flash attention reads this skipped SUB's inputs
+    const ggml_tensor * fused_get_rows_bcast {};  // the current GET_ROWS reads this skipped REPEAT's source
+    // per node index of this graph: not dispatched, a later fused pass writes what it would have
+    std::vector<uint8_t> skip_node;
+    // dynamic-tap short convs (Inkling 2) matched in this graph: decided at the CONCAT, run at the SCALE
+    struct short_conv_dyn_match {
+        int scale;                  // node index of the SCALE the fused pass writes
+        const ggml_tensor * past;   // [3, C, S]
+        const ggml_tensor * cur;    // [C, T * S], the conv input and the residual
+        const ggml_tensor * w;      // [4, C]
+        const ggml_tensor * taps;   // [4 * n_heads, T * S]
+        const ggml_tensor * state;  // [3 * C, S], the state rows the CPY writes
+        int64_t head_size;
+    };
+    std::vector<short_conv_dyn_match> short_conv_dyn_matches;
+    int fused_short_conv_dyn {-1};  // current SCALE runs a dynamic-tap conv (index into short_conv_dyn_matches)
     bool fused_fwht_signed {};
     // GLU whose result the next MUL_MAT writes as its B straight from the GLU inputs (GLU_MUL_MAT: q8_1, or f16 for XL)
     ggml_tensor * fused_glu_q8_1 {};
@@ -1809,6 +1833,9 @@ struct ggml_backend_vk_context {
     std::atomic<uint64_t> depth_mix_fusion_count {};
     std::atomic<uint64_t> l2_clip_fusion_count {};
     std::atomic<uint64_t> loop_ctrl_fusion_count {};
+    std::atomic<uint64_t> fa_bias_sub_fusion_count {};
+    std::atomic<uint64_t> get_rows_bcast_fusion_count {};
+    std::atomic<uint64_t> short_conv_dyn_fusion_count {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
