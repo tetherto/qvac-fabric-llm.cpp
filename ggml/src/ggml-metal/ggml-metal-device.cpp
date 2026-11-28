@@ -3011,6 +3011,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm(ggml_met
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_clip(ggml_metal_library_t lib, const ggml_tensor * l2, bool has_w, bool has_f) {
+    assert(l2->op == GGML_OP_L2_NORM);
+
+    char name[256];
+
+    const bool is_c4 = l2->ne[0] % 4 == 0;
+
+    snprintf(name, 256, "kernel_%sl2_clip%s_f32%s", has_w ? "mul_" : "", has_f ? "_mul" : "", is_c4 ? "_4" : "");
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    res.c4   = is_c4;
+    res.smem = 32*sizeof(float);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_GROUP_NORM);
 

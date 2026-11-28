@@ -1983,6 +1983,55 @@ static const std::vector<ggml_op> ops_rms_norm_gate    = { GGML_OP_RMS_NORM, GGM
 // the UNARY reads the gate through a RESHAPE that the graph places right before it
 static const std::vector<ggml_op> ops_rms_norm_rs_gate = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_UNARY, GGML_OP_MUL };
 
+static const std::vector<ggml_op> ops_l2_clip       = { GGML_OP_L2_NORM, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_l2_clip_f     = { GGML_OP_L2_NORM, GGML_OP_SCALE, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_mul_l2_clip   = { GGML_OP_MUL, GGML_OP_L2_NORM, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_mul_l2_clip_f = { GGML_OP_MUL, GGML_OP_L2_NORM, GGML_OP_SCALE, GGML_OP_MUL };
+
+// an L2 clip weight (rows as wide as x) or row factor (one value per row) that repeats over x
+static bool ggml_metal_fusion_l2_clip_input_ok(const ggml_tensor * t, const ggml_tensor * x, int64_t ne0) {
+    return t->type == GGML_TYPE_F32 && t->ne[0] == ne0 && ggml_is_contiguous_rows(t) && ggml_can_repeat(t, x);
+}
+
+// [MUL +] L2_NORM + SCALE [+ MUL]: the factor MUL reads the SCALE as src0; a SCALE with a bias keeps the separate
+// passes, as on Vulkan, since only the bias-free form is checked byte for byte
+static bool ggml_metal_fusion_check_l2_clip(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+
+    const int  n     = (int) fusion->ops.size();
+    const bool has_w = fusion->ops[0] == GGML_OP_MUL;
+    const bool has_f = fusion->ops[n - 1] == GGML_OP_MUL;
+
+    const ggml_tensor * l2    = nodes[has_w ? 1 : 0];
+    const ggml_tensor * scale = nodes[has_w ? 2 : 1];
+    const ggml_tensor * dst   = nodes[n - 1];
+    const ggml_tensor * x     = has_w ? nodes[0]->src[0] : l2->src[0];
+    const ggml_tensor * w     = has_w ? nodes[0]->src[1] : nullptr;
+    const ggml_tensor * f     = has_f ? dst->src[1]      : nullptr;
+
+    const bool ok =
+        x->type == GGML_TYPE_F32 && l2->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        (!has_w || nodes[0]->type == GGML_TYPE_F32) && ggml_is_contiguous_rows(x) && ggml_is_contiguous_rows(dst) &&
+        ggml_get_op_params_f32(scale, 1) == 0.0f &&
+        (!has_w || ggml_metal_fusion_l2_clip_input_ok(w, x, x->ne[0])) &&
+        (!has_f || (dst->src[0] == scale && ggml_metal_fusion_l2_clip_input_ok(f, x, 1)));
+
+    if (!ok || mode != GGML_METAL_FUSION_FULL || x->ne[0] % 4 != 0) {
+        return ok;
+    }
+
+    // the kernel reads x and the weight and writes dst as float4 rows when the rows are a multiple of 4 wide
+    return ggml_metal_fusion_float4_rows(x) && ggml_metal_fusion_float4_rows(dst) && (!has_w || ggml_metal_fusion_float4_rows(w));
+}
+
 static const std::vector<ggml_op> ops_add_2 = { GGML_OP_ADD, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_add_3 = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_add_4 = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
@@ -2280,6 +2329,10 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_rms_norm_mul,           {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_rms_norm_mul_add,       {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_SCALE,     ops_rms_norm_scale,         {},     false, ggml_metal_fusion_check_norm },
+    { GGML_METAL_FUSION_L2_CLIP,        ops_l2_clip,                {},     false, ggml_metal_fusion_check_l2_clip },
+    { GGML_METAL_FUSION_L2_CLIP,        ops_l2_clip_f,              {},     false, ggml_metal_fusion_check_l2_clip },
+    { GGML_METAL_FUSION_L2_CLIP,        ops_mul_l2_clip,            {},     false, ggml_metal_fusion_check_l2_clip },
+    { GGML_METAL_FUSION_L2_CLIP,        ops_mul_l2_clip_f,          {},     false, ggml_metal_fusion_check_l2_clip },
     { GGML_METAL_FUSION_RMS_NORM_GATE,  ops_rms_norm_gate,          {},     true,  ggml_metal_fusion_check_rms_norm_gate },
     { GGML_METAL_FUSION_RMS_NORM_GATE,  ops_rms_norm_rs_gate,       {},     true,  ggml_metal_fusion_check_rms_norm_gate },
     { GGML_METAL_FUSION_ADD_CHAIN,      ops_add_2,                  {},     false, ggml_metal_fusion_check_add_chain },

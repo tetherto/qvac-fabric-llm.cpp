@@ -4743,14 +4743,22 @@ struct test_rms_norm_back : public test_case {
 
 // the row L2 clip of Inkling 2: [x*w ->] l2_norm(x, t)*t [-> *f with one f per token]. tail adds a node after it: the clip
 // fuses (Vulkan L2_CLIP) only when it is not the last node.
+static int64_t backend_fusion_label_count(ggml_backend_t backend, const char * label);
+
 struct test_l2_clip : public test_case {
     const std::array<int64_t, 4> ne;
     const bool  with_w;
     const bool  with_f;
     const float thr;
     const bool  tail;
+    const float bias; // a SCALE bias keeps the separate passes
     mutable bool has_fusion_counter = false;
     mutable bool supported = false;
+    mutable bool has_fusion_label = false;
+
+    std::string fusion_label() const {
+        return std::string(with_w ? "MUL+" : "") + "L2_NORM+SCALE" + (with_f ? "+MUL" : "");
+    }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4760,10 +4768,15 @@ struct test_l2_clip : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR5(ne, with_w, with_f, thr, tail);
+        return VARS_TO_STR6(ne, with_w, with_f, thr, tail, bias);
     }
 
     uint64_t fusion_count(ggml_backend_t backend) override {
+        const int64_t label_count = backend_fusion_label_count(backend, fusion_label().c_str());
+        has_fusion_label = label_count >= 0;
+        if (has_fusion_label) {
+            return (uint64_t) label_count;
+        }
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         using counter_fn   = uint64_t (*)(ggml_backend_t);
         using supported_fn = bool (*)(ggml_backend_t);
@@ -4774,13 +4787,18 @@ struct test_l2_clip : public test_case {
         return counter != nullptr ? counter(backend) : 0;
     }
 
-    bool expect_fusion() override { return tail && has_fusion_counter && supported; }
+    // Vulkan keeps the separate passes when the clip is the last node, Metal fuses it there too
+    bool expect_fusion() override {
+        return bias == 0.0f && (has_fusion_label || (tail && has_fusion_counter && supported));
+    }
 
-    bool expect_no_fusion() override { return !tail && has_fusion_counter; }
+    bool expect_no_fusion() override {
+        return bias != 0.0f ? (has_fusion_label || has_fusion_counter) : (!has_fusion_label && !tail && has_fusion_counter);
+    }
 
     test_l2_clip(std::array<int64_t, 4> ne = {128, 24, 3, 1}, bool with_w = true, bool with_f = false, float thr = 22.6f,
-                 bool tail = true)
-        : ne(ne), with_w(with_w), with_f(with_f), thr(thr), tail(tail) {}
+                 bool tail = true, float bias = 0.0f)
+        : ne(ne), with_w(with_w), with_f(with_f), thr(thr), tail(tail), bias(bias) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -4791,7 +4809,7 @@ struct test_l2_clip : public test_case {
             ggml_set_name(w, "w");
             cur = ggml_mul(ctx, cur, w);
         }
-        cur = ggml_scale(ctx, ggml_l2_norm(ctx, cur, thr), thr);
+        cur = ggml_scale_bias(ctx, ggml_l2_norm(ctx, cur, thr), thr, bias);
         if (with_f) {
             ggml_tensor * f = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, ne[2], ne[3]);
             ggml_set_name(f, "f");
@@ -18475,14 +18493,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool with_f : { false, true }) {
             for (std::array<int64_t, 4> ne : { std::array<int64_t, 4>{128, 24, 1, 1}, std::array<int64_t, 4>{128, 8, 7, 1},
                                                std::array<int64_t, 4>{16, 24, 5, 1}, std::array<int64_t, 4>{128, 24, 512, 1},
-                                               std::array<int64_t, 4>{1500, 2, 3, 2} }) {
+                                               std::array<int64_t, 4>{1500, 2, 3, 2}, std::array<int64_t, 4>{130, 6, 3, 1} }) {
                 test_cases.emplace_back(new test_l2_clip(ne, with_w, with_f, ne[0] == 16 ? 8.0f : 22.6f));
             }
         }
     }
-    // as the last node the clip keeps its separate passes
+    // the clip as the last node of the graph
     test_cases.emplace_back(new test_l2_clip({128, 24, 1, 1}, true, true, 22.6f, false));
     test_cases.emplace_back(new test_l2_clip({128, 8, 7, 1}, false, false, 22.6f, false));
+    test_cases.emplace_back(new test_l2_clip({128, 24, 3, 1}, true, true, 22.6f, true, 0.25f));
+    test_cases.emplace_back(new test_l2_clip({130, 8, 3, 1}, false, false, 22.6f, true, 0.25f));
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));

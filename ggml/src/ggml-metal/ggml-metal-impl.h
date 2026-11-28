@@ -978,6 +978,32 @@ typedef struct {
     float    eps;
 } ggml_metal_kargs_l2_norm;
 
+// the strides of x (nb0*), the weight (nb1*), the row factor (nb2*) and dst; the weight and the factor repeat over x
+typedef struct {
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    int32_t  ne00;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    int32_t  ne21;
+    int32_t  ne22;
+    int32_t  ne23;
+    float    eps;   // of the L2_NORM
+    float    scale; // of the SCALE
+    float    bias;  // of the SCALE
+} ggml_metal_kargs_l2_clip;
+
 typedef struct {
     int64_t  ne00;
     int64_t  ne01;

@@ -5925,6 +5925,85 @@ int ggml_metal_op_flash_attn_ext_back(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// [MUL +] L2_NORM + SCALE [+ MUL] in one pass (see GGML_METAL_FUSION_L2_CLIP), one threadgroup per row as the L2_NORM
+static int ggml_metal_op_l2_clip(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    const bool has_w = ctx->node(idx)->op == GGML_OP_MUL;
+    const bool has_f = ctx->node(idx + n_fuse - 1)->op == GGML_OP_MUL;
+
+    const ggml_tensor * l2    = ctx->node(idx + (has_w ? 1 : 0));
+    const ggml_tensor * scale = ctx->node(idx + (has_w ? 2 : 1));
+    const ggml_tensor * dst   = ctx->node(idx + n_fuse - 1);
+
+    // an absent weight or factor binds x, which the kernel then does not read
+    const ggml_tensor * x = has_w ? ctx->node(idx)->src[0] : l2->src[0];
+    const ggml_tensor * w = has_w ? ctx->node(idx)->src[1] : x;
+    const ggml_tensor * f = has_f ? dst->src[1]            : x;
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, x,   ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, x,   nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, w,   ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, w,   nb);
+    GGML_TENSOR_LOCALS( int32_t, ne2, f,   ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb2, f,   nb);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  dst, nb);
+
+    auto pipeline = ggml_metal_library_get_pipeline_l2_clip(lib, l2, has_w, has_f);
+
+    ggml_metal_kargs_l2_clip args = {
+        /*.nb01  =*/ nb01,
+        /*.nb02  =*/ nb02,
+        /*.nb03  =*/ nb03,
+        /*.nb11  =*/ nb11,
+        /*.nb12  =*/ nb12,
+        /*.nb13  =*/ nb13,
+        /*.nb21  =*/ nb21,
+        /*.nb22  =*/ nb22,
+        /*.nb23  =*/ nb23,
+        /*.nb1   =*/ nb1,
+        /*.nb2   =*/ nb2,
+        /*.nb3   =*/ nb3,
+        /*.ne00  =*/ pipeline.c4 ? ne00/4 : ne00,
+        /*.ne11  =*/ ne11,
+        /*.ne12  =*/ ne12,
+        /*.ne13  =*/ ne13,
+        /*.ne21  =*/ ne21,
+        /*.ne22  =*/ ne22,
+        /*.ne23  =*/ ne23,
+        /*.eps   =*/ ggml_get_op_params_f32(l2, 0),
+        /*.scale =*/ ggml_get_op_params_f32(scale, 0),
+        /*.bias  =*/ ggml_get_op_params_f32(scale, 1),
+    };
+
+    // the thread count of ggml_metal_op_l2_norm, so the sums reduce in the same order
+    int nth = 32; // SIMD width
+
+    while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+        nth *= 2;
+    }
+
+    nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+        GGML_LOG_DEBUG("%s: fuse: L2 clip, %d nodes, weight %d, factor %d\n", __func__, n_fuse, has_w, has_f);
+    }
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(f),   3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst), 4);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+
+    return n_fuse;
+}
+
 int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     int n_fuse = 1;
     const ggml_metal_fusion * fusion = nullptr;
@@ -5951,6 +6030,11 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_MOE_REDUCE) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_moe_reduce(ctx, idx);
+        }
+
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_L2_CLIP) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_l2_clip(ctx, idx, n_fuse);
         }
 
         // sign vector + hadamard mul_mat: mul -> reshape -> mul_mat
@@ -6119,6 +6203,16 @@ int ggml_metal_op_silu_back(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_l2_norm(ggml_metal_op_t ctx, int idx) {
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_L2_CLIP) {
+            ctx->count_fusions(fusion);
+
+            return ggml_metal_op_l2_clip(ctx, idx, n);
+        }
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
