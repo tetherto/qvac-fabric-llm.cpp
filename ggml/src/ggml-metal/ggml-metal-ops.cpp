@@ -884,6 +884,70 @@ static int ggml_metal_op_ssm_conv_state_resid(ggml_metal_op_t ctx, int idx, int 
     return n_fuse;
 }
 
+// [RMS_NORM] [CONCAT] [REPEAT] MUL_MAT + SOFT_MAX + CONT + MUL_MAT [+ CONT], see GGML_METAL_FUSION_DEPTH_MIX
+static int ggml_metal_op_depth_mix(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_metal_op_fusion_concurrency(ctx, idx, n_fuse);
+
+    const ggml_tensor * nodes[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < n_fuse; ++i) {
+        nodes[i] = ctx->node(idx + i);
+    }
+    const ggml_metal_depth_mix_nodes m = ggml_metal_fusion_depth_mix_nodes(nodes, n_fuse);
+
+    const ggml_tensor * states = m.concat ? m.concat : m.scores->src[0];
+    const ggml_tensor * stack  = m.concat ? m.concat->src[0] : states;
+    const ggml_tensor * last   = m.norm ? m.norm->src[0] : m.concat ? m.concat->src[1] : stack;
+    const ggml_tensor * query  = m.repeat ? m.repeat->src[0] : m.scores->src[1];
+    const ggml_tensor * dst    = m.tail ? m.tail : m.out;
+
+    const int last_mode = m.norm ? GGML_METAL_DEPTH_MIX_LAST_NORM : m.concat ? GGML_METAL_DEPTH_MIX_LAST_READ : GGML_METAL_DEPTH_MIX_LAST_NONE;
+
+    // dst holds [n_embd, n_queries, n_tokens] with contiguous channels: the one-query out [1, n_embd, n_tokens], the CONT
+    // of its permute, or the [n_embd, n_tokens] CONT of a view of the one-query out
+    const bool dst_2d = m.tail && m.tail->src[0]->op == GGML_OP_VIEW;
+
+    ggml_metal_kargs_depth_mix args = {
+        /*.n_embd4   =*/ (int32_t) (states->ne[0]/4),
+        /*.n_stack   =*/ (int32_t) stack->ne[1],
+        /*.n_queries =*/ (int32_t) query->ne[1],
+        /*.scale     =*/ ggml_get_op_params_f32(m.soft_max, 0),
+        /*.eps       =*/ m.norm ? ggml_get_op_params_f32(m.norm, 0) : 0.0f,
+        /*.nbs1      =*/ stack->nb[1],
+        /*.nbs2      =*/ stack->nb[2],
+        /*.nbl2      =*/ last->nb[2],
+        /*.nbq1      =*/ query->nb[1],
+        /*.nbd1      =*/ m.tail && !dst_2d ? dst->nb[1] : 0,
+        /*.nbd2      =*/ dst_2d ? dst->nb[1] : dst->nb[2],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_depth_mix(lib, last_mode);
+
+    // one float4 channel per thread, in whole simdgroups
+    constexpr int simd_width = 32;
+    const int nth_max = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), simd_width*GGML_METAL_DEPTH_MIX_MAX_SIMDGROUPS);
+    const int nth     = std::min(nth_max, (args.n_embd4 + simd_width - 1)/simd_width*simd_width);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(stack), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(last),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(query), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),   4);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, states->ne[2], 1, 1, nth, 1, 1);
+
+    if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+        GGML_LOG_DEBUG("%s: fuse: DEPTH_MIX (%d nodes, last mode %d)\n", __func__, n_fuse, last_mode);
+    }
+
+    return n_fuse;
+}
+
 int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -903,6 +967,11 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
 
             return ggml_metal_op_ssm_conv_state_resid(ctx, idx, n);
+        }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DEPTH_MIX) {
+            ctx->count_fusions(fusion);
+
+            return ggml_metal_op_depth_mix(ctx, idx, n);
         }
     }
 
@@ -996,6 +1065,16 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
 
 int ggml_metal_op_repeat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DEPTH_MIX) {
+            ctx->count_fusions(fusion);
+
+            return ggml_metal_op_depth_mix(ctx, idx, n);
+        }
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -3836,6 +3915,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
             return ggml_metal_op_mul_mv_glu(ctx, idx, n);
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DEPTH_MIX) {
+            ctx->count_fusions(fusion);
+
+            return ggml_metal_op_depth_mix(ctx, idx, n);
+        }
     }
 
     ggml_tensor * op = ctx->node(idx);
@@ -6656,6 +6740,11 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_RMS_NORM_ROPE) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_rms_norm_rope(ctx, idx, n);
+        }
+
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DEPTH_MIX) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_depth_mix(ctx, idx, n);
         }
 
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_RMS_NORM_FWHT) {

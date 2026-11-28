@@ -6012,7 +6012,8 @@ struct test_loop_ctrl : public test_case {
 };
 
 // Inkling 2's depth mix as mix() builds it on a GPU: softmax(states^T queries / sqrt(n_embd)) over the states, then their
-// weighted sum per query. tail adds a node after it: the mix fuses (Vulkan DEPTH_MIX) only when it is not the last node.
+// weighted sum per query. tail adds a node after it: the mix fuses (Vulkan DEPTH_MIX) only when it is not the last node;
+// fuses is Vulkan's expectation, metal_fuses() Metal's (DEPTH_MIX there also fuses as the last node).
 struct test_depth_mix : public test_case {
     const int64_t n_embd;
     const int64_t n_states;
@@ -6025,6 +6026,10 @@ struct test_depth_mix : public test_case {
     const depth_mix_shared shared;
     mutable bool has_fusion_counter = false;
     mutable bool supported = false;
+    mutable bool metal = false;
+
+    // the Metal kernel takes float4 channels and up to 8 states and 4 queries
+    bool metal_fuses() const { return n_embd % 4 == 0 && n_states <= 8 && n_queries <= 4; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6047,14 +6052,16 @@ struct test_depth_mix : public test_case {
         using supported_fn = bool (*)(ggml_backend_t);
         auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_depth_mix_fusion_count");
         auto support = (supported_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_depth_mix_supported");
+        auto metal_counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_depth_mix_fusion_count");
         has_fusion_counter = counter != nullptr;
         supported = support != nullptr && support(backend);
-        return counter != nullptr ? counter(backend) : 0;
+        metal = metal_counter != nullptr;
+        return counter != nullptr ? counter(backend) : metal ? metal_counter(backend) : 0;
     }
 
-    bool expect_fusion() override { return fuses && has_fusion_counter && supported; }
+    bool expect_fusion() override { return metal ? metal_fuses() : fuses && has_fusion_counter && supported; }
 
-    bool expect_no_fusion() override { return !fuses && has_fusion_counter; }
+    bool expect_no_fusion() override { return metal ? !metal_fuses() : !fuses && has_fusion_counter; }
 
     test_depth_mix(int64_t n_embd, int64_t n_states, int64_t n_queries, int64_t n_tokens, bool tail = true, bool fuses = true,
                    depth_mix_head head = depth_mix_head::states, bool view_cont = false, depth_mix_shared shared = depth_mix_shared::none)
@@ -17327,6 +17334,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // wider than the states the Vulkan pass keeps in registers
     test_cases.emplace_back(new test_depth_mix(3000, 5, 3, 7));
     test_cases.emplace_back(new test_depth_mix(3000, 2, 1, 1));
+    // more float4 channels than a Metal threadgroup has threads
+    test_cases.emplace_back(new test_depth_mix(8200, 3, 2, 3, true, true, depth_mix_head::norm));
     // the states as the model builds them, a CONCAT of the stack with the last state, which may be an RMS_NORM
     for (depth_mix_head head : { depth_mix_head::concat, depth_mix_head::norm }) {
         for (int64_t n_states : { 2, 5 }) {

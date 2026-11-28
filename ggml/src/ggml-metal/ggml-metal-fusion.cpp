@@ -2352,6 +2352,199 @@ static bool ggml_metal_fusion_check_situ(
     return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n_nodes, fusion->ops.data(), outputs, 1);
 }
 
+// ---- depth mix ------------------------------------------------------------
+
+// Inkling 2's depth mix as mix() builds it: [RMS_NORM of the last state] [CONCAT] [REPEAT of the queries], the scores
+// MUL_MAT, SOFT_MAX, the CONT of the transposed states, the weighted-sum MUL_MAT [+ the CONT of a permute or a view]
+enum ggml_metal_depth_mix_head { GGML_METAL_DEPTH_MIX_HEAD_STATES, GGML_METAL_DEPTH_MIX_HEAD_CONCAT, GGML_METAL_DEPTH_MIX_HEAD_NORM };
+enum ggml_metal_depth_mix_tail { GGML_METAL_DEPTH_MIX_TAIL_NONE, GGML_METAL_DEPTH_MIX_TAIL_PERMUTE, GGML_METAL_DEPTH_MIX_TAIL_VIEW };
+
+// the raw op sequence of one pattern, views included, in the order the graph builds it
+static std::vector<ggml_op> ops_depth_mix(ggml_metal_depth_mix_head head, bool repeat, ggml_metal_depth_mix_tail tail) {
+    std::vector<ggml_op> ops;
+    if (head == GGML_METAL_DEPTH_MIX_HEAD_NORM) {
+        ops.push_back(GGML_OP_RMS_NORM);
+    }
+    if (head != GGML_METAL_DEPTH_MIX_HEAD_STATES) {
+        ops.push_back(GGML_OP_CONCAT);
+    }
+    if (repeat) {
+        ops.push_back(GGML_OP_REPEAT);
+    }
+    ops.insert(ops.end(), { GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_MUL_MAT });
+    if (tail == GGML_METAL_DEPTH_MIX_TAIL_PERMUTE) {
+        ops.insert(ops.end(), { GGML_OP_PERMUTE, GGML_OP_CONT });
+    } else if (tail == GGML_METAL_DEPTH_MIX_TAIL_VIEW) {
+        ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_CONT });
+    }
+    return ops;
+}
+
+struct ggml_metal_depth_mix_nodes ggml_metal_fusion_depth_mix_nodes(const ggml_tensor * const * nodes, int n) {
+    ggml_metal_depth_mix_nodes m = {};
+    int j = 0;
+    m.norm     = nodes[j]->op == GGML_OP_RMS_NORM ? nodes[j++] : nullptr;
+    m.concat   = nodes[j]->op == GGML_OP_CONCAT   ? nodes[j++] : nullptr;
+    m.repeat   = nodes[j]->op == GGML_OP_REPEAT   ? nodes[j++] : nullptr;
+    m.scores   = nodes[j++];
+    m.soft_max = nodes[j++];
+    m.cont     = nodes[j++];
+    m.out      = nodes[j++];
+    m.tail     = j < n ? nodes[j] : nullptr;
+    return m;
+}
+
+static const ggml_tensor * ggml_metal_depth_mix_states(const ggml_metal_depth_mix_nodes & m) {
+    return m.concat ? m.concat : m.scores->src[0];
+}
+
+static const ggml_tensor * ggml_metal_depth_mix_query(const ggml_metal_depth_mix_nodes & m) {
+    return m.repeat ? m.repeat->src[0] : m.scores->src[1];
+}
+
+static bool ggml_metal_depth_mix_all_f32(const ggml_metal_depth_mix_nodes & m) {
+    for (const ggml_tensor * t : { m.norm, m.concat, m.repeat, m.scores, m.soft_max, m.cont, m.out, m.tail }) {
+        if (t && (t->type != GGML_TYPE_F32 || (t->src[0] && t->src[0]->type != GGML_TYPE_F32) ||
+                  (t->src[1] && t->src[1]->type != GGML_TYPE_F32))) {
+            return false;
+        }
+    }
+    return ggml_metal_depth_mix_query(m)->type == GGML_TYPE_F32;
+}
+
+// the states [n_embd, n_states, n_tokens], the stack and the last state of the concat, and the [n_embd, n_queries] queries
+static bool ggml_metal_depth_mix_inputs_ok(const ggml_metal_depth_mix_nodes & m) {
+    const ggml_tensor * states = ggml_metal_depth_mix_states(m);
+    const ggml_tensor * query  = ggml_metal_depth_mix_query(m);
+    const int64_t n_embd = states->ne[0];
+
+    if (n_embd % 4 != 0 || states->ne[1] > GGML_METAL_DEPTH_MIX_MAX_STATES || states->ne[3] != 1 ||
+        query->ne[0] != n_embd || query->ne[1] > GGML_METAL_DEPTH_MIX_MAX_QUERIES || query->ne[2] != 1 || query->ne[3] != 1 ||
+        query->nb[0] != sizeof(float) || states->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (m.repeat && (m.repeat->ne[0] != n_embd || m.repeat->ne[1] != query->ne[1] || m.repeat->ne[2] != states->ne[2] || m.repeat->ne[3] != 1)) {
+        return false;
+    }
+    if (!m.concat) {
+        return true;
+    }
+
+    const ggml_tensor * stack = m.concat->src[0];
+    const ggml_tensor * last  = m.concat->src[1];
+    if (ggml_get_op_params_i32(m.concat, 0) != 1 || stack->nb[0] != sizeof(float) || last->nb[0] != sizeof(float) ||
+        last->ne[1] != 1 || stack->ne[2] != states->ne[2] || last->ne[2] != states->ne[2]) {
+        return false;
+    }
+    return !m.norm || (m.norm == last && m.norm->src[0]->nb[0] == sizeof(float) && ggml_are_same_shape(m.norm->src[0], last));
+}
+
+// scores = MUL_MAT(states, queries), softmax without mask or sinks, out = MUL_MAT(softmax, CONT(states^T)) [n_queries, n_embd, n_tokens]
+static bool ggml_metal_depth_mix_core_ok(const ggml_metal_depth_mix_nodes & m) {
+    const ggml_tensor * states = ggml_metal_depth_mix_states(m);
+    const ggml_tensor * tr     = m.cont->src[0];
+
+    if (m.scores->src[0] != states || m.scores->src[1] != (m.repeat ? m.repeat : ggml_metal_depth_mix_query(m))) {
+        return false;
+    }
+    if (m.soft_max->src[0] != m.scores || m.soft_max->src[1] || m.soft_max->src[2] || ggml_get_op_params_f32(m.soft_max, 1) != 0.0f) {
+        return false;
+    }
+    if (tr->op != GGML_OP_TRANSPOSE || tr->src[0] != states) {
+        return false;
+    }
+    return m.out->src[0] == m.soft_max && m.out->src[1] == m.cont && ggml_is_contiguous(m.out);
+}
+
+// the last node holds the mix as [n_embd, n_queries, n_tokens] with contiguous channels: the one-query output itself,
+// the CONT of its permute, or the CONT of a whole contiguous view of the one-query output
+static bool ggml_metal_depth_mix_tail_ok(const ggml_metal_depth_mix_nodes & m) {
+    const int64_t n_queries = m.out->ne[0];
+    if (!m.tail) {
+        return n_queries == 1;
+    }
+
+    const ggml_tensor * v = m.tail->src[0];
+    if (!ggml_is_contiguous(m.tail) || v->view_src != m.out) {
+        return false;
+    }
+    if (v->op == GGML_OP_PERMUTE) {
+        const int32_t * axes = (const int32_t *) v->op_params;
+        return v->src[0] == m.out && axes[0] == 1 && axes[1] == 0 && axes[2] == 2 && axes[3] == 3;
+    }
+    return v->op == GGML_OP_VIEW && n_queries == 1 && v->src[0]->op == GGML_OP_RESHAPE && v->src[0]->src[0] == m.out &&
+        v->view_offs == 0 && ggml_is_contiguous(v) && ggml_nelements(v) == ggml_nelements(m.out);
+}
+
+// the elided nodes may have no consumers outside the group; the transpose is a node of the group only when it views
+// the concat (an external states tensor is read directly)
+static bool ggml_metal_depth_mix_subgraph_ok(
+        const ggml_metal_fusion      * fusion,
+        const ggml_metal_depth_mix_nodes & m,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx) {
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    const int n_raw = ggml_metal_fusion_raw_span(fusion, gf, node_idxs, idx, raw_idxs);
+    if (n_raw == 0) {
+        return false;
+    }
+
+    int     idxs[GGML_METAL_FUSION_MAX];
+    ggml_op ops [GGML_METAL_FUSION_MAX];
+    int n = 0;
+    for (int i = 0; i < n_raw; ++i) {
+        if (gf->nodes[raw_idxs[i]] == m.cont->src[0] && !m.concat) {
+            continue;
+        }
+        idxs[n] = raw_idxs[i];
+        ops [n] = fusion->ops_all[i];
+        n++;
+    }
+
+    const int outputs[1] = { raw_idxs[n_raw - 1] };
+    return ggml_can_fuse_subgraph_ext(gf, idxs, n, ops, outputs, 1);
+}
+
+// the kernel reads float4 channels of the stack, the last state and the queries and writes float4 channels; the
+// one-query out [1, n_embd, n_tokens] keeps its channels in dim 1, so only its start and token stride matter
+static bool ggml_metal_depth_mix_memory_ok(const ggml_metal_depth_mix_nodes & m) {
+    const ggml_tensor * stack = m.concat ? m.concat->src[0] : ggml_metal_depth_mix_states(m);
+    const ggml_tensor * last  = m.norm ? m.norm->src[0] : m.concat ? m.concat->src[1] : nullptr;
+
+    for (const ggml_tensor * t : { stack, last, ggml_metal_depth_mix_query(m), m.tail }) {
+        if (t && !ggml_metal_fusion_float4_rows(t)) {
+            return false;
+        }
+    }
+    if (m.tail) {
+        return true;
+    }
+
+    constexpr size_t align = 4*sizeof(float);
+    ggml_backend_buffer_t buf = m.out->view_src ? m.out->view_src->buffer : m.out->buffer;
+    const ggml_metal_buffer_id bid = ggml_metal_buffer_get_id((ggml_metal_buffer_t) buf->context, m.out);
+    return bid.offs % align == 0 && m.out->nb[2] % align == 0;
+}
+
+static bool ggml_metal_fusion_check_depth_mix(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    const ggml_metal_depth_mix_nodes m = ggml_metal_fusion_depth_mix_nodes(nodes, (int) fusion->ops.size());
+
+    if (!ggml_metal_depth_mix_all_f32(m) || !ggml_metal_depth_mix_inputs_ok(m) || !ggml_metal_depth_mix_core_ok(m) ||
+        !ggml_metal_depth_mix_tail_ok(m) || !ggml_metal_depth_mix_subgraph_ok(fusion, m, gf, node_idxs, idx)) {
+        return false;
+    }
+
+    // the graph is not allocated in the structural phase
+    return mode == GGML_METAL_FUSION_STRUCTURAL || ggml_metal_depth_mix_memory_ok(m);
+}
+
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_norm_mul_add,           {},     false, ggml_metal_fusion_check_norm },
@@ -2414,6 +2607,25 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_RMS_NORM_ROPE,   ops_rms_norm_rope_set,     {},     true,  ggml_metal_fusion_check_rms_norm_rope },
     { GGML_METAL_FUSION_RMS_NORM_ROPE,   ops_rms_norm_rope,         {},     true,  ggml_metal_fusion_check_rms_norm_rope },
     { GGML_METAL_FUSION_SITU,            ops_situ,                  {},     true,  ggml_metal_fusion_check_situ },
+    // the depth mix: each head (norm + concat, concat, plain states) with and without the queries' REPEAT and each tail
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_NORM, false, GGML_METAL_DEPTH_MIX_TAIL_VIEW), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_NORM, false, GGML_METAL_DEPTH_MIX_TAIL_PERMUTE), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_NORM, false, GGML_METAL_DEPTH_MIX_TAIL_NONE), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_NORM, true, GGML_METAL_DEPTH_MIX_TAIL_VIEW), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_NORM, true, GGML_METAL_DEPTH_MIX_TAIL_PERMUTE), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_NORM, true, GGML_METAL_DEPTH_MIX_TAIL_NONE), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_CONCAT, false, GGML_METAL_DEPTH_MIX_TAIL_VIEW), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_CONCAT, false, GGML_METAL_DEPTH_MIX_TAIL_PERMUTE), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_CONCAT, false, GGML_METAL_DEPTH_MIX_TAIL_NONE), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_CONCAT, true, GGML_METAL_DEPTH_MIX_TAIL_VIEW), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_CONCAT, true, GGML_METAL_DEPTH_MIX_TAIL_PERMUTE), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_CONCAT, true, GGML_METAL_DEPTH_MIX_TAIL_NONE), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_STATES, false, GGML_METAL_DEPTH_MIX_TAIL_VIEW), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_STATES, false, GGML_METAL_DEPTH_MIX_TAIL_PERMUTE), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_STATES, false, GGML_METAL_DEPTH_MIX_TAIL_NONE), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_STATES, true, GGML_METAL_DEPTH_MIX_TAIL_VIEW), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_STATES, true, GGML_METAL_DEPTH_MIX_TAIL_PERMUTE), {}, true, ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX, ops_depth_mix(GGML_METAL_DEPTH_MIX_HEAD_STATES, true, GGML_METAL_DEPTH_MIX_TAIL_NONE), {}, true, ggml_metal_fusion_check_depth_mix },
 };
 
 ggml_metal_fusion_id ggml_metal_fusion_id_at(int idx) {

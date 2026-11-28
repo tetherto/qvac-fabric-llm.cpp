@@ -586,6 +586,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_me
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix(ggml_metal_library_t lib, int last_mode) {
+    GGML_ASSERT(last_mode >= GGML_METAL_DEPTH_MIX_LAST_NONE && last_mode <= GGML_METAL_DEPTH_MIX_LAST_NORM);
+
+    static const char * names[] = { "kernel_depth_mix_none", "kernel_depth_mix_read", "kernel_depth_mix_norm" };
+    const char * name = names[last_mode];
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    // the subgroup sums of every score and of the last state's sum of squares
+    res.smem = (GGML_METAL_DEPTH_MIX_MAX_QUERIES*GGML_METAL_DEPTH_MIX_MAX_STATES + 1)*GGML_METAL_DEPTH_MIX_MAX_SIMDGROUPS*sizeof(float);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer(
         ggml_metal_library_t lib,
         const ggml_tensor * op) {

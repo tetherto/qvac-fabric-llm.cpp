@@ -1301,6 +1301,28 @@ typedef struct {
     int32_t  n_head_log2;
 } ggml_metal_kargs_soft_max;
 
+// the depth mix kernel keeps every (query, state) score in registers; the last state is absent, read, or RMS-normalized
+#define GGML_METAL_DEPTH_MIX_MAX_STATES     8
+#define GGML_METAL_DEPTH_MIX_MAX_QUERIES    4
+#define GGML_METAL_DEPTH_MIX_MAX_SIMDGROUPS 32
+#define GGML_METAL_DEPTH_MIX_LAST_NONE      0
+#define GGML_METAL_DEPTH_MIX_LAST_READ      1
+#define GGML_METAL_DEPTH_MIX_LAST_NORM      2
+
+typedef struct {
+    int32_t  n_embd4;   // float4 channels
+    int32_t  n_stack;   // states read from the stack, before the last state
+    int32_t  n_queries;
+    float    scale;     // of the SOFT_MAX
+    float    eps;       // of the RMS_NORM of the last state
+    uint64_t nbs1;      // stack [n_embd, n_stack, n_tokens] strides
+    uint64_t nbs2;
+    uint64_t nbl2;      // last state [n_embd, 1, n_tokens] token stride
+    uint64_t nbq1;      // queries [n_embd, n_queries] row stride
+    uint64_t nbd1;      // dst [n_embd, n_queries, n_tokens] strides
+    uint64_t nbd2;
+} ggml_metal_kargs_depth_mix;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne00_4;
