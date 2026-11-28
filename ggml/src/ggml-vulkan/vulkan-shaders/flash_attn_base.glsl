@@ -39,6 +39,8 @@ const bool USE_KV_ROWS      = (Flags & 2048) != 0;
 // K/V rows are read through the index list of binding 7
 const bool KV_GATHER        = USE_SPARSE || USE_KV_ROWS;
 const bool USE_BIAS         = BiasBins != 0;
+// the table is read minus binding 10's value of the same query and head (a SUB folded into the kernel)
+const bool BIAS_SUB         = (Flags & 4096) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -101,6 +103,7 @@ layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 
 layout (binding = 8) readonly buffer BT {float data_bias_table[];};
 layout (binding = 9) readonly buffer BI {int32_t data_bias_idx[];};
+layout (binding = 10) readonly buffer BS {float data_bias_sub[];};
 
 #define MASK_OPT_ALL_NEG_INF 1
 // a mask value at or below this (f16 -inf, or the lowest finite f16 some mask writers use for it) hides the key
@@ -336,7 +339,13 @@ float fa_bias(const uint32_t r, const uint32_t m_col) {
     const uint32_t query = iq3 * p.nem1 + row;
     const uint32_t head  = gqa ? iq2 + r : iq2;
     const uint32_t bin   = uint32_t(data_bias_idx[query * KV + m_col]);
-    return data_bias_table[(query * p.neq2 + head) * BiasBins + bin];
+    const float t = data_bias_table[(query * p.neq2 + head) * BiasBins + bin];
+    if (!BIAS_SUB) {
+        return t;
+    }
+    // the f32 subtraction of the SUB it replaces, kept apart from the caller's add
+    precise float b = t - data_bias_sub[query * p.neq2 + head];
+    return b;
 }
 
 const uint32_t F32_SIGN_BITS            = 0x80000000u;
@@ -380,7 +389,8 @@ float fa_round_to_f16(const float x) {
 
 // Mask value m plus the indexed bias, rounded to f16 as the fallback's F16 mask stores it.
 float fa_add_bias(const float m, const uint32_t r, const uint32_t m_col) {
-    return fa_round_to_f16(m + fa_bias(r, m_col));
+    precise float mb = m + fa_bias(r, m_col);
+    return fa_round_to_f16(mb);
 }
 
 // Bias applied to softmax to stay in fp16 range.

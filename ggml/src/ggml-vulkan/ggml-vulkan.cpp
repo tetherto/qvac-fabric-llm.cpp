@@ -1832,8 +1832,8 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 // compiles the sparse gather path too, so they must not overlap.
 static constexpr uint32_t GGML_VK_FA_FLAG_QJL_FULL_PROJ = 32;
 
-// Q, K, V, mask, sinks, O, mask_opt, sparse/kv_rows, bias table, bias indices
-static constexpr uint32_t GGML_VK_FA_BINDING_COUNT = 10;
+// Q, K, V, mask, sinks, O, mask_opt, sparse/kv_rows, bias table, bias indices, bias subtrahend
+static constexpr uint32_t GGML_VK_FA_BINDING_COUNT = 11;
 
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type,
@@ -11718,8 +11718,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint32_t nem3 = mask ? mask->ne[3] : 0;
 
     const bool has_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
-    const ggml_tensor * bias_table = has_bias ? dst->src[6] : nullptr;
-    const ggml_tensor * bias_idx   = has_bias ? dst->src[7] : nullptr;
+    // FA_BIAS_SUB: the table's SUB was not dispatched; read its minuend and subtract its [1, H, T] subtrahend here
+    const ggml_tensor * bias_sub = ctx->fused_fa_bias_sub;
+    GGML_ASSERT(bias_sub == nullptr || (has_bias && bias_sub == dst->src[6]));
+    const ggml_tensor * bias_table      = !has_bias ? nullptr : bias_sub ? bias_sub->src[0] : dst->src[6];
+    const ggml_tensor * bias_subtrahend = bias_sub ? bias_sub->src[1] : nullptr;
+    const ggml_tensor * bias_idx        = has_bias ? dst->src[7] : nullptr;
     const uint32_t bias_bins = has_bias ? (uint32_t)bias_table->ne[0] : 0;
 
     const uint32_t HSK = nek0;
@@ -12016,6 +12020,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (use_vt) {
         fa_pipeline_state.flags |= FA_FLAG_V_TRANSPOSED;
     }
+    if (bias_subtrahend) {
+        fa_pipeline_state.flags |= FA_FLAG_BIAS_SUB;
+        ctx->fa_bias_sub_fusion_count.fetch_add(1, std::memory_order_relaxed);
+    }
     if (use_mr) {
         // schedule knobs, each default on (=0 disables); Qwen3.8-27B pp2048 at d32768, FA op time on gfx1151:
         //   GGML_VK_FA_MR_LAZY:  skip the O rescale of row blocks whose running max did not move  1171 -> 1095 ms
@@ -12236,6 +12244,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer bias_table_buf = bias_table ? ggml_vk_tensor_subbuffer(ctx, bias_table) : q_buf;
     vk_subbuffer bias_idx_buf   = bias_idx   ? ggml_vk_tensor_subbuffer(ctx, bias_idx)   : q_buf;
+    vk_subbuffer bias_sub_buf   = bias_subtrahend ? ggml_vk_tensor_subbuffer(ctx, bias_subtrahend) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
     // binding 7: the sparse index lists, or the kv_rows lists and block rows when the kernel reads K/V through them
     vk_subbuffer sparse_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) :
@@ -12522,7 +12531,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
         vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, sparse_buf, bias_table_buf, bias_idx_buf},
+                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, sparse_buf, bias_table_buf, bias_idx_buf, bias_sub_buf},
                                     pc, { dispatch_x, workgroups_y, workgroups_z });
 
         ggml_vk_sync_buffers(ctx, subctx);
@@ -12537,7 +12546,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             workgroups_x *= pipeline->wg_denoms[0];
         }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, sparse_buf, bias_table_buf, bias_idx_buf},
+                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, sparse_buf, bias_table_buf, bias_idx_buf, bias_sub_buf},
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
     }
 
@@ -17922,7 +17931,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
         return false;
     }
-    if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+    if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ctx->fused_skip_node) {
         return false;
     }
 
@@ -21332,6 +21341,131 @@ static bool ggml_vk_ssm_conv_direct_at_conv(ggml_backend_vk_context * ctx, const
 }
 
 
+static bool ggml_vk_fa_bias_sub_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_VK_FA_BIAS_SUB");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// uses of t as a src in the graph, 0 if t is not one of its tensors
+static int32_t ggml_vk_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    return ggml_bitset_get(cgraph->visited_hash_set.used, pos) ? cgraph->use_counts[pos] : 0;
+}
+
+// index of the one node after i that reads nodes[i], -1 if nodes[i] has no use or several
+static int ggml_vk_only_reader(const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * t = cgraph->nodes[i];
+    if (ggml_vk_use_count(cgraph, t) != 1) {
+        return -1;
+    }
+    for (int n = i + 1; n < cgraph->n_nodes; ++n) {
+        if (ggml_vk_node_reads(cgraph->nodes[n], t)) {
+            return n;
+        }
+    }
+    return -1;
+}
+
+// whether a reads t only as its src[slot], not through another src or a view
+static bool ggml_vk_reads_only_as(const ggml_tensor * a, const ggml_tensor * t, int slot) {
+    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+        const ggml_tensor * src = a->src[k];
+        if (src && (src == t || src->view_src == t) && (k != slot || src != t)) {
+            return false;
+        }
+    }
+    return a->src[slot] == t;
+}
+
+// whether a node in [from, to] writes memory that overlaps a or b
+static bool ggml_vk_written_between(const ggml_cgraph * cgraph, int from, int to, const ggml_tensor * a, const ggml_tensor * b) {
+    for (int n = from; n <= to; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        if (t->buffer == nullptr || t->op == GGML_OP_NONE || ggml_op_is_empty(t->op) || ggml_is_empty(t)) {
+            continue;
+        }
+        if (ggml_vk_tensors_overlap(t, a, false) || ggml_vk_tensors_overlap(t, b, false)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A SUB t - s whose only reader is a flash attention taking it as the indexed-bias table, with t laid out like the
+// SUB and s contiguous [1, H, T, 1]: returns the attention's node index, else -1. With runtime = true it also checks
+// the addresses: nothing from the SUB through the attention may write t or s (the allocator runs the SUB in place on
+// t, and graph_optimize keeps s alive), else the SUB runs.
+static int ggml_vk_fa_bias_sub_check(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i, bool runtime) {
+    const ggml_tensor * sub = cgraph->nodes[i];
+    if (sub->op != GGML_OP_SUB || sub->type != GGML_TYPE_F32 || (sub->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_is_contiguous(sub)) {
+        return -1;
+    }
+    const ggml_tensor * t = sub->src[0];
+    const ggml_tensor * s = sub->src[1];
+    if (t->type != GGML_TYPE_F32 || s->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_is_contiguous(s) ||
+        !ggml_are_same_shape(t, sub) || s->ne[0] != 1 || s->ne[1] != sub->ne[1] || s->ne[2] != sub->ne[2] ||
+        s->ne[3] != 1 || sub->ne[3] != 1) {
+        return -1;
+    }
+    const int fa = ggml_vk_only_reader(cgraph, i);
+    if (fa < 0) {
+        return -1;
+    }
+    const ggml_tensor * att = cgraph->nodes[fa];
+    if (att->op != GGML_OP_FLASH_ATTN_EXT || !ggml_flash_attn_ext_has_indexed_bias(att) || !ggml_vk_reads_only_as(att, sub, 6) ||
+        (att->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return -1;
+    }
+    if (runtime) {
+        if (!t->buffer || !s->buffer || get_misalign_bytes(ctx, t) != 0 || get_misalign_bytes(ctx, s) != 0 ||
+            ggml_vk_written_between(cgraph, i + 1, fa, t, s)) {
+            return -1;
+        }
+    }
+    return fa;
+}
+
+static bool ggml_vk_fa_bias_sub_at_sub(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_vk_fa_bias_sub_enabled() || ggml_vk_fa_bias_sub_check(ctx, cgraph, i, true) < 0) {
+        return false;
+    }
+    ctx->fa_bias_subs.push_back(cgraph->nodes[i]);
+    ctx->fused_skip_node = true;
+    return true;
+}
+
+static bool ggml_vk_fa_bias_sub_at_fa(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * att = cgraph->nodes[i];
+    if (att->op != GGML_OP_FLASH_ATTN_EXT || !ggml_flash_attn_ext_has_indexed_bias(att)) {
+        return false;
+    }
+    const ggml_tensor * sub = att->src[6];
+    if (std::find(ctx->fa_bias_subs.begin(), ctx->fa_bias_subs.end(), sub) == ctx->fa_bias_subs.end()) {
+        return false;
+    }
+    ctx->fused_fa_bias_sub = sub;
+    ctx->fused_extra_srcs[0] = sub->src[0];
+    ctx->fused_extra_srcs[1] = sub->src[1];
+    return true;
+}
+
+// FA_BIAS_SUB reads the SUB's subtrahend at the attention: keep it allocated until then (the minuend is the SUB's
+// in-place parent, and the runtime check falls back to the SUB if either is overwritten)
+static void ggml_vk_fa_bias_sub_add_alloc_deps(const ggml_backend_vk_context * ctx, ggml_cgraph * graph,
+                                               const ggml_backend_graph_optimize_params * params) {
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const int fa = ggml_vk_fa_bias_sub_check(ctx, graph, i, false);
+        if (fa < 0) {
+            continue;
+        }
+        ggml_tensor * s = graph->nodes[i]->src[1];
+        params->add_alloc_dep(params->user_data, s->view_src ? s->view_src : s, graph->nodes[fa]);
+    }
+}
+
 static bool ggml_vk_can_fuse_conv_1d_dw_direct_norm_channel(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_CONV_1D_DW_DIRECT, GGML_OP_NORM_CHANNEL })) {
         return false;
@@ -21518,6 +21652,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
     ctx->ssm_conv_direct_matches.clear();
+    ctx->fa_bias_subs.clear();
 
     int last_node = cgraph->n_nodes - 1;
 
@@ -21682,10 +21817,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_concat_tail = -1;
         ctx->fused_ssm_conv_direct = -1;
         ctx->fused_extra_srcs[0] = ctx->fused_extra_srcs[1] = nullptr;
+        ctx->fused_skip_node = false;
+        ctx->fused_fa_bias_sub = nullptr;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (num_adds) {
+            if (ggml_vk_fa_bias_sub_at_sub(ctx, cgraph, i)) {
+                fusion_string = "FA_BIAS_SUB";  // the SUB is not dispatched
+            } else if (ggml_vk_fa_bias_sub_at_fa(ctx, cgraph, i)) {
+                fusion_string = "FA_BIAS_SUB";
+            } else if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
@@ -23190,6 +23331,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
             }
         }
+    }
+    if (ggml_vk_fa_bias_sub_enabled() && !ctx->device->disable_fusion && params && params->add_alloc_dep) {
+        ggml_vk_fa_bias_sub_add_alloc_deps(ctx, graph, params);
     }
 }
 
@@ -24785,6 +24929,12 @@ static uint64_t ggml_backend_vk_l2_clip_fusion_count(ggml_backend_t backend) {
     return ctx->l2_clip_fusion_count.load(std::memory_order_relaxed);
 }
 
+static uint64_t ggml_backend_vk_fa_bias_sub_fusion_count(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    return ctx->fa_bias_sub_fusion_count.load(std::memory_order_relaxed);
+}
+
 static bool ggml_backend_vk_l2_clip_supported(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_vk(backend));
     return ggml_vk_l2_clip_supported((ggml_backend_vk_context *) backend->context);
@@ -24841,6 +24991,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     // exported only while the fusion is on, so a test expects the fusion only then
     if (strcmp(name, "ggml_backend_vk_gdn_cache_fusion_count") == 0 && ggml_vk_fuse_gdn_cache_enabled()) {
         return (void *) ggml_backend_vk_gdn_cache_fusion_count;
+    }
+    if (strcmp(name, "ggml_backend_vk_fa_bias_sub_fusion_count") == 0 && ggml_vk_fa_bias_sub_enabled()) {
+        return (void *) ggml_backend_vk_fa_bias_sub_fusion_count;
     }
     return NULL;
 }

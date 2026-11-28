@@ -15204,13 +15204,29 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
     const ggml_type type_KV;
     const bool causal;      // prefix of 0 per query, -inf after, distance bins
     const int64_t n_kv_max; // sparse hint
+    const bool sub_sinks;   // the table is SUB(table, per-query value), as Inkling 2 builds it
+    mutable bool has_fusion_counter = false;
 
     std::vector<int32_t> rows;
     std::vector<int64_t> visible;
 
     std::string vars() override {
-        return VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_bins, kv_rows, sinks, type_KV, causal, n_kv_max);
+        const std::string v = VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_bins, kv_rows, sinks, type_KV, causal, n_kv_max);
+        return sub_sinks ? v + ",sub_sinks=1" : v;
     }
+
+    // whole graph, so a backend can fold the SUB into the attention
+    bool run_whole_graph() override { return sub_sinks; }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn = uint64_t (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fa_bias_sub_fusion_count");
+        has_fusion_counter = counter != nullptr;
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return sub_sinks && has_fusion_counter; }
 
     double max_nmse_err() override {
         return 5e-4;
@@ -15218,9 +15234,9 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
 
     test_flash_attn_ext_indexed_bias(int64_t hs = 128, int64_t nh = 2, int64_t gqa = 3, int64_t kv = 768, int64_t nb = 7, int64_t n_stream = 2,
                                      int64_t n_bins = 17, bool kv_rows = false, bool sinks = true, ggml_type type_KV = GGML_TYPE_F16,
-                                     bool causal = false, int64_t n_kv_max = 0)
+                                     bool causal = false, int64_t n_kv_max = 0, bool sub_sinks = false)
         : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), n_bins(n_bins), kv_rows(kv_rows), sinks(sinks), type_KV(type_KV),
-          causal(causal), n_kv_max(n_kv_max) {}
+          causal(causal), n_kv_max(n_kv_max), sub_sinks(sub_sinks) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_stream);
@@ -15242,6 +15258,12 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
 
         ggml_tensor * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_bins, nh*gqa, nb*n_stream);
         ggml_set_name(table, "table");
+        if (sub_sinks) {
+            ggml_tensor * qsink = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, nh*gqa, nb*n_stream);
+            ggml_set_name(qsink, "qsink");
+            table = ggml_sub(ctx, table, qsink);
+            ggml_set_name(table, "table_sub");
+        }
 
         ggml_tensor * indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, nb*n_stream);
         ggml_set_name(indices, "indices");
@@ -15328,7 +15350,7 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
                 ggml_backend_tensor_set(t, idx.data(), 0, idx.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "table") == 0) {
                 init_tensor_uniform(t, -4.0f, 4.0f);
-            } else if (strcmp(t->name, "s") == 0) {
+            } else if (strcmp(t->name, "s") == 0 || strcmp(t->name, "qsink") == 0) {
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else {
                 init_tensor_uniform(t);
@@ -20697,8 +20719,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t kv : {1536, 4608}) {
         for (int64_t nb : {1, 512}) {
             test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, kv, nb, 1, 1025, false, true, GGML_TYPE_F16, true));
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, kv, nb, 1, 1025, false, true, GGML_TYPE_F16, true, 0, true));
         }
     }
+    // the table as Inkling 2 builds it: a SUB of the per-query sink value
+    for (bool kv_rows : {false, true}) {
+        for (int64_t nb : {1, 7, 65}) {
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768, nb, 2, 17, kv_rows, true, GGML_TYPE_F16, false, 0, true));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 1100, 7, 2, 33, false, false, GGML_TYPE_Q8_0, false, 0, true));
 
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
