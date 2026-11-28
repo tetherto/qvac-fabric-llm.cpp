@@ -13164,6 +13164,22 @@ struct test_topk_moe : public test_case {
     // Verify two outputs
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
 
+    // the Metal label of the biased sigmoid routing with a unit-scale sum bias and a weight scale (Inkling 2)
+    static constexpr const char * sigmoid_fusion_label = "UNARY+ADD+ARGSORT+GET_ROWS+SUM_ROWS+SCALE+DIV+SCALE";
+
+    mutable bool has_fusion_label = false;
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const int64_t count = backend_fusion_label_count(backend, sigmoid_fusion_label);
+        has_fusion_label = count >= 0;
+        return has_fusion_label ? (uint64_t) count : 0;
+    }
+
+    bool expect_fusion() override {
+        return has_fusion_label && gating_func == GATING_FUNC_SIGMOID && bias_probs && norm_bias && scale_w != 0.0f &&
+               n_expert_groups == 1;
+    }
+
     // allow output in arbitrary order
     double err(const float * a, const float * b, size_t n) override {
         std::vector<float> a2(n);
@@ -21229,6 +21245,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_moe({384, 1, 1, 1}, 6, true, true, GATING_FUNC_SQRT_SOFTPLUS, 1.5f, 1, true)); // DeepSeek-V4.1
     test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true)); // Inkling 2 Mini
     test_cases.emplace_back(new test_topk_moe({128, 4, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
+    test_cases.emplace_back(new test_topk_moe({128, 8, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
+    test_cases.emplace_back(new test_topk_moe({128, 512, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));

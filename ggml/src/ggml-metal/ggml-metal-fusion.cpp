@@ -1179,6 +1179,30 @@ static const std::vector<ggml_op> ops_topk_moe_norm_scale = {
     GGML_OP_SOFT_MAX, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS,
     GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE
 };
+// sigmoid scores ranked with a selection bias, the sum adjusted by the bias of a unit SCALE (Inkling 2)
+static const std::vector<ggml_op> ops_topk_moe_sig_norm_scale_bias = {
+    GGML_OP_UNARY, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS,
+    GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_SCALE, GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE
+};
+
+// the selection bias is one F32 value per expert, shared by all rows
+static bool ggml_metal_fusion_topk_moe_bias_ok(const ggml_tensor * probs, const ggml_tensor * scores) {
+    const ggml_tensor * bias = scores->src[1];
+
+    return scores->op == GGML_OP_ADD && scores->src[0] == probs && scores->type == GGML_TYPE_F32 &&
+           bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
+           bias->ne[0] == probs->ne[0] && bias->ne[1] == 1 && bias->ne[2] == 1 && bias->ne[3] == 1;
+}
+
+// the fused kernel implements plain softmax only
+static bool ggml_metal_fusion_topk_moe_softmax_ok(const ggml_tensor * softmax) {
+    float scale    = 1.0f;
+    float max_bias = 0.0f;
+    memcpy(&scale,    ((const int32_t *) softmax->op_params) + 0, sizeof(scale));
+    memcpy(&max_bias, ((const int32_t *) softmax->op_params) + 1, sizeof(max_bias));
+
+    return scale == 1.0f && max_bias == 0.0f && !softmax->src[1] && !softmax->src[2];
+}
 
 static bool ggml_metal_fusion_check_topk_moe(
         const ggml_metal_fusion       * fusion,
@@ -1192,8 +1216,8 @@ static bool ggml_metal_fusion_check_topk_moe(
 
     const int n_ops = (int) fusion->ops.size();
 
-    const bool with_norm  = n_ops >= 6;
-    const bool with_scale = n_ops == 4 || n_ops == 7;
+    const bool with_norm  = std::find(fusion->ops.begin(), fusion->ops.end(), GGML_OP_SUM_ROWS) != fusion->ops.end();
+    const bool with_scale = fusion->ops.back() == GGML_OP_SCALE;
 
     // the fusion table operates on the non-empty node sequence; the raw graph also
     // contains the RESHAPE/VIEW nodes that the fused kernel elides.
@@ -1228,24 +1252,29 @@ static bool ggml_metal_fusion_check_topk_moe(
         }
     }
 
-    const ggml_tensor * softmax        = gf->nodes[raw_start];
-    const ggml_tensor * probs_reshaped = gf->nodes[raw_start + 1];
-    const ggml_tensor * argsort        = gf->nodes[raw_start + 2];
-    const ggml_tensor * ids            = gf->nodes[raw_start + 3];
-    const ggml_tensor * get_rows       = gf->nodes[raw_start + 4];
-    const ggml_tensor * out            = gf->nodes[raw_end];
-    const ggml_tensor * logits         = softmax->src[0];
+    const ggml_tensor * probs   = gf->nodes[raw_start];
+    const bool          sigmoid = probs->op == GGML_OP_UNARY;
 
-    // the fused kernel implements plain softmax only
-    float scale   = 1.0f;
-    float max_bias = 0.0f;
-    memcpy(&scale,    ((const int32_t *) softmax->op_params) + 0, sizeof(scale));
-    memcpy(&max_bias, ((const int32_t *) softmax->op_params) + 1, sizeof(max_bias));
-    if (scale != 1.0f || max_bias != 0.0f || softmax->src[1] || softmax->src[2]) {
+    if (sigmoid && ggml_get_unary_op(probs) != GGML_UNARY_OP_SIGMOID) {
         return false;
     }
 
-    if (logits->type != GGML_TYPE_F32 || softmax->type != GGML_TYPE_F32 ||
+    // the sigmoid chain ranks the bias ADD that follows the probs reshape, the softmax chain ranks the probs
+    const int bias_off = sigmoid ? 1 : 0;
+
+    const ggml_tensor * probs_reshaped = gf->nodes[raw_start + 1];
+    const ggml_tensor * scores         = sigmoid ? gf->nodes[raw_start + 2] : probs;
+    const ggml_tensor * argsort        = gf->nodes[raw_start + 2 + bias_off];
+    const ggml_tensor * ids            = gf->nodes[raw_start + 3 + bias_off];
+    const ggml_tensor * get_rows       = gf->nodes[raw_start + 4 + bias_off];
+    const ggml_tensor * out            = gf->nodes[raw_end];
+    const ggml_tensor * logits         = probs->src[0];
+
+    if (sigmoid ? !ggml_metal_fusion_topk_moe_bias_ok(probs, scores) : !ggml_metal_fusion_topk_moe_softmax_ok(probs)) {
+        return false;
+    }
+
+    if (logits->type != GGML_TYPE_F32 || probs->type != GGML_TYPE_F32 ||
         out->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
         return false;
     }
@@ -1272,38 +1301,39 @@ static bool ggml_metal_fusion_check_topk_moe(
         return false;
     }
 
-    if (probs_reshaped->src[0] != softmax || argsort->src[0] != softmax ||
+    if (probs_reshaped->src[0] != probs || argsort->src[0] != scores ||
         ids->src[0] != argsort || get_rows->src[0] != probs_reshaped || get_rows->src[1] != ids) {
         return false;
     }
 
     if (with_norm) {
-        const ggml_tensor * weights_reshaped = gf->nodes[raw_start + 5];
-        const ggml_tensor * sum_rows         = gf->nodes[raw_start + 6];
-        const ggml_tensor * clamp            = gf->nodes[raw_start + 7];
-        const ggml_tensor * div              = gf->nodes[raw_start + 8];
-        const ggml_tensor * out_reshaped     = gf->nodes[raw_start + 9];
+        const int norm_off = 5 + bias_off;
+
+        const ggml_tensor * weights_reshaped = gf->nodes[raw_start + norm_off + 0];
+        const ggml_tensor * sum_rows         = gf->nodes[raw_start + norm_off + 1];
+        const ggml_tensor * denom            = gf->nodes[raw_start + norm_off + 2];
+        const ggml_tensor * div              = gf->nodes[raw_start + norm_off + 3];
+        const ggml_tensor * out_reshaped     = gf->nodes[raw_start + norm_off + 4];
 
         if (weights_reshaped->src[0] != get_rows || sum_rows->src[0] != weights_reshaped ||
-            clamp->src[0] != sum_rows || div->src[0] != weights_reshaped || div->src[1] != clamp ||
+            denom->src[0] != sum_rows || div->src[0] != weights_reshaped || div->src[1] != denom ||
             out_reshaped->src[0] != div) {
             return false;
         }
 
-        if (with_scale) {
-            const ggml_tensor * scale_node = gf->nodes[raw_start + 10];
-            if (scale_node->src[0] != out_reshaped) {
-                return false;
-            }
-        }
-    } else if (with_scale) {
-        const ggml_tensor * scale_node = gf->nodes[raw_start + 5];
-        if (scale_node->src[0] != get_rows) {
+        // the kernel adds the bias of a SCALE denominator to the sum, it cannot apply its factor
+        if (denom->op == GGML_OP_SCALE && ggml_get_op_params_f32(denom, 0) != 1.0f) {
             return false;
         }
+
+        if (with_scale && out->src[0] != out_reshaped) {
+            return false;
+        }
+    } else if (with_scale && out->src[0] != get_rows) {
+        return false;
     }
 
-    const int outputs[2] = { raw_start + 3, raw_end };
+    const int outputs[2] = { raw_start + 3 + bias_off, raw_end };
     if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, ops_all.data(), outputs, 2)) {
         return false;
     }
@@ -2350,6 +2380,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe_scale,         {1},    true,  ggml_metal_fusion_check_topk_moe },
     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe_norm,          {1},    true,  ggml_metal_fusion_check_topk_moe },
     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe_norm_scale,    {1},    true,  ggml_metal_fusion_check_topk_moe },
+    { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe_sig_norm_scale_bias, {2}, true, ggml_metal_fusion_check_topk_moe },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_2,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_3,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_4,           {},     true,  ggml_metal_fusion_check_moe_reduce },

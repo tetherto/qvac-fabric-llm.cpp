@@ -1751,6 +1751,7 @@ typedef struct {
     uint64_t nb01;      // logits row stride
     uint64_t nb1_ids;   // ids row stride
     float    clamp;
+    float    bias;      // added to the weight sum after the clamp
     float    scale;
 } ggml_metal_kargs_topk_moe;
 

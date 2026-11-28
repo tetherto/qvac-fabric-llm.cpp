@@ -1312,6 +1312,9 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     if (ctx->use_fusion()) {
         int n = 1;
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_TOPK_MOE) {
+            return ggml_metal_op_topk_moe(ctx, idx);
+        }
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_UNARY_MUL) {
             ctx->count_fusions(fusion);
 
@@ -8130,6 +8133,24 @@ static void ggml_metal_op_top_k_chunked(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth_merge, 1, 1);
 }
 
+// the fused routing nodes the encoder reads its operands from
+struct ggml_metal_topk_moe_nodes {
+    ggml_tensor * get_rows     = nullptr;
+    ggml_tensor * prob_bias    = nullptr; // the selection bias of the sigmoid chain
+    int           sum_rows_pos = -1;      // the weight sum, followed by its clamp or unit scale
+};
+
+static ggml_metal_topk_moe_nodes ggml_metal_op_topk_moe_find_nodes(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    ggml_metal_topk_moe_nodes res;
+    for (int j = 0; j < n_fuse; ++j) {
+        ggml_tensor * node = ctx->node(idx + j);
+        if (node->op == GGML_OP_GET_ROWS) { res.get_rows = node; }
+        if (node->op == GGML_OP_ADD)      { res.prob_bias = node->src[1]; }
+        if (node->op == GGML_OP_SUM_ROWS) { res.sum_rows_pos = j; }
+    }
+    return res;
+}
+
 int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -8140,29 +8161,42 @@ int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
         return 1;
     }
 
-    ggml_tensor * softmax  = ctx->node(idx);
-    ggml_tensor * logits   = softmax->src[0];
-    ggml_tensor * get_rows = ctx->node(idx + 2);
-    ggml_tensor * ids      = get_rows->src[1];
-    ggml_tensor * weights  = ctx->node(idx + n_fuse - 1);
+    ggml_tensor * first  = ctx->node(idx);
+    ggml_tensor * logits = first->src[0];
+
+    // the sigmoid chain ranks the scores plus a selection bias (the ADD), the softmax chain ranks the probs
+    const bool sigmoid = first->op == GGML_OP_UNARY;
+
+    const ggml_metal_topk_moe_nodes found = ggml_metal_op_topk_moe_find_nodes(ctx, idx, n_fuse);
+
+    ggml_tensor * prob_bias    = found.prob_bias;
+    const int     sum_rows_pos = found.sum_rows_pos;
+
+    ggml_tensor * ids     = found.get_rows->src[1];
+    ggml_tensor * weights = ctx->node(idx + n_fuse - 1);
 
     const int64_t n_expert      = logits->ne[0];
     const int64_t n_tokens      = logits->ne[1];
     const int64_t n_expert_used = ids->ne[0];
 
-    const bool with_norm  = n_fuse >= 6;
-    const bool with_scale = n_fuse == 4 || n_fuse == 7;
+    const bool with_norm  = sum_rows_pos >= 0;
+    const bool with_scale = weights->op == GGML_OP_SCALE;
 
+    // the weight sum is adjusted by a lower clamp or by the bias of a unit scale
     float clamp = -INFINITY;
+    float bias  = 0.0f;
     if (with_norm) {
-        ggml_tensor * clamp_node = ctx->node(idx + 4);
-        clamp = ggml_get_op_params_f32(clamp_node, 0);
+        ggml_tensor * denom_node = ctx->node(idx + sum_rows_pos + 1);
+        if (denom_node->op == GGML_OP_SCALE) {
+            bias = ggml_get_op_params_f32(denom_node, 1);
+        } else {
+            clamp = ggml_get_op_params_f32(denom_node, 0);
+        }
     }
 
     float scale = 1.0f;
     if (with_scale) {
-        ggml_tensor * scale_node = ctx->node(idx + n_fuse - 1);
-        scale = ggml_get_op_params_f32(scale_node, 0);
+        scale = ggml_get_op_params_f32(weights, 0);
     }
 
     ggml_metal_kargs_topk_moe args = {
@@ -8170,23 +8204,25 @@ int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
         /*.nb01      =*/ logits->nb[1],
         /*.nb1_ids   =*/ ids->nb[1],
         /*.clamp =*/ clamp,
+        /*.bias  =*/ bias,
         /*.scale =*/ scale,
     };
 
-    auto pipeline = ggml_metal_library_get_pipeline_topk_moe(lib, (int32_t) n_expert, (int32_t) n_expert_used, with_norm);
+    auto pipeline = ggml_metal_library_get_pipeline_topk_moe(lib, (int32_t) n_expert, (int32_t) n_expert_used, with_norm, sigmoid);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(logits),  1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(weights), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),     3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(prob_bias ? prob_bias : logits), 4);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (uint32_t) n_tokens, 1, 1, 32, 1, 1);
 
     ctx->count_fusions(fusion);
 
     if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
-        GGML_LOG_DEBUG("%s: fuse: SOFT_MAX + ARGSORT + GET_ROWS\n", __func__);
+        GGML_LOG_DEBUG("%s: fuse: %s + ARGSORT + GET_ROWS\n", __func__, sigmoid ? "SIGMOID" : "SOFT_MAX");
     }
 
     return n_fuse;
