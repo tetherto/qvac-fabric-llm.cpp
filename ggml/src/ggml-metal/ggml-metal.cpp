@@ -741,6 +741,7 @@ static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgrap
 
     // keep the MoE weighted-reduction inputs alive until the fused output so the
     // allocator cannot reuse them while the fused kernel is still reading them
+    ggml_metal_fusion_sink_conv_copies(cgraph);
     ggml_metal_fusion_add_alloc_deps(params->user_data, params->add_alloc_dep, cgraph);
 
     ggml_metal_t ctx = (ggml_metal_t)backend->context;

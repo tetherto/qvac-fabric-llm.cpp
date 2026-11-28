@@ -822,6 +822,57 @@ static int ggml_metal_op_ssm_conv_state(ggml_metal_op_t ctx, int idx, int n_fuse
     return n_fuse;
 }
 
+// CONCAT + CPY + SSM_CONV + ADD + SCALE, see GGML_METAL_FUSION_SSM_CONV_STATE_RESID
+static int ggml_metal_op_ssm_conv_state_resid(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_metal_op_fusion_concurrency(ctx, idx, n_fuse);
+
+    const ggml_tensor * cc    = ctx->node(idx);
+    const ggml_tensor * cpy   = ctx->node(idx + 1);
+    const ggml_tensor * conv  = ctx->node(idx + 2);
+    const ggml_tensor * scale = ctx->node(idx + 4);
+
+    const ggml_tensor * st = cc->src[0];
+    const ggml_tensor * x  = cc->src[1];
+    const ggml_tensor * ds = cpy->src[1];
+
+    const int32_t C      = (int32_t) st->ne[1];
+    const int32_t n_seqs = (int32_t) st->ne[2];
+
+    ggml_metal_kargs_ssm_conv_state_resid args = {
+        /*.C     =*/ C,
+        /*.scale =*/ ggml_get_op_params_f32(scale, 0),
+        /*.bias  =*/ ggml_get_op_params_f32(scale, 1),
+        /*.nb01  =*/ st->nb[1],
+        /*.nb02  =*/ st->nb[2],
+        /*.nb11  =*/ x->nb[1],
+        /*.nb12  =*/ x->nb[2],
+        /*.nb2   =*/ scale->nb[1],
+        /*.nbs1  =*/ ds->nb[1],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_state_resid(lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(st),           1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),            2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(conv->src[1]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(scale),        4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ds),           5);
+
+    const int nth = 128;
+    ggml_metal_encoder_dispatch_threadgroups(enc, (C + nth - 1)/nth, n_seqs, 1, nth, 1, 1);
+
+    if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+        GGML_LOG_DEBUG("%s: fuse: CONCAT + CPY + SSM_CONV + ADD + SCALE\n", __func__);
+    }
+
+    return n_fuse;
+}
+
 int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -836,6 +887,11 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
 
             return ggml_metal_op_ssm_conv_state(ctx, idx, n);
+        }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SSM_CONV_STATE_RESID) {
+            ctx->count_fusions(fusion);
+
+            return ggml_metal_op_ssm_conv_state_resid(ctx, idx, n);
         }
     }
 

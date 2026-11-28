@@ -56,6 +56,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_SSM_CONV_STATE,  // CONCAT + CPY + SSM_CONV + UNARY(silu) (decode conv step with its conv state update)
     GGML_METAL_FUSION_RMS_NORM_MUL_MV_GLU, // RMS_NORM + MUL + MUL_MAT + MUL_MAT + GLU (norm folded into the decode gate/up + swiglu)
     GGML_METAL_FUSION_SSM_CONV_STATE_NORM, // SSM_CONV_STATE + (RMS_NORM + SCALE) x 2 (the q/k L2 norms of the conv output)
+    GGML_METAL_FUSION_SSM_CONV_STATE_RESID, // CONCAT + CPY + SSM_CONV + ADD + SCALE (the decode short conv with a residual, as Inkling builds it)
     GGML_METAL_FUSION_GDN_GATES,       // ADD + UNARY(softplus) + MUL + UNARY(sigmoid) + GDN_CACHE (gates activated in the gdn kernel)
 } ggml_metal_fusion_id;
 
@@ -68,6 +69,9 @@ ggml_metal_fusion_id ggml_metal_fusion_get_id(const struct ggml_metal_fusion * f
 
 // identifier of the idx-th table entry (same indexing as the fusion info counters)
 ggml_metal_fusion_id ggml_metal_fusion_id_at(int idx);
+
+// move the state copy of each decode short conv next to its SSM_CONV, so GGML_METAL_FUSION_SSM_CONV_STATE_RESID matches
+void ggml_metal_fusion_sink_conv_copies(struct ggml_cgraph * gf);
 
 // apply any alloc-dependencies required by the fused kernels during graph optimize
 void ggml_metal_fusion_add_alloc_deps(

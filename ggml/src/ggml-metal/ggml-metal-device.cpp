@@ -676,6 +676,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_state(g
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_state_resid(ggml_metal_library_t lib) {
+    const char * name = "kernel_ssm_conv_state_resid_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
         ggml_metal_library_t lib, const ggml_tensor * op, int32_t nc, bool use_silu) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);

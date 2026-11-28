@@ -7426,15 +7426,20 @@ struct test_qwen35_elementwise : public test_case {
 // concat columns into the conv state cache, adjacent as the qwen35 graphs build it (Metal fuses them into one kernel).
 // with inplace the state is the cache row the copy writes. Verified nodes: the SiLU output and the new state.
 // with n_norm, the L2 norms of the first n_norm heads of hd channels follow (n_norm/2 q heads, then the k heads, as
-// build_gdn_l2_norm builds them), which Metal also folds into the kernel
+// build_gdn_l2_norm builds them), which Metal also folds into the kernel.
+// with resid, the output is scale(add(x, ssm_conv)) as the Inkling short convs build it, with x the new input column
 struct test_ssm_conv_state : public test_case {
     const int64_t channels, n_t, n_s;
     const bool inplace;
     const bool extra_reader; // a whole-concat reader: no fusion
     const int64_t n_norm;
     const int64_t hd;
+    const bool resid;
 
     const char * fusion_label() const {
+        if (resid) {
+            return "CONCAT+CPY+SSM_CONV+ADD+SCALE";
+        }
         return n_norm > 0 ? "CONCAT+CPY+SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE" : "CONCAT+CPY+SSM_CONV+UNARY";
     }
 
@@ -7451,7 +7456,7 @@ struct test_ssm_conv_state : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
 
     std::string vars() override {
-        return VARS_TO_STR7(channels, n_t, n_s, inplace, extra_reader, n_norm, hd);
+        return VARS_TO_STR7(channels, n_t, n_s, inplace, extra_reader, n_norm, hd) + (resid ? ",resid=1" : "");
     }
 
     uint64_t fusion_count(ggml_backend_t backend) override {
@@ -7464,8 +7469,8 @@ struct test_ssm_conv_state : public test_case {
     bool expect_no_fusion() override { return has_fusion_label && !(n_t == 1 && !extra_reader); }
 
     test_ssm_conv_state(int64_t channels = 64, int64_t n_t = 1, int64_t n_s = 1, bool inplace = false, bool extra_reader = false,
-            int64_t n_norm = 0, int64_t hd = 128)
-        : channels(channels), n_t(n_t), n_s(n_s), inplace(inplace), extra_reader(extra_reader), n_norm(n_norm), hd(hd) {}
+            int64_t n_norm = 0, int64_t hd = 128, bool resid = false)
+        : channels(channels), n_t(n_t), n_s(n_s), inplace(inplace), extra_reader(extra_reader), n_norm(n_norm), hd(hd), resid(resid) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         verify.clear();
@@ -7484,7 +7489,9 @@ struct test_ssm_conv_state : public test_case {
         }
         ggml_tensor * x_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_t, n_s);
         ggml_set_name(x_src, "x_src");
-        ggml_tensor * x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, like the qkv projection
+        // an allocatable intermediate, like the qkv projection: a [C, n_t*n_s] tensor viewed as [C, n_t, n_s] when resid
+        ggml_tensor * cur = resid ? ggml_scale(ctx, ggml_reshape_2d(ctx, x_src, C, n_t*n_s), 0.5f) : nullptr;
+        ggml_tensor * x   = resid ? ggml_reshape_3d(ctx, cur, C, n_t, n_s) : ggml_scale(ctx, x_src, 0.5f);
         ggml_tensor * kern = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
         ggml_set_name(kern, "kernel");
 
@@ -7496,7 +7503,10 @@ struct test_ssm_conv_state : public test_case {
         }
         verify.push_back(cpy);
 
-        ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, cc, kern));
+        ggml_tensor * conv = ggml_ssm_conv(ctx, cc, kern);
+        ggml_tensor * out  = resid ?
+            ggml_scale(ctx, ggml_add(ctx, cur, ggml_reshape_2d(ctx, conv, C, n_t*n_s)), 1.0f/sqrtf(9.0f)) :
+            ggml_silu(ctx, conv);
         ggml_set_name(out, "out");
         if (gf) {
             ggml_build_forward_expand(gf, out);
@@ -21246,6 +21256,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv_state(192,   1, ns, inplace, false, 2,  64));
         }
         test_cases.emplace_back(new test_ssm_conv_state(640, 2, 1, inplace, false, 4, 128)); // two new columns: no fusion
+        // the Inkling short conv: scale(x + conv) with the state copy
+        for (int64_t ns : {1, 2, 5}) {
+            test_cases.emplace_back(new test_ssm_conv_state(130,  1, ns, inplace, false, 0, 128, true));
+            test_cases.emplace_back(new test_ssm_conv_state(2304, 1, ns, inplace, false, 0, 128, true));
+        }
+        test_cases.emplace_back(new test_ssm_conv_state(130, 2, 1, inplace, false, 0, 128, true)); // two new columns: no fusion
+        test_cases.emplace_back(new test_ssm_conv_state(130, 1, 1, inplace, true,  0, 128, true)); // another concat reader: no fusion
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
