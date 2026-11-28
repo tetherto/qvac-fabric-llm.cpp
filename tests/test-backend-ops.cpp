@@ -5947,6 +5947,11 @@ struct test_loop_ctrl : public test_case {
     mutable bool has_fusion_counter = false;
     mutable bool supported = false;
 
+    // the Metal fusion label, from the generic fusion debugging API; Metal also fuses a block that ends the graph
+    static constexpr const char * metal_fusion_label = "CONCAT+RMS_NORM+MUL_MAT+MUL_MAT+UNARY+MUL+SUB+MUL_MAT+UNARY+MUL+ADD";
+
+    mutable bool has_metal_fusion_label = false;
+
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "LOOP_CTRL";
@@ -5970,12 +5975,21 @@ struct test_loop_ctrl : public test_case {
         auto support = (supported_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_loop_ctrl_supported");
         has_fusion_counter = counter != nullptr;
         supported = support != nullptr && support(backend);
-        return counter != nullptr ? counter(backend) : 0;
+        if (counter != nullptr) {
+            return counter(backend);
+        }
+        const int64_t count = backend_fusion_label_count(backend, metal_fusion_label);
+        has_metal_fusion_label = count >= 0;
+        return has_metal_fusion_label ? (uint64_t) count : 0;
     }
 
-    bool expect_fusion() override { return fuses && tail && has_fusion_counter && supported; }
+    bool expect_fusion() override {
+        return has_metal_fusion_label ? fuses : fuses && tail && has_fusion_counter && supported;
+    }
 
-    bool expect_no_fusion() override { return (!fuses || !tail) && has_fusion_counter; }
+    bool expect_no_fusion() override {
+        return has_metal_fusion_label ? !fuses : (!fuses || !tail) && has_fusion_counter;
+    }
 
     test_loop_ctrl(int64_t n = 2304, int64_t r = 64, int64_t T = 1, bool tail = true, bool fuses = true)
         : n(n), r(r), T(T), tail(tail), fuses(fuses) {}

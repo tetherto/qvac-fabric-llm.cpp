@@ -188,6 +188,125 @@ template [[host_name("kernel_rms_norm_mul_f32_4")]]     kernel kernel_rms_norm_f
 template [[host_name("kernel_rms_norm_mul_add_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 3>;
 
 template [[host_name("kernel_rms_norm_mul_silu_f32")]]   kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float,  2, GGML_METAL_NORM_EPI_SILU_GATE>;
+
+static float loop_ctrl_sum_partials(threadgroup const float * part, short nsg) {
+    float sum = 0.0f;
+    for (short s = 0; s < nsg; ++s) {
+        sum += part[s];
+    }
+    return sum;
+}
+
+// Inkling 2 loop controller, pass 1: one threadgroup per (rank row, token). The gate is the down projection of
+// [rms_norm(cur); rms_norm(msg)]: the norms scale the two half-row dot products, so the normalized rows are never written.
+kernel void kernel_loop_ctrl_down_f32(
+        constant ggml_metal_kargs_loop_ctrl & args,
+        device const float * cur,
+        device const float * msg,
+        device const float * wd,
+        device       float * gate,
+        threadgroup  float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int r = tgpig.x;
+    const int t = tgpig.y;
+
+    device const float * c  = cur + t*args.n;
+    device const float * m  = msg + t*args.n;
+    device const float * wr = wd  + r*2*args.n;
+
+    float cc = 0.0f;
+    float mm = 0.0f;
+    float wc = 0.0f;
+    float wm = 0.0f;
+
+    for (int i = tpitg.x; i < args.n; i += ntg.x) {
+        const float ci = c[i];
+        const float mi = m[i];
+        cc += ci*ci;
+        mm += mi*mi;
+        wc += wr[i]*ci;
+        wm += wr[args.n + i]*mi;
+    }
+
+    const short nsg = ntg.x/N_SIMDWIDTH;
+
+    cc = simd_sum(cc);
+    mm = simd_sum(mm);
+    wc = simd_sum(wc);
+    wm = simd_sum(wm);
+
+    // four partial sums, nsg slots each
+    if (tiisg == 0) {
+        shmem_f32[0*nsg + sgitg] = cc;
+        shmem_f32[1*nsg + sgitg] = mm;
+        shmem_f32[2*nsg + sgitg] = wc;
+        shmem_f32[3*nsg + sgitg] = wm;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tpitg.x == 0) {
+        const float s_cc = loop_ctrl_sum_partials(shmem_f32 + 0*nsg, nsg);
+        const float s_mm = loop_ctrl_sum_partials(shmem_f32 + 1*nsg, nsg);
+        const float s_wc = loop_ctrl_sum_partials(shmem_f32 + 2*nsg, nsg);
+        const float s_wm = loop_ctrl_sum_partials(shmem_f32 + 3*nsg, nsg);
+
+        const float scale_c = 1.0f/sqrt(s_cc/args.n + args.eps);
+        const float scale_m = 1.0f/sqrt(s_mm/args.n + args.eps);
+
+        gate[t*args.rank + r] = scale_c*s_wc + scale_m*s_wm;
+    }
+}
+
+// Inkling 2 loop controller, pass 2: the gain and forget projections of the gate and the mix
+// (cur - tanh(forget)*cur) + tanh(gain)*msg. One simdgroup owns one output channel.
+kernel void kernel_loop_ctrl_up_f32(
+        constant ggml_metal_kargs_loop_ctrl & args,
+        device const float * cur,
+        device const float * msg,
+        device const float * gate,
+        device const float * wg,
+        device const float * wf,
+        device       float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int nsg = ntg.x/N_SIMDWIDTH;
+    const int ch  = tgpig.x*nsg + sgitg;
+    const int t   = tgpig.y;
+
+    if (ch >= args.n) {
+        return;
+    }
+
+    device const float * g   = gate + t*args.rank;
+    device const float * wgr = wg   + ch*args.rank;
+    device const float * wfr = wf   + ch*args.rank;
+
+    float gain   = 0.0f;
+    float forget = 0.0f;
+
+    for (int k = tiisg; k < args.rank; k += N_SIMDWIDTH) {
+        const float x = g[k];
+        gain   += wgr[k]*x;
+        forget += wfr[k]*x;
+    }
+
+    gain   = simd_sum(gain);
+    forget = simd_sum(forget);
+
+    if (tiisg == 0) {
+        const int   i = t*args.n + ch;
+        const float c = cur[i];
+
+        dst[i] = (c - precise::tanh(forget)*c) + precise::tanh(gain)*msg[i];
+    }
+}
 template [[host_name("kernel_rms_norm_mul_silu_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2, GGML_METAL_NORM_EPI_SILU_GATE>;
 
 kernel void kernel_rms_norm_back(

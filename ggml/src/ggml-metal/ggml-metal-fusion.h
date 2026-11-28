@@ -61,6 +61,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_GDN_GATES,       // ADD + UNARY(softplus) + MUL + UNARY(sigmoid) + GDN_CACHE (gates activated in the gdn kernel)
     GGML_METAL_FUSION_SITU,            // (SCALE + UNARY(tanh) + SCALE) x 2 + UNARY(sigmoid) + MUL x 2 (MoE situ on the gate_up halves)
     GGML_METAL_FUSION_DEPTH_MIX,       // [RMS_NORM] [CONCAT] [REPEAT] MUL_MAT + SOFT_MAX + CONT + MUL_MAT [+ CONT] (Inkling 2's depth mix)
+    GGML_METAL_FUSION_LOOP_CTRL,       // CONCAT + RMS_NORM + MUL_MAT x 3 + UNARY(tanh) x 2 + MUL x 2 + SUB + ADD (Inkling 2 loop controller)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

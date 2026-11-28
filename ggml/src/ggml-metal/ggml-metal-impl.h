@@ -290,6 +290,13 @@ typedef struct {
     float    up_out_bias;
 } ggml_metal_kargs_situ;
 
+// Inkling 2's loop controller: cur and msg [n, n_tokens], the down weight [2n, rank], gain and forget [rank, n]
+typedef struct {
+    int32_t n;
+    int32_t rank;
+    float   eps;
+} ggml_metal_kargs_loop_ctrl;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;
