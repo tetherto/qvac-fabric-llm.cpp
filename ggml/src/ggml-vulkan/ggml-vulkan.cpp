@@ -22822,8 +22822,73 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return order;
         };
 
+        // MUL_MAT_ID + the MUL that scales it (per-expert scales gathered after the MUL_MAT_ID): the gather goes
+        // first, then the pair, so it stays adjacent and fuses. Returns the new order (gather nodes, MUL_MAT_ID, MUL), or empty.
+        auto const &mmid_scale_order = [&](int r) -> std::vector<int> {
+            std::vector<int> order;
+            if (graph->nodes[r]->op != GGML_OP_MUL_MAT_ID) {
+                return order;
+            }
+            const int lim = std::min(r + NUM_TO_CHECK, graph->n_nodes);
+            int j = r + 1;
+            while (j < lim && (used[j] || graph->nodes[j]->op != GGML_OP_MUL || graph->nodes[j]->src[0] != graph->nodes[r])) {
+                j++;
+            }
+            if (j >= lim) {
+                return order;
+            }
+            // the MUL's other inputs must not wait on unused nodes before the MUL_MAT_ID
+            for (int c = first_unused; c < r; ++c) {
+                if (!used[c] && is_src_of(graph->nodes[j], graph->nodes[c])) {
+                    return order;
+                }
+            }
+            const ggml_tensor * scale = graph->nodes[j]->src[1];
+            // nodes in (r, j) the scale needs; none may depend on the MUL_MAT_ID or on unused nodes before it
+            std::vector<bool> need(j - r, false);
+            for (int m = j - 1; m > r; --m) {
+                if (used[m]) {
+                    continue;
+                }
+                if (graph->nodes[m] == scale) {
+                    need[m - r] = true;
+                }
+                if (!need[m - r]) {
+                    // left behind: the MUL must not depend on it
+                    if (is_src_of(graph->nodes[j], graph->nodes[m])) {
+                        return order;
+                    }
+                    continue;
+                }
+                for (int c = first_unused; c < m; ++c) {
+                    if (used[c] || !is_src_of(graph->nodes[m], graph->nodes[c])) {
+                        continue;
+                    }
+                    if (c <= r) {
+                        return order;
+                    }
+                    need[c - r] = true;
+                }
+            }
+            for (int m = r + 1; m < j; ++m) {
+                if (!used[m] && need[m - r]) {
+                    order.push_back(m);
+                }
+            }
+            // already adjacent: the lookahead keeps the pair together
+            if (order.empty() && j == r + 1) {
+                return order;
+            }
+            order.push_back(r);
+            order.push_back(j);
+            return order;
+        };
+
         {
-            const std::vector<int> order = gated_norm_order(first_unused);
+            std::vector<int> order = gated_norm_order(first_unused);
+            if (order.empty()) {
+                order = mmid_scale_order(first_unused);
+            }
             if (!order.empty()) {
                 for (int m : order) {
                     new_order.push_back(graph->nodes[m]);
@@ -22889,7 +22954,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
                 match_pattern(hc_post_gate_pattern, j) ||
-                !gated_norm_order(j).empty()) {
+                !gated_norm_order(j).empty() ||
+                !mmid_scale_order(j).empty()) {
                 continue;
             }
             bool ok = true;
