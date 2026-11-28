@@ -3,6 +3,7 @@
 constant bool FC_topk_moe_with_norm [[function_constant(FC_TOPK_MOE + 0)]];
 constant int  FC_topk_moe_n_expert  [[function_constant(FC_TOPK_MOE + 1)]];
 constant int  FC_topk_moe_top_k     [[function_constant(FC_TOPK_MOE + 2)]];
+constant bool FC_topk_moe_sigmoid   [[function_constant(FC_TOPK_MOE + 3)]];
 
 constant int  FC_moe_reduce_n_expert_used [[function_constant(FC_MOE_REDUCE + 0)]];
 
@@ -513,13 +514,14 @@ kernel void kernel_top_k_merge_chunks_f32_i32(
     ggml_top_k_radix_select(src, n, args.top_k, dst + args.top_k*row, histo, sh_bucket, sh_above, out_count, tpitg.x, ntg.x);
 }
 
-// fused SOFT_MAX + top-k + GET_ROWS (+ optional norm/scale) for MoE routing.
+// fused SOFT_MAX or biased SIGMOID + top-k + GET_ROWS (+ optional norm/scale) for MoE routing.
 // One SIMDgroup handles one token row; n_expert is limited to 1024 by the host.
 kernel void kernel_topk_moe_f32(
         constant   ggml_metal_kargs_topk_moe & args,
         device const char * src0,
         device       float * weights,
         device      int32_t * ids,
+        device const float * probs_bias,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]]) {
     const int row = (int) tgpig.x;
@@ -548,50 +550,68 @@ kernel void kernel_topk_moe_f32(
         wt[i / 32] = isnan(v) ? -FLT_MAX : v;
     }
 
-    // softmax over the expert logits
-    float max_val = -INFINITY;
-    FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
-        max_val = max(max_val, wt[i]);
-    }
-    max_val = simd_max(max_val);
+    // the ranking keys add the selection bias to the sigmoid scores, the output weights stay unbiased
+    float sel[32];
+    if (FC_topk_moe_sigmoid) {
+        FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
+            const int expert = lane + i * 32;
+            wt[i]  = 1.0f / (1.0f + exp(-wt[i]));
+            sel[i] = expert < n_expert ? wt[i] + probs_bias[expert] : -INFINITY;
+        }
+    } else {
+        // softmax over the expert logits
+        float max_val = -INFINITY;
+        FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
+            max_val = max(max_val, wt[i]);
+        }
+        max_val = simd_max(max_val);
 
-    float sum_val = 0.0f;
-    FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
-        wt[i] = exp(wt[i] - max_val);
-        sum_val += wt[i];
-    }
-    sum_val = simd_sum(sum_val);
+        float sum_val = 0.0f;
+        FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
+            wt[i] = exp(wt[i] - max_val);
+            sum_val += wt[i];
+        }
+        sum_val = simd_sum(sum_val);
 
-    const float inv_sum = 1.0f / sum_val;
-    FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
-        wt[i] *= inv_sum;
+        const float inv_sum = 1.0f / sum_val;
+        FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
+            wt[i] *= inv_sum;
+        }
     }
 
     float wt_sum = 0.0f;
 
     for (int k = 0; k < top_k; ++k) {
-        float best_val = -INFINITY;
+        float best_val    = -INFINITY;
+        float best_key    = -INFINITY;
         int   best_expert = -1;
 
         FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
-            const int expert = lane + i * 32;
-            if (expert < n_expert && (wt[i] > best_val || (wt[i] == best_val && expert < best_expert))) {
+            const int   expert = lane + i * 32;
+            const float key    = FC_topk_moe_sigmoid ? sel[i] : wt[i];
+            if (expert < n_expert && (key > best_key || (key == best_key && expert < best_expert))) {
                 best_val    = wt[i];
+                best_key    = key;
                 best_expert = expert;
             }
         }
 
         FOR_UNROLL (int mask = 16; mask > 0; mask >>= 1) {
             const float val    = simd_shuffle_xor(best_val, mask);
+            const float key    = simd_shuffle_xor(best_key, mask);
             const int   expert = simd_shuffle_xor(best_expert, mask);
-            if (val > best_val || (val == best_val && expert < best_expert)) {
+            if (key > best_key || (key == best_key && expert < best_expert)) {
                 best_val    = val;
+                best_key    = key;
                 best_expert = expert;
             }
         }
 
         if ((best_expert & 31) == lane) {
             wt[best_expert / 32] = -INFINITY;
+            if (FC_topk_moe_sigmoid) {
+                sel[best_expert / 32] = -INFINITY;
+            }
         }
 
         if ((k & 31) == lane) {
@@ -608,7 +628,7 @@ kernel void kernel_topk_moe_f32(
 
     if (FC_topk_moe_with_norm) {
         wt_sum = simd_sum(wt_sum);
-        wt_sum = max(wt_sum, args.clamp);
+        wt_sum = max(wt_sum, args.clamp) + args.bias;
         const float inv = 1.0f / wt_sum;
         FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
             output_weights[i] *= inv;

@@ -322,3 +322,154 @@ kernel void kernel_soft_max_back_4(
         dx[i00] = (dy4 - sum4) * y4 * scale;
     }
 }
+
+constant int DM_MAX_STATES  = GGML_METAL_DEPTH_MIX_MAX_STATES;
+constant int DM_MAX_QUERIES = GGML_METAL_DEPTH_MIX_MAX_QUERIES;
+constant int DM_MAX_SG      = GGML_METAL_DEPTH_MIX_MAX_SIMDGROUPS;
+
+// the token's float4 channel c of the stack states (0 past n_stack), of the last state and of the queries
+template <int LAST_MODE>
+static void depth_mix_load(
+        constant ggml_metal_kargs_depth_mix & args,
+        device const char * s_tok, device const char * l_tok, device const char * query, int c,
+        thread float4 * s, thread float4 & x, thread float4 * w) {
+    FOR_UNROLL (int n = 0; n < DM_MAX_STATES; ++n) {
+        s[n] = n < args.n_stack ? *((device const float4 *) (s_tok + n*args.nbs1) + c) : float4(0.0f);
+    }
+    x = LAST_MODE == GGML_METAL_DEPTH_MIX_LAST_NONE ? float4(0.0f) : *((device const float4 *) l_tok + c);
+    FOR_UNROLL (int q = 0; q < DM_MAX_QUERIES; ++q) {
+        w[q] = q < args.n_queries ? *((device const float4 *) (query + q*args.nbq1) + c) : float4(0.0f);
+    }
+}
+
+// the simdgroup sum of v in slot (q, n) of the threadgroup partials, one slot per simdgroup
+static void depth_mix_store_partial(threadgroup float * shmem, int slot, float v, ushort sgitg, ushort tiisg) {
+    const float r = simd_sum(v);
+    if (tiisg == 0) {
+        shmem[slot*DM_MAX_SG + sgitg] = r;
+    }
+}
+
+// the sum over the simdgroups of slot, in every lane
+static float depth_mix_total(threadgroup const float * shmem, int slot, int nsg, ushort tiisg) {
+    return simd_sum(tiisg < nsg ? shmem[slot*DM_MAX_SG + tiisg] : 0.0f);
+}
+
+// as kernel_soft_max: exp(x - max), times 1/sum; the last state's weight also takes its norm scale
+template <int LAST_MODE>
+static void depth_mix_weights(
+        constant ggml_metal_kargs_depth_mix & args, threadgroup const float * shmem, int q, int nsg, float norm_scale, ushort tiisg,
+        thread float * p, thread float & p_last) {
+    float x[DM_MAX_STATES];
+    float m = -INFINITY;
+    FOR_UNROLL (int n = 0; n < DM_MAX_STATES; ++n) {
+        x[n] = n < args.n_stack ? args.scale*depth_mix_total(shmem, q*DM_MAX_STATES + n, nsg, tiisg) : -INFINITY;
+        m = MAX(m, x[n]);
+    }
+    float xl = -INFINITY;
+    if (LAST_MODE != GGML_METAL_DEPTH_MIX_LAST_NONE) {
+        xl = args.scale*norm_scale*depth_mix_total(shmem, q*DM_MAX_STATES + args.n_stack, nsg, tiisg);
+        m = MAX(m, xl);
+    }
+    float sum = 0.0f;
+    FOR_UNROLL (int n = 0; n < DM_MAX_STATES; ++n) {
+        x[n] = n < args.n_stack ? exp(x[n] - m) : 0.0f;
+        sum += x[n];
+    }
+    const float el = LAST_MODE != GGML_METAL_DEPTH_MIX_LAST_NONE ? exp(xl - m) : 0.0f;
+    sum += el;
+    const float inv_sum = 1.0f/sum;
+    FOR_UNROLL (int n = 0; n < DM_MAX_STATES; ++n) {
+        p[n] = x[n]*inv_sum;
+    }
+    p_last = el*inv_sum*norm_scale;
+}
+
+// Inkling 2's depth mix, one threadgroup per token: per query, softmax over the states of scale * dot(state, query),
+// then the weighted sum of the states. the states are a stack and a last state, absent, read, or RMS-normalized here
+template <int LAST_MODE>
+kernel void kernel_depth_mix(
+        constant ggml_metal_kargs_depth_mix & args,
+        device const char * stack,
+        device const char * last,
+        device const char * query,
+        device       char * dst,
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tpitg [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort ntg   [[threads_per_threadgroup]]) {
+    device const char * s_tok = stack + tgpig*args.nbs2;
+    device const char * l_tok = last  + tgpig*args.nbl2;
+    device       char * d_tok = dst   + tgpig*args.nbd2;
+
+    float acc[DM_MAX_QUERIES][DM_MAX_STATES] = {};
+    float acc_last[DM_MAX_QUERIES] = {};
+    float sq = 0.0f;
+
+    float4 s[DM_MAX_STATES];
+    float4 x;
+    float4 w[DM_MAX_QUERIES];
+    for (int c = tpitg; c < args.n_embd4; c += ntg) {
+        depth_mix_load<LAST_MODE>(args, s_tok, l_tok, query, c, s, x, w);
+        FOR_UNROLL (int q = 0; q < DM_MAX_QUERIES; ++q) {
+            FOR_UNROLL (int n = 0; n < DM_MAX_STATES; ++n) {
+                acc[q][n] += dot(s[n], w[q]);
+            }
+            acc_last[q] += dot(x, w[q]);
+        }
+        sq += dot(x, x);
+    }
+
+    FOR_UNROLL (int q = 0; q < DM_MAX_QUERIES; ++q) {
+        if (q < args.n_queries) {
+            FOR_UNROLL (int n = 0; n < DM_MAX_STATES; ++n) {
+                if (n < args.n_stack) {
+                    depth_mix_store_partial(shmem, q*DM_MAX_STATES + n, acc[q][n], sgitg, tiisg);
+                }
+            }
+            if (LAST_MODE != GGML_METAL_DEPTH_MIX_LAST_NONE) {
+                depth_mix_store_partial(shmem, q*DM_MAX_STATES + args.n_stack, acc_last[q], sgitg, tiisg);
+            }
+        }
+    }
+    if (LAST_MODE == GGML_METAL_DEPTH_MIX_LAST_NORM) {
+        depth_mix_store_partial(shmem, DM_MAX_QUERIES*DM_MAX_STATES, sq, sgitg, tiisg);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int nsg = (ntg + N_SIMDWIDTH - 1)/N_SIMDWIDTH;
+    float norm_scale = 1.0f;
+    if (LAST_MODE == GGML_METAL_DEPTH_MIX_LAST_NORM) {
+        const float mean = depth_mix_total(shmem, DM_MAX_QUERIES*DM_MAX_STATES, nsg, tiisg)/(4*args.n_embd4);
+        norm_scale = rsqrt(mean + args.eps);
+    }
+
+    float p[DM_MAX_QUERIES][DM_MAX_STATES];
+    float p_last[DM_MAX_QUERIES];
+    FOR_UNROLL (int q = 0; q < DM_MAX_QUERIES; ++q) {
+        if (q < args.n_queries) {
+            depth_mix_weights<LAST_MODE>(args, shmem, q, nsg, norm_scale, tiisg, p[q], p_last[q]);
+        }
+    }
+
+    for (int c = tpitg; c < args.n_embd4; c += ntg) {
+        depth_mix_load<LAST_MODE>(args, s_tok, l_tok, query, c, s, x, w);
+        FOR_UNROLL (int q = 0; q < DM_MAX_QUERIES; ++q) {
+            if (q < args.n_queries) {
+                float4 o = p_last[q]*x;
+                FOR_UNROLL (int n = 0; n < DM_MAX_STATES; ++n) {
+                    o += p[q][n]*s[n];
+                }
+                *((device float4 *) (d_tok + q*args.nbd1) + c) = o;
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_depth_mix<GGML_METAL_DEPTH_MIX_LAST_NONE>) kernel_depth_mix_t;
+
+template [[host_name("kernel_depth_mix_none")]] kernel kernel_depth_mix_t kernel_depth_mix<GGML_METAL_DEPTH_MIX_LAST_NONE>;
+template [[host_name("kernel_depth_mix_read")]] kernel kernel_depth_mix_t kernel_depth_mix<GGML_METAL_DEPTH_MIX_LAST_READ>;
+template [[host_name("kernel_depth_mix_norm")]] kernel kernel_depth_mix_t kernel_depth_mix<GGML_METAL_DEPTH_MIX_LAST_NORM>;

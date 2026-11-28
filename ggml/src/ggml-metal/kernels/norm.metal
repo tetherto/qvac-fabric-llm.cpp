@@ -188,6 +188,125 @@ template [[host_name("kernel_rms_norm_mul_f32_4")]]     kernel kernel_rms_norm_f
 template [[host_name("kernel_rms_norm_mul_add_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 3>;
 
 template [[host_name("kernel_rms_norm_mul_silu_f32")]]   kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float,  2, GGML_METAL_NORM_EPI_SILU_GATE>;
+
+static float loop_ctrl_sum_partials(threadgroup const float * part, short nsg) {
+    float sum = 0.0f;
+    for (short s = 0; s < nsg; ++s) {
+        sum += part[s];
+    }
+    return sum;
+}
+
+// Inkling 2 loop controller, pass 1: one threadgroup per (rank row, token). The gate is the down projection of
+// [rms_norm(cur); rms_norm(msg)]: the norms scale the two half-row dot products, so the normalized rows are never written.
+kernel void kernel_loop_ctrl_down_f32(
+        constant ggml_metal_kargs_loop_ctrl & args,
+        device const float * cur,
+        device const float * msg,
+        device const float * wd,
+        device       float * gate,
+        threadgroup  float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int r = tgpig.x;
+    const int t = tgpig.y;
+
+    device const float * c  = cur + t*args.n;
+    device const float * m  = msg + t*args.n;
+    device const float * wr = wd  + r*2*args.n;
+
+    float cc = 0.0f;
+    float mm = 0.0f;
+    float wc = 0.0f;
+    float wm = 0.0f;
+
+    for (int i = tpitg.x; i < args.n; i += ntg.x) {
+        const float ci = c[i];
+        const float mi = m[i];
+        cc += ci*ci;
+        mm += mi*mi;
+        wc += wr[i]*ci;
+        wm += wr[args.n + i]*mi;
+    }
+
+    const short nsg = ntg.x/N_SIMDWIDTH;
+
+    cc = simd_sum(cc);
+    mm = simd_sum(mm);
+    wc = simd_sum(wc);
+    wm = simd_sum(wm);
+
+    // four partial sums, nsg slots each
+    if (tiisg == 0) {
+        shmem_f32[0*nsg + sgitg] = cc;
+        shmem_f32[1*nsg + sgitg] = mm;
+        shmem_f32[2*nsg + sgitg] = wc;
+        shmem_f32[3*nsg + sgitg] = wm;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tpitg.x == 0) {
+        const float s_cc = loop_ctrl_sum_partials(shmem_f32 + 0*nsg, nsg);
+        const float s_mm = loop_ctrl_sum_partials(shmem_f32 + 1*nsg, nsg);
+        const float s_wc = loop_ctrl_sum_partials(shmem_f32 + 2*nsg, nsg);
+        const float s_wm = loop_ctrl_sum_partials(shmem_f32 + 3*nsg, nsg);
+
+        const float scale_c = 1.0f/sqrt(s_cc/args.n + args.eps);
+        const float scale_m = 1.0f/sqrt(s_mm/args.n + args.eps);
+
+        gate[t*args.rank + r] = scale_c*s_wc + scale_m*s_wm;
+    }
+}
+
+// Inkling 2 loop controller, pass 2: the gain and forget projections of the gate and the mix
+// (cur - tanh(forget)*cur) + tanh(gain)*msg. One simdgroup owns one output channel.
+kernel void kernel_loop_ctrl_up_f32(
+        constant ggml_metal_kargs_loop_ctrl & args,
+        device const float * cur,
+        device const float * msg,
+        device const float * gate,
+        device const float * wg,
+        device const float * wf,
+        device       float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int nsg = ntg.x/N_SIMDWIDTH;
+    const int ch  = tgpig.x*nsg + sgitg;
+    const int t   = tgpig.y;
+
+    if (ch >= args.n) {
+        return;
+    }
+
+    device const float * g   = gate + t*args.rank;
+    device const float * wgr = wg   + ch*args.rank;
+    device const float * wfr = wf   + ch*args.rank;
+
+    float gain   = 0.0f;
+    float forget = 0.0f;
+
+    for (int k = tiisg; k < args.rank; k += N_SIMDWIDTH) {
+        const float x = g[k];
+        gain   += wgr[k]*x;
+        forget += wfr[k]*x;
+    }
+
+    gain   = simd_sum(gain);
+    forget = simd_sum(forget);
+
+    if (tiisg == 0) {
+        const int   i = t*args.n + ch;
+        const float c = cur[i];
+
+        dst[i] = (c - precise::tanh(forget)*c) + precise::tanh(gain)*msg[i];
+    }
+}
 template [[host_name("kernel_rms_norm_mul_silu_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2, GGML_METAL_NORM_EPI_SILU_GATE>;
 
 kernel void kernel_rms_norm_back(
@@ -383,6 +502,75 @@ typedef decltype(kernel_l2_norm_impl<float, float>) kernel_l2_norm_t;
 
 template [[host_name("kernel_l2_norm_f32_f32")]]   kernel kernel_l2_norm_t kernel_l2_norm_impl<float,  float>;
 template [[host_name("kernel_l2_norm_f32_f32_4")]] kernel kernel_l2_norm_t kernel_l2_norm_impl<float4, float4>;
+
+// [x*w ->] L2_NORM -> SCALE [-> *f] with the sums of kernel_l2_norm_impl and the products of the MUL and SCALE kernels
+template <typename T, bool W, bool F>
+kernel void kernel_l2_clip_impl(
+        constant ggml_metal_kargs_l2_clip & args,
+        device const char * src0,
+        device const char * srcw,
+        device const char * srcf,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i03 = tgpig.z;
+    const int i02 = tgpig.y;
+    const int i01 = tgpig.x;
+
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    device const T     * x = (device const T     *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device const T     * w = (device const T     *) (srcw + (i03%args.ne13)*args.nb13 + (i02%args.ne12)*args.nb12 + (i01%args.ne11)*args.nb11);
+    device const float * f = (device const float *) (srcf + (i03%args.ne23)*args.nb23 + (i02%args.ne22)*args.nb22 + (i01%args.ne21)*args.nb21);
+    device       T     * y = (device       T     *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
+
+    float sumf = 0.0f;
+
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        const T v = W ? x[i00]*w[i00] : x[i00];
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float scale = 1.0f/max(sqrt(sumf), args.eps);
+
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        // each product rounds as in its own kernel: no folding of args.scale into scale
+        #pragma clang fp reassociate(off)
+        const T v       = W ? x[i00]*w[i00] : x[i00];
+        const T normed  = v * scale;
+        const T clipped = args.scale * normed + args.bias;
+        y[i00] = F ? clipped*f[0] : clipped;
+    }
+}
+
+typedef decltype(kernel_l2_clip_impl<float, false, false>) kernel_l2_clip_t;
+
+template [[host_name("kernel_l2_clip_f32")]]           kernel kernel_l2_clip_t kernel_l2_clip_impl<float,  false, false>;
+template [[host_name("kernel_l2_clip_mul_f32")]]       kernel kernel_l2_clip_t kernel_l2_clip_impl<float,  false, true>;
+template [[host_name("kernel_mul_l2_clip_f32")]]       kernel kernel_l2_clip_t kernel_l2_clip_impl<float,  true,  false>;
+template [[host_name("kernel_mul_l2_clip_mul_f32")]]   kernel kernel_l2_clip_t kernel_l2_clip_impl<float,  true,  true>;
+template [[host_name("kernel_l2_clip_f32_4")]]         kernel kernel_l2_clip_t kernel_l2_clip_impl<float4, false, false>;
+template [[host_name("kernel_l2_clip_mul_f32_4")]]     kernel kernel_l2_clip_t kernel_l2_clip_impl<float4, false, true>;
+template [[host_name("kernel_mul_l2_clip_f32_4")]]     kernel kernel_l2_clip_t kernel_l2_clip_impl<float4, true,  false>;
+template [[host_name("kernel_mul_l2_clip_mul_f32_4")]] kernel kernel_l2_clip_t kernel_l2_clip_impl<float4, true,  true>;
 
 kernel void kernel_group_norm_f32(
         constant ggml_metal_kargs_group_norm & args,

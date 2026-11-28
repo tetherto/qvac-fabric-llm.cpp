@@ -294,6 +294,15 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                     res = GGML_PAD(res, 256) + sizeof(float)*ggml_nelements(tensor->src[0]);
                 }
             } break;
+        case GGML_OP_MUL_MAT:
+            {
+                ggml_metal_device_t ctx_dev = (ggml_metal_device_t) buft->device->context;
+                const bool has_tensor = ggml_metal_device_get_props(ctx_dev)->has_tensor;
+                const size_t extra = ggml_metal_op_mul_mat_extra_splitk(tensor, has_tensor);
+                if (extra > 0) {
+                    res = GGML_PAD(res, 256) + extra;
+                }
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
@@ -741,6 +750,7 @@ static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgrap
 
     // keep the MoE weighted-reduction inputs alive until the fused output so the
     // allocator cannot reuse them while the fused kernel is still reading them
+    ggml_metal_fusion_sink_conv_copies(cgraph);
     ggml_metal_fusion_add_alloc_deps(params->user_data, params->add_alloc_dep, cgraph);
 
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
@@ -1160,6 +1170,23 @@ static uint64_t ggml_backend_metal_fwht_fusion_count(ggml_backend_t backend) {
     return res;
 }
 
+// depth mix fusion counter for test-backend-ops; the first call turns the device stats on
+static uint64_t ggml_backend_metal_depth_mix_fusion_count(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    struct ggml_metal_fusion_info * finfo = ggml_metal_device_get_fusion_info((ggml_metal_device_t) backend->device->context);
+    ggml_metal_fusion_info_stats_init(finfo);
+
+    uint64_t res = 0;
+    for (int i = 0; i < ggml_metal_fusion_info_n_fusions(finfo); i++) {
+        if (ggml_metal_fusion_id_at(i) == GGML_METAL_FUSION_DEPTH_MIX) {
+            res += ggml_metal_fusion_info_count(finfo, i);
+        }
+    }
+
+    return res;
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
@@ -1201,6 +1228,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_fwht_fusion_count") == 0) {
         return (void *)ggml_backend_metal_fwht_fusion_count;
+    }
+    if (strcmp(name, "ggml_backend_metal_depth_mix_fusion_count") == 0) {
+        return (void *)ggml_backend_metal_depth_mix_fusion_count;
     }
 
     return NULL;

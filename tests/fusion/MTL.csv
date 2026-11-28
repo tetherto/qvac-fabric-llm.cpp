@@ -229,10 +229,19 @@ hy_v4               ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
 hy_v4               ,0   ,any     ,NORM+MUL+ADD                ,      1
 hy_v4               ,0   ,any     ,RMS_NORM+MUL                ,      9
 hy_v4               ,0   ,any     ,UNARY+MUL                   ,      2
+inkling2            ,0   ,any     ,L2_NORM+SCALE               ,      3
 inkling2            ,0   ,any     ,MUL+ADD                     ,      6
-inkling2            ,0   ,any     ,MUL_MAT_ID+MUL              ,      3
+inkling2            ,0   ,any     ,MUL+L2_NORM+SCALE           ,      5
+inkling2            ,0   ,any     ,MUL+L2_NORM+SCALE+MUL       ,      1
+inkling2            ,0   ,any     ,MUL_MAT_ID+MUL              ,      2
+inkling2            ,0   ,decode  ,RMS_NORM+CONCAT+MUL_MAT+SOFT_MAX+CONT+MUL_MAT,      4
+inkling2            ,0   ,decode  ,RMS_NORM+CONCAT+MUL_MAT+SOFT_MAX+CONT+MUL_MAT+CONT,      2
+inkling2            ,0   ,prefill ,RMS_NORM+CONCAT+REPEAT+MUL_MAT+SOFT_MAX+CONT+MUL_MAT,      4
+inkling2            ,0   ,prefill ,RMS_NORM+CONCAT+REPEAT+MUL_MAT+SOFT_MAX+CONT+MUL_MAT+CONT,      2
 inkling2            ,0   ,any     ,RMS_NORM+MUL                ,     10
-inkling2            ,0   ,any     ,UNARY+MUL                   ,      6
+inkling2            ,0   ,any     ,SCALE+UNARY+SCALE+UNARY+MUL+SCALE+UNARY+SCALE+MUL,      3
+inkling2            ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS+SUM_ROWS+SCALE+DIV+SCALE,      3
+inkling2            ,0   ,any     ,UNARY+MUL                   ,      3
 internlm2           ,0   ,prefill ,MUL_MAT+ADD                 ,      2
 internlm2           ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      2
 internlm2           ,0   ,any     ,RMS_NORM+MUL                ,      5

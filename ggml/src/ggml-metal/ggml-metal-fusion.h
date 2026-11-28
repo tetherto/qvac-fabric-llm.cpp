@@ -36,10 +36,11 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_NORM_MUL,     // NORM/RMS_NORM + MUL
     GGML_METAL_FUSION_NORM_MUL_ADD, // NORM/RMS_NORM + MUL + ADD
     GGML_METAL_FUSION_NORM_SCALE,   // NORM/RMS_NORM + SCALE
+    GGML_METAL_FUSION_L2_CLIP,      // [MUL +] L2_NORM + SCALE [+ MUL] (row L2 clip with an optional weight and row factor)
     GGML_METAL_FUSION_ADD_CHAIN,    // ADD x N (N in [2, 7])
     GGML_METAL_FUSION_SNAKE,        // MUL + SIN + SQR + MUL + ADD
     GGML_METAL_FUSION_GDN_CACHE,    // GATED_DELTA_NET + CPY (write snapshots into the recurrent cache)
-    GGML_METAL_FUSION_TOPK_MOE,     // SOFT_MAX + ARGSORT + GET_ROWS + norm/scale (MoE routing)
+    GGML_METAL_FUSION_TOPK_MOE,     // SOFT_MAX or SIGMOID + ADD (bias) + ARGSORT + GET_ROWS + norm/scale (MoE routing)
     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA or one-row PQ2_0/Q4_0/MXFP4 mat-vec store)
@@ -56,7 +57,11 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_SSM_CONV_STATE,  // CONCAT + CPY + SSM_CONV + UNARY(silu) (decode conv step with its conv state update)
     GGML_METAL_FUSION_RMS_NORM_MUL_MV_GLU, // RMS_NORM + MUL + MUL_MAT + MUL_MAT + GLU (norm folded into the decode gate/up + swiglu)
     GGML_METAL_FUSION_SSM_CONV_STATE_NORM, // SSM_CONV_STATE + (RMS_NORM + SCALE) x 2 (the q/k L2 norms of the conv output)
+    GGML_METAL_FUSION_SSM_CONV_STATE_RESID, // CONCAT + CPY + SSM_CONV + ADD + SCALE (the decode short conv with a residual, as Inkling builds it)
     GGML_METAL_FUSION_GDN_GATES,       // ADD + UNARY(softplus) + MUL + UNARY(sigmoid) + GDN_CACHE (gates activated in the gdn kernel)
+    GGML_METAL_FUSION_SITU,            // (SCALE + UNARY(tanh) + SCALE) x 2 + UNARY(sigmoid) + MUL x 2 (MoE situ on the gate_up halves)
+    GGML_METAL_FUSION_DEPTH_MIX,       // [RMS_NORM] [CONCAT] [REPEAT] MUL_MAT + SOFT_MAX + CONT + MUL_MAT [+ CONT] (Inkling 2's depth mix)
+    GGML_METAL_FUSION_LOOP_CTRL,       // CONCAT + RMS_NORM + MUL_MAT x 3 + UNARY(tanh) x 2 + MUL x 2 + SUB + ADD (Inkling 2 loop controller)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
@@ -68,6 +73,9 @@ ggml_metal_fusion_id ggml_metal_fusion_get_id(const struct ggml_metal_fusion * f
 
 // identifier of the idx-th table entry (same indexing as the fusion info counters)
 ggml_metal_fusion_id ggml_metal_fusion_id_at(int idx);
+
+// move the state copy of each decode short conv next to its SSM_CONV, so GGML_METAL_FUSION_SSM_CONV_STATE_RESID matches
+void ggml_metal_fusion_sink_conv_copies(struct ggml_cgraph * gf);
 
 // apply any alloc-dependencies required by the fused kernels during graph optimize
 void ggml_metal_fusion_add_alloc_deps(
@@ -113,6 +121,20 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
 // true if the RMS_NORM_FWHT fusion at idx (a position in node_idxs) also writes the weighted norm, which has
 // consumers outside the fused group
 bool ggml_metal_fusion_rms_norm_fwht_write_norm(const struct ggml_cgraph * gf, const int * node_idxs, int idx);
+
+// the nodes of a DEPTH_MIX group of n non-empty nodes; the optional ones (norm, concat, repeat, tail) are null when absent
+struct ggml_metal_depth_mix_nodes {
+    const struct ggml_tensor * norm;
+    const struct ggml_tensor * concat;
+    const struct ggml_tensor * repeat;
+    const struct ggml_tensor * scores;
+    const struct ggml_tensor * soft_max;
+    const struct ggml_tensor * cont;
+    const struct ggml_tensor * out;
+    const struct ggml_tensor * tail;
+};
+
+struct ggml_metal_depth_mix_nodes ggml_metal_fusion_depth_mix_nodes(const struct ggml_tensor * const * nodes, int n);
 
 // optimize phase: maximum number of nodes starting at idx (a raw sequential graph index) that
 // could be fused on a device with props, chaining patterns back-to-back. returns at least 1.

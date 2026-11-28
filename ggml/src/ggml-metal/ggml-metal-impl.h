@@ -265,6 +265,38 @@ typedef struct {
     float    max;
 } ggml_metal_kargs_unary;
 
+// situ(gate, up) = s1*tanh(s0*gate)*sigmoid(gate) * s3*tanh(s2*up): the scale and bias of the four SCALE nodes
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    gate_in_scale;
+    float    gate_in_bias;
+    float    gate_out_scale;
+    float    gate_out_bias;
+    float    up_in_scale;
+    float    up_in_bias;
+    float    up_out_scale;
+    float    up_out_bias;
+} ggml_metal_kargs_situ;
+
+// Inkling 2's loop controller: cur and msg [n, n_tokens], the down weight [2n, rank], gain and forget [rank, n]
+typedef struct {
+    int32_t n;
+    int32_t rank;
+    float   eps;
+} ggml_metal_kargs_loop_ctrl;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;
@@ -545,6 +577,9 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  bias_n_bins;
+    int32_t  bias_n_keys;
+    int32_t  bias_query_stride;
 } ggml_metal_kargs_flash_attn_ext;
 
 typedef struct {
@@ -615,6 +650,9 @@ typedef struct {
     int32_t  n_head_log2;
     float    logit_softcap;
     int32_t  n_kv_max_padded;
+    int32_t  bias_n_bins;
+    int32_t  bias_n_keys;
+    int32_t  bias_query_stride;
 } ggml_metal_kargs_flash_attn_ext_vec;
 
 typedef struct {
@@ -649,6 +687,11 @@ typedef struct {
     int16_t  r2;
     int16_t  r3;
 } ggml_metal_kargs_mul_mm;
+
+typedef struct {
+    int32_t  nsplit;
+    int64_t  ne;
+} ggml_metal_kargs_mul_mm_splitk_reduce;
 
 typedef struct {
     int32_t  ne00;
@@ -953,6 +996,32 @@ typedef struct {
     float    eps;
 } ggml_metal_kargs_l2_norm;
 
+// the strides of x (nb0*), the weight (nb1*), the row factor (nb2*) and dst; the weight and the factor repeat over x
+typedef struct {
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    int32_t  ne00;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    int32_t  ne21;
+    int32_t  ne22;
+    int32_t  ne23;
+    float    eps;   // of the L2_NORM
+    float    scale; // of the SCALE
+    float    bias;  // of the SCALE
+} ggml_metal_kargs_l2_clip;
+
 typedef struct {
     int64_t  ne00;
     int64_t  ne01;
@@ -1244,6 +1313,28 @@ typedef struct {
     int32_t  n_head_log2;
 } ggml_metal_kargs_soft_max;
 
+// the depth mix kernel keeps every (query, state) score in registers; the last state is absent, read, or RMS-normalized
+#define GGML_METAL_DEPTH_MIX_MAX_STATES     8
+#define GGML_METAL_DEPTH_MIX_MAX_QUERIES    4
+#define GGML_METAL_DEPTH_MIX_MAX_SIMDGROUPS 32
+#define GGML_METAL_DEPTH_MIX_LAST_NONE      0
+#define GGML_METAL_DEPTH_MIX_LAST_READ      1
+#define GGML_METAL_DEPTH_MIX_LAST_NORM      2
+
+typedef struct {
+    int32_t  n_embd4;   // float4 channels
+    int32_t  n_stack;   // states read from the stack, before the last state
+    int32_t  n_queries;
+    float    scale;     // of the SOFT_MAX
+    float    eps;       // of the RMS_NORM of the last state
+    uint64_t nbs1;      // stack [n_embd, n_stack, n_tokens] strides
+    uint64_t nbs2;
+    uint64_t nbl2;      // last state [n_embd, 1, n_tokens] token stride
+    uint64_t nbq1;      // queries [n_embd, n_queries] row stride
+    uint64_t nbd1;      // dst [n_embd, n_queries, n_tokens] strides
+    uint64_t nbd2;
+} ggml_metal_kargs_depth_mix;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne00_4;
@@ -1305,6 +1396,19 @@ typedef struct {
     uint64_t nbk1;  // dst_k [hd, n_k, 1, n_seqs] strides
     uint64_t nbk3;
 } ggml_metal_kargs_ssm_conv_state_norm;
+
+typedef struct {
+    int32_t  C;     // channels
+    float    scale; // of the SCALE
+    float    bias;
+    uint64_t nb01;  // conv state [3, C, n_seqs] strides
+    uint64_t nb02;
+    uint64_t nb11;  // new input [1, C, n_seqs] strides, also the residual
+    uint64_t nb12;
+    uint64_t nb2;   // dst [C, n_seqs] row stride
+    uint64_t nbs1;  // new conv state [3*C, n_seqs] row stride
+    uint64_t nbr;   // trailing residual [C, n_seqs] row stride
+} ggml_metal_kargs_ssm_conv_state_resid;
 
 typedef struct {
     int64_t  d_state;
@@ -1687,6 +1791,7 @@ typedef struct {
     uint64_t nb01;      // logits row stride
     uint64_t nb1_ids;   // ids row stride
     float    clamp;
+    float    bias;      // added to the weight sum after the clamp
     float    scale;
 } ggml_metal_kargs_topk_moe;
 

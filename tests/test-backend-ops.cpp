@@ -4743,14 +4743,22 @@ struct test_rms_norm_back : public test_case {
 
 // the row L2 clip of Inkling 2: [x*w ->] l2_norm(x, t)*t [-> *f with one f per token]. tail adds a node after it: the clip
 // fuses (Vulkan L2_CLIP) only when it is not the last node.
+static int64_t backend_fusion_label_count(ggml_backend_t backend, const char * label);
+
 struct test_l2_clip : public test_case {
     const std::array<int64_t, 4> ne;
     const bool  with_w;
     const bool  with_f;
     const float thr;
     const bool  tail;
+    const float bias; // a SCALE bias keeps the separate passes
     mutable bool has_fusion_counter = false;
     mutable bool supported = false;
+    mutable bool has_fusion_label = false;
+
+    std::string fusion_label() const {
+        return std::string(with_w ? "MUL+" : "") + "L2_NORM+SCALE" + (with_f ? "+MUL" : "");
+    }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4760,10 +4768,15 @@ struct test_l2_clip : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR5(ne, with_w, with_f, thr, tail);
+        return VARS_TO_STR6(ne, with_w, with_f, thr, tail, bias);
     }
 
     uint64_t fusion_count(ggml_backend_t backend) override {
+        const int64_t label_count = backend_fusion_label_count(backend, fusion_label().c_str());
+        has_fusion_label = label_count >= 0;
+        if (has_fusion_label) {
+            return (uint64_t) label_count;
+        }
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         using counter_fn   = uint64_t (*)(ggml_backend_t);
         using supported_fn = bool (*)(ggml_backend_t);
@@ -4774,13 +4787,18 @@ struct test_l2_clip : public test_case {
         return counter != nullptr ? counter(backend) : 0;
     }
 
-    bool expect_fusion() override { return tail && has_fusion_counter && supported; }
+    // Vulkan keeps the separate passes when the clip is the last node, Metal fuses it there too
+    bool expect_fusion() override {
+        return bias == 0.0f && (has_fusion_label || (tail && has_fusion_counter && supported));
+    }
 
-    bool expect_no_fusion() override { return !tail && has_fusion_counter; }
+    bool expect_no_fusion() override {
+        return bias != 0.0f ? (has_fusion_label || has_fusion_counter) : (!has_fusion_label && !tail && has_fusion_counter);
+    }
 
     test_l2_clip(std::array<int64_t, 4> ne = {128, 24, 3, 1}, bool with_w = true, bool with_f = false, float thr = 22.6f,
-                 bool tail = true)
-        : ne(ne), with_w(with_w), with_f(with_f), thr(thr), tail(tail) {}
+                 bool tail = true, float bias = 0.0f)
+        : ne(ne), with_w(with_w), with_f(with_f), thr(thr), tail(tail), bias(bias) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -4791,7 +4809,7 @@ struct test_l2_clip : public test_case {
             ggml_set_name(w, "w");
             cur = ggml_mul(ctx, cur, w);
         }
-        cur = ggml_scale(ctx, ggml_l2_norm(ctx, cur, thr), thr);
+        cur = ggml_scale_bias(ctx, ggml_l2_norm(ctx, cur, thr), thr, bias);
         if (with_f) {
             ggml_tensor * f = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, ne[2], ne[3]);
             ggml_set_name(f, "f");
@@ -5723,6 +5741,11 @@ struct test_situ : public test_case {
     const float beta;
     const float lb;
 
+    // the Metal fusion label, from the generic fusion debugging API
+    static constexpr const char * fusion_label = "SCALE+UNARY+SCALE+UNARY+MUL+SCALE+UNARY+SCALE+MUL";
+
+    mutable bool has_fusion_label = false;
+
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "SITU";
@@ -5733,6 +5756,14 @@ struct test_situ : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const int64_t count = backend_fusion_label_count(backend, fusion_label);
+        has_fusion_label = count >= 0;
+        return has_fusion_label ? (uint64_t) count : 0;
+    }
+
+    bool expect_fusion() override { return has_fusion_label; }
 
     test_situ(std::array<int64_t, 3> ne = {1152, 8, 4}, float beta = 4.0f, float lb = 25.0f)
         : ne(ne), beta(beta), lb(lb) {}
@@ -5916,6 +5947,11 @@ struct test_loop_ctrl : public test_case {
     mutable bool has_fusion_counter = false;
     mutable bool supported = false;
 
+    // the Metal fusion label, from the generic fusion debugging API; Metal also fuses a block that ends the graph
+    static constexpr const char * metal_fusion_label = "CONCAT+RMS_NORM+MUL_MAT+MUL_MAT+UNARY+MUL+SUB+MUL_MAT+UNARY+MUL+ADD";
+
+    mutable bool has_metal_fusion_label = false;
+
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "LOOP_CTRL";
@@ -5939,12 +5975,21 @@ struct test_loop_ctrl : public test_case {
         auto support = (supported_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_loop_ctrl_supported");
         has_fusion_counter = counter != nullptr;
         supported = support != nullptr && support(backend);
-        return counter != nullptr ? counter(backend) : 0;
+        if (counter != nullptr) {
+            return counter(backend);
+        }
+        const int64_t count = backend_fusion_label_count(backend, metal_fusion_label);
+        has_metal_fusion_label = count >= 0;
+        return has_metal_fusion_label ? (uint64_t) count : 0;
     }
 
-    bool expect_fusion() override { return fuses && tail && has_fusion_counter && supported; }
+    bool expect_fusion() override {
+        return has_metal_fusion_label ? fuses : fuses && tail && has_fusion_counter && supported;
+    }
 
-    bool expect_no_fusion() override { return (!fuses || !tail) && has_fusion_counter; }
+    bool expect_no_fusion() override {
+        return has_metal_fusion_label ? !fuses : (!fuses || !tail) && has_fusion_counter;
+    }
 
     test_loop_ctrl(int64_t n = 2304, int64_t r = 64, int64_t T = 1, bool tail = true, bool fuses = true)
         : n(n), r(r), T(T), tail(tail), fuses(fuses) {}
@@ -5981,7 +6026,8 @@ struct test_loop_ctrl : public test_case {
 };
 
 // Inkling 2's depth mix as mix() builds it on a GPU: softmax(states^T queries / sqrt(n_embd)) over the states, then their
-// weighted sum per query. tail adds a node after it: the mix fuses (Vulkan DEPTH_MIX) only when it is not the last node.
+// weighted sum per query. tail adds a node after it: the mix fuses (Vulkan DEPTH_MIX) only when it is not the last node;
+// fuses is Vulkan's expectation, metal_fuses() Metal's (DEPTH_MIX there also fuses as the last node).
 struct test_depth_mix : public test_case {
     const int64_t n_embd;
     const int64_t n_states;
@@ -5994,6 +6040,10 @@ struct test_depth_mix : public test_case {
     const depth_mix_shared shared;
     mutable bool has_fusion_counter = false;
     mutable bool supported = false;
+    mutable bool metal = false;
+
+    // the Metal kernel takes float4 channels and up to 8 states and 4 queries
+    bool metal_fuses() const { return n_embd % 4 == 0 && n_states <= 8 && n_queries <= 4; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6016,14 +6066,16 @@ struct test_depth_mix : public test_case {
         using supported_fn = bool (*)(ggml_backend_t);
         auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_depth_mix_fusion_count");
         auto support = (supported_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_depth_mix_supported");
+        auto metal_counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_depth_mix_fusion_count");
         has_fusion_counter = counter != nullptr;
         supported = support != nullptr && support(backend);
-        return counter != nullptr ? counter(backend) : 0;
+        metal = metal_counter != nullptr;
+        return counter != nullptr ? counter(backend) : metal ? metal_counter(backend) : 0;
     }
 
-    bool expect_fusion() override { return fuses && has_fusion_counter && supported; }
+    bool expect_fusion() override { return metal ? metal_fuses() : fuses && has_fusion_counter && supported; }
 
-    bool expect_no_fusion() override { return !fuses && has_fusion_counter; }
+    bool expect_no_fusion() override { return metal ? !metal_fuses() : !fuses && has_fusion_counter; }
 
     test_depth_mix(int64_t n_embd, int64_t n_states, int64_t n_queries, int64_t n_tokens, bool tail = true, bool fuses = true,
                    depth_mix_head head = depth_mix_head::states, bool view_cont = false, depth_mix_shared shared = depth_mix_shared::none)
@@ -7426,15 +7478,21 @@ struct test_qwen35_elementwise : public test_case {
 // concat columns into the conv state cache, adjacent as the qwen35 graphs build it (Metal fuses them into one kernel).
 // with inplace the state is the cache row the copy writes. Verified nodes: the SiLU output and the new state.
 // with n_norm, the L2 norms of the first n_norm heads of hd channels follow (n_norm/2 q heads, then the k heads, as
-// build_gdn_l2_norm builds them), which Metal also folds into the kernel
+// build_gdn_l2_norm builds them), which Metal also folds into the kernel.
+// with resid, the output is scale(add(x, ssm_conv)) as the Inkling short convs build it, with x the new input column
 struct test_ssm_conv_state : public test_case {
     const int64_t channels, n_t, n_s;
     const bool inplace;
     const bool extra_reader; // a whole-concat reader: no fusion
     const int64_t n_norm;
     const int64_t hd;
+    const bool resid;
+    const bool res_add; // with resid: a second residual added after the scale
 
     const char * fusion_label() const {
+        if (resid) {
+            return res_add ? "CONCAT+CPY+SSM_CONV+ADD+SCALE+ADD" : "CONCAT+CPY+SSM_CONV+ADD+SCALE";
+        }
         return n_norm > 0 ? "CONCAT+CPY+SSM_CONV+UNARY+RMS_NORM+SCALE+RMS_NORM+SCALE" : "CONCAT+CPY+SSM_CONV+UNARY";
     }
 
@@ -7451,7 +7509,7 @@ struct test_ssm_conv_state : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
 
     std::string vars() override {
-        return VARS_TO_STR7(channels, n_t, n_s, inplace, extra_reader, n_norm, hd);
+        return VARS_TO_STR7(channels, n_t, n_s, inplace, extra_reader, n_norm, hd) + (resid ? ",resid=1" : "") + (res_add ? ",res_add=1" : "");
     }
 
     uint64_t fusion_count(ggml_backend_t backend) override {
@@ -7464,8 +7522,8 @@ struct test_ssm_conv_state : public test_case {
     bool expect_no_fusion() override { return has_fusion_label && !(n_t == 1 && !extra_reader); }
 
     test_ssm_conv_state(int64_t channels = 64, int64_t n_t = 1, int64_t n_s = 1, bool inplace = false, bool extra_reader = false,
-            int64_t n_norm = 0, int64_t hd = 128)
-        : channels(channels), n_t(n_t), n_s(n_s), inplace(inplace), extra_reader(extra_reader), n_norm(n_norm), hd(hd) {}
+            int64_t n_norm = 0, int64_t hd = 128, bool resid = false, bool res_add = false)
+        : channels(channels), n_t(n_t), n_s(n_s), inplace(inplace), extra_reader(extra_reader), n_norm(n_norm), hd(hd), resid(resid), res_add(res_add) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         verify.clear();
@@ -7484,9 +7542,22 @@ struct test_ssm_conv_state : public test_case {
         }
         ggml_tensor * x_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_t, n_s);
         ggml_set_name(x_src, "x_src");
-        ggml_tensor * x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, like the qkv projection
+        // an allocatable intermediate, like the qkv projection: a [C, n_t*n_s] tensor viewed as [C, n_t, n_s] when resid
+        ggml_tensor * cur = resid ? ggml_scale(ctx, ggml_reshape_2d(ctx, x_src, C, n_t*n_s), 0.5f) : nullptr;
+        ggml_tensor * x   = resid ? ggml_reshape_3d(ctx, cur, C, n_t, n_s) : ggml_scale(ctx, x_src, 0.5f);
         ggml_tensor * kern = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
         ggml_set_name(kern, "kernel");
+
+        // the residual stream is computed before the conv step
+        ggml_tensor * res = nullptr;
+        if (resid && res_add) {
+            ggml_tensor * res_src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n_t*n_s);
+            ggml_set_name(res_src, "res_src");
+            res = ggml_scale(ctx, res_src, 0.25f);
+            if (gf) {
+                ggml_build_forward_expand(gf, res);
+            }
+        }
 
         ggml_tensor * cc   = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
         ggml_tensor * tail = ggml_view_3d(ctx, cc, 3, C, n_s, cc->nb[1], cc->nb[2], ggml_row_size(cc->type, n_t));
@@ -7496,7 +7567,13 @@ struct test_ssm_conv_state : public test_case {
         }
         verify.push_back(cpy);
 
-        ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, cc, kern));
+        ggml_tensor * conv = ggml_ssm_conv(ctx, cc, kern);
+        ggml_tensor * out  = resid ?
+            ggml_scale(ctx, ggml_add(ctx, cur, ggml_reshape_2d(ctx, conv, C, n_t*n_s)), 1.0f/sqrtf(9.0f)) :
+            ggml_silu(ctx, conv);
+        if (res) {
+            out = ggml_add(ctx, res, out);
+        }
         ggml_set_name(out, "out");
         if (gf) {
             ggml_build_forward_expand(gf, out);
@@ -13108,6 +13185,22 @@ struct test_topk_moe : public test_case {
     // Verify two outputs
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
 
+    // the Metal label of the biased sigmoid routing with a unit-scale sum bias and a weight scale (Inkling 2)
+    static constexpr const char * sigmoid_fusion_label = "UNARY+ADD+ARGSORT+GET_ROWS+SUM_ROWS+SCALE+DIV+SCALE";
+
+    mutable bool has_fusion_label = false;
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const int64_t count = backend_fusion_label_count(backend, sigmoid_fusion_label);
+        has_fusion_label = count >= 0;
+        return has_fusion_label ? (uint64_t) count : 0;
+    }
+
+    bool expect_fusion() override {
+        return has_fusion_label && gating_func == GATING_FUNC_SIGMOID && bias_probs && norm_bias && scale_w != 0.0f &&
+               n_expert_groups == 1;
+    }
+
     // allow output in arbitrary order
     double err(const float * a, const float * b, size_t n) override {
         std::vector<float> a2(n);
@@ -17255,6 +17348,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // wider than the states the Vulkan pass keeps in registers
     test_cases.emplace_back(new test_depth_mix(3000, 5, 3, 7));
     test_cases.emplace_back(new test_depth_mix(3000, 2, 1, 1));
+    // more float4 channels than a Metal threadgroup has threads
+    test_cases.emplace_back(new test_depth_mix(8200, 3, 2, 3, true, true, depth_mix_head::norm));
     // the states as the model builds them, a CONCAT of the stack with the last state, which may be an RMS_NORM
     for (depth_mix_head head : { depth_mix_head::concat, depth_mix_head::norm }) {
         for (int64_t n_states : { 2, 5 }) {
@@ -18437,14 +18532,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool with_f : { false, true }) {
             for (std::array<int64_t, 4> ne : { std::array<int64_t, 4>{128, 24, 1, 1}, std::array<int64_t, 4>{128, 8, 7, 1},
                                                std::array<int64_t, 4>{16, 24, 5, 1}, std::array<int64_t, 4>{128, 24, 512, 1},
-                                               std::array<int64_t, 4>{1500, 2, 3, 2} }) {
+                                               std::array<int64_t, 4>{1500, 2, 3, 2}, std::array<int64_t, 4>{130, 6, 3, 1} }) {
                 test_cases.emplace_back(new test_l2_clip(ne, with_w, with_f, ne[0] == 16 ? 8.0f : 22.6f));
             }
         }
     }
-    // as the last node the clip keeps its separate passes
+    // the clip as the last node of the graph
     test_cases.emplace_back(new test_l2_clip({128, 24, 1, 1}, true, true, 22.6f, false));
     test_cases.emplace_back(new test_l2_clip({128, 8, 7, 1}, false, false, 22.6f, false));
+    test_cases.emplace_back(new test_l2_clip({128, 24, 3, 1}, true, true, 22.6f, true, 0.25f));
+    test_cases.emplace_back(new test_l2_clip({130, 8, 3, 1}, false, false, 22.6f, true, 0.25f));
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
@@ -19006,6 +19103,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
+
+    // a few rows of a few columns against many rows, batched (the weighted sum over the depth states of Inkling 2)
+    for (int64_t m : {1, 3, 8, 33}) {
+        for (int64_t k : {2, 5, 24, 31}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 2304, k, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 97, k, {7, 2}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 33, k, {2, 3}, {2, 1}));
+        }
+    }
+    // Inkling 2's relative-position bias table: 1025 bins of 16 against 24 heads, broadcast over 512 tokens, and in decode
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1025, 24, 16, {1, 1}, {512, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1025, 24, 16, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1025, 27, 16, {1, 1}, {3, 1}));
+    // few output tiles over a long K (split K on Metal's tensor path): Inkling 2's loop controller down projection
+    // and attention sinks, Qwen3.5's GDN alpha, then a broadcast batch with a partial last K slice, and F16
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 64, 512, 4608, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 24, 512, 2304, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 48, 512, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 64, 200, 1000, {2, 1}, {2, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 1024, 64, 4608, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 64, 300,  640, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
 
@@ -20068,6 +20186,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_concat(GGML_TYPE_Q8_0, {8192, 2, 1, 1}, dim == 0 ? 4096 : 1, dim, 0));
     }
 
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        test_cases.emplace_back(new test_concat(type, {64, 4, 512, 1}, 512, 2, 0));
+        test_cases.emplace_back(new test_concat(type, {66, 4, 512, 1}, 512, 2, 0));
+        test_cases.emplace_back(new test_concat(type, {128, 4, 512, 1}, 512, 2, 1));
+
+        for (int dim : { 0, 1, 3 }) {
+            test_cases.emplace_back(new test_concat(type, {300, 4, 5, 1}, 300, dim, 0));
+        }
+        test_cases.emplace_back(new test_concat(type, {1025, 4, 512, 1}, 1025, 0, 0));
+        test_cases.emplace_back(new test_concat(type, {3, 4, 512, 1}, 5, 0, 0));
+    }
+
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98306, 8, 1, 1}, 286, 0, 0));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {98306, 8, 1, 1}, 286, 0, 0));
+
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
             test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}));
@@ -20699,6 +20832,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // mask-row and KV-length tails: 3 query rows, 777 mask columns
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 777, 3, 1, 1025, false, true, GGML_TYPE_F16, true));
+
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
@@ -21147,6 +21283,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_moe({384, 1, 1, 1}, 6, true, true, GATING_FUNC_SQRT_SOFTPLUS, 1.5f, 1, true)); // DeepSeek-V4.1
     test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true)); // Inkling 2 Mini
     test_cases.emplace_back(new test_topk_moe({128, 4, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
+    test_cases.emplace_back(new test_topk_moe({128, 8, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
+    test_cases.emplace_back(new test_topk_moe({128, 512, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
@@ -21222,6 +21360,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv_state(192,   1, ns, inplace, false, 2,  64));
         }
         test_cases.emplace_back(new test_ssm_conv_state(640, 2, 1, inplace, false, 4, 128)); // two new columns: no fusion
+        // the Inkling short conv: scale(x + conv) with the state copy
+        for (int64_t ns : {1, 2, 5}) {
+            test_cases.emplace_back(new test_ssm_conv_state(130,  1, ns, inplace, false, 0, 128, true));
+            test_cases.emplace_back(new test_ssm_conv_state(2304, 1, ns, inplace, false, 0, 128, true));
+        }
+        test_cases.emplace_back(new test_ssm_conv_state(130, 2, 1, inplace, false, 0, 128, true)); // two new columns: no fusion
+        test_cases.emplace_back(new test_ssm_conv_state(130, 1, 1, inplace, true,  0, 128, true)); // another concat reader: no fusion
+        // with the trailing residual ADD
+        for (int64_t ns : {1, 2, 5}) {
+            test_cases.emplace_back(new test_ssm_conv_state(130,  1, ns, inplace, false, 0, 128, true, true));
+            test_cases.emplace_back(new test_ssm_conv_state(2304, 1, ns, inplace, false, 0, 128, true, true));
+        }
+        test_cases.emplace_back(new test_ssm_conv_state(130, 2, 1, inplace, false, 0, 128, true, true)); // two new columns: no fusion
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
