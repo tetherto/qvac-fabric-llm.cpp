@@ -19703,9 +19703,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // MUL_MAT_ID+MUL+MUL (per-expert scale, then router weights): one token fuses on the Vulkan mat-vec, four do not
-    for (int bs : {1, 4}) {
-        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
+    // MUL_MAT_ID+MUL+MUL (per-expert scale, then router weights): one token fuses on the Vulkan mat-vec, four do not;
+    // 129 and 512 tokens fuse in the GEMM epilogue (prefetch for NVFP4 and Q8_0, int8 MMQ for Q4_0)
+    for (int bs : {1, 4, 129, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152, 1, true, false, true));
         }
         test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 16, false, 256, bs, 512, 1, true, true, true));

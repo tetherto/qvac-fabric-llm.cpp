@@ -224,8 +224,14 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #error "MM_PREFETCH: the B prefetch loads 8 values per lane"
 #endif
 #if defined(MUL_MAT_ID)
-float mmid_row_scale(const u16vec2 row_idx) {
-    return (p.fusion_flags & 1u) != 0 ? data_scale[uint(row_idx.y) * p.nei0 + uint(row_idx.x)] : 1.0f;
+// the fused MUL epilogues of an output row, each rounded on its own as the separate passes do
+float mmid_scale_rows(const float v, const u16vec2 row_idx) {
+    const uint i = uint(row_idx.y) * p.nei0 + uint(row_idx.x);
+    precise float r = (p.fusion_flags & 1u) != 0 ? v * data_scale[i] : v;
+    if ((p.fusion_flags & 2u) != 0) {
+        r = r * data_scale2[i];
+    }
+    return r;
 }
 
 // B offset of tile row col; rows past _ne1 repeat the tile's last row, whose results are never stored

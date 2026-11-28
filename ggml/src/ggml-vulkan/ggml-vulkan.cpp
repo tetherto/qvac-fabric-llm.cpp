@@ -3269,8 +3269,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     X(GGML_TYPE_PQ2_0,  pq2_0)
 
     const int mul_mat_id_param_count = 5;
-    // int8 MMQ coopmat1 MUL_MAT_ID: a sixth binding carries the router weights of the fused MUL_MAT_ID+MUL epilogue
-    const int mul_mat_id_mmq_cm1_param_count = 6;
+    // int8 MMQ coopmat1 and prefetch MUL_MAT_ID: the sixth and seventh bindings carry the scales of the fused
+    // MUL_MAT_ID+MUL(+MUL) epilogue
+    const int mul_mat_id_mmq_cm1_param_count = 7;
     constexpr uint32_t stream_k_spec_id = 15;
 
     using spec_fn_t = std::function<std::vector<uint32_t>(const std::vector<uint32_t>&, bool)>;
@@ -8306,18 +8307,20 @@ static void ggml_vk_matmul_id(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
-        uint32_t row_ids_offset, uint32_t max_tiles, const vk_subbuffer * scale = nullptr) {
+        uint32_t row_ids_offset, uint32_t max_tiles, const vk_subbuffer * scale = nullptr, const vk_subbuffer * scale2 = nullptr) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
-    // fusion_flags bit 0 (int8 MMQ cm1 only): scale rows by the router weights
+    // fusion_flags (int8 MMQ cm1 and prefetch only): bit 0 scales rows by the first MUL's weights, bit 1 then by the second's
+    GGML_ASSERT(scale2 == nullptr || scale != nullptr);
+    const uint32_t fusion_flags = (scale ? 1u : 0u) | (scale2 ? 2u : 0u);
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, n_as, row_ids_offset, scale ? 1u : 0u };
+                                              nei0, nei1, nbi1, ne11, n_as, row_ids_offset, fusion_flags };
     const uint32_t tiles_y = std::min(max_tiles, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
     const std::array<uint32_t, 3> elements = { m, tiles_y * pipeline->wg_denoms[1], uint32_t(CEIL_DIV(max_tiles, tiles_y)) };
-    if (pipeline->parameter_count == 6) {
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, scale ? *scale : d }, pc, elements);
+    if (pipeline->parameter_count == 7) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, scale ? *scale : d, scale2 ? *scale2 : d }, pc, elements);
     } else {
         GGML_ASSERT(scale == nullptr);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, elements);
@@ -10852,8 +10855,8 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     }
 }
 
-// scale (optional): the router weights of a fused MUL_MAT_ID+MUL; dst is then the MUL's destination
-static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * scale = nullptr) {
+// scale, scale2 (optional): the weights of a fused MUL_MAT_ID+MUL(+MUL); dst is then the last MUL's destination
+static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * scale = nullptr, const ggml_tensor * scale2 = nullptr) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -11193,10 +11196,15 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
 
     vk_subbuffer d_scale;
+    vk_subbuffer d_scale2;
     if (scale != nullptr) {
         // ggml_vk_mmid_scale_epilogue_ok admitted this node only for the int8 MMQ coopmat1 and the prefetch pipelines
-        GGML_ASSERT((quantize_y || mmid_prefetch) && !qx_needs_dequant && pipeline->parameter_count == 6);
+        GGML_ASSERT((quantize_y || mmid_prefetch) && !qx_needs_dequant && pipeline->parameter_count == 7);
         d_scale = ggml_vk_tensor_subbuffer(ctx, scale);
+    }
+    if (scale2 != nullptr) {
+        GGML_ASSERT(scale != nullptr);
+        d_scale2 = ggml_vk_tensor_subbuffer(ctx, scale2);
     }
 
     // compute
@@ -11207,7 +11215,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ne01, ne21, ne10, ne10, stride_b_y, ne01,
         stride_batch_x, stride_batch_y, ne20*ne21,
         n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, row_ids_offset, max_tiles,
-        scale != nullptr ? &d_scale : nullptr
+        scale != nullptr ? &d_scale : nullptr, scale2 != nullptr ? &d_scale2 : nullptr
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
@@ -11480,6 +11488,12 @@ void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ggml_tensor * mul = cgraph->nodes[node_idx + 1];
         GGML_ASSERT(mul->op == GGML_OP_MUL && mul->src[0] == dst);
         ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, mul, mul->src[1]);
+    } else if (ctx->num_additional_fused_ops == 2) {
+        // MUL_MAT_ID+MUL+MUL: the per-expert scale, then the router weights, written to the second MUL's destination
+        ggml_tensor * mul0 = cgraph->nodes[node_idx + 1];
+        ggml_tensor * mul1 = cgraph->nodes[node_idx + 2];
+        GGML_ASSERT(mul0->op == GGML_OP_MUL && mul0->src[0] == dst && mul1->op == GGML_OP_MUL && mul1->src[0] == mul0);
+        ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, mul1, mul0->src[1], mul1->src[1]);
     } else {
         GGML_ASSERT(ctx->num_additional_fused_ops == 0);
         ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst);
@@ -19471,7 +19485,7 @@ static bool ggml_vk_can_fuse_unary_mul_pair(const struct ggml_cgraph * cgraph, i
            ggml_vk_can_fuse_unary_mul(cgraph, node_idx, node_idx + 1);
 }
 
-// GGML_VK_FUSE_MMID_MUL_MUL=0 runs the second MUL after a mat-vec MUL_MAT_ID+MUL as its own pass, in the same graph order
+// GGML_VK_FUSE_MMID_MUL_MUL=0 runs the second MUL after a MUL_MAT_ID+MUL as its own pass, in the same graph order
 static bool ggml_vk_fuse_mmid_mul_mul_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_VK_FUSE_MMID_MUL_MUL");
@@ -19491,8 +19505,17 @@ static bool ggml_vk_mmid_epilogue_enabled() {
     return on;
 }
 
+// weights [1, n_expert_used, n_tokens], contiguous, one per output row of src; no broadcast of the expert outputs
+static bool ggml_vk_mmid_row_scale_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * src, const ggml_tensor * mul) {
+    const ggml_tensor * scale = mul->src[1];
+    return ggml_are_same_shape(mul, src) && ggml_is_contiguous(mul) && ggml_is_contiguous(src) &&
+           ggml_is_contiguous(scale) && get_misalign_bytes(ctx, scale) == 0 &&
+           scale->ne[0] == 1 && scale->ne[1] == mul->ne[1] && scale->ne[2] == mul->ne[2] && scale->ne[3] == 1 &&
+           mul->ne[3] == 1;
+}
+
 // true when ggml_vk_mul_mat_id_q_f16 will run this MUL_MAT_ID on an int8 MMQ coopmat1 or a prefetch pipeline (the
-// MUL_MAT_ID GEMMs with the router-weight binding) and the MUL is a per-row scale it can apply
+// MUL_MAT_ID GEMMs with the scale bindings) and the MUL is a per-row scale it can apply
 static bool ggml_vk_mmid_scale_epilogue_ok(const ggml_backend_vk_context * cctx, const ggml_tensor * mmid, const ggml_tensor * mul) {
     if (!ggml_vk_mmid_epilogue_enabled()) {
         return false;
@@ -19525,18 +19548,17 @@ static bool ggml_vk_mmid_scale_epilogue_ok(const ggml_backend_vk_context * cctx,
         return false;
     }
     for (const auto & pair : *mmp) {
-        if (!pair.unaligned || pair.unaligned->parameter_count != 6) {
+        if (!pair.unaligned || pair.unaligned->parameter_count != 7) {
             return false;
         }
     }
-    // weights [1, n_expert_used, n_tokens], contiguous, one per output row; no broadcast of the expert outputs
-    if (!ggml_are_same_shape(mul, mmid) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(mmid) ||
-        !ggml_is_contiguous(scale) || get_misalign_bytes(ctx, scale) != 0 ||
-        scale->ne[0] != 1 || scale->ne[1] != mul->ne[1] || scale->ne[2] != mul->ne[2] || scale->ne[3] != 1 ||
-        mul->ne[3] != 1) {
-        return false;
-    }
-    return true;
+    return ggml_vk_mmid_row_scale_ok(ctx, mmid, mul);
+}
+
+// MUL_MAT_ID+MUL+MUL on the GEMM path: the second MUL scales the first one's rows the same way
+static bool ggml_vk_mmid_second_scale_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * mul0, const ggml_tensor * mul1) {
+    return mul1->src[0] == mul0 && mul1->type == GGML_TYPE_F32 && mul1->src[1]->type == GGML_TYPE_F32 &&
+           ggml_vk_mmid_row_scale_ok(ctx, mul0, mul1);
 }
 
 static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -20076,13 +20098,15 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
     }
 
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_MUL_MAT_ID && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_MUL) {
-        // mat-vec only: the second MUL is the epilogue's second scale
+        // the second MUL is the epilogue's second scale, on the mat-vec or the GEMM path
         const ggml_tensor *mmid = cgraph->nodes[node_idx];
         const ggml_tensor *mul0 = cgraph->nodes[node_idx + 1];
         const ggml_tensor *mul1 = cgraph->nodes[node_idx + 2];
 
-        if (!ggml_vk_fuse_mmid_mul_mul_enabled() || !ggml_vk_use_mul_mat_vec_id(cgraph, node_idx) ||
-            !mmid_mul_ok(mmid, mul0) || !mmid_mul_ok(mul0, mul1)) {
+        if (!ggml_vk_fuse_mmid_mul_mul_enabled() || !mmid_mul_ok(mmid, mul0)) {
+            return false;
+        }
+        if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx) ? !mmid_mul_ok(mul0, mul1) : !ggml_vk_mmid_second_scale_ok(ctx, mul0, mul1)) {
             return false;
         }
     }
