@@ -3990,6 +3990,93 @@ int ggml_metal_op_convrot(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// output tiles at or below which a tensor-path mat-mul is bound by its serial K loop, and the fewest 32-deep K steps
+// per slice when it is split to fill GGML_METAL_MIN_THREADGROUPS
+static constexpr int64_t GGML_METAL_MM_SPLITK_MAX_TILES = 16;
+static constexpr int64_t GGML_METAL_MM_SPLITK_MIN_STEPS = 8;
+
+// dst rows and columns of one tensor-path mul_mm tile
+static constexpr int64_t GGML_METAL_MM_TILE_M = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
+static constexpr int64_t GGML_METAL_MM_TILE_N = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
+
+// balanced K slices for a grid of this many output tiles; never more for more tiles
+static int64_t ggml_metal_op_mul_mat_splitk_count(int64_t tiles, int64_t steps) {
+    const int64_t want = std::min((GGML_METAL_MIN_THREADGROUPS + tiles - 1)/tiles, steps/GGML_METAL_MM_SPLITK_MIN_STEPS);
+
+    if (tiles > GGML_METAL_MM_SPLITK_MAX_TILES || want < 2) {
+        return 1;
+    }
+
+    const int64_t per = (steps + want - 1)/want;
+
+    return (steps + per - 1)/per;
+}
+
+static int64_t ggml_metal_op_mul_mat_splitk_steps(const ggml_tensor * op) {
+    return (op->src[0]->ne[0] + N_MM_NK_TOTAL - 1)/N_MM_NK_TOTAL;
+}
+
+// the partial sums need the tensor API, and a Hadamard mat-mul never splits: the FWHT kernels take it
+static bool ggml_metal_op_mul_mat_splitk_allowed(const ggml_tensor * op, bool has_tensor) {
+    return has_tensor && op->op == GGML_OP_MUL_MAT && op->type == GGML_TYPE_F32 &&
+           ggml_get_op_params_i32(op, 1) != GGML_HINT_SRC0_IS_HADAMARD;
+}
+
+int ggml_metal_op_mul_mat_splitk(const ggml_tensor * op, bool has_tensor) {
+    if (!ggml_metal_op_mul_mat_splitk_allowed(op, has_tensor) || !ggml_metal_op_mul_mat_use_mm(op, true)) {
+        return 1;
+    }
+
+    const int64_t tiles = ((op->ne[1] + GGML_METAL_MM_TILE_N - 1)/GGML_METAL_MM_TILE_N) *
+                          ((op->ne[0] + GGML_METAL_MM_TILE_M - 1)/GGML_METAL_MM_TILE_M) * op->ne[2] * op->ne[3];
+
+    return (int) ggml_metal_op_mul_mat_splitk_count(tiles, ggml_metal_op_mul_mat_splitk_steps(op));
+}
+
+// sized for the most slices at any column count or batch (one column tile, batch 1), so the allocation of a later
+// graph with fewer tokens never grows past the reserved one
+size_t ggml_metal_op_mul_mat_extra_splitk(const ggml_tensor * op, bool has_tensor) {
+    if (!ggml_metal_op_mul_mat_splitk_allowed(op, has_tensor)) {
+        return 0;
+    }
+
+    const int64_t tiles  = (op->ne[0] + GGML_METAL_MM_TILE_M - 1)/GGML_METAL_MM_TILE_M;
+    const int64_t nsplit = ggml_metal_op_mul_mat_splitk_count(tiles, ggml_metal_op_mul_mat_splitk_steps(op));
+
+    return nsplit > 1 ? nsplit*ggml_nbytes(op) : 0;
+}
+
+// a split-K mat-mul writes its per-slice partial sums after dst (see get_alloc_size)
+static ggml_metal_buffer_id ggml_metal_op_mul_mat_mm_out(const ggml_tensor * op, int nsplit) {
+    ggml_metal_buffer_id res = ggml_metal_get_buffer_id(op);
+
+    if (nsplit > 1) {
+        res.offs += GGML_PAD(ggml_nbytes(op), 256);
+    }
+
+    return res;
+}
+
+static void ggml_metal_op_mul_mat_splitk_reduce(ggml_metal_op_t ctx, const ggml_tensor * op, int nsplit) {
+    ggml_metal_kargs_mul_mm_splitk_reduce args = {
+        /*.nsplit =*/ nsplit,
+        /*.ne     =*/ op->ne[0]*op->ne[1],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mm_splitk_reduce(ctx->lib);
+
+    const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_memory_barrier(ctx->enc);
+
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_op_mul_mat_mm_out(op, nsplit), 1);
+    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op),             2);
+
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (int) ((args.ne + nth - 1)/nth), (int) (op->ne[2]*op->ne[3]), 1, nth, 1, 1);
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     if (ctx->use_fusion()) {
         int n = 1;
@@ -4152,7 +4239,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //    default: break;
         //}
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
+        const int nsplit = ggml_metal_op_mul_mat_splitk(op, props_dev->has_tensor);
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, nsplit);
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
@@ -4175,7 +4264,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_op_mul_mat_mm_out(op, nsplit), 3);
 
         const size_t smem = pipeline.smem;
 
@@ -4185,7 +4274,15 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const int nr1 = pipeline.nr1;
         const int nsg = pipeline.nsg;
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13 * nsplit, 32, nsg, 1);
+
+        if (nsplit > 1) {
+            ggml_metal_op_mul_mat_splitk_reduce(ctx, op, nsplit);
+
+            if (ctx->debug_graph > 0) {
+                GGML_LOG_DEBUG("%s: split K: %s into %d slices\n", __func__, ggml_get_name(op), nsplit);
+            }
+        }
     } else {
         return ggml_metal_op_mul_mat_mv(ctx, idx);
     }

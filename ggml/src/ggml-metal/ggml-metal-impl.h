@@ -689,6 +689,11 @@ typedef struct {
 } ggml_metal_kargs_mul_mm;
 
 typedef struct {
+    int32_t  nsplit;
+    int64_t  ne;
+} ggml_metal_kargs_mul_mm_splitk_reduce;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;

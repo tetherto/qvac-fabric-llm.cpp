@@ -37,6 +37,12 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 // id map [n_tokens, n_expert]
 size_t ggml_metal_op_mul_mat_id_extra_ids(const struct ggml_tensor * op);
 
+// K slices of a tensor-path mat-mul with too few output tiles to fill the GPU (1 = no split)
+int ggml_metal_op_mul_mat_splitk(const struct ggml_tensor * op, bool has_tensor);
+
+// per-slice partial results of a split-K mat-mul, placed after dst
+size_t ggml_metal_op_mul_mat_extra_splitk(const struct ggml_tensor * op, bool has_tensor);
+
 // return true if we should use the FA vector kernel for this op
 bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
 

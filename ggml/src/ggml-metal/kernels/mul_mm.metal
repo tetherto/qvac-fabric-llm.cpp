@@ -8,6 +8,7 @@ constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
+constant short FC_mul_mm_nsplit [[function_constant(FC_MUL_MM + 8)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -32,8 +33,9 @@ kernel void kernel_mul_mm(
     const int M = args.ne0;
     const int N = args.ne1;
 
-    // Batch dimension handling
-    const int im = tgpig.z;
+    // Batch dimension handling; with a split K, z also carries the K slice
+    const int im = tgpig.z / FC_mul_mm_nsplit;
+    const int is = tgpig.z % FC_mul_mm_nsplit;
     const int i12 = im % FC_mul_mm_ne12;
     const int i13 = im / FC_mul_mm_ne12;
 
@@ -75,8 +77,13 @@ kernel void kernel_mul_mm(
 
     auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
-    // Accumulate partial results over K dimension
-    for (int loop_k = 0; loop_k < K; loop_k += N_MM_NK_TOTAL) {
+    const int k_steps = (K + N_MM_NK_TOTAL - 1)/N_MM_NK_TOTAL;
+    const int k_per   = (k_steps + FC_mul_mm_nsplit - 1)/FC_mul_mm_nsplit;
+    const int k_begin = is*k_per*N_MM_NK_TOTAL;
+    const int k_end   = min(K, k_begin + k_per*N_MM_NK_TOTAL);
+
+    // Accumulate partial results over this slice of the K dimension
+    for (int loop_k = k_begin; loop_k < k_end; loop_k += N_MM_NK_TOTAL) {
         // === PHASE 1: Dequantization of A into threadgroup memory ===
         for (int work = tiitg; work < A_WORK_ITEMS; work += NUM_THREADS) {
             const int row = work / N_MM_NK;
@@ -133,13 +140,13 @@ kernel void kernel_mul_mm(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Store result tile to output matrix (with batch offset)
+    // Store result tile to output matrix (with batch offset; z = batch*nsplit + slice, a split K stores partials)
     // a slice is not used because its byte offset is int32 and wraps at 2 GiB
     // ref: https://github.com/ggml-org/llama.cpp/pull/28748
     const int tileM = min(NRA, M - ra);
     const int tileN = min(NRB, N - rb);
 
-    device float * dstTile = (device float *)dst + (uint64_t) im * N * M + (uint64_t) rb * M + ra;
+    device float * dstTile = (device float *)dst + (uint64_t) tgpig.z * N * M + (uint64_t) rb * M + ra;
 
     auto tD = tensor(dstTile, dextents<int32_t, 2>(tileM, tileN), array<int, 2>({1, M}));
     cT.store(tD);
@@ -884,6 +891,33 @@ kernel void kernel_mul_mm_id(
             *(D + i) = *(C + i);
         }
     }
+}
+
+// sums the K slices of a split-K mat-mul in slice order: partials [batch][nsplit][ne] -> dst [batch][ne]
+float mul_mm_splitk_sum(device const float * part, int nsplit, int64_t ne) {
+    float sum = 0.0f;
+
+    for (int s = 0; s < nsplit; ++s) {
+        sum += part[s*ne];
+    }
+
+    return sum;
+}
+
+kernel void kernel_mul_mm_splitk_reduce(
+        constant ggml_metal_kargs_mul_mm_splitk_reduce & args,
+        device const float * part,
+        device       float * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        uint3  tpitg[[thread_position_in_threadgroup]],
+        uint3  ntg  [[threads_per_threadgroup]]) {
+    const int64_t i = (int64_t) tgpig.x*ntg.x + tpitg.x;
+
+    if (i >= args.ne) {
+        return;
+    }
+
+    dst[(uint64_t) tgpig.y*args.ne + i] = mul_mm_splitk_sum(part + (uint64_t) tgpig.y*args.nsplit*args.ne + i, args.nsplit, args.ne);
 }
 
 //

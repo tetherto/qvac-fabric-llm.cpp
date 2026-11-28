@@ -294,6 +294,15 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                     res = GGML_PAD(res, 256) + sizeof(float)*ggml_nelements(tensor->src[0]);
                 }
             } break;
+        case GGML_OP_MUL_MAT:
+            {
+                ggml_metal_device_t ctx_dev = (ggml_metal_device_t) buft->device->context;
+                const bool has_tensor = ggml_metal_device_get_props(ctx_dev)->has_tensor;
+                const size_t extra = ggml_metal_op_mul_mat_extra_splitk(tensor, has_tensor);
+                if (extra > 0) {
+                    res = GGML_PAD(res, 256) + extra;
+                }
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
