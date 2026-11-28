@@ -5472,6 +5472,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_tail_f32,        "ssm_conv_tail_f32",        ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {256, 1, 0, 0, 2, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_short_conv_f32, "short_conv_f32", short_conv_f32_len, short_conv_f32_data, "main", 4, sizeof(vk_op_short_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_short_conv_state_f32, "short_conv_state_f32", short_conv_state_f32_len, short_conv_state_f32_data, "main", 5, sizeof(vk_op_short_conv_state_push_constants), {32, 16, 1}, {32, 16}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_short_conv_dyn_f32, "short_conv_dyn_f32", short_conv_dyn_f32_len, short_conv_dyn_f32_data, "main", 6, sizeof(vk_op_short_conv_dyn_push_constants), {32, 16, 1}, {32, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_control_mix_f32, "control_mix_f32", control_mix_f32_len, control_mix_f32_data, "main", 5, sizeof(vk_op_control_mix_push_constants), {256, 1, 1}, {256}, 1);
     if (ggml_vk_loop_ctrl_device_ok(device)) {
         const std::vector<uint32_t> loop_ctrl_spec = { vk_loop_ctrl_block, vk_loop_ctrl_block / device->subgroup_size };
@@ -15272,6 +15273,30 @@ static void ggml_vk_short_conv_state(ggml_backend_vk_context * ctx, vk_context &
         pc, { (uint32_t) conv->ne[0], (uint32_t) conv->ne[1], (uint32_t) conv->ne[2] });
 }
 
+// a dynamic-tap short conv as one pass at its SCALE: reads past, w, cur and the taps, writes dst and the state rows
+static void ggml_vk_short_conv_dyn(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_backend_vk_context::short_conv_dyn_match & m,
+                                   ggml_tensor * dst) {
+    vk_pipeline pipeline = ctx->device->pipeline_short_conv_dyn_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t T = (uint32_t) (m.cur->ne[1] / m.past->ne[2]);
+    const vk_op_short_conv_dyn_push_constants pc = {
+        (uint32_t) (m.past->nb[1] / sizeof(float)), (uint32_t) (m.past->nb[2] / sizeof(float)),
+        (uint32_t) (m.w->nb[1] / sizeof(float)),
+        (uint32_t) (m.cur->nb[1] / sizeof(float)),
+        (uint32_t) (dst->nb[1] / sizeof(float)),
+        (uint32_t) m.past->ne[1], T, (uint32_t) m.past->ne[2],
+        ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1),
+        (uint32_t) (m.state->nb[1] / sizeof(float)),
+        (uint32_t) (m.taps->nb[1] / sizeof(float)), (uint32_t) m.head_size,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, m.past), ggml_vk_tensor_subbuffer(ctx, m.w), ggml_vk_tensor_subbuffer(ctx, m.cur),
+          ggml_vk_tensor_subbuffer(ctx, dst), ggml_vk_tensor_subbuffer(ctx, m.state), ggml_vk_tensor_subbuffer(ctx, m.taps) },
+        pc, { (uint32_t) m.past->ne[1], T, (uint32_t) m.past->ne[2] });
+    ctx->short_conv_dyn_fusion_count.fetch_add(1, std::memory_order_relaxed);
+}
+
 // control_mix_pattern at node_idx as one pass: reads f, cur, g and m, writes the ADD
 static void ggml_vk_control_mix(ggml_backend_vk_context * ctx, vk_context & subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * f   = cgraph->nodes[node_idx]->src[0];
@@ -18026,11 +18051,16 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
                 }
             }
         }
-        // tensors a fused kernel reads that are not srcs of its nodes (the direct conv reads x and the state)
+        // tensors a fused kernel reads that are not srcs of its nodes (the direct conv reads x and the state), and
+        // the one it writes that is not a node (the dynamic-tap conv's state rows)
         for (const ggml_tensor * extra : ctx->fused_extra_srcs) {
             if (extra && !need_sync && overlaps_unsynced(extra, ctx->unsynced_nodes_written)) {
                 need_sync = true;
             }
+        }
+        if (ctx->fused_extra_dst && !need_sync && (overlaps_unsynced(ctx->fused_extra_dst, ctx->unsynced_nodes_read) ||
+                                                   overlaps_unsynced(ctx->fused_extra_dst, ctx->unsynced_nodes_written))) {
+            need_sync = true;
         }
 
         if (need_sync) {
@@ -18066,6 +18096,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             if (extra) {
                 ctx->unsynced_nodes_read.push_back(get_buffer_range(extra));
             }
+        }
+        if (ctx->fused_extra_dst) {
+            ctx->unsynced_nodes_written.push_back(get_buffer_range(ctx->fused_extra_dst));
         }
     }
     if (vk_enable_sync_logger) {
@@ -18203,6 +18236,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             ggml_vk_dsv4_hc_post(ctx, compute_ctx, hc_post->src[0], hc_post->src[1], hc_post->src[2], hc_post->src[3], hc_post, node);
         } else if (ctx->fused_situ) {
             ggml_vk_situ(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_short_conv_dyn >= 0) {
+            ggml_vk_short_conv_dyn(ctx, compute_ctx, ctx->short_conv_dyn_matches[ctx->fused_short_conv_dyn], node);
         } else {
             ggml_vk_scale(ctx, compute_ctx, src0, node);
         }
@@ -21522,6 +21557,273 @@ static bool ggml_vk_get_rows_bcast_at_get_rows(ggml_backend_vk_context * ctx, co
     return true;
 }
 
+// GGML_VK_FUSE_SHORT_CONV_DYN=0 runs Inkling 2's dynamic-tap short convs as separate passes
+static bool ggml_vk_fuse_short_conv_dyn_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_SHORT_CONV_DYN");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static constexpr int SHORT_CONV_DYN_TAPS = 4;
+// the nodes a dynamic-tap block dispatches before its SCALE: CONCAT, state CPY, SSM_CONV, per tap CONT, MUL and ADD,
+// and the residual ADD
+static constexpr int SHORT_CONV_DYN_SKIPPED = 3 + 3 * SHORT_CONV_DYN_TAPS + 1;
+// how far past the CONCAT its SSM_CONV and state CPY may be
+static constexpr int SHORT_CONV_DYN_REACH = 128;
+
+// the one node after i reading nodes[i], when it has op `op` and reads it as src[slot]; -1 otherwise
+static int ggml_vk_only_reader_as(const ggml_cgraph * cgraph, int i, ggml_op op, int slot) {
+    const int n = ggml_vk_only_reader(cgraph, i);
+    return n >= 0 && cgraph->nodes[n]->op == op && cgraph->nodes[n]->src[slot] == cgraph->nodes[i] ? n : -1;
+}
+
+static bool ggml_vk_is_f32(const ggml_tensor * t) {
+    return t != nullptr && t->type == GGML_TYPE_F32;
+}
+
+// tap `lag` of a dynamic-tap block: term = reshape(window * tap), window = reshape(cont(transpose(view(cc)))) at
+// concat column 3 - lag, tap = view(reshape(taps)) at row lag. Sets taps and the head size from the first tap.
+static bool ggml_vk_short_conv_dyn_tap_ok(const ggml_cgraph * cgraph, const ggml_tensor * term, const ggml_tensor * cc, int lag,
+                                          const ggml_tensor *& taps, int64_t & head_size) {
+    const ggml_tensor * mul = term->src[0];
+    if (term->op != GGML_OP_RESHAPE || !mul || mul->op != GGML_OP_MUL || !ggml_vk_is_f32(mul) || ggml_vk_use_count(cgraph, mul) != 1) {
+        return false;
+    }
+    const ggml_tensor * win3 = mul->src[0];
+    const ggml_tensor * tap  = mul->src[1];
+    const ggml_tensor * cont = win3 ? win3->src[0] : nullptr;
+    const ggml_tensor * tr   = cont ? cont->src[0] : nullptr;
+    const ggml_tensor * view = tr ? tr->src[0] : nullptr;
+    if (win3->op != GGML_OP_RESHAPE || !cont || cont->op != GGML_OP_CONT || !tr || tr->op != GGML_OP_TRANSPOSE ||
+        !view || view->op != GGML_OP_VIEW || view->src[0] != cc) {
+        return false;
+    }
+    for (const ggml_tensor * t : { win3, cont, tr, view }) {
+        if (ggml_vk_use_count(cgraph, t) != 1) {
+            return false;
+        }
+    }
+    const int64_t C = cc->ne[1], T = cc->ne[0] - 3, S = cc->ne[2];
+    if (view->ne[0] != T || view->ne[1] != C || view->ne[2] != S || view->nb[1] != cc->nb[1] || view->nb[2] != cc->nb[2] ||
+        view->view_offs != (size_t) (3 - lag) * sizeof(float) || !ggml_is_contiguous(cont)) {
+        return false;
+    }
+    const ggml_tensor * tr3 = tap ? tap->src[0] : nullptr;
+    if (!tap || tap->op != GGML_OP_VIEW || !tr3 || tr3->op != GGML_OP_RESHAPE || !ggml_vk_is_f32(tr3->src[0])) {
+        return false;
+    }
+    const ggml_tensor * t2 = tr3->src[0];
+    const int64_t nh = tr3->ne[1];
+    if (lag == 0) {
+        taps = t2;
+        head_size = nh > 0 ? C / nh : 0;
+    }
+    return t2 == taps && ggml_is_contiguous(t2) && t2->ne[0] == SHORT_CONV_DYN_TAPS * nh && t2->ne[1] == T * S &&
+           tr3->ne[0] == SHORT_CONV_DYN_TAPS && tr3->ne[2] == T * S && head_size * nh == C &&
+           tap->ne[0] == 1 && tap->ne[1] == nh && tap->ne[2] == T * S && tap->nb[1] == tr3->nb[1] && tap->nb[2] == tr3->nb[2] &&
+           tap->view_offs == (size_t) lag * sizeof(float) &&
+           win3->ne[0] == head_size && win3->ne[1] == nh && win3->ne[2] == T * S;
+}
+
+// the CPY of cc's last 3 columns (a VIEW at column T) into the state rows, searched in (i, end); -1 if none
+static int ggml_vk_short_conv_dyn_state_cpy(const ggml_cgraph * cgraph, int i, int end) {
+    const ggml_tensor * cc = cgraph->nodes[i];
+    const int64_t C = cc->ne[1], T = cc->ne[0] - 3, S = cc->ne[2];
+    for (int n = i + 1; n < end; ++n) {
+        const ggml_tensor * cpy = cgraph->nodes[n];
+        const ggml_tensor * tail = cpy->src[0];
+        if (cpy->op != GGML_OP_CPY || !tail || tail->op != GGML_OP_VIEW || tail->src[0] != cc) {
+            continue;
+        }
+        const ggml_tensor * st = cpy->src[1];
+        const bool ok = tail->ne[0] == 3 && tail->ne[1] == C && tail->ne[2] == S && tail->view_offs == (size_t) T * sizeof(float) &&
+                        tail->nb[1] == cc->nb[1] && tail->nb[2] == cc->nb[2] && ggml_vk_use_count(cgraph, tail) == 1 &&
+                        ggml_vk_is_f32(st) && st->ne[0] == 3 * C && st->ne[1] == S && st->ne[2] == 1 && st->nb[0] == sizeof(float);
+        return ok ? n : -1;
+    }
+    return -1;
+}
+
+// whether a node in (from, to), other than the block's own, writes past, cur, w, or the taps after `taps_at`, or reads
+// or writes the state rows: the fused pass reads its inputs and writes the state at the SCALE instead
+static bool ggml_vk_short_conv_dyn_hazard(const ggml_cgraph * cgraph, int from, int to, const int * block,
+                                          const ggml_backend_vk_context::short_conv_dyn_match & m, int taps_at) {
+    for (int n = from + 1; n < to; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        if (std::find(block, block + SHORT_CONV_DYN_SKIPPED, n) != block + SHORT_CONV_DYN_SKIPPED ||
+            t->buffer == nullptr || t->op == GGML_OP_NONE || ggml_op_is_empty(t->op) || ggml_is_empty(t)) {
+            continue;
+        }
+        if (ggml_vk_tensors_overlap(t, m.past, false) || ggml_vk_tensors_overlap(t, m.cur, false) ||
+            ggml_vk_tensors_overlap(t, m.w, false) || ggml_vk_tensors_overlap(t, m.state, false) ||
+            (n > taps_at && t != m.taps && ggml_vk_tensors_overlap(t, m.taps, false))) {
+            return true;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (t->src[k] && t->src[k]->buffer && ggml_vk_tensors_overlap(t->src[k], m.state, false)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Structural match of a dynamic-tap short conv at the CONCAT nodes[i] (inkling2 convolve with dynamic taps): fills m
+// and the indices of the nodes the fused pass replaces. With runtime = true it also checks the addresses.
+static bool ggml_vk_short_conv_dyn_check(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i,
+                                         ggml_backend_vk_context::short_conv_dyn_match & m, int * nodes, bool runtime) {
+    const ggml_tensor * cc = cgraph->nodes[i];
+    // read by the conv, the state tail and one window per tap
+    if (cc->op != GGML_OP_CONCAT || !ggml_vk_is_f32(cc) || ggml_get_op_params_i32(cc, 0) != 0 || (cc->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        !ggml_is_contiguous(cc) || cc->ne[3] != 1 || ggml_vk_use_count(cgraph, cc) != 2 + SHORT_CONV_DYN_TAPS) {
+        return false;
+    }
+    const ggml_tensor * past = cc->src[0];
+    const ggml_tensor * xt   = cc->src[1];
+    if (!ggml_vk_is_f32(past) || !ggml_vk_is_f32(xt) || xt->op != GGML_OP_TRANSPOSE || !xt->view_src) {
+        return false;
+    }
+    const ggml_tensor * cur = xt->view_src;
+    const int64_t C = cc->ne[1], T = cc->ne[0] - 3, S = cc->ne[2];
+    if (T < 1 || past->ne[0] != 3 || past->ne[1] != C || past->ne[2] != S || past->ne[3] != 1 || past->nb[0] != sizeof(float) ||
+        !ggml_vk_is_f32(cur) || !ggml_is_contiguous(cur) || cur->ne[0] != C || cur->ne[1] != T * S || cur->ne[2] != 1 ||
+        xt->view_offs != 0 || xt->ne[0] != T || xt->ne[1] != C || xt->ne[2] != S || xt->nb[0] != cur->nb[1] || xt->nb[1] != sizeof(float)) {
+        return false;
+    }
+    const int end = std::min(i + SHORT_CONV_DYN_REACH, cgraph->n_nodes);
+    int conv = -1;
+    for (int n = i + 1; n < end && conv < 0; ++n) {
+        conv = cgraph->nodes[n]->op == GGML_OP_SSM_CONV && cgraph->nodes[n]->src[0] == cc ? n : -1;
+    }
+    if (conv < 0) {
+        return false;
+    }
+    const ggml_tensor * w = cgraph->nodes[conv]->src[1];
+    if (!ggml_vk_is_f32(cgraph->nodes[conv]) || !ggml_vk_is_f32(w) || w->ne[0] != 4 || w->ne[1] != C || w->nb[0] != sizeof(float)) {
+        return false;
+    }
+    int k = 0;
+    nodes[k++] = i;
+    nodes[k++] = conv;
+    int prev = ggml_vk_only_reader_as(cgraph, conv, GGML_OP_RESHAPE, 0);
+    if (prev < 0 || cgraph->nodes[prev]->ne[0] != C || cgraph->nodes[prev]->ne[1] != T * S) {
+        return false;
+    }
+    m.taps = nullptr;
+    m.head_size = 0;
+    for (int lag = 0; lag < SHORT_CONV_DYN_TAPS; ++lag) {
+        const int add = ggml_vk_only_reader_as(cgraph, prev, GGML_OP_ADD, 0);
+        if (add < 0 || !ggml_vk_is_f32(cgraph->nodes[add]) ||
+            !ggml_vk_short_conv_dyn_tap_ok(cgraph, cgraph->nodes[add]->src[1], cc, lag, m.taps, m.head_size)) {
+            return false;
+        }
+        const ggml_tensor * mul  = cgraph->nodes[add]->src[1]->src[0];
+        const ggml_tensor * cont = mul->src[0]->src[0];
+        for (int n = i + 1; n < add; ++n) {
+            if (cgraph->nodes[n] == mul || cgraph->nodes[n] == cont) {
+                nodes[k++] = n;
+            }
+        }
+        nodes[k++] = add;
+        prev = add;
+    }
+    const int resid = ggml_vk_only_reader_as(cgraph, prev, GGML_OP_ADD, 1);
+    const int scale = resid >= 0 ? ggml_vk_only_reader_as(cgraph, resid, GGML_OP_SCALE, 0) : -1;
+    if (scale < 0 || cgraph->nodes[resid]->src[0] != cur || !ggml_vk_is_f32(cgraph->nodes[scale]) ||
+        !ggml_is_contiguous(cgraph->nodes[scale]) || !ggml_are_same_shape(cgraph->nodes[scale], cur) ||
+        (cgraph->nodes[scale]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    nodes[k++] = resid;
+    const int cpy = ggml_vk_short_conv_dyn_state_cpy(cgraph, i, scale);
+    if (cpy < 0 || k != SHORT_CONV_DYN_SKIPPED - 1) {
+        return false;
+    }
+    nodes[k++] = cpy;
+    m.scale = scale;
+    m.past  = past;
+    m.cur   = cur;
+    m.w     = w;
+    m.state = cgraph->nodes[cpy]->src[1];
+    if (!runtime) {
+        return true;
+    }
+    const ggml_tensor * dst = cgraph->nodes[scale];
+    for (const ggml_tensor * t : { m.past, m.cur, m.w, m.taps, m.state, dst }) {
+        if (!t->buffer || get_misalign_bytes(ctx, t) != 0) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * t : { m.past, m.cur, m.w, m.taps, m.state }) {
+        if (ggml_vk_tensors_overlap(t, dst, false)) {
+            return false;
+        }
+    }
+    // other tokens' threads read past while the last one writes the state rows
+    if (ggml_vk_tensors_overlap(m.past, m.state, false)) {
+        return false;
+    }
+    int taps_at = i;
+    for (int n = i + 1; n < scale; ++n) {
+        taps_at = cgraph->nodes[n] == m.taps ? n : taps_at;
+    }
+    return !ggml_vk_short_conv_dyn_hazard(cgraph, i, scale, nodes, m, taps_at);
+}
+
+static bool ggml_vk_short_conv_dyn_at_concat(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_vk_fuse_short_conv_dyn_enabled() || cgraph->nodes[i]->op != GGML_OP_CONCAT) {
+        return false;
+    }
+    ggml_backend_vk_context::short_conv_dyn_match m;
+    int nodes[SHORT_CONV_DYN_SKIPPED];
+    if (!ggml_vk_short_conv_dyn_check(ctx, cgraph, i, m, nodes, true)) {
+        return false;
+    }
+    for (int n = 0; n < SHORT_CONV_DYN_SKIPPED; ++n) {
+        ctx->skip_node[nodes[n]] = 1;
+    }
+    ctx->short_conv_dyn_matches.push_back(m);
+    ctx->fused_skip_node = true;
+    return true;
+}
+
+static bool ggml_vk_short_conv_dyn_at_scale(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (cgraph->nodes[i]->op != GGML_OP_SCALE) {
+        return false;
+    }
+    for (size_t k = 0; k < ctx->short_conv_dyn_matches.size(); ++k) {
+        const auto & m = ctx->short_conv_dyn_matches[k];
+        if (m.scale == i) {
+            ctx->fused_short_conv_dyn = (int) k;
+            ctx->fused_extra_srcs[0] = m.past;
+            ctx->fused_extra_srcs[1] = m.cur;
+            ctx->fused_extra_srcs[2] = m.w;
+            ctx->fused_extra_srcs[3] = m.taps;
+            ctx->fused_extra_dst = m.state;
+            return true;
+        }
+    }
+    return false;
+}
+
+// the dynamic-tap conv reads past, cur and the taps at its SCALE: keep them allocated until then
+static void ggml_vk_short_conv_dyn_add_alloc_deps(const ggml_backend_vk_context * ctx, ggml_cgraph * graph,
+                                                  const ggml_backend_graph_optimize_params * params) {
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_backend_vk_context::short_conv_dyn_match m;
+        int nodes[SHORT_CONV_DYN_SKIPPED];
+        if (graph->nodes[i]->op != GGML_OP_CONCAT || !ggml_vk_short_conv_dyn_check(ctx, graph, i, m, nodes, false)) {
+            continue;
+        }
+        for (const ggml_tensor * t : { m.past, m.cur, m.taps }) {
+            ggml_tensor * root = const_cast<ggml_tensor *>(t->view_src ? t->view_src : t);
+            params->add_alloc_dep(params->user_data, root, graph->nodes[m.scale]);
+        }
+    }
+}
+
 // FA_BIAS_SUB reads the SUB's subtrahend at the attention: keep it allocated until then (the minuend is the SUB's
 // in-place parent, and the runtime check falls back to the SUB if either is overwritten)
 static void ggml_vk_fa_bias_sub_add_alloc_deps(const ggml_backend_vk_context * ctx, ggml_cgraph * graph,
@@ -21723,6 +22025,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials_offset_calculation = false;
     ctx->ssm_conv_direct_matches.clear();
     ctx->skipped_nodes.clear();
+    ctx->short_conv_dyn_matches.clear();
+    ctx->skip_node.assign(cgraph->n_nodes, 0);
 
     int last_node = cgraph->n_nodes - 1;
 
@@ -21886,14 +22190,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_glu_q8_1 = nullptr;
         ctx->fused_concat_tail = -1;
         ctx->fused_ssm_conv_direct = -1;
-        ctx->fused_extra_srcs[0] = ctx->fused_extra_srcs[1] = nullptr;
+        std::fill(std::begin(ctx->fused_extra_srcs), std::end(ctx->fused_extra_srcs), nullptr);
+        ctx->fused_extra_dst = nullptr;
+        ctx->fused_short_conv_dyn = -1;
         ctx->fused_skip_node = false;
         ctx->fused_fa_bias_sub = nullptr;
         ctx->fused_get_rows_bcast = nullptr;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (ggml_vk_fa_bias_sub_at_sub(ctx, cgraph, i)) {
+            if (ctx->skip_node[i]) {
+                ctx->fused_skip_node = true;  // part of a block whose fused pass runs at a later node
+            } else if (ggml_vk_short_conv_dyn_at_concat(ctx, cgraph, i)) {
+                fusion_string = "SHORT_CONV_DYN";  // the block's nodes are not dispatched
+            } else if (ggml_vk_short_conv_dyn_at_scale(ctx, cgraph, i)) {
+                fusion_string = "SHORT_CONV_DYN";
+            } else if (ggml_vk_fa_bias_sub_at_sub(ctx, cgraph, i)) {
                 fusion_string = "FA_BIAS_SUB";  // the SUB is not dispatched
             } else if (ggml_vk_fa_bias_sub_at_fa(ctx, cgraph, i)) {
                 fusion_string = "FA_BIAS_SUB";
@@ -23409,6 +23721,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     }
     if (ggml_vk_fa_bias_sub_enabled() && !ctx->device->disable_fusion && params && params->add_alloc_dep) {
         ggml_vk_fa_bias_sub_add_alloc_deps(ctx, graph, params);
+    }
+    if (ggml_vk_fuse_short_conv_dyn_enabled() && !ctx->device->disable_fusion && params && params->add_alloc_dep) {
+        ggml_vk_short_conv_dyn_add_alloc_deps(ctx, graph, params);
     }
 }
 
@@ -25016,6 +25331,12 @@ static uint64_t ggml_backend_vk_get_rows_bcast_fusion_count(ggml_backend_t backe
     return ctx->get_rows_bcast_fusion_count.load(std::memory_order_relaxed);
 }
 
+static uint64_t ggml_backend_vk_short_conv_dyn_fusion_count(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    return ctx->short_conv_dyn_fusion_count.load(std::memory_order_relaxed);
+}
+
 static bool ggml_backend_vk_l2_clip_supported(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_vk(backend));
     return ggml_vk_l2_clip_supported((ggml_backend_vk_context *) backend->context);
@@ -25078,6 +25399,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_get_rows_bcast_fusion_count") == 0 && ggml_vk_get_rows_bcast_enabled()) {
         return (void *) ggml_backend_vk_get_rows_bcast_fusion_count;
+    }
+    if (strcmp(name, "ggml_backend_vk_short_conv_dyn_fusion_count") == 0 && ggml_vk_fuse_short_conv_dyn_enabled()) {
+        return (void *) ggml_backend_vk_short_conv_dyn_fusion_count;
     }
     return NULL;
 }

@@ -5857,11 +5857,14 @@ struct test_short_conv : public test_case {
     }
 };
 
-// test_short_conv with the conv's state copy: the last 3 concat columns of each channel go to the recurrent state rows
+// test_short_conv with the conv's state copy: the last 3 concat columns of each channel go to the recurrent state rows.
+// n_heads > 0 adds Inkling 2's input-dependent taps, one per head and lag, as its full-attention K and V convs build them.
 struct test_short_conv_state : public test_case {
     const int64_t n_channels;
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
+    const int64_t n_heads;
+    mutable bool has_fusion_counter = false;
 
     std::vector<ggml_tensor *> verify;
 
@@ -5871,14 +5874,39 @@ struct test_short_conv_state : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR3(n_channels, n_seq_tokens, n_seqs);
+        return n_heads ? VARS_TO_STR4(n_channels, n_seq_tokens, n_seqs, n_heads) : VARS_TO_STR3(n_channels, n_seq_tokens, n_seqs);
     }
 
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
 
-    test_short_conv_state(int64_t n_channels = 1024, int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
-        : n_channels(n_channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn = uint64_t (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_short_conv_dyn_fusion_count");
+        has_fusion_counter = counter != nullptr;
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override { return n_heads > 0 && has_fusion_counter; }
+
+    test_short_conv_state(int64_t n_channels = 1024, int64_t n_seq_tokens = 1, int64_t n_seqs = 1, int64_t n_heads = 0)
+        : n_channels(n_channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), n_heads(n_heads) {}
+
+    ggml_tensor * add_dynamic_taps(ggml_context * ctx, ggml_tensor * out, ggml_tensor * x) {
+        const int64_t n_tokens = n_seq_tokens * n_seqs;
+        ggml_tensor * taps = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4 * n_heads, n_tokens);
+        ggml_set_name(taps, "taps");
+        ggml_tensor * dynamic = ggml_reshape_3d(ctx, taps, 4, n_heads, n_tokens);
+        for (int64_t lag = 0; lag < 4; ++lag) {
+            ggml_tensor * tap    = ggml_view_3d(ctx, dynamic, 1, n_heads, n_tokens, dynamic->nb[1], dynamic->nb[2], lag * dynamic->nb[0]);
+            ggml_tensor * window = ggml_view_3d(ctx, x, n_seq_tokens, n_channels, n_seqs, x->nb[1], x->nb[2], (3 - lag) * x->nb[0]);
+            window = ggml_cont(ctx, ggml_transpose(ctx, window));
+            window = ggml_reshape_3d(ctx, window, n_channels / n_heads, n_heads, n_tokens);
+            out = ggml_add(ctx, out, ggml_reshape_2d(ctx, ggml_mul(ctx, window, tap), n_channels, n_tokens));
+        }
+        return out;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         verify.clear();
@@ -5904,7 +5932,10 @@ struct test_short_conv_state : public test_case {
         verify.push_back(cpy);
 
         ggml_tensor * conv = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, x, w), n_channels, n_seq_tokens * n_seqs);
-        ggml_tensor * out  = ggml_scale(ctx, ggml_add(ctx, cur, conv), 1.0f / sqrtf(5.0f));
+        if (n_heads) {
+            conv = add_dynamic_taps(ctx, conv, x);
+        }
+        ggml_tensor * out  = ggml_scale(ctx, ggml_add(ctx, cur, conv), 1.0f / sqrtf(n_heads ? 9.0f : 5.0f));
         ggml_set_name(out, "out");
         verify.push_back(out);
         return out;
@@ -17308,6 +17339,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_short_conv_state(2304, 1, 1));
     test_cases.emplace_back(new test_short_conv_state(2304, 4, 1));
     test_cases.emplace_back(new test_short_conv_state(1024, 33, 2));
+    for (int64_t n_seqs : { 1, 2 }) {
+        for (int64_t n_seq_tokens : { 1, 4, 33 }) {
+            test_cases.emplace_back(new test_short_conv_state(1024, n_seq_tokens, n_seqs, 8));
+        }
+    }
+    test_cases.emplace_back(new test_short_conv_state(84, 5, 3, 7));
 
     for (bool with_mm : { true, false }) {
         test_cases.emplace_back(new test_control_mix(2304, 1, with_mm));
